@@ -9,8 +9,8 @@ use agora_core::game_base::BaseMode;
 use agora_core::game_deploy::{add_content, deployment_dir, set_content_enabled};
 use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
 use agora_core::game_instance::{
-    create, prepare_launch_with, runtime_findings, GameInstanceRecord, InstanceError,
-    LaunchOptions, VfsFailure,
+    create, launch_checks, prepare_launch_with, runtime_findings, GameInstanceRecord,
+    InstanceError, LaunchOptions, VfsFailure,
 };
 use agora_core::game_launch::{
     prepare_base_launch_with, LaunchError, LaunchedGame, Launcher, PreparedLaunch,
@@ -20,8 +20,8 @@ use agora_core::game_registry::{
 };
 use agora_game_api::{
     BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
-    InstallKind, LaunchRecipe, LaunchValue, PackageDefinition, RelPath, RuntimeFileProblem,
-    RuntimeFileRule, RuntimeIdentity, StoreId, StoreIdentifier,
+    InstallKind, LaunchRecipe, LaunchValue, PackageDefinition, PluginListRule, RelPath,
+    RuntimeFileProblem, RuntimeFileRule, RuntimeIdentity, StoreId, StoreIdentifier,
 };
 use tempfile::TempDir;
 
@@ -37,6 +37,46 @@ fn skse_rule() -> RuntimeFileRule {
         applies_to: vec![],
         repair: "Install the SKSE build for Skyrim {version}".into(),
     }
+}
+
+/// A second framework rule, whose family is present but built for another version.
+fn other_framework_rule() -> RuntimeFileRule {
+    RuntimeFileRule {
+        id: "other-framework".into(),
+        name: "Other Framework".into(),
+        family: "other_*.dll".into(),
+        expected: "other_1.dll".into(),
+        applies_to: vec![],
+        repair: "Install the Other Framework for this version".into(),
+    }
+}
+
+/// A plugin list rule with no engine semantics, so a check needs no plugin headers.
+fn plugin_list_rule() -> PluginListRule {
+    PluginListRule {
+        user_file: RelPath::new("user/Plugins.txt").unwrap(),
+        plugin_folder: RelPath::new("Data").unwrap(),
+        patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+        active_prefix: "*".into(),
+        header: vec![],
+        semantics: None,
+        implicit: Vec::new(),
+        implicit_list_file: None,
+    }
+}
+
+/// Write the instance's plugin list with `plugins`, each active.
+fn write_plugin_list(s: &Setup, plugins: &[&str]) {
+    let path = s
+        .ctx
+        .paths
+        .instance_dir(&s.instance.instance_id)
+        .unwrap()
+        .join("user")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let lines: Vec<String> = plugins.iter().map(|name| format!("*{name}")).collect();
+    std::fs::write(path, lines.join("\n")).unwrap();
 }
 
 fn make_test_definition() -> GameDefinition {
@@ -427,4 +467,78 @@ fn a_disabled_content_layer_with_another_versions_skse_gives_no_finding() {
         .is_empty());
     let prepared = prepare(&s, false, &NoVfs).expect("the disabled layer is not in the game");
     assert!(prepared.runtime_findings.is_empty());
+}
+
+#[test]
+fn launch_checks_list_the_frameworks_and_plugin_count_that_passed() {
+    let mut s = setup(&["skse64_1_6_1170.dll"]);
+    s.def.plugin_list = Some(plugin_list_rule());
+    write_plugin_list(&s, &["A.esp", "B.esp"]);
+
+    let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
+    assert!(checks.runtime.is_empty(), "{:?}", checks.runtime);
+    assert!(checks.load_order.is_empty(), "{:?}", checks.load_order);
+    assert_eq!(checks.passed.len(), 2, "{:?}", checks.passed);
+    assert_eq!(checks.passed[0].kind, "framework");
+    assert_eq!(checks.passed[0].title, "Skyrim Script Extender (SKSE)");
+    assert!(checks.passed[0].detail.contains("skse64_1_6_1170.dll"));
+    assert_eq!(checks.passed[1].kind, "load_order");
+    assert_eq!(checks.passed[1].title, "Plugin load order");
+    assert_eq!(checks.passed[1].detail, "2 plugins in a valid order.");
+}
+
+#[test]
+fn launch_checks_say_zero_plugins_rather_than_omitting_the_load_order() {
+    let mut s = setup(&[]);
+    s.def.runtime_files = Vec::new();
+    s.def.plugin_list = Some(plugin_list_rule());
+
+    let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
+    assert_eq!(checks.passed.len(), 1, "{:?}", checks.passed);
+    assert_eq!(checks.passed[0].kind, "load_order");
+    assert_eq!(checks.passed[0].detail, "0 plugins in a valid order.");
+}
+
+#[test]
+fn launch_checks_list_a_passing_framework_beside_a_blocking_one() {
+    let mut s = setup(&["skse64_1_6_1170.dll", "other_2.dll"]);
+    s.def.runtime_files = vec![skse_rule(), other_framework_rule()];
+
+    let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
+    assert_eq!(checks.runtime.len(), 1, "{:?}", checks.runtime);
+    assert_eq!(checks.runtime[0].rule_id, "other-framework");
+    assert_eq!(checks.passed.len(), 1, "{:?}", checks.passed);
+    assert_eq!(checks.passed[0].kind, "framework");
+    assert_eq!(checks.passed[0].title, "Skyrim Script Extender (SKSE)");
+}
+
+#[test]
+fn launch_checks_with_nothing_declared_pass_nothing() {
+    let mut s = setup(&[]);
+    s.def.runtime_files = Vec::new();
+
+    let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
+    assert!(checks.passed.is_empty(), "{:?}", checks.passed);
+}
+
+#[test]
+fn an_unpinned_instance_passes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+    let mut install = make_install(&tmp, &["skse64_1_6_1170.dll"]);
+    install.discovered.capabilities.executables_readable = false;
+    let instance = create(
+        &ctx,
+        &install,
+        &def,
+        "Unpinned",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("create unpinned instance");
+
+    let checks = launch_checks(&ctx, &instance, &def).expect("the launch checks run");
+    assert!(checks.passed.is_empty(), "{:?}", checks.passed);
 }

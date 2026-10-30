@@ -769,9 +769,25 @@ pub fn runtime_findings(
     id: &str,
     definition: &GameDefinition,
 ) -> Result<Vec<agora_game_api::RuntimeFileFinding>, InstanceError> {
+    Ok(runtime_check(ctx, id, definition)?.0)
+}
+
+/// The framework findings and passes for a launch of this instance, from one reading of the files
+/// the game will see. An unpinned instance has neither.
+fn runtime_check(
+    ctx: &Ctx,
+    id: &str,
+    definition: &GameDefinition,
+) -> Result<
+    (
+        Vec<agora_game_api::RuntimeFileFinding>,
+        Vec<agora_game_api::RuntimeFilePass>,
+    ),
+    InstanceError,
+> {
     let record = get(ctx, id)?.ok_or_else(|| InstanceError::NotFound(id.to_string()))?;
     let BaseReference::Pinned { id: base_id, .. } = record.base else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let manifest = get_manifest(ctx, id)?;
     let manifest_path = ctx.paths.base_manifest_path(&base_id);
@@ -784,11 +800,20 @@ pub fn runtime_findings(
         Some(mode) => crate::game_deploy::visible_paths(ctx, id, definition, mode)?,
         None => base_manifest.files.iter().map(|f| f.path.clone()).collect(),
     };
-    Ok(crate::game_launch::runtime_findings(
-        definition,
-        &base_manifest.runtime.version,
-        &paths,
+    Ok((
+        crate::game_launch::runtime_findings(definition, &base_manifest.runtime.version, &paths),
+        crate::game_launch::runtime_passes(definition, &base_manifest.runtime.version, &paths),
     ))
+}
+
+/// A check that ran and passed, in words a page can show. Only checks that actually examined
+/// something are here: an empty list means no check applied, never that everything passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PassedCheck {
+    /// `framework`, `load_order`, `tool` or `base`, the same values as a finding's kind.
+    pub kind: &'static str,
+    pub title: String,
+    pub detail: String,
 }
 
 /// The findings `games instance check` and the instance Overview report, from one place so they
@@ -797,6 +822,8 @@ pub struct LaunchChecks {
     pub runtime: Vec<agora_game_api::RuntimeFileFinding>,
     pub load_order: Vec<crate::game_load_order::Finding>,
     pub outputs: Vec<crate::game_tools::OutputFinding>,
+    /// The checks that ran and passed, for the page to list beside any findings.
+    pub passed: Vec<PassedCheck>,
 }
 
 /// Which check failed, so each caller keeps the error code it gives that check.
@@ -823,32 +850,59 @@ pub fn launch_checks(
     let id = record.instance_id.as_str();
     let pinned = matches!(record.base, BaseReference::Pinned { .. });
     let (runtime, links) = std::thread::scope(|scope| {
-        let runtime = scope.spawn(|| runtime_findings(ctx, id, definition));
+        let runtime = scope.spawn(|| runtime_check(ctx, id, definition));
         let links = scope.spawn(|| match definition.plugin_list {
             Some(_) if pinned => crate::game_load_order::plan_for_order(ctx, id, definition),
             _ => Ok(None),
         });
         (join_scoped(runtime), join_scoped(links))
     });
-    let runtime = runtime?;
+    let (runtime, framework_passes) = runtime?;
     if !pinned {
         return Ok(LaunchChecks {
             runtime,
             load_order: Vec::new(),
             outputs: Vec::new(),
+            passed: Vec::new(),
         });
     }
     let links = links?;
-    let load_order = match definition.plugin_list {
-        Some(_) => crate::game_load_order::check_with_view(ctx, id, definition, links.as_ref())?,
-        None => Vec::new(),
+    let (load_order, plugin_count) = match definition.plugin_list {
+        Some(_) => {
+            let order =
+                crate::game_load_order::order_with_view(ctx, id, definition, links.as_ref())?;
+            let count = order.entries.len();
+            (order.findings, Some(count))
+        }
+        None => (Vec::new(), None),
     };
     let outputs =
         crate::game_tools::output_findings_with_view(ctx, id, definition, links.as_ref())?;
+    let mut passed = Vec::new();
+    for pass in &framework_passes {
+        passed.push(PassedCheck {
+            kind: "framework",
+            title: pass.rule_name.clone(),
+            detail: format!("Found {}, which matches this game version.", pass.expected),
+        });
+    }
+    if let Some(count) = plugin_count {
+        if load_order.is_empty() {
+            passed.push(PassedCheck {
+                kind: "load_order",
+                title: "Plugin load order".to_string(),
+                detail: format!(
+                    "{count} {} in a valid order.",
+                    if count == 1 { "plugin" } else { "plugins" }
+                ),
+            });
+        }
+    }
     Ok(LaunchChecks {
         runtime,
         load_order,
         outputs,
+        passed,
     })
 }
 

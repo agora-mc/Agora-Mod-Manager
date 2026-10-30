@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use agora_game_api::{
     check_runtime_files, describe_runtime_findings, GameDefinition, GamePath, LaunchRecipe,
-    LaunchValue, RuntimeFileFinding, UserDataLocation,
+    LaunchValue, RuntimeFileFinding, RuntimeFilePass, UserDataLocation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -166,6 +166,16 @@ pub fn runtime_findings<S: AsRef<str>>(
     paths: &[S],
 ) -> Vec<RuntimeFileFinding> {
     check_runtime_files(&definition.runtime_files, version, paths)
+}
+
+/// The framework rules `paths` satisfy for `version`. The same paths and rules the findings use,
+/// so a rule is never reported as both passing and failing.
+pub fn runtime_passes<S: AsRef<str>>(
+    definition: &GameDefinition,
+    version: &str,
+    paths: &[S],
+) -> Vec<RuntimeFilePass> {
+    agora_game_api::runtime_file_passes(&definition.runtime_files, version, paths)
 }
 
 /// A launch alternative (a framework's loader) that was used instead of the recipe's own

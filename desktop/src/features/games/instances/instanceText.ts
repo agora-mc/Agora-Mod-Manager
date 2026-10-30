@@ -77,18 +77,43 @@ export function baseModeCopy(mode: BaseMode): { label: string; explain: string }
       };
 }
 
-/** A check's one-line summary for its header: what is blocking, what to review, or that all is well. */
+/** A check's one-line summary for its header: what is blocking, what to review, or what passed. */
 export function checkHeadline(check: InstanceCheck | null): string {
   if (check === null) return 'Checking this instance…';
   if (!check.checked) return 'This instance runs from its install folder, so there is no framework check.';
   switch (check.status) {
     case 'ok':
-      return 'Everything Agora checks is in order.';
+      return check.passed.length === 0
+        ? 'No launch checks apply to this instance.'
+        : `All ${check.passed.length} ${check.passed.length === 1 ? 'check' : 'checks'} passed.`;
     case 'warnings':
       return warningsText(check.findings.length);
     case 'findings':
       return blockingText(check.findings.filter((finding) => finding.blocks).length);
   }
+}
+
+/** The names of the checks a launch-anyway would skip, in the page's order, without repeats. */
+export function skippedChecks(check: InstanceCheck | null): string[] {
+  if (check === null) return [];
+  const titles: string[] = [];
+  for (const finding of check.findings) {
+    if (finding.blocks && !titles.includes(finding.title)) titles.push(finding.title);
+  }
+  return titles;
+}
+
+/**
+ * The launch-anyway sentence naming the checks it would skip, or null when nothing is blocking
+ * (the page then keeps its generic wording).
+ */
+export function launchAnywayText(check: InstanceCheck | null): string | null {
+  const titles = skippedChecks(check);
+  if (titles.length === 0) return null;
+  const list = titles.length === 1
+    ? titles[0]
+    : `${titles.slice(0, -1).join(', ')} and ${titles[titles.length - 1]}`;
+  return `start the game past ${list}, even when ${titles.length === 1 ? 'it' : 'they'} would stop it.`;
 }
 
 export function blockingText(count: number): string {

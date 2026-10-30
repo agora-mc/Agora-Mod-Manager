@@ -60,11 +60,19 @@ export interface CheckFinding {
   repair: string | null;
 }
 
+export interface PassedCheck {
+  kind: FindingKind;
+  title: string;
+  detail: string;
+}
+
 export interface InstanceCheck {
   instanceId: string;
   checked: boolean;
   status: 'ok' | 'warnings' | 'findings';
   findings: CheckFinding[];
+  /** The checks that ran and passed. Empty means none applied, never that all passed. */
+  passed: PassedCheck[];
 }
 
 export type LaunchStatus = 'launched' | 'refused' | 'vfs_unavailable';
@@ -166,6 +174,14 @@ function isFinding(value: unknown): value is CheckFinding {
     && isOptionalString(value.repair);
 }
 
+function isPassed(value: unknown): value is PassedCheck {
+  if (!isRecord(value)) return false;
+  return typeof value.kind === 'string'
+    && FINDING_KINDS.includes(value.kind)
+    && typeof value.title === 'string'
+    && typeof value.detail === 'string';
+}
+
 function isLaunchReply(value: unknown): value is LaunchReply {
   if (!isRecord(value)) return false;
   return typeof value.status === 'string'
@@ -239,6 +255,8 @@ export async function checkGameInstance(instanceId: string): Promise<InstanceChe
     || !CHECK_STATUSES.includes(reply.status)
     || !Array.isArray(reply.findings)
     || !reply.findings.every(isFinding)
+    || !Array.isArray(reply.passed)
+    || !reply.passed.every(isPassed)
   ) {
     throw shapeError('games_instance_check');
   }

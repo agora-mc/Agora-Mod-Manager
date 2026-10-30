@@ -7874,6 +7874,7 @@ async fn run_command(
                         runtime: findings,
                         load_order,
                         outputs: generated,
+                        passed: _,
                     } = match agora_core::game_instance::launch_checks(ctx, &record, game_def) {
                         Ok(checks) => checks,
                         Err(e) => fail(format!("{e}")),
