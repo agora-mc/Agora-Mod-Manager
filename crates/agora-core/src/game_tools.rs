@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use agora_game_api::{
-    glob_match, BaseReference, DeploymentStrategy, GameDefinition, GamePath, InputFingerprint,
-    Layer, LayerId, LayerSource, LayerStack, RelPath, StoreId, ToolDefinition, ToolId,
+    fold_path_case, glob_match, BaseReference, DeploymentStrategy, GameDefinition, GamePath,
+    InputFingerprint, Layer, LayerId, LayerSource, LayerStack, RelPath, StoreId, ToolDefinition,
+    ToolId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1702,7 +1703,7 @@ fn executable_layer(
     let winner = planned
         .files
         .iter()
-        .find(|file| file.path.as_str().eq_ignore_ascii_case(path.as_str()));
+        .find(|file| fold_path_case(file.path.as_str()) == fold_path_case(path.as_str()));
     Ok(winner.and_then(|file| match file.source {
         crate::game_deploy::FileSource::Content { .. } => Some(file.layer_id.clone()),
         _ => None,
@@ -2052,7 +2053,8 @@ fn outside_data(changes: InstallChanges) -> InstallChanges {
         paths
             .into_iter()
             .filter(|p| {
-                !(p.eq_ignore_ascii_case("Data") || p.to_ascii_lowercase().starts_with("data/"))
+                let folded = fold_path_case(p);
+                !(folded == "data" || folded.starts_with("data/"))
             })
             .collect()
     };
@@ -2343,7 +2345,7 @@ fn would_be_manifest(
     Ok(manifest)
 }
 
-/// The files the game would read once `tool`'s run is promoted, lower-cased and `/`-separated
+/// The files the game would read once `tool`'s run is promoted, case-folded and `/`-separated
 /// (MASTER_SPEC §26.9). The stack is the instance's, with the tool's generated layer holding the run's
 /// staging folder and the run's whiteouts. The layers above that layer are left out, the writable
 /// layer among them: the game's own writes are not the tool's output. The planner does the work, so
@@ -2371,7 +2373,7 @@ fn would_be_files(
         Ok(plan) => Ok(Ok(plan
             .files
             .iter()
-            .map(|file| file.path.as_str().to_ascii_lowercase())
+            .map(|file| fold_path_case(file.path.as_str()))
             .collect())),
         Err(e) => Ok(Err(format!(
             "the output the run would produce cannot be deployed: {e}"
@@ -2408,11 +2410,11 @@ pub fn drop_unchanged_outputs(
     let below: BTreeMap<String, &crate::game_deploy::PlannedFile> = baseline
         .files
         .iter()
-        .map(|file| (file.path.as_str().to_ascii_lowercase(), file))
+        .map(|file| (fold_path_case(file.path.as_str()), file))
         .collect();
     let mut dropped = 0;
     for rel in written_files(staging)? {
-        let Some(file) = below.get(&rel.to_ascii_lowercase()) else {
+        let Some(file) = below.get(&fold_path_case(&rel)) else {
             continue;
         };
         let path = rel
@@ -2512,7 +2514,7 @@ fn output_check(
             Err(reason) => return Ok(Some(reason)),
         };
         for pattern in &tool.required_outputs {
-            let wanted = pattern.to_ascii_lowercase();
+            let wanted = fold_path_case(pattern);
             if !files.iter().any(|key| glob_match(&wanted, key)) {
                 return Ok(Some(format!(
                     "required output '{pattern}' is missing from the output the run would produce"
@@ -2524,11 +2526,8 @@ fn output_check(
     // A file the run wrote must begin with its declared bytes. A file the run did not write is the
     // output of an earlier run, which was checked when it was promoted, so it is not read here.
     for required in &tool.required_magic {
-        let wanted = required.file.as_str().to_ascii_lowercase();
-        let Some(rel) = written
-            .iter()
-            .find(|rel| rel.to_ascii_lowercase() == wanted)
-        else {
+        let wanted = fold_path_case(required.file.as_str());
+        let Some(rel) = written.iter().find(|rel| fold_path_case(rel) == wanted) else {
             continue;
         };
         let Some(expected) = decode_hex(&required.magic) else {
@@ -2559,11 +2558,8 @@ fn output_check(
         if marker.contains.is_empty() {
             continue;
         }
-        let wanted = marker.file.as_str().to_ascii_lowercase();
-        let Some(rel) = written
-            .iter()
-            .find(|rel| rel.to_ascii_lowercase() == wanted)
-        else {
+        let wanted = fold_path_case(marker.file.as_str());
+        let Some(rel) = written.iter().find(|rel| fold_path_case(rel) == wanted) else {
             continue;
         };
         let path = rel
@@ -2762,14 +2758,14 @@ pub fn diff(ctx: &Ctx, instance_id: &str, tool_id: &ToolId) -> Result<DiffReport
     })
 }
 
-/// A generation's files, keyed by lower-cased path, with the path as written and its location.
+/// A generation's files, keyed by case-folded path, with the path as written and its location.
 fn files_by_key(root: &Path) -> Result<BTreeMap<String, (String, PathBuf)>, ToolError> {
     let mut out = BTreeMap::new();
     for rel in written_files(root)? {
         let abs = rel
             .split('/')
             .fold(root.to_path_buf(), |p, part| p.join(part));
-        out.insert(rel.to_ascii_lowercase(), (rel, abs));
+        out.insert(fold_path_case(&rel), (rel, abs));
     }
     Ok(out)
 }

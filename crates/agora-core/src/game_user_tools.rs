@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use agora_game_api::{GameDefinition, GamePath, ToolDefinition};
+use agora_game_api::{fold_path_case, GameDefinition, GamePath, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
@@ -130,7 +130,7 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
     let candidates = find_candidates(ctx, instance_id, &definition)?;
     let matched = candidates
         .iter()
-        .find(|candidate| candidate.exe.eq_ignore_ascii_case(&exe))
+        .find(|candidate| fold_path_case(&candidate.exe) == fold_path_case(&exe))
         .ok_or_else(|| {
             UserToolError::InvalidExe(format!(
                 "'{exe}' is not an executable this instance's deployment provides from an enabled mod or the game's files"
@@ -139,7 +139,7 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
     let canonical = matched.exe.clone();
     if tools
         .iter()
-        .any(|tool| tool.exe.eq_ignore_ascii_case(&canonical))
+        .any(|tool| fold_path_case(&tool.exe) == fold_path_case(&canonical))
     {
         return Err(UserToolError::Duplicate { exe: canonical });
     }
@@ -217,10 +217,10 @@ pub fn find_candidates(
     let known = known_tools(ctx, definition);
     let mut added: Vec<String> = list(ctx, instance_id)?
         .into_iter()
-        .map(|tool| tool.exe.to_ascii_lowercase())
+        .map(|tool| fold_path_case(&tool.exe))
         .collect();
     added.sort();
-    let is_added = |exe: &str| added.binary_search(&exe.to_ascii_lowercase()).is_ok();
+    let is_added = |exe: &str| added.binary_search(&fold_path_case(exe)).is_ok();
 
     let mut rows: BTreeMap<String, ToolCandidate> = BTreeMap::new();
     for file in &plan.files {
@@ -231,13 +231,13 @@ pub fn find_candidates(
         let Some(base) = file_name(path) else {
             continue;
         };
-        if !base.to_ascii_lowercase().ends_with(".exe") {
+        if !fold_path_case(base).ends_with(".exe") {
             continue;
         }
         if is_excluded_exe(base) {
             continue;
         }
-        let lower = path.to_ascii_lowercase();
+        let lower = fold_path_case(path);
         if rows.contains_key(&lower) {
             continue;
         }
@@ -251,18 +251,21 @@ pub fn find_candidates(
     // A known tool's executable is also a candidate when the deployment provides it from a source
     // that is not an enabled mod (for example the game's own files).
     for tool in &known {
-        if rows.keys().any(|key| key.eq_ignore_ascii_case(&tool.exe)) {
+        if rows
+            .keys()
+            .any(|key| fold_path_case(key) == fold_path_case(&tool.exe))
+        {
             continue;
         }
         let provided = plan
             .files
             .iter()
-            .any(|file| file.path.as_str().eq_ignore_ascii_case(&tool.exe));
+            .any(|file| fold_path_case(file.path.as_str()) == fold_path_case(&tool.exe));
         if !provided {
             continue;
         }
         rows.insert(
-            tool.exe.to_ascii_lowercase(),
+            fold_path_case(&tool.exe),
             candidate_row(
                 &tool.exe,
                 file_name(&tool.exe).unwrap_or(tool.exe.as_str()),
@@ -310,10 +313,10 @@ fn candidate_row(
     known: &[KnownTool],
     already_added: bool,
 ) -> ToolCandidate {
-    let base_lower = base.to_ascii_lowercase();
+    let base_folded = fold_path_case(base);
     let known_tool = known.iter().find(|tool| {
-        tool.exe.eq_ignore_ascii_case(exe)
-            || file_name(&tool.exe).is_some_and(|name| name.eq_ignore_ascii_case(&base_lower))
+        fold_path_case(&tool.exe) == fold_path_case(exe)
+            || file_name(&tool.exe).is_some_and(|name| fold_path_case(name) == base_folded)
     });
     ToolCandidate {
         exe: exe.to_string(),
@@ -329,15 +332,18 @@ fn candidate_row(
 
 /// The file's stem, without its `.exe`, for a name suggestion.
 fn exe_stem(base: &str) -> String {
-    let lower = base.to_ascii_lowercase();
-    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    base[..stem.len()].to_string()
+    if fold_path_case(base).ends_with(".exe") {
+        // ".exe" is four ASCII bytes in the original too, so this is a char boundary.
+        base.get(..base.len() - 4).unwrap_or(base).to_string()
+    } else {
+        base.to_string()
+    }
 }
 
 fn is_excluded_exe(base: &str) -> bool {
     EXCLUDED_EXE_NAMES
         .iter()
-        .any(|name| base.eq_ignore_ascii_case(name))
+        .any(|name| fold_path_case(base) == fold_path_case(name))
 }
 
 fn file_name(path: &str) -> Option<&str> {
@@ -463,7 +469,7 @@ fn normalise_exe(raw: &str) -> Result<String, UserToolError> {
         }
     }
     let base = segments.last().copied().unwrap_or_default();
-    if !base.to_ascii_lowercase().ends_with(".exe") || base.eq_ignore_ascii_case(".exe") {
+    if !fold_path_case(base).ends_with(".exe") || fold_path_case(base) == ".exe" {
         return Err(UserToolError::InvalidExe(format!(
             "'{raw}' is not an .exe file"
         )));

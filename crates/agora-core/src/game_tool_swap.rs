@@ -22,6 +22,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use agora_game_api::fold_path_case;
 use agora_game_api::{BaseReference, GameDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -249,9 +250,9 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     fn norm(p: &Path) -> String {
         let s = p.to_string_lossy();
         let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-        s.replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
+        let s = s.replace('/', "\\");
+        let s = s.trim_end_matches('\\');
+        fold_path_case(s)
     }
     norm(a) == norm(b)
 }
@@ -299,7 +300,7 @@ fn nearest_existing(path: &Path) -> Option<PathBuf> {
 fn volume_key(path: &Path) -> Option<String> {
     let probe = nearest_existing(path)?;
     crate::game_discovery::volume::get_volume_mount_root(&probe)
-        .map(|root| root.to_string_lossy().to_ascii_lowercase())
+        .map(|root| fold_path_case(&root.to_string_lossy()))
 }
 
 /// Whether two paths are on the same volume. An unknown volume is treated as a different one, which

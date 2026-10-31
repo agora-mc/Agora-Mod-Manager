@@ -73,7 +73,10 @@ fn nested(inner: &str, outer: &str) -> bool {
 
 /// Two folders overlap when one is the other, or lies inside it. Case-insensitive.
 fn overlaps(a: &str, b: &str) -> bool {
-    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    let (a, b) = (
+        agora_game_api::fold_path_case(a),
+        agora_game_api::fold_path_case(b),
+    );
     nested(&a, &b) || nested(&b, &a)
 }
 

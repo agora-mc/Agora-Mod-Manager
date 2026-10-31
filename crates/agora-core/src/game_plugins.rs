@@ -16,7 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    glob_match, GameDefinition, GameId, PluginListRule, StoreId, UserFileMapping, UserFileStrategy,
+    fold_path_case, glob_match, GameDefinition, GameId, PluginListRule, StoreId, UserFileMapping,
+    UserFileStrategy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -172,7 +173,12 @@ fn plugin_line<'a>(line: &'a [u8], rule: &PluginListRule) -> Option<(bool, &'a [
 }
 
 fn key(name: &[u8]) -> Vec<u8> {
-    name.to_ascii_lowercase()
+    // Plugin lists are bytes; a non-ASCII name is normally UTF-8 from the file system.
+    // Invalid UTF-8 keeps the old ASCII-only fold rather than inventing characters.
+    match std::str::from_utf8(name) {
+        Ok(text) => fold_path_case(text).into_bytes(),
+        Err(_) => name.to_ascii_lowercase(),
+    }
 }
 
 fn render_line(rule: &PluginListRule, name: &[u8], active: bool) -> Vec<u8> {
@@ -397,15 +403,13 @@ pub fn desired_plugins<'a>(
     plan: &DeploymentPlan,
     base_paths: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
-    let base_keys: std::collections::HashSet<String> = base_paths
-        .into_iter()
-        .map(|p| p.to_ascii_lowercase())
-        .collect();
+    let base_keys: std::collections::HashSet<String> =
+        base_paths.into_iter().map(fold_path_case).collect();
     let folder = rule.plugin_folder.as_str().trim_matches('/');
     let patterns: Vec<String> = rule
         .patterns
         .iter()
-        .map(|p| p.trim().to_ascii_lowercase())
+        .map(|p| fold_path_case(p.trim()))
         .collect();
 
     let mut found: Vec<(usize, usize, String, String)> = Vec::new();
@@ -418,17 +422,17 @@ pub fn desired_plugins<'a>(
             Some((parent, name)) => (parent, name),
             None => ("", path),
         };
-        if !parent.eq_ignore_ascii_case(folder) {
+        if fold_path_case(parent) != fold_path_case(folder) {
             continue;
         }
-        let lower = name.to_ascii_lowercase();
+        let lower = fold_path_case(name);
         let Some(pattern_rank) = patterns
             .iter()
             .position(|p| !p.is_empty() && glob_match(p, &lower))
         else {
             continue;
         };
-        if base_keys.contains(&path.to_ascii_lowercase()) {
+        if base_keys.contains(&fold_path_case(path)) {
             continue;
         }
         let Some(layer_rank) = content_layer_items.iter().position(|i| i == item_id) else {
@@ -974,6 +978,16 @@ mod tests {
         let (added, removed) = apply_sync(&mut f, &rule(), &names(&["A.esp"]), &names(&["A.esp"]));
         assert!(added.is_empty() && removed.is_empty());
         assert_eq!(lines(&f), ["*a.ESP"]);
+    }
+
+    #[test]
+    fn sync_matches_non_ascii_plugin_names_the_way_ntfs_does() {
+        // `key` still lower-cases ASCII only, while the planner folds Unicode: `Ü.esp` and `ü.esp`
+        // are one file on NTFS (checked 2026-10-31), but this writes a second line for it.
+        let mut f = ListFile::parse("*ü.esp\r\n".as_bytes());
+        let (added, removed) = apply_sync(&mut f, &rule(), &names(&["Ü.esp"]), &[]);
+        assert!(added.is_empty() && removed.is_empty());
+        assert_eq!(lines(&f), ["*ü.esp"]);
     }
 
     #[test]

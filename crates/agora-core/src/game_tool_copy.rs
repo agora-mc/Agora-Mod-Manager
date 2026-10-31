@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{GameDefinition, RelPath};
+use agora_game_api::{fold_path_case, GameDefinition, RelPath};
 use serde::{Deserialize, Serialize};
 
 use crate::content_store::protect;
@@ -142,7 +142,7 @@ pub fn data_files(
         let Some((first, rest)) = file.path.as_str().split_once('/') else {
             continue;
         };
-        if !first.eq_ignore_ascii_case("Data") || rest.is_empty() {
+        if fold_path_case(first) != fold_path_case("Data") || rest.is_empty() {
             continue;
         }
         let path = RelPath::new(rest)
@@ -153,7 +153,7 @@ pub fn data_files(
 }
 
 fn key(path: &RelPath) -> String {
-    path.as_str().to_ascii_lowercase()
+    fold_path_case(path.as_str())
 }
 
 fn source_stat(ctx: &Ctx, source: &FileSource) -> Result<(u64, i64), SwapError> {
@@ -539,7 +539,7 @@ fn update_kept(
     let mut present = Vec::new();
     list_files(copy_dir, Path::new(""), &mut present)?;
     for rel in present {
-        if !wanted.contains(&rel.to_ascii_lowercase()) {
+        if !wanted.contains(&fold_path_case(&rel)) {
             let path = copy_dir.join(&rel);
             make_writable(&path)?;
             std::fs::remove_file(&path)?;

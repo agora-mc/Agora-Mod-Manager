@@ -334,7 +334,11 @@ mod tests {
                     }
                     (Some('?'), Some(_)) | (Some('>'), Some(_)) => go(&p[1..], &n[1..]),
                     (Some('"'), Some('.')) => go(&p[1..], &n[1..]),
-                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b) && go(&p[1..], &n[1..]),
+                    (Some(a), Some(b)) => {
+                        agora_game_api::fold_path_case(&a.to_string())
+                            == agora_game_api::fold_path_case(&b.to_string())
+                            && go(&p[1..], &n[1..])
+                    }
                     (Some(_), None) => p.iter().all(|c| matches!(c, '*' | '<' | '>' | '"')),
                     (None, Some(_)) => false,
                 }
@@ -348,6 +352,7 @@ mod tests {
         assert!(wildcard("*.txt", "foo.TXT"));
         assert!(wildcard("foo?.txt", "foo1.txt"));
         assert!(!wildcard("foo?.txt", "foo12.txt"));
+        assert!(wildcard("Ü/*.txt", "ü/Tool.TXT"));
         assert!(wildcard("foo<txt", "foo.txt")); // DOS wildcard < matches . or *
         assert!(wildcard("foo\".txt", "foo..txt"));
         assert!(!wildcard("*.esp", "foo.esm"));

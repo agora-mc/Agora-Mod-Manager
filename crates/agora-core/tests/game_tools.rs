@@ -5061,14 +5061,22 @@ fn a_path_held_by_two_mods_is_one_row_for_the_file_the_deployment_uses() {
 }
 
 #[test]
-#[ignore = "planner folds ASCII case only; tracked separately"]
 fn a_path_held_by_two_mods_in_different_non_ascii_case_is_one_row() {
     // On NTFS "Ü" and "ü" name the same file, so the two mods collide on disk. One row is right.
     let f = fixture(Vec::new());
-    f.add_mod("Upper", &[("Data/Ü/Tool.exe", b"upper")]);
-    f.add_mod("Lower", &[("data/ü/tool.exe", b"lower")]);
+    let upper = f.add_mod("Upper", &[("Data/Ü/Tool.exe", b"upper")]);
+    let lower = f.add_mod("Lower", &[("data/ü/tool.exe", b"lower")]);
     let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
     assert_eq!(candidates.len(), 1, "{candidates:?}");
+    // The later mod wins, as it does for an ASCII case pair.
+    assert_eq!(candidates[0].mod_id, lower);
+    let plan = plan(&f.ctx, f.id(), &f.def, DeployMode::Links).unwrap();
+    let deployed = planned(&plan, "data/ü/tool.exe").expect("the deployment has it");
+    let FileSource::Content { item_id, .. } = &deployed.source else {
+        panic!("not a content file: {:?}", deployed.source);
+    };
+    assert_eq!(item_id, &lower);
+    assert_ne!(item_id, &upper);
 }
 
 #[test]
@@ -5090,5 +5098,20 @@ fn a_mod_whose_record_is_missing_is_an_error_not_no_candidates() {
     assert!(
         game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).is_err(),
         "a missing mod record must not read as no candidates"
+    );
+}
+
+#[test]
+fn a_staged_output_that_is_a_different_file_on_ntfs_is_never_dropped_as_unchanged() {
+    // NTFS keeps `i.txt` and `ı.txt` as two files (checked 2026-10-31). fold_path_case maps both to
+    // `I.TXT`, so the tool's own `ı.txt` is matched to the mod's `i.txt`, found equal, and deleted.
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod("Mod", &[("Data/i.txt", b"same bytes")]);
+    let staging = stage(&f, "sweep", &[("Data/ı.txt", b"same bytes")]);
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 0);
+    assert_eq!(
+        std::fs::read(staging.join("Data/ı.txt")).unwrap(),
+        b"same bytes"
     );
 }

@@ -257,3 +257,23 @@ fn a_package_id_that_could_leave_its_folder_is_refused() {
     assert!(map_thunderstore_bepinex(&paths, "Author-Mod").is_ok());
     assert!(map_thunderstore_bepinex(&paths, "Mod").is_ok());
 }
+
+#[test]
+fn top_level_thunderstore_files_stay_out_of_a_root_pack_whatever_their_case() {
+    // The root-pack branch compares its top-level names against lower-case literals, but the
+    // names are now upper-cased first, so Manifest.JSON, Icon.PNG and README.md get installed.
+    let paths = to_paths(&[
+        "Manifest.JSON",
+        "Icon.PNG",
+        "README.md",
+        "winhttp.dll",
+        "BepInEx/core/BepInEx.Preloader.dll",
+    ]);
+    let mut dests: Vec<String> = map_thunderstore_bepinex(&paths, "denikson-BepInExPack")
+        .unwrap()
+        .into_iter()
+        .map(|(_, d)| d.as_str().to_string())
+        .collect();
+    dests.sort();
+    assert_eq!(dests, ["BepInEx/core/BepInEx.Preloader.dll", "winhttp.dll"]);
+}

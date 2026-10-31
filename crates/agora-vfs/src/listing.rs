@@ -149,7 +149,11 @@ pub fn wildcard(pattern: &str, name: &str) -> bool {
             (Some('*'), _) | (Some('<'), _) => go(&p[1..], n) || (!n.is_empty() && go(p, &n[1..])),
             (Some('?'), Some(_)) | (Some('>'), Some(_)) => go(&p[1..], &n[1..]),
             (Some('"'), Some('.')) => go(&p[1..], &n[1..]),
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b) && go(&p[1..], &n[1..]),
+            (Some(a), Some(b)) => {
+                agora_game_api::fold_path_case(&a.to_string())
+                    == agora_game_api::fold_path_case(&b.to_string())
+                    && go(&p[1..], &n[1..])
+            }
             (Some(_), None) => p.iter().all(|c| matches!(c, '*' | '<' | '>' | '"')),
             (None, Some(_)) => false,
         }
@@ -157,6 +161,11 @@ pub fn wildcard(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
     go(&p, &n)
+}
+
+/// The VFS's own whiteout folder, matched through the same case fold as every other name.
+fn is_whiteout_dir(folded_name: &str) -> bool {
+    folded_name == ".agvfs-wh"
 }
 
 /// The merged listing of virtual directory `rel`: upper first, then lowers in priority order;
@@ -191,8 +200,8 @@ pub unsafe fn build_listing(
         }
         for entry in read_real_dir(&dir, class) {
             let name = entry_name(&entry, class);
-            let key = name.to_lowercase();
-            if rel.is_empty() && key == ".agvfs-wh" {
+            let key = agora_game_api::fold_path_case(&name);
+            if rel.is_empty() && is_whiteout_dir(&key) {
                 continue;
             }
             if !seen.insert(key) {
@@ -312,4 +321,19 @@ pub unsafe fn query_directory(
     *iosb = status as u32 as usize;
     *iosb.add(1) = written;
     Some(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_whiteout_dir;
+
+    #[test]
+    fn whiteout_folder_name_matches_whatever_its_case() {
+        for name in [".agvfs-wh", ".AGVFS-WH", ".AgVfs-Wh"] {
+            assert!(is_whiteout_dir(&agora_game_api::fold_path_case(name)));
+        }
+        assert!(!is_whiteout_dir(&agora_game_api::fold_path_case(
+            ".agvfs-wh-copy"
+        )));
+    }
 }

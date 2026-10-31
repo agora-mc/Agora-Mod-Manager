@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{Layer, LayerSource, RelPath};
+use agora_game_api::{fold_path_case, Layer, LayerSource, RelPath};
 use serde::Serialize;
 
 use crate::content_store::{self, ContentFile};
@@ -143,7 +143,7 @@ fn mounted_path(layer: &Layer, file: &ContentFile) -> Option<RelPath> {
         && source_parts
             .iter()
             .zip(file_parts.iter())
-            .all(|(source, part)| source.eq_ignore_ascii_case(part))
+            .all(|(source, part)| fold_path_case(source) == fold_path_case(part))
     {
         Some(file_parts[source_parts.len()..].join("/"))
     } else {
@@ -168,14 +168,14 @@ fn normalize_input(path: &str) -> String {
 
 fn same_path(left: &str, right: &str) -> bool {
     if cfg!(windows) {
-        left.eq_ignore_ascii_case(right)
+        fold_path_case(left) == fold_path_case(right)
     } else {
         left == right
     }
 }
 
 fn key(path: &str) -> String {
-    path.to_ascii_lowercase()
+    fold_path_case(path)
 }
 
 /// One mod that ships a path, and the layer position that decides the winner.

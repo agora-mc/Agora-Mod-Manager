@@ -535,14 +535,10 @@ pub fn is_subpath(path: &Path, dir: &Path) -> bool {
 
     #[cfg(windows)]
     {
-        let p_str = norm_path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
-        let mut d_str = norm_dir
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
+        let p_str = norm_path.to_string_lossy().replace('\\', "/");
+        let p_str = agora_game_api::fold_path_case(&p_str);
+        let d_str = norm_dir.to_string_lossy().replace('\\', "/");
+        let mut d_str = agora_game_api::fold_path_case(&d_str);
         if !d_str.ends_with('/') {
             d_str.push('/');
         }
@@ -638,7 +634,8 @@ pub fn wait_for_exit(
                 {
                     if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
                         #[cfg(windows)]
-                        let matches_name = name.eq_ignore_ascii_case(&main_exe_name);
+                        let matches_name = agora_game_api::fold_path_case(name)
+                            == agora_game_api::fold_path_case(&main_exe_name);
                         #[cfg(not(windows))]
                         let matches_name = name == main_exe_name;
                         if matches_name {

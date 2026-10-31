@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{glob_match, GameDefinition, PluginListRule};
+use agora_game_api::{fold_path_case, glob_match, GameDefinition, PluginListRule};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
@@ -279,7 +279,7 @@ pub fn read_header(path: &Path) -> Result<PluginHeader, String> {
 // ---------------------------------------------------------------------------
 
 fn key(name: &str) -> String {
-    name.to_ascii_lowercase()
+    fold_path_case(name)
 }
 
 /// Whether the game declares the Creation Engine rules.
@@ -848,24 +848,24 @@ fn installed_files(
     let patterns: Vec<String> = rule
         .patterns
         .iter()
-        .map(|p| p.trim().to_ascii_lowercase())
+        .map(|p| fold_path_case(p.trim()))
         .filter(|p| !p.is_empty())
         .collect();
     let list_file = rule
         .implicit_list_file
         .as_ref()
-        .map(|p| p.as_str().to_ascii_lowercase());
+        .map(|p| fold_path_case(p.as_str()));
 
     let mut installed = Installed::new();
     let mut list_path = None;
     for file in &plan.files {
         let path = file.path.as_str();
-        if list_file.as_deref() == Some(path.to_ascii_lowercase().as_str()) {
+        if list_file.as_deref() == Some(fold_path_case(path).as_str()) {
             list_path = Some(game_deploy::source_path(ctx, &file.source));
             continue;
         }
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-        if !parent.eq_ignore_ascii_case(folder) {
+        if fold_path_case(parent) != fold_path_case(folder) {
             continue;
         }
         let lower = key(name);
@@ -1138,7 +1138,7 @@ mod tests {
             managed: false,
             locked: false,
             header_read: true,
-            master: name.to_ascii_lowercase().ends_with(".esm"),
+            master: fold_path_case(name).ends_with(".esm"),
             light: false,
             masters: masters.iter().map(|m| m.to_string()).collect(),
             header_error: None,
@@ -1639,7 +1639,7 @@ mod tests {
     fn installed_of(files: &[(&str, PathBuf)]) -> Installed {
         files
             .iter()
-            .map(|(name, path)| (name.to_ascii_lowercase(), path.clone()))
+            .map(|(name, path)| (fold_path_case(name), path.clone()))
             .collect()
     }
 

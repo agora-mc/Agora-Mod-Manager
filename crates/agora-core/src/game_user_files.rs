@@ -13,8 +13,8 @@
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    GameDefinition, GameId, GamePath, RelPath, StoreId, UserDataLocation, UserFileMapping,
-    UserFileStrategy,
+    fold_path_case, GameDefinition, GameId, GamePath, RelPath, StoreId, UserDataLocation,
+    UserFileMapping, UserFileStrategy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -163,7 +163,7 @@ pub fn resolve_rel_case_insensitive(base: &Path, rel: &str) -> PathBuf {
         if let Ok(entries) = std::fs::read_dir(&current) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
-                if name.to_string_lossy().eq_ignore_ascii_case(part) {
+                if fold_path_case(&name.to_string_lossy()) == fold_path_case(part) {
                     current.push(name);
                     matched = true;
                     break;
@@ -181,11 +181,11 @@ pub fn resolve_rel_case_insensitive(base: &Path, rel: &str) -> PathBuf {
 pub fn paths_eq_case_insensitive(a: &Path, b: &Path) -> bool {
     let a_comps: Vec<_> = a
         .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .map(|c| fold_path_case(&c.as_os_str().to_string_lossy()))
         .collect();
     let b_comps: Vec<_> = b
         .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .map(|c| fold_path_case(&c.as_os_str().to_string_lossy()))
         .collect();
     a_comps == b_comps
 }
