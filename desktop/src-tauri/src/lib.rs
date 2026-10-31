@@ -497,6 +497,7 @@ pub fn run() {
             commands::restart_app,
             commands::open_external_url,
             games::discovery::games_list,
+            games::icons::games_icon,
             games::discovery::games_discover,
             games::discovery::games_add_folder,
             games::discovery::games_remove_folder,
