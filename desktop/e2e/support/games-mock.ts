@@ -32,7 +32,8 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
   await page.addInitScript(
     ({ table, settingsKey, unmockedKey }) => {
       // The shell asks which games are turned off on every start; no rows means none are.
-      const replies: Record<string, unknown> = { games_support_list: [], ...table.replies };
+      // The game switcher asks for each game's exe icon; null means "this game has none".
+      const replies: Record<string, unknown> = { games_support_list: [], games_icon: null, ...table.replies };
       const seeded: Record<string, unknown> = { onboarding_complete: true, ...table.settings };
       const stored = JSON.parse(localStorage.getItem(settingsKey) ?? '{}') as Record<string, unknown>;
       const settings: Record<string, unknown> = { ...seeded, ...stored };

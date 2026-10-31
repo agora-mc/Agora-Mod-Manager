@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { TOUR_STEPS } from '../src/features/tour/tourModel';
+import { TOUR_STEPS, visibleTourSteps } from '../src/features/tour/tourModel';
 
 // ---------------------------------------------------------------------------
 // Types for the install call queue
@@ -987,7 +987,8 @@ test.describe('Guided install version order', () => {
   });
 
   test('one click advances one step: the destination step is shown when the right instance is already selected', async ({ page }) => {
-    const stepIndex = TOUR_STEPS.findIndex((step) => step.id === 'install-pick-instance');
+    const steps = visibleTourSteps(TOUR_STEPS, { multipleGames: false });
+    const stepIndex = steps.findIndex((step) => step.id === 'install-pick-instance');
     await page.addInitScript((index) => {
       localStorage.setItem('agora-tour', JSON.stringify({ version: 1, status: 'running', index, completed: false }));
       window.history.replaceState({ __agora: { type: 'mod-detail', itemId: 'test-mod', browseInstanceId: 'test-instance' } }, '');
@@ -1001,7 +1002,7 @@ test.describe('Guided install version order', () => {
     await page.getByRole('button', { name: /Install to Instance|Installed .*Change version/ }).click();
     const tour = page.getByRole('dialog', { name: 'Guided tour' });
     await expect(tour.getByText('Choose where it goes')).toBeVisible();
-    await expect(tour.getByText(`Step ${stepIndex + 1} of ${TOUR_STEPS.length}`)).toBeVisible();
+    await expect(tour.getByText(`Step ${stepIndex + 1} of ${steps.length}`)).toBeVisible();
     await tour.getByRole('button', { name: 'Continue' }).click();
     await expect(tour.getByText('Then pick a version')).toBeVisible();
   });

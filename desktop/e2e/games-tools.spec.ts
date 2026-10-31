@@ -139,6 +139,7 @@ async function boot(page: Page, tools: ToolsTable = {}) {
       ...BOOT_REPLIES,
       games_list: { games: [skyrim] },
       ...instanceHeaderReplies(INSTANCE_ID),
+      games_user_tools_list: { instanceId: INSTANCE_ID, tools: [] },
       games_tools_list: tools.list ?? toolsView,
       games_tools_run: tools.run ?? { status: 'finished', outcome },
       games_tools_swap_costs: tools.swapCosts ?? swapCosts,
