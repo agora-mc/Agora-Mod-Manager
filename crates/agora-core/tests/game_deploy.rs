@@ -5,13 +5,15 @@ use agora_core::ctx::CoreContext;
 use agora_core::game_base::{get_file_identity, BaseMode};
 use agora_core::game_deploy::{
     add_content, deploy, deployment_dir, move_content, plan, remove_content, set_content_enabled,
-    set_content_own_copy, undeploy, DeployError, DeployMode, DeployOutcome, FileSource, Placement,
+    set_content_own_copy, undeploy, visible_file_source, DeployError, DeployMode, DeployOutcome,
+    FileSource, Placement,
 };
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{
     create, get_manifest, prepare_launch_with_discovery, GameInstanceRecord, InstanceError,
     VfsFailure,
 };
+use agora_core::game_mod_ini;
 use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
@@ -2455,5 +2457,404 @@ fn probe_an_edited_config_copy_survives_redeploy_and_is_harvested() {
     assert_eq!(
         std::fs::read(instance_writable_dir(&ctx, &id).join("Mod/x.cfg")).unwrap(),
         b"edited by the game, longer"
+    );
+}
+
+#[test]
+fn an_instance_override_is_planned_after_the_writable_layer_and_wins() {
+    let (_tmp, ctx, def, id) = probe_fixture("OverrideAfterWritable");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[(
+            "SKSE/Plugins/SSEDisplayTweaks.ini",
+            b"[Display]
+gamma=1",
+        )],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    game_mod_ini::set_mod_ini_value(
+        &ctx,
+        &id,
+        "SKSE/Plugins/SSEDisplayTweaks.ini",
+        "Display",
+        "gamma",
+        "2",
+    )
+    .unwrap();
+    let writable = instance_writable_dir(&ctx, &id).join("SKSE/Plugins/SSEDisplayTweaks.ini");
+    std::fs::create_dir_all(writable.parent().unwrap()).unwrap();
+    std::fs::write(&writable, b"gamma=3").unwrap();
+
+    let planned = plan(&ctx, &id, &def, DeployMode::Links).unwrap();
+    let file = find(&planned, "SKSE/Plugins/SSEDisplayTweaks.ini").unwrap();
+    assert_eq!(
+        file.layer_id, "overrides",
+        "the user's copy is the last layer"
+    );
+    assert!(matches!(file.source, FileSource::Override { .. }));
+
+    deploy(&ctx, &id, &def, DeployMode::Links).unwrap();
+    let game = deployment_dir(&ctx, &id).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(game.join("SKSE/Plugins/SSEDisplayTweaks.ini")).unwrap(),
+        b"[Display]
+gamma=2"
+    );
+}
+
+#[test]
+fn reset_returns_to_the_mod_and_another_instance_is_unaffected() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let one = create_pinned_instance(&ctx, &install, &def, "OverrideOne");
+    let two = create_pinned_instance(&ctx, &install, &def, "OverrideTwo");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[(
+            "SKSE/Plugins/SSEDisplayTweaks.ini",
+            b"[Display]
+gamma=1",
+        )],
+    );
+    add_content(&ctx, &one.instance_id, &item, None, None).unwrap();
+    add_content(&ctx, &two.instance_id, &item, None, None).unwrap();
+    let store = ctx.paths.content_object_path(
+        &agora_core::content_store::get_item(&ctx, &item)
+            .unwrap()
+            .files[0]
+            .sha256,
+    );
+    let store_before = std::fs::read(&store).unwrap();
+
+    game_mod_ini::set_mod_ini_value(
+        &ctx,
+        &one.instance_id,
+        "SKSE/Plugins/SSEDisplayTweaks.ini",
+        "Display",
+        "gamma",
+        "2",
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&store).unwrap(), store_before);
+    let one_plan = plan(&ctx, &one.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&one_plan, "SKSE/Plugins/SSEDisplayTweaks.ini")
+            .unwrap()
+            .source,
+        FileSource::Override { .. }
+    ));
+    let two_plan = plan(&ctx, &two.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&two_plan, "SKSE/Plugins/SSEDisplayTweaks.ini")
+            .unwrap()
+            .source,
+        FileSource::Content { .. }
+    ));
+
+    game_mod_ini::reset_mod_ini(&ctx, &one.instance_id, "SKSE/Plugins/SSEDisplayTweaks.ini")
+        .unwrap();
+    let one_plan = plan(&ctx, &one.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&one_plan, "SKSE/Plugins/SSEDisplayTweaks.ini")
+            .unwrap()
+            .source,
+        FileSource::Content { .. }
+    ));
+    assert_eq!(std::fs::read(&store).unwrap(), store_before);
+}
+
+#[test]
+fn an_override_that_no_enabled_mod_ships_still_deploys() {
+    let (_tmp, ctx, def, id) = probe_fixture("OrphanOverride");
+    let dir = ctx
+        .paths
+        .instance_dir(&id)
+        .unwrap()
+        .join("overrides/SKSE/Plugins");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("OnlyHere.ini"), b"kept=1").unwrap();
+
+    let planned = plan(&ctx, &id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&planned, "SKSE/Plugins/OnlyHere.ini").unwrap().source,
+        FileSource::Override { .. }
+    ));
+    deploy(&ctx, &id, &def, DeployMode::Links).unwrap();
+    let game = deployment_dir(&ctx, &id).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(game.join("SKSE/Plugins/OnlyHere.ini")).unwrap(),
+        b"kept=1"
+    );
+}
+
+// Review (inis slice): deployment cases the first tests do not cover.
+
+#[test]
+fn review_every_file_the_overrides_layer_deploys_is_listed_to_the_user() {
+    let (_tmp, ctx, def, id) = probe_fixture("ReviewListedOverrides");
+    let dir = ctx
+        .paths
+        .instance_dir(&id)
+        .unwrap()
+        .join("overrides/SKSE/Plugins");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Orphan.ini"), b"k=1").unwrap();
+    std::fs::write(dir.join("Stray.txt"), b"not an ini").unwrap();
+
+    let planned = plan(&ctx, &id, &def, DeployMode::Links).unwrap();
+    assert!(
+        planned.files.iter().any(|f| f.layer_id == "overrides"),
+        "the overrides layer is planned"
+    );
+    let listed: Vec<String> = game_mod_ini::list_mod_inis(&ctx, &id)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.path.to_ascii_lowercase())
+        .collect();
+    for file in planned.files.iter().filter(|f| f.layer_id == "overrides") {
+        assert!(
+            listed.contains(&file.path.as_str().to_ascii_lowercase()),
+            "{} is deployed from overrides/ but the INI list does not show it (inis.md: nothing the user cannot see silently changes the game)",
+            file.path.as_str()
+        );
+    }
+}
+
+#[test]
+fn review_an_override_of_a_disabled_mod_still_deploys() {
+    let (_tmp, ctx, def, id) = probe_fixture("ReviewDisabledOverride");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"[Display]\ngamma=1")],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    game_mod_ini::set_mod_ini_value(
+        &ctx,
+        &id,
+        "SKSE/Plugins/SSEDisplayTweaks.ini",
+        "Display",
+        "gamma",
+        "2",
+    )
+    .unwrap();
+    set_content_enabled(&ctx, &id, &item, false).unwrap();
+
+    let planned = plan(&ctx, &id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&planned, "SKSE/Plugins/SSEDisplayTweaks.ini")
+            .unwrap()
+            .source,
+        FileSource::Override { .. }
+    ));
+    deploy(&ctx, &id, &def, DeployMode::Links).unwrap();
+    let game = deployment_dir(&ctx, &id).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(game.join("SKSE/Plugins/SSEDisplayTweaks.ini")).unwrap(),
+        b"[Display]\ngamma=2"
+    );
+    let row = game_mod_ini::list_mod_inis(&ctx, &id)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.path == "SKSE/Plugins/SSEDisplayTweaks.ini")
+        .unwrap();
+    assert!(row.overridden && !row.mod_enabled);
+}
+
+#[test]
+fn review_copies_mode_follows_an_edit_and_a_reset_on_disk() {
+    let (_tmp, ctx, def, id) = probe_fixture("ReviewCopiesReset");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"[Display]\ngamma=1")],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    let rel = "SKSE/Plugins/SSEDisplayTweaks.ini";
+
+    game_mod_ini::set_mod_ini_value(&ctx, &id, rel, "Display", "gamma", "2").unwrap();
+    deploy(&ctx, &id, &def, DeployMode::Copies).unwrap();
+    let game = deployment_dir(&ctx, &id).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(game.join(rel)).unwrap(),
+        b"[Display]\ngamma=2"
+    );
+
+    // Same length as the last edit: the game folder must still follow it.
+    game_mod_ini::set_mod_ini_value(&ctx, &id, rel, "Display", "gamma", "3").unwrap();
+    deploy(&ctx, &id, &def, DeployMode::Copies).unwrap();
+    assert_eq!(
+        std::fs::read(game.join(rel)).unwrap(),
+        b"[Display]\ngamma=3"
+    );
+
+    game_mod_ini::reset_mod_ini(&ctx, &id, rel).unwrap();
+    deploy(&ctx, &id, &def, DeployMode::Copies).unwrap();
+    assert_eq!(
+        std::fs::read(game.join(rel)).unwrap(),
+        b"[Display]\ngamma=1",
+        "after a reset the mod's file is back in the game folder"
+    );
+}
+
+#[test]
+fn review_overrides_as_a_file_is_an_error_for_the_plan_and_the_list() {
+    let (_tmp, ctx, def, id) = probe_fixture("ReviewOverridesFile");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"[Display]\ngamma=1")],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    std::fs::write(
+        ctx.paths.instance_dir(&id).unwrap().join("overrides"),
+        b"oops",
+    )
+    .unwrap();
+
+    assert!(
+        plan(&ctx, &id, &def, DeployMode::Links).is_err(),
+        "a file where the overrides folder should be is an error, not no overrides"
+    );
+    assert!(game_mod_ini::list_mod_inis(&ctx, &id).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn review_an_overrides_junction_pointing_outside_refuses_the_plan_and_the_list() {
+    let (tmp, ctx, def, id) = probe_fixture("ReviewOverridesJunction");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(outside.join("SKSE/Plugins")).unwrap();
+    std::fs::write(outside.join("SKSE/Plugins/Evil.ini"), b"k=evil").unwrap();
+    let overrides = ctx.paths.instance_dir(&id).unwrap().join("overrides");
+    junction::create(&outside, &overrides).unwrap();
+
+    assert!(plan(&ctx, &id, &def, DeployMode::Links).is_err());
+    assert!(game_mod_ini::list_mod_inis(&ctx, &id).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn review_a_junction_under_overrides_pointing_outside_is_refused_not_skipped() {
+    let (tmp, ctx, def, id) = probe_fixture("ReviewSubJunction");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[("SKSE/Plugins/Evil.ini", b"[Display]\ngamma=1")],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(outside.join("Plugins")).unwrap();
+    std::fs::write(outside.join("Plugins/Evil.ini"), b"[Display]\ngamma=evil").unwrap();
+    let overrides = ctx.paths.instance_dir(&id).unwrap().join("overrides");
+    std::fs::create_dir_all(&overrides).unwrap();
+    junction::create(&outside, overrides.join("SKSE")).unwrap();
+
+    // The write path refuses this layout (inis.md, path safety). The planner should not quietly
+    // drop the user's copy of that folder either.
+    assert!(
+        plan(&ctx, &id, &def, DeployMode::Links).is_err(),
+        "a junction under overrides/ that points outside the instance must be refused"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn review_visible_file_source_does_not_answer_with_a_file_through_an_overrides_junction() {
+    let (tmp, ctx, def, id) = probe_fixture("ReviewVisibleJunction");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(outside.join("SKSE/Plugins")).unwrap();
+    std::fs::write(outside.join("SKSE/Plugins/Evil.ini"), b"k=evil").unwrap();
+    let overrides = ctx.paths.instance_dir(&id).unwrap().join("overrides");
+    junction::create(&outside, &overrides).unwrap();
+
+    // plan() refuses this layout, so the lookup must not hand back a file that only exists
+    // through the junction.
+    let result = agora_core::game_deploy::visible_file_source(
+        &ctx,
+        &id,
+        &def,
+        DeployMode::Links,
+        "SKSE/Plugins/Evil.ini",
+    );
+    assert!(
+        result.is_err(),
+        "visible_file_source answered {result:?} for a file outside the instance"
+    );
+}
+
+// Verify only (item 5): the reviewer's finding about the writable layer and the overrides layer
+// under each strategy. This test is ignored because it documents a disagreement, not a contract.
+#[test]
+#[ignore = "finding: under Virtual the VFS upper layer (writable) beats the override in the farm, while visible_file_source answers with the override"]
+fn review_which_file_the_game_sees_when_writable_and_overrides_share_a_path() {
+    let (_tmp, ctx, def, id) = probe_fixture("ReviewWritableVsOverride");
+    let rel = "SKSE/Plugins/SSEDisplayTweaks.ini";
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[(
+            rel,
+            b"[Display]
+gamma=1",
+        )],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    game_mod_ini::set_mod_ini_value(&ctx, &id, rel, "Display", "gamma", "2").unwrap();
+
+    let writable = instance_writable_dir(&ctx, &id).join(rel);
+    std::fs::create_dir_all(writable.parent().unwrap()).unwrap();
+    std::fs::write(
+        &writable,
+        b"[Display]
+gamma=3",
+    )
+    .unwrap();
+    let override_path = ctx
+        .paths
+        .instance_dir(&id)
+        .unwrap()
+        .join("overrides")
+        .join(rel);
+
+    let seen = |mode| {
+        visible_file_source(&ctx, &id, &def, mode, rel)
+            .unwrap()
+            .unwrap()
+    };
+    let virtual_seen = seen(DeployMode::Virtual);
+    let links_seen = seen(DeployMode::Links);
+    let copies_seen = seen(DeployMode::Copies);
+
+    // What the game actually reads. Under the VFS the writable layer is the upper layer over the
+    // farm (game_instance::prepare_launch sets `upper: <instance>/writable`, `lowers: [game_dir]`),
+    // so a game-written file beats an override placed in the farm. Links and Copies place the
+    // overrides layer after the writable layer in the farm itself.
+    let vfs_game_reads = if writable.is_file() {
+        writable.clone()
+    } else {
+        virtual_seen.clone()
+    };
+    println!("virtual game reads {vfs_game_reads:?}");
+    println!("virtual lookup answers {virtual_seen:?}");
+    println!("links game/lookup answers {links_seen:?}");
+    println!("copies game/lookup answers {copies_seen:?}");
+
+    assert_eq!(
+        vfs_game_reads, writable,
+        "the VFS upper layer wins for the game"
+    );
+    assert_eq!(links_seen, override_path, "linked files read the override");
+    assert_eq!(copies_seen, override_path, "copied files read the override");
+    assert_eq!(
+        virtual_seen, vfs_game_reads,
+        "visible_file_source disagrees with the VFS about the same path"
     );
 }

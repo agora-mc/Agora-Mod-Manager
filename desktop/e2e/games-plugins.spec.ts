@@ -40,6 +40,7 @@ const BOOT_REPLIES = {
   check_all_instance_health: [],
   take_pending_cli_launch: null,
   get_governance_config: null,
+  games_mod_inis_list: [],
   plugins_enabled: false,
   list_plugins: [],
   list_plugin_contributions: [],

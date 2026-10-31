@@ -120,6 +120,11 @@ pub enum FileSource {
     Writable {
         path: PathBuf,
     },
+    /// A file in the instance's own overrides layer (`<instance>/overrides`), which is applied after
+    /// every other layer so the user's copy wins.
+    Override {
+        path: PathBuf,
+    },
     /// A file in a generated layer: the output of one tool run, kept in that generation's folder
     /// (MASTER_SPEC §26.9).
     Generated {
@@ -677,6 +682,33 @@ fn plan_inner(
         }
     }
 
+    // 4b. The instance's own overrides layer, applied after the writable layer so the user's copy
+    // of a mod's file wins (MASTER_SPEC §26.5). A missing folder means no overrides; one that
+    // exists but cannot be read is an error, never an empty layer.
+    let overrides_dir = instance_dir.join("overrides");
+    match std::fs::symlink_metadata(&overrides_dir) {
+        Ok(meta) => {
+            if is_reparse_point_or_symlink(&meta) {
+                return Err(DeployError::Other(format!(
+                    "refusing to deploy {}: a symlink or junction under overrides/ is not allowed",
+                    overrides_dir.display()
+                )));
+            }
+            let mut override_files = Vec::new();
+            walk_overrides_dir(&overrides_dir, Path::new(""), &mut override_files)?;
+            if !override_files.is_empty() {
+                layers.push(LayerContribution {
+                    layer_id: "overrides".to_string(),
+                    files: override_files,
+                    own_copy: true,
+                    whiteouts: Vec::new(),
+                });
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
     // 5. Check for File-versus-Folder conflicts across layers
     // A path that is a file in one layer and a folder in another is an error naming both paths and layers.
     {
@@ -818,8 +850,10 @@ fn plan_inner(
 
     let rules = PathRules::new(definition);
     for (_key, cand) in candidates {
-        // A generated layer's files are copies in every mode, as the writable layer's are.
+        // A generated layer's files are copies in every mode, as the writable layer's are. The
+        // overrides layer is the user's own file and is always copied, never linked into the farm.
         let generated = matches!(cand.source, FileSource::Generated { .. });
+        let overridden = matches!(cand.source, FileSource::Override { .. });
         // One normalization serves both rules. The conditions are pure, so the cheap ones come first.
         let normalized = PathRules::normalized(cand.path.as_str());
         let declared = normalized
@@ -829,6 +863,7 @@ fn plan_inner(
             && !declared
             && !cand.own_copy
             && !generated
+            && !overridden
             && !matches!(cand.source, FileSource::Writable { .. })
             && cand.size <= 1024 * 1024
             && normalized
@@ -836,16 +871,16 @@ fn plan_inner(
                 .is_some_and(|n| rules.is_copy_normalized(n));
 
         let placement = match mode {
-            _ if generated => Placement::Copy,
+            _ if generated || overridden => Placement::Copy,
             DeployMode::Copies => Placement::Copy,
             DeployMode::Virtual => {
                 if cand.own_copy || declared {
                     Placement::Copy
                 } else {
                     match &cand.source {
-                        FileSource::Writable { .. } | FileSource::Generated { .. } => {
-                            Placement::Copy
-                        }
+                        FileSource::Writable { .. }
+                        | FileSource::Override { .. }
+                        | FileSource::Generated { .. } => Placement::Copy,
                         FileSource::Base { .. } => Placement::Link,
                         FileSource::Content { .. } if store_links_here => Placement::Link,
                         FileSource::Content { .. } => Placement::Copy,
@@ -860,9 +895,9 @@ fn plan_inner(
                     Placement::Copy
                 } else {
                     match &cand.source {
-                        FileSource::Writable { .. } | FileSource::Generated { .. } => {
-                            Placement::Copy
-                        }
+                        FileSource::Writable { .. }
+                        | FileSource::Override { .. }
+                        | FileSource::Generated { .. } => Placement::Copy,
                         FileSource::Base { .. } => Placement::Link,
                         FileSource::Content { .. } if store_links_here => Placement::Link,
                         FileSource::Content { .. } => Placement::Copy,
@@ -879,6 +914,12 @@ fn plan_inner(
             FileSource::Content { item_id, sha256 } => format!("content:{item_id}:{sha256}"),
             FileSource::Writable { path } => format!(
                 "writable:{}:{}:{}",
+                path.display(),
+                cand.size,
+                cand.modified_unix_ms
+            ),
+            FileSource::Override { path } => format!(
+                "override:{}:{}:{}",
                 path.display(),
                 cand.size,
                 cand.modified_unix_ms
@@ -1039,6 +1080,54 @@ fn walk_writable_dir(
     Ok(())
 }
 
+/// Every file of the instance's overrides folder. A missing folder is handled by the caller; a
+/// folder that cannot be read is an error, because dropping its files would silently change the
+/// game. Symlinks and junctions are not followed, so nothing outside the instance is deployed.
+fn walk_overrides_dir(
+    root: &Path,
+    rel: &Path,
+    out: &mut Vec<LayerFileEntry>,
+) -> Result<(), DeployError> {
+    let cur = if rel.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel)
+    };
+    for entry in std::fs::read_dir(&cur)? {
+        let entry = entry?;
+        let abs_path = entry.path();
+        let meta = std::fs::symlink_metadata(&abs_path)?;
+        if is_reparse_point_or_symlink(&meta) {
+            return Err(DeployError::Other(format!(
+                "refusing to deploy {}: a symlink or junction under overrides/ is not allowed",
+                abs_path.display()
+            )));
+        }
+        let child_rel = rel.join(entry.file_name());
+        if meta.is_dir() {
+            walk_overrides_dir(root, &child_rel, out)?;
+        } else if meta.is_file() {
+            let rel_str = child_rel.to_string_lossy().replace('\\', "/");
+            let rel_path = RelPath::new(rel_str)
+                .map_err(|e| DeployError::Other(format!("invalid path in overrides layer: {e}")))?;
+            // Only INI files are part of the overrides layer; anything else there (a temp file, a
+            // stray text file) is not deployed and is not shown to the user.
+            if !is_ini_path(rel_path.as_str()) {
+                continue;
+            }
+            out.push(LayerFileEntry {
+                path: rel_path,
+                source: FileSource::Override {
+                    path: abs_path.clone(),
+                },
+                size: meta.len(),
+                modified_unix_ms: get_modified_unix_ms(&meta),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The paths (lower-cased, `/`-separated) the VFS has recorded as deleted in `writable_dir`.
 fn read_whiteout_markers(writable_dir: &Path) -> Result<Vec<String>, DeployError> {
     fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), DeployError> {
@@ -1097,6 +1186,7 @@ pub fn source_path(ctx: &Ctx, source: &FileSource) -> PathBuf {
         FileSource::Base { path, .. } => path.clone(),
         FileSource::Content { sha256, .. } => ctx.paths.content_object_path(sha256),
         FileSource::Writable { path } => path.clone(),
+        FileSource::Override { path } => path.clone(),
         FileSource::Generated { path, .. } => path.clone(),
     }
 }
@@ -1152,6 +1242,36 @@ pub(crate) fn visible_paths_of(
     Ok(paths)
 }
 
+/// Whether a game-relative path names an INI file, matched without case.
+fn is_ini_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ini"))
+}
+
+/// Refuse a symlink or junction on the way from `root` to `target`, naming it. A component that
+/// does not exist yet cannot point anywhere and ends the walk.
+fn refuse_reparse_on_the_way(root: &Path, target: &Path) -> Result<(), DeployError> {
+    let relative = target.strip_prefix(root).unwrap_or(target);
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if is_reparse_point_or_symlink(&meta) {
+                    return Err(DeployError::Other(format!(
+                        "refusing to use {}: a symlink or junction under overrides/ is not allowed",
+                        current.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// The file on disk whose bytes the game sees at `rel` (a `/`-separated path relative to the game
 /// root, matched case-insensitively) under `mode`. The writable layer is on top, so it wins. `None`
 /// when no file the game would see has that path.
@@ -1166,6 +1286,13 @@ pub fn visible_file_source(
         .paths
         .instance_dir(instance_id)
         .map_err(|e| DeployError::Other(e.to_string()))?;
+    let overrides_root = instance_dir.join("overrides");
+    refuse_reparse_on_the_way(&instance_dir, &overrides_root)?;
+    let overrides = overrides_root.join(rel);
+    refuse_reparse_on_the_way(&instance_dir, &overrides)?;
+    if is_ini_path(rel) && overrides.is_file() {
+        return Ok(Some(overrides));
+    }
     let writable = instance_dir.join("writable").join(rel);
     if writable.is_file() {
         return Ok(Some(writable));
@@ -2487,7 +2614,10 @@ fn plan_in_place(
                         && rec.placement == Placement::Copy
                         && at_link_limit(&mut link_limit, ctx, &file.source)))
                 && file.size == rec.size
-                && !matches!(file.source, FileSource::Writable { .. })
+                && !matches!(
+                    file.source,
+                    FileSource::Writable { .. } | FileSource::Override { .. }
+                )
         });
         if same_in_plan && !harvested.differing.contains(key) {
             kept.insert(key.clone(), rec.clone());

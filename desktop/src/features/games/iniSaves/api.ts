@@ -10,7 +10,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { isGamesError } from '../shared/types';
 
 /** Where the text of an INI file came from: the instance's copy, the game's own file, or nothing. */
-export type IniSourceName = 'copy' | 'game_file' | 'nothing';
+export type IniSourceName = 'copy' | 'game_file' | 'nothing' | 'override' | 'mod';
 
 export interface IniFileRow {
   /** The file's name inside the instance, as the game names it (for example `Skyrim.ini`). */
@@ -44,6 +44,22 @@ export interface IniChange {
   changed: boolean;
   view: IniView;
 }
+
+export interface ModIniRow {
+  /** The path inside the game folder, with forward slashes. */
+  path: string;
+  /** The content item's id. Empty for an override that no mod ships any more. */
+  modId: string;
+  /** The mod's name. Empty for an override that no mod ships any more. */
+  modName: string;
+  /** Whether the instance has its own copy in `overrides/`. */
+  overridden: boolean;
+  /** A later enabled mod that ships the same path, when one explains the file. */
+  shadowedBy: string | null;
+  /** False when the mod is turned off, or no mod ships the file any more. */
+  modEnabled: boolean;
+}
+
 
 export type SaveChoice = 'own' | 'shared';
 
@@ -89,12 +105,24 @@ function isNullableString(value: unknown): value is string | null {
 }
 
 function isIniSource(value: unknown): value is IniSourceName {
-  return value === 'copy' || value === 'game_file' || value === 'nothing';
+  return value === 'copy' || value === 'game_file' || value === 'nothing'
+    || value === 'override' || value === 'mod';
 }
 
 function isSaveChoice(value: unknown): value is SaveChoice {
   return value === 'own' || value === 'shared';
 }
+
+function isModIniRow(value: unknown): value is ModIniRow {
+  return isObject(value)
+    && typeof value.path === 'string'
+    && typeof value.modId === 'string'
+    && typeof value.modName === 'string'
+    && typeof value.overridden === 'boolean'
+    && isNullableString(value.shadowedBy)
+    && typeof value.modEnabled === 'boolean';
+}
+
 
 function isIniFileRow(value: unknown): value is IniFileRow {
   return isObject(value)
@@ -207,4 +235,43 @@ export async function getSaves(instanceId: string): Promise<SavesView> {
 export async function setSaves(instanceId: string, choice: SaveChoice): Promise<SavesChange> {
   const reply = await invoke<unknown>('games_saves_set', { instanceId, choice });
   return checkedReply('games_saves_set', reply, isSavesChange);
+}
+
+/** The INI files the instance's enabled mods ship, with the instance's own overrides listed too. */
+export async function listModInis(instanceId: string): Promise<ModIniRow[]> {
+  const reply = await invoke<unknown>('games_mod_inis_list', { instanceId });
+  if (!Array.isArray(reply) || !reply.every(isModIniRow)) {
+    throw new Error('games_mod_inis_list did not return the expected mod INI data.');
+  }
+  return reply;
+}
+
+/** One mod INI file's keys: the instance's copy when it has one, otherwise the mod's file. */
+export async function getModIni(instanceId: string, path: string): Promise<IniContents> {
+  const reply = await invoke<unknown>('games_mod_ini_get', { instanceId, path });
+  return checkedReply('games_mod_ini_get', reply, isIniContents);
+}
+
+/**
+ * Set a key in the instance's copy of a mod INI file. A `null` value removes the key. The first
+ * edit makes the copy from the mod's file; the stored mod is never changed.
+ */
+export async function setModIniValue(
+  instanceId: string,
+  path: string,
+  section: string,
+  key: string,
+  value: string | null,
+): Promise<IniContents> {
+  const reply = await invoke<unknown>('games_mod_ini_set', { instanceId, path, section, key, value });
+  return checkedReply('games_mod_ini_set', reply, isIniContents);
+}
+
+/** Remove the instance's copy of a mod INI file, so the mod's own file is used again. */
+export async function resetModIni(instanceId: string, path: string): Promise<ModIniRow[]> {
+  const reply = await invoke<unknown>('games_mod_ini_reset', { instanceId, path });
+  if (!Array.isArray(reply) || !reply.every(isModIniRow)) {
+    throw new Error('games_mod_ini_reset did not return the expected mod INI data.');
+  }
+  return reply;
 }
