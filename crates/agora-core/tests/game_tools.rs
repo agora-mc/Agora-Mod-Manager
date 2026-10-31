@@ -190,6 +190,7 @@ fn plugin_rule() -> PluginListRule {
         semantics: None,
         implicit: Vec::new(),
         implicit_list_file: None,
+        loot: None,
     }
 }
 

@@ -29,6 +29,9 @@ pub const CREATION_ENGINE: &str = "creation_engine";
 pub const FULL_PLUGIN_LIMIT: usize = 254;
 /// The engine loads at most this many light plugins (`.esl` or the light flag).
 pub const LIGHT_PLUGIN_LIMIT: usize = 4096;
+/// What a sort says when it could not use LOOT's masterlist.
+pub const MASTERS_ONLY_MESSAGE: &str =
+    "Sorted by masters only. Download LOOT's masterlist for a full sort.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadOrderError {
@@ -64,6 +67,21 @@ pub enum LoadOrderError {
     NoRoom { plugin: String, target: String },
     #[error("sort did not settle after {0} moves; nothing was written")]
     DidNotSettle(usize),
+    #[error("game '{0}' names no LOOT masterlist, so this game cannot use one")]
+    NoLootMasterlist(String),
+    #[error("cannot use the LOOT masterlist: {reason}")]
+    Masterlist { reason: String },
+    #[error("cannot download {url}: {reason}")]
+    MasterlistDownload { url: String, reason: String },
+    #[error("the {path} Git blob for {repo} is {actual}, but GitHub reported {expected}; the download was refused and the saved masterlist was left alone")]
+    MasterlistHash {
+        repo: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("LOOT could not sort the plugins: {reason}")]
+    Loot { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +124,26 @@ pub struct LoadOrder {
     pub exists: bool,
     pub entries: Vec<LoadOrderEntry>,
     pub findings: Vec<Finding>,
+    /// What LOOT's masterlist says about these plugins. Empty when no masterlist is cached.
+    #[serde(default)]
+    pub notes: Vec<PluginNote>,
+}
+
+/// How important a LOOT masterlist message is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteLevel {
+    Error,
+    Warn,
+    Info,
+}
+
+/// One thing LOOT's masterlist says about a plugin. Plain text, never markup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginNote {
+    pub plugin: String,
+    pub level: NoteLevel,
+    pub message: String,
 }
 
 /// A problem with the order that the game's rules name.
@@ -223,6 +261,20 @@ pub struct SortReport {
     pub blocked: Vec<Blocked>,
     /// Whether the moves were written to the instance's list (false for a dry run).
     pub written: bool,
+    /// What ordered the free plugins: LOOT's masterlist, or only their masters.
+    pub mode: SortMode,
+    /// A sentence for the user when the full sort could not run.
+    pub message: Option<String>,
+}
+
+/// What a sort used to order the free plugins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortMode {
+    /// LOOT's cached masterlist ordered the free plugins.
+    Loot,
+    /// Only the plugins' own masters were used.
+    Masters,
 }
 
 /// Where `move` puts a plugin. Positions are 1-based and count the always-loaded plugins too.
@@ -379,6 +431,7 @@ pub fn build_order(
         exists,
         entries,
         findings,
+        notes: Vec::new(),
     }
 }
 
@@ -673,6 +726,12 @@ pub fn sort_entries(
         });
     }
 
+    let blocked = blocked_of(entries, &fixed);
+    Ok((moves, blocked))
+}
+
+/// The plugins that still load above a master after a sort, because neither can move.
+fn blocked_of(entries: &[LoadOrderEntry], fixed: &Fixed) -> Vec<Blocked> {
     let mut blocked: Vec<Blocked> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for (at, dependent) in entries.iter().enumerate() {
@@ -697,7 +756,55 @@ pub fn sort_entries(
             }
         }
     }
-    Ok((moves, blocked))
+    blocked
+}
+
+/// Reorder the free entries into libloot's relative order, leaving fixed entries (always loaded,
+/// locked, or part of a master loop) exactly where they are. Every free position receives the next
+/// free plugin in libloot's order. Returns the moves that changed a plugin's position.
+fn apply_loot_order(
+    entries: &mut [LoadOrderEntry],
+    desired: &[String],
+) -> Result<Vec<SortMove>, LoadOrderError> {
+    let fixed = Fixed::of(entries);
+    let free_slots = free_slots_of(entries, |e| fixed.fixed(e));
+    let mut wanted: HashMap<String, usize> = HashMap::new();
+    for (index, name) in desired.iter().enumerate() {
+        wanted.insert(key(name), index);
+    }
+
+    let mut free: Vec<(usize, LoadOrderEntry)> = free_slots
+        .iter()
+        .map(|&slot| (slot, entries[slot].clone()))
+        .collect();
+    let before: HashMap<String, usize> = free
+        .iter()
+        .map(|(slot, entry)| (key(&entry.name), *slot))
+        .collect();
+    free.sort_by_key(|(slot, entry)| {
+        (
+            wanted.get(&key(&entry.name)).copied().unwrap_or(usize::MAX),
+            *slot,
+        )
+    });
+
+    for (slot, entry) in free_slots.iter().zip(free.iter()) {
+        entries[*slot] = entry.1.clone();
+    }
+
+    let mut moves = Vec::new();
+    for slot in &free_slots {
+        let entry = &entries[*slot];
+        let from = before[&key(&entry.name)];
+        if from != *slot {
+            moves.push(SortMove {
+                plugin: entry.name.clone(),
+                from: from + 1,
+                to: slot + 1,
+            });
+        }
+    }
+    Ok(moves)
 }
 
 /// Move a listed plugin to a position, or before or after another plugin. Returns the plugin's
@@ -1031,19 +1138,69 @@ fn sort_inner(
         )
         .map_err(PluginListError::from)?;
     let links = plan_for_order(ctx, instance_id, definition)?;
-    let mut entries = order_of_with_view(ctx, instance_id, definition, links.as_ref())?.entries;
-    let (moves, blocked) = sort_entries(&mut entries)?;
+    let listed = game_plugins::list(ctx, instance_id, definition)?;
+    let (installed, names) = installed_files(ctx, instance_id, definition, rule, links.as_ref())?;
+    let mut entries = build_order(
+        rule,
+        &listed.entries,
+        Some(&installed),
+        &names,
+        listed.exists,
+    )
+    .entries;
+
+    let mut counted: HashMap<String, usize> = HashMap::new();
+    let mut duplicated = false;
+    for entry in entries.iter().filter(|entry| !entry.implicit) {
+        let count = counted.entry(key(&entry.name)).or_insert(0);
+        *count += 1;
+        duplicated |= *count > 1;
+    }
+    let unreadable = entries
+        .iter()
+        .any(|entry| entry.present && entry.header_error.is_some());
+
+    let mut notes = Vec::new();
+    let mut mode = SortMode::Masters;
+    let mut message = None;
+    let (moves, blocked) = match &rule.loot {
+        Some(loot) if !duplicated && !unreadable => {
+            match crate::loot_masterlist::cached(ctx, definition)? {
+                Some(cached) => {
+                    let outcome = crate::loot_masterlist::sort_and_notes(
+                        &entries, &installed, loot, &cached,
+                    )?;
+                    let moves = apply_loot_order(&mut entries, &outcome.order)?;
+                    notes = outcome.notes;
+                    let fixed = Fixed::of(&entries);
+                    let blocked = blocked_of(&entries, &fixed);
+                    mode = SortMode::Loot;
+                    (moves, blocked)
+                }
+                None => {
+                    message = Some(MASTERS_ONLY_MESSAGE.to_string());
+                    sort_entries(&mut entries)?
+                }
+            }
+        }
+        Some(_) => {
+            message = Some(
+                "A plugin is listed twice or its header cannot be read, so LOOT cannot sort it.                  Sorted by masters only."
+                    .to_string(),
+            );
+            sort_entries(&mut entries)?
+        }
+        None => sort_entries(&mut entries)?,
+    };
+
     let written = !dry_run && !moves.is_empty();
     if written {
         write_entries(ctx, instance_id, definition, &entries)?;
     }
     let order = if want_order {
-        Some(order_of_with_view(
-            ctx,
-            instance_id,
-            definition,
-            links.as_ref(),
-        )?)
+        let mut order = order_of_with_view(ctx, instance_id, definition, links.as_ref())?;
+        order.notes = notes;
+        Some(order)
     } else {
         None
     };
@@ -1052,6 +1209,8 @@ fn sort_inner(
             moves,
             blocked,
             written,
+            mode,
+            message,
         },
         order,
     ))
@@ -1662,6 +1821,7 @@ mod tests {
             semantics: Some(CREATION_ENGINE.into()),
             implicit: vec!["Skyrim.esm".into(), "Dawnguard.esm".into()],
             implicit_list_file: Some(agora_game_api::RelPath::new("Skyrim.ccc").unwrap()),
+            loot: None,
         }
     }
 
@@ -1738,5 +1898,48 @@ mod tests {
         assert!(!order.engine);
         assert!(order.entries.iter().all(|e| !e.header_read && e.present));
         assert!(order.findings.is_empty());
+    }
+    #[test]
+    fn loot_order_maps_onto_free_slots_and_leaves_fixed_ones() {
+        let mut list = vec![
+            implicit("Skyrim.esm"),
+            entry("A.esp", &[]),
+            locked("L.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        // libloot's relative order of every plugin; the fixed entries are ignored in their slots.
+        let desired = vec![
+            "C.esp".to_string(),
+            "B.esp".to_string(),
+            "A.esp".to_string(),
+            "L.esp".to_string(),
+            "Skyrim.esm".to_string(),
+        ];
+        let moves = apply_loot_order(&mut list, &desired).unwrap();
+        assert_eq!(
+            names(&list),
+            ["Skyrim.esm", "C.esp", "L.esp", "B.esp", "A.esp"]
+        );
+        assert!(list[0].implicit && list[2].locked);
+        assert_eq!(
+            moves.iter().map(|m| m.plugin.as_str()).collect::<Vec<_>>(),
+            ["C.esp", "A.esp"]
+        );
+        // The same desired order second time moves nothing.
+        assert!(apply_loot_order(&mut list, &desired).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_or_single_plugin_list_sorts_to_itself() {
+        let mut empty: Vec<LoadOrderEntry> = Vec::new();
+        let (moves, blocked) = sort_entries(&mut empty).unwrap();
+        assert!(moves.is_empty() && blocked.is_empty());
+        assert!(empty.is_empty());
+
+        let mut single = vec![entry("Only.esp", &[])];
+        let (moves, blocked) = sort_entries(&mut single).unwrap();
+        assert!(moves.is_empty() && blocked.is_empty());
+        assert_eq!(names(&single), ["Only.esp"]);
     }
 }

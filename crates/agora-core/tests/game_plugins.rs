@@ -16,15 +16,15 @@ use agora_core::game_instance::{
 };
 use agora_core::game_launch::LaunchError;
 use agora_core::game_launch::SystemLauncher;
-use agora_core::game_load_order::{self, LoadOrderError, MoveTarget};
+use agora_core::game_load_order::{self, LoadOrderError, MoveTarget, SortMode};
 use agora_core::game_plugins::{list, set_active, set_locked, PluginListError};
 use agora_core::game_registry::{
     GameRegistry, GameRegistryError, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
-    LaunchAlternative, LaunchRecipe, PackageDefinition, PluginListRule, RelPath, RuntimeIdentity,
-    StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
+    LaunchAlternative, LaunchRecipe, LootRule, PackageDefinition, PluginListRule, RelPath,
+    RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -79,6 +79,7 @@ fn plugin_rule() -> PluginListRule {
         semantics: None,
         implicit: Vec::new(),
         implicit_list_file: None,
+        loot: None,
     }
 }
 
@@ -1430,4 +1431,27 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
         limit: 254,
     }];
     assert!(refuse_load_order(full, false).is_err());
+}
+
+#[test]
+fn with_no_masterlist_sort_says_it_used_masters_only() {
+    let mut def = definition();
+    let rule = def.plugin_list.as_mut().unwrap();
+    rule.semantics = Some("creation_engine".into());
+    rule.loot = Some(LootRule {
+        masterlist_repo: "loot/skyrimse".into(),
+        prelude_repo: None,
+        branch: "v0.29".into(),
+        game_type: "SkyrimSE".into(),
+    });
+    let h = Harness::with_definition(def);
+    let inst = h.instance("no-masterlist");
+    h.deploy(&inst);
+    let (report, _order) =
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, true).unwrap();
+    assert_eq!(report.mode, SortMode::Masters);
+    assert_eq!(
+        report.message.as_deref(),
+        Some(game_load_order::MASTERS_ONLY_MESSAGE)
+    );
 }

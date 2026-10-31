@@ -211,7 +211,8 @@ classified as a base game, add-on or tool (MASTER_SPEC §26.3), and manages pinn
 | `agora games instance plugins <instance> [--json]` | List the instance's load order: each plugin's position, state, master (`M`) and light (`L`) flags, lock, whether Agora manages it (a content layer deploys it) or you wrote the line, and the findings. Always-loaded plugins are marked `always` |
 | `agora games instance plugins enable <instance> <plugin>` | Activate a plugin in the instance's plugin list |
 | `agora games instance plugins disable <instance> <plugin>` | Deactivate a plugin; it stays listed and a redeploy leaves it that way |
-| `agora games instance plugins sort <instance> [--dry-run]` | Sort the list so every master comes before the plugins that need it, with as few moves as possible. Locked plugins do not move; `--dry-run` prints the moves and writes nothing |
+| `agora games instance plugins sort <instance> [--dry-run]` | Sort the list with LOOT's masterlist when one is saved, otherwise by masters alone. Locked and always-loaded plugins do not move, and free plugins only trade places among free slots; `--dry-run` prints the moves and writes nothing. With no saved masterlist it says it sorted by masters only |
+| `agora games instance plugins masterlist <instance>` | Download and verify LOOT's masterlist for the game (through GitHub, checked against the git blob SHA-1). Nothing is downloaded unless you run this, and a failed check leaves the saved copy alone |
 | `agora games instance plugins move <instance> <plugin> (--to N \| --before P \| --after P)` | Move a plugin to a 1-based position, or just before or after another plugin. Locked plugins do not move |
 | `agora games instance plugins lock <instance> <plugin>` | Lock a plugin's place, so sort and move leave it where it is |
 | `agora games instance plugins unlock <instance> <plugin>` | Unlock a plugin's place |
@@ -242,9 +243,12 @@ For Skyrim Special Edition the list also follows the Creation Engine's load orde
 game always loads its own masters and the Creation Club plugins named in `Skyrim.ccc` first, so
 those are shown as `always` and are never written into your list. A plugin that needs a master
 must load after it, and a plugin whose header cannot be read is reported by name. `plugins check`
-prints these findings. `plugins sort` moves masters up with as few moves as it can, and never
-moves a locked plugin. A plugin that loads above a locked master it cannot get past is reported as
-blocked: the only fix is to move that plugin down below the master, which sort does not do.
+prints these findings. `plugins sort` uses LOOT's masterlist when one is saved, otherwise it moves
+masters up with as few moves as it can. Either way it never moves a locked or always-loaded
+plugin, and free plugins only trade places among free slots. A plugin that loads above a locked
+master it cannot get past is reported as blocked: the only fix is to move that plugin down below
+the master, which sort does not do. `plugins masterlist` downloads the masterlist, and only when
+you ask for it.
 
 ### Catalog
 

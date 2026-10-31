@@ -448,6 +448,27 @@ pub struct PluginListRule {
     /// the file's order. Each loads after `implicit`, and only when present in the plugin folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_list_file: Option<RelPath>,
+    /// LOOT masterlist sources for this game, so sorting can use LOOT's rules. The repository
+    /// slug, branch and LOOT game name are package data: a game package supplies its own, and
+    /// core never hardcodes a game's repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loot: Option<LootRule>,
+}
+
+/// Where a game's LOOT masterlist comes from (MASTER_SPEC §26.6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LootRule {
+    /// The masterlist repository in `owner/repo` form, e.g. `loot/skyrimse`.
+    pub masterlist_repo: String,
+    /// The shared prelude repository in `owner/repo` form, when the masterlist uses one, e.g.
+    /// `loot/prelude`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelude_repo: Option<String>,
+    /// The branch of the masterlist repository that the bundled libloot version expects,
+    /// e.g. `v0.29`. Kept as data so a different libloot only changes a game package.
+    pub branch: String,
+    /// The game name libloot knows it by (`SkyrimSE`, `Fallout4`, ...).
+    pub game_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

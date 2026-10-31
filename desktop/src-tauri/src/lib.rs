@@ -528,6 +528,7 @@ pub fn run() {
             games::plugins::games_plugins_set_locked,
             games::plugins::games_plugins_move,
             games::plugins::games_plugins_sort,
+            games::plugins::games_plugins_update_masterlist,
             games::plugins::games_plugins_check,
             games::ini_saves::games_ini_get,
             games::ini_saves::games_ini_set,
