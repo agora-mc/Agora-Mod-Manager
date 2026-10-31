@@ -942,7 +942,10 @@ function AppContent() {
           onSuccess={handleControlifyInstallSuccess}
         />
       )}
-      <TourProvider onStart={handleTourStart}>
+      <TourProvider
+        onStart={handleTourStart}
+        conditions={{ multipleGames: gameShell.switcherVisible }}
+      >
       <AmbienceProvider>
       <AmbienceEnabledBridge onChange={setAmbienceEnabled} />
       <QueuedTourStarter />

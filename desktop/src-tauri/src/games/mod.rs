@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod dto;
 pub mod error;
 pub mod fomod;
+pub mod icons;
 pub mod import;
 pub mod ini_saves;
 pub mod instances;
