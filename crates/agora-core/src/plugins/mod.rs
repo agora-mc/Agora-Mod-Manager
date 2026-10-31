@@ -40,6 +40,7 @@ pub mod dispatch;
 pub mod events;
 pub mod install;
 pub mod logs;
+pub mod official;
 pub mod registry;
 pub mod service;
 pub mod store;
@@ -50,6 +51,10 @@ pub use events::{EventSubscriptions, PluginEventBus};
 pub use install::{
     added_capabilities, CapabilityDescription, ExistingInstall, InstallPreview, KeyFingerprint,
     UpdateSourceSummary,
+};
+pub use official::{
+    OfficialCatalog, OfficialEntry, OfficialInstallState, OfficialPluginInfo, OfficialPluginList,
+    OfficialStatus, PackageFetcher, RegistryTrust,
 };
 pub use registry::{NamespacedContribution, PluginStatus, Resolution};
 pub use service::{

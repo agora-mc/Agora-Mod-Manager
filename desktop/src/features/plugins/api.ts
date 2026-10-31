@@ -12,6 +12,7 @@ import type {
   InstallPreview,
   LaunchCheckOutcome,
   NamespacedContribution,
+  OfficialPluginList,
   PluginStartFailure,
   PluginSummary,
   RepairOutcome,
@@ -45,6 +46,18 @@ export const checkPluginUpdate = (pluginId: string) =>
 
 export const applyPluginUpdate = (pluginId: string, acceptCapabilities: boolean) =>
   invoke<UpdateOutcome | null>('plugin_apply_update', { pluginId, acceptCapabilities });
+
+/** The official plugins the signed catalog offers; empty with a reason when it cannot be verified. */
+export const listOfficialPlugins = () => invoke<OfficialPluginList>('list_official_plugins');
+
+export const installOfficialPlugin = (pluginId: string, acceptCapabilities: boolean) =>
+  invoke<UpdateOutcome>('install_official_plugin', { pluginId, acceptCapabilities });
+
+export const updateOfficialPlugin = (pluginId: string, acceptCapabilities: boolean) =>
+  invoke<UpdateOutcome>('update_official_plugin', { pluginId, acceptCapabilities });
+
+export const rollbackOfficialPlugin = (pluginId: string, acceptCapabilities: boolean) =>
+  invoke<UpdateOutcome>('rollback_official_plugin', { pluginId, acceptCapabilities });
 
 export const addPluginDevelopmentFolder = (path: string, acceptCapabilities: boolean) =>
   invoke<PluginSummary>('add_plugin_development_folder', { path, acceptCapabilities });

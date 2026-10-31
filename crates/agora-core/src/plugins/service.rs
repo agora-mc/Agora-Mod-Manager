@@ -105,6 +105,9 @@ pub struct PluginSummary {
     pub restorable_data: Option<store::CheckpointSummary>,
     /// Events this plugin missed because it could not keep up.
     pub dropped_events: u64,
+    /// Whether this plugin is currently verified as an official plugin, from
+    /// the signed registry. Never read from the manifest.
+    pub official: super::official::OfficialStatus,
 }
 
 /// The outcome of the most recent update check, for display.
@@ -255,13 +258,16 @@ impl LaunchCheckOutcome {
 // Shared state
 // ---------------------------------------------------------------------------
 
-struct Inner {
-    ctx: Ctx,
+pub(super) struct Inner {
+    pub(super) ctx: Ctx,
     host: Arc<dyn ScriptHost>,
     ui: Arc<dyn PluginUiSink>,
     subscriptions: EventSubscriptions,
     resolution: RwLock<Resolution>,
     logs_root: PathBuf,
+    /// The key the registry must be signed with for a plugin to count as
+    /// official. The compiled-in key everywhere except tests.
+    pub(super) registry_trust: super::official::RegistryTrust,
 }
 
 impl Inner {
@@ -273,7 +279,7 @@ impl Inner {
             .map(|resolved| resolved.record.clone())
     }
 
-    fn conn(&self) -> LauncherResult<rusqlite::Connection> {
+    pub(super) fn conn(&self) -> LauncherResult<rusqlite::Connection> {
         crate::db::local_state_connection(&self.ctx.paths.local_state_db()).map_err(|e| {
             LauncherError::Generic {
                 code: "ERR_LOCAL_STATE_FAILED".into(),
@@ -346,12 +352,23 @@ pub struct PluginContentProvider {
 /// Core-owned plugin management and execution.
 #[derive(Clone)]
 pub struct PluginService {
-    inner: Arc<Inner>,
+    pub(super) inner: Arc<Inner>,
     bus: PluginEventBus,
 }
 
 impl PluginService {
     pub fn new(ctx: Ctx, host: Arc<dyn ScriptHost>, ui: Arc<dyn PluginUiSink>) -> Self {
+        Self::new_with_registry_trust(ctx, host, ui, super::official::RegistryTrust::production())
+    }
+
+    /// [`Self::new`] with an explicit registry key. Test support: production
+    /// adapters call `new`, which trusts only the key compiled into the app.
+    pub fn new_with_registry_trust(
+        ctx: Ctx,
+        host: Arc<dyn ScriptHost>,
+        ui: Arc<dyn PluginUiSink>,
+        registry_trust: super::official::RegistryTrust,
+    ) -> Self {
         let subscriptions = EventSubscriptions::new();
         let logs_root = ctx.paths.plugin_logs_root();
         let inner = Arc::new(Inner {
@@ -361,6 +378,7 @@ impl PluginService {
             subscriptions: subscriptions.clone(),
             resolution: RwLock::new(Resolution::default()),
             logs_root,
+            registry_trust,
         });
         Self {
             bus: PluginEventBus::new(subscriptions, host),
@@ -416,6 +434,7 @@ impl PluginService {
         // per row for information that changes only on install or check.
         let (trust, checks) = self.trust_for_display();
         let checkpoints = self.checkpoints_for_display();
+        let official = self.official_statuses_for_display();
         resolution
             .plugins
             .iter()
@@ -454,6 +473,10 @@ impl PluginService {
                     last_update_check: checks.get(id.as_str()).cloned(),
                     restorable_data: checkpoints.get(id.as_str()).cloned(),
                     dropped_events: self.bus.dropped_count(&id),
+                    official: official
+                        .get(id.as_str())
+                        .cloned()
+                        .unwrap_or(super::official::OfficialStatus::Community),
                 }
             })
             .collect()
@@ -2118,7 +2141,7 @@ impl PluginService {
             })
     }
 
-    fn summary(&self, plugin_id: &PluginId) -> LauncherResult<PluginSummary> {
+    pub(super) fn summary(&self, plugin_id: &PluginId) -> LauncherResult<PluginSummary> {
         self.list()
             .into_iter()
             .find(|summary| summary.id == plugin_id.as_str())

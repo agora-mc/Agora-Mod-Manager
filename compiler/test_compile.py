@@ -2161,5 +2161,185 @@ class TestNormalizeCuratorWarning(unittest.TestCase):
         )
 
 
+class OfficialPluginTests(unittest.TestCase):
+    """registry/official-plugins/<id>.json compiles into the official_plugins table, and every
+    malformed entry stops the compile with a message naming the file and the field."""
+
+    EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "official-plugins" / "acme.fixture.json"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = self.tmp / "registry"
+        self.registry.mkdir()
+        patches = [
+            mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
+            mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_modrinth_versions", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_version_changelogs", lambda items: []),
+            mock.patch.object(_compile, "_load_github_token", lambda: None),
+            mock.patch.object(
+                _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def entry(self):
+        return json.loads(self.EXAMPLE.read_text(encoding="utf-8"))
+
+    def write(self, data, name=None):
+        path = self.registry / "official-plugins" / (name or f"{data['id']}.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def compile(self):
+        out = self.tmp / "out" / "registry.db"
+        _compile.compile_registry(out, skip_sign=True, no_governance_write=True, governance_mode_str="off")
+        return out
+
+    def rows(self, out):
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM official_plugins ORDER BY version")]
+        finally:
+            conn.close()
+
+    def assertRefused(self, *needles):
+        with self.assertRaises(SystemExit) as caught:
+            self.compile()
+        message = str(caught.exception.code)
+        for needle in needles:
+            self.assertIn(needle, message)
+
+    def test_the_example_entry_compiles_to_a_current_and_a_previous_row(self):
+        self.write(self.entry())
+        rows = self.rows(self.compile())
+        self.assertEqual([r["version"] for r in rows], ["1.0.0", "1.1.0"])
+        by_version = {r["version"]: r for r in rows}
+        self.assertEqual(by_version["1.1.0"]["channel"], "current")
+        self.assertEqual(by_version["1.0.0"]["channel"], "previous")
+        current = by_version["1.1.0"]
+        self.assertEqual(current["plugin_id"], "acme.fixture")
+        self.assertEqual(current["name"], "Acme Fixture")
+        self.assertEqual(json.loads(current["game_ids_json"]), ["fixture-game"])
+        self.assertEqual(current["package_url"], "https://plugins.example.org/acme.fixture-1.1.0.zip")
+        self.assertEqual(current["package_sha256"], "1" * 64)
+        self.assertEqual(current["package_size"], 4096)
+        self.assertEqual(current["min_agora_version"], "0.1.0")
+
+    def test_the_schema_version_is_unchanged_so_older_clients_still_read_the_registry(self):
+        self.write(self.entry())
+        out = self.compile()
+        conn = sqlite3.connect(str(out))
+        try:
+            version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            conn.close()
+        self.assertEqual(version, 9)
+        # Everything an older client reads is still there; the new table is purely additive.
+        self.assertIn("registry_items", tables)
+        self.assertIn("game_catalog_items", tables)
+        self.assertIn("official_plugins", tables)
+
+    def test_no_official_plugins_folder_compiles_to_an_empty_table(self):
+        self.assertEqual(self.rows(self.compile()), [])
+
+    def test_previous_is_optional(self):
+        data = self.entry()
+        del data["previous"]
+        self.write(data)
+        self.assertEqual([r["channel"] for r in self.rows(self.compile())], ["current"])
+
+    def test_a_non_https_url_is_refused(self):
+        for bad in [
+            "http://plugins.example.org/a.zip",
+            "ftp://plugins.example.org/a.zip",
+            "https://user:pw@plugins.example.org/a.zip",
+            "https://plugins.example.org:8443/a.zip",
+            "plugins.example.org/a.zip",
+            "https://",
+            "https://plugins.example.org/a b.zip",
+            "",
+        ]:
+            with self.subTest(url=bad):
+                data = self.entry()
+                data["current"]["package_url"] = bad
+                self.write(data)
+                self.assertRefused("current.package_url", "acme.fixture.json")
+
+    def test_a_malformed_hash_is_refused(self):
+        for bad in ["", "abc", "1" * 63, "1" * 65, "G" * 64, "A" * 64, None, 5]:
+            with self.subTest(sha256=bad):
+                data = self.entry()
+                data["previous"]["sha256"] = bad
+                self.write(data)
+                self.assertRefused("previous.sha256")
+
+    def test_a_bad_size_is_refused(self):
+        for bad in [0, -1, 64 * 1024 * 1024 + 1, 1.5, "10", True, None]:
+            with self.subTest(size=bad):
+                data = self.entry()
+                data["current"]["size"] = bad
+                self.write(data)
+                self.assertRefused("current.size")
+
+    def test_ids_must_be_lowercase_publisher_dot_plugin_and_match_the_file(self):
+        for bad in ["", "acme", "Acme.Fixture", "acme.fixture ", "../x.y", "acme..fixture", "-a.b", "a.b-"]:
+            with self.subTest(id=bad):
+                data = self.entry()
+                data["id"] = bad
+                self.write(data, name="acme.fixture.json")
+                self.assertRefused("id must be")
+        data = self.entry()
+        data["id"] = "acme.other"
+        self.write(data, name="acme.fixture.json")
+        self.assertRefused("file name must be the plugin id")
+
+    def test_versions_must_be_semver_and_previous_must_differ(self):
+        data = self.entry()
+        data["current"]["version"] = "latest"
+        self.write(data)
+        self.assertRefused("current.version")
+        data = self.entry()
+        data["previous"]["version"] = data["current"]["version"]
+        self.write(data)
+        self.assertRefused("previous must be a different version")
+        data = self.entry()
+        data["min_agora_version"] = "newest"
+        self.write(data)
+        self.assertRefused("min_agora_version")
+
+    def test_unknown_missing_and_stray_fields_are_refused(self):
+        data = self.entry()
+        data["official"] = True
+        self.write(data)
+        self.assertRefused("unknown field", "official")
+        data = self.entry()
+        del data["current"]["size"]
+        self.write(data)
+        self.assertRefused("missing", "size")
+        self.write(self.entry())
+        (self.registry / "official-plugins" / "notes.txt").write_text("x", encoding="utf-8")
+        self.assertRefused("official-plugins/<plugin-id>.json")
+
+    def test_a_malformed_file_is_refused_not_skipped(self):
+        path = self.registry / "official-plugins" / "acme.fixture.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{ not json", encoding="utf-8")
+        self.assertRefused("acme.fixture.json", "cannot read")
+
+    def test_archived_entries_are_skipped_like_everywhere_else(self):
+        data = self.entry()
+        path = self.registry / "official-plugins" / "archived" / "acme.fixture.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.rows(self.compile()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -249,7 +249,99 @@ pub fn upsert(
         ],
     )
     .map_err(db_error)?;
+    // Whatever replaced the files, it was not the official installer, which
+    // records its provenance only after this call returns. Leaving the old row
+    // would let a different package inherit the previous one's standing.
+    clear_official(conn, &manifest.id)?;
     Ok(())
+}
+
+/// Where an installed plugin came from, when it came from a signed registry
+/// entry: the entry that was matched, the package hash that entry pinned, and a
+/// digest of the files as they were written, so a later edit is noticed.
+///
+/// This is a record of an installation, not a verdict. Whether the plugin is
+/// *still* official is decided against the signed registry each time it matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfficialProvenance {
+    pub entry_id: String,
+    pub entry_version: String,
+    /// SHA-256 of the package zip, as pinned by the signed entry.
+    pub entry_sha256: String,
+    /// Digest of the extracted files; see `official::tree_digest`.
+    pub tree_sha256: String,
+    pub recorded_at: String,
+}
+
+/// Record that this plugin's current files came from a signed registry entry.
+pub fn set_official(
+    conn: &Connection,
+    plugin_id: &PluginId,
+    provenance: &OfficialProvenance,
+) -> LauncherResult<()> {
+    conn.execute(
+        "INSERT INTO plugin_official
+             (plugin_id, entry_id, entry_version, entry_sha256, tree_sha256, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(plugin_id) DO UPDATE SET
+             entry_id = excluded.entry_id,
+             entry_version = excluded.entry_version,
+             entry_sha256 = excluded.entry_sha256,
+             tree_sha256 = excluded.tree_sha256,
+             recorded_at = excluded.recorded_at",
+        params![
+            plugin_id.as_str(),
+            provenance.entry_id,
+            provenance.entry_version,
+            provenance.entry_sha256,
+            provenance.tree_sha256,
+            provenance.recorded_at,
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Forget any official provenance for this plugin.
+pub fn clear_official(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<()> {
+    conn.execute(
+        "DELETE FROM plugin_official WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Every recorded official provenance, keyed by plugin id.
+pub fn list_official(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, OfficialProvenance>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT plugin_id, entry_id, entry_version, entry_sha256, tree_sha256, recorded_at
+             FROM plugin_official",
+        )
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                OfficialProvenance {
+                    entry_id: row.get(1)?,
+                    entry_version: row.get(2)?,
+                    entry_sha256: row.get(3)?,
+                    tree_sha256: row.get(4)?,
+                    recorded_at: row.get(5)?,
+                },
+            ))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, provenance) = row.map_err(db_error)?;
+        out.insert(id, provenance);
+    }
+    Ok(out)
 }
 
 pub fn set_enabled(
@@ -395,6 +487,8 @@ pub fn remove(conn: &Connection, plugin_id: &PluginId, purge_data: bool) -> Laun
         params![plugin_id.as_str()],
     )
     .map_err(db_error)?;
+    // The files are gone, so whatever vouched for them no longer applies.
+    clear_official(conn, plugin_id)?;
     Ok(())
 }
 

@@ -1993,6 +1993,32 @@ def create_tables(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_game_catalog_items_game ON game_catalog_items(game)"
     )
 
+    # Official plugins: plugin packages whose id, version and package SHA-256 this
+    # signed registry vouches for. Another additive table, for the same reason as
+    # game_catalog_items: the schema version is unchanged, an older client never
+    # reads it, and a newer client reading a registry without it finds no official
+    # plugins. One row per listed version: the current one and, when the source
+    # keeps it, the previous one, so a bad update can be rolled back.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS official_plugins (
+            plugin_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            channel TEXT NOT NULL CHECK (channel IN ('current', 'previous')),
+            name TEXT NOT NULL,
+            description TEXT,
+            game_ids_json TEXT NOT NULL DEFAULT '[]',
+            package_url TEXT NOT NULL,
+            package_sha256 TEXT NOT NULL,
+            package_size INTEGER NOT NULL,
+            min_agora_version TEXT NOT NULL,
+            PRIMARY KEY (plugin_id, version)
+        )
+    """)
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_official_plugins_channel "
+        "ON official_plugins(plugin_id, channel)"
+    )
+
     for index_sql in CREATE_INDEXES:
         cursor.execute(index_sql)
 
@@ -2916,6 +2942,181 @@ def manifest_date_added(path: Path) -> str:
     # Fallback for untracked files during local development.
     mtime = path.stat().st_mtime
     return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+
+
+OFFICIAL_PLUGIN_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.[a-z0-9]+(?:-[a-z0-9]+)*")
+OFFICIAL_PLUGIN_ID_MAX = 96
+OFFICIAL_VERSION_RE = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
+OFFICIAL_GAME_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+# Matches the 64 MiB a plugin package may expand to; the zip is smaller still.
+OFFICIAL_PACKAGE_MAX_BYTES = 64 * 1024 * 1024
+OFFICIAL_PLUGIN_RELEASE_KEYS = {"version", "package_url", "sha256", "size"}
+OFFICIAL_PLUGIN_KEYS = {
+    "id", "name", "description", "game_ids", "min_agora_version", "current", "previous",
+}
+
+
+def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
+    if not isinstance(release, dict):
+        raise SystemExit(f"{path}: {label!r} must be an object")
+    unknown = sorted(set(release) - OFFICIAL_PLUGIN_RELEASE_KEYS)
+    if unknown:
+        raise SystemExit(f"{path}: {label!r} has unknown field(s): {', '.join(unknown)}")
+    missing = sorted(OFFICIAL_PLUGIN_RELEASE_KEYS - set(release))
+    if missing:
+        raise SystemExit(f"{path}: {label!r} is missing: {', '.join(missing)}")
+    version = release["version"]
+    if not isinstance(version, str) or not OFFICIAL_VERSION_RE.fullmatch(version):
+        raise SystemExit(f"{path}: {label}.version must be a semantic version, got {version!r}")
+    url = release["package_url"]
+    # https only, and nothing in the authority but a host: no userinfo, no port,
+    # no whitespace. The app pins the host of this URL for the download.
+    if (
+        not isinstance(url, str)
+        or not re.fullmatch(r"https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?:/[^\s#]*)?", url)
+    ):
+        raise SystemExit(
+            f"{path}: {label}.package_url must be an https:// URL with a plain host, got {url!r}"
+        )
+    sha256 = release["sha256"]
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise SystemExit(
+            f"{path}: {label}.sha256 must be exactly 64 lowercase hex characters, got {sha256!r}"
+        )
+    size = release["size"]
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+        or size > OFFICIAL_PACKAGE_MAX_BYTES
+    ):
+        raise SystemExit(
+            f"{path}: {label}.size must be a whole number of bytes between 1 and "
+            f"{OFFICIAL_PACKAGE_MAX_BYTES}, got {size!r}"
+        )
+    return {"version": version, "package_url": url, "sha256": sha256, "size": size}
+
+
+def load_official_plugins() -> list[tuple[Path, dict[str, Any]]]:
+    """Read ``registry/official-plugins/<id>.json``, one file per official plugin.
+
+    The folder is flat and the file name must be the plugin id, so an id cannot
+    be listed twice. Anything malformed refuses the whole compile: this table is
+    what the app trusts to decide which downloads count as official, so a typo
+    must not become a silently missing or silently different entry.
+    """
+    root = REGISTRY_DIR / "official-plugins"
+    results: list[tuple[Path, dict[str, Any]]] = []
+    if not root.exists():
+        return results
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        parts = path.relative_to(root).parts
+        if "archived" in parts:
+            continue
+        if len(parts) != 1 or path.suffix != ".json":
+            raise SystemExit(
+                f"{path}: official plugins live at registry/official-plugins/<plugin-id>.json"
+            )
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(f"{path}: cannot read official plugin entry: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SystemExit(f"{path}: an official plugin entry must be a JSON object")
+        unknown = sorted(set(data) - OFFICIAL_PLUGIN_KEYS)
+        if unknown:
+            raise SystemExit(f"{path}: unknown field(s): {', '.join(unknown)}")
+        plugin_id = data.get("id")
+        if (
+            not isinstance(plugin_id, str)
+            or len(plugin_id) > OFFICIAL_PLUGIN_ID_MAX
+            or not OFFICIAL_PLUGIN_ID_RE.fullmatch(plugin_id)
+        ):
+            raise SystemExit(
+                f"{path}: id must be `publisher.plugin` in lowercase letters, digits and inner "
+                f"hyphens, got {plugin_id!r}"
+            )
+        if path.stem != plugin_id:
+            raise SystemExit(f"{path}: the file name must be the plugin id, {plugin_id}.json")
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SystemExit(f"{path}: name is required")
+        description = data.get("description")
+        if description is not None and not isinstance(description, str):
+            raise SystemExit(f"{path}: description must be text")
+        game_ids = data.get("game_ids", [])
+        if not isinstance(game_ids, list) or any(
+            not isinstance(g, str) or not OFFICIAL_GAME_ID_RE.fullmatch(g) for g in game_ids
+        ):
+            raise SystemExit(f"{path}: game_ids must be a list of lowercase game ids")
+        if len(set(game_ids)) != len(game_ids):
+            raise SystemExit(f"{path}: game_ids lists a game twice")
+        min_version = data.get("min_agora_version")
+        if not isinstance(min_version, str) or not OFFICIAL_VERSION_RE.fullmatch(min_version):
+            raise SystemExit(
+                f"{path}: min_agora_version must be a semantic version, got {min_version!r}"
+            )
+        if "current" not in data:
+            raise SystemExit(f"{path}: current is required")
+        current = _official_release(path, "current", data["current"])
+        previous = None
+        if data.get("previous") is not None:
+            previous = _official_release(path, "previous", data["previous"])
+            if previous["version"] == current["version"]:
+                raise SystemExit(f"{path}: previous must be a different version from current")
+        results.append(
+            (
+                path,
+                {
+                    "id": plugin_id,
+                    "name": name.strip(),
+                    "description": description,
+                    "game_ids": list(game_ids),
+                    "min_agora_version": min_version,
+                    "current": current,
+                    "previous": previous,
+                },
+            )
+        )
+    return results
+
+
+def insert_official_plugins(
+    conn: sqlite3.Connection, entries: list[tuple[Path, dict[str, Any]]]
+) -> None:
+    """Write one official_plugins row per listed version (current, then previous)."""
+    cursor = conn.cursor()
+    for _path, entry in entries:
+        for channel in ("current", "previous"):
+            release = entry[channel]
+            if release is None:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO official_plugins (
+                    plugin_id, version, channel, name, description, game_ids_json,
+                    package_url, package_sha256, package_size, min_agora_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry["id"],
+                    release["version"],
+                    channel,
+                    entry["name"],
+                    entry["description"],
+                    json.dumps(entry["game_ids"], separators=(",", ":")),
+                    release["package_url"],
+                    release["sha256"],
+                    release["size"],
+                    entry["min_agora_version"],
+                ),
+            )
 
 
 def insert_game_catalog_item(conn: sqlite3.Connection, item: dict[str, Any], path: Path) -> None:
@@ -4304,6 +4505,9 @@ def compile_registry(
     # tables never see them, and they land in game_catalog_items instead.
     game_declarations = load_game_declarations()
     game_items = load_game_manifests(game_declarations)
+    # Official plugins (registry/official-plugins/): read up front so a malformed
+    # entry stops the compile before any slow work, and written to their own table.
+    official_plugins = load_official_plugins()
 
     # Identity must be canonical before hydration and governance. Keep the
     # legacy alias readable for existing registries, but never let downstream
@@ -4480,6 +4684,8 @@ def compile_registry(
     for path, data in game_items:
         insert_game_catalog_item(conn, data, path)
     logger.info("Inserted %d entr(ies) for other games", len(game_items))
+    insert_official_plugins(conn, official_plugins)
+    logger.info("Inserted %d official plugin(s)", len(official_plugins))
 
     # Per-version changelogs — must run after registry_items so FK is satisfied.
     try:
