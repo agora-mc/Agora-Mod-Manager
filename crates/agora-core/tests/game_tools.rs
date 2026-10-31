@@ -4555,7 +4555,8 @@ fn more_hostile_exe_spellings_are_refused_as_invalid_exe() {
         "Data/tools/My.exe/",
     ];
     for exe in refused {
-        let error = add_user_tool(&f, "My Tool", exe).expect_err(&format!("{exe:?} must be refused"));
+        let error =
+            add_user_tool(&f, "My Tool", exe).expect_err(&format!("{exe:?} must be refused"));
         assert!(
             matches!(
                 error,
@@ -4633,7 +4634,11 @@ fn a_malformed_user_tools_file_in_every_shape_is_an_error_for_list_add_and_remov
             game_user_tools::remove(&f.ctx, f.id(), "a").is_err(),
             "{label}: remove must refuse"
         );
-        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{label}: file changed");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "{label}: file changed"
+        );
     }
 }
 
@@ -4664,19 +4669,35 @@ fn a_mod_whose_record_cannot_be_read_is_an_error_not_no_candidates() {
 fn a_name_with_a_control_character_is_refused() {
     // Judgement call, not in the brief's list: a name with a line break or a bell would break the
     // tab's layout. The brief is silent, so this test records the gap rather than a rule it states.
+    let names = [
+        "My\nTool",
+        "My\u{7}Tool",
+        "My\u{0}Tool",
+        "My\tTool",
+        "My\r\nTool",
+    ];
     let f = fixture(Vec::new());
-    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
-    for name in ["My\nTool", "My\u{7}Tool", "My\u{0}Tool"] {
-        let error = add_user_tool(&f, name, "Data/tools/My.exe")
-            .expect_err(&format!("{name:?} must be refused"));
-        assert!(
-            matches!(
-                error,
-                agora_core::game_user_tools::UserToolError::InvalidName(_)
-            ),
-            "{name:?} gave {error:?}"
-        );
+    // One exe per name, so an accepted name cannot make a later one a duplicate.
+    let files: Vec<(String, Vec<u8>)> = (0..names.len())
+        .map(|i| (format!("Data/tools/T{i}.exe"), b"MZ".to_vec()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    f.add_mod("Tools", &refs);
+    let mut accepted = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        match add_user_tool(&f, name, &format!("Data/tools/T{i}.exe")) {
+            Err(agora_core::game_user_tools::UserToolError::InvalidName(_)) => {}
+            Err(other) => panic!("{name:?} gave {other:?}"),
+            Ok(_) => accepted.push(*name),
+        }
     }
+    assert!(
+        accepted.is_empty(),
+        "control characters accepted in a name: {accepted:?}"
+    );
 }
 
 #[test]
@@ -4785,4 +4806,288 @@ fn a_declared_tool_that_no_mod_provides_is_not_offered() {
     let f = fixture(vec![mytool_known_at_a_nested_path()]);
     let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
     assert!(candidates.is_empty(), "{candidates:?}");
+}
+
+#[test]
+fn an_empty_or_blank_exe_is_refused_as_invalid_exe() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for exe in ["", " ", "\t", "  \n  "] {
+        let error =
+            add_user_tool(&f, "My Tool", exe).expect_err(&format!("{exe:?} must be refused"));
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidExe(_)
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+/// Each refusal names the rule it broke. Several of these spellings are also not in the candidate
+/// list, so the bare variant cannot tell the validator from the fallback: the message can.
+#[test]
+fn a_refused_exe_is_refused_by_its_own_rule_not_only_by_being_unknown() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let cases: [(&str, &str); 16] = [
+        ("Data//tools/My.exe", "empty path segment"),
+        ("C:x.exe", "inside the game folder"),
+        ("c:/Data/tools/My.exe", "inside the game folder"),
+        (r"\\server\share\My.exe", "inside the game folder"),
+        ("/Data/tools/My.exe", "inside the game folder"),
+        (r"..\..\evil.exe", "leave the game folder"),
+        ("./Data/tools/My.exe", "leave the game folder"),
+        ("Data/../My.exe", "leave the game folder"),
+        ("Data/tools/prn.exe", "names a device"),
+        ("NUL.exe", "names a device"),
+        ("con.exe", "names a device"),
+        ("Data/tools/My.exe..", "dot or a space"),
+        ("Data/tools/My .exe ", "dot or a space"),
+        ("Data/tools/My.bat", "not an .exe"),
+        ("Data/tools/.exe", "not an .exe"),
+        ("Data/tools/My.exe/", "empty path segment"),
+    ];
+    let mut wrong = Vec::new();
+    for (exe, expected) in cases {
+        match add_user_tool(&f, "My Tool", exe) {
+            Err(agora_core::game_user_tools::UserToolError::InvalidExe(message))
+                if message.contains(expected) => {}
+            other => wrong.push(format!("{exe:?} expected '{expected}', got {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn a_blank_name_is_refused_as_invalid_name() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for name in ["", " ", "\t", "\n", "\u{a0}", " \u{3000} "] {
+        let error = add_user_tool(&f, name, "Data/tools/My.exe")
+            .expect_err(&format!("{name:?} must be refused"));
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidName(_)
+            ),
+            "{name:?} gave {error:?}"
+        );
+    }
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn the_same_exe_by_other_case_or_separator_is_refused_as_a_duplicate() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "First", "Data/tools/My.exe").unwrap();
+    for exe in ["data/tools/my.exe", r"data\TOOLS\MY.EXE"] {
+        let error = add_user_tool(&f, "Second", exe).expect_err(exe);
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::Duplicate { .. }
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn an_exe_only_a_disabled_mod_ships_is_refused_and_one_an_enabled_mod_also_ships_is_accepted() {
+    let f = fixture(Vec::new());
+    let off = f.add_mod(
+        "Off",
+        &[
+            ("Data/tools/Off.exe", b"MZ"),
+            ("Data/tools/Both.exe", b"MZ"),
+        ],
+    );
+    f.add_mod("On", &[("Data/tools/Both.exe", b"MZ")]);
+    set_content_enabled(&f.ctx, f.id(), &off, false).unwrap();
+    let error = add_user_tool(&f, "Off", "Data/tools/Off.exe").expect_err("disabled mod");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidExe(_)
+        ),
+        "{error:?}"
+    );
+    add_user_tool(&f, "Both", "Data/tools/Both.exe").expect("an enabled mod also ships it");
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_user_tools_file_that_cannot_be_read_is_an_error_and_is_left_alone() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let path = f.instance_dir().join("user_tools.json");
+    let before = std::fs::read(&path).unwrap();
+    {
+        // share_mode(0): no one else may open the file while this handle is held.
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let listed = game_user_tools::list(&f.ctx, f.id());
+        assert!(
+            matches!(
+                listed,
+                Err(agora_core::game_user_tools::UserToolError::Unreadable { .. })
+            ),
+            "list must not read as no tools: {listed:?}"
+        );
+        assert!(matches!(
+            add_user_tool(&f, "Other", "Data/tools/My.exe"),
+            Err(agora_core::game_user_tools::UserToolError::Unreadable { .. })
+        ));
+        assert!(game_user_tools::remove(&f.ctx, f.id(), "anything").is_err());
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn a_user_tools_file_that_is_not_utf8_is_an_error_and_is_left_alone() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let bytes: &[u8] = &[b'{', 0xff, 0xfe, b'}'];
+    let path = write_user_tools(&f, bytes);
+    assert!(game_user_tools::list(&f.ctx, f.id()).is_err());
+    assert!(add_user_tool(&f, "My Tool", "Data/tools/My.exe").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn a_failed_replace_leaves_no_temp_file_and_the_list_as_it_was() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[("Data/tools/My.exe", b"MZ"), ("Data/tools/B.exe", b"MZ")],
+    );
+    add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let path = f.instance_dir().join("user_tools.json");
+    let before = std::fs::read(&path).unwrap();
+    {
+        // share_mode(FILE_SHARE_READ): the file can be read but not replaced, so the final rename
+        // of the atomic write fails after the temporary file has been written.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let error = add_user_tool(&f, "Second", "Data/tools/B.exe");
+        assert!(
+            matches!(
+                error,
+                Err(agora_core::game_user_tools::UserToolError::Io(_))
+            ),
+            "the replace must fail with an I/O error while the file is held: {error:?}"
+        );
+        let leftovers: Vec<String> = names(&f.instance_dir())
+            .into_iter()
+            .filter(|name| name.contains("user_tools") && name != "user_tools.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary file left behind: {leftovers:?}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "the list changed");
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn an_exe_in_a_mod_that_is_later_disabled_is_no_longer_offered() {
+    let f = fixture(Vec::new());
+    let mod_id = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    assert_eq!(
+        game_user_tools::find_candidates(&f.ctx, f.id(), &f.def)
+            .unwrap()
+            .len(),
+        1
+    );
+    set_content_enabled(&f.ctx, f.id(), &mod_id, false).unwrap();
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert!(candidates.is_empty(), "{candidates:?}");
+}
+
+#[test]
+fn the_installers_are_never_offered_in_any_case_and_add_refuses_them() {
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[
+            ("Data/tools/Setup.exe", b"MZ"),
+            ("Data/tools/Uninstall.EXE", b"MZ"),
+            ("Data/tools/unins000.exe", b"MZ"),
+            ("Data/tools/Uninstall.exe.bak", b"MZ"),
+        ],
+    );
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let offered: Vec<&str> = candidates.iter().map(|c| c.exe.as_str()).collect();
+    assert_eq!(offered, vec!["Data/tools/Setup.exe"], "{candidates:?}");
+    for exe in ["Data/tools/Uninstall.EXE", "Data/tools/unins000.exe"] {
+        assert!(
+            add_user_tool(&f, "Installer", exe).is_err(),
+            "{exe} must be refused"
+        );
+    }
+    assert_eq!(EXCLUDED_EXE_NAMES, &["uninstall.exe", "unins000.exe"]);
+}
+
+#[test]
+fn a_path_held_by_two_mods_is_one_row_for_the_file_the_deployment_uses() {
+    let f = fixture(Vec::new());
+    let lower = f.add_mod("Lower", &[("Data/tools/Shared.exe", b"lower")]);
+    let upper = f.add_mod("Upper", &[("Data/tools/Shared.exe", b"upper")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let plan = plan(&f.ctx, f.id(), &f.def, DeployMode::Links).unwrap();
+    let deployed = planned(&plan, "Data/tools/Shared.exe").expect("the deployment has it");
+    let FileSource::Content { item_id, .. } = &deployed.source else {
+        panic!("not a content file: {:?}", deployed.source);
+    };
+    assert_eq!(&candidates[0].mod_id, item_id);
+    assert_eq!(item_id, &upper);
+    assert_ne!(item_id, &lower);
+}
+
+#[test]
+fn a_path_held_by_two_mods_in_different_non_ascii_case_is_one_row() {
+    // On NTFS "Ü" and "ü" name the same file, so the two mods collide on disk. One row is right.
+    let f = fixture(Vec::new());
+    f.add_mod("Upper", &[("Data/Ü/Tool.exe", b"upper")]);
+    f.add_mod("Lower", &[("data/ü/tool.exe", b"lower")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+}
+
+#[test]
+fn a_declared_tool_a_mod_ships_is_offered_with_its_id_and_name() {
+    let f = fixture(vec![mytool_known_at_a_nested_path()]);
+    f.add_mod("My Tool Pack", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].known_tool_id.as_deref(), Some("mytool"));
+    assert_eq!(candidates[0].suggested_name, "My Tool");
+    assert_eq!(candidates[0].mod_name, "My Tool Pack");
+}
+
+#[test]
+fn a_mod_whose_record_is_missing_is_an_error_not_no_candidates() {
+    let f = fixture(Vec::new());
+    let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    std::fs::remove_file(f.ctx.paths.content_item_path(&item)).unwrap();
+    assert!(
+        game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).is_err(),
+        "a missing mod record must not read as no candidates"
+    );
 }
