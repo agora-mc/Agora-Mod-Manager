@@ -10,7 +10,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { isGamesError } from '../shared/types';
 
 /** Where the text of an INI file came from: the instance's copy, the game's own file, or nothing. */
-export type IniSourceName = 'copy' | 'game_file' | 'nothing';
+export type IniSourceName = 'copy' | 'game_file' | 'nothing' | 'override' | 'mod';
 
 export interface IniFileRow {
   /** The file's name inside the instance, as the game names it (for example `Skyrim.ini`). */
@@ -60,13 +60,6 @@ export interface ModIniRow {
   modEnabled: boolean;
 }
 
-export type ModIniSourceName = 'override' | 'mod';
-
-export interface ModIniContents {
-  path: string;
-  source: ModIniSourceName;
-  contents: string;
-}
 
 export type SaveChoice = 'own' | 'shared';
 
@@ -112,15 +105,12 @@ function isNullableString(value: unknown): value is string | null {
 }
 
 function isIniSource(value: unknown): value is IniSourceName {
-  return value === 'copy' || value === 'game_file' || value === 'nothing';
+  return value === 'copy' || value === 'game_file' || value === 'nothing'
+    || value === 'override' || value === 'mod';
 }
 
 function isSaveChoice(value: unknown): value is SaveChoice {
   return value === 'own' || value === 'shared';
-}
-
-function isModIniSource(value: unknown): value is ModIniSourceName {
-  return value === 'override' || value === 'mod';
 }
 
 function isModIniRow(value: unknown): value is ModIniRow {
@@ -131,13 +121,6 @@ function isModIniRow(value: unknown): value is ModIniRow {
     && typeof value.overridden === 'boolean'
     && isNullableString(value.shadowedBy)
     && typeof value.modEnabled === 'boolean';
-}
-
-function isModIniContents(value: unknown): value is ModIniContents {
-  return isObject(value)
-    && typeof value.path === 'string'
-    && isModIniSource(value.source)
-    && typeof value.contents === 'string';
 }
 
 
@@ -263,20 +246,25 @@ export async function listModInis(instanceId: string): Promise<ModIniRow[]> {
   return reply;
 }
 
-/** One mod INI file: the instance's copy when it has one, otherwise the mod's stored file. */
-export async function getModIni(instanceId: string, path: string): Promise<ModIniContents> {
+/** One mod INI file's keys: the instance's copy when it has one, otherwise the mod's file. */
+export async function getModIni(instanceId: string, path: string): Promise<IniContents> {
   const reply = await invoke<unknown>('games_mod_ini_get', { instanceId, path });
-  return checkedReply('games_mod_ini_get', reply, isModIniContents);
+  return checkedReply('games_mod_ini_get', reply, isIniContents);
 }
 
-/** Save the instance's own copy of a mod INI file. The stored mod is never changed. */
-export async function setModIni(
+/**
+ * Set a key in the instance's copy of a mod INI file. A `null` value removes the key. The first
+ * edit makes the copy from the mod's file; the stored mod is never changed.
+ */
+export async function setModIniValue(
   instanceId: string,
   path: string,
-  contents: string,
-): Promise<ModIniContents> {
-  const reply = await invoke<unknown>('games_mod_ini_set', { instanceId, path, contents });
-  return checkedReply('games_mod_ini_set', reply, isModIniContents);
+  section: string,
+  key: string,
+  value: string | null,
+): Promise<IniContents> {
+  const reply = await invoke<unknown>('games_mod_ini_set', { instanceId, path, section, key, value });
+  return checkedReply('games_mod_ini_set', reply, isIniContents);
 }
 
 /** Remove the instance's copy of a mod INI file, so the mod's own file is used again. */

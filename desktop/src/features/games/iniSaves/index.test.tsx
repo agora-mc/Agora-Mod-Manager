@@ -28,9 +28,9 @@ const MOD_INI = {
 };
 
 const CONTENTS = {
-  path: MOD_INI.path,
+  instancePath: MOD_INI.path,
   source: 'mod',
-  contents: '[Display]\nfGamma=1.0\n',
+  entries: [{ section: 'Display', key: 'fGamma', value: '1.0' }],
 };
 
 let replies: Record<string, (args: Record<string, unknown>) => unknown>;
@@ -63,14 +63,15 @@ describe('the mod INI section', () => {
     route();
   });
 
-  it('lists each mod INI with its path and mod name, and opens its contents', async () => {
+  it('opens a mod INI in the same per-key editor as the game INI files', async () => {
     mountTab();
     expect(await screen.findByText('From your mods')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /SKSE\/Plugins\/SSEDisplayTweaks\.ini/ })).toHaveTextContent(
       'SSE Display Tweaks',
     );
-    const editor = await screen.findByRole('textbox', { name: `Contents of ${MOD_INI.path}` });
-    expect(editor).toHaveValue(CONTENTS.contents);
+    expect(await screen.findByText('[Display]')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Value of fGamma in [Display]' })).toHaveValue('1.0');
+    expect(screen.getByRole('button', { name: 'Save key' })).toBeInTheDocument();
   });
 
   it('says quietly that no enabled mod ships an INI, rather than failing', async () => {
@@ -80,37 +81,71 @@ describe('the mod INI section', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
-  it('saves the whole file as the instance copy', async () => {
+  it('saves one key into the instance copy, leaving the mod file alone', async () => {
     replies.games_mod_ini_set = (args) => ({
-      path: MOD_INI.path,
+      ...CONTENTS,
       source: 'override',
-      contents: args.contents,
+      entries: [{ section: 'Display', key: 'fGamma', value: args.value }],
     });
     mountTab();
-    const editor = await screen.findByRole('textbox', { name: `Contents of ${MOD_INI.path}` });
-    fireEvent.change(editor, { target: { value: '[Display]\nfGamma=2.2\n' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Save for this instance' }));
+    const value = await screen.findByRole('textbox', { name: 'Value of fGamma in [Display]' });
+    fireEvent.change(value, { target: { value: '2.2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith('games_mod_ini_set', {
         instanceId: 'inst-1',
         path: MOD_INI.path,
-        contents: '[Display]\nfGamma=2.2\n',
+        section: 'Display',
+        key: 'fGamma',
+        value: '2.2',
       }),
     );
-    expect(await screen.findByRole('status')).toHaveTextContent("Saved this instance's copy");
+    expect(await screen.findByRole('status')).toHaveTextContent("The mod's own file was not changed.");
     expect(screen.getByText('Edited for this instance')).toBeInTheDocument();
+    expect(value).toHaveValue('2.2');
+  });
+
+  it('adds a key and removes one through the same editor', async () => {
+    replies.games_mod_ini_set = (args) => ({
+      ...CONTENTS,
+      source: 'override',
+      entries: [{ section: args.section as string, key: args.key as string, value: (args.value as string) ?? '' }],
+    });
+    mountTab();
+    await screen.findByRole('textbox', { name: 'Value of fGamma in [Display]' });
+
+    fireEvent.change(screen.getByPlaceholderText('General'), { target: { value: 'Video' } });
+    fireEvent.change(screen.getByPlaceholderText('sLanguage'), { target: { value: 'bDoGodRays' } });
+    const valueInputs = screen.getAllByRole('textbox');
+    fireEvent.change(valueInputs[valueInputs.length - 1], { target: { value: '1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save key' }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        'games_mod_ini_set',
+        expect.objectContaining({ section: 'Video', key: 'bDoGodRays', value: '1' }),
+      ),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove key' }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith(
+        'games_mod_ini_set',
+        expect.objectContaining({ section: 'Video', key: 'bDoGodRays', value: null }),
+      ),
+    );
   });
 
   it('lets a turned-off mod be reset but not edited', async () => {
-    replies.games_mod_inis_list = () => [
-      { ...MOD_INI, overridden: true, modEnabled: false },
-    ];
+    replies.games_mod_inis_list = () => [{ ...MOD_INI, overridden: true, modEnabled: false }];
     replies.games_mod_ini_get = () => ({ ...CONTENTS, source: 'override' });
     replies.games_mod_ini_reset = () => [];
     mountTab();
-    const editor = await screen.findByRole('textbox', { name: `Contents of ${MOD_INI.path}` });
-    expect(editor).toBeDisabled();
+    const value = await screen.findByRole('textbox', { name: 'Value of fGamma in [Display]' });
+    expect(value).toBeDisabled();
     expect(screen.getByText(/Its mod is turned off/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save key' })).toBeDisabled();
 
     fireEvent.click(screen.getByRole('button', { name: "Reset to the mod's version" }));
     const dialog = await screen.findByRole('dialog');
@@ -124,6 +159,17 @@ describe('the mod INI section', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('is back to the version its mod ships');
     expect(await screen.findByText("None of this instance's enabled mods ships an INI file.")).toBeInTheDocument();
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('shows a clear message and no editor for a file that is not text', async () => {
+    replies.games_mod_ini_get = () =>
+      Promise.reject({ code: 'core_failed', message: "'binary.ini' is not a text INI file, so it cannot be edited here" });
+    mountTab();
+    expect(
+      await screen.findByText("'binary.ini' is not a text INI file, so it cannot be edited here"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: /Value of/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Save key' })).toBeNull();
   });
 
   it('shows a failed list as an error, never as no files', async () => {

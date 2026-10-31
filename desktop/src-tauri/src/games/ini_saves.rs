@@ -168,7 +168,6 @@ pub async fn games_ini_set(
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // INI files that mods ship
 // ---------------------------------------------------------------------------
 
@@ -190,16 +189,6 @@ pub struct ModIniRow {
     pub mod_enabled: bool,
 }
 
-/// A mod INI file's text, and where it came from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModIniContents {
-    pub path: String,
-    /// `override` (the instance's copy) or `mod` (the stored mod file).
-    pub source: String,
-    pub contents: String,
-}
-
 fn mod_ini_row(row: &ModIni) -> ModIniRow {
     ModIniRow {
         path: row.path.clone(),
@@ -218,11 +207,20 @@ fn mod_ini_source_name(source: ModIniSource) -> &'static str {
     }
 }
 
-fn mod_ini_contents(read: ModIniRead) -> ModIniContents {
-    ModIniContents {
-        path: read.path,
+fn mod_ini_contents(read: ModIniRead) -> IniContents {
+    IniContents {
+        instance_path: read.path,
         source: mod_ini_source_name(read.source).to_string(),
-        contents: String::from_utf8_lossy(&read.document.render()).into_owned(),
+        entries: read
+            .document
+            .entries()
+            .into_iter()
+            .map(|entry| IniEntryRow {
+                section: entry.section,
+                key: entry.key,
+                value: entry.value,
+            })
+            .collect(),
     }
 }
 
@@ -243,13 +241,13 @@ pub async fn games_mod_inis_list(
     .await
 }
 
-/// One mod INI file's text: the instance's copy when it has one, otherwise the mod's file.
+/// One mod INI file's keys: the instance's copy when it has one, otherwise the mod's file.
 #[tauri::command]
 pub async fn games_mod_ini_get(
     app: tauri::AppHandle,
     instance_id: String,
     path: String,
-) -> Result<ModIniContents, GamesError> {
+) -> Result<IniContents, GamesError> {
     run_blocking(app, "Reading the mod INI file", move |ctx| {
         let read = game_mod_ini::read_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
         Ok(mod_ini_contents(read))
@@ -257,16 +255,25 @@ pub async fn games_mod_ini_get(
     .await
 }
 
-/// Save the instance's own copy of a mod's INI file. The stored mod is never changed.
+/// Set a key in the instance's copy of a mod's INI file, or remove it when `value` is `None`. The
+/// stored mod is never changed.
 #[tauri::command]
 pub async fn games_mod_ini_set(
     app: tauri::AppHandle,
     instance_id: String,
     path: String,
-    contents: String,
-) -> Result<ModIniContents, GamesError> {
+    section: String,
+    key: String,
+    value: Option<String>,
+) -> Result<IniContents, GamesError> {
     run_blocking(app, "Saving the mod INI file", move |ctx| {
-        game_mod_ini::write_mod_ini(&ctx, &instance_id, &path, &contents).map_err(core_failed)?;
+        match &value {
+            Some(value) => {
+                game_mod_ini::set_mod_ini_value(&ctx, &instance_id, &path, &section, &key, value)
+            }
+            None => game_mod_ini::unset_mod_ini_value(&ctx, &instance_id, &path, &section, &key),
+        }
+        .map_err(core_failed)?;
         let read = game_mod_ini::read_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
         Ok(mod_ini_contents(read))
     })
@@ -288,6 +295,7 @@ pub async fn games_mod_ini_reset(
     .await
 }
 
+// ---------------------------------------------------------------------------
 // Saves
 // ---------------------------------------------------------------------------
 

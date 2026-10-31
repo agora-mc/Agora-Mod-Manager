@@ -39,6 +39,8 @@ pub enum ModIniError {
     OverridesNotAFolder { path: PathBuf },
     #[error("refusing to use {}: it points outside the instance", path.display())]
     EscapesInstance { path: PathBuf },
+    #[error("'{0}' is not a text INI file, so it cannot be edited here")]
+    Unparseable(String),
     #[error("cannot read {}: {source}", path.display())]
     Unreadable {
         path: PathBuf,
@@ -455,6 +457,20 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>, ModIniError> {
     })
 }
 
+/// Parse one of the instance's mod INI files. The parser keeps everything it does not change, so a
+/// text file always parses. A file that is not text (invalid UTF-8 or a NUL byte) is refused rather
+/// than shown as a half-read editor that would write back different bytes.
+fn parse_ini(path: &str, bytes: &[u8]) -> Result<IniDocument, ModIniError> {
+    if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {
+        return Err(ModIniError::Unparseable(path.to_string()));
+    }
+    Ok(IniDocument::parse(bytes))
+}
+
+fn load_ini(path: &str, file: &Path) -> Result<IniDocument, ModIniError> {
+    parse_ini(path, &read_bytes(file)?)
+}
+
 /// Read a mod INI as the instance sees it: the override when one exists, otherwise the winning
 /// mod's stored file. Reading never writes anything.
 pub fn read_mod_ini(ctx: &Ctx, instance_id: &str, path: &str) -> Result<ModIniRead, ModIniError> {
@@ -462,9 +478,9 @@ pub fn read_mod_ini(ctx: &Ctx, instance_id: &str, path: &str) -> Result<ModIniRe
     let override_path = override_path(ctx, instance_id, &row)?;
     if override_path.is_file() {
         return Ok(ModIniRead {
-            path: row.path,
+            path: row.path.clone(),
             source: ModIniSource::Override,
-            document: IniDocument::parse(&read_bytes(&override_path)?),
+            document: load_ini(&row.path, &override_path)?,
         });
     }
     let manifest = manifest(ctx, instance_id)?;
@@ -474,22 +490,53 @@ pub fn read_mod_ini(ctx: &Ctx, instance_id: &str, path: &str) -> Result<ModIniRe
             reason: "no enabled mod ships it and the instance has no copy".to_string(),
         });
     };
-    let bytes = read_bytes(&ctx.paths.content_object_path(&file.sha256))?;
     Ok(ModIniRead {
-        path: row.path,
+        path: row.path.clone(),
         source: ModIniSource::Mod,
-        document: IniDocument::parse(&bytes),
+        document: load_ini(&row.path, &ctx.paths.content_object_path(&file.sha256))?,
     })
 }
 
-/// Save the instance's own copy of a mod INI. The stored mod is never touched; the copy is written
-/// through a temporary file beside it, so an interrupted write leaves the old copy.
-pub fn write_mod_ini(
+/// Set a key in the instance's copy of a mod's INI file. The first edit seeds the copy from the
+/// mod's file. Returns whether the file changed. The stored mod is never touched.
+pub fn set_mod_ini_value(
     ctx: &Ctx,
     instance_id: &str,
     path: &str,
-    contents: &str,
-) -> Result<(), ModIniError> {
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<bool, ModIniError> {
+    edit_mod_ini(ctx, instance_id, path, |document| {
+        let changed = document.set(section, key, value)?;
+        Ok((changed, changed))
+    })
+}
+
+/// Remove a key from the instance's copy of a mod's INI file, seeding the copy from the mod when
+/// it does not exist yet. Returns whether the file changed.
+pub fn unset_mod_ini_value(
+    ctx: &Ctx,
+    instance_id: &str,
+    path: &str,
+    section: &str,
+    key: &str,
+) -> Result<bool, ModIniError> {
+    edit_mod_ini(ctx, instance_id, path, |document| {
+        let changed = document.unset(section, key)?;
+        Ok((changed, changed))
+    })
+}
+
+/// Edit the instance's copy with `f`, which returns its own result and whether it changed the
+/// document. The copy is written only when it changed, through a temporary file beside it. The
+/// store is read, never written.
+fn edit_mod_ini<T>(
+    ctx: &Ctx,
+    instance_id: &str,
+    path: &str,
+    f: impl FnOnce(&mut IniDocument) -> Result<(T, bool), crate::game_ini::IniError>,
+) -> Result<T, ModIniError> {
     let row = listed_row(ctx, instance_id, path)?;
     if !row.mod_enabled {
         return Err(ModIniError::NotEditable {
@@ -504,17 +551,33 @@ pub fn write_mod_ini(
     let target = override_path(ctx, instance_id, &row)?;
     let _lock = ctx.lock_manager.acquire(
         LockResource::Instance(instance_id.to_string()),
-        "mod-ini-write",
+        "mod-ini-edit",
     )?;
-    std::fs::create_dir_all(target.parent().unwrap_or_else(|| Path::new("."))).map_err(
-        |source| ModIniError::Write {
-            path: target.clone(),
-            source,
-        },
-    )?;
-    // Creating the folders may have followed a link that was not there a moment ago.
-    ensure_inside_instance(&instance_dir(ctx, instance_id)?, &target)?;
-    write_atomic(&target, contents.as_bytes())
+    let mut document = if target.is_file() {
+        load_ini(&row.path, &target)?
+    } else {
+        let manifest = manifest(ctx, instance_id)?;
+        let Some((_, _, file)) = winning_mod_file(ctx, &manifest, &row.path)? else {
+            return Err(ModIniError::NotEditable {
+                path: row.path,
+                reason: "no enabled mod ships it and the instance has no copy".to_string(),
+            });
+        };
+        load_ini(&row.path, &ctx.paths.content_object_path(&file.sha256))?
+    };
+    let (value, changed) = f(&mut document).map_err(|e| ModIniError::Other(e.to_string()))?;
+    if changed {
+        std::fs::create_dir_all(target.parent().unwrap_or_else(|| Path::new("."))).map_err(
+            |source| ModIniError::Write {
+                path: target.clone(),
+                source,
+            },
+        )?;
+        // Creating the folders may have followed a link that was not there a moment ago.
+        ensure_inside_instance(&instance_dir(ctx, instance_id)?, &target)?;
+        write_atomic(&target, &document.render())?;
+    }
+    Ok(value)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ModIniError> {

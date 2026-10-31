@@ -2465,10 +2465,22 @@ fn an_instance_override_is_planned_after_the_writable_layer_and_wins() {
     let item = add_content_folder(
         &ctx,
         "Tweak",
-        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"gamma=1")],
+        &[(
+            "SKSE/Plugins/SSEDisplayTweaks.ini",
+            b"[Display]
+gamma=1",
+        )],
     );
     add_content(&ctx, &id, &item, None, None).unwrap();
-    game_mod_ini::write_mod_ini(&ctx, &id, "SKSE/Plugins/SSEDisplayTweaks.ini", "gamma=2").unwrap();
+    game_mod_ini::set_mod_ini_value(
+        &ctx,
+        &id,
+        "SKSE/Plugins/SSEDisplayTweaks.ini",
+        "Display",
+        "gamma",
+        "2",
+    )
+    .unwrap();
     let writable = instance_writable_dir(&ctx, &id).join("SKSE/Plugins/SSEDisplayTweaks.ini");
     std::fs::create_dir_all(writable.parent().unwrap()).unwrap();
     std::fs::write(&writable, b"gamma=3").unwrap();
@@ -2485,7 +2497,8 @@ fn an_instance_override_is_planned_after_the_writable_layer_and_wins() {
     let game = deployment_dir(&ctx, &id).unwrap().unwrap();
     assert_eq!(
         std::fs::read(game.join("SKSE/Plugins/SSEDisplayTweaks.ini")).unwrap(),
-        b"gamma=2"
+        b"[Display]
+gamma=2"
     );
 }
 
@@ -2503,7 +2516,11 @@ fn reset_returns_to_the_mod_and_another_instance_is_unaffected() {
     let item = add_content_folder(
         &ctx,
         "Tweak",
-        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"gamma=1")],
+        &[(
+            "SKSE/Plugins/SSEDisplayTweaks.ini",
+            b"[Display]
+gamma=1",
+        )],
     );
     add_content(&ctx, &one.instance_id, &item, None, None).unwrap();
     add_content(&ctx, &two.instance_id, &item, None, None).unwrap();
@@ -2515,11 +2532,13 @@ fn reset_returns_to_the_mod_and_another_instance_is_unaffected() {
     );
     let store_before = std::fs::read(&store).unwrap();
 
-    game_mod_ini::write_mod_ini(
+    game_mod_ini::set_mod_ini_value(
         &ctx,
         &one.instance_id,
         "SKSE/Plugins/SSEDisplayTweaks.ini",
-        "gamma=2",
+        "Display",
+        "gamma",
+        "2",
     )
     .unwrap();
     assert_eq!(std::fs::read(&store).unwrap(), store_before);

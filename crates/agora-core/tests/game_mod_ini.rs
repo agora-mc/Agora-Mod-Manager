@@ -196,7 +196,7 @@ fn writing_makes_only_the_instances_copy_and_reset_goes_back_to_the_mod() {
         "Mod A",
         &[(
             "SKSE/Plugins/SSEDisplayTweaks.ini",
-            b"[Display]\r\nfGamma=1.0\r\n",
+            b"[Display]\r\n; mine\r\nfGamma=1.0\r\n",
         )],
     );
     make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
@@ -208,12 +208,23 @@ fn writing_makes_only_the_instances_copy_and_reset_goes_back_to_the_mod() {
         std::fs::metadata(&store_path).unwrap().modified().unwrap(),
     );
 
-    let edited = "[Display]\r\n; mine\r\nfGamma=2.2\r\n";
-    game_mod_ini::write_mod_ini(&ctx, "inst-a", "SKSE/Plugins/SSEDisplayTweaks.ini", edited)
-        .unwrap();
+    let changed = game_mod_ini::set_mod_ini_value(
+        &ctx,
+        "inst-a",
+        "SKSE/Plugins/SSEDisplayTweaks.ini",
+        "Display",
+        "fGamma",
+        "2.2",
+    )
+    .unwrap();
+    assert!(changed);
 
     let copy = override_file(&ctx, "inst-a", "SKSE/Plugins/SSEDisplayTweaks.ini");
-    assert_eq!(std::fs::read(&copy).unwrap(), edited.as_bytes());
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        b"[Display]\r\n; mine\r\nfGamma=2.2\r\n".as_slice(),
+        "only that key changed; comments and order are kept"
+    );
     assert_eq!(
         (
             std::fs::read(&store_path).unwrap(),
@@ -226,15 +237,31 @@ fn writing_makes_only_the_instances_copy_and_reset_goes_back_to_the_mod() {
         game_mod_ini::read_mod_ini(&ctx, "inst-a", "SKSE/Plugins/SSEDisplayTweaks.ini").unwrap();
     assert_eq!(read.source, ModIniSource::Override);
     assert_eq!(
-        std::fs::read(copy).unwrap(),
-        edited.as_bytes(),
-        "the copy is exactly what was saved, comments and order kept"
+        read.document.get("Display", "fGamma").as_deref(),
+        Some("2.2")
+    );
+
+    assert!(game_mod_ini::unset_mod_ini_value(
+        &ctx,
+        "inst-a",
+        "SKSE/Plugins/SSEDisplayTweaks.ini",
+        "Display",
+        "fGamma",
+    )
+    .unwrap());
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        b"[Display]\r\n; mine\r\n".as_slice()
     );
 
     game_mod_ini::reset_mod_ini(&ctx, "inst-a", "SKSE/Plugins/SSEDisplayTweaks.ini").unwrap();
     let read =
         game_mod_ini::read_mod_ini(&ctx, "inst-a", "SKSE/Plugins/SSEDisplayTweaks.ini").unwrap();
     assert_eq!(read.source, ModIniSource::Mod);
+    assert_eq!(
+        read.document.get("Display", "fGamma").as_deref(),
+        Some("1.0")
+    );
     assert!(
         !override_file(&ctx, "inst-a", "SKSE/Plugins").exists(),
         "emptied folders go"
@@ -273,9 +300,21 @@ fn reset_of_a_listed_path_with_no_override_is_a_no_op_success() {
 fn a_mod_turned_off_keeps_its_override_listed_but_cannot_edit_it() {
     let tmp = TempDir::new().unwrap();
     let ctx = context(&tmp);
-    let a = add_item(&ctx, "Mod A", &[("SKSE/Plugins/tweak.ini", b"a=b\n")]);
+    let a = add_item(
+        &ctx,
+        "Mod A",
+        &[("SKSE/Plugins/tweak.ini", b"[General]\na=b\n")],
+    );
     make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
-    game_mod_ini::write_mod_ini(&ctx, "inst-a", "SKSE/Plugins/tweak.ini", "a=mine\n").unwrap();
+    game_mod_ini::set_mod_ini_value(
+        &ctx,
+        "inst-a",
+        "SKSE/Plugins/tweak.ini",
+        "General",
+        "a",
+        "mine",
+    )
+    .unwrap();
 
     set_layers(&ctx, "inst-a", vec![layer("mod-a", &a, false)]);
 
@@ -286,12 +325,19 @@ fn a_mod_turned_off_keeps_its_override_listed_but_cannot_edit_it() {
     assert!(!rows[0].mod_enabled);
     assert!(rows[0].overridden);
 
-    let error = game_mod_ini::write_mod_ini(&ctx, "inst-a", "SKSE/Plugins/tweak.ini", "a=again\n")
-        .unwrap_err();
+    let error = game_mod_ini::set_mod_ini_value(
+        &ctx,
+        "inst-a",
+        "SKSE/Plugins/tweak.ini",
+        "General",
+        "a",
+        "again",
+    )
+    .unwrap_err();
     assert!(matches!(error, ModIniError::NotEditable { .. }));
     assert_eq!(
         std::fs::read(override_file(&ctx, "inst-a", "SKSE/Plugins/tweak.ini")).unwrap(),
-        b"a=mine\n"
+        b"[General]\na=mine\n"
     );
 
     game_mod_ini::reset_mod_ini(&ctx, "inst-a", "SKSE/Plugins/tweak.ini").unwrap();
@@ -305,7 +351,12 @@ fn an_override_no_mod_ships_is_listed_and_can_only_be_reset() {
     let tmp = TempDir::new().unwrap();
     let ctx = context(&tmp);
     make_instance(&ctx, "inst-a", Vec::new());
-    write_override(&ctx, "inst-a", "SKSE/Plugins/old.ini", b"old=1\n");
+    write_override(
+        &ctx,
+        "inst-a",
+        "SKSE/Plugins/old.ini",
+        b"[General]\nold=1\n",
+    );
 
     let rows = game_mod_ini::list_mod_inis(&ctx, "inst-a").unwrap();
     assert_eq!(rows.len(), 1);
@@ -315,12 +366,19 @@ fn an_override_no_mod_ships_is_listed_and_can_only_be_reset() {
     assert!(!rows[0].mod_enabled);
     assert!(rows[0].overridden);
     assert!(matches!(
-        game_mod_ini::write_mod_ini(&ctx, "inst-a", "SKSE/Plugins/old.ini", "old=2\n"),
+        game_mod_ini::set_mod_ini_value(
+            &ctx,
+            "inst-a",
+            "SKSE/Plugins/old.ini",
+            "General",
+            "old",
+            "2"
+        ),
         Err(ModIniError::NotEditable { .. })
     ));
     let read = game_mod_ini::read_mod_ini(&ctx, "inst-a", "SKSE/Plugins/old.ini").unwrap();
     assert_eq!(read.source, ModIniSource::Override);
-    assert_eq!(read.document.get("", "old").as_deref(), None);
+    assert_eq!(read.document.get("General", "old").as_deref(), Some("1"));
 
     game_mod_ini::reset_mod_ini(&ctx, "inst-a", "SKSE/Plugins/old.ini").unwrap();
     assert!(!override_file(&ctx, "inst-a", "SKSE/Plugins/old.ini").exists());
@@ -368,7 +426,7 @@ fn every_path_that_is_not_listed_is_refused_before_anything_is_touched() {
     for path in refused {
         assert!(
             matches!(
-                game_mod_ini::write_mod_ini(&ctx, "inst-a", path, "x=y\n"),
+                game_mod_ini::set_mod_ini_value(&ctx, "inst-a", path, "s", "k", "v"),
                 Err(ModIniError::UnknownPath { .. })
             ),
             "write refused {path:?}"
@@ -420,7 +478,7 @@ fn a_file_where_the_overrides_folder_should_be_is_an_error() {
         Err(ModIniError::OverridesNotAFolder { .. })
     ));
     assert!(matches!(
-        game_mod_ini::write_mod_ini(&ctx, "inst-a", "x.ini", "a=c\n"),
+        game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "v"),
         Err(ModIniError::OverridesNotAFolder { .. })
     ));
     assert!(!override_file(&ctx, "inst-a", "x.ini").exists());
@@ -445,7 +503,7 @@ fn a_junction_inside_overrides_that_points_outside_is_refused() {
         "a path through the junction is not listed"
     );
     assert!(matches!(
-        game_mod_ini::write_mod_ini(&ctx, "inst-a", "linked/evil.ini", "a=mine\n"),
+        game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "linked/evil.ini", "s", "k", "v"),
         Err(ModIniError::UnknownPath { .. })
     ));
     assert!(matches!(
@@ -456,5 +514,51 @@ fn a_junction_inside_overrides_that_points_outside_is_refused() {
         std::fs::read(outside.path().join("evil.ini")).unwrap(),
         b"a=evil\n",
         "the file outside the instance is untouched"
+    );
+}
+
+#[test]
+fn a_file_that_is_not_text_is_refused_and_never_written() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("binary.ini", &[0xff, 0x00, 0x01])]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+
+    assert!(matches!(
+        game_mod_ini::read_mod_ini(&ctx, "inst-a", "binary.ini"),
+        Err(ModIniError::Unparseable(_))
+    ));
+    assert!(matches!(
+        game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "binary.ini", "s", "k", "v"),
+        Err(ModIniError::Unparseable(_))
+    ));
+    assert!(!ctx
+        .paths
+        .instance_dir("inst-a")
+        .unwrap()
+        .join("overrides")
+        .exists());
+
+    let b = add_item(
+        &ctx,
+        "Mod B",
+        &[(
+            "text.ini", b"a=b
+",
+        )],
+    );
+    set_layers(&ctx, "inst-a", vec![layer("mod-b", &b, true)]);
+    write_override(&ctx, "inst-a", "text.ini", &[0xff, 0xfe]);
+    assert!(matches!(
+        game_mod_ini::read_mod_ini(&ctx, "inst-a", "text.ini"),
+        Err(ModIniError::Unparseable(_))
+    ));
+    assert!(matches!(
+        game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "text.ini", "s", "k", "v"),
+        Err(ModIniError::Unparseable(_))
+    ));
+    assert_eq!(
+        std::fs::read(override_file(&ctx, "inst-a", "text.ini")).unwrap(),
+        vec![0xff, 0xfe]
     );
 }

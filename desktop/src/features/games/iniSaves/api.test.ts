@@ -10,7 +10,7 @@ import {
   listModInis,
   resetModIni,
   setIniValue,
-  setModIni,
+  setModIniValue,
   setSaves,
   type SavesView,
 } from './api';
@@ -127,6 +127,12 @@ describe('mod INI commands', () => {
     modEnabled: true,
   };
 
+  const contents = {
+    instancePath: modRow.path,
+    source: 'override',
+    entries: [{ section: 'Display', key: 'fGamma', value: '2.2' }],
+  };
+
   beforeEach(() => {
     invokeMock.mockReset();
   });
@@ -138,11 +144,6 @@ describe('mod INI commands', () => {
   });
 
   it('reads, saves and resets one file by its path', async () => {
-    const contents = {
-      path: modRow.path,
-      source: 'override',
-      contents: '[Display]\nfGamma=2.2\n',
-    };
     invokeMock.mockResolvedValueOnce(contents);
     await expect(getModIni('inst-1', modRow.path)).resolves.toEqual(contents);
     expect(invokeMock).toHaveBeenLastCalledWith('games_mod_ini_get', {
@@ -151,12 +152,20 @@ describe('mod INI commands', () => {
     });
 
     invokeMock.mockResolvedValueOnce(contents);
-    await setModIni('inst-1', modRow.path, contents.contents);
+    await setModIniValue('inst-1', modRow.path, 'Display', 'fGamma', '2.2');
     expect(invokeMock).toHaveBeenLastCalledWith('games_mod_ini_set', {
       instanceId: 'inst-1',
       path: modRow.path,
-      contents: contents.contents,
+      section: 'Display',
+      key: 'fGamma',
+      value: '2.2',
     });
+    invokeMock.mockResolvedValueOnce(contents);
+    await setModIniValue('inst-1', modRow.path, 'Display', 'fGamma', null);
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      'games_mod_ini_set',
+      expect.objectContaining({ value: null }),
+    );
 
     invokeMock.mockResolvedValueOnce([{ ...modRow, overridden: false }]);
     await expect(resetModIni('inst-1', modRow.path)).resolves.toEqual([{ ...modRow, overridden: false }]);
@@ -175,8 +184,12 @@ describe('mod INI commands', () => {
     await expect(listModInis('inst-1')).rejects.toThrow('games_mod_inis_list did not return');
   });
 
-  it('rejects file contents with no text rather than editing an empty file', async () => {
-    invokeMock.mockResolvedValueOnce({ path: modRow.path, source: 'mod' });
+  it('rejects an entries reply with no value rather than opening an empty editor', async () => {
+    invokeMock.mockResolvedValueOnce({
+      instancePath: modRow.path,
+      source: 'mod',
+      entries: [{ section: 'Display', key: 'fGamma' }],
+    });
     await expect(getModIni('inst-1', modRow.path)).rejects.toThrow('games_mod_ini_get did not return');
   });
 });
