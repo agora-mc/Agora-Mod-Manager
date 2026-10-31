@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { expectNoUnmockedCommands, installGamesMock } from './support/games-mock';
+import { expectNoUnmockedCommands, instanceHeaderReplies, installGamesMock } from './support/games-mock';
 
 /**
  * The content slice (MASTER_SPEC §26.6, §26.14): the Library's store, an instance's Content tab,
@@ -95,7 +95,7 @@ interface Overrides {
 
 async function boot(page: Page, replies: Record<string, unknown>, overrides: Overrides = {}) {
   await installGamesMock(page, {
-    replies: { ...BOOT_REPLIES, games_list: { games: [skyrim] }, ...replies },
+    replies: { ...BOOT_REPLIES, games_list: { games: [skyrim] }, ...instanceHeaderReplies('inst-1'), ...replies },
     settings: { active_game: 'skyrim-se' },
   });
   await page.addInitScript(

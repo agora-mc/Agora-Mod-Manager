@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
+import { expectNoUnmockedCommands, instanceHeaderReplies, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
 
 /**
  * The Tools page of an instance of a non-Minecraft game (MASTER_SPEC §26.9): the declared tools, their
@@ -138,6 +138,7 @@ async function boot(page: Page, tools: ToolsTable = {}) {
     replies: {
       ...BOOT_REPLIES,
       games_list: { games: [skyrim] },
+      ...instanceHeaderReplies(INSTANCE_ID),
       games_tools_list: tools.list ?? toolsView,
       games_tools_run: tools.run ?? { status: 'finished', outcome },
       games_tools_swap_costs: tools.swapCosts ?? swapCosts,
