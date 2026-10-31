@@ -77,7 +77,10 @@
       "tool_ids": [
         "nemesis",
         "bodyslide",
-        "pandora"
+        "pandora",
+        "texgen",
+        "dyndolod",
+        "pgpatcher"
       ],
       "launch": {
         "executable": {
@@ -453,6 +456,78 @@
           "magic": "57e0e05710c0c010"
         }
       ]
+    },
+    {
+      "id": "texgen",
+      "game": "skyrim-se",
+      "name": "TexGen",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD/TexGenx64.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "output": {
+        "kind": "mod",
+        "folder": "TexGen_Output"
+      }
+    },
+    {
+      "id": "dyndolod",
+      "game": "skyrim-se",
+      "name": "DynDOLOD",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD/DynDOLODx64.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "output": {
+        "kind": "mod",
+        "folder": "DynDOLOD_Output"
+      }
+    },
+    {
+      "id": "pgpatcher",
+      "game": "skyrim-se",
+      "name": "PGPatcher",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/PGPatcher/PGPatcher.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/PGPatcher"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "output": {
+        "kind": "mod",
+        "folder": "PGPatcher Output"
+      }
     }
   ]
 }

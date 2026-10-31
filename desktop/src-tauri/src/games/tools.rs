@@ -18,7 +18,7 @@ use agora_core::game_tool_copy::{self, CopyKind, SwapCosts};
 use agora_core::game_tool_swap::{self, PendingSwap};
 use agora_core::game_tools::{
     self, CaptureMethod, CaptureMode, OutputFinding, OutputStatus, RunOutcome, ToolError,
-    ToolOffer, ToolState,
+    ToolOffer, ToolOutputRecord, ToolState,
 };
 use agora_core::game_user_tools::{self, NewUserTool, ToolCandidate, UserTool};
 use agora_game_api::{GameDefinition, ToolId};
@@ -55,6 +55,17 @@ pub struct ToolRow {
     pub status: Option<OutputStatus>,
     /// Another tool that conflicts with this one has enabled output as well.
     pub conflicts: bool,
+    /// Whether the tool writes a generated layer or imports a whole mod.
+    pub output_kind: OutputKind,
+    /// The folder a mod-output tool writes, for the screen to say where it goes.
+    pub output_folder: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputKind {
+    GeneratedLayer,
+    Mod,
 }
 
 /// What a run answered. `Finished` covers both a promoted run and a discarded one; `outcome.promoted`
@@ -78,6 +89,12 @@ pub enum RunResult {
     },
     NeedsSwap {
         tool: String,
+    },
+    /// A mod-output tool's folder already holds files. Nothing ran; the person chooses between moving
+    /// it aside and cancelling.
+    OutputFolderNotEmpty {
+        folder: String,
+        aside: String,
     },
 }
 
@@ -205,11 +222,15 @@ pub struct RestoreReply {
 #[serde(rename_all = "camelCase")]
 pub struct UserToolRow {
     pub id: String,
+    /// The id the tool runs under, namespaced away from the game's declared tools.
+    pub tool_id: String,
     pub name: String,
-    /// Game-relative path, with forward slashes.
+    /// Game-relative path, with forward slashes, or an absolute path the person chose.
     pub exe: String,
     pub args: Vec<String>,
     pub known_tool_id: Option<String>,
+    pub output_is_mod: bool,
+    pub output_folder: Option<String>,
 }
 
 /// The instance's own tools.
@@ -233,12 +254,18 @@ pub struct ToolCandidateRow {
 }
 
 fn user_tool_row(tool: UserTool) -> UserToolRow {
+    let tool_id = game_tools::user_tool_id(&tool.id)
+        .map(|id| id.to_string())
+        .unwrap_or_default();
     UserToolRow {
         id: tool.id,
+        tool_id,
         name: tool.name,
         exe: tool.exe,
         args: tool.args,
         known_tool_id: tool.known_tool_id,
+        output_is_mod: tool.output_is_mod,
+        output_folder: tool.output_folder,
     }
 }
 
@@ -338,14 +365,24 @@ pub fn tools_view(
         .collect();
     let tools = states
         .into_iter()
-        .map(|state| ToolRow {
-            conflicts: conflicting.contains(state.tool.as_str()),
-            tool_id: state.tool,
-            name: state.name,
-            declared: state.declared,
-            current: state.current,
-            previous: state.previous,
-            status: state.status,
+        .map(|state| {
+            let (output_kind, output_folder) = match &state.output {
+                agora_game_api::ToolOutput::GeneratedLayer => (OutputKind::GeneratedLayer, None),
+                agora_game_api::ToolOutput::Mod { folder } => {
+                    (OutputKind::Mod, Some(folder.clone()))
+                }
+            };
+            ToolRow {
+                conflicts: conflicting.contains(state.tool.as_str()),
+                tool_id: state.tool,
+                name: state.name,
+                declared: state.declared,
+                current: state.current,
+                previous: state.previous,
+                status: state.status,
+                output_kind,
+                output_folder,
+            }
         })
         .collect();
     ToolsView { instance_id, tools }
@@ -441,6 +478,9 @@ pub fn run_reply(result: Result<RunOutcome, ToolError>) -> Result<RunResult, Gam
             offers: offers.iter().map(OfferDto::from).collect(),
         }),
         Err(ToolError::InstallPathNeedsSwap { tool, .. }) => Ok(RunResult::NeedsSwap { tool }),
+        Err(ToolError::OutputFolderNotEmpty { folder, aside, .. }) => {
+            Ok(RunResult::OutputFolderNotEmpty { folder, aside })
+        }
         // Core refuses a swap whose costs were not shown and accepted; the screen is told by code.
         Err(ToolError::SwapNotConfirmed) => Err(GamesError::new(
             SWAP_NOT_CONFIRMED,
@@ -660,10 +700,22 @@ pub async fn games_user_tools_add(
     name: String,
     exe: String,
     args: Vec<String>,
+    output_is_mod: bool,
+    output_folder: Option<String>,
 ) -> Result<UserToolRow, GamesError> {
     with_ctx(app, move |ctx| {
-        let tool = game_user_tools::add(&ctx, &instance_id, NewUserTool { name, exe, args })
-            .map_err(core_error)?;
+        let tool = game_user_tools::add(
+            &ctx,
+            &instance_id,
+            NewUserTool {
+                name,
+                exe,
+                args,
+                output_is_mod,
+                output_folder,
+            },
+        )
+        .map_err(core_error)?;
         Ok(user_tool_row(tool))
     })
     .await
@@ -694,6 +746,151 @@ pub async fn games_user_tools_find(
         let candidates =
             game_user_tools::find_candidates(&ctx, &instance_id, &game).map_err(core_error)?;
         Ok(candidates.into_iter().map(candidate_row).collect())
+    })
+    .await
+}
+
+/// One earlier output of a mod-output tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolOutputRow {
+    pub item_id: String,
+    pub name: String,
+    pub added_at_unix_ms: i64,
+}
+
+fn output_rows(records: Vec<ToolOutputRecord>) -> Vec<ToolOutputRow> {
+    records
+        .into_iter()
+        .map(|record| ToolOutputRow {
+            item_id: record.item_id,
+            name: record.name,
+            added_at_unix_ms: record.added_at_unix_ms,
+        })
+        .collect()
+}
+
+/// A mod-output tool's earlier outputs, newest last.
+#[tauri::command]
+pub async fn games_tools_outputs(
+    app: tauri::AppHandle,
+    instance_id: String,
+    tool_id: String,
+) -> Result<Vec<ToolOutputRow>, GamesError> {
+    let tool = tool_id_of(&tool_id)?;
+    with_ctx(app, move |ctx| {
+        let records =
+            game_tools::list_tool_outputs(&ctx, &instance_id, &tool).map_err(core_error)?;
+        Ok(output_rows(records))
+    })
+    .await
+}
+
+/// Point a mod-output tool's layer back at an earlier output.
+#[tauri::command]
+pub async fn games_tools_use_output(
+    app: tauri::AppHandle,
+    instance_id: String,
+    tool_id: String,
+    item_id: String,
+) -> Result<Vec<ToolOutputRow>, GamesError> {
+    let tool = tool_id_of(&tool_id)?;
+    with_ctx(app, move |ctx| {
+        let game = definition_of(&ctx, &instance_id)?;
+        let records = game_tools::use_tool_output(&ctx, &instance_id, &game, &tool, &item_id)
+            .map_err(core_error)?;
+        Ok(output_rows(records))
+    })
+    .await
+}
+
+/// Run one of the person's own tools through the same pipeline as a declared one.
+#[tauri::command]
+pub async fn games_user_tools_run(
+    app: tauri::AppHandle,
+    instance_id: String,
+    id: String,
+    capture: String,
+    refusal: Option<String>,
+    confirm_swap: bool,
+    move_aside: bool,
+) -> Result<RunResult, GamesError> {
+    let capture = parse_capture(&capture)?;
+    require_named_refusal(refusal.as_deref())?;
+    with_ctx(app, move |ctx| {
+        let game = definition_of(&ctx, &instance_id)?;
+        let cancel = CancellationToken::new();
+        let result = match refusal {
+            Some(reason) => game_tools::run_user_tool_after_vfs_refusal(
+                &ctx,
+                &instance_id,
+                &game,
+                &id,
+                capture,
+                confirm_swap,
+                &reason,
+                move_aside,
+                &SystemLauncher,
+                &cancel,
+            ),
+            None => game_tools::run_user_tool(
+                &ctx,
+                &instance_id,
+                &game,
+                &id,
+                capture,
+                confirm_swap,
+                move_aside,
+                &SystemLauncher,
+                &cancel,
+            ),
+        };
+        run_reply(result)
+    })
+    .await
+}
+
+fn user_tool_tool_id(ctx: &Ctx, instance_id: &str, id: &str) -> Result<ToolId, GamesError> {
+    let user = game_user_tools::list(ctx, instance_id)
+        .map_err(core_error)?
+        .into_iter()
+        .find(|tool| tool.id == id)
+        .ok_or_else(|| {
+            GamesError::new(NOT_FOUND, format!("The instance has no user tool '{id}'."))
+        })?;
+    game_tools::user_tool_id(&user.id).map_err(core_error)
+}
+
+/// A user tool's earlier mod outputs, newest last.
+#[tauri::command]
+pub async fn games_user_tools_outputs(
+    app: tauri::AppHandle,
+    instance_id: String,
+    id: String,
+) -> Result<Vec<ToolOutputRow>, GamesError> {
+    with_ctx(app, move |ctx| {
+        let tool = user_tool_tool_id(&ctx, &instance_id, &id)?;
+        let records =
+            game_tools::list_tool_outputs(&ctx, &instance_id, &tool).map_err(core_error)?;
+        Ok(output_rows(records))
+    })
+    .await
+}
+
+/// Point a user tool's layer back at one of its earlier outputs.
+#[tauri::command]
+pub async fn games_user_tools_use_output(
+    app: tauri::AppHandle,
+    instance_id: String,
+    id: String,
+    item_id: String,
+) -> Result<Vec<ToolOutputRow>, GamesError> {
+    with_ctx(app, move |ctx| {
+        let game = definition_of(&ctx, &instance_id)?;
+        let tool = user_tool_tool_id(&ctx, &instance_id, &id)?;
+        let records = game_tools::use_tool_output(&ctx, &instance_id, &game, &tool, &item_id)
+            .map_err(core_error)?;
+        Ok(output_rows(records))
     })
     .await
 }
@@ -750,6 +947,7 @@ mod tests {
             tool: tool.into(),
             name: tool.into(),
             declared: true,
+            output: agora_game_api::ToolOutput::GeneratedLayer,
             current: status.map(|_| "1".to_string()),
             previous: None,
             status,

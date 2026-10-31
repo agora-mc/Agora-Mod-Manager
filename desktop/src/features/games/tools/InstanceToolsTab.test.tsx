@@ -11,7 +11,10 @@ import {
   gameToolSwapStatus,
   listGameTools,
   listUserTools,
+  listUserToolOutputs,
   removeUserTool,
+  runUserTool,
+  useUserToolOutput,
   type ToolCandidate,
 } from './api';
 
@@ -24,8 +27,11 @@ vi.mock('./api', async (importOriginal) => {
     gameToolSwapStatus: vi.fn(),
     listGameTools: vi.fn(),
     listUserTools: vi.fn(),
+    listUserToolOutputs: vi.fn(),
     removeUserTool: vi.fn(),
     restoreGameToolSwap: vi.fn(),
+    runUserTool: vi.fn(),
+    useUserToolOutput: vi.fn(),
   };
 });
 
@@ -63,12 +69,18 @@ beforeEach(() => {
   vi.mocked(findUserTools).mockReset().mockResolvedValue([unknown, known, added]);
   vi.mocked(addUserTool).mockReset().mockImplementation(async (_id, tool) => ({
     id: 'made-1',
+    toolId: 'user-made1',
     name: tool.name,
     exe: tool.exe,
     args: tool.args,
     knownToolId: null,
+    outputIsMod: tool.outputIsMod ?? false,
+    outputFolder: tool.outputFolder ?? null,
   }));
   vi.mocked(removeUserTool).mockReset();
+  vi.mocked(runUserTool).mockReset();
+  vi.mocked(listUserToolOutputs).mockReset().mockResolvedValue([]);
+  vi.mocked(useUserToolOutput).mockReset();
 });
 
 function mount() {
@@ -127,7 +139,7 @@ describe('the list of the person’s own tools', () => {
   it('lists a tool with its executable and removes it', async () => {
     vi.mocked(listUserTools).mockResolvedValue({
       instanceId: 'inst-1',
-      tools: [{ id: 'tool-1', name: 'FNIS', exe: 'Data/tools/FNIS.exe', args: ['-a'], knownToolId: null }],
+      tools: [{ id: 'tool-1', toolId: 'user-tool1', name: 'FNIS', exe: 'Data/tools/FNIS.exe', args: ['-a'], knownToolId: null, outputIsMod: false, outputFolder: null }],
     });
     vi.mocked(removeUserTool).mockResolvedValue({ instanceId: 'inst-1', tools: [] });
     mount();
@@ -144,5 +156,86 @@ describe('the list of the person’s own tools', () => {
     const alert = await screen.findByTestId('user-tools-error');
     expect(alert).toHaveTextContent('Your own tools could not be listed: The file is malformed.');
     expect(screen.queryByTestId('user-tools-empty')).toBeNull();
+  });
+});
+
+describe('running the person’s own tools', () => {
+  const fnis = {
+    id: 'tool-1',
+    toolId: 'user-tool1',
+    name: 'FNIS',
+    exe: 'Data/tools/FNIS.exe',
+    args: ['-a'],
+    knownToolId: null,
+    outputIsMod: false,
+    outputFolder: null,
+  };
+
+  it('runs a tool from its card through the user-tool command', async () => {
+    vi.mocked(listUserTools).mockResolvedValue({ instanceId: 'inst-1', tools: [fnis] });
+    vi.mocked(runUserTool).mockResolvedValue({
+      status: 'finished',
+      outcome: {
+        toolId: 'user-tool1',
+        name: 'FNIS',
+        run: 'run-1',
+        capture: 'vfs',
+        captureReason: null,
+        promoted: true,
+        current: '1',
+        previous: null,
+        written: ['Data/tools/out.txt'],
+        deleted: [],
+        exitCode: 0,
+        cancelled: false,
+        failedFolder: null,
+        failure: null,
+        copiedLayer: null,
+        installChanges: { created: [], changed: [], deleted: [], mayBeIncomplete: false, unavailable: null },
+        swap: null,
+        offers: [],
+        unchangedDropped: 0,
+      },
+    });
+    mount();
+    await screen.findByTestId('user-tool-card');
+    fireEvent.click(screen.getByRole('button', { name: 'Build FNIS' }));
+    await waitFor(() => expect(runUserTool).toHaveBeenCalledWith('inst-1', 'tool-1', 'auto', {}));
+    expect(await screen.findByTestId('tool-outcome')).toBeInTheDocument();
+  });
+
+  it('adds a tool whose output is a mod, with the folder the person chose', async () => {
+    mount();
+    await screen.findByTestId('user-tools-empty');
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'DynDOLOD' } });
+    fireEvent.change(screen.getByLabelText('Executable'), { target: { value: 'C:/Modding/DynDOLOD/DynDOLODx64.exe' } });
+    fireEvent.click(screen.getByLabelText('Its output is a mod'));
+    fireEvent.change(screen.getByLabelText('Output folder (relative to the executable, or absolute)'), { target: { value: 'DynDOLOD_Output' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add this tool' }));
+    await waitFor(() => expect(addUserTool).toHaveBeenCalledWith('inst-1', {
+      name: 'DynDOLOD',
+      exe: 'C:/Modding/DynDOLOD/DynDOLODx64.exe',
+      args: [],
+      outputIsMod: true,
+      outputFolder: 'DynDOLOD_Output',
+    }));
+  });
+
+  it('offers an earlier output and points the layer back at it', async () => {
+    vi.mocked(listUserTools).mockResolvedValue({
+      instanceId: 'inst-1',
+      tools: [{ ...fnis, outputIsMod: true, outputFolder: 'DynDOLOD_Output' }],
+    });
+    vi.mocked(listUserToolOutputs).mockResolvedValue([
+      { itemId: 'aaaa', name: 'FNIS Output (2026-10-31 14:02)', addedAtUnixMs: 1 },
+    ]);
+    vi.mocked(useUserToolOutput).mockResolvedValue([
+      { itemId: 'aaaa', name: 'FNIS Output (2026-10-31 14:02)', addedAtUnixMs: 1 },
+    ]);
+    mount();
+    await screen.findByTestId('user-tool-card');
+    fireEvent.click(screen.getByRole('button', { name: 'Use an earlier output' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Use this output' }));
+    await waitFor(() => expect(useUserToolOutput).toHaveBeenCalledWith('inst-1', 'tool-1', 'aaaa'));
   });
 });

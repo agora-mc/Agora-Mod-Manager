@@ -42,6 +42,8 @@ const nemesisRow = {
   previous: '1',
   status: 'current',
   conflicts: true,
+  outputKind: 'generated_layer',
+  outputFolder: null,
 };
 const pandoraRow = {
   toolId: 'pandora',
@@ -51,6 +53,8 @@ const pandoraRow = {
   previous: null,
   status: 'stale',
   conflicts: true,
+  outputKind: 'generated_layer',
+  outputFolder: null,
 };
 const bodyslideRow = {
   toolId: 'bodyslide',
@@ -60,6 +64,8 @@ const bodyslideRow = {
   previous: null,
   status: null,
   conflicts: false,
+  outputKind: 'generated_layer',
+  outputFolder: null,
 };
 
 const toolsView = { instanceId: INSTANCE_ID, tools: [nemesisRow, pandoraRow, bodyslideRow] };

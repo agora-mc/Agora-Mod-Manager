@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use agora_game_api::{
     glob_match, BaseReference, DeploymentStrategy, GameDefinition, GamePath, InputFingerprint,
-    Layer, LayerId, LayerSource, LayerStack, RelPath, StoreId, ToolDefinition, ToolId,
+    Layer, LayerId, LayerSource, LayerStack, RelPath, StoreId, ToolDefinition, ToolId, ToolOutput,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -41,6 +41,7 @@ use crate::game_load_order;
 use crate::game_tool_copy::{self, CopyKind, SwapCosts};
 use crate::game_tool_swap::{self, SwapError, SwapJournal};
 use crate::game_user_files::{self, UserFilesError};
+use crate::game_user_tools::UserTool;
 use crate::install_watch::{InstallChanges, InstallWatch};
 use crate::lock_manager::LockResource;
 
@@ -77,6 +78,14 @@ pub enum ToolError {
     NoOutput(String),
     #[error("tool '{0}' has no earlier generation to compare with or roll back to")]
     NoPrevious(String),
+    /// A mod-output tool's folder already holds files. Nothing ran: the user has to choose between
+    /// moving it aside and cancelling (MASTER_SPEC §26.9).
+    #[error("{tool} would write into '{folder}', but that folder already has files. Move it aside to '{aside}' and run again, or cancel.")]
+    OutputFolderNotEmpty {
+        tool: String,
+        folder: String,
+        aside: String,
+    },
     #[error("the game is running from instance '{0}'; close it before running a tool")]
     SessionRunning(String),
     /// The virtual file system could not start, so nothing ran (MASTER_SPEC §26.9). `next` is the tier
@@ -119,6 +128,8 @@ pub enum ToolError {
     Launch(#[from] LaunchError),
     #[error(transparent)]
     UserFiles(#[from] UserFilesError),
+    #[error(transparent)]
+    Content(#[from] crate::content_store::ContentError),
     #[error(transparent)]
     Instance(#[from] crate::game_instance::InstanceError),
     #[error(transparent)]
@@ -176,6 +187,9 @@ pub struct ToolState {
     pub name: String,
     /// The game's package still declares the tool. An output whose tool is gone is listed anyway.
     pub declared: bool,
+    /// Whether the tool writes a generated layer or a whole mod (MASTER_SPEC §26.9).
+    #[serde(default)]
+    pub output: ToolOutput,
     pub current: Option<String>,
     pub previous: Option<String>,
     /// `None` when the instance has no output for the tool.
@@ -411,6 +425,271 @@ fn deployment_folder(base: &BaseManifest, instance_id: &str) -> Result<PathBuf, 
         .join("deployments")
         .join(instance_id)
         .join("game"))
+}
+
+/// The id a user tool runs under (MASTER_SPEC §26.9): `user-` plus the tool's own generated id. The
+/// caller refuses a collision with a declared tool, so a stored id can never take a declared tool's
+/// place.
+pub fn user_tool_id(stored_id: &str) -> Result<ToolId, ToolError> {
+    let valid = !stored_id.is_empty()
+        && stored_id.len() <= 32
+        && stored_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err(ToolError::Invalid(format!(
+            "a user tool's saved id '{stored_id}' is not a valid tool id"
+        )));
+    }
+    ToolId::new(format!("user-{stored_id}")).map_err(ToolError::Id)
+}
+
+/// The definition a user tool runs under. A tool whose `known_tool_id` names a declared tool runs as
+/// that tool instead; [`run_user_tool`] checks that first.
+pub fn user_tool_definition(
+    definition: &GameDefinition,
+    user: &UserTool,
+) -> Result<ToolDefinition, ToolError> {
+    let id = user_tool_id(&user.id)?;
+    if definition.tool_ids.iter().any(|declared| declared == &id) {
+        return Err(ToolError::Invalid(format!(
+            "user tool '{}' would run as '{id}', which the game already declares",
+            user.name
+        )));
+    }
+    let external = crate::game_user_tools::is_absolute_exe(&user.exe);
+    let arguments = user
+        .args
+        .iter()
+        .map(|arg| agora_game_api::LaunchValue::Literal { value: arg.clone() })
+        .collect();
+    let launch = if external {
+        agora_game_api::LaunchRecipe {
+            executable: GamePath::Runtime {
+                path: RelPath::default(),
+            },
+            arguments,
+            environment: Default::default(),
+            working_directory: GamePath::Runtime {
+                path: RelPath::default(),
+            },
+        }
+    } else {
+        let rel = RelPath::new(user.exe.as_str()).map_err(|e| ToolError::Invalid(e.to_string()))?;
+        let parent = user
+            .exe
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_default();
+        agora_game_api::LaunchRecipe {
+            executable: GamePath::Runtime { path: rel },
+            arguments,
+            environment: Default::default(),
+            working_directory: GamePath::Runtime {
+                path: RelPath::new(parent).map_err(|e| ToolError::Invalid(e.to_string()))?,
+            },
+        }
+    };
+    Ok(ToolDefinition {
+        output: if user.output_is_mod {
+            ToolOutput::Mod {
+                folder: user.output_folder.clone().unwrap_or_default(),
+            }
+        } else {
+            ToolOutput::GeneratedLayer
+        },
+        output_patterns: Vec::new(),
+        id,
+        game: definition.id.clone(),
+        name: user.name.clone(),
+        launch,
+        relevant_settings: Vec::new(),
+        after_tools: Vec::new(),
+        conflicts_with: Vec::new(),
+        uses_install_path: false,
+        required_outputs: Vec::new(),
+        failure_markers: Vec::new(),
+        required_magic: Vec::new(),
+    })
+}
+
+/// The program a tool run starts: the user's absolute executable when there is one, otherwise the
+/// game-relative path its recipe names in the deployment.
+fn tool_program_path(
+    base: &BaseManifest,
+    instance_id: &str,
+    tool: &ToolDefinition,
+    external: Option<&Path>,
+) -> PathBuf {
+    if let Some(program) = external {
+        return program.to_path_buf();
+    }
+    match &tool.launch.executable {
+        GamePath::Runtime { path } => deployment_folder(base, instance_id)
+            .map(|root| root.join(path.as_str()))
+            .unwrap_or_default(),
+        GamePath::Install { path, .. } => base.source_location.join(path.as_str()),
+        GamePath::Base { path, .. } => base.location.join(path.as_str()),
+        _ => PathBuf::new(),
+    }
+}
+
+/// The folder a mod-output tool writes into. A relative folder is next to its executable; an
+/// absolute one is used as it is.
+fn mod_output_folder(tool: &ToolDefinition, program: &Path) -> Result<PathBuf, ToolError> {
+    let ToolOutput::Mod { folder } = &tool.output else {
+        return Err(ToolError::Other(format!(
+            "tool '{}' does not write a mod",
+            tool.id
+        )));
+    };
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return Err(ToolError::Invalid(format!(
+            "tool '{}' writes a mod but names no output folder",
+            tool.name
+        )));
+    }
+    let as_path = Path::new(folder);
+    if as_path.is_absolute() {
+        return Ok(as_path.to_path_buf());
+    }
+    let parent = program.parent().ok_or_else(|| {
+        ToolError::Invalid(format!(
+            "tool '{}' has no folder to put its output beside",
+            tool.name
+        ))
+    })?;
+    Ok(parent.join(folder))
+}
+
+fn folder_is_empty(dir: &Path) -> Result<bool, ToolError> {
+    let mut entries = std::fs::read_dir(dir)?;
+    Ok(entries.next().is_none())
+}
+
+fn aside_folder(instance_dir: &Path, tool: &ToolId) -> PathBuf {
+    instance_dir
+        .join("tool-output-replaced")
+        .join(tool.as_str())
+}
+
+fn next_aside_path(root: &Path) -> PathBuf {
+    let stamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
+    let mut candidate = root.join(&stamp);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = root.join(format!("{stamp}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Deal with a mod-output tool's folder before it runs (MASTER_SPEC §26.9). A non-empty folder is
+/// never deleted: the user chooses between moving it into `<instance>/tool-output-replaced/<tool>/`
+/// and cancelling. A move that cannot be made refuses and changes nothing.
+fn prepare_mod_output(
+    instance_dir: &Path,
+    tool: &ToolDefinition,
+    folder: &Path,
+    move_aside: bool,
+) -> Result<(), ToolError> {
+    if !folder.exists() {
+        return Ok(());
+    }
+    if !folder.is_dir() {
+        return Err(ToolError::Invalid(format!(
+            "'{}' is not a folder, so {} cannot write its output there",
+            folder.display(),
+            tool.name
+        )));
+    }
+    if folder_is_empty(folder)? {
+        return Ok(());
+    }
+    let root = aside_folder(instance_dir, &tool.id);
+    if root.exists() && !root.is_dir() {
+        return Err(ToolError::Invalid(format!(
+            "'{}' is a file, so Agora cannot move the old output aside",
+            root.display()
+        )));
+    }
+    let target = next_aside_path(&root);
+    if !move_aside {
+        return Err(ToolError::OutputFolderNotEmpty {
+            tool: tool.name.clone(),
+            folder: folder.display().to_string(),
+            aside: target.display().to_string(),
+        });
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(folder, &target).map_err(|error| {
+        ToolError::Invalid(format!(
+            "the old output could not be moved to '{}': {error}. Nothing was changed",
+            target.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// A tool's absolute executable, when its recipe is not a game path. The file is checked again here,
+/// so an edited list cannot point a run somewhere else.
+fn external_program(program: Option<&Path>) -> Result<Option<PathBuf>, ToolError> {
+    let Some(program) = program else {
+        return Ok(None);
+    };
+    if !program.is_file() {
+        return Err(ToolError::Invalid(format!(
+            "'{}' is not an existing file",
+            program.display()
+        )));
+    }
+    let is_exe = program
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    if !is_exe {
+        return Err(ToolError::Invalid(format!(
+            "'{}' is not an .exe file",
+            program.display()
+        )));
+    }
+    Ok(Some(program.to_path_buf()))
+}
+
+/// Resolve a tool's launch, using the user's absolute executable when there is one.
+fn resolve_tool_launch(
+    tool: &ToolDefinition,
+    roots: &LaunchRoots,
+    external: Option<&Path>,
+) -> Result<crate::game_launch::ResolvedLaunch, LaunchError> {
+    let Some(program) = external else {
+        return game_launch::resolve_recipe(&tool.launch, roots);
+    };
+    if !program.is_file() {
+        return Err(LaunchError::ProgramMissing {
+            path: program.to_path_buf(),
+        });
+    }
+    let mut args = Vec::with_capacity(tool.launch.arguments.len());
+    for arg in &tool.launch.arguments {
+        let agora_game_api::LaunchValue::Literal { value } = arg else {
+            return Err(LaunchError::UnsupportedRoot(
+                "an absolute user tool only takes literal arguments".to_string(),
+            ));
+        };
+        args.push(std::ffi::OsString::from(value));
+    }
+    Ok(crate::game_launch::ResolvedLaunch {
+        program: program.to_path_buf(),
+        args,
+        env: Default::default(),
+        cwd: program
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| program.to_path_buf()),
+    })
 }
 
 fn read_record(dir: &Path) -> Result<ToolRecord, ToolError> {
@@ -755,9 +1034,8 @@ fn list_with_manifest(
         .map_err(|e| ToolError::Other(e.to_string()))?;
     let mut states: BTreeMap<String, ToolState> = BTreeMap::new();
     for tool_id in &definition.tool_ids {
-        let name = ctx
-            .games
-            .tool(&definition.id, tool_id)
+        let declared_tool = ctx.games.tool(&definition.id, tool_id);
+        let name = declared_tool
             .map(|t| t.name.clone())
             .unwrap_or_else(|| tool_id.to_string());
         states.insert(
@@ -766,6 +1044,9 @@ fn list_with_manifest(
                 tool: tool_id.to_string(),
                 name,
                 declared: true,
+                output: declared_tool
+                    .map(|t| t.output.clone())
+                    .unwrap_or(ToolOutput::GeneratedLayer),
                 current: None,
                 previous: None,
                 status: None,
@@ -794,6 +1075,9 @@ fn list_with_manifest(
                 tool: tool.to_string(),
                 name,
                 declared: declared.is_some(),
+                output: declared
+                    .map(|t| t.output.clone())
+                    .unwrap_or(ToolOutput::GeneratedLayer),
                 current: Some(generation.clone()),
                 previous,
                 status: Some(layer_status(
@@ -1310,16 +1594,20 @@ pub fn run(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
+    let tool = declared_tool(ctx, definition, tool_id)?;
     run_inner(
         ctx,
         instance_id,
         definition,
+        &tool,
         tool_id,
         capture,
         swap_costs_acknowledged,
         launcher,
         cancel,
         None,
+        None,
+        false,
     )
 }
 
@@ -1339,14 +1627,90 @@ pub fn run_after_vfs_refusal(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
+    let tool = declared_tool(ctx, definition, tool_id)?;
     match next {
         CaptureMode::Links | CaptureMode::Swap => run_inner(
             ctx,
             instance_id,
             definition,
+            &tool,
             tool_id,
             next,
             swap_costs_acknowledged,
+            launcher,
+            cancel,
+            Some(refusal),
+            None,
+            false,
+        ),
+        CaptureMode::Vfs | CaptureMode::Auto => Err(ToolError::Other(
+            "only link capture or the full-copy swap can follow a refused virtual file system run"
+                .into(),
+        )),
+    }
+}
+
+/// The user's tool in an instance's list.
+fn find_user_tool(ctx: &Ctx, instance_id: &str, id: &str) -> Result<UserTool, ToolError> {
+    crate::game_user_tools::list(ctx, instance_id)
+        .map_err(|e| ToolError::Invalid(e.to_string()))?
+        .into_iter()
+        .find(|tool| tool.id == id)
+        .ok_or_else(|| ToolError::Invalid(format!("the instance has no user tool '{id}'")))
+}
+
+/// A user tool's run: a tool the user added runs through the same pipeline as a declared tool, under
+/// the same capture (MASTER_SPEC §26.9). A user tool whose `known_tool_id` names a declared tool runs
+/// as that tool. A tool that wrote a whole mod has its output imported after a successful run.
+#[allow(clippy::too_many_arguments)]
+pub fn run_user_tool(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    user_tool_id: &str,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    move_aside: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
+    run_user_inner(
+        ctx,
+        instance_id,
+        definition,
+        user_tool_id,
+        capture,
+        swap_costs_acknowledged,
+        move_aside,
+        launcher,
+        cancel,
+        None,
+    )
+}
+
+/// [`run_user_tool`] by the tier the user chose after the virtual file system refused it.
+#[allow(clippy::too_many_arguments)]
+pub fn run_user_tool_after_vfs_refusal(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    user_tool_id: &str,
+    next: CaptureMode,
+    swap_costs_acknowledged: bool,
+    refusal: &str,
+    move_aside: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
+    match next {
+        CaptureMode::Links | CaptureMode::Swap => run_user_inner(
+            ctx,
+            instance_id,
+            definition,
+            user_tool_id,
+            next,
+            swap_costs_acknowledged,
+            move_aside,
             launcher,
             cancel,
             Some(refusal),
@@ -1356,6 +1720,71 @@ pub fn run_after_vfs_refusal(
                 .into(),
         )),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_user_inner(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    user_tool_id: &str,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    move_aside: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+    fallback: Option<&str>,
+) -> Result<RunOutcome, ToolError> {
+    let user = find_user_tool(ctx, instance_id, user_tool_id)?;
+    if let Some(known) = user.known_tool_id.as_deref() {
+        if let Ok(id) = ToolId::new(known) {
+            if ctx.games.tool(&definition.id, &id).is_some() {
+                return match fallback {
+                    Some(refusal) => run_after_vfs_refusal(
+                        ctx,
+                        instance_id,
+                        definition,
+                        &id,
+                        capture,
+                        swap_costs_acknowledged,
+                        refusal,
+                        launcher,
+                        cancel,
+                    ),
+                    None => run(
+                        ctx,
+                        instance_id,
+                        definition,
+                        &id,
+                        capture,
+                        swap_costs_acknowledged,
+                        launcher,
+                        cancel,
+                    ),
+                };
+            }
+        }
+    }
+    let tool = user_tool_definition(definition, &user)?;
+    let external = if crate::game_user_tools::is_absolute_exe(&user.exe) {
+        Some(PathBuf::from(&user.exe))
+    } else {
+        None
+    };
+    run_inner(
+        ctx,
+        instance_id,
+        definition,
+        &tool,
+        &tool.id,
+        capture,
+        swap_costs_acknowledged,
+        launcher,
+        cancel,
+        fallback,
+        external.as_deref(),
+        move_aside,
+    )
 }
 
 /// The reason a run captured by a tier the user chose after a refusal gives (MASTER_SPEC §26.9).
@@ -1371,17 +1800,19 @@ fn run_inner(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    tool: &ToolDefinition,
     tool_id: &ToolId,
     capture: CaptureMode,
     swap_costs_acknowledged: bool,
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
     fallback: Option<&str>,
+    external: Option<&Path>,
+    move_aside: bool,
 ) -> Result<RunOutcome, ToolError> {
     if capture == CaptureMode::Swap && !swap_costs_acknowledged {
         return Err(ToolError::SwapNotConfirmed);
     }
-    let tool = declared_tool(ctx, definition, tool_id)?;
     let record = crate::game_instance::get(ctx, instance_id)?
         .ok_or_else(|| ToolError::InstanceNotFound(instance_id.to_string()))?;
     let base_id = match &record.base {
@@ -1393,6 +1824,21 @@ fn run_inner(
     let base = load_base(ctx, &base_id)?;
     let store = base.runtime.store.clone();
     refuse_during_session(ctx, definition, &store)?;
+
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    let external = external_program(external)?;
+    let output_dir = match &tool.output {
+        ToolOutput::GeneratedLayer => None,
+        ToolOutput::Mod { .. } => {
+            let program = tool_program_path(&base, instance_id, tool, external.as_deref());
+            let folder = mod_output_folder(tool, &program)?;
+            prepare_mod_output(&instance_dir, tool, &folder, move_aside)?;
+            Some(folder)
+        }
+    };
 
     // Decided before anything is deployed (MASTER_SPEC §26.9, decision 1). Under `auto` a virtual instance
     // runs every tool under the virtual file system; a linked or copied instance runs a tool that uses its
@@ -1423,12 +1869,12 @@ fn run_inner(
         CaptureMode::Vfs | CaptureMode::Auto => match launcher.locate_vfs_dll() {
             Ok(dll) => Route::Vfs(dll),
             Err(reason) => {
-                let next = next_capture(&tool);
+                let next = next_capture(tool);
                 return Err(refused_vfs(
                     ctx,
                     instance_id,
                     definition,
-                    &tool,
+                    tool,
                     tool_id,
                     reason,
                     next,
@@ -1450,18 +1896,20 @@ fn run_inner(
                 ctx,
                 instance_id,
                 definition,
-                &tool,
+                tool,
                 tool_id,
                 &base,
                 launcher,
                 cancel,
                 reason,
+                external.as_deref(),
+                output_dir.as_deref(),
             )?;
             Ok(with_offers(
                 ctx,
                 instance_id,
                 definition,
-                &tool,
+                tool,
                 tool_id,
                 outcome,
                 false,
@@ -1472,23 +1920,25 @@ fn run_inner(
                 ctx,
                 instance_id,
                 definition,
-                &tool,
+                tool,
                 tool_id,
                 &base,
                 dll,
                 launcher,
                 cancel,
+                external.as_deref(),
+                output_dir.as_deref(),
             ) {
                 Ok(found) => found,
                 // The program would not start under the VFS, after the instance was deployed: nothing ran,
                 // and the refusal is counted like one from the locate step.
                 Err(ToolError::VfsUnavailable { reason, next, .. }) => {
-                    let next = next.unwrap_or_else(|| next_capture(&tool));
+                    let next = next.unwrap_or_else(|| next_capture(tool));
                     return Err(refused_vfs(
                         ctx,
                         instance_id,
                         definition,
-                        &tool,
+                        tool,
                         tool_id,
                         reason,
                         next,
@@ -1500,7 +1950,7 @@ fn run_inner(
                 ctx,
                 instance_id,
                 definition,
-                &tool,
+                tool,
                 tool_id,
                 outcome,
                 injected,
@@ -1511,18 +1961,20 @@ fn run_inner(
                 ctx,
                 instance_id,
                 definition,
-                &tool,
+                tool,
                 tool_id,
                 &base,
                 launcher,
                 cancel,
                 reason,
+                external.as_deref(),
+                output_dir.as_deref(),
             )?;
             Ok(with_offers(
                 ctx,
                 instance_id,
                 definition,
-                &tool,
+                tool,
                 tool_id,
                 outcome,
                 false,
@@ -1584,6 +2036,8 @@ fn run_under_vfs(
     dll: PathBuf,
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
+    external: Option<&Path>,
+    output_dir: Option<&Path>,
 ) -> Result<(RunOutcome, bool), ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -1601,7 +2055,7 @@ fn run_under_vfs(
         install: Some(base.source_location.clone()),
         base: Some(base.location.clone()),
     };
-    let resolved = game_launch::resolve_recipe(&tool.launch, &roots)?;
+    let resolved = resolve_tool_launch(tool, &roots, external)?;
 
     let dir = tool_dir(&instance_dir, tool_id.as_str());
     let run = new_run_id();
@@ -1670,6 +2124,7 @@ fn run_under_vfs(
                 &run,
                 &fingerprint,
                 &exit,
+                output_dir,
             )
             .map(|settled| (settled, dropped))
         });
@@ -1726,6 +2181,8 @@ fn run_from_links(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
     reason: Option<String>,
+    external: Option<&Path>,
+    output_dir: Option<&Path>,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -1754,7 +2211,7 @@ fn run_from_links(
         install: Some(base.source_location.clone()),
         base: Some(base.location.clone()),
     };
-    let resolved = game_launch::resolve_recipe(&tool.launch, &roots)?;
+    let resolved = resolve_tool_launch(tool, &roots, external)?;
 
     let dir = tool_dir(&instance_dir, tool_id.as_str());
     let run = new_run_id();
@@ -1791,6 +2248,7 @@ fn run_from_links(
         &game_dir,
         &before,
         &exit,
+        output_dir,
     );
     // The farm holds whatever the tool wrote. It goes whatever became of the output, and without a
     // harvest: the writes were captured above, and the next launch deploys the promoted output.
@@ -1832,6 +2290,8 @@ fn run_by_swap(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
     reason: Option<String>,
+    external: Option<&Path>,
+    output_dir: Option<&Path>,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -1892,7 +2352,7 @@ fn run_by_swap(
         install: Some(install.clone()),
         base: Some(base.location.clone()),
     };
-    let resolved = match game_launch::resolve_recipe(&tool.launch, &roots) {
+    let resolved = match resolve_tool_launch(tool, &roots, external) {
         Ok(resolved) => resolved,
         Err(e) => {
             return Err(put_back_after(
@@ -1946,6 +2406,7 @@ fn run_by_swap(
         &journal.copy_dir,
         &before,
         &exit,
+        output_dir,
     );
     let finished = game_tool_copy::finish_copy(ctx, definition, &journal);
     let released = release_session(ctx, definition, &store);
@@ -2001,6 +2462,7 @@ fn capture_from_copy(
     copy_dir: &Path,
     before: &game_tool_copy::CopyRecord,
     exit: &TreeExit,
+    output_dir: Option<&Path>,
 ) -> Result<(Settled, CopyCounts), ToolError> {
     std::fs::create_dir_all(staging)?;
     let deployed = game_tool_copy::as_deployment_record(before);
@@ -2041,6 +2503,7 @@ fn capture_from_copy(
         run,
         fingerprint,
         exit,
+        output_dir,
     )?;
     Ok((settled, counts))
 }
@@ -2166,6 +2629,7 @@ fn capture_from_links(
     game_dir: &Path,
     before: &DeploymentRecord,
     exit: &TreeExit,
+    output_dir: Option<&Path>,
 ) -> Result<Settled, ToolError> {
     std::fs::create_dir_all(staging)?;
     // A copy is changed when its bytes differ, not when its time moves: a tool that rewrites the same
@@ -2220,6 +2684,7 @@ fn capture_from_links(
         run,
         fingerprint,
         exit,
+        output_dir,
     )
 }
 
@@ -2237,6 +2702,262 @@ pub(crate) fn write_whiteout(staging: &Path, rel: &RelPath) -> Result<(), ToolEr
     }
     std::fs::write(&marker, b"")?;
     Ok(())
+}
+
+/// A mod-output tool's earlier outputs (MASTER_SPEC §26.9). They stay in the content store, so
+/// pointing the tool's layer back at one is a layer change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputRecord {
+    pub item_id: String,
+    pub name: String,
+    pub added_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ToolOutputsFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    tools: BTreeMap<String, Vec<ToolOutputRecord>>,
+}
+
+const TOOL_OUTPUTS_FILE: &str = "tool-outputs.json";
+
+fn read_outputs(instance_dir: &Path) -> Result<ToolOutputsFile, ToolError> {
+    let path = instance_dir.join(TOOL_OUTPUTS_FILE);
+    if !path.exists() {
+        return Ok(ToolOutputsFile::default());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    serde_json::from_str(&text).map_err(|e| {
+        ToolError::Other(format!(
+            "'{}' is not a valid record of tool outputs: {e}",
+            path.display()
+        ))
+    })
+}
+
+fn write_outputs(instance_dir: &Path, file: &ToolOutputsFile) -> Result<(), ToolError> {
+    std::fs::create_dir_all(instance_dir)?;
+    let path = instance_dir.join(TOOL_OUTPUTS_FILE);
+    let tmp = instance_dir.join(format!("{TOOL_OUTPUTS_FILE}.{}.tmp", new_id_suffix()));
+    let mut bytes = serde_json::to_vec_pretty(file)?;
+    bytes.push(b'\n');
+    std::fs::write(&tmp, bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// The layer a mod-output tool's result sits in, named after the tool so a later run can point it at
+/// a new item without adding another layer.
+fn output_layer_id(tool_id: &ToolId) -> Result<LayerId, ToolError> {
+    let digest = Sha256::digest(tool_id.as_str().as_bytes());
+    let hex = format!("{digest:x}");
+    LayerId::new(format!("tool-output:{}", &hex[..16])).map_err(ToolError::Id)
+}
+
+/// Point a mod-output tool's layer at `item_id`: the item from this run, or an earlier output the
+/// user chose. A new layer goes at the end of the content (mod) order.
+fn point_output_layer(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    item_id: &str,
+) -> Result<(), ToolError> {
+    let mut manifest = load_manifest(ctx, instance_id)?;
+    let mut layers = manifest.layers.layers().to_vec();
+    let id = output_layer_id(tool_id)?;
+    match layers.iter().position(|layer| layer.id == id) {
+        Some(i) => {
+            layers[i].source = LayerSource::Content {
+                content: item_id.to_string(),
+            };
+            layers[i].enabled = true;
+        }
+        None => {
+            let layer = Layer {
+                id,
+                enabled: true,
+                mount_path: RelPath::default(),
+                source_path: RelPath::default(),
+                source: LayerSource::Content {
+                    content: item_id.to_string(),
+                },
+                whiteouts: Vec::new(),
+                own_copy: false,
+            };
+            let at = layers
+                .iter()
+                .position(|layer| layer.source.rank() > 2)
+                .unwrap_or(layers.len());
+            layers.insert(at, layer);
+        }
+    }
+    save_layers(ctx, instance_id, definition, &mut manifest, layers)
+}
+
+fn current_mod_output(
+    ctx: &Ctx,
+    instance_id: &str,
+    tool_id: &ToolId,
+) -> Result<Option<String>, ToolError> {
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    Ok(read_outputs(&instance_dir)?
+        .tools
+        .get(tool_id.as_str())
+        .and_then(|items| items.last())
+        .map(|item| item.item_id.clone()))
+}
+
+/// Import a mod-output tool's folder as a content item and point the tool's layer at it. The item is
+/// named after the tool and the local UTC time of the run.
+fn import_mod_output(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool: &ToolDefinition,
+    folder: &Path,
+) -> Result<ToolOutputRecord, ToolError> {
+    let now = chrono::Utc::now();
+    let name = format!("{} Output ({})", tool.name, now.format("%Y-%m-%d %H:%M"));
+    let outcome = crate::content_store::add_folder(ctx, folder, Some(&name))?;
+    let item = outcome.item();
+    let record = ToolOutputRecord {
+        item_id: item.item_id.clone(),
+        name,
+        added_at_unix_ms: now.timestamp_millis(),
+    };
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    let mut file = read_outputs(&instance_dir)?;
+    file.version = 1;
+    let items = file.tools.entry(tool.id.to_string()).or_default();
+    if items.last().map(|last| &last.item_id) != Some(&record.item_id) {
+        items.push(record.clone());
+    }
+    write_outputs(&instance_dir, &file)?;
+    point_output_layer(ctx, instance_id, definition, &tool.id, &record.item_id)?;
+    Ok(record)
+}
+
+/// A mod-output tool's earlier outputs, newest last.
+pub fn list_tool_outputs(
+    ctx: &Ctx,
+    instance_id: &str,
+    tool_id: &ToolId,
+) -> Result<Vec<ToolOutputRecord>, ToolError> {
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    Ok(read_outputs(&instance_dir)?
+        .tools
+        .get(tool_id.as_str())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Point a tool's layer back at an earlier output. The item must be one this tool produced; nothing
+/// else can be made a tool's output through this door.
+pub fn use_tool_output(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    item_id: &str,
+) -> Result<Vec<ToolOutputRecord>, ToolError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "tool-output-use",
+    )?;
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    let file = read_outputs(&instance_dir)?;
+    let items = file
+        .tools
+        .get(tool_id.as_str())
+        .cloned()
+        .unwrap_or_default();
+    if !items.iter().any(|item| item.item_id == item_id) {
+        return Err(ToolError::Invalid(format!(
+            "'{item_id}' is not an earlier output of tool '{tool_id}'"
+        )));
+    }
+    crate::content_store::get_item(ctx, item_id)?;
+    point_output_layer(ctx, instance_id, definition, tool_id, item_id)?;
+    Ok(items)
+}
+
+/// Settle a run of a tool whose output is a whole mod: the folder is the output, not the run's
+/// staging folder. Nothing is imported when the run failed, was cancelled, or left the folder empty.
+#[allow(clippy::too_many_arguments)]
+fn settle_mod_output(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool: &ToolDefinition,
+    dir: &Path,
+    staging: &Path,
+    run: &str,
+    folder: &Path,
+    exit: &TreeExit,
+) -> Result<Settled, ToolError> {
+    let written = written_files(staging)?;
+    let failure = if exit.cancelled {
+        Some("the run was cancelled".to_string())
+    } else if exit.code != Some(0) {
+        Some(match exit.code {
+            Some(code) => format!("the tool exited with code {code}"),
+            None => "the tool exited with no exit code".to_string(),
+        })
+    } else {
+        match crate::content_store::collect_folder_files(folder) {
+            Ok(files) if !files.is_empty() => None,
+            Ok(_) => Some(format!(
+                "the tool exited with code 0 but its output folder '{}' has no files, so nothing was imported",
+                folder.display()
+            )),
+            Err(e) => Some(format!(
+                "the tool exited with code 0 but its output folder '{}' could not be read: {e}",
+                folder.display()
+            )),
+        }
+    };
+    let current = current_mod_output(ctx, instance_id, &tool.id)?;
+    if let Some(failure) = failure {
+        let failed = discard(dir, staging, run)?;
+        return Ok(Settled {
+            written,
+            promoted: false,
+            current,
+            previous: None,
+            deleted: Vec::new(),
+            failed_folder: Some(failed),
+            failure: Some(failure),
+        });
+    }
+    let record = import_mod_output(ctx, instance_id, definition, tool, folder)?;
+    let _ = std::fs::remove_dir_all(staging);
+    Ok(Settled {
+        written: Vec::new(),
+        promoted: true,
+        current: Some(record.item_id.clone()),
+        previous: current,
+        deleted: Vec::new(),
+        failed_folder: None,
+        failure: None,
+    })
 }
 
 /// What became of a finished run's output.
@@ -2264,7 +2985,21 @@ fn settle_run(
     run: &str,
     fingerprint: &str,
     exit: &TreeExit,
+    output_dir: Option<&Path>,
 ) -> Result<Settled, ToolError> {
+    if let Some(folder) = output_dir {
+        return settle_mod_output(
+            ctx,
+            instance_id,
+            definition,
+            tool,
+            dir,
+            staging,
+            run,
+            folder,
+            exit,
+        );
+    }
     let written = written_files(staging)?;
     let failure = if exit.cancelled {
         Some("the run was cancelled".to_string())

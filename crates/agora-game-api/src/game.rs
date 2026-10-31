@@ -1303,6 +1303,25 @@ pub struct InstalledFramework {
     pub layers: Vec<LayerId>,
 }
 
+/// What a tool's successful run produces (MASTER_SPEC §26.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolOutput {
+    /// A generated layer: everything the run wrote, kept as the tool's next generation.
+    #[default]
+    GeneratedLayer,
+    /// A whole mod the tool wrote into a folder. A successful run imports that folder as a content
+    /// item and points the tool's layer at it. A relative folder is next to the tool's executable;
+    /// an absolute one is used as it is.
+    Mod { folder: String },
+}
+
+impl ToolOutput {
+    pub fn is_generated_layer(&self) -> bool {
+        matches!(self, ToolOutput::GeneratedLayer)
+    }
+}
+
 /// A program the game's package declares that reads the installed mods and writes files the game
 /// needs (MASTER_SPEC §26.9). Core runs it under the instance's virtual file system and keeps what
 /// it wrote as a generated layer.
@@ -1316,6 +1335,10 @@ pub struct ToolDefinition {
     /// What the tool is called to a person, e.g. "Nemesis".
     pub name: String,
     pub launch: LaunchRecipe,
+    /// What the tool produces (MASTER_SPEC §26.9). Defaults to a generated layer, so a tool that
+    /// writes files for the game keeps the behaviour it had before this field existed.
+    #[serde(default, skip_serializing_if = "ToolOutput::is_generated_layer")]
+    pub output: ToolOutput,
     /// INI settings, as `file:section:key` (e.g. `user/Skyrim.ini:General:SLocalSavePath`), whose
     /// values the tool's output depends on. A change makes the output stale.
     #[serde(default)]
