@@ -689,14 +689,10 @@ fn plan_inner(
     match std::fs::symlink_metadata(&overrides_dir) {
         Ok(meta) => {
             if is_reparse_point_or_symlink(&meta) {
-                let root = std::fs::canonicalize(&instance_dir)?;
-                let resolved = std::fs::canonicalize(&overrides_dir)?;
-                if !resolved.starts_with(&root) {
-                    return Err(DeployError::Other(format!(
-                        "refusing to deploy {}: it points outside the instance",
-                        overrides_dir.display()
-                    )));
-                }
+                return Err(DeployError::Other(format!(
+                    "refusing to deploy {}: a symlink or junction under overrides/ is not allowed",
+                    overrides_dir.display()
+                )));
             }
             let mut override_files = Vec::new();
             walk_overrides_dir(&overrides_dir, Path::new(""), &mut override_files)?;
@@ -1102,7 +1098,10 @@ fn walk_overrides_dir(
         let abs_path = entry.path();
         let meta = std::fs::symlink_metadata(&abs_path)?;
         if is_reparse_point_or_symlink(&meta) {
-            continue;
+            return Err(DeployError::Other(format!(
+                "refusing to deploy {}: a symlink or junction under overrides/ is not allowed",
+                abs_path.display()
+            )));
         }
         let child_rel = rel.join(entry.file_name());
         if meta.is_dir() {
@@ -1111,6 +1110,11 @@ fn walk_overrides_dir(
             let rel_str = child_rel.to_string_lossy().replace('\\', "/");
             let rel_path = RelPath::new(rel_str)
                 .map_err(|e| DeployError::Other(format!("invalid path in overrides layer: {e}")))?;
+            // Only INI files are part of the overrides layer; anything else there (a temp file, a
+            // stray text file) is not deployed and is not shown to the user.
+            if !is_ini_path(rel_path.as_str()) {
+                continue;
+            }
             out.push(LayerFileEntry {
                 path: rel_path,
                 source: FileSource::Override {
@@ -1238,6 +1242,36 @@ pub(crate) fn visible_paths_of(
     Ok(paths)
 }
 
+/// Whether a game-relative path names an INI file, matched without case.
+fn is_ini_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ini"))
+}
+
+/// Refuse a symlink or junction on the way from `root` to `target`, naming it. A component that
+/// does not exist yet cannot point anywhere and ends the walk.
+fn refuse_reparse_on_the_way(root: &Path, target: &Path) -> Result<(), DeployError> {
+    let relative = target.strip_prefix(root).unwrap_or(target);
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if is_reparse_point_or_symlink(&meta) {
+                    return Err(DeployError::Other(format!(
+                        "refusing to use {}: a symlink or junction under overrides/ is not allowed",
+                        current.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// The file on disk whose bytes the game sees at `rel` (a `/`-separated path relative to the game
 /// root, matched case-insensitively) under `mode`. The writable layer is on top, so it wins. `None`
 /// when no file the game would see has that path.
@@ -1252,8 +1286,11 @@ pub fn visible_file_source(
         .paths
         .instance_dir(instance_id)
         .map_err(|e| DeployError::Other(e.to_string()))?;
-    let overrides = instance_dir.join("overrides").join(rel);
-    if overrides.is_file() {
+    let overrides_root = instance_dir.join("overrides");
+    refuse_reparse_on_the_way(&instance_dir, &overrides_root)?;
+    let overrides = overrides_root.join(rel);
+    refuse_reparse_on_the_way(&instance_dir, &overrides)?;
+    if is_ini_path(rel) && overrides.is_file() {
         return Ok(Some(overrides));
     }
     let writable = instance_dir.join("writable").join(rel);

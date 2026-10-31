@@ -497,18 +497,17 @@ fn a_junction_inside_overrides_that_points_outside_is_refused() {
     std::fs::create_dir_all(&overrides).unwrap();
     junction::create(outside.path(), overrides.join("linked")).unwrap();
 
-    let rows = game_mod_ini::list_mod_inis(&ctx, "inst-a").unwrap();
-    assert!(
-        rows.iter().all(|row| row.path != "linked/evil.ini"),
-        "a path through the junction is not listed"
-    );
+    assert!(matches!(
+        game_mod_ini::list_mod_inis(&ctx, "inst-a"),
+        Err(ModIniError::Reparse { .. })
+    ));
     assert!(matches!(
         game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "linked/evil.ini", "s", "k", "v"),
-        Err(ModIniError::UnknownPath { .. })
+        Err(ModIniError::Reparse { .. })
     ));
     assert!(matches!(
         game_mod_ini::reset_mod_ini(&ctx, "inst-a", "linked/evil.ini"),
-        Err(ModIniError::UnknownPath { .. })
+        Err(ModIniError::Reparse { .. })
     ));
     assert_eq!(
         std::fs::read(outside.path().join("evil.ini")).unwrap(),

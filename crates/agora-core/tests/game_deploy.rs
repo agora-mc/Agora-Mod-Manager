@@ -5,7 +5,8 @@ use agora_core::ctx::CoreContext;
 use agora_core::game_base::{get_file_identity, BaseMode};
 use agora_core::game_deploy::{
     add_content, deploy, deployment_dir, move_content, plan, remove_content, set_content_enabled,
-    set_content_own_copy, undeploy, DeployError, DeployMode, DeployOutcome, FileSource, Placement,
+    set_content_own_copy, undeploy, visible_file_source, DeployError, DeployMode, DeployOutcome,
+    FileSource, Placement,
 };
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{
@@ -2786,5 +2787,74 @@ fn review_visible_file_source_does_not_answer_with_a_file_through_an_overrides_j
     assert!(
         result.is_err(),
         "visible_file_source answered {result:?} for a file outside the instance"
+    );
+}
+
+// Verify only (item 5): the reviewer's finding about the writable layer and the overrides layer
+// under each strategy. This test is ignored because it documents a disagreement, not a contract.
+#[test]
+#[ignore = "finding: under Virtual the VFS upper layer (writable) beats the override in the farm, while visible_file_source answers with the override"]
+fn review_which_file_the_game_sees_when_writable_and_overrides_share_a_path() {
+    let (_tmp, ctx, def, id) = probe_fixture("ReviewWritableVsOverride");
+    let rel = "SKSE/Plugins/SSEDisplayTweaks.ini";
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[(
+            rel,
+            b"[Display]
+gamma=1",
+        )],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    game_mod_ini::set_mod_ini_value(&ctx, &id, rel, "Display", "gamma", "2").unwrap();
+
+    let writable = instance_writable_dir(&ctx, &id).join(rel);
+    std::fs::create_dir_all(writable.parent().unwrap()).unwrap();
+    std::fs::write(
+        &writable,
+        b"[Display]
+gamma=3",
+    )
+    .unwrap();
+    let override_path = ctx
+        .paths
+        .instance_dir(&id)
+        .unwrap()
+        .join("overrides")
+        .join(rel);
+
+    let seen = |mode| {
+        visible_file_source(&ctx, &id, &def, mode, rel)
+            .unwrap()
+            .unwrap()
+    };
+    let virtual_seen = seen(DeployMode::Virtual);
+    let links_seen = seen(DeployMode::Links);
+    let copies_seen = seen(DeployMode::Copies);
+
+    // What the game actually reads. Under the VFS the writable layer is the upper layer over the
+    // farm (game_instance::prepare_launch sets `upper: <instance>/writable`, `lowers: [game_dir]`),
+    // so a game-written file beats an override placed in the farm. Links and Copies place the
+    // overrides layer after the writable layer in the farm itself.
+    let vfs_game_reads = if writable.is_file() {
+        writable.clone()
+    } else {
+        virtual_seen.clone()
+    };
+    println!("virtual game reads {vfs_game_reads:?}");
+    println!("virtual lookup answers {virtual_seen:?}");
+    println!("links game/lookup answers {links_seen:?}");
+    println!("copies game/lookup answers {copies_seen:?}");
+
+    assert_eq!(
+        vfs_game_reads, writable,
+        "the VFS upper layer wins for the game"
+    );
+    assert_eq!(links_seen, override_path, "linked files read the override");
+    assert_eq!(copies_seen, override_path, "copied files read the override");
+    assert_eq!(
+        virtual_seen, vfs_game_reads,
+        "visible_file_source disagrees with the VFS about the same path"
     );
 }

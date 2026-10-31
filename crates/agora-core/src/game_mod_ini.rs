@@ -41,6 +41,8 @@ pub enum ModIniError {
     EscapesInstance { path: PathBuf },
     #[error("'{0}' is not a text INI file, so it cannot be edited here")]
     Unparseable(String),
+    #[error("refusing to use {}: a symlink or junction under overrides/ is not allowed", path.display())]
+    Reparse { path: PathBuf },
     #[error("cannot read {}: {source}", path.display())]
     Unreadable {
         path: PathBuf,
@@ -228,14 +230,8 @@ fn override_files(ctx: &Ctx, instance_id: &str) -> Result<Vec<String>, ModIniErr
             if !followed.is_dir() {
                 return Err(ModIniError::OverridesNotAFolder { path: root });
             }
-            if is_reparse_point(&meta) {
-                std::fs::canonicalize(&root).map_err(|source| ModIniError::UnreadableOverrides {
-                    path: root.clone(),
-                    source,
-                })?
-            } else {
-                root
-            }
+            let _ = meta;
+            root
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
@@ -271,7 +267,7 @@ fn walk_overrides(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), 
             }
         })?;
         if is_reparse_point(&meta) {
-            continue;
+            return Err(ModIniError::Reparse { path: entry.path() });
         }
         let child = rel.join(entry.file_name());
         if meta.is_dir() {
@@ -301,7 +297,7 @@ fn is_reparse_point(meta: &std::fs::Metadata) -> bool {
 /// Refuse a path under `instance_dir` when a symlink or junction on the way points outside it.
 /// Components that do not exist yet are fine: nothing there can point anywhere.
 fn ensure_inside_instance(instance_dir: &Path, target: &Path) -> Result<(), ModIniError> {
-    let root = std::fs::canonicalize(instance_dir).map_err(|source| ModIniError::Unreadable {
+    std::fs::canonicalize(instance_dir).map_err(|source| ModIniError::Unreadable {
         path: instance_dir.to_path_buf(),
         source,
     })?;
@@ -324,14 +320,7 @@ fn ensure_inside_instance(instance_dir: &Path, target: &Path) -> Result<(), ModI
             }
         };
         if is_reparse_point(&meta) {
-            let resolved =
-                std::fs::canonicalize(&current).map_err(|source| ModIniError::Unreadable {
-                    path: current.clone(),
-                    source,
-                })?;
-            if !resolved.starts_with(&root) {
-                return Err(ModIniError::EscapesInstance { path: current });
-            }
+            return Err(ModIniError::Reparse { path: current });
         }
     }
     Ok(())
@@ -593,8 +582,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ModIniError> {
         "{name}.{}.agora-tmp",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::write(&tmp, bytes).map_err(error)?;
-    std::fs::rename(&tmp, path).map_err(error)
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error(e));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error(e));
+    }
+    Ok(())
 }
 
 /// Remove the instance's copy of a mod INI, so the mod's file is used again. Only that one file

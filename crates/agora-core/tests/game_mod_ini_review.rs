@@ -269,28 +269,56 @@ fn review_a_failed_write_leaves_no_temp_file_behind() {
 }
 
 #[test]
-fn review_a_hardlinked_override_is_refused_for_write_and_reset() {
-    // inis.md: "the override FILE itself is a junction/hardlink to a file outside. Writes and
-    // resets must refuse."
+fn review_a_hardlinked_override_is_replaced_by_set_and_reset_leaving_the_outside_file_alone() {
+    // Writes go through a temp file and a rename, and reset removes the link, so the file outside
+    // keeps its bytes. (A hardlink is not a symlink and is allowed.)
     let tmp = TempDir::new().unwrap();
     let ctx = context(&tmp);
-    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    let a = add_item(
+        &ctx,
+        "Mod A",
+        &[(
+            "x.ini",
+            b"[s]
+k=1
+",
+        )],
+    );
     make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
     let outside = tmp.path().join("outside.ini");
-    std::fs::write(&outside, b"a=evil\n").unwrap();
+    std::fs::write(
+        &outside, b"a=evil
+",
+    )
+    .unwrap();
     let dest = override_file(&ctx, "inst-a", "x.ini");
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::hard_link(&outside, &dest).unwrap();
 
-    assert!(
-        game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "v").is_err(),
-        "a write to a hardlinked override must be refused"
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "v").unwrap();
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"a=evil
+",
+        "the set replaced the link, not the file it pointed at"
     );
-    assert!(
-        game_mod_ini::reset_mod_ini(&ctx, "inst-a", "x.ini").is_err(),
-        "a reset of a hardlinked override must be refused"
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"a=evil
+
+[s]
+k=v
+"
     );
-    assert_eq!(std::fs::read(&outside).unwrap(), b"a=evil\n");
+
+    game_mod_ini::reset_mod_ini(&ctx, "inst-a", "x.ini").unwrap();
+    assert!(!dest.exists());
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"a=evil
+",
+        "the reset removed the link, not the file it pointed at"
+    );
 }
 
 #[test]
