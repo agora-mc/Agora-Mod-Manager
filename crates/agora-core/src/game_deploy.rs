@@ -9,8 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use agora_game_api::{
-    BaseReference, CompiledGlob, GameDefinition, Layer, LayerId, LayerSource, LayerStack, RelPath,
-    DEFAULT_COPY_PATTERNS,
+    fold_path_case, BaseReference, CompiledGlob, GameDefinition, Layer, LayerId, LayerSource,
+    LayerStack, RelPath, DEFAULT_COPY_PATTERNS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -566,7 +566,7 @@ fn plan_inner(
                     && src_parts
                         .iter()
                         .zip(cf_parts.iter())
-                        .all(|(sp, cp)| sp.eq_ignore_ascii_case(cp))
+                        .all(|(sp, cp)| fold_path_case(sp) == fold_path_case(cp))
                 {
                     Some(cf_parts[src_parts.len()..].join("/"))
                 } else {
@@ -660,7 +660,7 @@ fn plan_inner(
             whiteouts: layer
                 .whiteouts
                 .iter()
-                .map(|w| w.as_str().to_ascii_lowercase())
+                .map(|w| fold_path_case(w.as_str()))
                 .collect(),
         });
     }
@@ -722,7 +722,7 @@ fn plan_inner(
         for l in &layers {
             for f in &l.files {
                 all_files.push(FileLayerItem {
-                    lower_path: f.path.as_str().to_ascii_lowercase(),
+                    lower_path: fold_path_case(f.path.as_str()),
                     original_path: f.path.clone(),
                     layer_id: l.layer_id.clone(),
                 });
@@ -764,7 +764,7 @@ fn plan_inner(
             candidates.retain(|key, _| !(*key == *marker || key.starts_with(&prefix)));
         }
         for f in l.files {
-            let key = f.path.as_str().to_ascii_lowercase();
+            let key = fold_path_case(f.path.as_str());
             if let Some(existing) = candidates.get_mut(&key) {
                 let mut hidden = existing.hidden_layers.clone();
                 hidden.push(existing.layer_id.clone());
@@ -798,7 +798,7 @@ fn plan_inner(
     for layer in manifest.layers.layers() {
         if matches!(layer.source, LayerSource::Writable { .. }) {
             for wh in &layer.whiteouts {
-                let key = wh.as_str().to_ascii_lowercase();
+                let key = fold_path_case(wh.as_str());
                 candidates.remove(&key);
             }
         }
@@ -1128,7 +1128,7 @@ fn walk_overrides_dir(
     Ok(())
 }
 
-/// The paths (lower-cased, `/`-separated) the VFS has recorded as deleted in `writable_dir`.
+/// The paths (case-folded, `/`-separated) the VFS has recorded as deleted in `writable_dir`.
 fn read_whiteout_markers(writable_dir: &Path) -> Result<Vec<String>, DeployError> {
     fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), DeployError> {
         for entry in std::fs::read_dir(dir)? {
@@ -1148,7 +1148,7 @@ fn read_whiteout_markers(writable_dir: &Path) -> Result<Vec<String>, DeployError
             } else if meta.is_file() {
                 if let Some(path) = child.strip_suffix(WHITEOUT_SUFFIX) {
                     if !path.is_empty() {
-                        out.push(path.to_ascii_lowercase());
+                        out.push(fold_path_case(path));
                     }
                 }
             }
@@ -1229,14 +1229,10 @@ pub(crate) fn visible_paths_of(
     }
     // The writable layer is the newest change and comes first, so a case-only duplicate keeps it.
     paths.extend(plan.files.iter().map(|file| file.path.as_str().to_string()));
-    // The order of the lower-cased paths, compared without building each one (this sorts every
-    // path the game sees, so a String per comparison was most of the time in a check).
-    paths.sort_by(|a, b| {
-        a.bytes()
-            .map(|c| c.to_ascii_lowercase())
-            .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
-    });
-    paths.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    // One folded key per path (this sorts every path the game sees, so a String per comparison was
+    // most of the time in a check).
+    paths.sort_by_cached_key(|path| fold_path_case(path));
+    paths.dedup_by(|a, b| fold_path_case(a) == fold_path_case(b));
     Ok(paths)
 }
 
@@ -1299,7 +1295,7 @@ pub fn visible_file_source(
     Ok(plan
         .files
         .iter()
-        .find(|file| file.path.as_str().eq_ignore_ascii_case(rel))
+        .find(|file| fold_path_case(file.path.as_str()) == fold_path_case(rel))
         .map(|file| source_path(ctx, &file.source)))
 }
 
@@ -1959,12 +1955,12 @@ impl PathRules {
             .iter()
             .copied()
             .chain(definition.copy_patterns.iter().map(String::as_str))
-            .map(|pattern| CompiledGlob::new(&pattern.to_ascii_lowercase()))
+            .map(|pattern| CompiledGlob::new(&fold_path_case(pattern)))
             .collect();
         let declared = definition
             .declared_writes
             .iter()
-            .map(|pattern| CompiledGlob::new(&pattern.to_ascii_lowercase()))
+            .map(|pattern| CompiledGlob::new(&fold_path_case(pattern)))
             .collect();
         Self { copy, declared }
     }
@@ -1973,7 +1969,7 @@ impl PathRules {
     fn normalized(path: &str) -> Option<String> {
         RelPath::new(path)
             .ok()
-            .map(|rel| rel.as_str().to_ascii_lowercase())
+            .map(|rel| fold_path_case(rel.as_str()))
     }
 
     /// [`Self::is_copy_pattern`] for a path already run through [`Self::normalized`].
@@ -2104,7 +2100,7 @@ pub(crate) enum FarmChange<'a> {
 /// How a deployed game folder differs from its record. Harvest and a tool run that captures from
 /// links both compare through [`compare_farm`], so they cannot disagree about what changed.
 pub(crate) struct FarmDiff<'a> {
-    /// Changed and added files, in lower-cased path order.
+    /// Changed and added files, in case-folded path order.
     pub changes: Vec<FarmChange<'a>>,
     /// Recorded files the folder no longer has, in the record's order.
     pub missing: Vec<&'a DeployedFileRecord>,
@@ -2123,13 +2119,13 @@ pub(crate) fn compare_farm<'a>(
 
     let mut record_map: BTreeMap<String, &'a DeployedFileRecord> = BTreeMap::new();
     for f in &record.files {
-        record_map.insert(f.path.as_str().to_ascii_lowercase(), f);
+        record_map.insert(fold_path_case(f.path.as_str()), f);
     }
 
     let missing = record
         .files
         .iter()
-        .filter(|f| !current.contains_key(&f.path.as_str().to_ascii_lowercase()))
+        .filter(|f| !current.contains_key(&fold_path_case(f.path.as_str())))
         .collect();
 
     let mut changes = Vec::new();
@@ -2146,7 +2142,7 @@ pub(crate) fn compare_farm<'a>(
     Ok(FarmDiff { changes, missing })
 }
 
-/// Every file under `root`, keyed by lower-cased path. Links and other reparse points are skipped.
+/// Every file under `root`, keyed by case-folded path. Links and other reparse points are skipped.
 fn walk_farm(
     root: &Path,
     rel: &Path,
@@ -2176,7 +2172,7 @@ fn walk_farm(
                 .map_err(|e| DeployError::Other(format!("invalid game file path: {e}")))?;
             let mtime = get_modified_unix_ms(&meta);
             out.insert(
-                rel_path.as_str().to_ascii_lowercase(),
+                fold_path_case(rel_path.as_str()),
                 FarmFile {
                     rel_path,
                     size: meta.len(),
@@ -2287,7 +2283,7 @@ fn harvest_changes(
         differing = record
             .files
             .iter()
-            .map(|f| f.path.as_str().to_ascii_lowercase())
+            .map(|f| fold_path_case(f.path.as_str()))
             .collect();
         return Ok(HarvestedFarm {
             report,
@@ -2363,18 +2359,18 @@ fn harvest_changes(
         if let Some(idx) = existing_writable_idx {
             let mut current_whiteouts = layers_vec[idx].whiteouts.clone();
             for nw in new_whiteouts {
-                let nw_lower = nw.as_str().to_ascii_lowercase();
+                let nw_lower = fold_path_case(nw.as_str());
                 if !current_whiteouts
                     .iter()
-                    .any(|w| w.as_str().to_ascii_lowercase() == nw_lower)
+                    .any(|w| fold_path_case(w.as_str()) == nw_lower)
                 {
                     current_whiteouts.push(nw);
                 }
             }
             // If any copied_to_writable path was previously whited out, un-whiteout it
             for cw in &report.copied_to_writable {
-                let cw_lower = cw.as_str().to_ascii_lowercase();
-                current_whiteouts.retain(|w| w.as_str().to_ascii_lowercase() != cw_lower);
+                let cw_lower = fold_path_case(cw.as_str());
+                current_whiteouts.retain(|w| fold_path_case(w.as_str()) != cw_lower);
             }
             layers_vec[idx].whiteouts = current_whiteouts;
         } else {
@@ -2453,9 +2449,9 @@ fn updating_marker(deployment_dir: &Path) -> PathBuf {
     deployment_dir.join(UPDATING_FILE)
 }
 
-/// A path as the record and the plan compare it: lower-cased, as the farm's own paths are keyed.
+/// A path as the record and the plan compare it: case-folded, as the farm's own paths are keyed.
 fn path_key(path: &str) -> String {
-    path.to_ascii_lowercase()
+    fold_path_case(path)
 }
 
 thread_local! {
@@ -2605,7 +2601,7 @@ fn plan_in_place(
     let mut link_limit = HashMap::new();
     for (key, &rec) in &recorded {
         let same_in_plan = planned.get(key).is_some_and(|file| {
-            file.path == rec.path
+            fold_path_case(file.path.as_str()) == fold_path_case(rec.path.as_str())
                 && file.source == rec.source
                 && (file.placement == rec.placement
                     || (file.placement == Placement::Link

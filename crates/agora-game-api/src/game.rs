@@ -593,13 +593,13 @@ pub fn check_runtime_files<S: AsRef<str>>(
         }
         if deployed_paths
             .iter()
-            .any(|path| path.as_ref().eq_ignore_ascii_case(&expected))
+            .any(|path| fold_path_case(path.as_ref()) == fold_path_case(&expected))
         {
             continue;
         }
 
-        family_files.sort_by_key(|path| path.to_ascii_lowercase());
-        family_files.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        family_files.sort_by_key(|path| fold_path_case(path));
+        family_files.dedup_by(|a, b| fold_path_case(a) == fold_path_case(b));
         let found = family_files
             .iter()
             .take(RUNTIME_FILE_FINDING_MAX_FOUND)
@@ -635,7 +635,7 @@ pub fn runtime_file_passes<S: AsRef<str>>(
         };
         if deployed_paths
             .iter()
-            .any(|path| path.as_ref().eq_ignore_ascii_case(&expected))
+            .any(|path| fold_path_case(path.as_ref()) == fold_path_case(&expected))
         {
             passes.push(RuntimeFilePass {
                 rule_id: rule.id.clone(),
@@ -683,8 +683,8 @@ fn cannot_check(rule: &RuntimeFileRule, reason: &str) -> RuntimeFileFinding {
 /// Case-insensitive match of a pattern against a path or a version. A pattern without `*` must be
 /// equal to the text; one with `*` is matched by [`glob_match`].
 fn runtime_path_matches(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let text = text.to_ascii_lowercase();
+    let pattern = fold_path_case(pattern);
+    let text = fold_path_case(text);
     if pattern.contains('*') {
         glob_match(&pattern, &text)
     } else {
@@ -769,10 +769,10 @@ impl GameDefinition {
         let Ok(rel) = RelPath::new(path) else {
             return false;
         };
-        let normalized = rel.as_str().to_ascii_lowercase();
+        let normalized = fold_path_case(rel.as_str());
         self.linked_archive_patterns
             .iter()
-            .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &normalized))
+            .any(|pattern| glob_match(&fold_path_case(pattern), &normalized))
     }
 
     /// Whether `path` (relative to the runtime root) matches a declared write pattern.
@@ -781,10 +781,10 @@ impl GameDefinition {
         let Ok(rel) = RelPath::new(path) else {
             return false;
         };
-        let normalized = rel.as_str().to_ascii_lowercase();
+        let normalized = fold_path_case(rel.as_str());
         self.declared_writes
             .iter()
-            .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &normalized))
+            .any(|pattern| glob_match(&fold_path_case(pattern), &normalized))
     }
 
     /// Whether `path` (relative to the runtime root) matches either core default copy patterns
@@ -793,14 +793,14 @@ impl GameDefinition {
         let Ok(rel) = RelPath::new(path) else {
             return false;
         };
-        let normalized = rel.as_str().to_ascii_lowercase();
+        let normalized = fold_path_case(rel.as_str());
         DEFAULT_COPY_PATTERNS
             .iter()
-            .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &normalized))
+            .any(|pattern| glob_match(&fold_path_case(pattern), &normalized))
             || self
                 .copy_patterns
                 .iter()
-                .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &normalized))
+                .any(|pattern| glob_match(&fold_path_case(pattern), &normalized))
     }
 
     /// Whether `path` (relative to the install root) matches an excluded path pattern.
@@ -809,10 +809,10 @@ impl GameDefinition {
         let Ok(rel) = RelPath::new(path) else {
             return false;
         };
-        let normalized = rel.as_str().to_ascii_lowercase();
+        let normalized = fold_path_case(rel.as_str());
         self.excluded_paths
             .iter()
-            .any(|pattern| glob_match(&pattern.to_ascii_lowercase(), &normalized))
+            .any(|pattern| glob_match(&fold_path_case(pattern), &normalized))
     }
 }
 
@@ -830,7 +830,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
             }
             let mut prefix_match = true;
             for (sc, fc) in current_source_components.iter().zip(comps.iter()) {
-                if !sc.eq_ignore_ascii_case(fc) {
+                if fold_path_case(sc) != fold_path_case(fc) {
                     prefix_match = false;
                     break;
                 }
@@ -871,7 +871,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
         // 1. A fomod folder at that level (case-insensitive): Installer
         if folders_at_level
             .iter()
-            .any(|f| f.eq_ignore_ascii_case("fomod"))
+            .any(|f| fold_path_case(f) == fold_path_case("fomod"))
         {
             return Suggestion::Installer {
                 reason: format!("{unwrapped_prefix}archive contains a FOMOD installer (`fomod/`)"),
@@ -882,7 +882,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
         let mut root_match: Option<String> = None;
         for name in &top_level_names {
             if !layout.data_path.as_str().is_empty()
-                && name.eq_ignore_ascii_case(layout.data_path.as_str())
+                && fold_path_case(name) == fold_path_case(layout.data_path.as_str())
             {
                 root_match = Some(name.clone());
                 break;
@@ -890,7 +890,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
             if layout
                 .root_markers
                 .iter()
-                .any(|m| glob_match(&m.to_ascii_lowercase(), &name.to_ascii_lowercase()))
+                .any(|m| glob_match(&fold_path_case(m), &fold_path_case(name)))
             {
                 root_match = Some(name.clone());
                 break;
@@ -899,7 +899,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
 
         if let Some(m) = root_match {
             let reason = if !layout.data_path.as_str().is_empty()
-                && m.eq_ignore_ascii_case(layout.data_path.as_str())
+                && fold_path_case(&m) == fold_path_case(layout.data_path.as_str())
             {
                 format!("{unwrapped_prefix}`{m}` matches data folder, so it goes in game root")
             } else {
@@ -918,7 +918,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
             if layout
                 .data_markers
                 .iter()
-                .any(|m| glob_match(&m.to_ascii_lowercase(), &name.to_ascii_lowercase()))
+                .any(|m| glob_match(&fold_path_case(m), &fold_path_case(name)))
             {
                 data_match = Some(name.clone());
                 break;
@@ -959,6 +959,30 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
 
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     CompiledGlob::new(pattern).matches(path)
+}
+
+/// A game path with the case Windows' NTFS uses to compare names: per character, simple
+/// (one-to-one) uppercase.
+///
+/// NTFS keeps a per-volume upcase table, built when the volume is formatted, and compares names
+/// through it. That is Unicode's *simple* uppercase mapping, so `ß` stays `ß` (it is not full case
+/// folding to `SS`) and names are not normalised (`é` precomposed and `e` plus a combining accent
+/// are different names). The exact table is volume-specific, so the mapping here follows Unicode's
+/// simple uppercase and is unverified against a particular formatted volume. A character whose
+/// uppercase form is more than one code point has no simple mapping and is left as it is.
+///
+/// ASCII paths therefore fold to the same equivalence classes they had when callers lower-cased
+/// ASCII: comparisons and stored records keep matching.
+pub fn fold_path_case(path: &str) -> String {
+    let mut folded = String::with_capacity(path.len());
+    for ch in path.chars() {
+        let mut upper = ch.to_uppercase();
+        match (upper.next(), upper.next()) {
+            (Some(single), None) => folded.push(single),
+            _ => folded.push(ch),
+        }
+    }
+    folded
 }
 
 /// A pattern for [`glob_match`], parsed once for matching many paths: for every `pattern` and `path`,
@@ -1108,7 +1132,7 @@ pub fn map_thunderstore_bepinex(
 ) -> Result<Vec<(RelPath, RelPath)>, ThunderstoreMappingError> {
     let has_manifest = paths
         .iter()
-        .any(|p| p.as_str().eq_ignore_ascii_case("manifest.json"));
+        .any(|p| fold_path_case(p.as_str()) == fold_path_case("manifest.json"));
     if !has_manifest {
         return Err(ThunderstoreMappingError::NotPackage);
     }
@@ -1121,9 +1145,9 @@ pub fn map_thunderstore_bepinex(
 
     let is_preloader = |parts: &[&str]| {
         parts.len() == 3
-            && parts[0].eq_ignore_ascii_case("BepInEx")
-            && parts[1].eq_ignore_ascii_case("core")
-            && parts[2].eq_ignore_ascii_case("BepInEx.Preloader.dll")
+            && fold_path_case(parts[0]) == fold_path_case("BepInEx")
+            && fold_path_case(parts[1]) == fold_path_case("core")
+            && fold_path_case(parts[2]) == fold_path_case("BepInEx.Preloader.dll")
     };
     // A BepInEx pack: the folder holding `BepInEx/core/BepInEx.Preloader.dll`, which is usually a
     // top-level folder (`BepInExPack_Valheim/`) and sometimes the package itself (`Some("")`).
@@ -1149,7 +1173,7 @@ pub fn map_thunderstore_bepinex(
             let parts: Vec<&str> = p.as_str().split('/').filter(|s| !s.is_empty()).collect();
             let thunderstore_file = parts.len() == 1
                 && ["manifest.json", "icon.png", "readme.md", "changelog.md"]
-                    .contains(&parts[0].to_ascii_lowercase().as_str());
+                    .contains(&fold_path_case(parts[0]).as_str());
             if !parts.is_empty() && !thunderstore_file {
                 mappings.push((p.clone(), p.clone()));
             }
@@ -1160,7 +1184,7 @@ pub fn map_thunderstore_bepinex(
             if parts.is_empty() {
                 continue;
             }
-            if parts[0].eq_ignore_ascii_case(&folder) {
+            if fold_path_case(parts[0]) == fold_path_case(&folder) {
                 let rel = parts[1..].join("/");
                 if !rel.is_empty() {
                     let dest = RelPath::new(&rel)
@@ -1175,9 +1199,9 @@ pub fn map_thunderstore_bepinex(
             if parts.is_empty() {
                 continue;
             }
-            let top = parts[0].to_ascii_lowercase();
+            let top = fold_path_case(parts[0]);
             let dest_str = match top.as_str() {
-                "plugins" => {
+                "PLUGINS" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         format!("BepInEx/plugins/{pkg}")
@@ -1185,7 +1209,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/plugins/{pkg}/{sub}")
                     }
                 }
-                "patchers" => {
+                "PATCHERS" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         format!("BepInEx/patchers/{pkg}")
@@ -1193,7 +1217,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/patchers/{pkg}/{sub}")
                     }
                 }
-                "monomod" => {
+                "MONOMOD" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         format!("BepInEx/monomod/{pkg}")
@@ -1201,7 +1225,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/monomod/{pkg}/{sub}")
                     }
                 }
-                "config" => {
+                "CONFIG" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         "BepInEx/config".to_string()
@@ -1209,7 +1233,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/config/{sub}")
                     }
                 }
-                "core" => {
+                "CORE" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         "BepInEx/core".to_string()
@@ -1233,7 +1257,7 @@ pub fn map_thunderstore_bepinex(
 
     let mut seen_lower = std::collections::HashSet::with_capacity(mappings.len());
     for (_, dest) in &mappings {
-        let lower = dest.as_str().to_ascii_lowercase();
+        let lower = fold_path_case(dest.as_str());
         if !seen_lower.insert(lower) {
             return Err(ThunderstoreMappingError::Collision(format!(
                 "equals another destination path case-insensitively: '{dest}'"
@@ -1244,7 +1268,7 @@ pub fn map_thunderstore_bepinex(
     for (_, dest) in &mappings {
         let parts: Vec<&str> = dest.as_str().split('/').collect();
         for i in 1..parts.len() {
-            let prefix = parts[..i].join("/").to_ascii_lowercase();
+            let prefix = fold_path_case(&parts[..i].join("/"));
             if seen_lower.contains(&prefix) {
                 return Err(ThunderstoreMappingError::Collision(format!(
                     "prefix folder '{prefix}' matches another file"
@@ -2080,6 +2104,55 @@ mod tests {
                 assert_eq!(mount_path.as_str(), "");
             }
             other => panic!("expected Place at root, got {other:?}"),
+        }
+    }
+    #[test]
+    fn path_case_folds_like_windows_simple_uppercase() {
+        assert_eq!(fold_path_case("Data/Ü/x"), "DATA/Ü/X");
+        assert_eq!(fold_path_case("ü"), "Ü");
+
+        // Simple uppercase, not full case folding: ß has no one-to-one mapping.
+        assert_eq!(fold_path_case("ß"), "ß");
+        assert_ne!(fold_path_case("ß"), fold_path_case("SS"));
+        assert_ne!(fold_path_case("ẞ"), fold_path_case("ß"));
+
+        // No normalisation: precomposed and decomposed accents are different names.
+        assert_ne!(fold_path_case("é"), fold_path_case("e\u{301}"));
+
+        // Turkish: Unicode simple uppercase maps both i and dotless ı to I; dotted İ stays itself.
+        assert_eq!(fold_path_case("ı"), "I");
+        assert_eq!(fold_path_case("I"), "I");
+        assert_eq!(fold_path_case("i"), "I");
+        assert_eq!(fold_path_case("İ"), "İ");
+        assert_ne!(fold_path_case("İ"), fold_path_case("i"));
+    }
+
+    #[test]
+    fn ascii_paths_fold_as_they_did_when_ascii_lowercased() {
+        let paths = [
+            "Data",
+            "DATA",
+            "data/Meshes/Thing.NIF",
+            "Data/Meshes/thing.nif",
+            "ReadMe.txt",
+        ];
+        for left in paths {
+            for right in paths {
+                assert_eq!(
+                    fold_path_case(left) == fold_path_case(right),
+                    left.eq_ignore_ascii_case(right),
+                    "{left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_multibyte_paths_fold_without_panicking() {
+        assert_eq!(fold_path_case(""), "");
+        assert_eq!(fold_path_case("日本語/файл/😀"), "日本語/ФАЙЛ/😀");
+        for path in ["", "é", "ß", "ı", "日本語", "😀", "a/日本語/b"] {
+            let _ = fold_path_case(path);
         }
     }
 }

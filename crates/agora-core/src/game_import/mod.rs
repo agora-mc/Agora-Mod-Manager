@@ -15,7 +15,9 @@ pub mod mo2;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{glob_match, BaseReference, GameDefinition, GameId, RelPath, StoreId, ToolId};
+use agora_game_api::{
+    fold_path_case, glob_match, BaseReference, GameDefinition, GameId, RelPath, StoreId, ToolId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::content_store::{self, ContentError, ContentSource, Mo2Provenance};
@@ -173,7 +175,7 @@ pub fn scan() -> ScanReport {
     }
 
     for (ini, how) in found {
-        let key = ini.to_string_lossy().to_ascii_lowercase();
+        let key = fold_path_case(&ini.to_string_lossy());
         if !seen.insert(key) {
             continue;
         }
@@ -249,7 +251,7 @@ fn scan_dir(dir: &Path, depth: usize, found: &mut Vec<(PathBuf, String)>) {
         if !meta.is_dir() || content_store::is_reparse_point_or_symlink(&meta) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        let name = fold_path_case(&entry.file_name().to_string_lossy());
         if SKIPPED_DIRS.contains(&name.as_str()) || name.starts_with("program files") {
             continue;
         }
@@ -445,10 +447,8 @@ fn mount_point(def: &GameDefinition) -> String {
 }
 
 fn normalise_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
+    let text = path.to_string_lossy().replace('/', "\\");
+    fold_path_case(text.trim_end_matches('\\'))
 }
 
 fn read_text_optional(path: &Path) -> Result<Option<String>, ImportError> {
@@ -489,7 +489,7 @@ pub fn plan(
         .find(|g| {
             g.mo2_game_name
                 .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(&mo2_game))
+                .is_some_and(|n| fold_path_case(n) == fold_path_case(&mo2_game))
         })
         .ok_or_else(|| ImportError::UnknownGame(mo2_game.clone()))?;
     let game_path = ini.game_path.clone().ok_or(ImportError::NoGamePath)?;
@@ -548,7 +548,7 @@ pub fn plan(
     let mut unmanaged: Vec<String> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     for line in mo2::parse_modlist(&modlist) {
-        if line.name.to_ascii_lowercase().ends_with("_separator") {
+        if fold_path_case(&line.name).ends_with("_SEPARATOR") {
             separators += 1;
             continue;
         }
@@ -575,7 +575,7 @@ pub fn plan(
             });
             continue;
         }
-        if !seen_names.insert(line.name.to_ascii_lowercase()) {
+        if !seen_names.insert(fold_path_case(&line.name)) {
             problems.push(Problem {
                 line: Some(line.line),
                 entry: line.name.clone(),
@@ -818,7 +818,7 @@ fn split_overwrite(
                     id.clone(),
                     t.output_patterns
                         .iter()
-                        .map(|p| p.to_ascii_lowercase())
+                        .map(|p| fold_path_case(p))
                         .collect(),
                 )
             })
@@ -832,7 +832,7 @@ fn split_overwrite(
         } else {
             format!("{mount}/{}", rel.as_str())
         };
-        let lower = game_path.to_ascii_lowercase();
+        let lower = fold_path_case(&game_path);
         let owner = patterns
             .iter()
             .find(|(_, pats)| pats.iter().any(|p| !p.is_empty() && glob_match(p, &lower)));
@@ -884,13 +884,9 @@ fn plan_plugins(
     let active_names: HashSet<String> = listed
         .iter()
         .filter(|p| p.active)
-        .map(|p| p.name.to_ascii_lowercase())
+        .map(|p| fold_path_case(&p.name))
         .collect();
-    let implicit: HashSet<String> = rule
-        .implicit
-        .iter()
-        .map(|n| n.to_ascii_lowercase())
-        .collect();
+    let implicit: HashSet<String> = rule.implicit.iter().map(|n| fold_path_case(n)).collect();
 
     let managed: Vec<String> = {
         let mut seen = HashSet::new();
@@ -899,15 +895,15 @@ fn plan_plugins(
             .flat_map(|m| m.plugin_files.iter().cloned())
             // A plugin the install already has is the game's, so it is never managed.
             .filter(|n| !base_data.join(n).is_file())
-            .filter(|n| seen.insert(n.to_ascii_lowercase()))
+            .filter(|n| seen.insert(fold_path_case(n)))
             .collect()
     };
-    let managed_keys: HashSet<String> = managed.iter().map(|n| n.to_ascii_lowercase()).collect();
+    let managed_keys: HashSet<String> = managed.iter().map(|n| fold_path_case(n)).collect();
     // The overwrite plugins are managed only where MO2 lists them: a line is never added for
     // one, so a plugin MO2 does not list keeps the import's usual handling.
     let overwrite_keys: HashSet<String> = overwrite_plugins
         .iter()
-        .map(|n| n.to_ascii_lowercase())
+        .map(|n| fold_path_case(n))
         .collect();
 
     let mut lines: Vec<PluginLinePlan> = Vec::new();
@@ -918,11 +914,11 @@ fn plan_plugins(
         .cloned()
         .chain(listed.iter().map(|p| p.name.clone()));
     for name in names {
-        let key = name.to_ascii_lowercase();
+        let key = fold_path_case(&name);
         if implicit.contains(&key) {
             if !implicit_skipped
                 .iter()
-                .any(|n: &String| n.eq_ignore_ascii_case(&name))
+                .any(|n: &String| fold_path_case(n) == fold_path_case(&name))
             {
                 implicit_skipped.push(name);
             }
@@ -938,7 +934,7 @@ fn plan_plugins(
         });
     }
     for name in &managed {
-        if have.insert(name.to_ascii_lowercase()) {
+        if have.insert(fold_path_case(name)) {
             notes.push(format!(
                 "{name} is in an enabled mod but not in the profile's plugin lists; it is kept inactive"
             ));
@@ -954,7 +950,7 @@ fn plan_plugins(
         for lock in mo2::parse_lockedorder(&text) {
             match lines
                 .iter()
-                .find(|l| l.name.eq_ignore_ascii_case(&lock.name))
+                .find(|l| fold_path_case(&l.name) == fold_path_case(&lock.name))
             {
                 Some(line) => locked.push(line.name.clone()),
                 None => notes.push(format!(
@@ -997,10 +993,7 @@ fn plan_inis(
             continue;
         };
         for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(name)
+            if fold_path_case(&entry.file_name().to_string_lossy()) == fold_path_case(name)
                 && entry.path().is_file()
             {
                 out.push(IniPlan {

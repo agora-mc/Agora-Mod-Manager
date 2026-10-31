@@ -149,7 +149,11 @@ pub fn wildcard(pattern: &str, name: &str) -> bool {
             (Some('*'), _) | (Some('<'), _) => go(&p[1..], n) || (!n.is_empty() && go(p, &n[1..])),
             (Some('?'), Some(_)) | (Some('>'), Some(_)) => go(&p[1..], &n[1..]),
             (Some('"'), Some('.')) => go(&p[1..], &n[1..]),
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b) && go(&p[1..], &n[1..]),
+            (Some(a), Some(b)) => {
+                agora_game_api::fold_path_case(&a.to_string())
+                    == agora_game_api::fold_path_case(&b.to_string())
+                    && go(&p[1..], &n[1..])
+            }
             (Some(_), None) => p.iter().all(|c| matches!(c, '*' | '<' | '>' | '"')),
             (None, Some(_)) => false,
         }
@@ -191,7 +195,7 @@ pub unsafe fn build_listing(
         }
         for entry in read_real_dir(&dir, class) {
             let name = entry_name(&entry, class);
-            let key = name.to_lowercase();
+            let key = agora_game_api::fold_path_case(&name);
             if rel.is_empty() && key == ".agvfs-wh" {
                 continue;
             }

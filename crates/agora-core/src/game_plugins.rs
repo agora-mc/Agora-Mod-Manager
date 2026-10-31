@@ -16,7 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    glob_match, GameDefinition, GameId, PluginListRule, StoreId, UserFileMapping, UserFileStrategy,
+    fold_path_case, glob_match, GameDefinition, GameId, PluginListRule, StoreId, UserFileMapping,
+    UserFileStrategy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -397,15 +398,13 @@ pub fn desired_plugins<'a>(
     plan: &DeploymentPlan,
     base_paths: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
-    let base_keys: std::collections::HashSet<String> = base_paths
-        .into_iter()
-        .map(|p| p.to_ascii_lowercase())
-        .collect();
+    let base_keys: std::collections::HashSet<String> =
+        base_paths.into_iter().map(fold_path_case).collect();
     let folder = rule.plugin_folder.as_str().trim_matches('/');
     let patterns: Vec<String> = rule
         .patterns
         .iter()
-        .map(|p| p.trim().to_ascii_lowercase())
+        .map(|p| fold_path_case(p.trim()))
         .collect();
 
     let mut found: Vec<(usize, usize, String, String)> = Vec::new();
@@ -418,17 +417,17 @@ pub fn desired_plugins<'a>(
             Some((parent, name)) => (parent, name),
             None => ("", path),
         };
-        if !parent.eq_ignore_ascii_case(folder) {
+        if fold_path_case(parent) != fold_path_case(folder) {
             continue;
         }
-        let lower = name.to_ascii_lowercase();
+        let lower = fold_path_case(name);
         let Some(pattern_rank) = patterns
             .iter()
             .position(|p| !p.is_empty() && glob_match(p, &lower))
         else {
             continue;
         };
-        if base_keys.contains(&path.to_ascii_lowercase()) {
+        if base_keys.contains(&fold_path_case(path)) {
             continue;
         }
         let Some(layer_rank) = content_layer_items.iter().position(|i| i == item_id) else {

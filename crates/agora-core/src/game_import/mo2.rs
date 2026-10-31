@@ -335,8 +335,8 @@ pub fn check_mod_folder_name(name: &str) -> Result<(), String> {
 
 /// Whether a file name is a plugin the game loads (`.esp`, `.esm`, `.esl`).
 pub fn is_plugin_file(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".esp") || lower.ends_with(".esm") || lower.ends_with(".esl")
+    let folded = agora_game_api::fold_path_case(name);
+    folded.ends_with(".ESP") || folded.ends_with(".ESM") || folded.ends_with(".ESL")
 }
 
 #[cfg(test)]

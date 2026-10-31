@@ -26,6 +26,7 @@ name = "agora-vfs-sleeper"
 path = "src/bin/sleeper.rs"
 
 [dependencies]
+agora-game-api = { path = "../agora-game-api" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

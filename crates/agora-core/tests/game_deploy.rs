@@ -293,6 +293,194 @@ fn test_case_insensitivity_override() {
 }
 
 #[test]
+fn non_ascii_case_paths_are_one_file_and_the_later_mod_wins() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let inst = create_pinned_instance(&ctx, &install, &def, "NonAsciiCase");
+
+    let upper = add_content_folder(&ctx, "Upper", &[("Data/Ü/Shared.txt", b"upper")]);
+    let lower = add_content_folder(&ctx, "Lower", &[("data/ü/shared.txt", b"lower")]);
+    add_content(&ctx, &inst.instance_id, &upper, None, None).unwrap();
+    add_content(&ctx, &inst.instance_id, &lower, None, None).unwrap();
+
+    let p = plan(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    let rows: Vec<_> = p
+        .files
+        .iter()
+        .filter(|f| {
+            f.path.as_str().ends_with("Shared.txt") || f.path.as_str().ends_with("shared.txt")
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", p.files);
+    let FileSource::Content { item_id, .. } = &rows[0].source else {
+        panic!("not a content file: {:?}", rows[0].source);
+    };
+    assert_eq!(item_id, &lower);
+
+    deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    let game_dir = deployment_dir(&ctx, &inst.instance_id).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(game_dir.join("data").join("ü").join("shared.txt")).unwrap(),
+        b"lower"
+    );
+}
+
+#[test]
+fn sharp_s_and_ss_are_two_different_files() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let inst = create_pinned_instance(&ctx, &install, &def, "SharpS");
+
+    let item = add_content_folder(&ctx, "Letter", &[("Data/ß.txt", b"eszett")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+    let item = add_content_folder(&ctx, "Caps", &[("Data/SS.txt", b"two letters")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+
+    let p = plan(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    assert_eq!(
+        p.files
+            .iter()
+            .filter(|f| {
+                let p = f.path.as_str();
+                p.starts_with("Data/") && p.ends_with(".txt")
+            })
+            .count(),
+        2,
+        "{:?}",
+        p.files
+    );
+}
+
+#[test]
+fn precomposed_and_decomposed_accents_are_two_different_files() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let inst = create_pinned_instance(&ctx, &install, &def, "Accents");
+
+    let item = add_content_folder(&ctx, "Precomposed", &[("Data/é.txt", b"precomposed")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+    let item = add_content_folder(&ctx, "Decomposed", &[("Data/e\u{301}.txt", b"decomposed")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+
+    let p = plan(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    assert_eq!(
+        p.files
+            .iter()
+            .filter(|f| {
+                let p = f.path.as_str();
+                p.starts_with("Data/") && p.ends_with(".txt")
+            })
+            .count(),
+        2,
+        "{:?}",
+        p.files
+    );
+}
+
+#[test]
+fn an_old_deployment_record_is_still_matched_after_the_case_fold_change() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let inst = create_pinned_instance(&ctx, &install, &def, "OldRecord");
+
+    let old = add_content_folder(&ctx, "Old", &[("Data/Old.txt", b"old")]);
+    add_content(&ctx, &inst.instance_id, &old, None, None).unwrap();
+    deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+
+    // A record written by today's code names the path as the plan does, not a folded key.
+    let game_dir = deployment_dir(&ctx, &inst.instance_id).unwrap().unwrap();
+    let record_path = game_dir.parent().unwrap().join("deployment.json");
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    assert!(
+        record["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "Data/Old.txt"),
+        "{record}"
+    );
+
+    // A plan change updates in place, keeping the recorded file.
+    let new = add_content_folder(&ctx, "New", &[("Data/New.txt", b"new")]);
+    add_content(&ctx, &inst.instance_id, &new, None, None).unwrap();
+    let outcome = deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(
+        matches!(outcome, DeployOutcome::Built { kept, removed: 0, .. } if kept > 0),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(game_dir.join("Data").join("Old.txt")).unwrap(),
+        b"old"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_record_spelled_in_another_case_still_matches_the_farm() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let inst = create_pinned_instance(&ctx, &install, &def, "RecasedRecord");
+
+    let old = add_content_folder(&ctx, "Old", &[("Data/Old.txt", b"old")]);
+    add_content(&ctx, &inst.instance_id, &old, None, None).unwrap();
+    deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+
+    let game_dir = deployment_dir(&ctx, &inst.instance_id).unwrap().unwrap();
+    let record_path = game_dir.parent().unwrap().join("deployment.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+    for file in record["files"].as_array_mut().unwrap() {
+        if file["path"] == "Data/Old.txt" {
+            file["path"] = serde_json::Value::String("DATA/OLD.TXT".into());
+        }
+    }
+    std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    let new = add_content_folder(&ctx, "New", &[("Data/New.txt", b"new")]);
+    add_content(&ctx, &inst.instance_id, &new, None, None).unwrap();
+    let outcome = deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(
+        matches!(outcome, DeployOutcome::Built { kept, removed: 0, .. } if kept > 0),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(game_dir.join("Data").join("Old.txt")).unwrap(),
+        b"old"
+    );
+}
+
+#[test]
 fn test_file_folder_conflict_across_layers() {
     let tmp = TempDir::new().unwrap();
     let def = make_test_definition();

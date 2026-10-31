@@ -70,7 +70,7 @@ fn strip_form(name: &str, form: &str) -> Option<String> {
         return None;
     }
     let (head, tail) = name.split_at(form.len());
-    if !head.eq_ignore_ascii_case(form) {
+    if agora_game_api::fold_path_case(head) != agora_game_api::fold_path_case(form) {
         return None;
     }
     if tail.is_empty() {
@@ -294,7 +294,8 @@ pub fn add_system_forms(cfg: &mut RuntimeConfig) {
         }
         let mut tails = vec![tail];
         if let Some(short) = unsafe { short_path(&prefix.original) } {
-            let differs = !short.eq_ignore_ascii_case(&prefix.original);
+            let differs = agora_game_api::fold_path_case(&short)
+                != agora_game_api::fold_path_case(&prefix.original);
             if differs && short.len() >= 2 && short.as_bytes()[1] == b':' {
                 tails.push(short[2..].to_string());
             }
@@ -303,7 +304,9 @@ pub fn add_system_forms(cfg: &mut RuntimeConfig) {
         for head in &heads {
             for tail in &tails {
                 let form = format!("{head}{tail}");
-                if !forms.iter().any(|f| f.eq_ignore_ascii_case(&form)) {
+                if !forms.iter().any(|f| {
+                    agora_game_api::fold_path_case(f) == agora_game_api::fold_path_case(&form)
+                }) {
                     forms.push(form);
                 }
             }

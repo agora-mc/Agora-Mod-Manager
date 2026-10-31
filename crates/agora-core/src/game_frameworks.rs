@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use agora_game_api::{FrameworkDefinition, FrameworkVersionSource, GameDefinition};
+use agora_game_api::{fold_path_case, FrameworkDefinition, FrameworkVersionSource, GameDefinition};
 
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
@@ -50,7 +50,10 @@ pub fn framework_status(
                 message: e.to_string(),
             }
         })?;
-    if !visible.iter().any(|path| path.eq_ignore_ascii_case(marker)) {
+    if !visible
+        .iter()
+        .any(|path| fold_path_case(path) == fold_path_case(marker))
+    {
         return Ok(FrameworkStatus::Absent);
     }
 

@@ -5061,14 +5061,22 @@ fn a_path_held_by_two_mods_is_one_row_for_the_file_the_deployment_uses() {
 }
 
 #[test]
-#[ignore = "planner folds ASCII case only; tracked separately"]
 fn a_path_held_by_two_mods_in_different_non_ascii_case_is_one_row() {
     // On NTFS "Ü" and "ü" name the same file, so the two mods collide on disk. One row is right.
     let f = fixture(Vec::new());
-    f.add_mod("Upper", &[("Data/Ü/Tool.exe", b"upper")]);
-    f.add_mod("Lower", &[("data/ü/tool.exe", b"lower")]);
+    let upper = f.add_mod("Upper", &[("Data/Ü/Tool.exe", b"upper")]);
+    let lower = f.add_mod("Lower", &[("data/ü/tool.exe", b"lower")]);
     let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
     assert_eq!(candidates.len(), 1, "{candidates:?}");
+    // The later mod wins, as it does for an ASCII case pair.
+    assert_eq!(candidates[0].mod_id, lower);
+    let plan = plan(&f.ctx, f.id(), &f.def, DeployMode::Links).unwrap();
+    let deployed = planned(&plan, "data/ü/tool.exe").expect("the deployment has it");
+    let FileSource::Content { item_id, .. } = &deployed.source else {
+        panic!("not a content file: {:?}", deployed.source);
+    };
+    assert_eq!(item_id, &lower);
+    assert_ne!(item_id, &upper);
 }
 
 #[test]
