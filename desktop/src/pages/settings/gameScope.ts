@@ -16,10 +16,10 @@ export const SETTINGS_CARD_AUDIENCE = {
   // General
   'advanced-mode': 'all-games',
   installation: 'all-games',
-  walkthrough: 'minecraft',
+  walkthrough: 'all-games',
   'game-support': 'all-games',
   'template-settings': 'minecraft',
-  'runtime-reclaim': 'minecraft',
+  'runtime-reclaim': 'all-games',
   updates: 'all-games',
   'instance-updates': 'minecraft',
 
@@ -44,7 +44,7 @@ export const SETTINGS_CARD_AUDIENCE = {
   'game-window': 'minecraft',
 
   // Services and Privacy
-  'content-sources': 'minecraft',
+  'content-sources': 'all-games',
   'ai-assistant': 'all-games',
   'ai-mcp': 'all-games',
   plugins: 'all-games',

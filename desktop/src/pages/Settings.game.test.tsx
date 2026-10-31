@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ComponentProps } from 'react';
+import { useState, type ComponentProps } from 'react';
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -162,9 +162,9 @@ describe('Settings for another game', () => {
     expect(await screen.findByText(/1 base for Skyrim Special Edition, using 2.0 KB/)).toBeInTheDocument();
     expect(screen.getByText(/E:\/AgoraBases\/skyrim-se-1/)).toBeInTheDocument();
 
-    expect(within(pages()).queryByRole('tab', { name: 'Walkthrough' })).toBeNull();
+    expect(within(pages()).getByRole('tab', { name: 'Walkthrough' })).toBeInTheDocument();
     expect(within(pages()).queryByRole('tab', { name: 'Templates' })).toBeNull();
-    expect(within(pages()).queryByRole('tab', { name: 'Storage' })).toBeNull();
+    expect(within(pages()).getByRole('tab', { name: 'Storage' })).toBeInTheDocument();
     expect(within(pages()).getByRole('tab', { name: 'Game support' })).toBeInTheDocument();
     expect(within(pages()).getByRole('tab', { name: 'Updates' })).toBeInTheDocument();
 
@@ -174,12 +174,47 @@ describe('Settings for another game', () => {
     expect(screen.queryByRole('tab', { name: 'Skin & cape' })).toBeNull();
 
     fireEvent.click(within(sections()).getByRole('tab', { name: 'Services' }));
-    expect(within(pages()).queryByRole('tab', { name: 'Content sources' })).toBeNull();
+    expect(within(pages()).getByRole('tab', { name: 'Content sources' })).toBeInTheDocument();
     expect(within(pages()).getByRole('tab', { name: 'AI assistant' })).toBeInTheDocument();
     expect(within(pages()).getByRole('tab', { name: 'Plugins' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Switch to Minecraft' }));
     expect(onSwitchToMinecraft).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the app-wide Walkthrough, Storage and Content sources pages for another game', async () => {
+    answer({ games_list: { games: [] } });
+    renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
+
+    expect(await screen.findByRole('heading', { name: 'Advanced mode' })).toBeInTheDocument();
+    expect(within(pages()).getByRole('tab', { name: 'Walkthrough' })).toBeInTheDocument();
+    expect(within(pages()).getByRole('tab', { name: 'Storage' })).toBeInTheDocument();
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Services' }));
+    expect(within(pages()).getByRole('tab', { name: 'Content sources' })).toBeInTheDocument();
+  });
+
+  it('stays on the same Settings tab when the game switches to Minecraft', async () => {
+    answer({ games_list: { games: [] } });
+    function Harness() {
+      const [game, setGame] = useState<string>('skyrim-se');
+      return (
+        <Settings
+          onResetLayout={() => undefined}
+          activeGame={game}
+          activeGameName="Skyrim Special Edition"
+          onSwitchToMinecraft={() => setGame('minecraft')}
+        />
+      );
+    }
+    render(<Harness />);
+
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Accounts' }));
+    expect(await screen.findByRole('heading', { name: 'GitHub Account' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to Minecraft' }));
+    expect(await screen.findByRole('heading', { name: 'GitHub Account' })).toBeInTheDocument();
+    expect(within(sections()).getByRole('tab', { name: 'Accounts' })).toHaveAttribute('aria-selected', 'true');
+    expect(within(sections()).getByRole('tab', { name: 'Launching' })).toBeInTheDocument();
   });
 
   it('treats an unknown plugin game id like any other non-Minecraft game', async () => {
