@@ -130,19 +130,13 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
     let candidates = find_candidates(ctx, instance_id, &definition)?;
     let matched = candidates
         .iter()
-        .find(|candidate| candidate.exe.eq_ignore_ascii_case(&exe));
-    let known_exe = known_tools(ctx, &definition)
-        .into_iter()
-        .find(|known| known.exe.eq_ignore_ascii_case(&exe));
-    let canonical = match (matched, &known_exe) {
-        (Some(candidate), _) => candidate.exe.clone(),
-        (None, Some(known)) => known.exe.clone(),
-        (None, None) => {
-            return Err(UserToolError::InvalidExe(format!(
-                "'{exe}' is not an executable in this instance's enabled mods"
-            )))
-        }
-    };
+        .find(|candidate| candidate.exe.eq_ignore_ascii_case(&exe))
+        .ok_or_else(|| {
+            UserToolError::InvalidExe(format!(
+                "'{exe}' is not an executable this instance's deployment provides from an enabled mod or the game's files"
+            ))
+        })?;
+    let canonical = matched.exe.clone();
     if tools
         .iter()
         .any(|tool| tool.exe.eq_ignore_ascii_case(&canonical))
@@ -156,15 +150,19 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
             "a tool needs a name".to_string(),
         ));
     }
+    if name.chars().any(char::is_control) {
+        return Err(UserToolError::InvalidName(
+            "a tool's name cannot contain control characters such as a line break or a tab"
+                .to_string(),
+        ));
+    }
     if name.chars().count() > NAME_MAX_CHARS {
         return Err(UserToolError::InvalidName(format!(
             "a tool's name can be at most {NAME_MAX_CHARS} characters"
         )));
     }
 
-    let known_tool_id = matched
-        .and_then(|candidate| candidate.known_tool_id.clone())
-        .or_else(|| known_exe.as_ref().map(|known| known.id.clone()));
+    let known_tool_id = matched.known_tool_id.clone();
 
     let tool = UserTool {
         id: new_user_tool_id(),
@@ -401,7 +399,10 @@ fn write_file(path: &Path, file: &UserToolsFile) -> Result<(), UserToolError> {
     ));
     let mut bytes = serde_json::to_vec_pretty(file)?;
     bytes.push(b'\n');
-    std::fs::write(&tmp, bytes)?;
+    if let Err(error) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.into());
