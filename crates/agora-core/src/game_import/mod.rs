@@ -548,7 +548,7 @@ pub fn plan(
     let mut unmanaged: Vec<String> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     for line in mo2::parse_modlist(&modlist) {
-        if fold_path_case(&line.name).ends_with("_SEPARATOR") {
+        if fold_path_case(&line.name).ends_with("_separator") {
             separators += 1;
             continue;
         }
@@ -1478,10 +1478,8 @@ mod case_fold_review_tests {
     fn drive_scan_skips_windows_recycle_bin_and_program_files_whatever_their_case() {
         // SKIPPED_DIRS is lower-case and `name` is now upper-cased by fold_path_case, so the skip
         // never matches: the scan walks into WINDOWS, $RECYCLE.BIN and PROGRAM FILES.
-        let root = std::env::temp_dir().join(format!(
-            "agora-review-drive-scan-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agora-review-drive-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for dir in [
             "Windows",

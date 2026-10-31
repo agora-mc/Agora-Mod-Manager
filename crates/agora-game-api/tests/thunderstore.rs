@@ -275,8 +275,5 @@ fn top_level_thunderstore_files_stay_out_of_a_root_pack_whatever_their_case() {
         .map(|(_, d)| d.as_str().to_string())
         .collect();
     dests.sort();
-    assert_eq!(
-        dests,
-        ["BepInEx/core/BepInEx.Preloader.dll", "winhttp.dll"]
-    );
+    assert_eq!(dests, ["BepInEx/core/BepInEx.Preloader.dll", "winhttp.dll"]);
 }

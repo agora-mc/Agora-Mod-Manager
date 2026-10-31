@@ -231,7 +231,7 @@ pub fn find_candidates(
         let Some(base) = file_name(path) else {
             continue;
         };
-        if !fold_path_case(base).ends_with(".EXE") {
+        if !fold_path_case(base).ends_with(".exe") {
             continue;
         }
         if is_excluded_exe(base) {
@@ -332,7 +332,7 @@ fn candidate_row(
 
 /// The file's stem, without its `.exe`, for a name suggestion.
 fn exe_stem(base: &str) -> String {
-    if fold_path_case(base).ends_with(".EXE") {
+    if fold_path_case(base).ends_with(".exe") {
         // ".exe" is four ASCII bytes in the original too, so this is a char boundary.
         base.get(..base.len() - 4).unwrap_or(base).to_string()
     } else {
@@ -469,7 +469,7 @@ fn normalise_exe(raw: &str) -> Result<String, UserToolError> {
         }
     }
     let base = segments.last().copied().unwrap_or_default();
-    if !fold_path_case(base).ends_with(".EXE") || fold_path_case(base) == ".EXE" {
+    if !fold_path_case(base).ends_with(".exe") || fold_path_case(base) == ".exe" {
         return Err(UserToolError::InvalidExe(format!(
             "'{raw}' is not an .exe file"
         )));

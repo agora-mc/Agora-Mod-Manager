@@ -163,6 +163,11 @@ pub fn wildcard(pattern: &str, name: &str) -> bool {
     go(&p, &n)
 }
 
+/// The VFS's own whiteout folder, matched through the same case fold as every other name.
+fn is_whiteout_dir(folded_name: &str) -> bool {
+    folded_name == ".agvfs-wh"
+}
+
 /// The merged listing of virtual directory `rel`: upper first, then lowers in priority order;
 /// a name seen in a higher layer hides the same name below, whiteouts hide it entirely.
 /// If `mount == lowers[0]` or any folders point to the exact same path, duplicates are de-duped.
@@ -196,7 +201,7 @@ pub unsafe fn build_listing(
         for entry in read_real_dir(&dir, class) {
             let name = entry_name(&entry, class);
             let key = agora_game_api::fold_path_case(&name);
-            if rel.is_empty() && key == ".agvfs-wh" {
+            if rel.is_empty() && is_whiteout_dir(&key) {
                 continue;
             }
             if !seen.insert(key) {
@@ -316,4 +321,19 @@ pub unsafe fn query_directory(
     *iosb = status as u32 as usize;
     *iosb.add(1) = written;
     Some(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_whiteout_dir;
+
+    #[test]
+    fn whiteout_folder_name_matches_whatever_its_case() {
+        for name in [".agvfs-wh", ".AGVFS-WH", ".AgVfs-Wh"] {
+            assert!(is_whiteout_dir(&agora_game_api::fold_path_case(name)));
+        }
+        assert!(!is_whiteout_dir(&agora_game_api::fold_path_case(
+            ".agvfs-wh-copy"
+        )));
+    }
 }

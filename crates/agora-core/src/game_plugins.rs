@@ -173,7 +173,12 @@ fn plugin_line<'a>(line: &'a [u8], rule: &PluginListRule) -> Option<(bool, &'a [
 }
 
 fn key(name: &[u8]) -> Vec<u8> {
-    name.to_ascii_lowercase()
+    // Plugin lists are bytes; a non-ASCII name is normally UTF-8 from the file system.
+    // Invalid UTF-8 keeps the old ASCII-only fold rather than inventing characters.
+    match std::str::from_utf8(name) {
+        Ok(text) => fold_path_case(text).into_bytes(),
+        Err(_) => name.to_ascii_lowercase(),
+    }
 }
 
 fn render_line(rule: &PluginListRule, name: &[u8], active: bool) -> Vec<u8> {

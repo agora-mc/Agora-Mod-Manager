@@ -1138,7 +1138,7 @@ mod tests {
             managed: false,
             locked: false,
             header_read: true,
-            master: fold_path_case(name).ends_with(".ESM"),
+            master: fold_path_case(name).ends_with(".esm"),
             light: false,
             masters: masters.iter().map(|m| m.to_string()).collect(),
             header_error: None,

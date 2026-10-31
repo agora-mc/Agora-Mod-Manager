@@ -961,25 +961,284 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
     CompiledGlob::new(pattern).matches(path)
 }
 
-/// A game path with the case Windows' NTFS uses to compare names: per character, simple
-/// (one-to-one) uppercase.
+/// Characters whose simple uppercase NTFS does **not** treat as the same name, measured on
+/// this machine's `D:` volume on 2026-10-31 by creating `x<c>` and asking whether `x<UPPER(c)>`
+/// opens the same file. 225 of 1171 measured characters did not fold. Sorted by the first
+/// character; `fold_path_case` leaves them alone.
 ///
-/// NTFS keeps a per-volume upcase table, built when the volume is formatted, and compares names
-/// through it. That is Unicode's *simple* uppercase mapping, so `ß` stays `ß` (it is not full case
-/// folding to `SS`) and names are not normalised (`é` precomposed and `e` plus a combining accent
-/// are different names). The exact table is volume-specific, so the mapping here follows Unicode's
-/// simple uppercase and is unverified against a particular formatted volume. A character whose
-/// uppercase form is more than one code point has no simple mapping and is left as it is.
+/// The measurement is a committed, ignored-by-default test in
+/// `crates/agora-game-api/tests/case_fold_ntfs.rs`. NTFS builds this table when a volume is
+/// formatted, so another volume may differ; the list is the one measured here.
+const NTFS_UNFOLDED: &[(char, char)] = &[
+    ('\u{b5}', '\u{39c}'),    // U+00B5 -> U+039C
+    ('\u{131}', 'I'),         // U+0131 -> U+0049
+    ('\u{17f}', 'S'),         // U+017F -> U+0053
+    ('\u{19b}', '\u{a7dc}'),  // U+019B -> U+A7DC
+    ('\u{1c5}', '\u{1c4}'),   // U+01C5 -> U+01C4
+    ('\u{1c8}', '\u{1c7}'),   // U+01C8 -> U+01C7
+    ('\u{1cb}', '\u{1ca}'),   // U+01CB -> U+01CA
+    ('\u{1f2}', '\u{1f1}'),   // U+01F2 -> U+01F1
+    ('\u{23f}', '\u{2c7e}'),  // U+023F -> U+2C7E
+    ('\u{240}', '\u{2c7f}'),  // U+0240 -> U+2C7F
+    ('\u{252}', '\u{2c70}'),  // U+0252 -> U+2C70
+    ('\u{25c}', '\u{a7ab}'),  // U+025C -> U+A7AB
+    ('\u{261}', '\u{a7ac}'),  // U+0261 -> U+A7AC
+    ('\u{264}', '\u{a7cb}'),  // U+0264 -> U+A7CB
+    ('\u{265}', '\u{a78d}'),  // U+0265 -> U+A78D
+    ('\u{266}', '\u{a7aa}'),  // U+0266 -> U+A7AA
+    ('\u{26a}', '\u{a7ae}'),  // U+026A -> U+A7AE
+    ('\u{26c}', '\u{a7ad}'),  // U+026C -> U+A7AD
+    ('\u{282}', '\u{a7c5}'),  // U+0282 -> U+A7C5
+    ('\u{287}', '\u{a7b1}'),  // U+0287 -> U+A7B1
+    ('\u{29d}', '\u{a7b2}'),  // U+029D -> U+A7B2
+    ('\u{29e}', '\u{a7b0}'),  // U+029E -> U+A7B0
+    ('\u{345}', '\u{399}'),   // U+0345 -> U+0399
+    ('\u{3c2}', '\u{3a3}'),   // U+03C2 -> U+03A3
+    ('\u{3d0}', '\u{392}'),   // U+03D0 -> U+0392
+    ('\u{3d1}', '\u{398}'),   // U+03D1 -> U+0398
+    ('\u{3d5}', '\u{3a6}'),   // U+03D5 -> U+03A6
+    ('\u{3d6}', '\u{3a0}'),   // U+03D6 -> U+03A0
+    ('\u{3f0}', '\u{39a}'),   // U+03F0 -> U+039A
+    ('\u{3f1}', '\u{3a1}'),   // U+03F1 -> U+03A1
+    ('\u{3f3}', '\u{37f}'),   // U+03F3 -> U+037F
+    ('\u{3f5}', '\u{395}'),   // U+03F5 -> U+0395
+    ('\u{525}', '\u{524}'),   // U+0525 -> U+0524
+    ('\u{527}', '\u{526}'),   // U+0527 -> U+0526
+    ('\u{529}', '\u{528}'),   // U+0529 -> U+0528
+    ('\u{52b}', '\u{52a}'),   // U+052B -> U+052A
+    ('\u{52d}', '\u{52c}'),   // U+052D -> U+052C
+    ('\u{52f}', '\u{52e}'),   // U+052F -> U+052E
+    ('\u{10d0}', '\u{1c90}'), // U+10D0 -> U+1C90
+    ('\u{10d1}', '\u{1c91}'), // U+10D1 -> U+1C91
+    ('\u{10d2}', '\u{1c92}'), // U+10D2 -> U+1C92
+    ('\u{10d3}', '\u{1c93}'), // U+10D3 -> U+1C93
+    ('\u{10d4}', '\u{1c94}'), // U+10D4 -> U+1C94
+    ('\u{10d5}', '\u{1c95}'), // U+10D5 -> U+1C95
+    ('\u{10d6}', '\u{1c96}'), // U+10D6 -> U+1C96
+    ('\u{10d7}', '\u{1c97}'), // U+10D7 -> U+1C97
+    ('\u{10d8}', '\u{1c98}'), // U+10D8 -> U+1C98
+    ('\u{10d9}', '\u{1c99}'), // U+10D9 -> U+1C99
+    ('\u{10da}', '\u{1c9a}'), // U+10DA -> U+1C9A
+    ('\u{10db}', '\u{1c9b}'), // U+10DB -> U+1C9B
+    ('\u{10dc}', '\u{1c9c}'), // U+10DC -> U+1C9C
+    ('\u{10dd}', '\u{1c9d}'), // U+10DD -> U+1C9D
+    ('\u{10de}', '\u{1c9e}'), // U+10DE -> U+1C9E
+    ('\u{10df}', '\u{1c9f}'), // U+10DF -> U+1C9F
+    ('\u{10e0}', '\u{1ca0}'), // U+10E0 -> U+1CA0
+    ('\u{10e1}', '\u{1ca1}'), // U+10E1 -> U+1CA1
+    ('\u{10e2}', '\u{1ca2}'), // U+10E2 -> U+1CA2
+    ('\u{10e3}', '\u{1ca3}'), // U+10E3 -> U+1CA3
+    ('\u{10e4}', '\u{1ca4}'), // U+10E4 -> U+1CA4
+    ('\u{10e5}', '\u{1ca5}'), // U+10E5 -> U+1CA5
+    ('\u{10e6}', '\u{1ca6}'), // U+10E6 -> U+1CA6
+    ('\u{10e7}', '\u{1ca7}'), // U+10E7 -> U+1CA7
+    ('\u{10e8}', '\u{1ca8}'), // U+10E8 -> U+1CA8
+    ('\u{10e9}', '\u{1ca9}'), // U+10E9 -> U+1CA9
+    ('\u{10ea}', '\u{1caa}'), // U+10EA -> U+1CAA
+    ('\u{10eb}', '\u{1cab}'), // U+10EB -> U+1CAB
+    ('\u{10ec}', '\u{1cac}'), // U+10EC -> U+1CAC
+    ('\u{10ed}', '\u{1cad}'), // U+10ED -> U+1CAD
+    ('\u{10ee}', '\u{1cae}'), // U+10EE -> U+1CAE
+    ('\u{10ef}', '\u{1caf}'), // U+10EF -> U+1CAF
+    ('\u{10f0}', '\u{1cb0}'), // U+10F0 -> U+1CB0
+    ('\u{10f1}', '\u{1cb1}'), // U+10F1 -> U+1CB1
+    ('\u{10f2}', '\u{1cb2}'), // U+10F2 -> U+1CB2
+    ('\u{10f3}', '\u{1cb3}'), // U+10F3 -> U+1CB3
+    ('\u{10f4}', '\u{1cb4}'), // U+10F4 -> U+1CB4
+    ('\u{10f5}', '\u{1cb5}'), // U+10F5 -> U+1CB5
+    ('\u{10f6}', '\u{1cb6}'), // U+10F6 -> U+1CB6
+    ('\u{10f7}', '\u{1cb7}'), // U+10F7 -> U+1CB7
+    ('\u{10f8}', '\u{1cb8}'), // U+10F8 -> U+1CB8
+    ('\u{10f9}', '\u{1cb9}'), // U+10F9 -> U+1CB9
+    ('\u{10fa}', '\u{1cba}'), // U+10FA -> U+1CBA
+    ('\u{10fd}', '\u{1cbd}'), // U+10FD -> U+1CBD
+    ('\u{10fe}', '\u{1cbe}'), // U+10FE -> U+1CBE
+    ('\u{10ff}', '\u{1cbf}'), // U+10FF -> U+1CBF
+    ('\u{13f8}', '\u{13f0}'), // U+13F8 -> U+13F0
+    ('\u{13f9}', '\u{13f1}'), // U+13F9 -> U+13F1
+    ('\u{13fa}', '\u{13f2}'), // U+13FA -> U+13F2
+    ('\u{13fb}', '\u{13f3}'), // U+13FB -> U+13F3
+    ('\u{13fc}', '\u{13f4}'), // U+13FC -> U+13F4
+    ('\u{13fd}', '\u{13f5}'), // U+13FD -> U+13F5
+    ('\u{1c80}', '\u{412}'),  // U+1C80 -> U+0412
+    ('\u{1c81}', '\u{414}'),  // U+1C81 -> U+0414
+    ('\u{1c82}', '\u{41e}'),  // U+1C82 -> U+041E
+    ('\u{1c83}', '\u{421}'),  // U+1C83 -> U+0421
+    ('\u{1c84}', '\u{422}'),  // U+1C84 -> U+0422
+    ('\u{1c85}', '\u{422}'),  // U+1C85 -> U+0422
+    ('\u{1c86}', '\u{42a}'),  // U+1C86 -> U+042A
+    ('\u{1c87}', '\u{462}'),  // U+1C87 -> U+0462
+    ('\u{1c88}', '\u{a64a}'), // U+1C88 -> U+A64A
+    ('\u{1c8a}', '\u{1c89}'), // U+1C8A -> U+1C89
+    ('\u{1d8e}', '\u{a7c6}'), // U+1D8E -> U+A7C6
+    ('\u{1e9b}', '\u{1e60}'), // U+1E9B -> U+1E60
+    ('\u{1fbe}', '\u{399}'),  // U+1FBE -> U+0399
+    ('\u{2c5f}', '\u{2c2f}'), // U+2C5F -> U+2C2F
+    ('\u{2cec}', '\u{2ceb}'), // U+2CEC -> U+2CEB
+    ('\u{2cee}', '\u{2ced}'), // U+2CEE -> U+2CED
+    ('\u{2cf3}', '\u{2cf2}'), // U+2CF3 -> U+2CF2
+    ('\u{2d27}', '\u{10c7}'), // U+2D27 -> U+10C7
+    ('\u{2d2d}', '\u{10cd}'), // U+2D2D -> U+10CD
+    ('\u{a661}', '\u{a660}'), // U+A661 -> U+A660
+    ('\u{a699}', '\u{a698}'), // U+A699 -> U+A698
+    ('\u{a69b}', '\u{a69a}'), // U+A69B -> U+A69A
+    ('\u{a791}', '\u{a790}'), // U+A791 -> U+A790
+    ('\u{a793}', '\u{a792}'), // U+A793 -> U+A792
+    ('\u{a794}', '\u{a7c4}'), // U+A794 -> U+A7C4
+    ('\u{a797}', '\u{a796}'), // U+A797 -> U+A796
+    ('\u{a799}', '\u{a798}'), // U+A799 -> U+A798
+    ('\u{a79b}', '\u{a79a}'), // U+A79B -> U+A79A
+    ('\u{a79d}', '\u{a79c}'), // U+A79D -> U+A79C
+    ('\u{a79f}', '\u{a79e}'), // U+A79F -> U+A79E
+    ('\u{a7a1}', '\u{a7a0}'), // U+A7A1 -> U+A7A0
+    ('\u{a7a3}', '\u{a7a2}'), // U+A7A3 -> U+A7A2
+    ('\u{a7a5}', '\u{a7a4}'), // U+A7A5 -> U+A7A4
+    ('\u{a7a7}', '\u{a7a6}'), // U+A7A7 -> U+A7A6
+    ('\u{a7a9}', '\u{a7a8}'), // U+A7A9 -> U+A7A8
+    ('\u{a7b5}', '\u{a7b4}'), // U+A7B5 -> U+A7B4
+    ('\u{a7b7}', '\u{a7b6}'), // U+A7B7 -> U+A7B6
+    ('\u{a7b9}', '\u{a7b8}'), // U+A7B9 -> U+A7B8
+    ('\u{a7bb}', '\u{a7ba}'), // U+A7BB -> U+A7BA
+    ('\u{a7bd}', '\u{a7bc}'), // U+A7BD -> U+A7BC
+    ('\u{a7bf}', '\u{a7be}'), // U+A7BF -> U+A7BE
+    ('\u{a7c1}', '\u{a7c0}'), // U+A7C1 -> U+A7C0
+    ('\u{a7c3}', '\u{a7c2}'), // U+A7C3 -> U+A7C2
+    ('\u{a7c8}', '\u{a7c7}'), // U+A7C8 -> U+A7C7
+    ('\u{a7ca}', '\u{a7c9}'), // U+A7CA -> U+A7C9
+    ('\u{a7cd}', '\u{a7cc}'), // U+A7CD -> U+A7CC
+    ('\u{a7cf}', '\u{a7ce}'), // U+A7CF -> U+A7CE
+    ('\u{a7d1}', '\u{a7d0}'), // U+A7D1 -> U+A7D0
+    ('\u{a7d3}', '\u{a7d2}'), // U+A7D3 -> U+A7D2
+    ('\u{a7d5}', '\u{a7d4}'), // U+A7D5 -> U+A7D4
+    ('\u{a7d7}', '\u{a7d6}'), // U+A7D7 -> U+A7D6
+    ('\u{a7d9}', '\u{a7d8}'), // U+A7D9 -> U+A7D8
+    ('\u{a7db}', '\u{a7da}'), // U+A7DB -> U+A7DA
+    ('\u{a7f6}', '\u{a7f5}'), // U+A7F6 -> U+A7F5
+    ('\u{ab53}', '\u{a7b3}'), // U+AB53 -> U+A7B3
+    ('\u{ab70}', '\u{13a0}'), // U+AB70 -> U+13A0
+    ('\u{ab71}', '\u{13a1}'), // U+AB71 -> U+13A1
+    ('\u{ab72}', '\u{13a2}'), // U+AB72 -> U+13A2
+    ('\u{ab73}', '\u{13a3}'), // U+AB73 -> U+13A3
+    ('\u{ab74}', '\u{13a4}'), // U+AB74 -> U+13A4
+    ('\u{ab75}', '\u{13a5}'), // U+AB75 -> U+13A5
+    ('\u{ab76}', '\u{13a6}'), // U+AB76 -> U+13A6
+    ('\u{ab77}', '\u{13a7}'), // U+AB77 -> U+13A7
+    ('\u{ab78}', '\u{13a8}'), // U+AB78 -> U+13A8
+    ('\u{ab79}', '\u{13a9}'), // U+AB79 -> U+13A9
+    ('\u{ab7a}', '\u{13aa}'), // U+AB7A -> U+13AA
+    ('\u{ab7b}', '\u{13ab}'), // U+AB7B -> U+13AB
+    ('\u{ab7c}', '\u{13ac}'), // U+AB7C -> U+13AC
+    ('\u{ab7d}', '\u{13ad}'), // U+AB7D -> U+13AD
+    ('\u{ab7e}', '\u{13ae}'), // U+AB7E -> U+13AE
+    ('\u{ab7f}', '\u{13af}'), // U+AB7F -> U+13AF
+    ('\u{ab80}', '\u{13b0}'), // U+AB80 -> U+13B0
+    ('\u{ab81}', '\u{13b1}'), // U+AB81 -> U+13B1
+    ('\u{ab82}', '\u{13b2}'), // U+AB82 -> U+13B2
+    ('\u{ab83}', '\u{13b3}'), // U+AB83 -> U+13B3
+    ('\u{ab84}', '\u{13b4}'), // U+AB84 -> U+13B4
+    ('\u{ab85}', '\u{13b5}'), // U+AB85 -> U+13B5
+    ('\u{ab86}', '\u{13b6}'), // U+AB86 -> U+13B6
+    ('\u{ab87}', '\u{13b7}'), // U+AB87 -> U+13B7
+    ('\u{ab88}', '\u{13b8}'), // U+AB88 -> U+13B8
+    ('\u{ab89}', '\u{13b9}'), // U+AB89 -> U+13B9
+    ('\u{ab8a}', '\u{13ba}'), // U+AB8A -> U+13BA
+    ('\u{ab8b}', '\u{13bb}'), // U+AB8B -> U+13BB
+    ('\u{ab8c}', '\u{13bc}'), // U+AB8C -> U+13BC
+    ('\u{ab8d}', '\u{13bd}'), // U+AB8D -> U+13BD
+    ('\u{ab8e}', '\u{13be}'), // U+AB8E -> U+13BE
+    ('\u{ab8f}', '\u{13bf}'), // U+AB8F -> U+13BF
+    ('\u{ab90}', '\u{13c0}'), // U+AB90 -> U+13C0
+    ('\u{ab91}', '\u{13c1}'), // U+AB91 -> U+13C1
+    ('\u{ab92}', '\u{13c2}'), // U+AB92 -> U+13C2
+    ('\u{ab93}', '\u{13c3}'), // U+AB93 -> U+13C3
+    ('\u{ab94}', '\u{13c4}'), // U+AB94 -> U+13C4
+    ('\u{ab95}', '\u{13c5}'), // U+AB95 -> U+13C5
+    ('\u{ab96}', '\u{13c6}'), // U+AB96 -> U+13C6
+    ('\u{ab97}', '\u{13c7}'), // U+AB97 -> U+13C7
+    ('\u{ab98}', '\u{13c8}'), // U+AB98 -> U+13C8
+    ('\u{ab99}', '\u{13c9}'), // U+AB99 -> U+13C9
+    ('\u{ab9a}', '\u{13ca}'), // U+AB9A -> U+13CA
+    ('\u{ab9b}', '\u{13cb}'), // U+AB9B -> U+13CB
+    ('\u{ab9c}', '\u{13cc}'), // U+AB9C -> U+13CC
+    ('\u{ab9d}', '\u{13cd}'), // U+AB9D -> U+13CD
+    ('\u{ab9e}', '\u{13ce}'), // U+AB9E -> U+13CE
+    ('\u{ab9f}', '\u{13cf}'), // U+AB9F -> U+13CF
+    ('\u{aba0}', '\u{13d0}'), // U+ABA0 -> U+13D0
+    ('\u{aba1}', '\u{13d1}'), // U+ABA1 -> U+13D1
+    ('\u{aba2}', '\u{13d2}'), // U+ABA2 -> U+13D2
+    ('\u{aba3}', '\u{13d3}'), // U+ABA3 -> U+13D3
+    ('\u{aba4}', '\u{13d4}'), // U+ABA4 -> U+13D4
+    ('\u{aba5}', '\u{13d5}'), // U+ABA5 -> U+13D5
+    ('\u{aba6}', '\u{13d6}'), // U+ABA6 -> U+13D6
+    ('\u{aba7}', '\u{13d7}'), // U+ABA7 -> U+13D7
+    ('\u{aba8}', '\u{13d8}'), // U+ABA8 -> U+13D8
+    ('\u{aba9}', '\u{13d9}'), // U+ABA9 -> U+13D9
+    ('\u{abaa}', '\u{13da}'), // U+ABAA -> U+13DA
+    ('\u{abab}', '\u{13db}'), // U+ABAB -> U+13DB
+    ('\u{abac}', '\u{13dc}'), // U+ABAC -> U+13DC
+    ('\u{abad}', '\u{13dd}'), // U+ABAD -> U+13DD
+    ('\u{abae}', '\u{13de}'), // U+ABAE -> U+13DE
+    ('\u{abaf}', '\u{13df}'), // U+ABAF -> U+13DF
+    ('\u{abb0}', '\u{13e0}'), // U+ABB0 -> U+13E0
+    ('\u{abb1}', '\u{13e1}'), // U+ABB1 -> U+13E1
+    ('\u{abb2}', '\u{13e2}'), // U+ABB2 -> U+13E2
+    ('\u{abb3}', '\u{13e3}'), // U+ABB3 -> U+13E3
+    ('\u{abb4}', '\u{13e4}'), // U+ABB4 -> U+13E4
+    ('\u{abb5}', '\u{13e5}'), // U+ABB5 -> U+13E5
+    ('\u{abb6}', '\u{13e6}'), // U+ABB6 -> U+13E6
+    ('\u{abb7}', '\u{13e7}'), // U+ABB7 -> U+13E7
+    ('\u{abb8}', '\u{13e8}'), // U+ABB8 -> U+13E8
+    ('\u{abb9}', '\u{13e9}'), // U+ABB9 -> U+13E9
+    ('\u{abba}', '\u{13ea}'), // U+ABBA -> U+13EA
+    ('\u{abbb}', '\u{13eb}'), // U+ABBB -> U+13EB
+    ('\u{abbc}', '\u{13ec}'), // U+ABBC -> U+13EC
+    ('\u{abbd}', '\u{13ed}'), // U+ABBD -> U+13ED
+    ('\u{abbe}', '\u{13ee}'), // U+ABBE -> U+13EE
+    ('\u{abbf}', '\u{13ef}'), // U+ABBF -> U+13EF
+];
+
+/// The simple (one-to-one) uppercase mapping, or the character itself when its full uppercase is
+/// more than one code point.
+fn simple_upper(ch: char) -> char {
+    let mut upper = ch.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(single), None) => single,
+        _ => ch,
+    }
+}
+
+/// The simple (one-to-one) lowercase mapping, or the character itself when its full lowercase is
+/// more than one code point.
+fn simple_lower(ch: char) -> char {
+    let mut lower = ch.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(single), None) => single,
+        _ => ch,
+    }
+}
+
+/// A game path with the case Windows' NTFS uses to compare names: per character, the simple
+/// uppercase mapping then its simple lowercase, so the result is a lowercase key.
 ///
-/// ASCII paths therefore fold to the same equivalence classes they had when callers lower-cased
-/// ASCII: comparisons and stored records keep matching.
+/// NTFS keeps a per-volume upcase table and compares names through it. That is Unicode's *simple*
+/// uppercase mapping, so `ß` stays `ß` (it is not full case folding to `SS`) and names are not
+/// normalised (`é` precomposed and `e` plus a combining accent are different names). The table is
+/// volume-specific: [`NTFS_UNFOLDED`] records the characters this machine's NTFS did not fold, and
+/// the mapping here follows them. Characters whose mapping is more than one code point have no
+/// simple mapping and are left as they are.
+///
+/// ASCII paths are lowercased exactly as before, so comparisons, records and stored keys keep
+/// matching.
 pub fn fold_path_case(path: &str) -> String {
     let mut folded = String::with_capacity(path.len());
     for ch in path.chars() {
-        let mut upper = ch.to_uppercase();
-        match (upper.next(), upper.next()) {
-            (Some(single), None) => folded.push(single),
-            _ => folded.push(ch),
+        if NTFS_UNFOLDED
+            .binary_search_by_key(&ch, |&(character, _)| character)
+            .is_ok()
+        {
+            folded.push(ch);
+        } else {
+            folded.push(simple_lower(simple_upper(ch)));
         }
     }
     folded
@@ -1201,7 +1460,7 @@ pub fn map_thunderstore_bepinex(
             }
             let top = fold_path_case(parts[0]);
             let dest_str = match top.as_str() {
-                "PLUGINS" => {
+                "plugins" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         format!("BepInEx/plugins/{pkg}")
@@ -1209,7 +1468,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/plugins/{pkg}/{sub}")
                     }
                 }
-                "PATCHERS" => {
+                "patchers" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         format!("BepInEx/patchers/{pkg}")
@@ -1217,7 +1476,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/patchers/{pkg}/{sub}")
                     }
                 }
-                "MONOMOD" => {
+                "monomod" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         format!("BepInEx/monomod/{pkg}")
@@ -1225,7 +1484,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/monomod/{pkg}/{sub}")
                     }
                 }
-                "CONFIG" => {
+                "config" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         "BepInEx/config".to_string()
@@ -1233,7 +1492,7 @@ pub fn map_thunderstore_bepinex(
                         format!("BepInEx/config/{sub}")
                     }
                 }
-                "CORE" => {
+                "core" => {
                     let sub = parts[1..].join("/");
                     if sub.is_empty() {
                         "BepInEx/core".to_string()
@@ -2107,22 +2366,26 @@ mod tests {
         }
     }
     #[test]
-    fn path_case_folds_like_windows_simple_uppercase() {
-        assert_eq!(fold_path_case("Data/Ü/x"), "DATA/Ü/X");
-        assert_eq!(fold_path_case("ü"), "Ü");
+    fn path_case_folds_like_windows_simple_lowercase() {
+        assert_eq!(fold_path_case("Data/Ü/x"), "data/ü/x");
+        assert_eq!(fold_path_case("ü"), "ü");
 
-        // Simple uppercase, not full case folding: ß has no one-to-one mapping.
+        // Simple uppercase then simple lowercase, not full case folding: ß has no one-to-one
+        // uppercase mapping, so it stays itself.
         assert_eq!(fold_path_case("ß"), "ß");
         assert_ne!(fold_path_case("ß"), fold_path_case("SS"));
-        assert_ne!(fold_path_case("ẞ"), fold_path_case("ß"));
+        assert_eq!(fold_path_case("ẞ"), "ß");
 
         // No normalisation: precomposed and decomposed accents are different names.
         assert_ne!(fold_path_case("é"), fold_path_case("e\u{301}"));
 
-        // Turkish: Unicode simple uppercase maps both i and dotless ı to I; dotted İ stays itself.
-        assert_eq!(fold_path_case("ı"), "I");
-        assert_eq!(fold_path_case("I"), "I");
-        assert_eq!(fold_path_case("i"), "I");
+        // Measured NTFS exceptions: dotless ı and long ſ do not fold to i and s.
+        assert_eq!(fold_path_case("ı"), "ı");
+        assert_eq!(fold_path_case("ſ"), "ſ");
+        assert_ne!(fold_path_case("ı"), fold_path_case("i"));
+        assert_ne!(fold_path_case("ſ"), fold_path_case("s"));
+        assert_eq!(fold_path_case("I"), "i");
+        assert_eq!(fold_path_case("i"), "i");
         assert_eq!(fold_path_case("İ"), "İ");
         assert_ne!(fold_path_case("İ"), fold_path_case("i"));
     }
@@ -2150,7 +2413,7 @@ mod tests {
     #[test]
     fn empty_and_multibyte_paths_fold_without_panicking() {
         assert_eq!(fold_path_case(""), "");
-        assert_eq!(fold_path_case("日本語/файл/😀"), "日本語/ФАЙЛ/😀");
+        assert_eq!(fold_path_case("日本語/файл/😀"), "日本語/файл/😀");
         for path in ["", "é", "ß", "ı", "日本語", "😀", "a/日本語/b"] {
             let _ = fold_path_case(path);
         }

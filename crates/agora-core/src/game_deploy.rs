@@ -3585,10 +3585,8 @@ mod case_fold_review_tests {
         // NTFS on D: keeps `i.esp` and `ı.esp` as two files (checked 2026-10-31). fold_path_case maps
         // both to `I.ESP`, so walk_farm keeps one of them and compare_farm never reports the other
         // as Added: harvest then never copies the user's file into the writable layer.
-        let root = std::env::temp_dir().join(format!(
-            "agora-review-farm-dotless-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("agora-review-farm-dotless-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("Data")).unwrap();
         std::fs::write(root.join("Data").join("i.esp"), b"mod").unwrap();

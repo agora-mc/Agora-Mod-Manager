@@ -2054,7 +2054,7 @@ fn outside_data(changes: InstallChanges) -> InstallChanges {
             .into_iter()
             .filter(|p| {
                 let folded = fold_path_case(p);
-                !(folded == "DATA" || folded.starts_with("DATA/"))
+                !(folded == "data" || folded.starts_with("data/"))
             })
             .collect()
     };
