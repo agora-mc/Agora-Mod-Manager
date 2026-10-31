@@ -49,6 +49,7 @@ pub mod game_tool_copy;
 pub mod game_tool_swap;
 pub mod game_tools;
 pub mod game_user_files;
+pub mod game_user_tools;
 pub mod github_ratelimit;
 pub mod github_release;
 pub mod governance;

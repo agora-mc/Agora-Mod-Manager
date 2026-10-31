@@ -20,6 +20,7 @@ use agora_core::game_tools::{
     self, CaptureMethod, CaptureMode, OutputFinding, OutputStatus, RunOutcome, ToolError,
     ToolOffer, ToolState,
 };
+use agora_core::game_user_tools::{self, NewUserTool, ToolCandidate, UserTool};
 use agora_game_api::{GameDefinition, ToolId};
 use serde::Serialize;
 
@@ -199,6 +200,66 @@ pub struct RestoreReply {
     pub restored_tools: Vec<String>,
 }
 
+/// One tool the person added to the instance's own list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserToolRow {
+    pub id: String,
+    pub name: String,
+    /// Game-relative path, with forward slashes.
+    pub exe: String,
+    pub args: Vec<String>,
+    pub known_tool_id: Option<String>,
+}
+
+/// The instance's own tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserToolsView {
+    pub instance_id: String,
+    pub tools: Vec<UserToolRow>,
+}
+
+/// One executable `Find tools` offers, for the person to confirm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCandidateRow {
+    pub exe: String,
+    pub mod_id: String,
+    pub mod_name: String,
+    pub known_tool_id: Option<String>,
+    pub suggested_name: String,
+    pub already_added: bool,
+}
+
+fn user_tool_row(tool: UserTool) -> UserToolRow {
+    UserToolRow {
+        id: tool.id,
+        name: tool.name,
+        exe: tool.exe,
+        args: tool.args,
+        known_tool_id: tool.known_tool_id,
+    }
+}
+
+fn user_tools_view(instance_id: &str, tools: Vec<UserTool>) -> UserToolsView {
+    UserToolsView {
+        instance_id: instance_id.to_string(),
+        tools: tools.into_iter().map(user_tool_row).collect(),
+    }
+}
+
+fn candidate_row(candidate: ToolCandidate) -> ToolCandidateRow {
+    ToolCandidateRow {
+        exe: candidate.exe,
+        mod_id: candidate.mod_id,
+        mod_name: candidate.mod_name,
+        known_tool_id: candidate.known_tool_id,
+        suggested_name: candidate.suggested_name,
+        already_added: candidate.already_added,
+    }
+}
+
 fn core_error(error: impl std::fmt::Display) -> GamesError {
     GamesError::new(CORE_FAILED, error.to_string())
 }
@@ -291,8 +352,8 @@ pub fn tools_view(
 }
 
 fn view_of(ctx: &Ctx, instance_id: &str, game: &GameDefinition) -> Result<ToolsView, GamesError> {
-    let states = game_tools::list(ctx, instance_id, game).map_err(core_error)?;
-    let findings = game_tools::output_findings(ctx, instance_id, game).map_err(core_error)?;
+    let (states, findings) =
+        game_tools::list_and_findings(ctx, instance_id, game).map_err(core_error)?;
     Ok(tools_view(instance_id.to_string(), states, &findings))
 }
 
@@ -574,6 +635,65 @@ pub async fn games_tools_swap_restore(
         Ok(RestoreReply {
             restored_tools: restored.into_iter().map(|journal| journal.tool).collect(),
         })
+    })
+    .await
+}
+
+/// The tools the person added to this instance.
+#[tauri::command]
+pub async fn games_user_tools_list(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<UserToolsView, GamesError> {
+    with_ctx(app, move |ctx| {
+        let tools = game_user_tools::list(&ctx, &instance_id).map_err(core_error)?;
+        Ok(user_tools_view(&instance_id, tools))
+    })
+    .await
+}
+
+/// Add one executable to the instance's own tools. Nothing is added until the person confirms.
+#[tauri::command]
+pub async fn games_user_tools_add(
+    app: tauri::AppHandle,
+    instance_id: String,
+    name: String,
+    exe: String,
+    args: Vec<String>,
+) -> Result<UserToolRow, GamesError> {
+    with_ctx(app, move |ctx| {
+        let tool = game_user_tools::add(&ctx, &instance_id, NewUserTool { name, exe, args })
+            .map_err(core_error)?;
+        Ok(user_tool_row(tool))
+    })
+    .await
+}
+
+/// Remove a tool from the instance's own list. No files are deleted.
+#[tauri::command]
+pub async fn games_user_tools_remove(
+    app: tauri::AppHandle,
+    instance_id: String,
+    id: String,
+) -> Result<UserToolsView, GamesError> {
+    with_ctx(app, move |ctx| {
+        let tools = game_user_tools::remove(&ctx, &instance_id, &id).map_err(core_error)?;
+        Ok(user_tools_view(&instance_id, tools))
+    })
+    .await
+}
+
+/// Look through the instance's enabled mods for executables. Suggests; adds nothing.
+#[tauri::command]
+pub async fn games_user_tools_find(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<Vec<ToolCandidateRow>, GamesError> {
+    with_ctx(app, move |ctx| {
+        let game = definition_of(&ctx, &instance_id)?;
+        let candidates =
+            game_user_tools::find_candidates(&ctx, &instance_id, &game).map_err(core_error)?;
+        Ok(candidates.into_iter().map(candidate_row).collect())
     })
     .await
 }

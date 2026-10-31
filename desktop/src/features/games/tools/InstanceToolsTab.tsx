@@ -1,10 +1,23 @@
 /**
  * An instance's Tools page (MASTER_SPEC §26.9): the tools the game declares, the output each has
- * here, and the swap banner when a swap was interrupted. Each tool's own actions live in ToolCard.
+ * here, the tools the person added from their mods, and the swap banner when a swap was interrupted.
+ * Each declared tool's own actions live in ToolCard.
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { gameToolSwapStatus, listGameTools, restoreGameToolSwap, type SwapStatus, type ToolsView } from './api';
+import {
+  addUserTool,
+  findUserTools,
+  gameToolSwapStatus,
+  listGameTools,
+  listUserTools,
+  removeUserTool,
+  restoreGameToolSwap,
+  type SwapStatus,
+  type ToolCandidate,
+  type ToolsView,
+  type UserToolRow,
+} from './api';
 import { ToolCard } from './ToolCard';
 import { conflictLine, messageOf } from './toolCopy';
 
@@ -16,24 +29,49 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
   const [busy, setBusy] = useState(false);
   const [restoreMessage, setRestoreMessage] = useState<string | null>(null);
 
-  const load = useCallback(async (isCurrent: () => boolean) => {
+  const [userTools, setUserTools] = useState<UserToolRow[] | null>(null);
+  const [userToolsError, setUserToolsError] = useState<string | null>(null);
+  const [userNote, setUserNote] = useState<string | null>(null);
+  const [candidates, setCandidates] = useState<ToolCandidate[] | null>(null);
+  const [finding, setFinding] = useState(false);
+  const [findError, setFindError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [names, setNames] = useState<Record<string, string>>({});
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+
+  const loadTools = useCallback(async (isCurrent: () => boolean) => {
     setLoadError(null);
-    setSwapError(null);
-    const [listed, status] = await Promise.allSettled([listGameTools(instanceId), gameToolSwapStatus(instanceId)]);
+    setUserToolsError(null);
+    const [listed, users] = await Promise.allSettled([listGameTools(instanceId), listUserTools(instanceId)]);
     if (!isCurrent()) return;
     if (listed.status === 'fulfilled') setView(listed.value);
     else { setView(null); setLoadError(messageOf(listed.reason)); }
-    if (status.status === 'fulfilled') setSwap(status.value);
-    else { setSwap(null); setSwapError(messageOf(status.reason)); }
+    if (users.status === 'fulfilled') setUserTools(users.value.tools);
+    else { setUserTools(null); setUserToolsError(messageOf(users.reason)); }
+  }, [instanceId]);
+
+  const loadSwap = useCallback(async (isCurrent: () => boolean) => {
+    setSwapError(null);
+    try {
+      const status = await gameToolSwapStatus(instanceId);
+      if (isCurrent()) setSwap(status);
+    } catch (error) {
+      if (isCurrent()) { setSwap(null); setSwapError(messageOf(error)); }
+    }
   }, [instanceId]);
 
   useEffect(() => {
     let current = true;
-    void load(() => current);
+    void loadTools(() => current);
+    void loadSwap(() => current);
     return () => { current = false; };
-  }, [load]);
+  }, [loadTools, loadSwap]);
 
-  const reload = () => { void load(() => true); };
+  const reload = () => {
+    void loadTools(() => true);
+    void loadSwap(() => true);
+  };
 
   const restore = async () => {
     setBusy(true);
@@ -46,6 +84,74 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
       reload();
     } catch (error) {
       setRestoreMessage(messageOf(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const find = async () => {
+    setFinding(true);
+    setFindError(null);
+    setAddError(null);
+    setUserNote(null);
+    try {
+      const found = await findUserTools(instanceId);
+      setCandidates(found);
+      const nextSelected: Record<string, boolean> = {};
+      const nextNames: Record<string, string> = {};
+      for (const candidate of found) {
+        nextSelected[candidate.exe] = !candidate.alreadyAdded;
+        nextNames[candidate.exe] = candidate.suggestedName;
+      }
+      setSelected(nextSelected);
+      setNames(nextNames);
+    } catch (error) {
+      setCandidates(null);
+      setFindError(messageOf(error));
+    } finally {
+      setFinding(false);
+    }
+  };
+
+  const addSelected = async () => {
+    const checked = (candidates ?? []).filter((candidate) => selected[candidate.exe]);
+    if (checked.length === 0) {
+      setAddError('Choose at least one tool to add.');
+      return;
+    }
+    setAdding(true);
+    setAddError(null);
+    const failures: string[] = [];
+    let added = 0;
+    for (const candidate of checked) {
+      try {
+        await addUserTool(instanceId, {
+          name: (names[candidate.exe] ?? candidate.suggestedName).trim(),
+          exe: candidate.exe,
+          args: [],
+        });
+        added += 1;
+      } catch (error) {
+        failures.push(`${candidate.exe}: ${messageOf(error)}`);
+      }
+    }
+    setAdding(false);
+    if (added > 0) setUserNote(`Added ${added} ${added === 1 ? 'tool' : 'tools'}.`);
+    if (failures.length > 0) setAddError(failures.join(' '));
+    else setCandidates(null);
+    void loadTools(() => true);
+  };
+
+  const removeUser = async (row: UserToolRow) => {
+    setBusy(true);
+    setUserToolsError(null);
+    setUserNote(null);
+    try {
+      const reply = await removeUserTool(instanceId, row.id);
+      setUserTools(reply.tools);
+      setUserNote(`Removed ${row.name}.`);
+    } catch (error) {
+      setUserToolsError(messageOf(error));
     } finally {
       setBusy(false);
     }
@@ -137,6 +243,157 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
           />
         </div>
       ))}
+
+      <section aria-labelledby="user-tools-heading" className="space-y-3" data-testid="user-tools">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 id="user-tools-heading" className="text-base font-semibold">Your tools</h3>
+          <button
+            type="button"
+            disabled={finding}
+            onClick={() => void find()}
+            className="rounded-lg border border-border px-3 py-1.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            {finding ? 'Looking through your mods…' : 'Find tools'}
+          </button>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Tools you add from your mods, with the arguments you want them to start with.
+        </p>
+
+        {userToolsError && (
+          <div role="alert" className="space-y-2 rounded-xl border border-destructive bg-destructive/10 p-4 text-sm" data-testid="user-tools-error">
+            <p>Your own tools could not be listed: {userToolsError}</p>
+            <button
+              type="button"
+              onClick={reload}
+              className="rounded-lg border border-border px-3 py-1.5 font-medium hover:bg-accent"
+            >
+              Try again
+            </button>
+          </div>
+        )}
+
+        {userTools && userTools.length === 0 && !userToolsError && (
+          <p className="rounded-xl border border-dashed border-border p-6 text-sm text-muted-foreground" data-testid="user-tools-empty">
+            No tools of your own yet. Use Find tools to look through this instance’s mods.
+          </p>
+        )}
+
+        {userTools && userTools.map((row) => (
+          <article
+            key={row.id}
+            aria-label={row.name}
+            className="space-y-3 rounded-xl border border-border bg-card p-5"
+            data-testid="user-tool-card"
+          >
+            <header className="flex flex-wrap items-center gap-2">
+              <h4 className="text-base font-semibold">{row.name}</h4>
+              {row.knownToolId && (
+                <span className="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
+                  The game knows this tool
+                </span>
+              )}
+            </header>
+            <p className="break-all text-sm text-muted-foreground">{row.exe}</p>
+            {row.args.length > 0 && (
+              <p className="break-all text-sm text-muted-foreground">Starts with: {row.args.join(' ')}</p>
+            )}
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                disabled
+                title="Running your own tools comes next."
+                className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground shadow-sm disabled:opacity-50"
+              >
+                Run {row.name}
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void removeUser(row)}
+                className="rounded-lg border border-destructive px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+              >
+                Remove
+              </button>
+              <span className="text-xs text-muted-foreground">Running your own tools comes next.</span>
+            </div>
+          </article>
+        ))}
+
+        {userNote && <p role="status" className="text-sm text-muted-foreground">{userNote}</p>}
+        {findError && (
+          <p role="alert" className="rounded-lg border border-destructive bg-destructive/10 p-3 text-sm">
+            Your mods could not be searched: {findError}
+          </p>
+        )}
+
+        {candidates && (
+          <section aria-label="Tools found in your mods" className="space-y-3 rounded-xl border border-border p-4" data-testid="tool-candidates">
+            {candidates.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No tools found in this instance’s mods</p>
+            ) : (
+              <>
+                <p className="text-sm font-medium">Choose the tools to add. Nothing is added until you say so.</p>
+                {candidates.map((candidate) => (
+                  <div key={candidate.exe} className="space-y-2 rounded-lg border border-border p-3 text-sm" data-testid="tool-candidate">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        type="checkbox"
+                        aria-label={`Add ${candidate.exe}`}
+                        checked={selected[candidate.exe] ?? false}
+                        disabled={candidate.alreadyAdded}
+                        onChange={(event) => setSelected((current) => ({ ...current, [candidate.exe]: event.target.checked }))}
+                      />
+                      <span className="break-all font-medium">{candidate.exe}</span>
+                      {candidate.knownToolId && (
+                        <span className="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
+                          Known tool
+                        </span>
+                      )}
+                      {candidate.alreadyAdded && (
+                        <span className="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground">
+                          Already added
+                        </span>
+                      )}
+                    </div>
+                    {candidate.modName && <p className="text-xs text-muted-foreground">From {candidate.modName}</p>}
+                    <label className="flex flex-wrap items-center gap-2">
+                      <span className="text-muted-foreground">Name</span>
+                      <input
+                        type="text"
+                        value={names[candidate.exe] ?? candidate.suggestedName}
+                        disabled={candidate.alreadyAdded}
+                        onChange={(event) => setNames((current) => ({ ...current, [candidate.exe]: event.target.value }))}
+                        className="rounded-lg border border-border bg-background px-2 py-1"
+                      />
+                    </label>
+                  </div>
+                ))}
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={adding || !candidates.some((candidate) => selected[candidate.exe])}
+                    onClick={() => void addSelected()}
+                    className="rounded-lg bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground shadow-sm disabled:opacity-50"
+                  >
+                    Add selected
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCandidates(null)}
+                    className="rounded-lg border border-border px-3 py-1.5 text-sm font-medium hover:bg-accent"
+                  >
+                    Close
+                  </button>
+                </div>
+              </>
+            )}
+            {addError && (
+              <p role="alert" className="rounded-lg border border-destructive bg-destructive/10 p-3 text-sm">{addError}</p>
+            )}
+          </section>
+        )}
+      </section>
     </section>
   );
 }
