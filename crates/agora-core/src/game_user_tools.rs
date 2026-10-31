@@ -78,6 +78,12 @@ pub struct UserTool {
     /// The game-declared tool this executable matches, when it is one.
     #[serde(default)]
     pub known_tool_id: Option<String>,
+    /// The tool writes a whole mod into a folder instead of files for the game (MASTER_SPEC §26.9).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub output_is_mod: bool,
+    /// The folder the tool writes its mod into. A relative folder is next to the executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_folder: Option<String>,
 }
 
 /// What `add` is given: the user chose the name, path and arguments.
@@ -86,6 +92,8 @@ pub struct NewUserTool {
     pub name: String,
     pub exe: String,
     pub args: Vec<String>,
+    pub output_is_mod: bool,
+    pub output_folder: Option<String>,
 }
 
 /// One executable `find_candidates` found, for the person to confirm.
@@ -126,17 +134,17 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
     let path = instance_dir.join(USER_TOOLS_FILE);
     let mut tools = read_file(&path)?;
 
-    let exe = normalise_exe(&new.exe)?;
+    let exe = normalise_any_exe(&new.exe)?;
     let candidates = find_candidates(ctx, instance_id, &definition)?;
     let matched = candidates
         .iter()
-        .find(|candidate| fold_path_case(&candidate.exe) == fold_path_case(&exe))
-        .ok_or_else(|| {
-            UserToolError::InvalidExe(format!(
-                "'{exe}' is not an executable this instance's deployment provides from an enabled mod or the game's files"
-            ))
-        })?;
-    let canonical = matched.exe.clone();
+        .find(|candidate| fold_path_case(&candidate.exe) == fold_path_case(&exe));
+    if matched.is_none() && !is_absolute_path(&exe) {
+        return Err(UserToolError::InvalidExe(format!(
+            "'{exe}' is not an executable this instance's deployment provides from an enabled mod or the game's files"
+        )));
+    }
+    let canonical = matched.map(|m| m.exe.clone()).unwrap_or(exe);
     if tools
         .iter()
         .any(|tool| fold_path_case(&tool.exe) == fold_path_case(&canonical))
@@ -162,7 +170,8 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
         )));
     }
 
-    let known_tool_id = matched.known_tool_id.clone();
+    let (output_is_mod, output_folder) = normalise_output(new.output_is_mod, new.output_folder)?;
+    let known_tool_id = matched.and_then(|m| m.known_tool_id.clone());
 
     let tool = UserTool {
         id: new_user_tool_id(),
@@ -170,6 +179,8 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
         exe: canonical,
         args: new.args,
         known_tool_id,
+        output_is_mod,
+        output_folder,
     };
     tools.push(tool.clone());
     write_file(
@@ -475,6 +486,99 @@ fn normalise_exe(raw: &str) -> Result<String, UserToolError> {
         )));
     }
     Ok(path)
+}
+
+/// A relative path the deployment provides, or an absolute `.exe` the user chose (MASTER_SPEC
+/// §26.9). An absolute path is only accepted when it names an existing `.exe` file and has no
+/// control characters, so the run cannot be pointed at anything else.
+fn normalise_any_exe(raw: &str) -> Result<String, UserToolError> {
+    if raw.chars().any(char::is_control) {
+        return Err(UserToolError::InvalidExe(
+            "an executable cannot contain control characters".to_string(),
+        ));
+    }
+    if !is_absolute_path(raw) {
+        return normalise_exe(raw);
+    }
+    let path = raw.replace('\\', "/");
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(UserToolError::InvalidExe(
+            "a tool needs an executable".to_string(),
+        ));
+    }
+    let base = path.rsplit('/').find(|segment| !segment.is_empty());
+    let Some(base) = base else {
+        return Err(UserToolError::InvalidExe(format!(
+            "'{raw}' does not name a file"
+        )));
+    };
+    if !base.to_ascii_lowercase().ends_with(".exe") || base.eq_ignore_ascii_case(".exe") {
+        return Err(UserToolError::InvalidExe(format!(
+            "'{raw}' is not an .exe file"
+        )));
+    }
+    if base.ends_with('.') || base.ends_with(' ') {
+        return Err(UserToolError::InvalidExe(format!(
+            "'{raw}' has a file name ending in a dot or a space"
+        )));
+    }
+    let stem = base.split_once('.').map(|(stem, _)| stem).unwrap_or(base);
+    if is_device_name(stem) {
+        return Err(UserToolError::InvalidExe(format!("'{raw}' names a device")));
+    }
+    let file = Path::new(&path);
+    if !file.is_absolute() {
+        return Err(UserToolError::InvalidExe(format!(
+            "'{raw}' is not an absolute path"
+        )));
+    }
+    match std::fs::metadata(file) {
+        Ok(meta) if meta.is_file() => {}
+        _ => {
+            return Err(UserToolError::InvalidExe(format!(
+                "'{raw}' is not an existing .exe file"
+            )))
+        }
+    }
+    Ok(path.to_string())
+}
+
+/// Whether a stored executable is an absolute path outside the game folder. Read when a tool runs,
+/// so a saved list written by hand is judged by the same rule as `add`.
+pub fn is_absolute_exe(exe: &str) -> bool {
+    is_absolute_path(exe)
+}
+
+fn is_absolute_path(raw: &str) -> bool {
+    let path = raw.replace('\\', "/");
+    let path = path.trim();
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || path.starts_with('/')
+}
+
+/// The output choice a user tool made. A mod-output tool needs a folder; a relative folder is next
+/// to the executable, so it is stored as given.
+fn normalise_output(
+    is_mod: bool,
+    folder: Option<String>,
+) -> Result<(bool, Option<String>), UserToolError> {
+    if !is_mod {
+        return Ok((false, None));
+    }
+    let folder = folder.unwrap_or_default().trim().replace('\\', "/");
+    if folder.is_empty() {
+        return Err(UserToolError::InvalidExe(
+            "a tool whose output is a mod needs an output folder".to_string(),
+        ));
+    }
+    if folder.chars().any(char::is_control) {
+        return Err(UserToolError::InvalidExe(
+            "an output folder cannot contain control characters".to_string(),
+        ));
+    }
+    Ok((true, Some(folder)))
 }
 
 fn is_device_name(stem: &str) -> bool {

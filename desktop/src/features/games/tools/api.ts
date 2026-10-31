@@ -29,6 +29,10 @@ export interface ToolRow {
   status: OutputStatus | null;
   /** Another tool that conflicts with this one has enabled output as well. */
   conflicts: boolean;
+  /** Whether the tool writes a generated layer or imports a whole mod. */
+  outputKind: 'generated_layer' | 'mod';
+  /** The folder a mod-output tool writes. */
+  outputFolder: string | null;
 }
 
 export interface ToolsView {
@@ -97,7 +101,8 @@ export interface RunReport {
 export type RunResult =
   | { status: 'finished'; outcome: RunReport }
   | { status: 'vfsRefused'; reason: string; next: 'links' | 'swap' | null; offers: ToolOffer[] }
-  | { status: 'needsSwap'; tool: string };
+  | { status: 'needsSwap'; tool: string }
+  | { status: 'outputFolderNotEmpty'; folder: string; aside: string };
 
 export interface InterruptedSwap {
   /** `null` when the journal cannot be read, so the tool is unknown. */
@@ -131,11 +136,22 @@ export interface RestoreReply {
 /** One tool the person added to the instance's own list. */
 export interface UserToolRow {
   id: string;
+  /** The id the tool runs under, namespaced away from the game's declared tools. */
+  toolId: string;
   name: string;
-  /** Game-relative path, with forward slashes. */
+  /** Game-relative path, with forward slashes, or an absolute path outside the game. */
   exe: string;
   args: string[];
   knownToolId: string | null;
+  outputIsMod: boolean;
+  outputFolder: string | null;
+}
+
+/** One earlier output of a mod-output tool. */
+export interface ToolOutput {
+  itemId: string;
+  name: string;
+  addedAtUnixMs: number;
 }
 
 export interface UserToolsView {
@@ -171,7 +187,9 @@ function isToolRow(value: unknown): value is ToolRow {
     && isNullableString(value.current)
     && isNullableString(value.previous)
     && (value.status === null || (isString(value.status) && OUTPUT_STATUSES.includes(value.status)))
-    && typeof value.conflicts === 'boolean';
+    && typeof value.conflicts === 'boolean'
+    && (value.outputKind === 'generated_layer' || value.outputKind === 'mod')
+    && isNullableString(value.outputFolder);
 }
 
 export function isToolsView(value: unknown): value is ToolsView {
@@ -242,6 +260,7 @@ export function isRunResult(value: unknown): value is RunResult {
       && value.offers.every(isOffer);
   }
   if (value.status === 'needsSwap') return isString(value.tool);
+  if (value.status === 'outputFolderNotEmpty') return isString(value.folder) && isString(value.aside);
   return false;
 }
 
@@ -279,7 +298,17 @@ function isUserToolRow(value: unknown): value is UserToolRow {
     && isString(value.name)
     && isString(value.exe)
     && isStringArray(value.args)
-    && isNullableString(value.knownToolId);
+    && isNullableString(value.knownToolId)
+    && isString(value.toolId)
+    && typeof value.outputIsMod === 'boolean'
+    && isNullableString(value.outputFolder);
+}
+
+function isToolOutput(value: unknown): value is ToolOutput {
+  return isObject(value)
+    && isString(value.itemId)
+    && isString(value.name)
+    && isNumber(value.addedAtUnixMs);
 }
 
 export function isUserToolsView(value: unknown): value is UserToolsView {
@@ -377,15 +406,71 @@ export async function listUserTools(instanceId: string): Promise<UserToolsView> 
 /** Add one executable to the instance's own list. */
 export async function addUserTool(
   instanceId: string,
-  tool: { name: string; exe: string; args: string[] },
+  tool: { name: string; exe: string; args: string[]; outputIsMod?: boolean; outputFolder?: string | null },
 ): Promise<UserToolRow> {
   const reply = await invoke<unknown>('games_user_tools_add', {
     instanceId,
     name: tool.name,
     exe: tool.exe,
     args: tool.args,
+    outputIsMod: tool.outputIsMod ?? false,
+    outputFolder: tool.outputFolder ?? null,
   });
   return expectReply('games_user_tools_add', reply, isUserToolRow);
+}
+
+/** Run one of the person's own tools through the same pipeline as a declared one. */
+export async function runUserTool(
+  instanceId: string,
+  id: string,
+  capture: CaptureChoice,
+  options: { refusal?: string; confirmSwap?: boolean; moveAside?: boolean } = {},
+): Promise<RunResult> {
+  const reply = await invoke<unknown>('games_user_tools_run', {
+    instanceId,
+    id,
+    capture,
+    refusal: options.refusal ?? null,
+    confirmSwap: options.confirmSwap ?? false,
+    moveAside: options.moveAside ?? false,
+  });
+  return expectReply('games_user_tools_run', reply, isRunResult);
+}
+
+/** A mod-output tool's earlier outputs, newest last. */
+export async function listToolOutputs(instanceId: string, toolId: string): Promise<ToolOutput[]> {
+  const reply = await invoke<unknown>('games_tools_outputs', { instanceId, toolId });
+  if (!Array.isArray(reply) || !reply.every(isToolOutput)) {
+    throw new Error('games_tools_outputs did not return the reply the screen expects.');
+  }
+  return reply;
+}
+
+/** Point a mod-output tool's layer back at an earlier output. */
+export async function useToolOutput(instanceId: string, toolId: string, itemId: string): Promise<ToolOutput[]> {
+  const reply = await invoke<unknown>('games_tools_use_output', { instanceId, toolId, itemId });
+  if (!Array.isArray(reply) || !reply.every(isToolOutput)) {
+    throw new Error('games_tools_use_output did not return the reply the screen expects.');
+  }
+  return reply;
+}
+
+/** A user tool's earlier mod outputs, newest last. */
+export async function listUserToolOutputs(instanceId: string, id: string): Promise<ToolOutput[]> {
+  const reply = await invoke<unknown>('games_user_tools_outputs', { instanceId, id });
+  if (!Array.isArray(reply) || !reply.every(isToolOutput)) {
+    throw new Error('games_user_tools_outputs did not return the reply the screen expects.');
+  }
+  return reply;
+}
+
+/** Point a user tool's layer back at one of its earlier outputs. */
+export async function useUserToolOutput(instanceId: string, id: string, itemId: string): Promise<ToolOutput[]> {
+  const reply = await invoke<unknown>('games_user_tools_use_output', { instanceId, id, itemId });
+  if (!Array.isArray(reply) || !reply.every(isToolOutput)) {
+    throw new Error('games_user_tools_use_output did not return the reply the screen expects.');
+  }
+  return reply;
 }
 
 /** Remove a tool from the instance's own list. Returns the list as it now is. */

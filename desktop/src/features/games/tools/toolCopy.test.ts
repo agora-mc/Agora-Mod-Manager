@@ -144,7 +144,7 @@ describe('shownPaths', () => {
 });
 
 describe('conflictLine', () => {
-  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true };
+  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true, outputKind: 'generated_layer', outputFolder: null };
   const pandora: ToolRow = { ...nemesis, toolId: 'pandora', name: 'Pandora', conflicts: true };
   const bodyslide: ToolRow = { ...nemesis, toolId: 'bodyslide', name: 'BodySlide', conflicts: false };
 

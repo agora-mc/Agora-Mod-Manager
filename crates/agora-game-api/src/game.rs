@@ -957,6 +957,28 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
     Suggestion::Unknown { top_level: vec![] }
 }
 
+/// Fold a path the way this platform compares names: a per-character simple uppercase, so a
+/// character whose uppercase is more than one character (`ß`) keeps its own form. Windows paths
+/// compare case-insensitively; elsewhere this is the identity.
+pub fn fold_path_case(path: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        return path.to_string();
+    }
+    #[cfg(windows)]
+    {
+        let mut folded = String::with_capacity(path.len());
+        for ch in path.chars() {
+            let mut upper = ch.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => folded.push(single),
+                _ => folded.push(ch),
+            }
+        }
+        folded
+    }
+}
+
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     CompiledGlob::new(pattern).matches(path)
 }
@@ -1586,6 +1608,31 @@ pub struct InstalledFramework {
     pub layers: Vec<LayerId>,
 }
 
+/// What a tool's successful run produces (MASTER_SPEC §26.9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolOutput {
+    /// A generated layer: everything the run wrote, kept as the tool's next generation.
+    #[default]
+    GeneratedLayer,
+    /// A whole mod the tool wrote into a folder. A successful run imports that folder as a content
+    /// item and points the tool's layer at it. A relative folder is next to the tool's executable;
+    /// an absolute one is used as it is.
+    Mod {
+        folder: String,
+        /// The folder is set in the tool's own settings, not by Agora (PGPatcher). A user tool
+        /// supplies it, and Agora refuses it when it is inside the game or the deployment.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        user_configured: bool,
+    },
+}
+
+impl ToolOutput {
+    pub fn is_generated_layer(&self) -> bool {
+        matches!(self, ToolOutput::GeneratedLayer)
+    }
+}
+
 /// A program the game's package declares that reads the installed mods and writes files the game
 /// needs (MASTER_SPEC §26.9). Core runs it under the instance's virtual file system and keeps what
 /// it wrote as a generated layer.
@@ -1599,6 +1646,15 @@ pub struct ToolDefinition {
     /// What the tool is called to a person, e.g. "Nemesis".
     pub name: String,
     pub launch: LaunchRecipe,
+    /// What the tool produces (MASTER_SPEC §26.9). Defaults to a generated layer, so a tool that
+    /// writes files for the game keeps the behaviour it had before this field existed.
+    #[serde(default, skip_serializing_if = "ToolOutput::is_generated_layer")]
+    pub output: ToolOutput,
+    /// How a mod-output tool is told where to write, when it takes an argument (DynDOLOD, TexGen:
+    /// `-o:"{output}"`). `{output}` is replaced with a folder Agora owns for the run, so no folder
+    /// outside Agora's control is touched. Absent for a tool that reads its output folder elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_arg: Option<String>,
     /// INI settings, as `file:section:key` (e.g. `user/Skyrim.ini:General:SLocalSavePath`), whose
     /// values the tool's output depends on. A change makes the output stale.
     #[serde(default)]
