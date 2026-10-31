@@ -114,7 +114,14 @@ describe('checkGameInstance', () => {
   });
 
   it('accepts findings with their kind and whether they block', async () => {
-    const check = { instanceId: 'grounded-1', checked: true, status: 'findings', findings: [framework] };
+    const check = { instanceId: 'grounded-1', checked: true, status: 'findings', findings: [framework], passed: [] };
+    invokeMock.mockResolvedValueOnce(check);
+    await expect(checkGameInstance('grounded-1')).resolves.toEqual(check);
+  });
+
+  it('accepts the checks that ran and passed', async () => {
+    const passed = { kind: 'framework', title: 'Skyrim Script Extender (SKSE)', detail: 'Found skse64_1_6_1170.dll, which matches this game version.' };
+    const check = { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], passed: [passed] };
     invokeMock.mockResolvedValueOnce(check);
     await expect(checkGameInstance('grounded-1')).resolves.toEqual(check);
   });
@@ -124,12 +131,22 @@ describe('checkGameInstance', () => {
     ['a finding without a repair field', { ...framework, repair: undefined, detail: 7 }],
     ['a finding that is null', null],
   ])('rejects %s', async (_label, finding) => {
-    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', checked: true, status: 'findings', findings: [finding] });
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', checked: true, status: 'findings', findings: [finding], passed: [] });
+    await expect(checkGameInstance('grounded-1')).rejects.toThrow('games_instance_check did not return');
+  });
+
+  it.each([
+    ['a reply with no passed list', { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [] }],
+    ['a passed list that is not a list', { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], passed: 'all good' }],
+    ['a passed check with an unknown kind', { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], passed: [{ kind: 'mystery', title: 'x', detail: 'y' }] }],
+    ['a passed check with no detail', { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], passed: [{ kind: 'framework', title: 'x' }] }],
+  ])('rejects %s', async (_label, reply) => {
+    invokeMock.mockResolvedValueOnce(reply);
     await expect(checkGameInstance('grounded-1')).rejects.toThrow('games_instance_check did not return');
   });
 
   it('rejects a check whose status is not one the page knows', async () => {
-    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', checked: true, status: 'fine', findings: [] });
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', checked: true, status: 'fine', findings: [], passed: [] });
     await expect(checkGameInstance('grounded-1')).rejects.toThrow('games_instance_check did not return');
   });
 });

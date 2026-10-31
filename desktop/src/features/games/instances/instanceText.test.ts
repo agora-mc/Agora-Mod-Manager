@@ -9,8 +9,10 @@ import {
   fallbackTradeoffs,
   formatWhen,
   frameworksMatch,
+  launchAnywayText,
   orderFindings,
   progressText,
+  skippedChecks,
 } from './instanceText';
 
 function finding(overrides: Partial<CheckFinding> = {}): CheckFinding {
@@ -26,7 +28,7 @@ function finding(overrides: Partial<CheckFinding> = {}): CheckFinding {
 }
 
 function check(overrides: Partial<InstanceCheck> = {}): InstanceCheck {
-  return { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], ...overrides };
+  return { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], passed: [], ...overrides };
 }
 
 describe('deployment words', () => {
@@ -85,6 +87,56 @@ describe('check headlines', () => {
   it('counts warnings as things to review', () => {
     expect(checkHeadline(check({ status: 'warnings', findings: [finding()] }))).toBe('1 thing to review');
     expect(checkHeadline(check({ status: 'warnings', findings: [finding(), finding()] }))).toBe('2 things to review');
+  });
+
+  it('summarises the checks that passed', () => {
+    const passed = [
+      { kind: 'framework' as const, title: 'SKSE', detail: 'Found it.' },
+      { kind: 'load_order' as const, title: 'Plugin load order', detail: '3 plugins in a valid order.' },
+    ];
+    expect(checkHeadline(check({ passed }))).toBe('All 2 checks passed.');
+    expect(checkHeadline(check({ passed: [passed[0]] }))).toBe('All 1 check passed.');
+  });
+
+  it('says no checks applied when everything is fine but nothing ran, never that all passed', () => {
+    const headline = checkHeadline(check({ passed: [] }));
+    expect(headline).toBe('No launch checks apply to this instance.');
+    expect(headline).not.toMatch(/passed/i);
+  });
+
+  it('lists no passed checks for an unpinned instance even when the reply carries some', () => {
+    // The backend sends none; this proves the page itself does not invent any for an unpinned run.
+    expect(checkHeadline(check({ checked: false, passed: [] }))).toMatch(/no framework check/);
+  });
+});
+
+describe('Launch anyway wording', () => {
+  it('names every check it would skip, without repeating a kind', () => {
+    const blocked = check({
+      status: 'findings',
+      findings: [
+        finding({ kind: 'framework', title: 'Skyrim Script Extender (SKSE)', blocks: true }),
+        finding({ kind: 'load_order', title: 'Plugin load order', blocks: true }),
+        finding({ kind: 'load_order', title: 'Plugin load order', blocks: true }),
+        finding({ kind: 'tool', title: 'BodySlide', blocks: false }),
+      ],
+    });
+    expect(skippedChecks(blocked)).toEqual(['Skyrim Script Extender (SKSE)', 'Plugin load order']);
+    expect(launchAnywayText(blocked)).toBe(
+      'start the game past Skyrim Script Extender (SKSE) and Plugin load order, even when they would stop it.',
+    );
+  });
+
+  it('names one check in the singular', () => {
+    const blocked = check({ status: 'findings', findings: [finding({ title: 'Base file changed', kind: 'base', blocks: true })] });
+    expect(launchAnywayText(blocked)).toBe('start the game past Base file changed, even when it would stop it.');
+  });
+
+  it('stays generic when no check would stop the launch', () => {
+    expect(skippedChecks(check())).toEqual([]);
+    expect(launchAnywayText(check())).toBeNull();
+    expect(launchAnywayText(check({ status: 'warnings', findings: [finding({ blocks: false })] }))).toBeNull();
+    expect(launchAnywayText(null)).toBeNull();
   });
 });
 

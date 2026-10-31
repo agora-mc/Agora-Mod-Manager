@@ -124,6 +124,8 @@ pub struct InstanceCheck {
     /// `ok`, `warnings`, or `findings` (a finding that stops the launch).
     pub status: &'static str,
     pub findings: Vec<CheckFinding>,
+    /// The checks that ran and passed, never a check that did not run.
+    pub passed: Vec<agora_core::game_instance::PassedCheck>,
 }
 
 /// What a launch did. `status` says which of the three answers this is.
@@ -457,6 +459,7 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
         checked: pinned,
         status: status_for(&findings),
         findings,
+        passed: checks.passed,
     })
 }
 

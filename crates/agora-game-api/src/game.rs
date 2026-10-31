@@ -539,6 +539,15 @@ impl RuntimeFileFinding {
     }
 }
 
+/// A framework rule the game's files satisfy for this runtime: the expected file is there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFilePass {
+    pub rule_id: String,
+    pub rule_name: String,
+    /// The path this runtime needs, with the version substituted.
+    pub expected: String,
+}
+
 /// Every finding's [`RuntimeFileFinding::summary`], joined for one message.
 pub fn describe_runtime_findings(findings: &[RuntimeFileFinding]) -> String {
     findings
@@ -562,12 +571,7 @@ pub fn check_runtime_files<S: AsRef<str>>(
 ) -> Vec<RuntimeFileFinding> {
     let mut findings = Vec::new();
     for rule in rules {
-        if !rule.applies_to.is_empty()
-            && !rule
-                .applies_to
-                .iter()
-                .any(|pattern| runtime_path_matches(pattern, version))
-        {
+        if !rule_applies(rule, version) {
             continue;
         }
 
@@ -611,6 +615,45 @@ pub fn check_runtime_files<S: AsRef<str>>(
         });
     }
     findings
+}
+
+/// The rules `check_runtime_files` verified for `version` and `deployed_paths`: a rule that
+/// applies and whose expected file the game will see. A rule that does not apply, whose expected
+/// file is absent, or whose whole family is not installed, is never a pass.
+pub fn runtime_file_passes<S: AsRef<str>>(
+    rules: &[RuntimeFileRule],
+    version: &str,
+    deployed_paths: &[S],
+) -> Vec<RuntimeFilePass> {
+    let mut passes = Vec::new();
+    for rule in rules {
+        if !rule_applies(rule, version) {
+            continue;
+        }
+        let Ok(expected) = expected_runtime_path(rule, version) else {
+            continue;
+        };
+        if deployed_paths
+            .iter()
+            .any(|path| path.as_ref().eq_ignore_ascii_case(&expected))
+        {
+            passes.push(RuntimeFilePass {
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
+                expected,
+            });
+        }
+    }
+    passes
+}
+
+/// Whether `rule`'s `applies_to` patterns cover `version`.
+fn rule_applies(rule: &RuntimeFileRule, version: &str) -> bool {
+    rule.applies_to.is_empty()
+        || rule
+            .applies_to
+            .iter()
+            .any(|pattern| runtime_path_matches(pattern, version))
 }
 
 /// The path `rule` expects for `version`, or why the rule cannot say.

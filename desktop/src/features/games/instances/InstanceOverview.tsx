@@ -24,6 +24,7 @@ import {
   fallbackTradeoffs,
   formatWhen,
   frameworksMatch,
+  launchAnywayText,
   orderFindings,
 } from './instanceText';
 
@@ -192,6 +193,7 @@ export function InstanceOverviewTab({ instanceId }: InstanceOverviewTabProps) {
   const choice: DeploymentChoice = detail.deployment ?? 'auto';
   const choiceCopy = DEPLOYMENT_OPTIONS.find((option) => option.id === choice);
   const elapsed = launchStartedAt === null ? 0 : (now - launchStartedAt) / 1000;
+  const skippedText = launchAnywayText(check);
 
   return (
     <section className="space-y-6" data-testid="instance-overview">
@@ -247,6 +249,21 @@ export function InstanceOverviewTab({ instanceId }: InstanceOverviewTabProps) {
           <p role="alert" className="text-sm text-destructive">The checks could not run. {checkError}</p>
         )}
         {checkError === null && <p className="text-sm text-muted-foreground">{checkHeadline(check)}</p>}
+        {check !== null && check.passed.length > 0 && (
+          <ul className="space-y-2" aria-label="Launch checks that passed">
+            {check.passed.map((passed, index) => (
+              <li key={`${passed.kind}-${index}`} className="rounded-lg border border-border bg-card p-3" data-testid="check-passed">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full border border-border px-2 py-0.5 text-xs font-semibold text-muted-foreground">
+                    Passed
+                  </span>
+                  <span className="font-semibold">{passed.title}</span>
+                </div>
+                <p className="text-sm text-muted-foreground">{passed.detail}</p>
+              </li>
+            ))}
+          </ul>
+        )}
         {check !== null && check.findings.length > 0 && (
           <ul className="space-y-3" aria-label="Launch check findings">
             {orderFindings(check.findings).map((finding, index) => (
@@ -336,7 +353,8 @@ export function InstanceOverviewTab({ instanceId }: InstanceOverviewTabProps) {
                   onChange={(event) => setLaunchAnyway(event.target.checked)}
                 />
                 <span>
-                  <span className="font-medium">Launch anyway</span>: start the game past the checks above, even when they would stop it.
+                  <span className="font-medium">Launch anyway</span>:{' '}
+                  {skippedText ?? 'start the game past the checks above, even when they would stop it.'}
                 </span>
               </label>
               <p className="text-xs text-destructive">

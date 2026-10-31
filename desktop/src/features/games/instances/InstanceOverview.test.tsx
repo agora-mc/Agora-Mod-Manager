@@ -46,7 +46,7 @@ function detail(instanceId: string): InstanceDetail {
   };
 }
 
-const cleanCheck: InstanceCheck = { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [] };
+const cleanCheck: InstanceCheck = { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], passed: [] };
 
 beforeEach(() => {
   vi.mocked(getGameInstance).mockReset();
@@ -67,6 +67,51 @@ describe('Launch anyway', () => {
     rerender(<InstanceOverviewTab gameId="skyrim-se" instanceId="modded-2" />);
     await screen.findByRole('heading', { name: 'Modded' });
     expect(screen.getByRole('checkbox', { name: /Launch anyway/ })).not.toBeChecked();
+  });
+});
+
+describe('checks that passed', () => {
+  it('lists each passed check and summarises the count', async () => {
+    vi.mocked(getGameInstance).mockImplementation(async (id) => detail(id));
+    vi.mocked(checkGameInstance).mockResolvedValue({
+      instanceId: 'grounded-1',
+      checked: true,
+      status: 'ok',
+      findings: [],
+      passed: [
+        { kind: 'framework', title: 'Skyrim Script Extender (SKSE)', detail: 'Found skse64_1_6_1170.dll, which matches this game version.' },
+        { kind: 'load_order', title: 'Plugin load order', detail: '3 plugins in a valid order.' },
+      ],
+    });
+    render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+    await screen.findByTestId('instance-overview');
+
+    expect(screen.getByText('All 2 checks passed.')).toBeInTheDocument();
+    const passed = screen.getAllByTestId('check-passed');
+    expect(passed).toHaveLength(2);
+    expect(passed[0]).toHaveTextContent('Skyrim Script Extender (SKSE)');
+    expect(passed[1]).toHaveTextContent('3 plugins in a valid order.');
+  });
+
+  it('names the blocking checks in the Launch anyway option', async () => {
+    vi.mocked(getGameInstance).mockImplementation(async (id) => detail(id));
+    vi.mocked(checkGameInstance).mockResolvedValue({
+      instanceId: 'grounded-1',
+      checked: true,
+      status: 'findings',
+      findings: [
+        { kind: 'framework', blocks: true, title: 'Skyrim Script Extender (SKSE)', detail: 'x', why: 'y', repair: null },
+        { kind: 'load_order', blocks: true, title: 'Plugin load order', detail: 'x', why: 'y', repair: null },
+      ],
+      passed: [],
+    });
+    render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+    await screen.findByTestId('instance-overview');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced options' }));
+    expect(screen.getByRole('checkbox', { name: /Launch anyway/ }).closest('label')).toHaveTextContent(
+      'start the game past Skyrim Script Extender (SKSE) and Plugin load order, even when they would stop it.',
+    );
   });
 });
 
