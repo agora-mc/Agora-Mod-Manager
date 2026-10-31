@@ -41,6 +41,8 @@ const BOOT_REPLIES = {
   take_pending_cli_launch: null,
   get_governance_config: null,
   games_mod_inis_list: [],
+  games_mod_ini_keep_game_version: [],
+  games_mod_ini_restore_mine: [],
   plugins_enabled: false,
   list_plugins: [],
   list_plugin_contributions: [],

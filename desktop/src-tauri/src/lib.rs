@@ -535,6 +535,8 @@ pub fn run() {
             games::ini_saves::games_mod_ini_get,
             games::ini_saves::games_mod_ini_set,
             games::ini_saves::games_mod_ini_reset,
+            games::ini_saves::games_mod_ini_keep_game_version,
+            games::ini_saves::games_mod_ini_restore_mine,
             games::ini_saves::games_saves_get,
             games::ini_saves::games_saves_set,
             games::tools::games_tools_list,

@@ -10,7 +10,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { isGamesError } from '../shared/types';
 
 /** Where the text of an INI file came from: the instance's copy, the game's own file, or nothing. */
-export type IniSourceName = 'copy' | 'game_file' | 'nothing' | 'override' | 'mod';
+export type IniSourceName = 'copy' | 'game_file' | 'nothing' | 'override' | 'mod' | 'writable';
 
 export interface IniFileRow {
   /** The file's name inside the instance, as the game names it (for example `Skyrim.ini`). */
@@ -56,6 +56,8 @@ export interface ModIniRow {
   overridden: boolean;
   /** A later enabled mod that ships the same path, when one explains the file. */
   shadowedBy: string | null;
+  /** The game wrote this file since the override or mod file, so the game's copy runs. */
+  gameChanged: boolean;
   /** False when the mod is turned off, or no mod ships the file any more. */
   modEnabled: boolean;
 }
@@ -106,7 +108,7 @@ function isNullableString(value: unknown): value is string | null {
 
 function isIniSource(value: unknown): value is IniSourceName {
   return value === 'copy' || value === 'game_file' || value === 'nothing'
-    || value === 'override' || value === 'mod';
+    || value === 'override' || value === 'mod' || value === 'writable';
 }
 
 function isSaveChoice(value: unknown): value is SaveChoice {
@@ -120,6 +122,7 @@ function isModIniRow(value: unknown): value is ModIniRow {
     && typeof value.modName === 'string'
     && typeof value.overridden === 'boolean'
     && isNullableString(value.shadowedBy)
+    && typeof value.gameChanged === 'boolean'
     && typeof value.modEnabled === 'boolean';
 }
 
@@ -265,6 +268,24 @@ export async function setModIniValue(
 ): Promise<IniContents> {
   const reply = await invoke<unknown>('games_mod_ini_set', { instanceId, path, section, key, value });
   return checkedReply('games_mod_ini_set', reply, isIniContents);
+}
+
+/** Adopt the game's version: copy the game's writable copy into the override. */
+export async function keepModIniGameVersion(instanceId: string, path: string): Promise<ModIniRow[]> {
+  const reply = await invoke<unknown>('games_mod_ini_keep_game_version', { instanceId, path });
+  if (!Array.isArray(reply) || !reply.every(isModIniRow)) {
+    throw new Error('games_mod_ini_keep_game_version did not return the expected mod INI data.');
+  }
+  return reply;
+}
+
+/** Go back to the instance's version: move the game's writable copy aside. */
+export async function restoreModIniMine(instanceId: string, path: string): Promise<ModIniRow[]> {
+  const reply = await invoke<unknown>('games_mod_ini_restore_mine', { instanceId, path });
+  if (!Array.isArray(reply) || !reply.every(isModIniRow)) {
+    throw new Error('games_mod_ini_restore_mine did not return the expected mod INI data.');
+  }
+  return reply;
 }
 
 /** Remove the instance's copy of a mod INI file, so the mod's own file is used again. */

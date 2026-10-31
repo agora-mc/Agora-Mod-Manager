@@ -106,6 +106,45 @@ fn write_override(ctx: &CoreContext, instance_id: &str, rel: &str, bytes: &[u8])
     std::fs::write(path, bytes).unwrap();
 }
 
+fn writable_file(ctx: &CoreContext, instance_id: &str, rel: &str) -> PathBuf {
+    ctx.paths
+        .instance_dir(instance_id)
+        .unwrap()
+        .join("writable")
+        .join(rel)
+}
+
+fn write_writable(ctx: &CoreContext, instance_id: &str, rel: &str, bytes: &[u8]) {
+    let path = writable_file(ctx, instance_id, rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn replaced_files(ctx: &CoreContext, instance_id: &str) -> Vec<PathBuf> {
+    let root = ctx
+        .paths
+        .instance_dir(instance_id)
+        .unwrap()
+        .join("overrides-replaced");
+    let mut out = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    walk(&root, &mut out);
+    out.sort();
+    out
+}
+
 fn files_under(root: &Path) -> Vec<(String, Vec<u8>)> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -445,6 +484,14 @@ fn every_path_that_is_not_listed_is_refused_before_anything_is_touched() {
             ),
             "read refused {path:?}"
         );
+        assert!(
+            game_mod_ini::keep_game_version(&ctx, "inst-a", path).is_err(),
+            "keep refused {path:?}"
+        );
+        assert!(
+            game_mod_ini::restore_mine(&ctx, "inst-a", path).is_err(),
+            "restore refused {path:?}"
+        );
     }
 
     assert_eq!(
@@ -559,5 +606,187 @@ fn a_file_that_is_not_text_is_refused_and_never_written() {
     assert_eq!(
         std::fs::read(override_file(&ctx, "inst-a", "text.ini")).unwrap(),
         vec![0xff, 0xfe]
+    );
+}
+
+#[test]
+fn game_changed_compares_the_game_copy_with_the_override_or_the_mod_file() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    let override_bytes = std::fs::read(override_file(&ctx, "inst-a", "x.ini")).unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", &override_bytes);
+    assert!(!game_mod_ini::list_mod_inis(&ctx, "inst-a").unwrap()[0].game_changed);
+
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=3\n");
+    assert!(game_mod_ini::list_mod_inis(&ctx, "inst-a").unwrap()[0].game_changed);
+
+    game_mod_ini::reset_mod_ini(&ctx, "inst-a", "x.ini").unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=9\n");
+    let row = &game_mod_ini::list_mod_inis(&ctx, "inst-a").unwrap()[0];
+    assert!(!row.overridden);
+    assert!(
+        row.game_changed,
+        "with no override it is compared with the mod file"
+    );
+}
+
+#[test]
+fn reading_uses_the_game_written_copy_when_one_exists() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=3\n");
+
+    let read = game_mod_ini::read_mod_ini(&ctx, "inst-a", "x.ini").unwrap();
+    assert_eq!(read.source, ModIniSource::Writable);
+    assert_eq!(read.document.get("s", "k").as_deref(), Some("3"));
+}
+
+#[test]
+fn a_save_on_a_game_changed_file_starts_from_the_games_copy_and_keeps_it_aside() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\nother=a\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=3\nother=b\n");
+
+    assert!(game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "4").unwrap());
+    assert_eq!(
+        std::fs::read(override_file(&ctx, "inst-a", "x.ini")).unwrap(),
+        b"[s]\nk=4\nother=b\n",
+        "the edit started from the game's version, not the old override"
+    );
+    assert!(!writable_file(&ctx, "inst-a", "x.ini").exists());
+    let backups = replaced_files(&ctx, "inst-a");
+    assert_eq!(backups.len(), 1);
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), b"[s]\nk=3\nother=b\n");
+    let row = game_mod_ini::list_mod_inis(&ctx, "inst-a")
+        .unwrap()
+        .remove(0);
+    assert!(row.overridden);
+    assert!(!row.game_changed);
+}
+
+#[test]
+fn keeping_the_games_version_makes_the_override_match_without_touching_writable() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=3\n");
+
+    game_mod_ini::keep_game_version(&ctx, "inst-a", "x.ini").unwrap();
+    assert_eq!(
+        std::fs::read(override_file(&ctx, "inst-a", "x.ini")).unwrap(),
+        b"[s]\nk=3\n"
+    );
+    assert_eq!(
+        std::fs::read(writable_file(&ctx, "inst-a", "x.ini")).unwrap(),
+        b"[s]\nk=3\n"
+    );
+    assert!(!game_mod_ini::list_mod_inis(&ctx, "inst-a").unwrap()[0].game_changed);
+    assert!(replaced_files(&ctx, "inst-a").is_empty());
+}
+
+#[test]
+fn going_back_to_mine_moves_the_games_copy_aside() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=3\n");
+
+    game_mod_ini::restore_mine(&ctx, "inst-a", "x.ini").unwrap();
+    assert!(!writable_file(&ctx, "inst-a", "x.ini").exists());
+    assert_eq!(
+        std::fs::read(override_file(&ctx, "inst-a", "x.ini")).unwrap(),
+        b"[s]\nk=2\n"
+    );
+    let backups = replaced_files(&ctx, "inst-a");
+    assert_eq!(backups.len(), 1);
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), b"[s]\nk=3\n");
+    assert!(!game_mod_ini::list_mod_inis(&ctx, "inst-a").unwrap()[0].game_changed);
+}
+
+#[test]
+fn quick_repeated_go_backs_keep_every_backup() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    for i in 0..20 {
+        write_writable(
+            &ctx,
+            "inst-a",
+            "x.ini",
+            format!("[s]\nk=game{i}\n").as_bytes(),
+        );
+        game_mod_ini::restore_mine(&ctx, "inst-a", "x.ini").unwrap();
+    }
+    let mut kept: Vec<Vec<u8>> = replaced_files(&ctx, "inst-a")
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    kept.sort();
+    kept.dedup();
+    assert_eq!(kept.len(), 20, "every game copy was kept, none overwritten");
+}
+
+#[test]
+fn reset_moves_the_games_copy_aside_so_the_mod_file_runs() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=3\n");
+
+    game_mod_ini::reset_mod_ini(&ctx, "inst-a", "x.ini").unwrap();
+    assert!(!writable_file(&ctx, "inst-a", "x.ini").exists());
+    assert!(!override_file(&ctx, "inst-a", "x.ini").exists());
+    let backups = replaced_files(&ctx, "inst-a");
+    assert_eq!(backups.len(), 1);
+    assert_eq!(std::fs::read(&backups[0]).unwrap(), b"[s]\nk=3\n");
+    let read = game_mod_ini::read_mod_ini(&ctx, "inst-a", "x.ini").unwrap();
+    assert_eq!(read.source, ModIniSource::Mod);
+}
+
+#[test]
+fn a_backup_path_that_is_a_file_refuses_the_edit_and_changes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    write_writable(&ctx, "inst-a", "x.ini", b"[s]\nk=3\n");
+    let replaced = ctx
+        .paths
+        .instance_dir("inst-a")
+        .unwrap()
+        .join("overrides-replaced");
+    std::fs::write(&replaced, b"not a folder").unwrap();
+    let override_before = std::fs::read(override_file(&ctx, "inst-a", "x.ini")).unwrap();
+    let writable_before = std::fs::read(writable_file(&ctx, "inst-a", "x.ini")).unwrap();
+
+    assert!(game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "4").is_err());
+    assert!(game_mod_ini::restore_mine(&ctx, "inst-a", "x.ini").is_err());
+    assert!(game_mod_ini::reset_mod_ini(&ctx, "inst-a", "x.ini").is_err());
+    assert_eq!(
+        std::fs::read(override_file(&ctx, "inst-a", "x.ini")).unwrap(),
+        override_before
+    );
+    assert_eq!(
+        std::fs::read(writable_file(&ctx, "inst-a", "x.ini")).unwrap(),
+        writable_before
     );
 }

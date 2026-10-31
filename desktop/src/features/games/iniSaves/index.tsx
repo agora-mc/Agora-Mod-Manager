@@ -15,8 +15,10 @@ import {
   getIni,
   getModIni,
   getSaves,
+  keepModIniGameVersion,
   listModInis,
   resetModIni,
+  restoreModIniMine,
   setModIniValue,
   setIniValue,
   setSaves,
@@ -634,17 +636,21 @@ function ModIniSection({ instanceId }: { instanceId: string }) {
     setBusy(true);
     setError(null);
     setNotice(null);
+    const movedGameCopy = activeRow.gameChanged;
     try {
       const updated = await setModIniValue(instanceId, activeRow.path, section, key, value);
       setContents(updated);
       setState({
         status: 'loaded',
-        value: rows.map((row) => (row.path === activeRow.path ? { ...row, overridden: true } : row)),
+        value: rows.map((row) =>
+          row.path === activeRow.path ? { ...row, overridden: true, gameChanged: false } : row,
+        ),
       });
+      const aside = movedGameCopy ? " The game's changed copy was kept aside." : '';
       if (value === null) {
-        setNotice(`Removed ${key} from [${section}]. The mod's own file was not changed.`);
+        setNotice(`Removed ${key} from [${section}]. The mod's own file was not changed.${aside}`);
       } else {
-        setNotice(`Saved ${key} in [${section}]. The mod's own file was not changed.`);
+        setNotice(`Saved ${key} in [${section}]. The mod's own file was not changed.${aside}`);
       }
       return true;
     } catch (failure: unknown) {
@@ -667,11 +673,54 @@ function ModIniSection({ instanceId }: { instanceId: string }) {
     await saveKey(entry.section, entry.key, null);
   };
 
+  const keepGameVersion = async () => {
+    if (activeRow === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await keepModIniGameVersion(instanceId, activeRow.path);
+      setState({ status: 'loaded', value: updated });
+      const read = await getModIni(instanceId, activeRow.path);
+      setContents(read);
+      setNotice("The game's version is now this instance's copy. The game's file was not changed.");
+    } catch (failure: unknown) {
+      setError(describeFailure(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const goBackToMine = async () => {
+    if (activeRow === null) return;
+    const confirmed = await confirm({
+      title: `Go back to your version of ${activeRow.path}?`,
+      body: "Agora keeps the copy the game wrote aside and uses your version again.",
+      confirmLabel: 'Go back to my version',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await restoreModIniMine(instanceId, activeRow.path);
+      setState({ status: 'loaded', value: updated });
+      const read = await getModIni(instanceId, activeRow.path);
+      setContents(read);
+      setNotice("Your version is in use again. The game's copy was kept aside.");
+    } catch (failure: unknown) {
+      setError(describeFailure(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const reset = async () => {
     if (activeRow === null) return;
     const confirmed = await confirm({
       title: `Reset ${activeRow.path}?`,
-      body: "Agora removes this instance's copy, so the mod's own file is used again.",
+      body: "Agora removes this instance's copy and keeps any copy the game wrote aside, so the mod's own file is used again.",
       confirmLabel: "Reset to the mod's version",
       tone: 'danger',
     });
@@ -738,6 +787,26 @@ function ModIniSection({ instanceId }: { instanceId: string }) {
             <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
               {fileError}
             </p>
+          )}
+          {activeRow?.gameChanged && (
+            <div
+              role="status"
+              className="space-y-3 rounded-lg border border-border bg-accent/50 p-3 text-sm"
+              data-testid="mod-ini-game-changed"
+            >
+              <p>
+                The game changed this file after your last edit (for example from an in-game settings menu). Agora uses
+                the game's version.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" onClick={() => void keepGameVersion()} disabled={busy}>
+                  Keep the game's version
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => void goBackToMine()} disabled={busy}>
+                  Go back to my version
+                </Button>
+              </div>
+            </div>
           )}
           {fileState === 'idle' && contents && activeRow && (
             <IniFileEditor

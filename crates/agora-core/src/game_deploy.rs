@@ -665,26 +665,9 @@ fn plan_inner(
         });
     }
 
-    // 4. Writable layer files
-    let writable_dir = instance_dir.join("writable");
-    // Under the VFS the writable layer is shown on top of the farm, not placed in it, so the
-    // farm (and its fingerprint) does not change when the game writes.
-    if would_be.is_none() && mode != DeployMode::Virtual && writable_dir.exists() {
-        let mut writable_files = Vec::new();
-        walk_writable_dir(&writable_dir, Path::new(""), &mut writable_files)?;
-        if !writable_files.is_empty() {
-            layers.push(LayerContribution {
-                layer_id: "writable".to_string(),
-                files: writable_files,
-                own_copy: false,
-                whiteouts: Vec::new(),
-            });
-        }
-    }
-
-    // 4b. The instance's own overrides layer, applied after the writable layer so the user's copy
-    // of a mod's file wins (MASTER_SPEC §26.5). A missing folder means no overrides; one that
-    // exists but cannot be read is an error, never an empty layer.
+    // 4. The instance's own overrides layer, below the writable layer so a game-written copy of
+    // the same file is the newest change and wins in every strategy. A missing folder means no
+    // overrides; one that exists but cannot be read is an error, never an empty layer.
     let overrides_dir = instance_dir.join("overrides");
     match std::fs::symlink_metadata(&overrides_dir) {
         Ok(meta) => {
@@ -709,7 +692,24 @@ fn plan_inner(
         Err(e) => return Err(e.into()),
     }
 
-    // 5. Check for File-versus-Folder conflicts across layers
+    // 5. Writable layer files. The game's own writes are the newest change, so they are above the
+    // overrides layer in every strategy. Under the VFS this layer is the upper layer, not placed in
+    // the farm, so the farm (and its fingerprint) does not change when the game writes.
+    let writable_dir = instance_dir.join("writable");
+    if would_be.is_none() && mode != DeployMode::Virtual && writable_dir.exists() {
+        let mut writable_files = Vec::new();
+        walk_writable_dir(&writable_dir, Path::new(""), &mut writable_files)?;
+        if !writable_files.is_empty() {
+            layers.push(LayerContribution {
+                layer_id: "writable".to_string(),
+                files: writable_files,
+                own_copy: false,
+                whiteouts: Vec::new(),
+            });
+        }
+    }
+
+    // 6. Check for File-versus-Folder conflicts across layers
     // A path that is a file in one layer and a folder in another is an error naming both paths and layers.
     {
         #[derive(Clone)]
@@ -746,7 +746,7 @@ fn plan_inner(
         }
     }
 
-    // 6. Build winning map and record overrides
+    // 7. Build winning map and record overrides
     struct Candidate {
         path: RelPath,
         source: FileSource,
@@ -794,7 +794,7 @@ fn plan_inner(
         }
     }
 
-    // 7. Remove whiteouts from writable layer
+    // 8. Remove whiteouts from writable layer
     for layer in manifest.layers.layers() {
         if matches!(layer.source, LayerSource::Writable { .. }) {
             for wh in &layer.whiteouts {
@@ -818,7 +818,7 @@ fn plan_inner(
         });
     }
 
-    // 8. Determine placement & compute fingerprint
+    // 9. Determine placement & compute fingerprint
     let detector = VolumeDetector::new();
     let deploy_vol = detector.get_volume_info(&game_dir);
     // Every content object lives under the store's objects folder, so its volume is asked once:
@@ -1212,11 +1212,7 @@ pub(crate) fn visible_paths_of(
     instance_id: &str,
     plan: &DeploymentPlan,
 ) -> Result<Vec<String>, DeployError> {
-    let mut paths: Vec<String> = plan
-        .files
-        .iter()
-        .map(|file| file.path.as_str().to_string())
-        .collect();
+    let mut paths: Vec<String> = Vec::new();
     let instance_dir = ctx
         .paths
         .instance_dir(instance_id)
@@ -1231,6 +1227,8 @@ pub(crate) fn visible_paths_of(
                 .map(|file| file.path.as_str().to_string()),
         );
     }
+    // The writable layer is the newest change and comes first, so a case-only duplicate keeps it.
+    paths.extend(plan.files.iter().map(|file| file.path.as_str().to_string()));
     // The order of the lower-cased paths, compared without building each one (this sorts every
     // path the game sees, so a String per comparison was most of the time in a check).
     paths.sort_by(|a, b| {
@@ -1286,16 +1284,16 @@ pub fn visible_file_source(
         .paths
         .instance_dir(instance_id)
         .map_err(|e| DeployError::Other(e.to_string()))?;
+    let writable = instance_dir.join("writable").join(rel);
+    if writable.is_file() {
+        return Ok(Some(writable));
+    }
     let overrides_root = instance_dir.join("overrides");
     refuse_reparse_on_the_way(&instance_dir, &overrides_root)?;
     let overrides = overrides_root.join(rel);
     refuse_reparse_on_the_way(&instance_dir, &overrides)?;
     if is_ini_path(rel) && overrides.is_file() {
         return Ok(Some(overrides));
-    }
-    let writable = instance_dir.join("writable").join(rel);
-    if writable.is_file() {
-        return Ok(Some(writable));
     }
     let plan = plan(ctx, instance_id, definition, mode)?;
     Ok(plan

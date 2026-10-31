@@ -1,10 +1,9 @@
 //! INI files that mods ship, edited per instance (MASTER_SPEC §26.5, *Per-user files*).
 //!
 //! Mods are stored once and shared by every instance. An edit to one of their INI files is kept
-//! at `<instance>/overrides/<path>`, a layer that is applied after every other layer, so the
-//! user's choice wins without changing the stored mod. This module lists the mod INI files an
-//! instance can see, reads them (the override when there is one), writes an override, and removes
-//! it again.
+//! at `<instance>/overrides/<path>`, without changing the stored mod. A file the game itself
+//! rewrote in `<instance>/writable/` is newer and wins; the editor reads that copy, and a save
+//! keeps it aside under `overrides-replaced/` before writing the user's version.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +19,7 @@ use crate::game_instance::{self, GameInstanceManifest};
 use crate::lock_manager::LockResource;
 
 const OVERRIDES: &str = "overrides";
+const REPLACED: &str = "overrides-replaced";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModIniError {
@@ -75,6 +75,9 @@ pub struct ModIni {
     /// A later enabled mod that ships the same path. The row itself names the winning mod, so
     /// this is only set when a mod other than the winner explains the file.
     pub shadowed_by: Option<String>,
+    /// The game has written this file since the override or mod file it is compared with, so the
+    /// game's copy is what runs. Such a row can be adopted or taken back.
+    pub game_changed: bool,
     /// False when the mod that shipped this path is turned off, or when no mod ships it any more.
     /// Such a row can be reset but not edited.
     pub mod_enabled: bool,
@@ -84,6 +87,8 @@ pub struct ModIni {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModIniSource {
+    /// The game's own write in `writable/`, the newest change.
+    Writable,
     /// The instance's own copy in `overrides/`.
     Override,
     /// The winning mod's file in the content store.
@@ -357,6 +362,7 @@ pub fn list_mod_inis(ctx: &Ctx, instance_id: &str) -> Result<Vec<ModIni>, ModIni
                     mod_name: winner.mod_name,
                     overridden: false,
                     shadowed_by: None,
+                    game_changed: false,
                     mod_enabled: winner.enabled,
                 },
             )
@@ -378,10 +384,32 @@ pub fn list_mod_inis(ctx: &Ctx, instance_id: &str) -> Result<Vec<ModIni>, ModIni
                     mod_name: String::new(),
                     overridden: true,
                     shadowed_by: None,
+                    game_changed: false,
                     mod_enabled: false,
                 },
             ));
         }
+    }
+
+    for (_, row) in rows.iter_mut() {
+        let writable = writable_path(ctx, instance_id, row)?;
+        if !writable.is_file() {
+            continue;
+        }
+        let written = read_bytes(&writable)?;
+        let target = override_path(ctx, instance_id, row)?;
+        let reference = if target.is_file() {
+            read_bytes(&target)?
+        } else {
+            let Some((_, _, file)) = winning_mod_file(ctx, &manifest, &row.path)? else {
+                return Err(ModIniError::Other(format!(
+                    "'{}' has a game-written copy but no override or mod file to compare it with",
+                    row.path
+                )));
+            };
+            read_bytes(&ctx.paths.content_object_path(&file.sha256))?
+        };
+        row.game_changed = written != reference;
     }
 
     rows.retain(|(_, row)| row.mod_enabled || row.overridden);
@@ -408,6 +436,80 @@ fn override_path(ctx: &Ctx, instance_id: &str, row: &ModIni) -> Result<PathBuf, 
     let path = dir.join(OVERRIDES).join(&row.path);
     ensure_inside_instance(&dir, &path)?;
     Ok(path)
+}
+
+/// The game's own copy of a path in `writable/`, made safe against links on the way.
+fn writable_path(ctx: &Ctx, instance_id: &str, row: &ModIni) -> Result<PathBuf, ModIniError> {
+    let dir = instance_dir(ctx, instance_id)?;
+    let path = dir.join("writable").join(&row.path);
+    ensure_inside_instance(&dir, &path)?;
+    Ok(path)
+}
+
+/// The folder that keeps game-written copies the user has replaced, so nothing is deleted.
+fn replaced_dir(ctx: &Ctx, instance_id: &str) -> Result<PathBuf, ModIniError> {
+    let dir = instance_dir(ctx, instance_id)?;
+    let path = dir.join(REPLACED);
+    ensure_inside_instance(&dir, &path)?;
+    Ok(path)
+}
+
+/// Copy the game's writable copy to `overrides-replaced/` without removing it yet. `None` when the
+/// game has written nothing. The caller removes the writable copy after its own write succeeds.
+fn stage_writable_backup(
+    ctx: &Ctx,
+    instance_id: &str,
+    row: &ModIni,
+) -> Result<Option<PathBuf>, ModIniError> {
+    let writable = writable_path(ctx, instance_id, row)?;
+    if !writable.is_file() {
+        return Ok(None);
+    }
+    let bytes = read_bytes(&writable)?;
+    let root = replaced_dir(ctx, instance_id)?;
+    std::fs::create_dir_all(&root).map_err(|source| ModIniError::Write {
+        path: root.clone(),
+        source,
+    })?;
+    // Creating the folder may have followed a link that was not there a moment ago.
+    let root = replaced_dir(ctx, instance_id)?;
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let backup = unused_backup_path(&root, &row.path, &stamp);
+    let dir = instance_dir(ctx, instance_id)?;
+    if let Some(parent) = backup.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ModIniError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    ensure_inside_instance(&dir, &backup)?;
+    write_atomic(&backup, &bytes)?;
+    Ok(Some(backup))
+}
+
+/// `<root>/<path>.<stamp>`, or `.<stamp>-N` when that name is taken, so two replacements in the
+/// same millisecond never overwrite the first backup.
+fn unused_backup_path(root: &Path, path: &str, stamp: &str) -> PathBuf {
+    let mut backup = root.join(format!("{path}.{stamp}"));
+    let mut n = 1;
+    while backup.symlink_metadata().is_ok() {
+        backup = root.join(format!("{path}.{stamp}-{n}"));
+        n += 1;
+    }
+    backup
+}
+
+/// Remove the game's writable copy after its bytes were staged.
+fn remove_writable(ctx: &Ctx, instance_id: &str, row: &ModIni) -> Result<(), ModIniError> {
+    let writable = writable_path(ctx, instance_id, row)?;
+    match std::fs::remove_file(&writable) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ModIniError::Write {
+            path: writable,
+            source,
+        }),
+    }
 }
 
 /// The winning enabled file for a path, read from the content store. Uses the item index once.
@@ -464,6 +566,14 @@ fn load_ini(path: &str, file: &Path) -> Result<IniDocument, ModIniError> {
 /// mod's stored file. Reading never writes anything.
 pub fn read_mod_ini(ctx: &Ctx, instance_id: &str, path: &str) -> Result<ModIniRead, ModIniError> {
     let row = listed_row(ctx, instance_id, path)?;
+    let writable = writable_path(ctx, instance_id, &row)?;
+    if writable.is_file() {
+        return Ok(ModIniRead {
+            path: row.path.clone(),
+            source: ModIniSource::Writable,
+            document: load_ini(&row.path, &writable)?,
+        });
+    }
     let override_path = override_path(ctx, instance_id, &row)?;
     if override_path.is_file() {
         return Ok(ModIniRead {
@@ -542,7 +652,10 @@ fn edit_mod_ini<T>(
         LockResource::Instance(instance_id.to_string()),
         "mod-ini-edit",
     )?;
-    let mut document = if target.is_file() {
+    let writable = writable_path(ctx, instance_id, &row)?;
+    let mut document = if writable.is_file() {
+        load_ini(&row.path, &writable)?
+    } else if target.is_file() {
         load_ini(&row.path, &target)?
     } else {
         let manifest = manifest(ctx, instance_id)?;
@@ -556,17 +669,77 @@ fn edit_mod_ini<T>(
     };
     let (value, changed) = f(&mut document).map_err(|e| ModIniError::Other(e.to_string()))?;
     if changed {
-        std::fs::create_dir_all(target.parent().unwrap_or_else(|| Path::new("."))).map_err(
-            |source| ModIniError::Write {
-                path: target.clone(),
-                source,
-            },
-        )?;
-        // Creating the folders may have followed a link that was not there a moment ago.
-        ensure_inside_instance(&instance_dir(ctx, instance_id)?, &target)?;
-        write_atomic(&target, &document.render())?;
+        // Stage the game's copy first: if the backup cannot be written, nothing changes.
+        let backup = stage_writable_backup(ctx, instance_id, &row)?;
+        let written = (|| {
+            std::fs::create_dir_all(target.parent().unwrap_or_else(|| Path::new("."))).map_err(
+                |source| ModIniError::Write {
+                    path: target.clone(),
+                    source,
+                },
+            )?;
+            // Creating the folders may have followed a link that was not there a moment ago.
+            ensure_inside_instance(&instance_dir(ctx, instance_id)?, &target)?;
+            write_atomic(&target, &document.render())
+        })();
+        if let Err(e) = written {
+            if let Some(backup) = backup {
+                let _ = std::fs::remove_file(backup);
+            }
+            return Err(e);
+        }
+        if backup.is_some() {
+            remove_writable(ctx, instance_id, &row)?;
+        }
     }
     Ok(value)
+}
+
+/// Adopt the game's version: copy the writable copy into the override, so both agree and the game
+/// keeps reading the same bytes. The writable copy stays.
+pub fn keep_game_version(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(), ModIniError> {
+    let row = listed_row(ctx, instance_id, path)?;
+    if !row.mod_enabled {
+        return Err(ModIniError::NotEditable {
+            path: row.path,
+            reason: if row.mod_name.is_empty() {
+                "no enabled mod ships it".to_string()
+            } else {
+                "its mod is turned off".to_string()
+            },
+        });
+    }
+    let writable = writable_path(ctx, instance_id, &row)?;
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "mod-ini-keep",
+    )?;
+    if !writable.is_file() {
+        return Ok(());
+    }
+    let bytes = read_bytes(&writable)?;
+    let target = override_path(ctx, instance_id, &row)?;
+    std::fs::create_dir_all(target.parent().unwrap_or_else(|| Path::new("."))).map_err(
+        |source| ModIniError::Write {
+            path: target.clone(),
+            source,
+        },
+    )?;
+    ensure_inside_instance(&instance_dir(ctx, instance_id)?, &target)?;
+    write_atomic(&target, &bytes)
+}
+
+/// Go back to the user's version: move the game's writable copy aside, so the override runs again.
+pub fn restore_mine(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(), ModIniError> {
+    let row = listed_row(ctx, instance_id, path)?;
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "mod-ini-restore",
+    )?;
+    if stage_writable_backup(ctx, instance_id, &row)?.is_some() {
+        remove_writable(ctx, instance_id, &row)?;
+    }
+    Ok(())
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ModIniError> {
@@ -603,15 +776,23 @@ pub fn reset_mod_ini(ctx: &Ctx, instance_id: &str, path: &str) -> Result<(), Mod
         LockResource::Instance(instance_id.to_string()),
         "mod-ini-reset",
     )?;
+    // The game's changed copy is kept aside too, so the mod's own file really runs.
+    let backup = stage_writable_backup(ctx, instance_id, &row)?;
     match std::fs::remove_file(&target) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
+            if let Some(backup) = backup {
+                let _ = std::fs::remove_file(backup);
+            }
             return Err(ModIniError::Write {
                 path: target,
                 source,
             });
         }
+    }
+    if backup.is_some() {
+        remove_writable(ctx, instance_id, &row)?;
     }
     remove_empty_parents(&instance_dir(ctx, instance_id)?.join(OVERRIDES), &target);
     Ok(())
@@ -625,5 +806,23 @@ fn remove_empty_parents(root: &Path, file: &Path) {
             break;
         }
         folder = current.parent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unused_backup_path;
+
+    #[test]
+    fn a_taken_backup_name_gets_a_counter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = unused_backup_path(tmp.path(), "x.ini", "S");
+        std::fs::write(&first, b"one").unwrap();
+        let second = unused_backup_path(tmp.path(), "x.ini", "S");
+        assert_ne!(first, second);
+        std::fs::write(&second, b"two").unwrap();
+        let third = unused_backup_path(tmp.path(), "x.ini", "S");
+        assert!(third != first && third != second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
     }
 }
