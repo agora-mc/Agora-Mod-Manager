@@ -12,7 +12,11 @@ import { useConfirm } from '@/components/ui/confirm';
 import {
   describeFailure,
   getIni,
+  getModIni,
   getSaves,
+  listModInis,
+  resetModIni,
+  setModIni,
   setIniValue,
   setSaves,
   type IniChange,
@@ -20,6 +24,8 @@ import {
   type IniEntryRow,
   type IniFileRow,
   type IniSourceName,
+  type ModIniContents,
+  type ModIniRow,
   type SaveChoice,
   type SaveFolderRow,
   type SavesChange,
@@ -35,6 +41,7 @@ export function InstanceIniSavesTab({ instanceId }: InstanceIniSavesTabProps) {
     <section className="space-y-8" aria-label="INI and saves" data-testid="ini-saves-tab">
       <SavesSection instanceId={instanceId} />
       <IniSection instanceId={instanceId} />
+      <ModIniSection instanceId={instanceId} />
     </section>
   );
 }
@@ -493,5 +500,205 @@ function IniKeyRow({ entry, disabled, onSave, onRemove }: IniKeyRowProps) {
         Remove
       </Button>
     </li>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// INI files from mods
+// ---------------------------------------------------------------------------
+
+/** Why a mod INI row's mod is not the text the user can edit right now. */
+function modIniOwner(row: ModIniRow): string {
+  if (row.modName === '') return 'No mod ships this file';
+  if (!row.modEnabled) return `${row.modName} (turned off)`;
+  if (row.shadowedBy) return `${row.modName}, with ${row.shadowedBy} after it`;
+  return row.modName;
+}
+
+function ModIniSection({ instanceId }: { instanceId: string }) {
+  const { confirm } = useConfirm();
+  const { state, refetch, setState } = useReadOnMount(listModInis, instanceId);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [contents, setContents] = useState<ModIniContents | null>(null);
+  const [draft, setDraft] = useState('');
+  const [fileState, setFileState] = useState<'idle' | 'loading' | 'failed'>('idle');
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const rows = state.status === 'loaded' ? state.value : [];
+  const activePath = selected !== null && rows.some((row) => row.path === selected)
+    ? selected
+    : rows[0]?.path ?? null;
+  const activeRow = rows.find((row) => row.path === activePath) ?? null;
+
+  useEffect(() => {
+    if (activePath === null) {
+      setContents(null);
+      setDraft('');
+      setFileState('idle');
+      return;
+    }
+    let cancelled = false;
+    setFileState('loading');
+    setFileError(null);
+    getModIni(instanceId, activePath)
+      .then((read) => {
+        if (cancelled) return;
+        setContents(read);
+        setDraft(read.contents);
+        setFileState('idle');
+      })
+      .catch((failure: unknown) => {
+        if (cancelled) return;
+        setFileError(describeFailure(failure));
+        setFileState('failed');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [instanceId, activePath]);
+
+  const save = async () => {
+    if (activeRow === null) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const saved = await setModIni(instanceId, activeRow.path, draft);
+      setContents(saved);
+      setDraft(saved.contents);
+      setState({
+        status: 'loaded',
+        value: rows.map((row) => (row.path === activeRow.path ? { ...row, overridden: true } : row)),
+      });
+      setNotice(`Saved this instance's copy of ${activeRow.path}. The mod's own file was not changed.`);
+    } catch (failure: unknown) {
+      setError(describeFailure(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const reset = async () => {
+    if (activeRow === null) return;
+    const confirmed = await confirm({
+      title: `Reset ${activeRow.path}?`,
+      body: "Agora removes this instance's copy, so the mod's own file is used again.",
+      confirmLabel: "Reset to the mod's version",
+      tone: 'danger',
+    });
+    if (!confirmed) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await resetModIni(instanceId, activeRow.path);
+      setState({ status: 'loaded', value: updated });
+      if (updated.some((row) => row.path === activeRow.path)) {
+        const read = await getModIni(instanceId, activeRow.path);
+        setContents(read);
+        setDraft(read.contents);
+      } else {
+        setContents(null);
+        setDraft('');
+      }
+      setNotice(`${activeRow.path} is back to the version its mod ships.`);
+    } catch (failure: unknown) {
+      setError(describeFailure(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <SectionFrame title="From your mods" id="ini-saves-mod-heading">
+      {state.status === 'loading' && <p className="text-sm text-muted-foreground">Reading the mods' INI files…</p>}
+      {state.status === 'failed' && <FailureNote message={state.message} onRetry={refetch} />}
+      {state.status === 'loaded' && rows.length === 0 && (
+        <p className="text-sm text-muted-foreground">None of this instance's enabled mods ships an INI file.</p>
+      )}
+      {state.status === 'loaded' && rows.length > 0 && (
+        <div className="space-y-4" data-testid="mod-ini-panel">
+          <p className="max-w-2xl text-sm text-muted-foreground">
+            Mods bring their own INI files, such as a display tweak's settings. Editing one keeps this instance's own
+            copy; the mod's file is not changed, and other instances keep using it as it is.
+          </p>
+          <div className="flex flex-wrap gap-2" role="group" aria-label="Mod INI files">
+            {rows.map((row) => {
+              const isActive = row.path === activePath;
+              return (
+                <button
+                  key={row.path}
+                  type="button"
+                  aria-pressed={isActive}
+                  onClick={() => setSelected(row.path)}
+                  className={[
+                    'rounded-lg px-3 py-1.5 text-left text-sm transition-colors',
+                    isActive
+                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      : 'border border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+                  ].join(' ')}
+                >
+                  <span className="font-mono">{row.path}</span>{' '}
+                  <span className="text-xs opacity-80">({modIniOwner(row)})</span>{' '}
+                  {row.overridden && <span className="text-xs font-semibold">Edited for this instance</span>}
+                </button>
+              );
+            })}
+          </div>
+
+          {fileState === 'loading' && <p className="text-sm text-muted-foreground">Reading the file…</p>}
+          {fileState === 'failed' && fileError && (
+            <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+              {fileError}
+            </p>
+          )}
+          {fileState === 'idle' && contents && activeRow && (
+            <div className="space-y-3">
+              {!activeRow.modEnabled && (
+                <p className="text-sm text-muted-foreground">
+                  {activeRow.modName === '' ? 'No mod ships this file any more' : 'Its mod is turned off'}, so it can
+                  only be reset to the mod's version.
+                </p>
+              )}
+              <label className="block space-y-1 text-sm">
+                <span className="text-muted-foreground">Contents</span>
+                <textarea
+                  aria-label={`Contents of ${contents.path}`}
+                  value={draft}
+                  onChange={(event) => setDraft(event.target.value)}
+                  disabled={busy || !activeRow.modEnabled}
+                  spellCheck={false}
+                  rows={12}
+                  className="w-full rounded-lg border border-border bg-background p-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                />
+              </label>
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => void save()} disabled={busy || !activeRow.modEnabled || draft === contents.contents}>
+                  Save for this instance
+                </Button>
+                {activeRow.overridden && (
+                  <Button variant="outline" onClick={() => void reset()} disabled={busy}>
+                    Reset to the mod's version
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {error && (
+        <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+      {notice && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {notice}
+        </p>
+      )}
+    </SectionFrame>
   );
 }

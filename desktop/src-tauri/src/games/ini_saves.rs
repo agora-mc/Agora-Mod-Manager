@@ -7,6 +7,7 @@
 
 use agora_core::game_ini::{self, IniFile, IniRead, IniSource};
 use agora_core::game_instance::SavesChoice;
+use agora_core::game_mod_ini::{self, ModIni, ModIniRead, ModIniSource};
 use agora_core::game_saves::{self, SaveFolder, SavesStatus, SettingChange};
 use serde::Serialize;
 
@@ -167,6 +168,126 @@ pub async fn games_ini_set(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// INI files that mods ship
+// ---------------------------------------------------------------------------
+
+/// An INI file a mod ships, as this instance sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModIniRow {
+    /// The path inside the game folder, with forward slashes.
+    pub path: String,
+    /// The content item's id. Empty for an override that no mod ships any more.
+    pub mod_id: String,
+    /// The mod's name. Empty for an override that no mod ships any more.
+    pub mod_name: String,
+    /// Whether the instance has its own copy in `overrides/`.
+    pub overridden: bool,
+    /// A later enabled mod that ships the same path, when one explains the file.
+    pub shadowed_by: Option<String>,
+    /// False when the mod is turned off, or no mod ships the file any more.
+    pub mod_enabled: bool,
+}
+
+/// A mod INI file's text, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModIniContents {
+    pub path: String,
+    /// `override` (the instance's copy) or `mod` (the stored mod file).
+    pub source: String,
+    pub contents: String,
+}
+
+fn mod_ini_row(row: &ModIni) -> ModIniRow {
+    ModIniRow {
+        path: row.path.clone(),
+        mod_id: row.mod_id.clone(),
+        mod_name: row.mod_name.clone(),
+        overridden: row.overridden,
+        shadowed_by: row.shadowed_by.clone(),
+        mod_enabled: row.mod_enabled,
+    }
+}
+
+fn mod_ini_source_name(source: ModIniSource) -> &'static str {
+    match source {
+        ModIniSource::Override => "override",
+        ModIniSource::Mod => "mod",
+    }
+}
+
+fn mod_ini_contents(read: ModIniRead) -> ModIniContents {
+    ModIniContents {
+        path: read.path,
+        source: mod_ini_source_name(read.source).to_string(),
+        contents: String::from_utf8_lossy(&read.document.render()).into_owned(),
+    }
+}
+
+fn mod_ini_rows(rows: Vec<ModIni>) -> Vec<ModIniRow> {
+    rows.iter().map(mod_ini_row).collect()
+}
+
+/// The INI files the instance's enabled mods ship, with any instance overrides listed too.
+#[tauri::command]
+pub async fn games_mod_inis_list(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<Vec<ModIniRow>, GamesError> {
+    run_blocking(app, "Reading the mod INI files", move |ctx| {
+        let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
+        Ok(mod_ini_rows(rows))
+    })
+    .await
+}
+
+/// One mod INI file's text: the instance's copy when it has one, otherwise the mod's file.
+#[tauri::command]
+pub async fn games_mod_ini_get(
+    app: tauri::AppHandle,
+    instance_id: String,
+    path: String,
+) -> Result<ModIniContents, GamesError> {
+    run_blocking(app, "Reading the mod INI file", move |ctx| {
+        let read = game_mod_ini::read_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
+        Ok(mod_ini_contents(read))
+    })
+    .await
+}
+
+/// Save the instance's own copy of a mod's INI file. The stored mod is never changed.
+#[tauri::command]
+pub async fn games_mod_ini_set(
+    app: tauri::AppHandle,
+    instance_id: String,
+    path: String,
+    contents: String,
+) -> Result<ModIniContents, GamesError> {
+    run_blocking(app, "Saving the mod INI file", move |ctx| {
+        game_mod_ini::write_mod_ini(&ctx, &instance_id, &path, &contents).map_err(core_failed)?;
+        let read = game_mod_ini::read_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
+        Ok(mod_ini_contents(read))
+    })
+    .await
+}
+
+/// Remove the instance's copy of a mod's INI file, so the mod's own file is used again.
+#[tauri::command]
+pub async fn games_mod_ini_reset(
+    app: tauri::AppHandle,
+    instance_id: String,
+    path: String,
+) -> Result<Vec<ModIniRow>, GamesError> {
+    run_blocking(app, "Resetting the mod INI file", move |ctx| {
+        game_mod_ini::reset_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
+        let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
+        Ok(mod_ini_rows(rows))
+    })
+    .await
+}
+
 // Saves
 // ---------------------------------------------------------------------------
 
@@ -440,5 +561,26 @@ mod tests {
             "an unset key is null, not an empty string"
         );
         assert!(json.get("instance_id").is_none());
+    }
+
+    #[test]
+    fn a_mod_ini_row_uses_the_names_the_frontend_reads() {
+        let row = ModIni {
+            path: "SKSE/Plugins/tweak.ini".into(),
+            mod_id: "item-a".into(),
+            mod_name: "Mod A".into(),
+            overridden: true,
+            shadowed_by: None,
+            mod_enabled: true,
+        };
+        let json = serde_json::to_value(mod_ini_row(&row)).expect("serialises");
+        assert_eq!(json["path"], "SKSE/Plugins/tweak.ini");
+        assert_eq!(json["modName"], "Mod A");
+        assert_eq!(json["overridden"], true);
+        assert!(json["shadowedBy"].is_null());
+        assert_eq!(json["modEnabled"], true);
+        assert!(json.get("mod_name").is_none());
+        assert_eq!(mod_ini_source_name(ModIniSource::Override), "override");
+        assert_eq!(mod_ini_source_name(ModIniSource::Mod), "mod");
     }
 }

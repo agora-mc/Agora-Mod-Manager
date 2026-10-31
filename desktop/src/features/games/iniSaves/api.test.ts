@@ -3,7 +3,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
-import { getIni, getSaves, setIniValue, setSaves, type SavesView } from './api';
+import {
+  getIni,
+  getModIni,
+  getSaves,
+  listModInis,
+  resetModIni,
+  setIniValue,
+  setModIni,
+  setSaves,
+  type SavesView,
+} from './api';
 
 const folder = { path: 'C:/Saves', exists: true, saves: 2, newest: '2026-10-01T10:00:00Z' };
 const savesView: SavesView = {
@@ -104,5 +114,69 @@ describe('saves commands', () => {
   it('rejects a change with no setting action', async () => {
     invokeMock.mockResolvedValueOnce({ previous: 'own', setting: {}, saves: savesView });
     await expect(setSaves('inst-1', 'shared')).rejects.toThrow('games_saves_set did not return');
+  });
+});
+
+describe('mod INI commands', () => {
+  const modRow = {
+    path: 'SKSE/Plugins/SSEDisplayTweaks.ini',
+    modId: 'aaaa1111',
+    modName: 'SSE Display Tweaks',
+    overridden: false,
+    shadowedBy: null,
+    modEnabled: true,
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('lists the mod INI files for the instance', async () => {
+    invokeMock.mockResolvedValueOnce([modRow]);
+    await expect(listModInis('inst-1')).resolves.toEqual([modRow]);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_mod_inis_list', { instanceId: 'inst-1' });
+  });
+
+  it('reads, saves and resets one file by its path', async () => {
+    const contents = {
+      path: modRow.path,
+      source: 'override',
+      contents: '[Display]\nfGamma=2.2\n',
+    };
+    invokeMock.mockResolvedValueOnce(contents);
+    await expect(getModIni('inst-1', modRow.path)).resolves.toEqual(contents);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_mod_ini_get', {
+      instanceId: 'inst-1',
+      path: modRow.path,
+    });
+
+    invokeMock.mockResolvedValueOnce(contents);
+    await setModIni('inst-1', modRow.path, contents.contents);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_mod_ini_set', {
+      instanceId: 'inst-1',
+      path: modRow.path,
+      contents: contents.contents,
+    });
+
+    invokeMock.mockResolvedValueOnce([{ ...modRow, overridden: false }]);
+    await expect(resetModIni('inst-1', modRow.path)).resolves.toEqual([{ ...modRow, overridden: false }]);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_mod_ini_reset', {
+      instanceId: 'inst-1',
+      path: modRow.path,
+    });
+  });
+
+  it.each([
+    ['null', null],
+    ['a row with no mod name', [{ ...modRow, modName: undefined }]],
+    ['a row with no mod id', [{ ...modRow, modId: undefined }]],
+  ])('rejects a mod INI list that is %s rather than reading it as no files', async (_label, reply) => {
+    invokeMock.mockResolvedValueOnce(reply);
+    await expect(listModInis('inst-1')).rejects.toThrow('games_mod_inis_list did not return');
+  });
+
+  it('rejects file contents with no text rather than editing an empty file', async () => {
+    invokeMock.mockResolvedValueOnce({ path: modRow.path, source: 'mod' });
+    await expect(getModIni('inst-1', modRow.path)).rejects.toThrow('games_mod_ini_get did not return');
   });
 });

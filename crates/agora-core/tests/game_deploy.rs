@@ -12,6 +12,7 @@ use agora_core::game_instance::{
     create, get_manifest, prepare_launch_with_discovery, GameInstanceRecord, InstanceError,
     VfsFailure,
 };
+use agora_core::game_mod_ini;
 use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
@@ -2455,5 +2456,120 @@ fn probe_an_edited_config_copy_survives_redeploy_and_is_harvested() {
     assert_eq!(
         std::fs::read(instance_writable_dir(&ctx, &id).join("Mod/x.cfg")).unwrap(),
         b"edited by the game, longer"
+    );
+}
+
+#[test]
+fn an_instance_override_is_planned_after_the_writable_layer_and_wins() {
+    let (_tmp, ctx, def, id) = probe_fixture("OverrideAfterWritable");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"gamma=1")],
+    );
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    game_mod_ini::write_mod_ini(&ctx, &id, "SKSE/Plugins/SSEDisplayTweaks.ini", "gamma=2").unwrap();
+    let writable = instance_writable_dir(&ctx, &id).join("SKSE/Plugins/SSEDisplayTweaks.ini");
+    std::fs::create_dir_all(writable.parent().unwrap()).unwrap();
+    std::fs::write(&writable, b"gamma=3").unwrap();
+
+    let planned = plan(&ctx, &id, &def, DeployMode::Links).unwrap();
+    let file = find(&planned, "SKSE/Plugins/SSEDisplayTweaks.ini").unwrap();
+    assert_eq!(
+        file.layer_id, "overrides",
+        "the user's copy is the last layer"
+    );
+    assert!(matches!(file.source, FileSource::Override { .. }));
+
+    deploy(&ctx, &id, &def, DeployMode::Links).unwrap();
+    let game = deployment_dir(&ctx, &id).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(game.join("SKSE/Plugins/SSEDisplayTweaks.ini")).unwrap(),
+        b"gamma=2"
+    );
+}
+
+#[test]
+fn reset_returns_to_the_mod_and_another_instance_is_unaffected() {
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+    let one = create_pinned_instance(&ctx, &install, &def, "OverrideOne");
+    let two = create_pinned_instance(&ctx, &install, &def, "OverrideTwo");
+    let item = add_content_folder(
+        &ctx,
+        "Tweak",
+        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"gamma=1")],
+    );
+    add_content(&ctx, &one.instance_id, &item, None, None).unwrap();
+    add_content(&ctx, &two.instance_id, &item, None, None).unwrap();
+    let store = ctx.paths.content_object_path(
+        &agora_core::content_store::get_item(&ctx, &item)
+            .unwrap()
+            .files[0]
+            .sha256,
+    );
+    let store_before = std::fs::read(&store).unwrap();
+
+    game_mod_ini::write_mod_ini(
+        &ctx,
+        &one.instance_id,
+        "SKSE/Plugins/SSEDisplayTweaks.ini",
+        "gamma=2",
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&store).unwrap(), store_before);
+    let one_plan = plan(&ctx, &one.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&one_plan, "SKSE/Plugins/SSEDisplayTweaks.ini")
+            .unwrap()
+            .source,
+        FileSource::Override { .. }
+    ));
+    let two_plan = plan(&ctx, &two.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&two_plan, "SKSE/Plugins/SSEDisplayTweaks.ini")
+            .unwrap()
+            .source,
+        FileSource::Content { .. }
+    ));
+
+    game_mod_ini::reset_mod_ini(&ctx, &one.instance_id, "SKSE/Plugins/SSEDisplayTweaks.ini")
+        .unwrap();
+    let one_plan = plan(&ctx, &one.instance_id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&one_plan, "SKSE/Plugins/SSEDisplayTweaks.ini")
+            .unwrap()
+            .source,
+        FileSource::Content { .. }
+    ));
+    assert_eq!(std::fs::read(&store).unwrap(), store_before);
+}
+
+#[test]
+fn an_override_that_no_enabled_mod_ships_still_deploys() {
+    let (_tmp, ctx, def, id) = probe_fixture("OrphanOverride");
+    let dir = ctx
+        .paths
+        .instance_dir(&id)
+        .unwrap()
+        .join("overrides/SKSE/Plugins");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("OnlyHere.ini"), b"kept=1").unwrap();
+
+    let planned = plan(&ctx, &id, &def, DeployMode::Links).unwrap();
+    assert!(matches!(
+        find(&planned, "SKSE/Plugins/OnlyHere.ini").unwrap().source,
+        FileSource::Override { .. }
+    ));
+    deploy(&ctx, &id, &def, DeployMode::Links).unwrap();
+    let game = deployment_dir(&ctx, &id).unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(game.join("SKSE/Plugins/OnlyHere.ini")).unwrap(),
+        b"kept=1"
     );
 }
