@@ -277,4 +277,24 @@ fn launch_checks_plan_the_instance_twice_however_many_tool_outputs_it_has() {
     assert_eq!(checks.load_order.len(), order.len());
     let outputs = game_tools::output_findings(&ctx, &id, &def).expect("the outputs check");
     assert_eq!(checks.outputs.len(), outputs.len());
+
+    // The Tools tab asks for the same list: its staleness checks read one Links plan for all the
+    // outputs, not one per output.
+    let before = PLAN_CALLS.load(Ordering::Relaxed);
+    let states = game_tools::list(&ctx, &id, &def).expect("the tool list");
+    let planned = PLAN_CALLS.load(Ordering::Relaxed) - before;
+    assert_eq!(planned, 1, "game_tools::list planned {planned} times");
+    assert_eq!(states.len(), 2);
+
+    // What the Tools tab's command asks for: the list and its conflict warnings from the same plan.
+    let before = PLAN_CALLS.load(Ordering::Relaxed);
+    let (states, findings) =
+        game_tools::list_and_findings(&ctx, &id, &def).expect("the list and findings");
+    let planned = PLAN_CALLS.load(Ordering::Relaxed) - before;
+    assert_eq!(
+        planned, 1,
+        "game_tools::list_and_findings planned {planned} times"
+    );
+    assert_eq!(states.len(), 2);
+    assert_eq!(findings.len(), checks.outputs.len());
 }

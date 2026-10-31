@@ -36,6 +36,7 @@ use agora_core::game_tools::{
     self, CaptureMethod, CaptureMode, OutputStatus, RunOutcome, ToolError, ToolOffer,
 };
 use agora_core::game_user_files::{record_process, swap_in};
+use agora_core::game_user_tools::{self, NewUserTool, EXCLUDED_EXE_NAMES, NAME_MAX_CHARS};
 use agora_core::process_identity;
 use agora_game_api::{
     BaseReference, DeploymentStrategy, FailureMarker, GameDefinition, GameId, GamePackage,
@@ -4221,4 +4222,280 @@ fn the_real_nemesis_exe_is_32_bit_and_the_locator_picks_the_x86_dll() {
         pe_machine(&dll64).expect("read the 64-bit DLL's header"),
         AMD64
     );
+}
+
+fn write_user_tools(f: &Fixture, content: &[u8]) -> PathBuf {
+    let path = f.instance_dir().join("user_tools.json");
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+fn add_user_tool(
+    f: &Fixture,
+    name: &str,
+    exe: &str,
+) -> Result<agora_core::game_user_tools::UserTool, agora_core::game_user_tools::UserToolError> {
+    game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: name.to_string(),
+            exe: exe.to_string(),
+            args: Vec::new(),
+        },
+    )
+}
+
+#[test]
+fn a_missing_user_tools_file_is_an_empty_list() {
+    let f = fixture(Vec::new());
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn listing_the_user_tools_of_an_unknown_instance_is_an_error() {
+    let f = fixture(Vec::new());
+    let error = game_user_tools::list(&f.ctx, "not-an-instance").expect_err("unknown instance");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InstanceNotFound(_)
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_malformed_or_wrong_version_or_unreadable_user_tools_file_is_an_error_and_add_leaves_it_alone()
+{
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for (label, bytes) in [
+        ("malformed", b"{\"version\":1,\"tools\":[".to_vec()),
+        ("wrong version", b"{\"version\":2,\"tools\":[]}".to_vec()),
+        ("unreadable", b"\xff\xfe\x00".to_vec()),
+    ] {
+        let path = write_user_tools(&f, &bytes);
+        assert!(
+            game_user_tools::list(&f.ctx, f.id()).is_err(),
+            "{label}: list must not read as no tools"
+        );
+        assert!(
+            add_user_tool(&f, "My Tool", "Data/tools/My.exe").is_err(),
+            "{label}: add must not overwrite the file"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "{label}: the file changed"
+        );
+    }
+}
+
+#[test]
+fn refused_executable_paths_are_named() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let refused = [
+        "",
+        "   ",
+        "C:/tools/My.exe",
+        "/tools/My.exe",
+        r"..\tools\My.exe",
+        "Data/../My.exe",
+        "Data/./My.exe",
+        "CON.exe",
+        "Data/tools/NUL.exe",
+        "Data/tools/My.exe.",
+        "Data/tools/My.exe ",
+        "Data/tools/My.txt",
+        "Data//tools/My.exe",
+        "Data/tools/My.exe:stream",
+    ];
+    for exe in refused {
+        let error =
+            add_user_tool(&f, "My Tool", exe).expect_err(&format!("{exe:?} must be refused"));
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidExe(_)
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+}
+
+#[test]
+fn an_exe_from_a_disabled_mod_is_refused() {
+    let f = fixture(Vec::new());
+    let enabled = f.add_mod("Enabled Tools", &[("Data/tools/On.exe", b"MZ")]);
+    let disabled = f.add_mod("Disabled Tools", &[("Data/tools/Off.exe", b"MZ")]);
+    assert_ne!(enabled, disabled);
+    set_content_enabled(&f.ctx, f.id(), &disabled, false).unwrap();
+    add_user_tool(&f, "On", "Data/tools/On.exe").unwrap();
+    let error = add_user_tool(&f, "Off", "Data/tools/Off.exe").expect_err("a disabled mod's exe");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidExe(_)
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn adding_the_same_exe_twice_is_refused() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "My Tool", r"Data\tools\My.exe").unwrap();
+    let first = game_user_tools::list(&f.ctx, f.id()).unwrap();
+    assert_eq!(
+        first[0].exe, "Data/tools/My.exe",
+        "forward slashes are stored"
+    );
+    let error = add_user_tool(&f, "My Tool again", "data/TOOLS/my.exe").expect_err("duplicate");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::Duplicate { .. }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_blank_name_or_one_longer_than_the_limit_is_refused() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for name in ["", "   "] {
+        let error = add_user_tool(&f, name, "Data/tools/My.exe").expect_err("blank");
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidName(_)
+            ),
+            "{error:?}"
+        );
+    }
+    let long = "a".repeat(NAME_MAX_CHARS + 1);
+    let error = add_user_tool(&f, &long, "Data/tools/My.exe").expect_err("too long");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidName(_)
+        ),
+        "{error:?}"
+    );
+    let exact = "a".repeat(NAME_MAX_CHARS);
+    add_user_tool(&f, &exact, "Data/tools/My.exe").unwrap();
+}
+
+#[test]
+fn removing_an_unknown_tool_id_is_an_error_and_removing_edits_only_the_list() {
+    let f = fixture(Vec::new());
+    let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let tool = add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let error = game_user_tools::remove(&f.ctx, f.id(), "not-a-tool").expect_err("unknown id");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::NotFound(_)
+        ),
+        "{error:?}"
+    );
+    game_user_tools::remove(&f.ctx, f.id(), &tool.id).unwrap();
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+    assert_eq!(
+        game_user_tools::find_candidates(&f.ctx, f.id(), &f.def)
+            .unwrap()
+            .into_iter()
+            .filter(|candidate| candidate.mod_id == item)
+            .count(),
+        1,
+        "the mod's files are untouched"
+    );
+}
+
+#[test]
+fn two_mods_shipping_the_same_exe_path_give_one_row_for_the_winner() {
+    let f = fixture(Vec::new());
+    f.add_mod("Lower", &[("Data/tools/Shared.exe", b"lower")]);
+    f.add_mod("Upper", &[("Data/tools/Shared.exe", b"upper")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let rows: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.exe.eq_ignore_ascii_case("Data/tools/Shared.exe"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{candidates:?}");
+    assert_eq!(
+        rows[0].mod_name, "Upper",
+        "the deployment's winner is the row"
+    );
+}
+
+#[test]
+fn a_known_tool_is_matched_by_the_file_name_of_its_executable() {
+    let mut known = tool("mytool", "My Tool", &[]);
+    known.launch.executable = GamePath::Runtime {
+        path: RelPath::new("Data/MyTool/My Tool.exe").unwrap(),
+    };
+    known.launch.working_directory = GamePath::Runtime {
+        path: RelPath::new("Data/MyTool").unwrap(),
+    };
+    let f = fixture(vec![known]);
+    f.add_mod("My Tool", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let row = candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .exe
+                .eq_ignore_ascii_case("Data/MyTool/My Tool.exe")
+        })
+        .unwrap_or_else(|| panic!("no row for the known tool: {candidates:?}"));
+    assert_eq!(row.known_tool_id.as_deref(), Some("mytool"));
+    assert_eq!(row.suggested_name, "My Tool");
+    assert_eq!(row.mod_name, "My Tool");
+}
+
+#[test]
+fn installer_executables_are_the_only_ones_left_out() {
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[
+            ("Data/tools/Keep.exe", b"MZ"),
+            ("Data/tools/uninstall.exe", b"MZ"),
+            ("Data/tools/Unins000.exe", b"MZ"),
+        ],
+    );
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let exes: Vec<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.exe.as_str())
+        .collect();
+    assert_eq!(exes, vec!["Data/tools/Keep.exe"]);
+    assert_eq!(EXCLUDED_EXE_NAMES, &["uninstall.exe", "unins000.exe"]);
+}
+
+#[test]
+fn the_list_is_written_atomically_and_reads_back_with_its_arguments() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let tool = game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: "  My Tool  ".into(),
+            exe: "Data/tools/My.exe".into(),
+            args: vec!["-a".into(), "x".into()],
+        },
+    )
+    .unwrap();
+    assert_eq!(tool.name, "My Tool");
+    let file = f.instance_dir().join("user_tools.json");
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(stored["version"], 1);
+    assert_eq!(stored["tools"][0]["args"][1], "x");
 }

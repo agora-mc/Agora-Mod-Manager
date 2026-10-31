@@ -701,13 +701,54 @@ fn rebuild_command(instance_id: &str, tool: &str) -> String {
     format!("agora games instance tools run {instance_id} {tool}")
 }
 
-/// The tools of an instance: every tool the game declares, and every tool with output here.
+/// The tools of an instance: every tool the game declares, and every tool with output here. The
+/// instance's Links plan is made once for the whole list, however many outputs it has.
 pub fn list(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<Vec<ToolState>, ToolError> {
     let manifest = load_manifest(ctx, instance_id)?;
+    let links = list_links(ctx, instance_id, definition, &manifest)?;
+    list_with_manifest(ctx, instance_id, definition, &manifest, links.as_ref())
+}
+
+/// [`list`] and [`output_findings_with_view`] from one Links plan: what `games_tools_list` needs,
+/// with no second planning pass.
+pub fn list_and_findings(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<(Vec<ToolState>, Vec<OutputFinding>), ToolError> {
+    let manifest = load_manifest(ctx, instance_id)?;
+    let links = list_links(ctx, instance_id, definition, &manifest)?;
+    let states = list_with_manifest(ctx, instance_id, definition, &manifest, links.as_ref())?;
+    let findings = output_findings_with_view(ctx, instance_id, definition, links.as_ref())?;
+    Ok((states, findings))
+}
+
+/// The Links plan a list's staleness checks read, when the game's rules read one. A generated
+/// layer per tool used to plan its own, so N outputs planned N + 1 times.
+fn list_links(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    manifest: &GameInstanceManifest,
+) -> Result<Option<crate::game_deploy::DeploymentPlan>, ToolError> {
+    if definition.plugin_list.is_none() || !matches!(manifest.base, BaseReference::Pinned { .. }) {
+        return Ok(None);
+    }
+    game_load_order::plan_for_order(ctx, instance_id, definition)
+        .map_err(|e| ToolError::Other(format!("cannot plan the instance's links: {e}")))
+}
+
+fn list_with_manifest(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    manifest: &GameInstanceManifest,
+    links: Option<&crate::game_deploy::DeploymentPlan>,
+) -> Result<Vec<ToolState>, ToolError> {
     let instance_dir = ctx
         .paths
         .instance_dir(instance_id)
@@ -761,7 +802,7 @@ pub fn list(
                     definition,
                     tool,
                     inputs,
-                    None,
+                    links,
                 )),
             },
         );

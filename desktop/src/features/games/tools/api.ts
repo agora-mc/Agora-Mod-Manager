@@ -128,6 +128,31 @@ export interface RestoreReply {
   restoredTools: string[];
 }
 
+/** One tool the person added to the instance's own list. */
+export interface UserToolRow {
+  id: string;
+  name: string;
+  /** Game-relative path, with forward slashes. */
+  exe: string;
+  args: string[];
+  knownToolId: string | null;
+}
+
+export interface UserToolsView {
+  instanceId: string;
+  tools: UserToolRow[];
+}
+
+/** One executable `Find tools` offers, for the person to confirm. */
+export interface ToolCandidate {
+  exe: string;
+  modId: string;
+  modName: string;
+  knownToolId: string | null;
+  suggestedName: string;
+  alreadyAdded: boolean;
+}
+
 const isString = (value: unknown): value is string => typeof value === 'string';
 const isNullableString = (value: unknown): value is string | null => value === null || typeof value === 'string';
 const isStringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(isString);
@@ -248,6 +273,32 @@ function isRestoreReply(value: unknown): value is RestoreReply {
   return isObject(value) && isStringArray(value.restoredTools);
 }
 
+function isUserToolRow(value: unknown): value is UserToolRow {
+  return isObject(value)
+    && isString(value.id)
+    && isString(value.name)
+    && isString(value.exe)
+    && isStringArray(value.args)
+    && isNullableString(value.knownToolId);
+}
+
+export function isUserToolsView(value: unknown): value is UserToolsView {
+  return isObject(value)
+    && isString(value.instanceId)
+    && Array.isArray(value.tools)
+    && value.tools.every(isUserToolRow);
+}
+
+function isToolCandidate(value: unknown): value is ToolCandidate {
+  return isObject(value)
+    && isString(value.exe)
+    && isString(value.modId)
+    && isString(value.modName)
+    && isNullableString(value.knownToolId)
+    && isString(value.suggestedName)
+    && typeof value.alreadyAdded === 'boolean';
+}
+
 function expectReply<T>(command: string, value: unknown, guard: (value: unknown) => value is T): T {
   if (!guard(value)) {
     throw new Error(`${command} did not return the reply the screen expects.`);
@@ -315,4 +366,39 @@ export async function gameToolSwapStatus(instanceId: string): Promise<SwapStatus
 export async function restoreGameToolSwap(instanceId: string): Promise<RestoreReply> {
   const reply = await invoke<unknown>('games_tools_swap_restore', { instanceId });
   return expectReply('games_tools_swap_restore', reply, isRestoreReply);
+}
+
+/** The tools the person added to this instance. Rejects a malformed reply. */
+export async function listUserTools(instanceId: string): Promise<UserToolsView> {
+  const reply = await invoke<unknown>('games_user_tools_list', { instanceId });
+  return expectReply('games_user_tools_list', reply, isUserToolsView);
+}
+
+/** Add one executable to the instance's own list. */
+export async function addUserTool(
+  instanceId: string,
+  tool: { name: string; exe: string; args: string[] },
+): Promise<UserToolRow> {
+  const reply = await invoke<unknown>('games_user_tools_add', {
+    instanceId,
+    name: tool.name,
+    exe: tool.exe,
+    args: tool.args,
+  });
+  return expectReply('games_user_tools_add', reply, isUserToolRow);
+}
+
+/** Remove a tool from the instance's own list. Returns the list as it now is. */
+export async function removeUserTool(instanceId: string, id: string): Promise<UserToolsView> {
+  const reply = await invoke<unknown>('games_user_tools_remove', { instanceId, id });
+  return expectReply('games_user_tools_remove', reply, isUserToolsView);
+}
+
+/** Look through the instance's enabled mods for executables. Adds nothing. */
+export async function findUserTools(instanceId: string): Promise<ToolCandidate[]> {
+  const reply = await invoke<unknown>('games_user_tools_find', { instanceId });
+  if (!Array.isArray(reply) || !reply.every(isToolCandidate)) {
+    throw new Error('games_user_tools_find did not return the reply the screen expects.');
+  }
+  return reply;
 }

@@ -4,14 +4,19 @@ const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
 import {
+  addUserTool,
   diffGameTool,
+  findUserTools,
   gameToolSwapCosts,
   gameToolSwapStatus,
   isRunResult,
   isSwapStatus,
   isToolsView,
+  isUserToolsView,
   listGameTools,
+  listUserTools,
   removeGameTool,
+  removeUserTool,
   restoreGameToolSwap,
   runGameTool,
 } from './api';
@@ -204,8 +209,76 @@ describe('the other tool commands', () => {
   });
 });
 
-describe('the reply guards', () => {
-  it('accept the offers a run can carry, and nothing else', () => {
+const userTool = {
+  id: 'tool-1',
+  name: 'FNIS',
+  exe: 'Data/tools/FNIS.exe',
+  args: ['-a'],
+  knownToolId: null,
+};
+
+const candidate = {
+  exe: 'Data/tools/FNIS.exe',
+  modId: 'aaaa1111',
+  modName: 'FNIS',
+  knownToolId: null,
+  suggestedName: 'FNIS',
+  alreadyAdded: false,
+};
+
+describe('the user tool commands', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('lists the instance’s own tools', async () => {
+    const view = { instanceId: 'sk-1', tools: [userTool] };
+    invokeMock.mockResolvedValueOnce(view);
+    await expect(listUserTools('sk-1')).resolves.toEqual(view);
+    expect(invokeMock).toHaveBeenCalledWith('games_user_tools_list', { instanceId: 'sk-1' });
+  });
+
+  it('rejects a malformed list rather than showing it as no tools', async () => {
+    invokeMock.mockResolvedValueOnce({ instanceId: 'sk-1', tools: [{ ...userTool, args: 'none' }] });
+    await expect(listUserTools('sk-1')).rejects.toThrow('games_user_tools_list');
+    invokeMock.mockResolvedValueOnce(undefined);
+    await expect(listUserTools('sk-1')).rejects.toThrow('games_user_tools_list');
+  });
+
+  it('adds a tool and reads the row back', async () => {
+    invokeMock.mockResolvedValueOnce(userTool);
+    await expect(addUserTool('sk-1', { name: 'FNIS', exe: 'Data/tools/FNIS.exe', args: ['-a'] })).resolves.toEqual(userTool);
+    expect(invokeMock).toHaveBeenCalledWith('games_user_tools_add', {
+      instanceId: 'sk-1',
+      name: 'FNIS',
+      exe: 'Data/tools/FNIS.exe',
+      args: ['-a'],
+    });
+  });
+
+  it('rejects an add reply that is not a tool', async () => {
+    invokeMock.mockResolvedValueOnce({ id: 'tool-1' });
+    await expect(addUserTool('sk-1', { name: 'FNIS', exe: 'x.exe', args: [] })).rejects.toThrow('games_user_tools_add');
+  });
+
+  it('removes a tool and reads the list that results', async () => {
+    const view = { instanceId: 'sk-1', tools: [] };
+    invokeMock.mockResolvedValueOnce(view);
+    await expect(removeUserTool('sk-1', 'tool-1')).resolves.toEqual(view);
+    expect(invokeMock).toHaveBeenCalledWith('games_user_tools_remove', { instanceId: 'sk-1', id: 'tool-1' });
+  });
+
+  it('reads the candidates, and rejects a reply that is not a list of them', async () => {
+    invokeMock.mockResolvedValueOnce([candidate]);
+    await expect(findUserTools('sk-1')).resolves.toEqual([candidate]);
+    invokeMock.mockResolvedValueOnce({ candidates: [candidate] });
+    await expect(findUserTools('sk-1')).rejects.toThrow('games_user_tools_find');
+    invokeMock.mockResolvedValueOnce([{ ...candidate, alreadyAdded: 'no' }]);
+    await expect(findUserTools('sk-1')).rejects.toThrow('games_user_tools_find');
+  });
+});
+
+describe('the reply guards', () => {  it('accept the offers a run can carry, and nothing else', () => {
     expect(isRunResult({ status: 'vfsRefused', reason: 'x', next: 'swap', offers: [{ offer: 'copySwap', costs }] })).toBe(true);
     expect(isRunResult({ status: 'vfsRefused', reason: 'x', next: null, offers: [{ offer: 'bribe' }] })).toBe(false);
   });
@@ -217,5 +290,7 @@ describe('the reply guards', () => {
 
   it('refuse a view whose tools are not a list', () => {
     expect(isToolsView({ instanceId: 'sk-1', tools: 'nemesis' })).toBe(false);
+    expect(isUserToolsView({ instanceId: 'sk-1', tools: 'nemesis' })).toBe(false);
+    expect(isUserToolsView({ instanceId: 'sk-1', tools: [userTool] })).toBe(true);
   });
 });
