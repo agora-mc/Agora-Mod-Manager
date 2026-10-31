@@ -466,7 +466,12 @@
           "root": "runtime",
           "path": "Data/DynDOLOD/TexGenx64.exe"
         },
-        "arguments": [],
+        "arguments": [
+          {
+            "kind": "literal",
+            "value": "-sse"
+          }
+        ],
         "environment": {},
         "working_directory": {
           "root": "runtime",
@@ -476,9 +481,10 @@
       "relevant_settings": [],
       "after_tools": [],
       "uses_install_path": false,
+      "output_arg": "-o:\"{output}\"",
       "output": {
         "kind": "mod",
-        "folder": "TexGen_Output"
+        "folder": ""
       }
     },
     {
@@ -490,7 +496,12 @@
           "root": "runtime",
           "path": "Data/DynDOLOD/DynDOLODx64.exe"
         },
-        "arguments": [],
+        "arguments": [
+          {
+            "kind": "literal",
+            "value": "-sse"
+          }
+        ],
         "environment": {},
         "working_directory": {
           "root": "runtime",
@@ -500,9 +511,10 @@
       "relevant_settings": [],
       "after_tools": [],
       "uses_install_path": false,
+      "output_arg": "-o:\"{output}\"",
       "output": {
         "kind": "mod",
-        "folder": "DynDOLOD_Output"
+        "folder": ""
       }
     },
     {
@@ -526,7 +538,8 @@
       "uses_install_path": false,
       "output": {
         "kind": "mod",
-        "folder": "PGPatcher Output"
+        "folder": "",
+        "user_configured": true
       }
     }
   ]

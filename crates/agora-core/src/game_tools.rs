@@ -494,10 +494,12 @@ pub fn user_tool_definition(
         output: if user.output_is_mod {
             ToolOutput::Mod {
                 folder: user.output_folder.clone().unwrap_or_default(),
+                user_configured: true,
             }
         } else {
             ToolOutput::GeneratedLayer
         },
+        output_arg: None,
         output_patterns: Vec::new(),
         id,
         game: definition.id.clone(),
@@ -536,31 +538,88 @@ fn tool_program_path(
 
 /// The folder a mod-output tool writes into. A relative folder is next to its executable; an
 /// absolute one is used as it is.
-fn mod_output_folder(tool: &ToolDefinition, program: &Path) -> Result<PathBuf, ToolError> {
-    let ToolOutput::Mod { folder } = &tool.output else {
-        return Err(ToolError::Other(format!(
-            "tool '{}' does not write a mod",
-            tool.id
-        )));
-    };
+fn resolve_mod_folder(folder: &str, program: &Path) -> Result<PathBuf, ToolError> {
     let folder = folder.trim();
     if folder.is_empty() {
-        return Err(ToolError::Invalid(format!(
-            "tool '{}' writes a mod but names no output folder",
-            tool.name
-        )));
+        return Err(ToolError::Invalid(
+            "a mod-output tool needs an output folder".to_string(),
+        ));
     }
     let as_path = Path::new(folder);
     if as_path.is_absolute() {
         return Ok(as_path.to_path_buf());
     }
     let parent = program.parent().ok_or_else(|| {
-        ToolError::Invalid(format!(
-            "tool '{}' has no folder to put its output beside",
-            tool.name
-        ))
+        ToolError::Invalid("the tool has no folder to put its output beside".to_string())
     })?;
     Ok(parent.join(folder))
+}
+
+/// The folder the user set in PGPatcher's own settings, recorded on the user tool that names
+/// PGPatcher (PGPatcher reads `output.dir` from its config and takes no folder argument:
+/// https://github.com/hakasapl/PGPatcher/blob/HEAD/PGLib/src/PGParams.cpp).
+fn user_configured_folder(
+    ctx: &Ctx,
+    instance_id: &str,
+    tool: &ToolDefinition,
+) -> Result<String, ToolError> {
+    let user = crate::game_user_tools::list(ctx, instance_id)
+        .map_err(|e| ToolError::Invalid(e.to_string()))?
+        .into_iter()
+        .find(|candidate| {
+            candidate.output_is_mod
+                && candidate.output_folder.is_some()
+                && candidate.known_tool_id.as_deref() == Some(tool.id.as_str())
+        });
+    match user.and_then(|candidate| candidate.output_folder) {
+        Some(folder) if !folder.trim().is_empty() => Ok(folder),
+        _ => Err(ToolError::Invalid(format!(
+            "Set the output folder in {}'s own settings, then add {} in Your tools with that same folder.",
+            tool.name, tool.name
+        ))),
+    }
+}
+
+/// Whether `path` is `root` or inside it, compared case-insensitively on Windows. A folder that does
+/// not exist yet is compared as it is written.
+fn path_within(path: &Path, root: &Path) -> bool {
+    let canon = |p: &Path| -> String {
+        let text = p
+            .canonicalize()
+            .unwrap_or_else(|_| p.to_path_buf())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = text.strip_prefix("//?/").unwrap_or(&text);
+        text.to_ascii_lowercase()
+    };
+    let (path, root) = (canon(path), canon(root));
+    path == root
+        || path
+            .strip_prefix(&root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Refuse an output folder inside the game, its Data folder, or the instance's deployment: the game
+/// reads those, and an output there would overwrite mods (PGPatcher itself refuses a folder inside
+/// Data: https://github.com/hakasapl/PGPatcher/blob/HEAD/PGPatcher/src/main.cpp).
+fn validate_configured_output(
+    folder: &Path,
+    base: &BaseManifest,
+    instance_id: &str,
+) -> Result<(), ToolError> {
+    let deployment = deployment_folder(base, instance_id)?;
+    let roots = [
+        base.source_location.clone(),
+        base.source_location.join("Data"),
+        deployment,
+    ];
+    if roots.iter().any(|root| path_within(folder, root)) {
+        return Err(ToolError::Invalid(format!(
+            "The output folder '{}' is inside the game or this instance's deployment. Use the folder you set in the tool's own settings, outside both.",
+            folder.display()
+        )));
+    }
+    Ok(())
 }
 
 fn folder_is_empty(dir: &Path) -> Result<bool, ToolError> {
@@ -1830,15 +1889,52 @@ fn run_inner(
         .instance_dir(instance_id)
         .map_err(|e| ToolError::Other(e.to_string()))?;
     let external = external_program(external)?;
+    let mut effective = tool.clone();
     let output_dir = match &tool.output {
         ToolOutput::GeneratedLayer => None,
-        ToolOutput::Mod { .. } => {
-            let program = tool_program_path(&base, instance_id, tool, external.as_deref());
-            let folder = mod_output_folder(tool, &program)?;
-            prepare_mod_output(&instance_dir, tool, &folder, move_aside)?;
-            Some(folder)
+        ToolOutput::Mod {
+            folder,
+            user_configured,
+        } => {
+            if let Some(template) = &tool.output_arg {
+                // DynDOLOD and TexGen take the folder as an argument (`-o:"[path]"`,
+                // https://dyndolod.info/Help/Command-Line-Argument). Agora gives each run its own
+                // folder under the instance, so another manager's folder is never touched.
+                let dir = instance_dir
+                    .join("tool-output")
+                    .join(tool.id.as_str())
+                    .join(format!("run-{}", new_run_id()));
+                let rendered = template.replace("{output}", &dir.to_string_lossy());
+                for arg in &mut effective.launch.arguments {
+                    if let agora_game_api::LaunchValue::Literal { value } = arg {
+                        if value.contains("{output}") {
+                            *value = value.replace("{output}", &dir.to_string_lossy());
+                        }
+                    }
+                }
+                effective
+                    .launch
+                    .arguments
+                    .push(agora_game_api::LaunchValue::Literal { value: rendered });
+                Some(dir)
+            } else {
+                let program = tool_program_path(&base, instance_id, tool, external.as_deref());
+                let raw_folder = if *user_configured && folder.trim().is_empty() {
+                    user_configured_folder(ctx, instance_id, tool)?
+                } else {
+                    folder.clone()
+                };
+                let dir = resolve_mod_folder(&raw_folder, &program)?;
+                if *user_configured {
+                    validate_configured_output(&dir, &base, instance_id)?;
+                }
+                prepare_mod_output(&instance_dir, tool, &dir, move_aside)?;
+                Some(dir)
+            }
         }
     };
+
+    let tool = &effective;
 
     // Decided before anything is deployed (MASTER_SPEC §26.9, decision 1). Under `auto` a virtual instance
     // runs every tool under the virtual file system; a linked or copied instance runs a tool that uses its
@@ -2937,6 +3033,9 @@ fn settle_mod_output(
     let current = current_mod_output(ctx, instance_id, &tool.id)?;
     if let Some(failure) = failure {
         let failed = discard(dir, staging, run)?;
+        if tool.output_arg.is_some() {
+            let _ = std::fs::remove_dir_all(folder);
+        }
         return Ok(Settled {
             written,
             promoted: false,
@@ -2949,6 +3048,9 @@ fn settle_mod_output(
     }
     let record = import_mod_output(ctx, instance_id, definition, tool, folder)?;
     let _ = std::fs::remove_dir_all(staging);
+    if tool.output_arg.is_some() {
+        let _ = std::fs::remove_dir_all(folder);
+    }
     Ok(Settled {
         written: Vec::new(),
         promoted: true,

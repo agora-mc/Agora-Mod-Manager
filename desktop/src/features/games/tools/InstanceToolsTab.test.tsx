@@ -210,7 +210,7 @@ describe('running the person’s own tools', () => {
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'DynDOLOD' } });
     fireEvent.change(screen.getByLabelText('Executable'), { target: { value: 'C:/Modding/DynDOLOD/DynDOLODx64.exe' } });
     fireEvent.click(screen.getByLabelText('Its output is a mod'));
-    fireEvent.change(screen.getByLabelText('Output folder (relative to the executable, or absolute)'), { target: { value: 'DynDOLOD_Output' } });
+    fireEvent.change(screen.getByLabelText(/Output folder/), { target: { value: 'DynDOLOD_Output' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add this tool' }));
     await waitFor(() => expect(addUserTool).toHaveBeenCalledWith('inst-1', {
       name: 'DynDOLOD',

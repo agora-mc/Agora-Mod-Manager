@@ -71,6 +71,7 @@ fn literal_args(args: &[&str]) -> Vec<LaunchValue> {
 fn writes_a_file(id: &str, file: &str) -> ToolDefinition {
     ToolDefinition {
         output: ToolOutput::GeneratedLayer,
+        output_arg: None,
         output_patterns: Vec::new(),
         id: ToolId::new(id).unwrap(),
         game: GameId::new(GAME).unwrap(),

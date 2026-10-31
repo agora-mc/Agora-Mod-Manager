@@ -155,6 +155,7 @@ fn literal_args(args: &[&str]) -> Vec<LaunchValue> {
 fn tool(id: &str, name: &str, args: &[&str]) -> ToolDefinition {
     ToolDefinition {
         output: ToolOutput::GeneratedLayer,
+        output_arg: None,
         output_patterns: Vec::new(),
         id: ToolId::new(id).unwrap(),
         game: GameId::new(GAME).unwrap(),
@@ -2714,6 +2715,7 @@ impl Drop for SwapTest {
 fn swap_tool(id: &str, name: &str, args: &[&str]) -> ToolDefinition {
     ToolDefinition {
         output: ToolOutput::GeneratedLayer,
+        output_arg: None,
         uses_install_path: true,
         required_outputs: Vec::new(),
         failure_markers: Vec::new(),
@@ -5600,4 +5602,146 @@ fn an_absolute_user_exe_must_be_an_existing_exe_without_control_characters() {
         );
         assert!(result.is_err(), "an absolute bad exe was accepted");
     }
+}
+
+// ---- tools that take their output folder as an argument, and PGPatcher's own setting ----
+
+/// A launcher that records the arguments and makes the output folder the run was given, then exits
+/// 0. Used to prove DynDOLOD and TexGen are passed their own per-run folder.
+struct OutputArgLauncher {
+    args: Mutex<Vec<std::ffi::OsString>>,
+    wrote: Mutex<bool>,
+}
+
+impl OutputArgLauncher {
+    fn new() -> Self {
+        Self {
+            args: Mutex::new(Vec::new()),
+            wrote: Mutex::new(false),
+        }
+    }
+
+    fn args(&self) -> Vec<String> {
+        self.args
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+impl Launcher for OutputArgLauncher {
+    fn locate_vfs_dll(&self) -> Result<PathBuf, String> {
+        Ok(PathBuf::from(r"C:\agora\agora_vfs.dll"))
+    }
+
+    fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        *self.args.lock().unwrap() = prepared.resolved.args.clone();
+        for arg in &prepared.resolved.args {
+            let text = arg.to_string_lossy();
+            if let Some(rest) = text.strip_prefix("-o:") {
+                let folder = PathBuf::from(rest.trim_matches('"'));
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("DynDOLOD.esp"), b"lod").unwrap();
+                *self.wrote.lock().unwrap() = true;
+            }
+        }
+        let mut plain = prepared.clone();
+        plain.vfs = None;
+        plain.resolved.args = vec![
+            std::ffi::OsString::from("/c"),
+            std::ffi::OsString::from("exit"),
+            std::ffi::OsString::from("0"),
+        ];
+        agora_core::game_launch::launch(&plain)
+    }
+}
+
+#[test]
+fn dyndolod_gets_its_own_output_folder_and_a_stale_folder_beside_it_is_untouched() {
+    let mut dyndolod = tool("dyndolod", "DynDOLOD", &[]);
+    dyndolod.output = ToolOutput::Mod {
+        folder: String::new(),
+        user_configured: false,
+    };
+    // https://dyndolod.info/Help/Command-Line-Argument
+    dyndolod.output_arg = Some("-o:\"{output}\"".to_string());
+    dyndolod.launch.arguments = vec![agora_game_api::LaunchValue::Literal {
+        value: "-sse".to_string(),
+    }];
+    let f = fixture(vec![dyndolod]);
+    deploy(&f.ctx, f.id(), &f.def, DeployMode::Virtual).unwrap();
+
+    let stale = f.deployed_game_dir().join("DynDOLOD_Output");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("old.esp"), b"old").unwrap();
+
+    let launcher = OutputArgLauncher::new();
+    let out = f.run_ok("dyndolod", &launcher);
+    assert!(out.promoted, "{out:?}");
+
+    let args = launcher.args();
+    assert!(args.iter().any(|arg| arg == "-sse"), "{args:?}");
+    let output_arg = args
+        .iter()
+        .find(|arg| arg.starts_with("-o:\""))
+        .unwrap_or_else(|| panic!("no -o: argument in {args:?}"));
+    let folder = PathBuf::from(output_arg.trim_start_matches("-o:").trim_matches('"'));
+    assert!(
+        folder.starts_with(f.instance_dir().join("tool-output").join("dyndolod")),
+        "the run's output is Agora's own folder, not next to the exe: {folder:?}"
+    );
+
+    assert_eq!(
+        f.content_bytes(&out.current.clone().unwrap(), "DynDOLOD.esp"),
+        b"lod"
+    );
+    assert_eq!(
+        std::fs::read(stale.join("old.esp")).unwrap(),
+        b"old",
+        "a folder another manager left next to the exe must not be touched"
+    );
+}
+
+#[test]
+fn a_pgpatcher_output_folder_inside_data_or_the_deployment_is_refused() {
+    let f = fixture(Vec::new());
+    let dir = TempDir::new().unwrap();
+    let exe = dir.path().join("PGPatcher.exe");
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).unwrap();
+    let exe_text = exe.to_string_lossy().into_owned();
+
+    let data_out = f._tmp.path().join("install").join("Data").join("PGOut");
+    std::fs::create_dir_all(&data_out).unwrap();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe_text,
+        &[],
+        true,
+        Some(&data_out.to_string_lossy()),
+    );
+    let refused = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), false).unwrap_err();
+    assert!(
+        refused.to_string().contains("inside the game"),
+        "a folder inside Data must be refused plainly: {refused:?}"
+    );
+
+    game_user_tools::remove(&f.ctx, f.id(), &tool.id).unwrap();
+    let deployment_out = f.deployed_game_dir().join("PGOut");
+    std::fs::create_dir_all(deployment_out.parent().unwrap()).unwrap();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe_text,
+        &[],
+        true,
+        Some(&deployment_out.to_string_lossy()),
+    );
+    let refused = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), false).unwrap_err();
+    assert!(
+        refused.to_string().contains("deployment"),
+        "a folder inside the deployment must be refused plainly: {refused:?}"
+    );
 }

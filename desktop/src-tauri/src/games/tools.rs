@@ -368,7 +368,7 @@ pub fn tools_view(
         .map(|state| {
             let (output_kind, output_folder) = match &state.output {
                 agora_game_api::ToolOutput::GeneratedLayer => (OutputKind::GeneratedLayer, None),
-                agora_game_api::ToolOutput::Mod { folder } => {
+                agora_game_api::ToolOutput::Mod { folder, .. } => {
                     (OutputKind::Mod, Some(folder.clone()))
                 }
             };

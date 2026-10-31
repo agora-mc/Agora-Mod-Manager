@@ -416,6 +416,9 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
                   onChange={(event) => setNewFolder(event.target.value)}
                   className="rounded-lg border border-border bg-background px-2 py-1"
                 />
+                <span className="text-xs text-muted-foreground">
+                  Use the same output folder you set in PGPatcher’s settings. It must be outside the game folder and this instance’s deployment.
+                </span>
               </label>
             )}
           </div>

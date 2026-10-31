@@ -1313,7 +1313,13 @@ pub enum ToolOutput {
     /// A whole mod the tool wrote into a folder. A successful run imports that folder as a content
     /// item and points the tool's layer at it. A relative folder is next to the tool's executable;
     /// an absolute one is used as it is.
-    Mod { folder: String },
+    Mod {
+        folder: String,
+        /// The folder is set in the tool's own settings, not by Agora (PGPatcher). A user tool
+        /// supplies it, and Agora refuses it when it is inside the game or the deployment.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        user_configured: bool,
+    },
 }
 
 impl ToolOutput {
@@ -1339,6 +1345,11 @@ pub struct ToolDefinition {
     /// writes files for the game keeps the behaviour it had before this field existed.
     #[serde(default, skip_serializing_if = "ToolOutput::is_generated_layer")]
     pub output: ToolOutput,
+    /// How a mod-output tool is told where to write, when it takes an argument (DynDOLOD, TexGen:
+    /// `-o:"{output}"`). `{output}` is replaced with a folder Agora owns for the run, so no folder
+    /// outside Agora's control is touched. Absent for a tool that reads its output folder elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_arg: Option<String>,
     /// INI settings, as `file:section:key` (e.g. `user/Skyrim.ini:General:SLocalSavePath`), whose
     /// values the tool's output depends on. A change makes the output stale.
     #[serde(default)]

@@ -269,6 +269,7 @@ fn registry_rejects_undefined_game_in_tool_leaving_registry_unchanged() {
     let mut builder = GameRegistry::builder();
     let tool = ToolDefinition {
         output: ToolOutput::GeneratedLayer,
+        output_arg: None,
         output_patterns: Vec::new(),
         id: ToolId::new("tool1").unwrap(),
         game: GameId::new("undefined-game").unwrap(),

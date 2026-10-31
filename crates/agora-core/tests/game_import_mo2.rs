@@ -119,6 +119,7 @@ fn skyrim_like() -> GameDefinition {
 fn nemesis() -> ToolDefinition {
     ToolDefinition {
         output: ToolOutput::GeneratedLayer,
+        output_arg: None,
         output_patterns: NEMESIS_PATTERNS.iter().map(|p| p.to_string()).collect(),
         id: ToolId::new("nemesis").unwrap(),
         game: GameId::new(GAME).unwrap(),
