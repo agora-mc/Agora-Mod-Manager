@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
+import { expectNoUnmockedCommands, instanceHeaderReplies, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
 
 /**
  * The Plugins and INI & saves tabs of a non-Minecraft game's instance (MASTER_SPEC §26.6, §26.7).
@@ -109,7 +109,7 @@ async function openPage(
   fail?: { command: string; error: unknown },
 ) {
   await installGamesMock(page, {
-    replies: { ...BOOT_REPLIES, ...replies },
+    replies: { ...BOOT_REPLIES, ...instanceHeaderReplies(INSTANCE_ID), ...replies },
     settings: { active_game: 'skyrim-se' },
   });
   // Added after the mock, so the failing wrapper sees the mock's invoke and not the other way round.

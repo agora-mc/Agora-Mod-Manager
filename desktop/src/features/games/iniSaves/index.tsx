@@ -9,6 +9,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useConfirm } from '@/components/ui/confirm';
+import { useOptionalInstanceSession } from '../instances';
 import {
   describeFailure,
   getIni,
@@ -99,10 +100,18 @@ function FailureNote({ message, onRetry }: { message: string; onRetry: () => voi
 // Save folder
 // ---------------------------------------------------------------------------
 
+/** The shared folder is named after the game when the page knows it: "Skyrim's usual save folder". */
+function saveChoicePlain(choice: SaveChoice, gameName: string | null): string {
+  if (choice === 'shared' && gameName !== null) {
+    return `${gameName}'s usual save folder, which every instance that uses shared saves reads.`;
+  }
+  return SAVE_CHOICE_WORDS[choice].plain;
+}
+
 const SAVE_CHOICE_WORDS: Record<SaveChoice, { label: string; plain: string }> = {
   shared: {
     label: 'Shared saves',
-    plain: "The game's own shared save folder, which every instance that uses shared saves reads.",
+    plain: "The game's usual save folder, which every instance that uses shared saves reads.",
   },
   own: {
     label: 'Own saves',
@@ -110,11 +119,29 @@ const SAVE_CHOICE_WORDS: Record<SaveChoice, { label: string; plain: string }> = 
   },
 };
 
-function folderLine(folder: SaveFolderRow): string {
+/** A save time as people read it; anything that does not parse is shown as it came. */
+export function readableWhen(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(parsed);
+}
+
+export function folderLine(folder: SaveFolderRow): string {
   if (!folder.exists) return 'Not made yet. The game creates it.';
   if (folder.saves === 0) return 'No saves yet.';
   const count = `${folder.saves} ${folder.saves === 1 ? 'save' : 'saves'}`;
-  return folder.newest ? `${count}, newest ${folder.newest}` : count;
+  return folder.newest ? `${count}, newest ${readableWhen(folder.newest)}` : count;
+}
+
+function FolderPath({ folder }: { folder: SaveFolderRow }) {
+  return (
+    <div className="space-y-1">
+      <p className="break-all rounded-md border border-border bg-muted/60 px-2.5 py-1.5 font-mono text-xs" title={folder.path}>
+        {folder.path}
+      </p>
+      <p className="text-xs text-muted-foreground">{folderLine(folder)}</p>
+    </div>
+  );
 }
 
 function settingSourceWords(source: IniSourceName): string {
@@ -144,6 +171,8 @@ function settingNotice(change: SavesChange): string {
 
 function SavesSection({ instanceId }: { instanceId: string }) {
   const { state, refetch, setState } = useReadOnMount(getSaves, instanceId);
+  const session = useOptionalInstanceSession();
+  const gameName = session?.page.status === 'loaded' ? session.page.detail.gameName : null;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -179,21 +208,28 @@ function SavesSection({ instanceId }: { instanceId: string }) {
           <div className="grid gap-3 md:grid-cols-2">
             {(['shared', 'own'] as const).map((choice) => {
               const current = state.value.choice === choice;
+              const folder = current ? state.value.inUse : state.value.other;
               return (
                 <div
                   key={choice}
                   className={[
-                    'space-y-2 rounded-xl border p-4',
+                    'flex flex-col gap-3 rounded-xl border p-4',
                     current ? 'border-primary bg-primary/5' : 'border-border bg-card',
                   ].join(' ')}
+                  data-testid={`saves-choice-${choice}`}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <h3 className="font-semibold">{SAVE_CHOICE_WORDS[choice].label}</h3>
-                    {current && <span className="text-xs font-medium text-primary">In use</span>}
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <h3 className="font-semibold">{SAVE_CHOICE_WORDS[choice].label}</h3>
+                      {current && (
+                        <span className="rounded-full bg-primary px-2 py-0.5 text-xs font-semibold text-primary-foreground">In use</span>
+                      )}
+                    </div>
+                    <p className="text-sm text-muted-foreground">{saveChoicePlain(choice, gameName)}</p>
                   </div>
-                  <p className="text-sm text-muted-foreground">{SAVE_CHOICE_WORDS[choice].plain}</p>
+                  <FolderPath folder={folder} />
                   {!current && (
-                    <Button variant="outline" size="sm" onClick={() => choose(choice)} disabled={busy}>
+                    <Button className="self-start" variant="outline" size="sm" onClick={() => choose(choice)} disabled={busy}>
                       Use {SAVE_CHOICE_WORDS[choice].label.toLowerCase()}
                     </Button>
                   )}
@@ -201,22 +237,16 @@ function SavesSection({ instanceId }: { instanceId: string }) {
               );
             })}
           </div>
-          <dl className="grid gap-2 text-sm md:grid-cols-[max-content_1fr]">
-            <dt className="text-muted-foreground">In use</dt>
-            <dd className="break-all font-mono text-xs">
-              {state.value.inUse.path} <span className="font-sans">({folderLine(state.value.inUse)})</span>
-            </dd>
-            <dt className="text-muted-foreground">Other folder</dt>
-            <dd className="break-all font-mono text-xs">
-              {state.value.other.path} <span className="font-sans">({folderLine(state.value.other)})</span>
-            </dd>
-            <dt className="text-muted-foreground">Game setting</dt>
-            <dd>
-              {state.value.setting} in {state.value.settingFile} is{' '}
-              <span className="font-mono text-xs">{state.value.settingValue ?? 'not set'}</span> (from{' '}
-              {settingSourceWords(state.value.settingSource)}).
-            </dd>
-          </dl>
+          <p className="text-xs text-muted-foreground" data-testid="saves-setting">
+            The game finds the folder through{' '}
+            <code className="rounded bg-muted px-1 py-0.5 font-mono">{state.value.setting}</code> in {state.value.settingFile}:{' '}
+            {state.value.settingValue === null ? (
+              'not set'
+            ) : (
+              <code className="rounded bg-muted px-1 py-0.5 font-mono">{state.value.settingValue}</code>
+            )}{' '}
+            (from {settingSourceWords(state.value.settingSource)}).
+          </p>
         </div>
       )}
       {error && (

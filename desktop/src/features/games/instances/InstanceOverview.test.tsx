@@ -1,11 +1,13 @@
 /**
  * The Overview's two choices that must not go wrong silently: a "Launch anyway" tick made for one
  * instance must not carry to another, and a deployment change that was saved must not read as
- * "not changed" because the page could not refresh afterwards.
+ * "not changed" because the page could not refresh afterwards. Also: reopening an instance shows its
+ * last checks at once while they run again, and never another instance's.
  */
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { InstanceOverviewTab } from './InstanceOverview';
+import { GameInstancePage } from '../shell/GameInstancePage';
+import { clearInstanceSessionCache } from './instanceSession';
 import {
   checkGameInstance,
   getGameInstance,
@@ -13,6 +15,11 @@ import {
   type InstanceCheck,
   type InstanceDetail,
 } from './api';
+
+vi.mock('../content', () => ({ InstanceContentTab: () => null }));
+vi.mock('../plugins', () => ({ InstancePluginsTab: () => null }));
+vi.mock('../iniSaves', () => ({ InstanceIniSavesTab: () => <p>ini page</p> }));
+vi.mock('../tools', () => ({ InstanceToolsTab: () => null }));
 
 vi.mock('./api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./api')>();
@@ -48,7 +55,12 @@ function detail(instanceId: string): InstanceDetail {
 
 const cleanCheck: InstanceCheck = { instanceId: 'grounded-1', checked: true, status: 'ok', findings: [], passed: [] };
 
+function InstanceOverviewTab({ instanceId, page = 'overview' }: { gameId: string; instanceId: string; page?: 'overview' | 'ini-saves' }) {
+  return <GameInstancePage gameId="skyrim-se" instanceId={instanceId} page={page} onNavigatePage={() => undefined} onBack={() => undefined} />;
+}
+
 beforeEach(() => {
+  clearInstanceSessionCache();
   vi.mocked(getGameInstance).mockReset();
   vi.mocked(checkGameInstance).mockReset().mockResolvedValue(cleanCheck);
   vi.mocked(setGameInstanceDeployment).mockReset();
@@ -66,6 +78,7 @@ describe('Launch anyway', () => {
 
     rerender(<InstanceOverviewTab gameId="skyrim-se" instanceId="modded-2" />);
     await screen.findByRole('heading', { name: 'Modded' });
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced options' }));
     expect(screen.getByRole('checkbox', { name: /Launch anyway/ })).not.toBeChecked();
   });
 });
@@ -86,7 +99,7 @@ describe('checks that passed', () => {
     render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
     await screen.findByTestId('instance-overview');
 
-    expect(screen.getByText('All 2 checks passed.')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('checks-headline')).toHaveTextContent('All 2 checks passed.'));
     const passed = screen.getAllByTestId('check-passed');
     expect(passed).toHaveLength(2);
     expect(passed[0]).toHaveTextContent('Skyrim Script Extender (SKSE)');
@@ -145,5 +158,75 @@ describe('deployment change', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('The way this instance runs was not changed. the save was refused');
+  });
+});
+
+describe('the last answer', () => {
+  const blocking: InstanceCheck = {
+    instanceId: 'grounded-1',
+    checked: true,
+    status: 'findings',
+    findings: [{ kind: 'framework', blocks: true, title: 'Skyrim Script Extender (SKSE)', detail: 'x', why: 'y', repair: null }],
+    passed: [],
+  };
+
+  it('shows the last checks at once when the instance is opened again, then the new ones', async () => {
+    vi.mocked(getGameInstance).mockImplementation(async (id) => detail(id));
+    vi.mocked(checkGameInstance).mockResolvedValueOnce(blocking);
+    const first = render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+    await waitFor(() => expect(screen.getByTestId('checks-headline')).toHaveTextContent('1 problem stops the game from launching'));
+    first.unmount();
+
+    let answer: (check: InstanceCheck) => void = () => undefined;
+    vi.mocked(checkGameInstance).mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+    render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+
+    // Before anything answers: the old result, marked as being checked again.
+    expect(screen.getByTestId('check-finding')).toHaveTextContent('Skyrim Script Extender (SKSE)');
+    expect(screen.getByText(/Showing the last answer/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Launch Grounded' })).toBeInTheDocument();
+
+    await waitFor(() => expect(checkGameInstance).toHaveBeenCalledTimes(2));
+    answer(cleanCheck);
+    await waitFor(() => expect(screen.getByTestId('checks-headline')).toHaveTextContent('No launch checks apply to this instance.'));
+    expect(screen.queryByTestId('check-finding')).toBeNull();
+    expect(screen.queryByText(/Showing the last answer/)).toBeNull();
+  });
+
+  it("never shows one instance its neighbour's last checks", async () => {
+    vi.mocked(getGameInstance).mockImplementation(async (id) => detail(id));
+    vi.mocked(checkGameInstance).mockResolvedValueOnce(blocking);
+    const first = render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+    await waitFor(() => expect(screen.getByTestId('checks-headline')).toHaveTextContent('1 problem stops the game from launching'));
+    first.unmount();
+
+    vi.mocked(checkGameInstance).mockImplementationOnce(() => new Promise(() => undefined));
+    render(<InstanceOverviewTab gameId="skyrim-se" instanceId="modded-2" />);
+    expect(screen.getByRole('status')).toHaveTextContent('Loading this instance');
+    await screen.findByRole('heading', { name: 'Modded' });
+    expect(screen.queryByTestId('check-finding')).toBeNull();
+    expect(screen.getByTestId('checks-headline')).toHaveTextContent('Checking this instance');
+  });
+
+  it('keeps the last answer and says so when reading the instance again fails', async () => {
+    vi.mocked(getGameInstance).mockImplementationOnce(async (id) => detail(id));
+    vi.mocked(checkGameInstance).mockResolvedValueOnce(blocking);
+    const first = render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+    await waitFor(() => expect(screen.getByTestId('checks-headline')).toHaveTextContent('1 problem stops the game from launching'));
+    first.unmount();
+
+    vi.mocked(getGameInstance).mockRejectedValueOnce(new Error('the database is locked'));
+    render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+    const alert = await screen.findByText(/could not be read again/);
+    expect(alert).toHaveTextContent('the database is locked');
+    expect(screen.getByTestId('check-finding')).toBeInTheDocument();
+  });
+
+  it('shows the header with Launch on the other pages too', async () => {
+    vi.mocked(getGameInstance).mockImplementation(async (id) => detail(id));
+    render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" page="ini-saves" />);
+    expect(await screen.findByRole('button', { name: 'Launch Grounded' })).toBeEnabled();
+    expect(screen.getByText('ini page')).toBeInTheDocument();
+    expect(screen.queryByTestId('instance-overview')).toBeNull();
   });
 });

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Boxes, Play, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { InstanceIcon, MetaChip } from '@/components/InstanceIcon';
 import { useConfirm } from '@/components/ui/confirm';
 import { CreateInstanceDialog } from './CreateInstanceDialog';
 import {
@@ -123,26 +124,34 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
       {state.status === 'loaded' && state.instances.length > 0 && (
         <ul className="grid gap-4 md:grid-cols-2" aria-label="Instances">
           {state.instances.map((card) => (
-            <li key={card.instanceId} className="flex flex-col gap-3 rounded-xl border border-border bg-card p-5" data-testid="instance-card">
-              <div className="flex flex-wrap items-start justify-between gap-2">
-                <h3 className="text-lg font-semibold">{card.name}</h3>
-                <div className="flex flex-wrap gap-1.5">
-                  {card.running && (
-                    <span className="rounded-full bg-primary px-2.5 py-0.5 text-xs font-semibold text-primary-foreground">Running</span>
-                  )}
-                  <span className="rounded-full border border-border px-2.5 py-0.5 text-xs font-semibold">
-                    {card.pinned ? 'Pinned base' : 'Runs from install'}
-                  </span>
+            <li
+              key={card.instanceId}
+              className={`instance-card flex flex-col gap-4 rounded-xl border border-border bg-card p-4${card.running ? ' instance-card--running' : ''}`}
+              data-testid="instance-card"
+            >
+              <div className="flex min-w-0 items-start gap-3">
+                <InstanceIcon name={card.name} seed={card.instanceId} />
+                <div className="min-w-0">
+                  <h3 className="wrap-break-word font-semibold">{card.name}</h3>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    <MetaChip>{[card.store, card.version].filter(Boolean).join(' ') || 'Runtime not recorded'}</MetaChip>
+                    <MetaChip>{deploymentLabel(card.deployment)}</MetaChip>
+                    <MetaChip>{card.pinned ? 'Pinned base' : 'Runs from install'}</MetaChip>
+                  </div>
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {card.running ? (
+                      <span className="inline-flex items-center gap-1.5 text-green-600 dark:text-green-400">
+                        <span className="instance-status-dot" aria-hidden="true" />
+                        Running now
+                      </span>
+                    ) : card.lastLaunchedAt ? (
+                      `Last played ${formatWhen(card.lastLaunchedAt)}`
+                    ) : (
+                      'Never played'
+                    )}
+                  </p>
                 </div>
               </div>
-              <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
-                <dt className="text-muted-foreground">Runtime</dt>
-                <dd>{[card.store, card.version].filter(Boolean).join(' ') || 'Not recorded'}</dd>
-                <dt className="text-muted-foreground">Deployment</dt>
-                <dd>{deploymentLabel(card.deployment)}</dd>
-                <dt className="text-muted-foreground">Last played</dt>
-                <dd>{formatWhen(card.lastLaunchedAt)}</dd>
-              </dl>
               <div className="mt-auto flex flex-wrap gap-2">
                 <Button type="button" onClick={() => onOpenInstance(card.instanceId)}>
                   <Play aria-hidden="true" />

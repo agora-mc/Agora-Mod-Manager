@@ -5,3 +5,5 @@
 
 export { GameInstancesPage } from './InstancesTab';
 export { InstanceOverviewTab } from './InstanceOverview';
+export { InstanceHero } from './InstanceHero';
+export { InstanceSessionProvider, useOptionalInstanceSession } from './instanceSession';

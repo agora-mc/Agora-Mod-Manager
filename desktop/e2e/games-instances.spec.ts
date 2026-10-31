@@ -86,6 +86,7 @@ const blockedCheck = {
   checked: true,
   status: 'findings',
   findings: [extenderFinding],
+  passed: [],
 };
 
 const cleanCheck = {
@@ -93,6 +94,7 @@ const cleanCheck = {
   checked: true,
   status: 'ok',
   findings: [],
+  passed: [],
 };
 
 /** The boot commands the shell answers with empty data. Shared by every test here. */
@@ -174,8 +176,7 @@ test('an instance opens to its Overview, where a framework that does not match b
 
   await cardFor(page, 'Grounded').getByRole('button', { name: 'Open' }).click();
 
-  const overview = page.getByTestId('instance-overview');
-  await expect(overview.getByRole('heading', { name: 'Grounded', exact: true })).toBeVisible();
+  await expect(page.getByTestId('instance-hero').getByRole('heading', { name: 'Grounded', exact: true })).toBeVisible();
   await expect(page.getByTestId('frameworks-status')).toHaveText('Do not match this game version');
   await expect(page.getByTestId('check-finding')).toHaveAttribute('data-blocks', 'true');
   await expect(page.getByTestId('check-finding')).toContainText('Stops the launch');
@@ -286,7 +287,7 @@ test('creating an instance needs a name, explains how it runs, and opens the new
   await expect(dialog.getByRole('button', { name: 'Create instance' })).toBeEnabled();
   await dialog.getByRole('button', { name: 'Create instance' }).click();
 
-  await expect(page.getByTestId('instance-overview').getByRole('heading', { name: 'Grounded', exact: true })).toBeVisible();
+  await expect(page.getByTestId('instance-hero').getByRole('heading', { name: 'Grounded', exact: true })).toBeVisible();
 });
 
 test('a launch that starts names the process, how it runs, and what the page does about it', async ({ page }) => {

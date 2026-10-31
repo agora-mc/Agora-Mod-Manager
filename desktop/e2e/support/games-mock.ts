@@ -31,7 +31,8 @@ const UNMOCKED_LOG_KEY = '__agora_games_mock_unmocked';
 export async function installGamesMock(page: Page, table: GamesMockTable): Promise<void> {
   await page.addInitScript(
     ({ table, settingsKey, unmockedKey }) => {
-      const replies = table.replies;
+      // The shell asks which games are turned off on every start; no rows means none are.
+      const replies: Record<string, unknown> = { games_support_list: [], ...table.replies };
       const seeded: Record<string, unknown> = { onboarding_complete: true, ...table.settings };
       const stored = JSON.parse(localStorage.getItem(settingsKey) ?? '{}') as Record<string, unknown>;
       const settings: Record<string, unknown> = { ...seeded, ...stored };
@@ -98,6 +99,34 @@ export async function expectNoUnmockedCommands(page: Page): Promise<void> {
  * others, and an unanswered command fails the test. Put this first in a spec's boot replies so
  * the spec's own entries override it.
  */
+/**
+ * What the header of a game instance page reads on every one of its pages: the instance and its
+ * launch checks. Specs for the other pages spread this in so the header has an answer.
+ */
+export function instanceHeaderReplies(instanceId: string): Record<string, unknown> {
+  return {
+    games_instance_get: {
+      instanceId,
+      gameId: 'skyrim-se',
+      gameName: 'Skyrim Special Edition',
+      name: 'Test instance',
+      pinned: true,
+      store: 'steam',
+      version: '1.6.1170',
+      build: null,
+      baseId: 'skyrim-se_steam_1.6.1170',
+      installId: null,
+      unpinnedReason: null,
+      deployment: null,
+      saves: 'shared',
+      createdAt: '2026-10-01 10:00:00',
+      lastLaunchedAt: null,
+      running: false,
+    },
+    games_instance_check: { instanceId, checked: true, status: 'ok', findings: [], passed: [] },
+  };
+}
+
 export const OTHER_SLICES_REPLIES: Record<string, unknown> = {
   games_instance_list: { instances: [] },
   games_discover: { folders: [], warnings: [] },
