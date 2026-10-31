@@ -7,8 +7,10 @@ import {
   getIni,
   getModIni,
   getSaves,
+  keepModIniGameVersion,
   listModInis,
   resetModIni,
+  restoreModIniMine,
   setIniValue,
   setModIniValue,
   setSaves,
@@ -124,6 +126,7 @@ describe('mod INI commands', () => {
     modName: 'SSE Display Tweaks',
     overridden: false,
     shadowedBy: null,
+    gameChanged: false,
     modEnabled: true,
   };
 
@@ -191,5 +194,21 @@ describe('mod INI commands', () => {
       entries: [{ section: 'Display', key: 'fGamma' }],
     });
     await expect(getModIni('inst-1', modRow.path)).rejects.toThrow('games_mod_ini_get did not return');
+  });
+
+  it('adopts or takes back the game version through their commands', async () => {
+    invokeMock.mockResolvedValueOnce([{ ...modRow, gameChanged: true }]);
+    await keepModIniGameVersion('inst-1', modRow.path);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_mod_ini_keep_game_version', {
+      instanceId: 'inst-1',
+      path: modRow.path,
+    });
+
+    invokeMock.mockResolvedValueOnce([{ ...modRow, gameChanged: false }]);
+    await restoreModIniMine('inst-1', modRow.path);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_mod_ini_restore_mine', {
+      instanceId: 'inst-1',
+      path: modRow.path,
+    });
   });
 });

@@ -185,6 +185,8 @@ pub struct ModIniRow {
     pub overridden: bool,
     /// A later enabled mod that ships the same path, when one explains the file.
     pub shadowed_by: Option<String>,
+    /// The game wrote this file since the override or mod file, so the game's copy is what runs.
+    pub game_changed: bool,
     /// False when the mod is turned off, or no mod ships the file any more.
     pub mod_enabled: bool,
 }
@@ -196,12 +198,14 @@ fn mod_ini_row(row: &ModIni) -> ModIniRow {
         mod_name: row.mod_name.clone(),
         overridden: row.overridden,
         shadowed_by: row.shadowed_by.clone(),
+        game_changed: row.game_changed,
         mod_enabled: row.mod_enabled,
     }
 }
 
 fn mod_ini_source_name(source: ModIniSource) -> &'static str {
     match source {
+        ModIniSource::Writable => "writable",
         ModIniSource::Override => "override",
         ModIniSource::Mod => "mod",
     }
@@ -289,6 +293,36 @@ pub async fn games_mod_ini_reset(
 ) -> Result<Vec<ModIniRow>, GamesError> {
     run_blocking(app, "Resetting the mod INI file", move |ctx| {
         game_mod_ini::reset_mod_ini(&ctx, &instance_id, &path).map_err(core_failed)?;
+        let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
+        Ok(mod_ini_rows(rows))
+    })
+    .await
+}
+
+/// Adopt the game's version of a mod INI: copy the game's writable copy into the override.
+#[tauri::command]
+pub async fn games_mod_ini_keep_game_version(
+    app: tauri::AppHandle,
+    instance_id: String,
+    path: String,
+) -> Result<Vec<ModIniRow>, GamesError> {
+    run_blocking(app, "Keeping the game's mod INI version", move |ctx| {
+        game_mod_ini::keep_game_version(&ctx, &instance_id, &path).map_err(core_failed)?;
+        let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
+        Ok(mod_ini_rows(rows))
+    })
+    .await
+}
+
+/// Go back to the instance's own version: move the game's writable copy aside.
+#[tauri::command]
+pub async fn games_mod_ini_restore_mine(
+    app: tauri::AppHandle,
+    instance_id: String,
+    path: String,
+) -> Result<Vec<ModIniRow>, GamesError> {
+    run_blocking(app, "Restoring your mod INI version", move |ctx| {
+        game_mod_ini::restore_mine(&ctx, &instance_id, &path).map_err(core_failed)?;
         let rows = game_mod_ini::list_mod_inis(&ctx, &instance_id).map_err(core_failed)?;
         Ok(mod_ini_rows(rows))
     })
@@ -579,6 +613,7 @@ mod tests {
             mod_name: "Mod A".into(),
             overridden: true,
             shadowed_by: None,
+            game_changed: false,
             mod_enabled: true,
         };
         let json = serde_json::to_value(mod_ini_row(&row)).expect("serialises");

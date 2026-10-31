@@ -5,8 +5,8 @@ use agora_core::ctx::CoreContext;
 use agora_core::game_base::{get_file_identity, BaseMode};
 use agora_core::game_deploy::{
     add_content, deploy, deployment_dir, move_content, plan, remove_content, set_content_enabled,
-    set_content_own_copy, undeploy, visible_file_source, DeployError, DeployMode, DeployOutcome,
-    FileSource, Placement,
+    set_content_own_copy, undeploy, visible_file_source, visible_paths, DeployError, DeployMode,
+    DeployOutcome, FileSource, Placement,
 };
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{
@@ -2461,16 +2461,12 @@ fn probe_an_edited_config_copy_survives_redeploy_and_is_harvested() {
 }
 
 #[test]
-fn an_instance_override_is_planned_after_the_writable_layer_and_wins() {
+fn the_game_writable_layer_wins_over_the_instance_override() {
     let (_tmp, ctx, def, id) = probe_fixture("OverrideAfterWritable");
     let item = add_content_folder(
         &ctx,
         "Tweak",
-        &[(
-            "SKSE/Plugins/SSEDisplayTweaks.ini",
-            b"[Display]
-gamma=1",
-        )],
+        &[("SKSE/Plugins/SSEDisplayTweaks.ini", b"[Display]\ngamma=1")],
     );
     add_content(&ctx, &id, &item, None, None).unwrap();
     game_mod_ini::set_mod_ini_value(
@@ -2484,22 +2480,21 @@ gamma=1",
     .unwrap();
     let writable = instance_writable_dir(&ctx, &id).join("SKSE/Plugins/SSEDisplayTweaks.ini");
     std::fs::create_dir_all(writable.parent().unwrap()).unwrap();
-    std::fs::write(&writable, b"gamma=3").unwrap();
+    std::fs::write(&writable, b"[Display]\ngamma=3").unwrap();
 
     let planned = plan(&ctx, &id, &def, DeployMode::Links).unwrap();
     let file = find(&planned, "SKSE/Plugins/SSEDisplayTweaks.ini").unwrap();
     assert_eq!(
-        file.layer_id, "overrides",
-        "the user's copy is the last layer"
+        file.layer_id, "writable",
+        "the game's own write is the newest change and wins"
     );
-    assert!(matches!(file.source, FileSource::Override { .. }));
+    assert!(matches!(file.source, FileSource::Writable { .. }));
 
     deploy(&ctx, &id, &def, DeployMode::Links).unwrap();
     let game = deployment_dir(&ctx, &id).unwrap().unwrap();
     assert_eq!(
         std::fs::read(game.join("SKSE/Plugins/SSEDisplayTweaks.ini")).unwrap(),
-        b"[Display]
-gamma=2"
+        b"[Display]\ngamma=3"
     );
 }
 
@@ -2790,71 +2785,51 @@ fn review_visible_file_source_does_not_answer_with_a_file_through_an_overrides_j
     );
 }
 
-// Verify only (item 5): the reviewer's finding about the writable layer and the overrides layer
-// under each strategy. This test is ignored because it documents a disagreement, not a contract.
 #[test]
-#[ignore = "finding: under Virtual the VFS upper layer (writable) beats the override in the farm, while visible_file_source answers with the override"]
-fn review_which_file_the_game_sees_when_writable_and_overrides_share_a_path() {
+fn a_writable_copy_and_an_override_give_the_same_answer_in_every_strategy() {
     let (_tmp, ctx, def, id) = probe_fixture("ReviewWritableVsOverride");
     let rel = "SKSE/Plugins/SSEDisplayTweaks.ini";
-    let item = add_content_folder(
-        &ctx,
-        "Tweak",
-        &[(
-            rel,
-            b"[Display]
-gamma=1",
-        )],
-    );
+    let item = add_content_folder(&ctx, "Tweak", &[(rel, b"[Display]\ngamma=1")]);
     add_content(&ctx, &id, &item, None, None).unwrap();
     game_mod_ini::set_mod_ini_value(&ctx, &id, rel, "Display", "gamma", "2").unwrap();
 
     let writable = instance_writable_dir(&ctx, &id).join(rel);
     std::fs::create_dir_all(writable.parent().unwrap()).unwrap();
-    std::fs::write(
-        &writable,
-        b"[Display]
-gamma=3",
-    )
-    .unwrap();
-    let override_path = ctx
-        .paths
-        .instance_dir(&id)
-        .unwrap()
-        .join("overrides")
-        .join(rel);
+    std::fs::write(&writable, b"[Display]\ngamma=3").unwrap();
 
     let seen = |mode| {
         visible_file_source(&ctx, &id, &def, mode, rel)
             .unwrap()
             .unwrap()
     };
-    let virtual_seen = seen(DeployMode::Virtual);
-    let links_seen = seen(DeployMode::Links);
-    let copies_seen = seen(DeployMode::Copies);
-
-    // What the game actually reads. Under the VFS the writable layer is the upper layer over the
-    // farm (game_instance::prepare_launch sets `upper: <instance>/writable`, `lowers: [game_dir]`),
-    // so a game-written file beats an override placed in the farm. Links and Copies place the
-    // overrides layer after the writable layer in the farm itself.
-    let vfs_game_reads = if writable.is_file() {
-        writable.clone()
-    } else {
-        virtual_seen.clone()
-    };
-    println!("virtual game reads {vfs_game_reads:?}");
-    println!("virtual lookup answers {virtual_seen:?}");
-    println!("links game/lookup answers {links_seen:?}");
-    println!("copies game/lookup answers {copies_seen:?}");
-
     assert_eq!(
-        vfs_game_reads, writable,
-        "the VFS upper layer wins for the game"
+        seen(DeployMode::Virtual),
+        writable,
+        "virtual reads writable"
     );
-    assert_eq!(links_seen, override_path, "linked files read the override");
-    assert_eq!(copies_seen, override_path, "copied files read the override");
+    assert_eq!(seen(DeployMode::Links), writable, "links read writable");
+    assert_eq!(seen(DeployMode::Copies), writable, "copies read writable");
+
+    for mode in [DeployMode::Links, DeployMode::Copies] {
+        let planned = plan(&ctx, &id, &def, mode).unwrap();
+        let file = find(&planned, rel).unwrap();
+        assert!(matches!(file.source, FileSource::Writable { .. }));
+    }
+    let virtual_plan = plan(&ctx, &id, &def, DeployMode::Virtual).unwrap();
+    assert!(
+        matches!(
+            find(&virtual_plan, rel).unwrap().source,
+            FileSource::Override { .. }
+        ),
+        "the farm still holds the override under the VFS"
+    );
+    let paths = visible_paths(&ctx, &id, &def, DeployMode::Virtual).unwrap();
     assert_eq!(
-        virtual_seen, vfs_game_reads,
-        "visible_file_source disagrees with the VFS about the same path"
+        paths
+            .iter()
+            .filter(|path| path.eq_ignore_ascii_case(rel))
+            .count(),
+        1,
+        "the VFS view lists the path once"
     );
 }

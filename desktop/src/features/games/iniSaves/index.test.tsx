@@ -24,6 +24,7 @@ const MOD_INI = {
   modName: 'SSE Display Tweaks',
   overridden: false,
   shadowedBy: null,
+  gameChanged: false,
   modEnabled: true,
 };
 
@@ -72,6 +73,7 @@ describe('the mod INI section', () => {
     expect(await screen.findByText('[Display]')).toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: 'Value of fGamma in [Display]' })).toHaveValue('1.0');
     expect(screen.getByRole('button', { name: 'Save key' })).toBeInTheDocument();
+    expect(screen.queryByTestId('mod-ini-game-changed')).toBeNull();
   });
 
   it('says quietly that no enabled mod ships an INI, rather than failing', async () => {
@@ -159,6 +161,40 @@ describe('the mod INI section', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('is back to the version its mod ships');
     expect(await screen.findByText("None of this instance's enabled mods ships an INI file.")).toBeInTheDocument();
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('shows the game-changed banner and adopts the game version', async () => {
+    replies.games_mod_inis_list = () => [{ ...MOD_INI, gameChanged: true, overridden: true }];
+    replies.games_mod_ini_keep_game_version = () => [{ ...MOD_INI, gameChanged: false, overridden: true }];
+    mountTab();
+    expect(await screen.findByTestId('mod-ini-game-changed')).toHaveTextContent(
+      'The game changed this file after your last edit',
+    );
+    fireEvent.click(screen.getByRole('button', { name: "Keep the game's version" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('games_mod_ini_keep_game_version', {
+        instanceId: 'inst-1',
+        path: MOD_INI.path,
+      }),
+    );
+    await waitFor(() => expect(screen.queryByTestId('mod-ini-game-changed')).toBeNull());
+  });
+
+  it('goes back to my version only after a confirmation', async () => {
+    replies.games_mod_inis_list = () => [{ ...MOD_INI, gameChanged: true, overridden: true }];
+    replies.games_mod_ini_restore_mine = () => [{ ...MOD_INI, gameChanged: false, overridden: true }];
+    mountTab();
+    fireEvent.click(await screen.findByRole('button', { name: 'Go back to my version' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(invokeMock).not.toHaveBeenCalledWith('games_mod_ini_restore_mine', expect.anything());
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Go back to my version' }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('games_mod_ini_restore_mine', {
+        instanceId: 'inst-1',
+        path: MOD_INI.path,
+      }),
+    );
+    expect(await screen.findByRole('status')).toHaveTextContent("The game's copy was kept aside.");
   });
 
   it('shows a clear message and no editor for a file that is not text', async () => {
