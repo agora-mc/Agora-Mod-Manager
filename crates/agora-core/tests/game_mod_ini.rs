@@ -718,6 +718,31 @@ fn going_back_to_mine_moves_the_games_copy_aside() {
 }
 
 #[test]
+fn quick_repeated_go_backs_keep_every_backup() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = context(&tmp);
+    let a = add_item(&ctx, "Mod A", &[("x.ini", b"[s]\nk=1\n")]);
+    make_instance(&ctx, "inst-a", vec![layer("mod-a", &a, true)]);
+    game_mod_ini::set_mod_ini_value(&ctx, "inst-a", "x.ini", "s", "k", "2").unwrap();
+    for i in 0..20 {
+        write_writable(
+            &ctx,
+            "inst-a",
+            "x.ini",
+            format!("[s]\nk=game{i}\n").as_bytes(),
+        );
+        game_mod_ini::restore_mine(&ctx, "inst-a", "x.ini").unwrap();
+    }
+    let mut kept: Vec<Vec<u8>> = replaced_files(&ctx, "inst-a")
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    kept.sort();
+    kept.dedup();
+    assert_eq!(kept.len(), 20, "every game copy was kept, none overwritten");
+}
+
+#[test]
 fn reset_moves_the_games_copy_aside_so_the_mod_file_runs() {
     let tmp = TempDir::new().unwrap();
     let ctx = context(&tmp);

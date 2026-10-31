@@ -473,8 +473,8 @@ fn stage_writable_backup(
     })?;
     // Creating the folder may have followed a link that was not there a moment ago.
     let root = replaced_dir(ctx, instance_id)?;
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-    let backup = root.join(format!("{}.{}", row.path, stamp));
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+    let backup = unused_backup_path(&root, &row.path, &stamp);
     let dir = instance_dir(ctx, instance_id)?;
     if let Some(parent) = backup.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ModIniError::Write {
@@ -485,6 +485,18 @@ fn stage_writable_backup(
     ensure_inside_instance(&dir, &backup)?;
     write_atomic(&backup, &bytes)?;
     Ok(Some(backup))
+}
+
+/// `<root>/<path>.<stamp>`, or `.<stamp>-N` when that name is taken, so two replacements in the
+/// same millisecond never overwrite the first backup.
+fn unused_backup_path(root: &Path, path: &str, stamp: &str) -> PathBuf {
+    let mut backup = root.join(format!("{path}.{stamp}"));
+    let mut n = 1;
+    while backup.symlink_metadata().is_ok() {
+        backup = root.join(format!("{path}.{stamp}-{n}"));
+        n += 1;
+    }
+    backup
 }
 
 /// Remove the game's writable copy after its bytes were staged.
@@ -794,5 +806,23 @@ fn remove_empty_parents(root: &Path, file: &Path) {
             break;
         }
         folder = current.parent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unused_backup_path;
+
+    #[test]
+    fn a_taken_backup_name_gets_a_counter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = unused_backup_path(tmp.path(), "x.ini", "S");
+        std::fs::write(&first, b"one").unwrap();
+        let second = unused_backup_path(tmp.path(), "x.ini", "S");
+        assert_ne!(first, second);
+        std::fs::write(&second, b"two").unwrap();
+        let third = unused_backup_path(tmp.path(), "x.ini", "S");
+        assert!(third != first && third != second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
     }
 }
