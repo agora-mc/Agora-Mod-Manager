@@ -119,6 +119,53 @@ function PopoverDetails({ label, panelClassName, children }: { label: string; pa
   );
 }
 
+/**
+ * The per-row "More actions" menu. It is controlled so Escape closes it even
+ * when it arrives before Radix has moved focus into the freshly opened menu.
+ * A lost Escape used to leave the menu covering the row's controls, and the
+ * default modal menu also locked the rest of the page until it was dismissed.
+ * Non-modal plus this Escape handler means an open menu can never trap the
+ * page; clicking anywhere else still closes it.
+ */
+function RowActionsMenu({ row, props }: { row: InstalledContentRow; props: InstalledContentPanelProps }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setOpen(false);
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => document.removeEventListener('keydown', onKeyDown, true);
+  }, [open]);
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
+      <DropdownMenuTrigger
+        className="rounded-sm p-1.5 text-muted-foreground hover:bg-accent"
+        title="More actions"
+        aria-label={`More actions for ${row.display_name}`}
+      >
+        <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
+      </DropdownMenuTrigger>
+      {/* Radix portals this to the body, which is what keeps it clear of
+          the table's overflow container and the sticky header's stacking
+          context. It also closes on outside click and Escape, which a bare
+          <details> does not — several could be open at once before. */}
+      <DropdownMenuContent align="end" className="w-44">
+        <DropdownMenuItem disabled={!row.resolved_path} onSelect={() => props.onRevealFile?.(row)}>Reveal file</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void navigator.clipboard.writeText(row.filename)}>Copy filename</DropdownMenuItem>
+        {props.onTogglePin ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onTogglePin?.(row, !row.update_pinned)}>{row.update_pinned ? 'Unpin updates' : 'Pin updates'}</DropdownMenuItem> : null}
+        {props.onExplainPresence ? <DropdownMenuItem onSelect={() => props.onExplainPresence?.(row)}>Why is this here?</DropdownMenuItem> : null}
+        {props.onChooseGroup ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onChooseGroup?.([row])}>Set group…</DropdownMenuItem> : null}
+        {props.onSetCustomIcon ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onSetCustomIcon?.(row)}>Set custom image</DropdownMenuItem> : null}
+        {row.registry_id || row.modrinth_id || row.mod_jar_id ? <DropdownMenuItem onSelect={() => props.onOpenDetails?.(row)}>View details</DropdownMenuItem> : null}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 export function InstalledContentPanel(props: InstalledContentPanelProps) {
   const preferences = useMemo(() => loadPreferences(props.contentType), [props.contentType]);
   const [query, setQuery] = useState('');
@@ -465,28 +512,7 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
           </button>
         ) : null}
         <button type="button" onClick={() => props.onRemove(row)} disabled={props.locked} className="rounded-sm p-1.5 text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50" title={props.locked ? props.lockedReason ?? 'Unlock the instance to remove content.' : `Remove ${row.display_name}`} aria-label={`Remove ${row.display_name}`}><Trash2 className="h-4 w-4" aria-hidden="true" /></button>
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            className="rounded-sm p-1.5 text-muted-foreground hover:bg-accent"
-            title="More actions"
-            aria-label={`More actions for ${row.display_name}`}
-          >
-            <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
-          </DropdownMenuTrigger>
-          {/* Radix portals this to the body, which is what keeps it clear of
-              the table's overflow container and the sticky header's stacking
-              context. It also closes on outside click and Escape, which a bare
-              <details> does not — several could be open at once before. */}
-          <DropdownMenuContent align="end" className="w-44">
-            <DropdownMenuItem disabled={!row.resolved_path} onSelect={() => props.onRevealFile?.(row)}>Reveal file</DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => void navigator.clipboard.writeText(row.filename)}>Copy filename</DropdownMenuItem>
-            {props.onTogglePin ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onTogglePin?.(row, !row.update_pinned)}>{row.update_pinned ? 'Unpin updates' : 'Pin updates'}</DropdownMenuItem> : null}
-            {props.onExplainPresence ? <DropdownMenuItem onSelect={() => props.onExplainPresence?.(row)}>Why is this here?</DropdownMenuItem> : null}
-            {props.onChooseGroup ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onChooseGroup?.([row])}>Set group…</DropdownMenuItem> : null}
-            {props.onSetCustomIcon ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onSetCustomIcon?.(row)}>Set custom image</DropdownMenuItem> : null}
-            {row.registry_id || row.modrinth_id || row.mod_jar_id ? <DropdownMenuItem onSelect={() => props.onOpenDetails?.(row)}>View details</DropdownMenuItem> : null}
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <RowActionsMenu row={row} props={props} />
       </div></td>;
       }
       case 'version': return <td key={column} className="px-3 py-2 text-sm">{row.version ?? 'Unknown'}</td>;
