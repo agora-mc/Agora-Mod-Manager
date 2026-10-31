@@ -6024,3 +6024,58 @@ fn a_refused_start_moves_nothing_aside() {
         "the output was moved aside although the tool never ran"
     );
 }
+
+/// A drive root contains the game, so it can never be an output folder.
+#[test]
+fn a_drive_root_as_the_output_folder_is_refused() {
+    use std::path::Component;
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let drive = f
+        ._tmp
+        .path()
+        .components()
+        .find_map(|component| match component {
+            Component::Prefix(prefix) => Some(prefix.as_os_str().to_os_string()),
+            _ => None,
+        })
+        .expect("the temp folder is on a drive");
+    let mut root = PathBuf::from(drive);
+    root.push(std::path::MAIN_SEPARATOR.to_string());
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[],
+        true,
+        Some(&root.to_string_lossy()),
+    );
+
+    let result = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+    assert!(result.is_err(), "a drive root was accepted: {result:?}");
+    assert!(f._tmp.path().join("install").join("Game.exe").is_file());
+}
+
+/// A verbatim (`\\?\`) spelling of the game path is the same folder and is refused.
+#[test]
+fn a_verbatim_unc_spelling_of_the_game_path_is_refused() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let install = f._tmp.path().join("install");
+    let verbatim = format!(r"\\?\{}", install.display());
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[],
+        true,
+        Some(&verbatim),
+    );
+
+    let result = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+    assert!(
+        result.is_err(),
+        "a verbatim spelling of the game folder was accepted: {result:?}"
+    );
+    assert!(install.join("Game.exe").is_file());
+}

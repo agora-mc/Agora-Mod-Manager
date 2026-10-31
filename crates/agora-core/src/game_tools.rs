@@ -580,44 +580,98 @@ fn user_configured_folder(
     }
 }
 
-/// Whether `path` is `root` or inside it, compared case-insensitively on Windows. A folder that does
-/// not exist yet is compared as it is written.
-fn path_within(path: &Path, root: &Path) -> bool {
-    let canon = |p: &Path| -> String {
-        let text = p
-            .canonicalize()
-            .unwrap_or_else(|_| p.to_path_buf())
-            .to_string_lossy()
-            .replace('\\', "/");
-        let text = text.strip_prefix("//?/").unwrap_or(&text);
-        text.to_ascii_lowercase()
-    };
-    let (path, root) = (canon(path), canon(root));
+/// Lexically normalise `.` and `..` without touching the disk, so a missing folder can never hide a
+/// path that reaches the game. The path is absolute by the time it gets here.
+fn lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)))
+                {
+                    out.pop();
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// The path with its longest existing prefix resolved through the real file system, so a junction or
+/// symlink on the way is followed even when the final folder does not exist yet.
+fn real_path(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
+            return path.to_path_buf();
+        };
+        if !existing.pop() {
+            return path.to_path_buf();
+        }
+        tail.push(name);
+    }
+}
+
+/// A path folded the way the platform compares names, with the Windows verbatim prefix removed and
+/// separators made uniform.
+fn folded_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text);
+    let text = text.trim_end_matches('/');
+    agora_game_api::fold_path_case(text)
+}
+
+fn same_or_inside(path: &str, root: &str) -> bool {
     path == root
         || path
-            .strip_prefix(&root)
+            .strip_prefix(root)
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Refuse an output folder inside the game, its Data folder, or the instance's deployment: the game
-/// reads those, and an output there would overwrite mods (PGPatcher itself refuses a folder inside
-/// Data: https://github.com/hakasapl/PGPatcher/blob/HEAD/PGPatcher/src/main.cpp).
-fn validate_configured_output(
+/// The one check for a user-chosen output folder (MASTER_SPEC §26.9). `folder` is compared by its
+/// real path and must not equal, sit inside, or contain any of `forbidden` (the game, its Data
+/// folder, the instance, the deployment, Agora's data and content store, and the tool's own folder).
+fn validate_output_folder(
     folder: &Path,
-    base: &BaseManifest,
-    instance_id: &str,
+    forbidden: &[PathBuf],
+    tool_root: Option<&Path>,
 ) -> Result<(), ToolError> {
-    let deployment = deployment_folder(base, instance_id)?;
-    let roots = [
-        base.source_location.clone(),
-        base.source_location.join("Data"),
-        deployment,
-    ];
-    if roots.iter().any(|root| path_within(folder, root)) {
-        return Err(ToolError::Invalid(format!(
-            "The output folder '{}' is inside the game or this instance's deployment. Use the folder you set in the tool's own settings, outside both.",
+    let folded = folded_path(&real_path(&lexical_path(folder)));
+    let refuse = |what: &str| {
+        ToolError::Invalid(format!(
+            "The output folder '{}' is inside {what}, or contains it. Use the folder you set in the tool's own settings, outside it.",
             folder.display()
-        )));
+        ))
+    };
+    for root in forbidden {
+        let root = folded_path(root);
+        if same_or_inside(&folded, &root) || same_or_inside(&root, &folded) {
+            return Err(refuse("the game or this instance's deployment"));
+        }
+    }
+    // A folder inside the tool's own folder is allowed (it does not move the executable), but the
+    // tool's folder itself, or a folder that contains it, would move the tool and is refused.
+    if let Some(root) = tool_root {
+        let root = folded_path(root);
+        if same_or_inside(&root, &folded) {
+            return Err(refuse("the tool's own folder"));
+        }
     }
     Ok(())
 }
@@ -644,53 +698,121 @@ fn next_aside_path(root: &Path) -> PathBuf {
     candidate
 }
 
-/// Deal with a mod-output tool's folder before it runs (MASTER_SPEC §26.9). A non-empty folder is
-/// never deleted: the user chooses between moving it into `<instance>/tool-output-replaced/<tool>/`
-/// and cancelling. A move that cannot be made refuses and changes nothing.
-fn prepare_mod_output(
-    instance_dir: &Path,
-    tool: &ToolDefinition,
-    folder: &Path,
-    move_aside: bool,
-) -> Result<(), ToolError> {
-    if !folder.exists() {
-        return Ok(());
-    }
-    if !folder.is_dir() {
-        return Err(ToolError::Invalid(format!(
-            "'{}' is not a folder, so {} cannot write its output there",
-            folder.display(),
-            tool.name
-        )));
-    }
-    if folder_is_empty(folder)? {
-        return Ok(());
-    }
-    let root = aside_folder(instance_dir, &tool.id);
-    if root.exists() && !root.is_dir() {
-        return Err(ToolError::Invalid(format!(
-            "'{}' is a file, so Agora cannot move the old output aside",
-            root.display()
-        )));
-    }
-    let target = next_aside_path(&root);
-    if !move_aside {
-        return Err(ToolError::OutputFolderNotEmpty {
+/// A mod-output tool's folder and the user's move-aside choice. The folder is validated when it is
+/// chosen and again immediately before it is moved, and the move only happens after the run's
+/// capture has started, so a refused run leaves everything where it was (MASTER_SPEC §26.9).
+struct ConfiguredOutput {
+    folder: PathBuf,
+    forbidden: Vec<PathBuf>,
+    tool_root: Option<PathBuf>,
+    aside_root: PathBuf,
+    needs_move: bool,
+    tool: String,
+}
+
+impl ConfiguredOutput {
+    fn new(
+        folder: PathBuf,
+        forbidden: Vec<PathBuf>,
+        tool_root: Option<PathBuf>,
+        instance_dir: &Path,
+        tool: &ToolDefinition,
+        move_aside: bool,
+    ) -> Result<Self, ToolError> {
+        let folder = lexical_path(&folder);
+        validate_output_folder(&folder, &forbidden, tool_root.as_deref())?;
+        let aside_root = aside_folder(instance_dir, &tool.id);
+        let needs_move = match std::fs::symlink_metadata(&folder) {
+            Ok(meta) if meta.is_dir() => !folder_is_empty(&folder)?,
+            Ok(_) => {
+                return Err(ToolError::Invalid(format!(
+                    "'{}' is not a folder, so {} cannot write its output there",
+                    folder.display(),
+                    tool.name
+                )))
+            }
+            Err(_) => false,
+        };
+        if needs_move {
+            if aside_root.exists() && !aside_root.is_dir() {
+                return Err(ToolError::Invalid(format!(
+                    "'{}' is a file, so Agora cannot move the old output aside",
+                    aside_root.display()
+                )));
+            }
+            if !move_aside {
+                return Err(ToolError::OutputFolderNotEmpty {
+                    tool: tool.name.clone(),
+                    folder: folder.display().to_string(),
+                    aside: next_aside_path(&aside_root).display().to_string(),
+                });
+            }
+        }
+        Ok(Self {
+            folder,
+            forbidden,
+            tool_root,
+            aside_root,
+            needs_move,
             tool: tool.name.clone(),
-            folder: folder.display().to_string(),
-            aside: target.display().to_string(),
-        });
+        })
     }
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+
+    /// Move a non-empty folder aside, after checking it once more. A refused move changes nothing.
+    fn move_aside(&self) -> Result<(), ToolError> {
+        if !self.needs_move || !self.folder.exists() {
+            return Ok(());
+        }
+        validate_output_folder(&self.folder, &self.forbidden, self.tool_root.as_deref())?;
+        if !self.folder.is_dir() {
+            return Err(ToolError::Invalid(format!(
+                "'{}' is not a folder, so {} cannot write its output there",
+                self.folder.display(),
+                self.tool
+            )));
+        }
+        if folder_is_empty(&self.folder)? {
+            return Ok(());
+        }
+        if self.aside_root.exists() && !self.aside_root.is_dir() {
+            return Err(ToolError::Invalid(format!(
+                "'{}' is a file, so Agora cannot move the old output aside",
+                self.aside_root.display()
+            )));
+        }
+        let target = next_aside_path(&self.aside_root);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&self.folder, &target).map_err(|error| {
+            ToolError::Invalid(format!(
+                "the old output could not be moved to '{}': {error}. Nothing was changed",
+                target.display()
+            ))
+        })?;
+        Ok(())
     }
-    std::fs::rename(folder, &target).map_err(|error| {
-        ToolError::Invalid(format!(
-            "the old output could not be moved to '{}': {error}. Nothing was changed",
-            target.display()
-        ))
-    })?;
-    Ok(())
+}
+
+/// Everything a user-chosen output folder must stay clear of.
+fn output_forbidden_roots(
+    ctx: &Ctx,
+    instance_id: &str,
+    base: &BaseManifest,
+) -> Result<Vec<PathBuf>, ToolError> {
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    let roots = vec![
+        lexical_path(&base.source_location),
+        lexical_path(&base.source_location.join("Data")),
+        lexical_path(&instance_dir),
+        lexical_path(&deployment_folder(base, instance_id)?),
+        lexical_path(ctx.paths.root()),
+        lexical_path(&ctx.paths.content_root()),
+    ];
+    Ok(roots.into_iter().map(|root| real_path(&root)).collect())
 }
 
 /// A tool's absolute executable, when its recipe is not a game path. The file is checked again here,
@@ -1797,30 +1919,21 @@ fn run_user_inner(
     let user = find_user_tool(ctx, instance_id, user_tool_id)?;
     if let Some(known) = user.known_tool_id.as_deref() {
         if let Ok(id) = ToolId::new(known) {
-            if ctx.games.tool(&definition.id, &id).is_some() {
-                return match fallback {
-                    Some(refusal) => run_after_vfs_refusal(
-                        ctx,
-                        instance_id,
-                        definition,
-                        &id,
-                        capture,
-                        swap_costs_acknowledged,
-                        refusal,
-                        launcher,
-                        cancel,
-                    ),
-                    None => run(
-                        ctx,
-                        instance_id,
-                        definition,
-                        &id,
-                        capture,
-                        swap_costs_acknowledged,
-                        launcher,
-                        cancel,
-                    ),
-                };
+            if let Some(declared) = ctx.games.tool(&definition.id, &id).cloned() {
+                return run_inner(
+                    ctx,
+                    instance_id,
+                    definition,
+                    &declared,
+                    &id,
+                    capture,
+                    swap_costs_acknowledged,
+                    launcher,
+                    cancel,
+                    fallback,
+                    None,
+                    move_aside,
+                );
             }
         }
     }
@@ -1890,8 +2003,8 @@ fn run_inner(
         .map_err(|e| ToolError::Other(e.to_string()))?;
     let external = external_program(external)?;
     let mut effective = tool.clone();
-    let output_dir = match &tool.output {
-        ToolOutput::GeneratedLayer => None,
+    let (output_dir, configured) = match &tool.output {
+        ToolOutput::GeneratedLayer => (None, None),
         ToolOutput::Mod {
             folder,
             user_configured,
@@ -1916,7 +2029,7 @@ fn run_inner(
                     .launch
                     .arguments
                     .push(agora_game_api::LaunchValue::Literal { value: rendered });
-                Some(dir)
+                (Some(dir), None)
             } else {
                 let program = tool_program_path(&base, instance_id, tool, external.as_deref());
                 let raw_folder = if *user_configured && folder.trim().is_empty() {
@@ -1925,11 +2038,17 @@ fn run_inner(
                     folder.clone()
                 };
                 let dir = resolve_mod_folder(&raw_folder, &program)?;
-                if *user_configured {
-                    validate_configured_output(&dir, &base, instance_id)?;
-                }
-                prepare_mod_output(&instance_dir, tool, &dir, move_aside)?;
-                Some(dir)
+                let forbidden = output_forbidden_roots(ctx, instance_id, &base)?;
+                let tool_root = program.parent().map(real_path);
+                let configured = ConfiguredOutput::new(
+                    dir,
+                    forbidden,
+                    tool_root,
+                    &instance_dir,
+                    tool,
+                    move_aside,
+                )?;
+                (Some(configured.folder.clone()), Some(configured))
             }
         }
     };
@@ -2000,6 +2119,7 @@ fn run_inner(
                 reason,
                 external.as_deref(),
                 output_dir.as_deref(),
+                configured.as_ref(),
             )?;
             Ok(with_offers(
                 ctx,
@@ -2024,6 +2144,7 @@ fn run_inner(
                 cancel,
                 external.as_deref(),
                 output_dir.as_deref(),
+                configured.as_ref(),
             ) {
                 Ok(found) => found,
                 // The program would not start under the VFS, after the instance was deployed: nothing ran,
@@ -2065,6 +2186,7 @@ fn run_inner(
                 reason,
                 external.as_deref(),
                 output_dir.as_deref(),
+                configured.as_ref(),
             )?;
             Ok(with_offers(
                 ctx,
@@ -2134,6 +2256,7 @@ fn run_under_vfs(
     cancel: &CancellationToken,
     external: Option<&Path>,
     output_dir: Option<&Path>,
+    configured: Option<&ConfiguredOutput>,
 ) -> Result<(RunOutcome, bool), ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -2179,6 +2302,13 @@ fn run_under_vfs(
     if let Err(e) = game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e.into());
+    }
+    if let Some(configured) = configured {
+        if let Err(e) = configured.move_aside() {
+            release_session(ctx, definition, &store)?;
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
     }
 
     // What the VFS's log held before the launch, so what it says about this run is read after it.
@@ -2279,6 +2409,7 @@ fn run_from_links(
     reason: Option<String>,
     external: Option<&Path>,
     output_dir: Option<&Path>,
+    configured: Option<&ConfiguredOutput>,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -2318,6 +2449,13 @@ fn run_from_links(
     prepared.deployment = Some(DeployMode::Links);
 
     game_user_files::swap_in(ctx, instance_id, definition, &store, &game_dir)?;
+    if let Some(configured) = configured {
+        if let Err(e) = configured.move_aside() {
+            let _ = discard_deployment(&deployment_dir, instance_id);
+            release_session(ctx, definition, &store)?;
+            return Err(e);
+        }
+    }
 
     // The real install is watched from just before the tool starts until it exits (MASTER_SPEC §26.9).
     let watch = InstallWatch::start(&base.source_location);
@@ -2388,6 +2526,7 @@ fn run_by_swap(
     reason: Option<String>,
     external: Option<&Path>,
     output_dir: Option<&Path>,
+    configured: Option<&ConfiguredOutput>,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -2438,6 +2577,11 @@ fn run_by_swap(
     };
     if let Err(e) = game_tool_swap::engage(&journal) {
         return Err(abandon_swap(ctx, definition, &store, &journal, e.into()));
+    }
+    if let Some(configured) = configured {
+        if let Err(e) = configured.move_aside() {
+            return Err(put_back_after(ctx, definition, &store, &journal, e));
+        }
     }
 
     // The tool runs from the install folder, with the copy in place of `Data`: a program the recipe starts

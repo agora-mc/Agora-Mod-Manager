@@ -851,6 +851,7 @@ pub async fn games_user_tools_run(
 }
 
 fn user_tool_tool_id(ctx: &Ctx, instance_id: &str, id: &str) -> Result<ToolId, GamesError> {
+    let game = definition_of(ctx, instance_id)?;
     let user = game_user_tools::list(ctx, instance_id)
         .map_err(core_error)?
         .into_iter()
@@ -858,6 +859,15 @@ fn user_tool_tool_id(ctx: &Ctx, instance_id: &str, id: &str) -> Result<ToolId, G
         .ok_or_else(|| {
             GamesError::new(NOT_FOUND, format!("The instance has no user tool '{id}'."))
         })?;
+    // A tool that names a declared tool records its output under that declared id, so list the same
+    // id rather than the user-tool namespace.
+    if let Some(known) = user.known_tool_id.as_deref() {
+        if let Ok(tool_id) = ToolId::new(known) {
+            if ctx.games.tool(&game.id, &tool_id).is_some() {
+                return Ok(tool_id);
+            }
+        }
+    }
     game_tools::user_tool_id(&user.id).map_err(core_error)
 }
 

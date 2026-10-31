@@ -957,6 +957,28 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
     Suggestion::Unknown { top_level: vec![] }
 }
 
+/// Fold a path the way this platform compares names: a per-character simple uppercase, so a
+/// character whose uppercase is more than one character (`ß`) keeps its own form. Windows paths
+/// compare case-insensitively; elsewhere this is the identity.
+pub fn fold_path_case(path: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        return path.to_string();
+    }
+    #[cfg(windows)]
+    {
+        let mut folded = String::with_capacity(path.len());
+        for ch in path.chars() {
+            let mut upper = ch.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => folded.push(single),
+                _ => folded.push(ch),
+            }
+        }
+        folded
+    }
+}
+
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     CompiledGlob::new(pattern).matches(path)
 }
