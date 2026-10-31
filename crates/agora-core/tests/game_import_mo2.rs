@@ -101,6 +101,7 @@ fn skyrim_like() -> GameDefinition {
         semantics: None,
         implicit: vec!["Skyrim.esm".into(), "Update.esm".into()],
         implicit_list_file: None,
+        loot: None,
     });
     def.tool_ids = vec![ToolId::new("nemesis").unwrap()];
     def.launch = Some(LaunchRecipe {

@@ -103,6 +103,7 @@ const listed = {
   listExists: true,
   rows: [...alwaysLoaded, skyui, requiem],
   findings: [orderFinding],
+  masterlist: { fetchedAt: '2026-01-02T03:04:05Z', source: 'https://api.github.com/repos/loot/skyrimse/contents/masterlist.yaml?ref=v0.29' },
 };
 
 async function openPage(
@@ -157,6 +158,7 @@ test.describe('Plugins tab', () => {
     // The finding is also written on the row it concerns.
     await expect(rows.nth(2)).toContainText("loads before its master");
     await expect(rows.nth(0)).toContainText('Always loaded');
+    await expect(page.getByTestId('plugins-masterlist')).toContainText('Masterlist from');
   });
 
   test('turning a plugin off shows the list as the backend returns it', async ({ page }) => {
@@ -220,6 +222,8 @@ test.describe('Plugins tab', () => {
       moves: [{ plugin: 'SkyUI.esp', from: 3, to: 4 }],
       blocked: [],
       written: true,
+      mode: 'loot',
+      message: null,
     };
     await openPage(page, 'plugins', {
       games_plugins_list: listed,
@@ -229,17 +233,40 @@ test.describe('Plugins tab', () => {
       },
     });
 
-    await page.getByRole('button', { name: 'Sort by masters…' }).click();
-    const dialog = page.getByRole('dialog', { name: 'Sort plugins by masters' });
+    await page.getByRole('button', { name: 'Sort…' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Sort plugins' });
     await expect(dialog).toContainText('SkyUI.esp: position 3 to 4');
     await dialog.getByRole('button', { name: 'Apply 1 move' }).click();
     await expect(page.getByRole('status')).toHaveText('Sorted. 1 plugin moved.');
     await expect(page.getByRole('dialog')).toHaveCount(0);
   });
 
+  test('sorting with no masterlist asks before downloading it', async ({ page }) => {
+    const noMaster = { ...listed, masterlist: null };
+    await openPage(page, 'plugins', {
+      games_plugins_list: noMaster,
+      games_plugins_sort: {
+        report: {
+          moves: [],
+          blocked: [],
+          written: false,
+          mode: 'masters',
+          message: "Sorted by masters only. Download LOOT's masterlist for a full sort.",
+        },
+        plugins: noMaster,
+      },
+    });
+
+    await page.getByRole('button', { name: 'Sort…' }).click();
+    const ask = page.getByRole('dialog', { name: "Download LOOT's masterlist?" });
+    await expect(ask).toBeVisible();
+    await ask.getByRole('button', { name: 'Sort by masters only' }).click();
+    await expect(page.getByRole('dialog', { name: 'Sort plugins' })).toBeVisible();
+  });
+
   test('a list with no plugins yet says what to do', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, rulesApply: true, listExists: true, rows: [], findings: [] },
+      games_plugins_list: { supported: true, rulesApply: true, listExists: true, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText("No plugins are in this instance's list yet.")).toBeVisible();
@@ -248,7 +275,7 @@ test.describe('Plugins tab', () => {
 
   test('an instance with no list yet is told when one appears', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, rulesApply: true, listExists: false, rows: [], findings: [] },
+      games_plugins_list: { supported: true, rulesApply: true, listExists: false, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText('This instance has no plugin list yet.')).toBeVisible();
@@ -256,7 +283,7 @@ test.describe('Plugins tab', () => {
 
   test('a game with no plugin list says so instead of showing an empty list', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: false, rulesApply: false, listExists: false, rows: [], findings: [] },
+      games_plugins_list: { supported: false, rulesApply: false, listExists: false, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText('This game does not keep a plugin list')).toBeVisible();

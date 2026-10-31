@@ -5,7 +5,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ArrowDown, ArrowUp, CheckCircle2, Lock, RefreshCw, Unlock } from 'lucide-react';
+import { AlertTriangle, ArrowDown, ArrowUp, CheckCircle2, Download, Lock, RefreshCw, Unlock } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -24,6 +24,7 @@ import {
   setGamePluginActive,
   setGamePluginLocked,
   sortGamePlugins,
+  updateGameMasterlist,
   type PluginFinding,
   type PluginRow,
   type PluginsView,
@@ -46,6 +47,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [sortPreview, setSortPreview] = useState<SortReport | null>(null);
+  const [askingForMasterlist, setAskingForMasterlist] = useState(false);
   // Counts the reads, so a reply for an instance the tab no longer shows is dropped.
   const requestId = useRef(0);
 
@@ -142,6 +144,41 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const previewSort = () =>
     run('sort-preview', () => sortGamePlugins(instanceId, true), (change) => setSortPreview(change.report));
 
+  const askOrPreviewSort = () => {
+    if (!view || view.masterlist === null) {
+      setAskingForMasterlist(true);
+      return;
+    }
+    previewSort();
+  };
+
+  const downloadMasterlistAndSort = async () => {
+    setBusy('masterlist');
+    setError(null);
+    setNotice(null);
+    try {
+      const masterlist = await updateGameMasterlist(instanceId);
+      setLoad((current) =>
+        current.status === 'loaded' ? { status: 'loaded', view: { ...current.view, masterlist } } : current,
+      );
+      setAskingForMasterlist(false);
+      const change = await sortGamePlugins(instanceId, true);
+      setSortPreview(change.report);
+    } catch (failure: unknown) {
+      setError(describeFailure(failure));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const updateMasterlistOnly = () =>
+    run('masterlist', () => updateGameMasterlist(instanceId), (masterlist) => {
+      setLoad((current) =>
+        current.status === 'loaded' ? { status: 'loaded', view: { ...current.view, masterlist } } : current,
+      );
+      setNotice('Masterlist updated.');
+    });
+
   const applySort = () =>
     run('sort-apply', () => sortGamePlugins(instanceId, false), (change) => {
       showView(change.plugins);
@@ -180,6 +217,11 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
             The game reads plugins from the top of this list down. When two plugins change the same thing,
             the one lower down wins. A plugin's masters must load above it.
           </p>
+          {view.masterlist && (
+            <p className="text-xs text-muted-foreground" data-testid="plugins-masterlist">
+              Masterlist from {formatDate(view.masterlist.fetchedAt)}
+            </p>
+          )}
         </div>
         {showTable && (
           <div className="flex flex-wrap gap-2">
@@ -187,8 +229,14 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
               <RefreshCw />
               Check again
             </Button>
-            <Button variant="outline" size="sm" onClick={previewSort} disabled={anyBusy || !view.rulesApply}>
-              Sort by masters…
+            {view.rulesApply && (
+              <Button variant="outline" size="sm" onClick={updateMasterlistOnly} disabled={anyBusy}>
+                <Download />
+                Update masterlist
+              </Button>
+            )}
+            <Button variant="outline" size="sm" onClick={askOrPreviewSort} disabled={anyBusy || !view.rulesApply}>
+              Sort…
             </Button>
           </div>
         )}
@@ -260,15 +308,42 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
         </div>
       )}
 
+      <Dialog open={askingForMasterlist} onOpenChange={setAskingForMasterlist}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Download LOOT's masterlist?</DialogTitle>
+            <DialogDescription>
+              Sorting with LOOT's masterlist puts plugins in the order the LOOT community recommends. It is
+              downloaded once, when you ask, and checked against the hash GitHub reports. Without it, Agora can
+              only put each plugin below its masters.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAskingForMasterlist(false)} disabled={anyBusy}>
+              Cancel
+            </Button>
+            <Button variant="outline" onClick={() => { setAskingForMasterlist(false); previewSort(); }} disabled={anyBusy}>
+              Sort by masters only
+            </Button>
+            <Button onClick={downloadMasterlistAndSort} disabled={anyBusy}>
+              Download and sort
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={sortPreview !== null} onOpenChange={(open) => { if (!open) setSortPreview(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Sort plugins by masters</DialogTitle>
+            <DialogTitle>Sort plugins</DialogTitle>
             <DialogDescription>
-              Each plugin is moved below the masters it needs. Nothing is written until you apply. Locked and
-              always-loaded plugins stay where they are.
+              Free plugins are put in LOOT's order, or below their masters when no masterlist is saved. Nothing is
+              written until you apply. Locked and always-loaded plugins stay where they are.
             </DialogDescription>
           </DialogHeader>
+          {sortPreview?.message && (
+            <p className="text-sm text-muted-foreground">{sortPreview.message}</p>
+          )}
           {sortPreview && sortPreview.moves.length === 0 && (
             <p className="text-sm">The list is already in order. Nothing would change.</p>
           )}
@@ -313,6 +388,11 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
       </Dialog>
     </section>
   );
+}
+
+function formatDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
 }
 
 function EmptyNote({ children }: { children: ReactNode }) {

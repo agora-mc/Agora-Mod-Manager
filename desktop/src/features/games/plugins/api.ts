@@ -36,6 +36,13 @@ export interface PluginFinding {
   plugins: string[];
 }
 
+export interface MasterlistView {
+  /** RFC 3339, as recorded when the copy was fetched. */
+  fetchedAt: string;
+  /** The contents API URL the copy came from. */
+  source: string;
+}
+
 export interface PluginsView {
   /** False when the game keeps no plugin list. The tab says so instead of showing an empty list. */
   supported: boolean;
@@ -45,6 +52,8 @@ export interface PluginsView {
   listExists: boolean;
   rows: PluginRow[];
   findings: PluginFinding[];
+  /** The LOOT masterlist cached for this game, when one has been downloaded. */
+  masterlist: MasterlistView | null;
 }
 
 export interface PluginChange {
@@ -76,12 +85,18 @@ export interface SortBlocked {
   master: string;
 }
 
+export type SortMode = 'loot' | 'masters';
+
 export interface SortReport {
   moves: SortMove[];
   /** Plugins that load above a master the sort may not move. The sort cannot fix those. */
   blocked: SortBlocked[];
   /** False for a dry run, which writes nothing. */
   written: boolean;
+  /** What ordered the free plugins: LOOT's masterlist, or only their masters. */
+  mode: SortMode;
+  /** A sentence for the player when the full sort could not run. */
+  message: string | null;
 }
 
 export interface SortChange {
@@ -126,6 +141,12 @@ function isPluginFinding(value: unknown): value is PluginFinding {
     && isStringArray(value.plugins);
 }
 
+function isMasterlistView(value: unknown): value is MasterlistView {
+  return isObject(value)
+    && typeof value.fetchedAt === 'string'
+    && typeof value.source === 'string';
+}
+
 function isPluginsView(value: unknown): value is PluginsView {
   if (!isObject(value)) return false;
   return typeof value.supported === 'boolean'
@@ -134,7 +155,8 @@ function isPluginsView(value: unknown): value is PluginsView {
     && Array.isArray(value.rows)
     && value.rows.every(isPluginRow)
     && Array.isArray(value.findings)
-    && value.findings.every(isPluginFinding);
+    && value.findings.every(isPluginFinding)
+    && (value.masterlist === null || isMasterlistView(value.masterlist));
 }
 
 function isPluginChange(value: unknown): value is PluginChange {
@@ -157,6 +179,8 @@ function isSortChange(value: unknown): value is SortChange {
     && Array.isArray(value.report.moves)
     && Array.isArray(value.report.blocked)
     && typeof value.report.written === 'boolean'
+    && (value.report.mode === 'loot' || value.report.mode === 'masters')
+    && (value.report.message === null || typeof value.report.message === 'string')
     && isPluginsView(value.plugins);
 }
 
@@ -203,6 +227,12 @@ export async function moveGamePlugin(instanceId: string, plugin: string, to: num
 export async function sortGamePlugins(instanceId: string, dryRun: boolean): Promise<SortChange> {
   const reply = await invoke<unknown>('games_plugins_sort', { instanceId, dryRun });
   return checkedReply('games_plugins_sort', reply, isSortChange);
+}
+
+/** Download and verify LOOT's masterlist for the game. */
+export async function updateGameMasterlist(instanceId: string): Promise<MasterlistView> {
+  const reply = await invoke<unknown>('games_plugins_update_masterlist', { instanceId });
+  return checkedReply('games_plugins_update_masterlist', reply, isMasterlistView);
 }
 
 /** The load order's findings, read again. Read only. */

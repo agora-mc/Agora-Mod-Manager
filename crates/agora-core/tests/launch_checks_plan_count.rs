@@ -155,6 +155,7 @@ fn definition(tools: &[ToolDefinition]) -> GameDefinition {
             semantics: Some("creation_engine".to_string()),
             implicit: Vec::new(),
             implicit_list_file: None,
+            loot: None,
         }),
         runtime_files: Vec::new(),
         save_location: Vec::new(),

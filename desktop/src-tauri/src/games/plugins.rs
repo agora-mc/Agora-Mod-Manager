@@ -12,6 +12,7 @@ use agora_core::game_load_order::{
     self as load_order, Finding, LoadOrder, LoadOrderEntry, MoveReport, MoveTarget, SortReport,
 };
 use agora_core::game_plugins;
+use agora_core::loot_masterlist;
 use serde::Serialize;
 
 use super::error::{GamesError, CORE_FAILED, TASK_FAILED};
@@ -84,6 +85,27 @@ pub struct PluginsView {
     /// Always-loaded plugins first, then the listed ones, in the order the game reads them.
     pub rows: Vec<PluginRow>,
     pub findings: Vec<PluginFinding>,
+    /// The LOOT masterlist cached for this game, when one has been downloaded.
+    pub masterlist: Option<MasterlistView>,
+}
+
+/// The cached LOOT masterlist, for the tab's "Masterlist from <date>" line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterlistView {
+    /// RFC 3339, as recorded when the copy was fetched.
+    pub fetched_at: String,
+    /// The contents API URL the copy came from.
+    pub source: String,
+}
+
+impl MasterlistView {
+    fn from_status(status: &loot_masterlist::MasterlistStatus) -> Self {
+        Self {
+            fetched_at: status.fetched_at.clone(),
+            source: status.source_url.clone(),
+        }
+    }
 }
 
 /// One plugin, as the load order shows it. `position` is 1-based and counts always-loaded plugins:
@@ -129,6 +151,7 @@ impl PluginsView {
             list_exists: false,
             rows: Vec::new(),
             findings: Vec::new(),
+            masterlist: None,
         }
     }
 
@@ -143,7 +166,13 @@ impl PluginsView {
                 .enumerate()
                 .map(|(index, entry)| row_view(index + 1, entry))
                 .collect(),
-            findings: order.findings.iter().map(finding_view).collect(),
+            findings: order
+                .findings
+                .iter()
+                .map(finding_view)
+                .chain(order.notes.iter().map(note_view))
+                .collect(),
+            masterlist: None,
         }
     }
 }
@@ -162,6 +191,14 @@ fn row_view(position: usize, entry: &LoadOrderEntry) -> PluginRow {
         light: entry.light,
         masters: entry.masters.clone(),
         header_error: entry.header_error.clone(),
+    }
+}
+
+fn note_view(note: &agora_core::game_load_order::PluginNote) -> PluginFinding {
+    PluginFinding {
+        message: note.message.clone(),
+        refuses_launch: false,
+        plugins: vec![note.plugin.clone()],
     }
 }
 
@@ -236,7 +273,32 @@ pub async fn games_plugins_list(
             return Ok(PluginsView::unsupported());
         }
         let order = load_order::order(&ctx, &instance_id, definition).map_err(core_failed)?;
-        Ok(PluginsView::from_order(&order))
+        let mut view = PluginsView::from_order(&order);
+        if definition
+            .plugin_list
+            .as_ref()
+            .and_then(|rule| rule.loot.as_ref())
+            .is_some()
+        {
+            view.masterlist = loot_masterlist::cached(&ctx, definition)
+                .map_err(core_failed)?
+                .map(|cached| MasterlistView::from_status(&cached.status));
+        }
+        Ok(view)
+    })
+    .await
+}
+
+/// Download and verify LOOT's masterlist for the game, replacing any cached copy.
+#[tauri::command]
+pub async fn games_plugins_update_masterlist(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<MasterlistView, GamesError> {
+    run_blocking(app, "Updating the masterlist", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let status = loot_masterlist::update(&ctx, definition).map_err(core_failed)?;
+        Ok(MasterlistView::from_status(&status))
     })
     .await
 }
@@ -386,6 +448,7 @@ mod tests {
             exists: true,
             entries,
             findings,
+            notes: Vec::new(),
         }
     }
 

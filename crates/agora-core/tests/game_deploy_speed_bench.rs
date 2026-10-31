@@ -266,6 +266,7 @@ fn deploy_and_launch_timings() {
             semantics: Some("creation_engine".into()),
             implicit: vec![],
             implicit_list_file: None,
+            loot: None,
         });
         def.user_files = vec![agora_game_api::UserFileMapping::new(
             GamePath::UserData {

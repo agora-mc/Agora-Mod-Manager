@@ -101,6 +101,7 @@ fn definition(plugin_list: u8) -> GameDefinition {
             semantics: (plugin_list == 2).then(|| "creation_engine".to_string()),
             implicit: vec![],
             implicit_list_file: None,
+            loot: None,
         });
         def.user_files = vec![UserFileMapping::new(
             GamePath::UserData {
