@@ -40,6 +40,7 @@ import { showToast, ToastContainer } from './components/Toast';
 import { useDestination, type Destination, type GameTabId, type Tab } from './lib/useDestination';
 import { MINECRAFT_GAME_ID } from './features/games/shared/types';
 import { useGameShell } from './features/games/shared/useGameShell';
+import { useGameSwitch } from './features/games/shared/useGameSwitch';
 import { GameSwitcher } from './features/games/shell/GameSwitcher';
 import { GameTabPage } from './features/games/shell/GameTabPage';
 import { GameInstancePage } from './features/games/shell/GameInstancePage';
@@ -511,14 +512,7 @@ function AppContent() {
     }
   }, [shownGame, navigateToGameTab, navigateToTab]);
 
-  const switchGame = useCallback((gameId: string) => {
-    setActiveGame(gameId);
-    if (gameId === MINECRAFT_GAME_ID) {
-      navigateToTab('home');
-    } else {
-      navigateToGameTab(gameId, 'instances' satisfies GameTabId);
-    }
-  }, [setActiveGame, navigateToTab, navigateToGameTab]);
+  const switchGame = useGameSwitch({ setActiveGame, navigateToTab, navigateToGameTab });
 
   // Keep the remembered game in step with where the user is. The first time discovery and the
   // stored choice have both answered, a fresh launch opens the game the user last chose rather
@@ -1178,6 +1172,9 @@ function AppContent() {
                 {effectiveTab === 'about' && <About />}
                 {effectiveTab === 'settings' && (
                   <Settings
+                    activeGame={activeGame}
+                    activeGameName={gameShell.foundGames.find((game) => game.gameId === activeGame)?.name}
+                    onSwitchToMinecraft={() => switchGame(MINECRAFT_GAME_ID, { navigate: false })}
                     onNavigateTab={navigateToTab}
                     onResetLayout={() => {
                       const reset = {

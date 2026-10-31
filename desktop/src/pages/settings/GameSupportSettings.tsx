@@ -54,6 +54,7 @@ export function GameSupportSettings() {
 
   return (
     <SettingsSection
+      card="game-support"
       icon={Gamepad2}
       title="Game support"
       description="Turn a game off to hide it from the game switcher. Its instances, bases and files stay where they are."

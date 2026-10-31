@@ -94,6 +94,7 @@ export function RuntimeReclaim() {
 
   return (
     <SettingsSection
+      card="runtime-reclaim"
       id="settings-storage"
       icon={HardDrive}
       title="Reclaim disk space"

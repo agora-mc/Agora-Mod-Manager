@@ -86,6 +86,13 @@ import { RuntimeReclaim } from './settings/RuntimeReclaim';
 import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
 import { GameSupportSettings } from './settings/GameSupportSettings';
+import { GameSettingsSection } from './settings/GameSettingsSection';
+import {
+  gameDisplayName,
+  isMinecraftSelected,
+  isSettingsCardVisible,
+  type SettingsCardId,
+} from './settings/gameScope';
 import { AiAssistantCard } from './settings/AiAssistantCard';
 import { PluginManager } from '../features/plugins/PluginManager';
 import { SettingsSubNav, SettingsTabRail } from './settings/SettingsNav';
@@ -104,6 +111,8 @@ import { UpdateCenter } from '../features/updates/UpdateCenter';
 interface SettingsPage {
   id: string;
   label: string;
+  /** The classified cards this page shows; a page with none is always shown. */
+  cards: SettingsCardId[];
   content: ReactNode;
 }
 
@@ -187,13 +196,28 @@ function TokenDisplay({ token }: { token: string }) {
 export function Settings({
   onResetLayout,
   onNavigateTab,
+  activeGame,
+  activeGameName,
+  onSwitchToMinecraft,
 }: {
   onResetLayout: () => void;
   /** Lets a settings card hand the user off to a full page (Living Background). */
   onNavigateTab?: (tab: Tab) => void;
+  /** The shell's remembered game. Minecraft until that choice has loaded. */
+  activeGame?: string | null;
+  /** The shell's name for that game, when it has one (discovery may not have found it). */
+  activeGameName?: string | null;
+  /** The shell's switch; Settings does not change the remembered game on its own. */
+  onSwitchToMinecraft?: () => void;
 }) {
   const ts = useTypedSettings();
   const { confirm } = useConfirm();
+  const minecraftSelected = isMinecraftSelected(activeGame);
+  const selectedGameName = gameDisplayName(activeGame ?? 'minecraft', activeGameName);
+
+  /** True when a card belongs on the page for the selected game. */
+  const showsCard = (card: SettingsCardId): boolean => isSettingsCardVisible(card, minecraftSelected);
+  const card = (id: SettingsCardId, node: ReactNode): ReactNode => (showsCard(id) ? node : null);
 
   const [activeTabId, setActiveTabId] = useState<string>(() => peekPendingSettingsSection()?.tab ?? readStoredSettingsTab() ?? 'general');
   const [activePageId, setActivePageId] = useState<string | null>(() => peekPendingSettingsSection()?.page ?? null);
@@ -1056,6 +1080,7 @@ export function Settings({
 
   const walkthroughCard = (
     <SettingsSection
+      card="walkthrough"
       id="settings-walkthrough"
       icon={Compass}
       title="Guided walkthrough"
@@ -1075,6 +1100,7 @@ export function Settings({
     <SettingsSection
       id="settings-general"
       icon={Sparkles}
+      card="advanced-mode"
       title="Advanced mode"
     >
       <label className="flex items-center justify-between">
@@ -1095,6 +1121,7 @@ export function Settings({
 
   const installationCard = (
     <SettingsSection
+      card="installation"
       id="settings-installation"
       icon={PackageCheck}
       title="Installation"
@@ -1158,6 +1185,7 @@ export function Settings({
 
   const updatesCard = (
     <SettingsSection
+      card="updates"
       id="settings-updates"
       icon={RefreshCw}
       title="Software Updates"
@@ -1236,6 +1264,7 @@ export function Settings({
 
   const instanceUpdatesCard = (
     <SettingsSection
+      card="instance-updates"
       id="settings-instance-updates"
       icon={PackageCheck}
       title="Instance mod updates"
@@ -1287,6 +1316,7 @@ export function Settings({
 
   const launchModeCard = (
     <SettingsSection
+      card="launch-mode"
       id="settings-launching"
       icon={Rocket}
       title="Launch Mode"
@@ -1315,6 +1345,7 @@ export function Settings({
 
   const launcherPathCard = (
     <SettingsSection
+      card="launcher-path"
       id="settings-launcher"
       icon={FolderSearch}
       title="Launcher Path"
@@ -1379,6 +1410,7 @@ export function Settings({
 
   const disclaimerCard = (
     <SettingsSection
+      card="disclaimer"
       id="settings-disclaimer"
       icon={AlertTriangle}
       title="Disclaimer"
@@ -1391,6 +1423,7 @@ export function Settings({
 
   const javaCard = (
     <SettingsSection
+      card="java-runtime"
       id="settings-java"
       icon={Coffee}
       title="Java Runtime Management"
@@ -1609,6 +1642,7 @@ export function Settings({
   const jvmCard = (
     <SettingsSection
       icon={Cpu}
+      card="jvm-defaults"
       title="JVM Defaults"
     >
       <label className="flex items-center justify-between">
@@ -1632,6 +1666,7 @@ export function Settings({
   const microsoftCard = (
     <SettingsSection
       icon={UserRound}
+      card="microsoft-account"
       title="Microsoft Account"
     >
       {msaLoading ? (
@@ -1736,6 +1771,7 @@ export function Settings({
 
   const githubCard = (
     <SettingsSection
+      card="github-account"
       id="settings-accounts"
       icon={Landmark}
       title="GitHub Account"
@@ -1802,6 +1838,7 @@ export function Settings({
 
   const contentSourcesCard = (
     <SettingsSection
+      card="content-sources"
       id="settings-services"
       icon={Boxes}
       title="Content sources"
@@ -1962,6 +1999,7 @@ export function Settings({
   const aiCard = (
     <SettingsSection
       icon={Bot}
+      card="ai-mcp"
       title="AI & automation"
       description="The local MCP server, for AI apps that cannot run commands."
       contentClassName="space-y-4"
@@ -2347,24 +2385,26 @@ export function Settings({
         {
           id: 'basics',
           label: 'Basics',
+          cards: ['advanced-mode', 'installation'],
           content: (
             <>
-              {advancedCard}
-              {installationCard}
+              {card('advanced-mode', advancedCard)}
+              {card('installation', installationCard)}
             </>
           ),
         },
-        { id: 'walkthrough', label: 'Walkthrough', content: walkthroughCard },
-        { id: 'games', label: 'Game support', content: <GameSupportSettings /> },
-        { id: 'templates', label: 'Templates', content: <TemplateSettings /> },
-        { id: 'storage', label: 'Storage', content: <RuntimeReclaim /> },
+        { id: 'walkthrough', label: 'Walkthrough', cards: ['walkthrough'], content: card('walkthrough', walkthroughCard) },
+        { id: 'games', label: 'Game support', cards: ['game-support'], content: card('game-support', <GameSupportSettings />) },
+        { id: 'templates', label: 'Templates', cards: ['template-settings'], content: card('template-settings', <TemplateSettings />) },
+        { id: 'storage', label: 'Storage', cards: ['runtime-reclaim'], content: card('runtime-reclaim', <RuntimeReclaim />) },
         {
           id: 'updates',
           label: 'Updates',
+          cards: ['updates', 'instance-updates'],
           content: (
             <>
-              {gate(updatesCard)}
-              {gate(instanceUpdatesCard)}
+              {card('updates', gate(updatesCard))}
+              {card('instance-updates', gate(instanceUpdatesCard))}
             </>
           ),
         },
@@ -2378,16 +2418,17 @@ export function Settings({
       blurb: 'Colour, type, and the living world behind every page.',
       footer: <AppearanceResetControls onResetLayout={onResetLayout} />,
       pages: [
-        { id: 'theme', label: 'Theme', content: <AppearanceThemeSettings /> },
-        { id: 'interface', label: 'Interface', content: <AppearanceInterfaceSettings /> },
+        { id: 'theme', label: 'Theme', cards: ['appearance-theme'], content: card('appearance-theme', <AppearanceThemeSettings />) },
+        { id: 'interface', label: 'Interface', cards: ['appearance-type', 'appearance-motion'], content: card('appearance-type', <AppearanceInterfaceSettings />) },
         {
           id: 'living-background',
           label: 'Living background',
-          content: (
+          cards: ['appearance-living-background'],
+          content: card('appearance-living-background', (
             <LivingBackgroundSettings
               onOpenLivingBackground={onNavigateTab ? () => onNavigateTab('living-background') : undefined}
             />
-          ),
+          )),
         },
       ],
     },
@@ -2401,14 +2442,20 @@ export function Settings({
         {
           id: 'sign-in',
           label: 'Sign in',
+          cards: ['microsoft-account', 'github-account'],
           content: (
             <>
-              {microsoftCard}
-              {githubCard}
+              {card('microsoft-account', microsoftCard)}
+              {card('github-account', githubCard)}
             </>
           ),
         },
-        { id: 'skin', label: 'Skin & cape', content: msaCreds && !msaCreds.needs_reauth ? <SkinSettings /> : <p className="rounded-xl border border-border bg-card p-4 text-sm text-muted-foreground">Sign in with a Microsoft account on the Sign in page to change your skin and cape.</p> },
+        {
+          id: 'skin',
+          label: 'Skin & cape',
+          cards: ['skin'],
+          content: card('skin', msaCreds && !msaCreds.needs_reauth ? <SkinSettings /> : <p className="rounded-xl border border-border bg-card p-4 text-sm text-muted-foreground">Sign in with a Microsoft account on the Sign in page to change your skin and cape.</p>),
+        },
       ],
     },
     {
@@ -2421,26 +2468,28 @@ export function Settings({
         {
           id: 'mode',
           label: 'Launch mode',
+          cards: ['launch-mode', 'when-game-starts', 'launcher-path', 'disclaimer'],
           content: (
             <>
-              {launchModeCard}
-              <GameStartWindowSettings />
-              {gate(launcherPathCard)}
-              {disclaimerCard}
+              {card('launch-mode', launchModeCard)}
+              {card('when-game-starts', <GameStartWindowSettings />)}
+              {card('launcher-path', gate(launcherPathCard))}
+              {card('disclaimer', disclaimerCard)}
             </>
           ),
         },
         {
           id: 'java',
           label: 'Java',
+          cards: ['java-runtime', 'jvm-defaults'],
           content: (
             <>
-              {gate(javaCard)}
-              {gate(jvmCard)}
+              {card('java-runtime', gate(javaCard))}
+              {card('jvm-defaults', gate(jvmCard))}
             </>
           ),
         },
-        { id: 'window', label: 'Game window', content: <GameWindowSettings /> },
+        { id: 'window', label: 'Game window', cards: ['game-window'], content: card('game-window', <GameWindowSettings />) },
       ],
     },
     {
@@ -2450,18 +2499,19 @@ export function Settings({
       hint: 'Sources & AI',
       blurb: 'Third-party content sources and the AI integrations.',
       pages: [
-        { id: 'sources', label: 'Content sources', content: gate(contentSourcesCard) },
+        { id: 'sources', label: 'Content sources', cards: ['content-sources'], content: card('content-sources', gate(contentSourcesCard)) },
         {
           id: 'ai',
           label: 'AI assistant',
+          cards: ['ai-assistant', 'ai-mcp'],
           content: (
             <>
-              <AiAssistantCard />
-              {gate(aiCard)}
+              {card('ai-assistant', <AiAssistantCard />)}
+              {card('ai-mcp', gate(aiCard))}
             </>
           ),
         },
-        { id: 'plugins', label: 'Plugins', content: <PluginManager /> },
+        { id: 'plugins', label: 'Plugins', cards: ['plugins'], content: <PluginManager /> },
       ],
     },
     ...(advancedMode
@@ -2474,18 +2524,35 @@ export function Settings({
         pages: [{
           id: 'privacy',
           label: 'Privacy',
+          cards: ['privacy'],
           content: <div id="settings-privacy" className="scroll-mt-24"><Privacy /></div>,
         }],
       } as SettingsTab]
       : []),
   ];
 
-  const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0];
+  // A page with no cards left for this game disappears; a section left with no
+  // pages disappears from the rail. That keeps Minecraft-only sections (Java,
+  // launching, mod updates, skins) out of another game's Settings entirely.
+  const visibleTabs: SettingsTab[] = tabs
+    .map((tab) => ({
+      ...tab,
+      pages: tab.pages.filter((page) =>
+        page.cards.length === 0 || page.cards.some((id) => showsCard(id))),
+    }))
+    .filter((tab) => tab.pages.length > 0);
+
+  const activeTab = visibleTabs.find((tab) => tab.id === activeTabId) ?? visibleTabs[0];
   const activePage = activeTab.pages.find((page) => page.id === activePageId) ?? activeTab.pages[0];
   const selectTab = (id: string) => {
     setActiveTabId(id);
     setActivePageId(null);
     storeSettingsTab(id);
+  };
+  const openGameSupport = () => {
+    setActiveTabId('general');
+    setActivePageId('games');
+    storeSettingsTab('general');
   };
 
   return (
@@ -2503,6 +2570,30 @@ export function Settings({
         </div>
       </section>
 
+      {!minecraftSelected && (
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-4">
+            <p className="text-sm">
+              Showing settings for {selectedGameName}. Minecraft settings appear when Minecraft is selected.
+            </p>
+            {onSwitchToMinecraft && (
+              <button
+                type="button"
+                onClick={onSwitchToMinecraft}
+                className="rounded-lg border border-input px-3 py-1.5 text-xs font-medium hover:bg-accent"
+              >
+                Switch to Minecraft
+              </button>
+            )}
+          </div>
+          <GameSettingsSection
+            gameId={activeGame ?? ''}
+            gameName={selectedGameName}
+            onOpenGameSupport={openGameSupport}
+          />
+        </>
+      )}
+
       {/* Inline error banner for any setting that failed to load. Page-level:
           a failed key can belong to any tab, and hiding the warning behind the
           tab that happens to own it is how it goes unnoticed. */}
@@ -2519,7 +2610,7 @@ export function Settings({
 
       <div className="settings-layout">
         <SettingsTabRail
-          items={tabs.map(({ id, label, icon, hint }) => ({ id, label, icon, hint }))}
+          items={visibleTabs.map(({ id, label, icon, hint }) => ({ id, label, icon, hint }))}
           activeId={activeTab.id}
           onSelect={selectTab}
         />
@@ -2580,7 +2671,7 @@ function GameWindowSettings() {
   }, []);
 
   return (
-    <SettingsSection icon={Cpu} title="Game window">
+    <SettingsSection card="game-window" icon={Cpu} title="Game window">
       <p className="text-xs text-muted-foreground">
         The size Minecraft opens at when Agora starts it (direct launch). An instance can set its own size on
         its Java &amp; Args tab. With the official launcher, set the resolution on its installation instead.
@@ -2680,7 +2771,7 @@ function GameStartWindowSettings() {
   ];
 
   return (
-    <SettingsSection icon={Rocket} title="When the game starts">
+    <SettingsSection card="when-game-starts" icon={Rocket} title="When the game starts">
       {mode === null ? (
         <p className="text-xs text-muted-foreground">Loading…</p>
       ) : (
