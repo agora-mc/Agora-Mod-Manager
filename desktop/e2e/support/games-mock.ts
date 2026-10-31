@@ -31,9 +31,10 @@ const UNMOCKED_LOG_KEY = '__agora_games_mock_unmocked';
 export async function installGamesMock(page: Page, table: GamesMockTable): Promise<void> {
   await page.addInitScript(
     ({ table, settingsKey, unmockedKey }) => {
-      // The shell asks which games are turned off on every start; no rows means none are.
-      // The game switcher asks for each game's exe icon; null means "this game has none".
-      const replies: Record<string, unknown> = { games_support_list: [], games_icon: null, ...table.replies };
+      // The shell asks which games are turned off on every start. A null answer is a failed list,
+      // which hides nothing (specs that need rows pass their own). The game switcher asks for each
+      // game's exe icon; null means "this game has none".
+      const replies: Record<string, unknown> = { games_support_list: null, games_icon: null, ...table.replies };
       const seeded: Record<string, unknown> = { onboarding_complete: true, ...table.settings };
       const stored = JSON.parse(localStorage.getItem(settingsKey) ?? '{}') as Record<string, unknown>;
       const settings: Record<string, unknown> = { ...seeded, ...stored };
@@ -61,8 +62,23 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
               persistSettings();
               return Promise.resolve(null);
             }
+            if (command === 'games_support_set_enabled') {
+              // The list a Settings toggle changes is the same one later reads get.
+              const rows = replies.games_support_list;
+              if (Array.isArray(rows)) {
+                for (const row of rows) {
+                  if (row && typeof row === 'object' && (row as { gameId?: unknown }).gameId === args.gameId) {
+                    (row as { enabled?: unknown }).enabled = args.enabled;
+                  }
+                }
+              }
+              return Promise.resolve(null);
+            }
             if (Object.prototype.hasOwnProperty.call(replies, command)) {
-              return Promise.resolve(replies[command]);
+              const reply = replies[command];
+              // A list is copied on the way out: a page that asks again after a toggle must see a
+              // new value, not the same array object it already holds.
+              return Promise.resolve(Array.isArray(reply) ? structuredClone(reply) : reply);
             }
             recordUnmocked(command);
             return Promise.reject(new Error(`Unmocked Tauri command in a games test: ${command}`));

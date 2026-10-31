@@ -183,3 +183,38 @@ test('landing on the remembered game at startup does not add a history entry beh
   expect(entry.destination).toMatchObject({ type: 'game-tab', gameId: 'skyrim-se' });
   expect(entry.depth, 'the game page is the first entry the app owns').toBe(0);
 });
+
+test('turning off the game being viewed remembers Minecraft and says so once', async ({ page }) => {
+  const supportRows = [
+    { gameId: 'minecraft', name: 'Minecraft: Java Edition', source: { kind: 'builtIn' }, enabled: true, canDisable: false },
+    { gameId: 'skyrim-se', name: 'Skyrim Special Edition', source: { kind: 'builtIn' }, enabled: true, canDisable: true },
+  ];
+  await installGamesMock(page, {
+    replies: {
+      ...BOOT_REPLIES,
+      games_list: { games: [skyrim] },
+      games_support_list: supportRows,
+      // Settings reads these on the way to the Game support list.
+      games_base_list: { bases: [], damaged: [] },
+      is_portable_mode: false,
+      msa_get_status: null,
+      msa_list_accounts: [],
+      credential_storage_status: null,
+      get_auth_status: false,
+    },
+  });
+  await page.goto('/');
+
+  await page.getByTestId('game-switcher').getByRole('button', { name: 'Game: Minecraft. Choose a game' }).click();
+  await page.getByRole('button', { name: 'Skyrim Special Edition', exact: true }).click();
+  await sidebarNav(page).getByRole('button', { name: 'Settings' }).click();
+
+  await page.getByRole('tablist', { name: / pages$/ }).getByRole('tab', { name: 'Game support' }).click();
+  await page.getByRole('checkbox', { name: 'Offer Skyrim Special Edition' }).uncheck();
+  await expect(page.getByRole('checkbox', { name: 'Offer Skyrim Special Edition' })).not.toBeChecked();
+
+  await expect.poll(() => navLabels(page)).toEqual(MINECRAFT_NAV);
+  await expect(page.getByRole('alert').filter({ hasText: 'Skyrim Special Edition is turned off, so Agora switched to Minecraft.' }))
+    .toBeVisible();
+  expect(await storedSetting(page, 'active_game')).toBe('minecraft');
+});

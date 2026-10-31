@@ -234,6 +234,44 @@ describe('Settings for another game', () => {
     expect(await screen.findByText('No bases built yet.')).toBeInTheDocument();
   });
 
+  it("shows this game's saved defaults and writes each change under its game id", async () => {
+    answer({ games_list: { games: [skyrimListing] }, get_setting: (args?: unknown) => {
+      const key = String((args as { key?: unknown } | undefined)?.key ?? '');
+      return key === 'game.skyrim-se.baseType' ? 'copied' : null;
+    } });
+    renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
+
+    const base = await screen.findByLabelText('Base type for new instances and bases');
+    expect(base).toHaveValue('copied');
+    expect(screen.getByLabelText('How new instances run')).toHaveValue('auto');
+    expect(screen.getByLabelText('Saves when importing a profile')).toHaveValue('off');
+
+    fireEvent.change(screen.getByLabelText('How new instances run'), { target: { value: 'links' } });
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('set_setting', {
+      key: 'game.skyrim-se.deployment',
+      value: 'links',
+    }));
+  });
+
+  it("keeps Skyrim's saved default away from another game", async () => {
+    answer({ games_list: { games: [skyrimListing] }, get_setting: (args?: unknown) => {
+      const key = String((args as { key?: unknown } | undefined)?.key ?? '');
+      return key === 'game.skyrim-se.baseType' ? 'copied' : null;
+    } });
+    const { rerender } = renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
+    expect(await screen.findByLabelText('Base type for new instances and bases')).toHaveValue('copied');
+
+    rerender(
+      <Settings
+        onResetLayout={() => undefined}
+        activeGame="valheim"
+        activeGameName="Valheim"
+      />,
+    );
+
+    expect(await screen.findByLabelText('Base type for new instances and bases')).toHaveValue('linked');
+  });
+
   it('opens the Game support page from the game section', async () => {
     answer({ games_list: { games: [] } });
     renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });

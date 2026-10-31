@@ -342,7 +342,7 @@ function AppContent() {
   const registry = useRegistryState();
   // Which game the shell shows, and the header switcher's list (MASTER_SPEC 26.14).
   const gameShell = useGameShell();
-  const { activeGame, shownGame, ready: gameShellReady, setActiveGame } = gameShell;
+  const { activeGame, shownGame, ready: gameShellReady, setActiveGame, turnedOffGames } = gameShell;
   const startupGameCheckedRef = useRef(false);
 
   // The background interval is only a backstop. Content changes made anywhere
@@ -513,6 +513,28 @@ function AppContent() {
   }, [shownGame, navigateToGameTab, navigateToTab]);
 
   const switchGame = useGameSwitch({ setActiveGame, navigateToTab, navigateToGameTab });
+
+  // Turning off the game being viewed must not leave its page on screen: the switcher has already
+  // moved to Minecraft, so remember that choice too and say once why the page changed. Settings is
+  // shared by every game, so it stays open and simply shows Minecraft's cards.
+  const turnedOffNoticeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!gameShellReady) return;
+    const openGame = destinationGame(destination)
+      ?? (destination.type === 'tab' && destination.tab === 'settings' ? activeGame : null);
+    if (openGame === null || openGame === MINECRAFT_GAME_ID) return;
+    const turnedOff = turnedOffGames.find((game) => game.gameId === openGame);
+    if (!turnedOff) {
+      turnedOffNoticeRef.current = null;
+      return;
+    }
+    switchGame(MINECRAFT_GAME_ID, { navigate: false });
+    if (destinationGame(destination) !== null) navigateToTab('home');
+    if (turnedOffNoticeRef.current !== turnedOff.gameId) {
+      turnedOffNoticeRef.current = turnedOff.gameId;
+      showToast(`${turnedOff.name} is turned off, so Agora switched to Minecraft.`);
+    }
+  }, [activeGame, destination, gameShellReady, navigateToTab, switchGame, turnedOffGames]);
 
   // Keep the remembered game in step with where the user is. The first time discovery and the
   // stored choice have both answered, a fresh launch opens the game the user last chose rather
