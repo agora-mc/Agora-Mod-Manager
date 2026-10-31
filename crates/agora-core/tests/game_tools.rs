@@ -5100,3 +5100,18 @@ fn a_mod_whose_record_is_missing_is_an_error_not_no_candidates() {
         "a missing mod record must not read as no candidates"
     );
 }
+
+#[test]
+fn a_staged_output_that_is_a_different_file_on_ntfs_is_never_dropped_as_unchanged() {
+    // NTFS keeps `i.txt` and `ı.txt` as two files (checked 2026-10-31). fold_path_case maps both to
+    // `I.TXT`, so the tool's own `ı.txt` is matched to the mod's `i.txt`, found equal, and deleted.
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod("Mod", &[("Data/i.txt", b"same bytes")]);
+    let staging = stage(&f, "sweep", &[("Data/ı.txt", b"same bytes")]);
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 0);
+    assert_eq!(
+        std::fs::read(staging.join("Data/ı.txt")).unwrap(),
+        b"same bytes"
+    );
+}

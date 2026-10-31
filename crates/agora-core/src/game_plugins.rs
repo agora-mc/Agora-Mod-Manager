@@ -976,6 +976,16 @@ mod tests {
     }
 
     #[test]
+    fn sync_matches_non_ascii_plugin_names_the_way_ntfs_does() {
+        // `key` still lower-cases ASCII only, while the planner folds Unicode: `Ü.esp` and `ü.esp`
+        // are one file on NTFS (checked 2026-10-31), but this writes a second line for it.
+        let mut f = ListFile::parse("*ü.esp\r\n".as_bytes());
+        let (added, removed) = apply_sync(&mut f, &rule(), &names(&["Ü.esp"]), &[]);
+        assert!(added.is_empty() && removed.is_empty());
+        assert_eq!(lines(&f), ["*ü.esp"]);
+    }
+
+    #[test]
     fn sync_removes_only_lines_agora_managed() {
         let mut f = ListFile::parse(b"*Gone.esp\r\n*Mine.esp\r\n# note\r\n*Kept.esp\r\n");
         let (added, removed) = apply_sync(

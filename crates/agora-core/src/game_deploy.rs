@@ -3575,3 +3575,58 @@ mod placement_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod case_fold_review_tests {
+    use super::*;
+
+    #[test]
+    fn farm_scan_reports_a_file_whose_name_differs_only_by_dotless_i_as_added() {
+        // NTFS on D: keeps `i.esp` and `ı.esp` as two files (checked 2026-10-31). fold_path_case maps
+        // both to `I.ESP`, so walk_farm keeps one of them and compare_farm never reports the other
+        // as Added: harvest then never copies the user's file into the writable layer.
+        let root = std::env::temp_dir().join(format!(
+            "agora-review-farm-dotless-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Data")).unwrap();
+        std::fs::write(root.join("Data").join("i.esp"), b"mod").unwrap();
+        std::fs::write(root.join("Data").join("ı.esp"), b"user").unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.join("Data")).unwrap().count(),
+            2,
+            "this volume must keep the two names apart"
+        );
+
+        let record = DeploymentRecord {
+            instance_id: "inst".to_string(),
+            base_id: "base".to_string(),
+            mode: DeployMode::Copies,
+            fingerprint: String::new(),
+            files: vec![DeployedFileRecord {
+                path: RelPath::new("Data/i.esp").unwrap(),
+                source: FileSource::Base {
+                    path: root.join("Data").join("i.esp"),
+                    linked_to_store: false,
+                },
+                placement: Placement::Copy,
+                size: 3,
+                modified_unix_ms: 0,
+            }],
+            deployed_at_unix_ms: 0,
+        };
+        let diff = compare_farm(&root, &record, &mut |_, _| Ok(false)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let added: Vec<String> = diff
+            .changes
+            .iter()
+            .filter_map(|change| match change {
+                FarmChange::Added(file) => Some(file.rel_path.as_str().to_string()),
+                FarmChange::Changed { .. } => None,
+            })
+            .collect();
+        assert_eq!(added, vec!["Data/ı.esp".to_string()]);
+    }
+}

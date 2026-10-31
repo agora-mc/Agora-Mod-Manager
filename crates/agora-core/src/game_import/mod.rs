@@ -1469,3 +1469,38 @@ pub fn run(
     }));
     Ok(report)
 }
+
+#[cfg(test)]
+mod case_fold_review_tests {
+    use super::*;
+
+    #[test]
+    fn drive_scan_skips_windows_recycle_bin_and_program_files_whatever_their_case() {
+        // SKIPPED_DIRS is lower-case and `name` is now upper-cased by fold_path_case, so the skip
+        // never matches: the scan walks into WINDOWS, $RECYCLE.BIN and PROGRAM FILES.
+        let root = std::env::temp_dir().join(format!(
+            "agora-review-drive-scan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [
+            "Windows",
+            "Program Files (x86)/Mod Organizer 2",
+            "$Recycle.Bin",
+            "Games/MO2",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("ModOrganizer.ini"), b"[General]\n").unwrap();
+        }
+
+        let mut found = Vec::new();
+        scan_dir(&root, 0, &mut found);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let paths: Vec<PathBuf> = found.into_iter().map(|(path, _)| path).collect();
+        assert_eq!(
+            paths,
+            vec![root.join("Games").join("MO2").join("ModOrganizer.ini")]
+        );
+    }
+}
