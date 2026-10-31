@@ -77,6 +77,9 @@ describe('useGameShell with the Game support list', () => {
     expect(result.current.shownGame).toBe('minecraft');
     expect(result.current.foundGames).toEqual([]);
     expect(result.current.switcherVisible).toBe(false);
+    expect(result.current.turnedOffGames).toEqual([
+      { gameId: 'skyrim-se', name: 'Skyrim Special Edition' },
+    ]);
     // The stored choice is kept, so turning the game back on brings it back.
     expect(result.current.activeGame).toBe('skyrim-se');
   });
@@ -95,6 +98,7 @@ describe('useGameShell with the Game support list', () => {
     await waitFor(() => expect(result.current.ready).toBe(true));
     expect(result.current.foundGames.map((g) => g.gameId)).toEqual(['skyrim-se']);
     expect(result.current.shownGame).toBe('skyrim-se');
+    expect(result.current.turnedOffGames).toEqual([]);
   });
 
   it('hides nothing when the support list reply is not a list', async () => {

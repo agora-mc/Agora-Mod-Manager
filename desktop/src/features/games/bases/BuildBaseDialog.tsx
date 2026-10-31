@@ -18,6 +18,9 @@ import { formatBytes } from '@/components/installed-content/contentTableState';
 import { listInstalledGames } from '../discovery/api';
 import type { InstallSummary } from '../shared/types';
 import { isGamesError } from '../shared/types';
+import { listGameSupport, type GameSupportRow } from '../support/api';
+import { isGameTurnedOff } from '../support/enabled';
+import { loadGameSettingsOrDefaults } from '../settings/gameSettings';
 import {
   buildBase,
   listenBuildProgress,
@@ -38,7 +41,7 @@ import {
 type Installs =
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'loaded'; installs: InstallSummary[] };
+  | { status: 'loaded'; installs: InstallSummary[]; turnedOff: boolean };
 
 type Phase =
   | { kind: 'choose' }
@@ -73,14 +76,21 @@ export function BuildBaseDialog({ open, onOpenChange, gameId, onBuilt }: BuildBa
     setInstalls({ status: 'loading' });
     setError(null);
     setPhase({ kind: 'choose' });
-    listInstalledGames()
-      .then((list) => {
+    Promise.all([
+      listInstalledGames(),
+      // A support list that could not be read hides nothing, the same as in the game switcher.
+      listGameSupport().catch((): GameSupportRow[] | null => null),
+      loadGameSettingsOrDefaults(gameId),
+    ])
+      .then(([list, support, defaults]) => {
         if (cancelled) return;
-        const game = list.games.find((listing) => listing.gameId === gameId);
+        const turnedOff = isGameTurnedOff(gameId, support);
+        const game = turnedOff ? undefined : list.games.find((listing) => listing.gameId === gameId);
         const found = game ? game.installs : [];
-        setInstalls({ status: 'loaded', installs: found });
+        setInstalls({ status: 'loaded', installs: found, turnedOff });
         const usable = found.find((install) => install.runtime.status === 'identified');
         setSelected((current) => (current && found.some((i) => i.installId === current) ? current : usable?.installId ?? null));
+        if (!turnedOff) setMode(defaults.baseType);
       })
       .catch((failure: unknown) => {
         if (!cancelled) setInstalls({ status: 'error', message: describeFailure(failure) });
@@ -166,14 +176,20 @@ export function BuildBaseDialog({ open, onOpenChange, gameId, onBuilt }: BuildBa
           <p role="alert" className="text-sm text-destructive">{installs.message}</p>
         )}
 
-        {(phase.kind === 'choose' || phase.kind === 'building') && installs.status === 'loaded' && installs.installs.length === 0 && (
+        {(phase.kind === 'choose' || phase.kind === 'building') && installs.status === 'loaded' && installs.turnedOff && (
+          <p role="alert" className="rounded-lg border border-border p-3 text-sm">
+            This game is turned off, so it is not offered here. Turn it on in Settings, Game support, to build a base.
+          </p>
+        )}
+
+        {(phase.kind === 'choose' || phase.kind === 'building') && installs.status === 'loaded' && !installs.turnedOff && installs.installs.length === 0 && (
           <div className="space-y-2 rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground" data-testid="no-installs">
             <p className="font-medium text-foreground">Agora has not found an installed copy of this game.</p>
             <p>Check that the game is installed, then rescan installs in the Installs section above.</p>
           </div>
         )}
 
-        {(phase.kind === 'choose' || phase.kind === 'building') && installs.status === 'loaded' && installs.installs.length > 0 && (
+        {(phase.kind === 'choose' || phase.kind === 'building') && installs.status === 'loaded' && !installs.turnedOff && installs.installs.length > 0 && (
           <div className="space-y-5">
             <fieldset disabled={building} className="space-y-2">
               <legend className="mb-2 text-sm font-medium">Which installed copy?</legend>
@@ -265,7 +281,8 @@ export function BuildBaseDialog({ open, onOpenChange, gameId, onBuilt }: BuildBa
             </>
           )}
 
-          {(phase.kind === 'choose' || phase.kind === 'building') && (
+          {(phase.kind === 'choose' || phase.kind === 'building')
+            && !(installs.status === 'loaded' && installs.turnedOff) && (
             <>
               <Button type="button" variant="outline" disabled={building} onClick={() => onOpenChange(false)}>
                 Cancel

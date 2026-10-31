@@ -12,6 +12,8 @@ import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
 import { pickDirectory } from '@/lib/tauri';
 import { isGamesError, type InstallSummary } from '../shared/types';
+import { listGameSupport, type GameSupportRow } from '../support/api';
+import { gamesToOffer } from '../support/enabled';
 import {
   addGameFolder,
   discoverGames,
@@ -64,6 +66,7 @@ function installVersion(install: InstallSummary): string {
 export function SetupInstallsSection(_props: SetupInstallsSectionProps) {
   const { confirm } = useConfirm();
   const [games, setGames] = useState<GamesList | null>(null);
+  const [support, setSupport] = useState<GameSupportRow[] | null | undefined>(undefined);
   const [scan, setScan] = useState<GameFolderScan | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -73,8 +76,14 @@ export function SetupInstallsSection(_props: SetupInstallsSectionProps) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [listed, found] = await Promise.all([listInstalledGames(), discoverGames()]);
+      const [listed, found, supportRows] = await Promise.all([
+        listInstalledGames(),
+        discoverGames(),
+        // A support list that could not be read hides nothing, the same as in the game switcher.
+        listGameSupport().catch((): GameSupportRow[] | null => null),
+      ]);
       setGames(listed);
+      setSupport(supportRows);
       setScan(found);
       setError(null);
     } catch (caught) {
@@ -142,7 +151,8 @@ export function SetupInstallsSection(_props: SetupInstallsSectionProps) {
     setBusy(false);
   };
 
-  const found: GameListing[] = games?.games ?? [];
+  // Turned-off games are not offered here; a failed support list (null) keeps every game.
+  const found: GameListing[] = gamesToOffer(games?.games ?? [], support);
   const folders = scan?.folders ?? [];
   const warnings: ScanWarning[] = scan?.warnings ?? [];
 

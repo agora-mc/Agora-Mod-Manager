@@ -229,8 +229,15 @@ export async function createGameInstance(
   installId: string,
   name: string,
   baseMode: BaseMode,
+  deployment: DeploymentChoice = 'auto',
 ): Promise<CreatedInstance> {
-  const reply: unknown = await invoke<unknown>('games_instance_create', { gameId, installId, name, baseMode });
+  const reply: unknown = await invoke<unknown>('games_instance_create', {
+    gameId,
+    installId,
+    name,
+    baseMode,
+    deployment,
+  });
   if (!isRecord(reply) || typeof reply.instanceId !== 'string' || typeof reply.name !== 'string') {
     throw shapeError('games_instance_create');
   }

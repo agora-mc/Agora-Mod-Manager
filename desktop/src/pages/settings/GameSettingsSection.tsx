@@ -1,8 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { Gamepad2 } from 'lucide-react';
 import { formatError } from '../../lib/tauri';
 import { listInstalledGames, type GameListing } from '../../features/games/discovery/api';
 import { listBases, type BaseSummary } from '../../features/games/bases/api';
+import {
+  loadGameSettings,
+  saveGameSetting,
+  type GameSettings,
+} from '../../features/games/settings/gameSettings';
 import { SettingsSection } from './SettingsSection';
 import { gameDisplayName } from './gameScope';
 
@@ -19,11 +24,78 @@ function formatBytes(bytes: number): string {
   return `${value >= 10 || exponent === 0 ? Math.round(value) : value.toFixed(1)} ${units[exponent]}`;
 }
 
+interface Choice<Value extends string> {
+  value: Value;
+  label: string;
+}
+
+const BASE_TYPE_OPTIONS: readonly Choice<GameSettings['baseType']>[] = [
+  { value: 'linked', label: 'Linked (default)' },
+  { value: 'copied', label: 'Copied' },
+];
+
+const DEPLOYMENT_OPTIONS: readonly Choice<GameSettings['deployment']>[] = [
+  { value: 'auto', label: 'Automatic (default)' },
+  { value: 'virtual', label: 'Virtual file system' },
+  { value: 'links', label: 'Linked files' },
+  { value: 'copies', label: 'Copied files' },
+];
+
+const IMPORT_SAVES_OPTIONS: readonly Choice<GameSettings['importCopySaves']>[] = [
+  { value: 'off', label: 'Leave them where they are (default)' },
+  { value: 'on', label: 'Copy them into the new instance' },
+];
+
 /**
- * The selected game's own settings, read-only for now: where Agora found it,
- * the bases it keeps, and the way to the game-support toggles. It never scans
- * the disk itself; both lists come from the commands the rest of the games UI
- * already uses.
+ * One per-game choice. The visible label and the sentence under it are the setting's whole
+ * explanation; the default is named in the option itself.
+ */
+function GameSettingSelect<Value extends string>({
+  label,
+  description,
+  value,
+  options,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  description: string;
+  value: Value;
+  options: readonly Choice<Value>[];
+  disabled: boolean;
+  onChange: (value: Value) => void;
+}) {
+  const id = useId();
+  const descriptionId = useId();
+  return (
+    <label htmlFor={id} className="block space-y-1">
+      <span className="block text-sm">{label}</span>
+      <span id={descriptionId} className="block text-xs text-muted-foreground">
+        {description}
+      </span>
+      <select
+        id={id}
+        aria-label={label}
+        aria-describedby={descriptionId}
+        className="flex h-9 w-full max-w-sm rounded-md border border-input bg-background px-3 py-1.5 text-sm"
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value as Value)}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+/**
+ * The selected game's own section: where Agora found it, the bases it keeps, the defaults for
+ * the next instance or base, and the way to the game-support toggles. It never scans the disk
+ * itself; every list comes from the commands the rest of the games UI already uses.
  */
 export function GameSettingsSection({
   gameId,
@@ -37,11 +109,16 @@ export function GameSettingsSection({
 }) {
   const [games, setGames] = useState<Load<GameListing | null>>({ status: 'loading' });
   const [bases, setBases] = useState<Load<BaseSummary[]>>({ status: 'loading' });
+  const [settings, setSettings] = useState<Load<GameSettings>>({ status: 'loading' });
+  const [saving, setSaving] = useState<keyof GameSettings | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     setGames({ status: 'loading' });
     setBases({ status: 'loading' });
+    setSettings({ status: 'loading' });
+    setSaveError(null);
 
     listInstalledGames()
       .then((list) => {
@@ -60,21 +137,46 @@ export function GameSettingsSection({
         if (!cancelled) setBases({ status: 'failed', message: formatError(error) });
       });
 
+    loadGameSettings(gameId)
+      .then((value) => {
+        if (!cancelled) setSettings({ status: 'loaded', value });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setSettings({ status: 'failed', message: formatError(error) });
+      });
+
     return () => {
       cancelled = true;
     };
   }, [gameId]);
 
+  const change = async <K extends keyof GameSettings>(name: K, value: GameSettings[K]) => {
+    if (settings.status !== 'loaded') return;
+    const previous = settings.value;
+    setSettings({ status: 'loaded', value: { ...previous, [name]: value } });
+    setSaving(name);
+    setSaveError(null);
+    try {
+      await saveGameSetting(gameId, name, value);
+    } catch (error) {
+      setSettings({ status: 'loaded', value: previous });
+      setSaveError(`That setting was not saved. ${formatError(error)}`);
+    } finally {
+      setSaving(null);
+    }
+  };
+
   const listing = games.status === 'loaded' ? games.value : null;
   const name = gameDisplayName(gameId, listing?.name ?? knownName);
   const installs = listing?.installs ?? [];
+  const choices = settings.status === 'loaded' ? settings.value : null;
 
   return (
     <SettingsSection
       card="selected-game"
       icon={Gamepad2}
       title={name}
-      description="Read-only for now. Minecraft's own settings appear when Minecraft is selected."
+      description="Your choices for this game only. Minecraft's own settings appear when Minecraft is selected."
     >
       <div className="space-y-1">
         <p className="text-sm font-medium">Install folders</p>
@@ -127,6 +229,52 @@ export function GameSettingsSection({
               ))}
             </ul>
           </>
+        )}
+      </div>
+
+      <div className="space-y-3">
+        <div>
+          <p className="text-sm font-medium">New instances and bases</p>
+          <p className="text-xs text-muted-foreground">
+            The choices here fill in the forms for {name}; you can still change them there.
+          </p>
+        </div>
+        {settings.status === 'loading' && <p className="text-xs text-muted-foreground">Reading these settings…</p>}
+        {settings.status === 'failed' && (
+          <p role="alert" className="text-xs text-destructive">
+            Agora could not read the settings for {name}. {settings.message}
+          </p>
+        )}
+        {choices !== null && (
+          <>
+            <GameSettingSelect
+              label="Base type for new instances and bases"
+              description="Linked shares most game files with the install and takes little space. Copied keeps its own copy of the game files."
+              value={choices.baseType}
+              options={BASE_TYPE_OPTIONS}
+              disabled={saving !== null}
+              onChange={(value) => void change('baseType', value)}
+            />
+            <GameSettingSelect
+              label="How new instances run"
+              description="Automatic uses the game's own choice. Another mode is set on each new instance and can be changed on its page."
+              value={choices.deployment}
+              options={DEPLOYMENT_OPTIONS}
+              disabled={saving !== null}
+              onChange={(value) => void change('deployment', value)}
+            />
+            <GameSettingSelect
+              label="Saves when importing a profile"
+              description="An imported profile can keep its saves where they are, or copy them into the new instance's own save folder."
+              value={choices.importCopySaves}
+              options={IMPORT_SAVES_OPTIONS}
+              disabled={saving !== null}
+              onChange={(value) => void change('importCopySaves', value)}
+            />
+          </>
+        )}
+        {saveError !== null && (
+          <p role="alert" className="text-xs text-destructive">{saveError}</p>
         )}
       </div>
 
