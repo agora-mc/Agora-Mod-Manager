@@ -5745,3 +5745,282 @@ fn a_pgpatcher_output_folder_inside_data_or_the_deployment_is_refused() {
         "a folder inside the deployment must be refused plainly: {refused:?}"
     );
 }
+
+// ---- review probes for the tools-run change: each test below is a bug that fails on this branch ----
+
+/// A copy of `cmd.exe` named `PGPatcher.exe` in `<tmp>/tools`, outside the game.
+fn own_tool_exe() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let exe = dir.path().join("tools").join("PGPatcher.exe");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).unwrap();
+    (dir, exe)
+}
+
+/// A fixture whose game folder is `<tmp>/games/install`, so `<tmp>/games` holds the game. Returns
+/// the fixture and `<tmp>/games`.
+fn fixture_with_install_in_games() -> (Fixture, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let def = definition(&[], false, false);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(registry(&def, Vec::new()));
+    let games = tmp.path().join("games");
+    let install_dir = games.join("install");
+    std::fs::create_dir_all(install_dir.join("Data")).unwrap();
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", install_dir.join("Game.exe")).unwrap();
+    std::fs::write(install_dir.join("Data").join("Skyrim.bsa"), b"BSA DATA").unwrap();
+    let inst = create(
+        &ctx,
+        &install_of(&install_dir),
+        &def,
+        "Tools",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("create instance");
+    (
+        Fixture {
+            _tmp: tmp,
+            ctx,
+            def,
+            inst,
+        },
+        games,
+    )
+}
+
+/// Bug: a PGPatcher output folder that CONTAINS the game passes validation, so move-aside moves the game.
+#[test]
+fn a_pgpatcher_output_folder_that_holds_the_game_is_refused_and_the_game_stays_put() {
+    let (f, games) = fixture_with_install_in_games();
+    let (_dir, exe) = own_tool_exe();
+    std::fs::write(games.join("old.bin"), b"old").unwrap();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &["/c", "exit", "0"],
+        true,
+        Some(&games.to_string_lossy()),
+    );
+
+    let _ = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+
+    assert!(
+        games.join("install").join("Game.exe").is_file(),
+        "the game was moved aside with the output folder that contains it"
+    );
+    assert!(games
+        .join("install")
+        .join("Data")
+        .join("Skyrim.bsa")
+        .is_file());
+}
+
+/// Bug: move-aside renames the tool's own folder before the run knows it can start.
+#[test]
+fn a_tool_whose_own_folder_is_its_output_folder_is_refused_before_anything_moves() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let tools_dir = exe.parent().unwrap().to_path_buf();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &["/c", "exit", "0"],
+        true,
+        Some(&tools_dir.to_string_lossy()),
+    );
+
+    let _ = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+
+    assert!(
+        exe.is_file(),
+        "the tool's own executable was moved aside with its output folder"
+    );
+}
+
+/// Bug: a `..` after a missing folder hides that the path lands in the game's Data folder.
+#[test]
+fn a_dot_dot_output_folder_that_reaches_the_game_through_a_missing_folder_is_refused() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let install = f._tmp.path().join("install");
+    let folder = f
+        ._tmp
+        .path()
+        .join("nope")
+        .join("..")
+        .join("install")
+        .join("Data")
+        .join("Out");
+    let out_text = folder.to_string_lossy().into_owned();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[
+            "/c",
+            "mkdir",
+            "%AGORA_OUT%",
+            "&",
+            "echo",
+            "x>",
+            r"%AGORA_OUT%\x.txt",
+        ],
+        true,
+        Some(&out_text),
+    );
+
+    let result = run_user_tool(
+        &f,
+        &tool.id,
+        &StagingLauncher::plain().with_env("AGORA_OUT", &out_text),
+        false,
+    );
+
+    assert!(
+        result.is_err(),
+        "an output folder inside the game was accepted: {result:?}"
+    );
+    assert!(
+        !install.join("Data").join("Out").exists(),
+        "the tool wrote into the game's Data folder"
+    );
+}
+
+/// Bug: a junction into the game's Data folder passes when the output folder does not exist yet.
+#[test]
+fn a_junction_to_the_game_data_folder_is_refused_when_the_output_folder_is_new() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let install = f._tmp.path().join("install");
+    let mods = f._tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    let link = mods.join("link");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(install.join("Data"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J failed");
+    let folder = link.join("Out");
+    let out_text = folder.to_string_lossy().into_owned();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[
+            "/c",
+            "mkdir",
+            "%AGORA_OUT%",
+            "&",
+            "echo",
+            "x>",
+            r"%AGORA_OUT%\x.txt",
+        ],
+        true,
+        Some(&out_text),
+    );
+
+    let result = run_user_tool(
+        &f,
+        &tool.id,
+        &StagingLauncher::plain().with_env("AGORA_OUT", &out_text),
+        false,
+    );
+
+    assert!(
+        result.is_err(),
+        "a junction into the game's Data folder was accepted: {result:?}"
+    );
+    assert!(
+        !install.join("Data").join("Out").exists(),
+        "the tool wrote into the game's Data folder through the junction"
+    );
+}
+
+/// Bug: a user tool that names a declared mod tool drops the move-aside choice (run() has none).
+#[test]
+fn a_move_aside_choice_is_honoured_by_a_user_tool_that_names_a_declared_mod_tool() {
+    let mut pgpatcher = tool(
+        "pgpatcher",
+        "PGPatcher",
+        &[
+            "/c",
+            "mkdir",
+            "%AGORA_OUT%",
+            "&",
+            "echo",
+            "x>",
+            r"%AGORA_OUT%\x.txt",
+        ],
+    );
+    pgpatcher.output = ToolOutput::Mod {
+        folder: String::new(),
+        user_configured: true,
+    };
+    let f = fixture(vec![pgpatcher]);
+    let out = f._tmp.path().join("pg-out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("old.bin"), b"old").unwrap();
+    let out_text = out.to_string_lossy().into_owned();
+    let json = serde_json::json!({
+        "version": 1,
+        "tools": [{
+            "id": "mine",
+            "name": "PGPatcher",
+            "exe": "Game.exe",
+            "args": [],
+            "known_tool_id": "pgpatcher",
+            "output_is_mod": true,
+            "output_folder": out_text,
+        }]
+    })
+    .to_string();
+    std::fs::write(f.instance_dir().join("user_tools.json"), json).unwrap();
+
+    let result = run_user_tool(
+        &f,
+        "mine",
+        &StagingLauncher::plain().with_env("AGORA_OUT", &out_text),
+        true,
+    );
+
+    let outcome = result.expect("the person asked to move the old output aside");
+    assert!(outcome.promoted, "{outcome:?}");
+    assert!(!out.join("old.bin").exists());
+}
+
+/// Bug: the output is moved aside before the VFS start or launch, so a refused start still moves it.
+#[test]
+fn a_refused_start_moves_nothing_aside() {
+    let (f, tool) = mod_tool_fixture();
+    std::fs::create_dir_all(&tool.folder).unwrap();
+    std::fs::write(tool.folder.join("old.bin"), b"old bytes").unwrap();
+    let user = add_mod_tool(&f, &tool, "one");
+
+    let result = game_tools::run_user_tool(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &user.id,
+        CaptureMode::Vfs,
+        false,
+        true,
+        &StagingLauncher::without_vfs("no agora_vfs.dll in this test"),
+        &CancellationToken::new(),
+    );
+
+    assert!(
+        matches!(result, Err(ToolError::VfsUnavailable { .. })),
+        "{result:?}"
+    );
+    assert!(
+        tool.folder.join("old.bin").is_file(),
+        "the output was moved aside although the tool never ran"
+    );
+}
