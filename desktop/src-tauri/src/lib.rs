@@ -546,6 +546,8 @@ pub fn run() {
             games::catalog::games_catalog_install,
             games::user_files::games_user_files_status,
             games::user_files::games_user_files_restore,
+            games::support::games_support_list,
+            games::support::games_support_set_enabled,
         ])
         .setup(|app| {
             #[cfg(target_os = "windows")]

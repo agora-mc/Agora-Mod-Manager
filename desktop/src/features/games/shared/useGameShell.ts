@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getSetting, setSetting } from '@/lib/tauri';
 import { listInstalledGames } from '../discovery/api';
+import { GAME_SUPPORT_CHANGED_EVENT, listGameSupport, type GameSupportRow } from '../support/api';
 import { MINECRAFT_GAME_ID, type GameListing } from './types';
 
 /** The settings key the active game persists under (the app's own settings store). */
@@ -18,7 +19,7 @@ export interface GameShell {
   foundGames: GameListing[];
   /** The header switcher is shown only when there is another game to switch to. */
   switcherVisible: boolean;
-  /** True once the stored choice and discovery have both settled (answered or failed). */
+  /** True once the stored choice, discovery and the support list have all settled (answered or failed). */
   ready: boolean;
   /** Choose a game and remember the choice across restarts. */
   setActiveGame: (gameId: string) => void;
@@ -36,10 +37,44 @@ export function parseActiveGame(value: unknown): string {
   return value;
 }
 
+/**
+ * The games the switcher offers: the found games minus the ones the user has turned off. A support
+ * list that did not load (null) hides nothing. This is a convenience filter, not a safety check,
+ * so an unreadable list must not make a found game disappear.
+ */
+export function visibleGames(games: GameListing[], support: GameSupportRow[] | null): GameListing[] {
+  if (support === null) return games;
+  const off = new Set(support.filter((row) => !row.enabled).map((row) => row.gameId));
+  return games.filter((game) => !off.has(game.gameId));
+}
+
 export function useGameShell(): GameShell {
   // null = the stored value has not come back yet.
   const [stored, setStored] = useState<string | null>(null);
   const [discovery, setDiscovery] = useState<Discovery>({ status: 'loading' });
+  // undefined = the support list has not answered yet; null = it failed, so nothing is hidden.
+  const [support, setSupport] = useState<GameSupportRow[] | null | undefined>(undefined);
+  // Only the newest reply counts, so a slow earlier read cannot overwrite a later toggle.
+  const supportRequest = useRef(0);
+
+  const refreshSupport = useCallback(() => {
+    const request = ++supportRequest.current;
+    listGameSupport()
+      .then((rows) => {
+        if (request === supportRequest.current) setSupport(rows);
+      })
+      .catch(() => {
+        // Not a list: hide nothing (see visibleGames).
+        if (request === supportRequest.current) setSupport(null);
+      });
+  }, []);
+
+  useEffect(() => {
+    refreshSupport();
+    // The Settings page announces a toggle, so the switcher follows it without a restart.
+    window.addEventListener(GAME_SUPPORT_CHANGED_EVENT, refreshSupport);
+    return () => window.removeEventListener(GAME_SUPPORT_CHANGED_EVENT, refreshSupport);
+  }, [refreshSupport]);
 
   useEffect(() => {
     let cancelled = false;
@@ -74,9 +109,9 @@ export function useGameShell(): GameShell {
     setSetting(ACTIVE_GAME_SETTING, gameId).catch(() => undefined);
   }, []);
 
-  const foundGames = discovery.status === 'loaded' ? discovery.games : [];
+  const foundGames = discovery.status === 'loaded' ? visibleGames(discovery.games, support ?? null) : [];
   const activeGame = stored ?? MINECRAFT_GAME_ID;
-  const ready = stored !== null && discovery.status !== 'loading';
+  const ready = stored !== null && discovery.status !== 'loading' && support !== undefined;
   const isFound = foundGames.some((game) => game.gameId === activeGame);
   const shownGame = !ready || activeGame === MINECRAFT_GAME_ID
     ? MINECRAFT_GAME_ID

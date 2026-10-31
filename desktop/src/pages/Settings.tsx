@@ -85,6 +85,7 @@ import { TemplateSettings } from './settings/TemplateSettings';
 import { RuntimeReclaim } from './settings/RuntimeReclaim';
 import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
+import { GameSupportSettings } from './settings/GameSupportSettings';
 import { AiAssistantCard } from './settings/AiAssistantCard';
 import { PluginManager } from '../features/plugins/PluginManager';
 import { SettingsSubNav, SettingsTabRail } from './settings/SettingsNav';
@@ -2354,6 +2355,7 @@ export function Settings({
           ),
         },
         { id: 'walkthrough', label: 'Walkthrough', content: walkthroughCard },
+        { id: 'games', label: 'Game support', content: <GameSupportSettings /> },
         { id: 'templates', label: 'Templates', content: <TemplateSettings /> },
         { id: 'storage', label: 'Storage', content: <RuntimeReclaim /> },
         {
