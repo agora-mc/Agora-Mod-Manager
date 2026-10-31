@@ -15,6 +15,7 @@ pub mod import;
 pub mod ini_saves;
 pub mod instances;
 pub mod plugins;
+pub mod support;
 pub mod tools;
 pub mod user_files;
 
