@@ -126,6 +126,18 @@ describe('useGameShell with the Game support list', () => {
     expect(result.current.shownGame).toBe('minecraft');
   });
 
+  it('keeps the found list the same array when only the chosen game changes', async () => {
+    answer({ ...baseReplies, games_support_list: [minecraftRow, skyrimRow(true)] });
+    const { result } = renderHook(() => useGameShell());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    const before = result.current.foundGames;
+    act(() => result.current.setActiveGame('minecraft'));
+    await waitFor(() => expect(result.current.activeGame).toBe('minecraft'));
+    // A new list on every render makes every consumer re-render, so a filtered
+    // view must keep the same identity while discovery and support are unchanged.
+    expect(result.current.foundGames).toBe(before);
+  });
+
   it('follows a toggle without a restart: the change event rereads the list', async () => {
     let supportRows: unknown = [minecraftRow, skyrimRow(false)];
     invokeMock.mockImplementation(async (command: string) => {

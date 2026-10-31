@@ -286,4 +286,36 @@ describe('per-mod update pin', () => {
     const menu = await screen.findByRole('menu');
     expect(menu.closest('table')).toBeNull();
   });
+
+  it('leaves the page usable while a row menu is open', async () => {
+    // An open modal menu disables pointer events on the whole page, so a menu
+    // that outlives its Escape makes every later control untouchable.
+    render(
+      <InstalledContentPanel
+        {...baseProps}
+        rows={[row({ filename: 'iris.jar' })]}
+        onTogglePin={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: /More actions for/i }));
+    expect(await screen.findByRole('menu')).toBeTruthy();
+    expect(document.body.style.pointerEvents).not.toBe('none');
+  });
+
+  it('closes the row menu on Escape even when focus has not moved into it yet', async () => {
+    // Escape is honoured while the menu is still opening, before Radix has
+    // moved focus into it; otherwise it would stay open over the row.
+    render(
+      <InstalledContentPanel
+        {...baseProps}
+        rows={[row({ filename: 'iris.jar' })]}
+        onTogglePin={vi.fn()}
+      />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: /More actions for/i }));
+    expect(await screen.findByRole('menu')).toBeTruthy();
+    screen.getByLabelText('Search installed content').focus();
+    await userEvent.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
 });

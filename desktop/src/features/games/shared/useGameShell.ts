@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getSetting, setSetting } from '@/lib/tauri';
 import { listInstalledGames } from '../discovery/api';
 import { GAME_SUPPORT_CHANGED_EVENT, listGameSupport, type GameSupportRow } from '../support/api';
@@ -109,7 +109,10 @@ export function useGameShell(): GameShell {
     setSetting(ACTIVE_GAME_SETTING, gameId).catch(() => undefined);
   }, []);
 
-  const foundGames = discovery.status === 'loaded' ? visibleGames(discovery.games, support ?? null) : [];
+  const foundGames = useMemo(
+    () => (discovery.status === 'loaded' ? visibleGames(discovery.games, support ?? null) : []),
+    [discovery, support],
+  );
   const activeGame = stored ?? MINECRAFT_GAME_ID;
   const ready = stored !== null && discovery.status !== 'loading' && support !== undefined;
   const isFound = foundGames.some((game) => game.gameId === activeGame);
