@@ -1175,6 +1175,9 @@ function AppContent() {
                 {effectiveTab === 'about' && <About />}
                 {effectiveTab === 'settings' && (
                   <Settings
+                    activeGame={activeGame}
+                    activeGameName={gameShell.foundGames.find((game) => game.gameId === activeGame)?.name}
+                    onSwitchToMinecraft={() => switchGame(MINECRAFT_GAME_ID)}
                     onNavigateTab={navigateToTab}
                     onResetLayout={() => {
                       const reset = {

@@ -33,6 +33,7 @@ export function AppearanceThemeSettings() {
 
   return (
     <SettingsSection
+      card="appearance-theme"
       id="settings-appearance"
       icon={Palette}
       title="Theme"
@@ -247,6 +248,7 @@ export function AppearanceInterfaceSettings() {
   return (
     <>
       <SettingsSection
+        card="appearance-type"
         icon={Type}
         title="Type & spacing"
         description="Font, density, corners, border thickness, and text size apply across every page."
@@ -319,6 +321,7 @@ export function AppearanceInterfaceSettings() {
       </SettingsSection>
 
       <SettingsSection
+        card="appearance-motion"
         icon={Zap}
         title="Motion & interaction"
         description="Animation preferences, including how instances are presented."
@@ -419,6 +422,7 @@ export function LivingBackgroundSettings({ onOpenLivingBackground }: { onOpenLiv
 
   return (
     <SettingsSection
+      card="appearance-living-background"
       id="settings-living-background"
       icon={Mountain}
       title="Living background"
