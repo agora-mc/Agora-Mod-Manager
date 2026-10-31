@@ -1434,6 +1434,89 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
 }
 
 #[test]
+fn a_corrupted_saved_masterlist_sorts_by_masters_and_says_so() {
+    let mut def = definition();
+    let rule = def.plugin_list.as_mut().unwrap();
+    rule.semantics = Some("creation_engine".into());
+    rule.loot = Some(LootRule {
+        masterlist_repo: "loot/skyrimse".into(),
+        prelude_repo: None,
+        branch: "v0.29".into(),
+        game_type: "SkyrimSE".into(),
+    });
+    let h = Harness::with_definition(def);
+    let inst = h.instance("corrupt-masterlist");
+    h.deploy(&inst);
+    let dir = h.ctx.paths.root().join("loot").join("test-game");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("masterlist.yaml"),
+        b"plugins: [unclosed
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("masterlist.json"),
+        br#"{"fetched_at":"2026-01-01T00:00:00Z","source_url":"old","commit_sha":"old","blob_sha":"old"}"#,
+    )
+    .unwrap();
+
+    let (report, _order) =
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, true).unwrap();
+    assert_eq!(report.mode, SortMode::Masters);
+    assert_eq!(
+        report.message.as_deref(),
+        Some(game_load_order::CACHED_MASTERLIST_UNREADABLE)
+    );
+}
+
+#[test]
+fn loot_messages_appear_on_the_first_list_read_when_a_masterlist_is_saved() {
+    let mut def = engine_definition(&[]);
+    def.plugin_list.as_mut().unwrap().loot = Some(LootRule {
+        masterlist_repo: "loot/skyrimse".into(),
+        prelude_repo: None,
+        branch: "v0.29".into(),
+        game_type: "SkyrimSE".into(),
+    });
+    let h = Harness::with_definition(def);
+    let inst = h.instance("loot-notes");
+    let item = h.item("notes", &[("Data/A.esp", &plugin_file(0, &[])[..])]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    let dir = h.ctx.paths.root().join("loot").join("test-game");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("masterlist.yaml"),
+        "plugins:
+  - name: 'A.esp'
+    msg:
+      - type: warn
+        content: '<script>alert(1)</script>'
+",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("masterlist.json"),
+        br#"{"fetched_at":"2026-01-01T00:00:00Z","source_url":"old","commit_sha":"old","blob_sha":"old"}"#,
+    )
+    .unwrap();
+
+    eprintln!(
+        "cached: {:?}",
+        agora_core::loot_masterlist::cached(&h.ctx, &h.def)
+    );
+    let order = game_load_order::order(&h.ctx, &inst.instance_id, &h.def).unwrap();
+    eprintln!("notes: {:?}", order.notes);
+    let note = order
+        .notes
+        .iter()
+        .find(|note| note.plugin == "A.esp")
+        .expect("the masterlist message is on the first read");
+    assert_eq!(note.message, "<script>alert(1)</script>");
+}
+
+#[test]
 fn with_no_masterlist_sort_says_it_used_masters_only() {
     let mut def = definition();
     let rule = def.plugin_list.as_mut().unwrap();

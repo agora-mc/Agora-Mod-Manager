@@ -32,6 +32,9 @@ pub const LIGHT_PLUGIN_LIMIT: usize = 4096;
 /// What a sort says when it could not use LOOT's masterlist.
 pub const MASTERS_ONLY_MESSAGE: &str =
     "Sorted by masters only. Download LOOT's masterlist for a full sort.";
+/// What a sort says when the saved masterlist can no longer be read.
+pub const CACHED_MASTERLIST_UNREADABLE: &str =
+    "Sorted by masters only. The saved LOOT masterlist could not be read; update it to sort with LOOT.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadOrderError {
@@ -1030,13 +1033,24 @@ fn order_of_with_view(
     let listed = game_plugins::list(ctx, instance_id, definition)?;
     if is_engine(rule) {
         let (installed, names) = installed_files(ctx, instance_id, definition, rule, links)?;
-        Ok(build_order(
+        let mut order = build_order(
             rule,
             &listed.entries,
             Some(&installed),
             &names,
             listed.exists,
-        ))
+        );
+        if let (Some(loot), Ok(Some(cached))) = (
+            rule.loot.as_ref(),
+            crate::loot_masterlist::cached(ctx, definition),
+        ) {
+            if let Ok(notes) =
+                crate::loot_masterlist::notes(&order.entries, &installed, loot, &cached)
+            {
+                order.notes = notes;
+            }
+        }
+        Ok(order)
     } else {
         Ok(build_order(rule, &listed.entries, None, &[], listed.exists))
     }
@@ -1166,17 +1180,23 @@ fn sort_inner(
     let (moves, blocked) = match &rule.loot {
         Some(loot) if !duplicated && !unreadable => {
             match crate::loot_masterlist::cached(ctx, definition)? {
-                Some(cached) => {
-                    let outcome = crate::loot_masterlist::sort_and_notes(
-                        &entries, &installed, loot, &cached,
-                    )?;
-                    let moves = apply_loot_order(&mut entries, &outcome.order)?;
-                    notes = outcome.notes;
-                    let fixed = Fixed::of(&entries);
-                    let blocked = blocked_of(&entries, &fixed);
-                    mode = SortMode::Loot;
-                    (moves, blocked)
-                }
+                Some(cached) => match crate::loot_masterlist::sort_and_notes(
+                    &entries, &installed, loot, &cached,
+                ) {
+                    Ok(outcome) => {
+                        let moves = apply_loot_order(&mut entries, &outcome.order)?;
+                        notes = outcome.notes;
+                        let fixed = Fixed::of(&entries);
+                        let blocked = blocked_of(&entries, &fixed);
+                        mode = SortMode::Loot;
+                        (moves, blocked)
+                    }
+                    Err(LoadOrderError::Masterlist { .. }) => {
+                        message = Some(CACHED_MASTERLIST_UNREADABLE.to_string());
+                        sort_entries(&mut entries)?
+                    }
+                    Err(error) => return Err(error),
+                },
                 None => {
                     message = Some(MASTERS_ONLY_MESSAGE.to_string());
                     sort_entries(&mut entries)?
