@@ -68,7 +68,13 @@
 //! `fileSize`, which is not guaranteed).
 
 use crate::pack_merge::{plan_pack_update_with_mod_ids, PackMergePlan};
-use agora_core::db::{list_instance_pack_files, replace_instance_pack_files, InstancePackFile};
+use agora_core::{
+    ctx::Ctx,
+    db::{list_instance_pack_files, replace_instance_pack_files, InstancePackFile},
+    helpers,
+    models::InstalledMod,
+    snapshot,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -664,7 +670,7 @@ pub fn preview_pack_update(
         theirs_side.files_needing_download = theirs_side.files_needing_download.saturating_sub(1);
     }
 
-    let manifest = agora_core::helpers::read_manifest(&instance_dir.join("instance_manifest.json"))
+    let manifest = helpers::read_manifest(&instance_dir.join("instance_manifest.json"))
         .map_err(|e| format!("cannot read instance manifest: {e}"))?;
 
     // Mod-id identity channel. THEIRS uses the Modrinth project id from the CDN
@@ -816,7 +822,7 @@ fn hash_staged_file(staged_dir: &Path, logical: &str) -> Result<String, String> 
     Ok(sha2_256_hex(&bytes))
 }
 
-fn matches_mod_id(entry: &agora_core::models::InstalledMod, mod_id: &str) -> bool {
+fn matches_mod_id(entry: &InstalledMod, mod_id: &str) -> bool {
     entry
         .modrinth_id
         .as_deref()
@@ -839,7 +845,7 @@ fn matches_mod_id(entry: &agora_core::models::InstalledMod, mod_id: &str) -> boo
 /// references were still live.
 fn all_entries_mut(
     manifest: &mut agora_core::models::InstanceManifest,
-) -> impl Iterator<Item = &mut agora_core::models::InstalledMod> {
+) -> impl Iterator<Item = &mut InstalledMod> {
     manifest
         .mods
         .iter_mut()
@@ -853,7 +859,7 @@ fn all_entries_mut(
 ///
 /// `None` means "any bucket"; the caller only narrows when the plan told it
 /// which content type the path belongs to.
-fn entry_in_bucket(entry: &agora_core::models::InstalledMod, ct: Option<&str>) -> bool {
+fn entry_in_bucket(entry: &InstalledMod, ct: Option<&str>) -> bool {
     // `content_type_for_logical` yields exactly the strings the manifest stores
     // in `InstalledMod.content_type`, so a direct comparison is the same test
     // the array-per-bucket version made.
@@ -867,7 +873,7 @@ fn find_by_filename_mut<'a>(
     manifest: &'a mut agora_core::models::InstanceManifest,
     filename: &str,
     ct: Option<&str>,
-) -> Option<&'a mut agora_core::models::InstalledMod> {
+) -> Option<&'a mut InstalledMod> {
     all_entries_mut(manifest).find(|entry| entry.filename == filename && entry_in_bucket(entry, ct))
 }
 
@@ -881,7 +887,7 @@ fn find_entry_mut<'a>(
     mod_id: Option<&str>,
     filename: &str,
     ct: Option<&str>,
-) -> Option<&'a mut agora_core::models::InstalledMod> {
+) -> Option<&'a mut InstalledMod> {
     // Decide *which* entry to return using immutable borrows, then take the
     // single mutable borrow the caller asked for.
     let by_mod_id = mod_id.and_then(|wanted| {
@@ -1082,7 +1088,7 @@ fn build_pack_entry(
     ct: &str,
     theirs: &MrpackTheirs,
     staged_dir: &Path,
-) -> Result<agora_core::models::InstalledMod, String> {
+) -> Result<InstalledMod, String> {
     let modrinth_id = theirs.mod_ids.get(logical_path).cloned();
     let source_url = theirs.download_urls.get(logical_path).cloned();
     let staged_path = safe_join(staged_dir, logical_path)?;
@@ -1092,7 +1098,7 @@ fn build_pack_entry(
         agora_core::dependency_ops::JarDeps::default()
     };
     let mod_jar_id = jar.mod_jar_id.clone().or_else(|| modrinth_id.clone());
-    Ok(agora_core::models::InstalledMod {
+    Ok(InstalledMod {
         hash_verified: true,
         provider: None,
         filename,
@@ -1129,9 +1135,9 @@ fn build_pack_entry(
 fn push_pack_entry(
     manifest: &mut agora_core::models::InstanceManifest,
     ct: &str,
-    installed: agora_core::models::InstalledMod,
+    installed: InstalledMod,
 ) {
-    let arr: &mut Vec<agora_core::models::InstalledMod> = match ct {
+    let arr: &mut Vec<InstalledMod> = match ct {
         "resourcepack" => &mut manifest.resourcepacks,
         "shader" => &mut manifest.shaders,
         "datapack" => &mut manifest.datapacks,
@@ -1365,7 +1371,7 @@ pub fn reconcile_manifest(
                         agora_core::dependency_ops::JarDeps::default()
                     };
                     let mod_jar_id = jar.mod_jar_id.clone().or_else(|| modrinth_id.clone());
-                    let installed = agora_core::models::InstalledMod {
+                    let installed = InstalledMod {
                         provider: None,
                         filename: new_filename,
                         registry_id: None,
@@ -1395,7 +1401,7 @@ pub fn reconcile_manifest(
                         content_item_id: None,
                         object_sha256: None,
                     };
-                    let arr: &mut Vec<agora_core::models::InstalledMod> = match ct {
+                    let arr: &mut Vec<InstalledMod> = match ct {
                         "resourcepack" => &mut new.resourcepacks,
                         "shader" => &mut new.shaders,
                         "datapack" => &mut new.datapacks,
@@ -1424,7 +1430,9 @@ pub fn reconcile_manifest(
 ///
 /// `resolutions` maps every conflicting key to how it was settled. A plan with an
 /// unresolved conflict is rejected rather than guessed at.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_merge(
+    ctx: Option<&Ctx>,
     conn: &rusqlite::Connection,
     instance_id: &str,
     instance_dir: &Path,
@@ -1500,28 +1508,22 @@ pub fn apply_merge(
     // overrides reach `defaultconfigs/` or `kubejs/` — or any root a future
     // pack format introduces — is covered because the plan says so.
     let planned_writes = planned_write_paths(plan, resolutions);
-    let scope = agora_core::snapshot::recovery_scope_for_writes(
-        agora_core::snapshot::default_tracked_entries(),
+    let scope = snapshot::recovery_scope_for_writes(
+        snapshot::default_tracked_entries(),
         planned_writes.iter().map(String::as_str),
     )?;
     let scope_refs: Vec<&str> = scope.iter().map(String::as_str).collect();
     // Belt and braces: if the derivation ever misses something, fail here,
     // before any live file is touched, rather than after.
-    let uncovered = agora_core::snapshot::uncovered_writes(
-        &scope_refs,
-        planned_writes.iter().map(String::as_str),
-    )?;
+    let uncovered =
+        snapshot::uncovered_writes(&scope_refs, planned_writes.iter().map(String::as_str))?;
     if !uncovered.is_empty() {
         return Err(format!(
             "refusing to apply: these paths would be written but could not be rolled back: {}",
             uncovered.join(", ")
         ));
     }
-    let snapshot = agora_core::snapshot::create_snapshot_scoped(
-        instance_dir,
-        Some("pack-merge"),
-        &scope_refs,
-    )?;
+    let snapshot = snapshot::create_snapshot_scoped(instance_dir, Some("pack-merge"), &scope_refs)?;
 
     // Everything that can leave the instance inconsistent belongs inside this
     // closure, because everything inside it is undone by the snapshot restore
@@ -1530,12 +1532,19 @@ pub fn apply_merge(
     // so the next update would diff against a baseline that never existed and
     // read the whole previous update as the user's own edits.
     let apply_result = (|| -> Result<(), String> {
+        let mut stored: BTreeMap<String, crate::content_bridge::StoredFile> = BTreeMap::new();
         for action in &plan.actions {
-            apply_one_action(instance_dir, staged_dir, action)?;
+            if let Some((path, file)) = apply_one_action(ctx, instance_dir, staged_dir, action)? {
+                stored.insert(path, file);
+            }
         }
         for conflict in &plan.conflicts {
             if resolutions.get(&conflict.key) == Some(&ConflictResolution::TakeTheirs) {
-                apply_theirs_for_conflict(instance_dir, staged_dir, conflict)?;
+                if let Some((path, file)) =
+                    apply_theirs_for_conflict(ctx, instance_dir, staged_dir, conflict)?
+                {
+                    stored.insert(path, file);
+                }
             }
             // KeepOurs: no change.
         }
@@ -1551,10 +1560,13 @@ pub fn apply_merge(
         // Reconciled manifest write is inside the protected region so the
         // snapshot's `instance_manifest.json` coverage makes rollback free.
         let mut manifest_to_write = reconciled_manifest.clone();
+        for (path, file) in &stored {
+            stamp_stored_file(&mut manifest_to_write, path, file);
+        }
         if let Some(origin) = manifest_to_write.pack_origin.as_mut() {
             origin.pack_content_hash = Some(crate::pack_inventory::pack_content_hash(&baseline));
         }
-        agora_core::helpers::atomic_write_manifest(
+        helpers::atomic_write_manifest(
             &instance_dir.join("instance_manifest.json"),
             &manifest_to_write,
         )
@@ -1568,23 +1580,35 @@ pub fn apply_merge(
         // that an existing recovery point no longer describes the instance;
         // without it a merge is invisible to that check and a stale pre-launch
         // snapshot stays eligible for reuse.
-        agora_core::snapshot::mark_instance_mutated(instance_dir)?;
+        snapshot::mark_instance_mutated(instance_dir)?;
         Ok(())
     })();
 
     if let Err(error) = apply_result {
-        let restore = agora_core::snapshot::restore_snapshot(instance_dir, &snapshot.id);
+        let restore = snapshot::restore_snapshot(instance_dir, &snapshot.id);
         return match restore {
-            Ok(outcome) => Err(match outcome.coverage {
-                agora_core::snapshot::RestoreCoverageKind::Exact => format!(
-                    "merge apply failed and the pre-merge snapshot was restored: {error}"
-                ),
-                agora_core::snapshot::RestoreCoverageKind::LegacyPartial => format!(
-                    "merge apply failed and the pre-merge snapshot was restored, but it predates scoped \
-                     snapshots so roots outside {:?} were left as they are: {error}",
-                    outcome.restored_roots
-                ),
-            }),
+            Ok(outcome) => {
+                // The snapshot restores copies. Put back the store links for everything the
+                // update did not have to change, so a failed merge leaves the instance as it
+                // was (bytes, manifest and placement) in the user's current placement mode.
+                let relink_note = match ctx {
+                    Some(ctx) => crate::content_bridge::relink_recorded_content(ctx, instance_dir)
+                        .err()
+                        .map(|e| format!("; restoring store placements failed: {e}"))
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
+                Err(match outcome.coverage {
+                    snapshot::RestoreCoverageKind::Exact => format!(
+                        "merge apply failed and the pre-merge snapshot was restored: {error}{relink_note}"
+                    ),
+                    snapshot::RestoreCoverageKind::LegacyPartial => format!(
+                        "merge apply failed and the pre-merge snapshot was restored, but it predates scoped \
+                         snapshots so roots outside {:?} were left as they are: {error}{relink_note}",
+                        outcome.restored_roots
+                    ),
+                })
+            }
             Err(restore_error) => Err(format!(
                 "merge apply failed and automatic restore could not complete; original state is protected in recovery storage. apply: {error}; restore: {restore_error}"
             )),
@@ -1646,44 +1670,65 @@ fn planned_write_paths(
 }
 
 fn apply_one_action(
+    ctx: Option<&Ctx>,
     instance_dir: &Path,
     staged_dir: &Path,
     action: &crate::pack_merge::PlanAction,
-) -> Result<(), String> {
+) -> Result<Option<(String, crate::content_bridge::StoredFile)>, String> {
     match action.kind.as_str() {
-        "keep" | "keep_user_added" => Ok(()),
+        "keep" | "keep_user_added" => Ok(None),
         "remove" => {
             let dest = safe_join(instance_dir, &action.target_path)?;
             if dest.exists() {
-                remove_file(&dest)?;
+                refuse_if_changed(&dest, action.ours_sha.as_deref(), &action.target_path)?;
+                remove_instance_file(instance_dir, &dest)?;
             }
-            Ok(())
+            Ok(None)
         }
         "add" | "update" | "update_keep_disabled" => {
             let src = safe_join(staged_dir, &action.logical_path)?;
             let dest = safe_join(instance_dir, &action.target_path)?;
-            copy_file(&src, &dest)
+            let was_update = action.kind.as_str() != "add";
+            replace_with_content(
+                ctx,
+                instance_dir,
+                &src,
+                &dest,
+                &action.target_path,
+                was_update,
+                action.ours_sha.as_deref(),
+            )
         }
         "rename_update" | "rename_update_keep_disabled" => {
             if let Some(previous) = &action.previous_path {
                 let prev = safe_join(instance_dir, previous)?;
                 if prev.exists() {
-                    remove_file(&prev)?;
+                    refuse_if_changed(&prev, action.ours_sha.as_deref(), previous)?;
+                    remove_instance_file(instance_dir, &prev)?;
                 }
             }
             let src = safe_join(staged_dir, &action.logical_path)?;
             let dest = safe_join(instance_dir, &action.target_path)?;
-            copy_file(&src, &dest)
+            replace_with_content(
+                ctx,
+                instance_dir,
+                &src,
+                &dest,
+                &action.target_path,
+                true,
+                action.ours_sha.as_deref(),
+            )
         }
         other => Err(format!("unhandled plan action kind: {other}")),
     }
 }
 
 fn apply_theirs_for_conflict(
+    ctx: Option<&Ctx>,
     instance_dir: &Path,
     staged_dir: &Path,
     conflict: &crate::pack_merge::PlanConflict,
-) -> Result<(), String> {
+) -> Result<Option<(String, crate::content_bridge::StoredFile)>, String> {
     let theirs_path = conflict.theirs_path.as_deref().ok_or_else(|| {
         format!(
             "cannot TakeTheirs for '{}': pack removed this file",
@@ -1696,11 +1741,137 @@ fn apply_theirs_for_conflict(
         if logical_path(ours_path) != logical_path(theirs_path) {
             let old = safe_join(instance_dir, ours_path)?;
             if old.exists() {
-                remove_file(&old)?;
+                refuse_if_changed(&old, conflict.ours_sha.as_deref(), ours_path)?;
+                remove_instance_file(instance_dir, &old)?;
             }
         }
     }
-    copy_file(&src, &dest)
+    replace_with_content(
+        ctx,
+        instance_dir,
+        &src,
+        &dest,
+        theirs_path,
+        true,
+        conflict.ours_sha.as_deref(),
+    )
+}
+
+/// Refuse to replace or delete a file whose bytes are no longer the ones the plan decided
+/// about. A file the user changed after the preview is theirs; the merge stops and the
+/// pre-merge snapshot is restored rather than deleting their edit.
+fn refuse_if_changed(
+    path: &Path,
+    recorded_sha256: Option<&str>,
+    shown: &str,
+) -> Result<(), String> {
+    let Some(recorded) = recorded_sha256 else {
+        return Ok(());
+    };
+    let matches = crate::content_bridge::file_matches_recorded(path, recorded)
+        .map_err(|error| error.to_string())?;
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{shown}' changed after the update was reviewed, so it was left as it is"
+        ))
+    }
+}
+
+/// Put staged bytes in place, through the shared store when the target is tracked content.
+/// Anything the plan decided to replace is removed first: a hard link to a protected store
+/// object cannot be written through, and a stale file must not make the placement fail.
+fn replace_with_content(
+    ctx: Option<&Ctx>,
+    instance_dir: &Path,
+    src: &Path,
+    dest: &Path,
+    target_path: &str,
+    was_update: bool,
+    recorded_sha256: Option<&str>,
+) -> Result<Option<(String, crate::content_bridge::StoredFile)>, String> {
+    if dest.exists() {
+        if !was_update {
+            return Err(format!(
+                "'{target_path}' appeared after the update was reviewed, so it was left as it is"
+            ));
+        }
+        refuse_if_changed(dest, recorded_sha256, target_path)?;
+        remove_instance_file(instance_dir, dest)?;
+    }
+    let stored = match ctx {
+        Some(ctx) => crate::content_bridge::store_and_place_file(
+            ctx,
+            instance_dir,
+            target_path,
+            src,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?,
+        None => None,
+    };
+    match stored {
+        Some(file) => {
+            // Fail after the write so a rollback test exercises restoring an already-mutated
+            // file rather than failing before any mutation.
+            check_failpoint("apply-one")?;
+            Ok(Some((target_path.to_string(), file)))
+        }
+        None => {
+            copy_file(src, dest)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Remove one instance file. Only a file in a content folder Agora places links in (or its own
+/// `.agora` staging/trash) can need the folder's delete-child right; a user folder such as
+/// `config/` must keep its ACL exactly as it was.
+fn remove_instance_file(instance_dir: &Path, path: &Path) -> Result<(), String> {
+    let agora_managed = path
+        .strip_prefix(instance_dir)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|first| first.as_os_str().to_str())
+        .is_some_and(|first| {
+            matches!(
+                first,
+                "mods" | "resourcepacks" | "shaderpacks" | "datapacks" | ".agora"
+            )
+        });
+    if agora_managed {
+        if let Some(folder) = path.parent() {
+            crate::content_bridge::ensure_folder_can_delete_children(folder)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    remove_file(path)
+}
+
+/// Record the store item on the manifest entry this merge just placed.
+fn stamp_stored_file(
+    manifest: &mut agora_core::models::InstanceManifest,
+    target_path: &str,
+    stored: &crate::content_bridge::StoredFile,
+) {
+    let filename = target_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(target_path);
+    let logical = filename.strip_suffix(DISABLED_SUFFIX).unwrap_or(filename);
+    let content_type = content_type_for_logical(target_path);
+    for entry in all_entries_mut(manifest) {
+        if entry.filename == logical
+            && content_type.is_none_or(|wanted| entry.content_type == wanted)
+        {
+            entry.content_item_id = Some(stored.item_id.clone());
+            entry.object_sha256 = Some(stored.sha256.clone());
+            entry.sha256 = stored.sha256.clone();
+            break;
+        }
+    }
 }
 
 fn copy_file(src: &Path, dest: &Path) -> Result<(), String> {
@@ -1797,6 +1968,7 @@ pub enum PackUpdateOutcome {
 /// already unhealthy.
 #[allow(clippy::too_many_arguments)]
 pub fn update_pack<F: PackFileFetcher>(
+    ctx: Option<&Ctx>,
     conn: &rusqlite::Connection,
     instance_id: &str,
     instance_dir: &Path,
@@ -1853,7 +2025,7 @@ pub fn update_pack<F: PackFileFetcher>(
     };
 
     let manifest_path = instance_dir.join("instance_manifest.json");
-    let old_manifest = match agora_core::helpers::read_manifest(&manifest_path) {
+    let old_manifest = match helpers::read_manifest(&manifest_path) {
         Ok(manifest) => manifest,
         Err(error) => return failed("manifest", error.to_string()),
     };
@@ -1869,6 +2041,7 @@ pub fn update_pack<F: PackFileFetcher>(
     };
 
     let outcome = match apply_merge(
+        ctx,
         conn,
         instance_id,
         instance_dir,
@@ -1985,6 +2158,7 @@ pub fn apply_pack_update(
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|e| e.to_string())?;
     let outcome = update_pack(
+        Some(ctx),
         &conn,
         &sanitized,
         instance_dir,
@@ -2166,11 +2340,7 @@ mod tests {
         write_manifest_with_mods(instance_dir, id, vec![]);
     }
 
-    fn write_manifest_with_mods(
-        instance_dir: &Path,
-        id: &str,
-        mods: Vec<agora_core::models::InstalledMod>,
-    ) {
+    fn write_manifest_with_mods(instance_dir: &Path, id: &str, mods: Vec<InstalledMod>) {
         let m = agora_core::models::InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
             game_data: Default::default(),
@@ -2510,8 +2680,7 @@ mod tests {
 
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
-        let old_manifest =
-            agora_core::helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: theirs.clone(),
             unverified: BTreeSet::new(),
@@ -2535,6 +2704,7 @@ mod tests {
         )
         .unwrap();
         let outcome = apply_merge(
+            None,
             &conn,
             "inst",
             &inst,
@@ -2596,12 +2766,12 @@ mod tests {
         // so nothing changes at all.
         let staged = tmp.path().join("staged");
         write(&staged, "config/foo.toml", b"x"); // wrong file present
-        let before = agora_core::snapshot::live_file_index(&inst).unwrap();
+        let before = snapshot::live_file_index(&inst).unwrap();
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
-        let old_manifest =
-            agora_core::helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let err = apply_merge(
+            None,
             &conn,
             "inst",
             &inst,
@@ -2613,7 +2783,7 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("staged file missing"));
         assert_eq!(
-            agora_core::snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst).unwrap(),
             before,
             "no mutation before the mandatory snapshot"
         );
@@ -2645,8 +2815,7 @@ mod tests {
         let staged = tmp.path().join("empty-stage");
         std::fs::create_dir_all(&staged).unwrap();
 
-        let old_manifest =
-            agora_core::helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: base.clone(),
             unverified: BTreeSet::new(),
@@ -2670,6 +2839,7 @@ mod tests {
         )
         .unwrap();
         let error = apply_merge(
+            None,
             &conn,
             "inst",
             &inst,
@@ -2711,9 +2881,8 @@ mod tests {
 
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
-        let before = agora_core::snapshot::live_metadata_fingerprint(&inst).unwrap();
-        let old_manifest =
-            agora_core::helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let before = snapshot::live_metadata_fingerprint(&inst).unwrap();
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: theirs.clone(),
             unverified: BTreeSet::new(),
@@ -2737,6 +2906,7 @@ mod tests {
         )
         .unwrap();
         apply_merge(
+            None,
             &conn,
             "inst",
             &inst,
@@ -2746,7 +2916,7 @@ mod tests {
             &reconciled,
         )
         .unwrap();
-        let after = agora_core::snapshot::live_metadata_fingerprint(&inst).unwrap();
+        let after = snapshot::live_metadata_fingerprint(&inst).unwrap();
         assert_ne!(
             before, after,
             "a merge must be visible to the pre-launch snapshot reuse check"
@@ -2780,8 +2950,7 @@ mod tests {
         // A connection with no `user_instances` row: the FK on
         // instance_pack_files rejects the baseline write.
         let (conn, _dbtmp) = test_conn();
-        let old_manifest =
-            agora_core::helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: theirs.clone(),
             unverified: BTreeSet::new(),
@@ -2805,6 +2974,7 @@ mod tests {
         )
         .unwrap();
         let error = apply_merge(
+            None,
             &conn,
             "inst",
             &inst,
@@ -2848,13 +3018,12 @@ mod tests {
         let staged = tmp.path().join("staged");
         write(&staged, "mods/a.jar", b"a-new");
 
-        let before = agora_core::snapshot::live_file_index(&inst).unwrap();
+        let before = snapshot::live_file_index(&inst).unwrap();
         // Inject a failure after one file has been applied.
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
-        let old_manifest =
-            agora_core::helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: theirs.clone(),
             unverified: BTreeSet::new(),
@@ -2878,6 +3047,7 @@ mod tests {
         )
         .unwrap();
         let err = apply_merge(
+            None,
             &conn,
             "inst",
             &inst,
@@ -2894,7 +3064,7 @@ mod tests {
             "apply must restore on failure: {err}"
         );
         assert_eq!(
-            agora_core::snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst).unwrap(),
             before,
             "instance must be exactly as it was before the merge"
         );
@@ -2937,12 +3107,11 @@ mod tests {
             b"from-the-pack",
         );
 
-        let before = agora_core::snapshot::live_file_index(&inst).unwrap();
+        let before = snapshot::live_file_index(&inst).unwrap();
         PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
         let (conn, _dbtmp) = test_conn();
         seed_instance_row(&conn, "inst");
-        let old_manifest =
-            agora_core::helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
         let theirs_struct = MrpackTheirs {
             files: theirs.clone(),
             unverified: BTreeSet::new(),
@@ -2966,6 +3135,7 @@ mod tests {
         )
         .unwrap();
         let err = apply_merge(
+            None,
             &conn,
             "inst",
             &inst,
@@ -2987,7 +3157,7 @@ mod tests {
             "the override root was written but not rolled back"
         );
         assert_eq!(
-            agora_core::snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst).unwrap(),
             before,
             "instance must be exactly as it was before the merge"
         );
@@ -3084,6 +3254,7 @@ mod tests {
         );
 
         let outcome = update_pack(
+            None,
             &conn,
             "inst",
             &inst,
@@ -3144,7 +3315,7 @@ mod tests {
             dependencies,
         );
 
-        let before_files = agora_core::snapshot::live_file_index(&inst).unwrap();
+        let before_files = snapshot::live_file_index(&inst).unwrap();
         let before_manifest = fs::read(inst.join("instance_manifest.json")).unwrap();
         let before_runtime = agora_core::db::get_instance(&conn, "inst")
             .unwrap()
@@ -3162,6 +3333,7 @@ mod tests {
         let staged = tmp.path().join("staged");
 
         let outcome = update_pack(
+            None,
             &conn,
             "inst",
             &inst,
@@ -3186,7 +3358,7 @@ mod tests {
             other => panic!("expected runtime rejection, got {other:?}"),
         }
         assert_eq!(
-            agora_core::snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst).unwrap(),
             before_files,
             "runtime rejection must not mutate instance files"
         );
@@ -3270,7 +3442,7 @@ mod tests {
             vec![],
             vec![("overrides/config/preview.toml", b"preview".as_slice())],
         );
-        let before_files = agora_core::snapshot::live_file_index(&inst).unwrap();
+        let before_files = snapshot::live_file_index(&inst).unwrap();
         let before_manifest = fs::read(inst.join("instance_manifest.json")).unwrap();
 
         let preview = preview_pack_update(&conn, "inst", &inst, &mrpack).unwrap();
@@ -3281,7 +3453,7 @@ mod tests {
         assert_eq!(serialized["runtimeRequirement"]["loader"], "fabric");
         assert_eq!(serialized["runtimeRequirement"]["loaderVersion"], "0.15.0");
         assert_eq!(
-            agora_core::snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst).unwrap(),
             before_files,
             "preview must not mutate the instance"
         );
@@ -3328,7 +3500,7 @@ mod tests {
         // A pack-installed sodium recorded in the manifest (modrinth_id "abc"),
         // with on-disk content at hash A.
         let old_bytes = b"old-sodium";
-        let sodium = agora_core::models::InstalledMod {
+        let sodium = InstalledMod {
             provider: None,
             filename: "sodium-0.5.jar".into(),
             registry_id: None,
@@ -3463,7 +3635,7 @@ mod tests {
         // New packmod content in staged
         write(&staged, "mods/packmod.jar", b"new-pack-content");
 
-        let user_mod = agora_core::models::InstalledMod {
+        let user_mod = InstalledMod {
             provider: None,
             filename: "usermod.jar".into(),
             registry_id: Some("my-reg".into()),
@@ -3489,7 +3661,7 @@ mod tests {
             content_item_id: None,
             object_sha256: None,
         };
-        let pack_mod = agora_core::models::InstalledMod {
+        let pack_mod = InstalledMod {
             provider: None,
             filename: "packmod.jar".into(),
             registry_id: None,
@@ -3625,7 +3797,7 @@ mod tests {
         fs::create_dir_all(staged.join("mods")).unwrap();
         write(&staged, "mods/newname.jar", b"new-bytes");
 
-        let old_entry = agora_core::models::InstalledMod {
+        let old_entry = InstalledMod {
             provider: None,
             filename: "oldname.jar".into(),
             registry_id: None,
@@ -3726,7 +3898,7 @@ mod tests {
         fs::create_dir_all(staged.join("mods")).unwrap();
         write(&staged, "mods/disabled.jar", b"new-content");
 
-        let old_entry = agora_core::models::InstalledMod {
+        let old_entry = InstalledMod {
             provider: None,
             filename: "disabled.jar".into(),
             registry_id: None,
@@ -3815,9 +3987,7 @@ mod tests {
         assert!(entry.pack_managed);
     }
 
-    fn bare_manifest(
-        mods: Vec<agora_core::models::InstalledMod>,
-    ) -> agora_core::models::InstanceManifest {
+    fn bare_manifest(mods: Vec<InstalledMod>) -> agora_core::models::InstanceManifest {
         agora_core::models::InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
             game_data: Default::default(),
@@ -3892,8 +4062,9 @@ mod tests {
             vec![("config/foo.toml", b"pack changed it too".as_slice())],
         );
 
-        let before = agora_core::snapshot::live_file_index(&inst).unwrap();
+        let before = snapshot::live_file_index(&inst).unwrap();
         let outcome = update_pack(
+            None,
             &conn,
             "inst",
             &inst,
@@ -3910,7 +4081,7 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(
-            agora_core::snapshot::live_file_index(&inst).unwrap(),
+            snapshot::live_file_index(&inst).unwrap(),
             before,
             "a refusal must not touch the instance"
         );
@@ -3964,7 +4135,7 @@ mod tests {
         let staged = tmp.path().join("staged");
         write(&staged, "mods/stray.jar", b"not in the plan");
 
-        let user_mod = agora_core::models::InstalledMod {
+        let user_mod = InstalledMod {
             provider: None,
             filename: "mine.jar".into(),
             registry_id: None,
@@ -4089,7 +4260,7 @@ mod tests {
         let staged = tmp.path().join("staged");
         fs::create_dir_all(&staged).unwrap();
 
-        let keep = agora_core::models::InstalledMod {
+        let keep = InstalledMod {
             provider: None,
             filename: "keep.jar".into(),
             registry_id: None,
@@ -4115,7 +4286,7 @@ mod tests {
             content_item_id: None,
             object_sha256: None,
         };
-        let remove = agora_core::models::InstalledMod {
+        let remove = InstalledMod {
             provider: None,
             filename: "remove.jar".into(),
             registry_id: None,
@@ -4289,7 +4460,7 @@ mod tests {
         fs::create_dir_all(staged.join("mods")).unwrap();
         write(&staged, "mods/conflict.jar", b"theirs-bytes");
 
-        let old_entry = agora_core::models::InstalledMod {
+        let old_entry = InstalledMod {
             provider: None,
             filename: "conflict.jar".into(),
             registry_id: None,
@@ -4393,5 +4564,546 @@ mod tests {
             .unwrap();
         assert_eq!(taken_entry.sha256, sha2_256_hex(b"theirs-bytes"));
         assert!(taken_entry.enabled);
+    }
+
+    // ---- Merges through the shared content store --------------------------
+
+    fn store_ctx(tmp: &TempDir) -> Ctx {
+        let ctx = crate::testing_context(tmp.path().join("data"));
+        ctx.paths.create_required_dirs().unwrap();
+        crate::content_bridge::init_local_state(&ctx);
+        ctx
+    }
+
+    fn linked_mod(filename: &str, stored: &crate::content_bridge::StoredFile) -> InstalledMod {
+        InstalledMod {
+            provider: None,
+            update_pinned: false,
+            pack_managed: true,
+            installed_as_dependency: false,
+            filename: filename.to_string(),
+            registry_id: None,
+            modrinth_id: None,
+            source: "modrinth-pack".into(),
+            source_url: None,
+            version: Some("1.0".into()),
+            sha256: stored.sha256.clone(),
+            hash_verified: true,
+            installed_at: chrono::Utc::now().to_rfc3339(),
+            java_packages: Vec::new(),
+            mod_jar_id: None,
+            depends_on: Vec::new(),
+            optional_deps: Vec::new(),
+            incompatible_deps: Vec::new(),
+            provided_mod_ids: Vec::new(),
+            enabled: true,
+            content_type: "mod".into(),
+            content_item_id: Some(stored.item_id.clone()),
+            object_sha256: Some(stored.sha256.clone()),
+        }
+    }
+
+    fn theirs_struct_for(theirs: Vec<InstancePackFile>) -> MrpackTheirs {
+        MrpackTheirs {
+            files: theirs,
+            unverified: BTreeSet::new(),
+            converged: BTreeSet::new(),
+            provisional_hash: BTreeMap::new(),
+            download_urls: BTreeMap::new(),
+            mod_ids: HashMap::new(),
+            files_needing_download: 0,
+            download_bytes: 0,
+            size_unknown_count: 0,
+            pack_name: "test".into(),
+            pack_version_id: None,
+            runtime_requirement: test_runtime_requirement(),
+        }
+    }
+
+    fn update_plan_and_reconcile(
+        inst: &Path,
+        base_bytes: &[u8],
+        staged: &Path,
+    ) -> (
+        PackMergePlan,
+        agora_core::models::InstanceManifest,
+        TempDir,
+        rusqlite::Connection,
+    ) {
+        let base = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha2_256_hex(base_bytes),
+            size: base_bytes.len() as u64,
+        }];
+        let theirs = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha('b'),
+            size: 1,
+        }];
+        let ours = crate::pack_inventory::collect_pack_inventory(inst).unwrap();
+        let plan = crate::pack_merge::plan_pack_update(&base, &theirs, &ours);
+        let (conn, dbtmp) = test_conn();
+        seed_instance_row(&conn, "inst");
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let reconciled = reconcile_manifest(
+            &old_manifest,
+            &plan,
+            &BTreeMap::new(),
+            &theirs_struct_for(theirs),
+            staged,
+        )
+        .unwrap();
+        (plan, reconciled, dbtmp, conn)
+    }
+
+    fn staged_update(staged_bytes: &[u8]) -> TempDir {
+        let staged = TempDir::new().unwrap();
+        write(staged.path(), "mods/packmod.jar", staged_bytes);
+        staged
+    }
+
+    #[test]
+    fn a_pack_update_replaces_a_linked_mod_and_rollback_restores_it() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        let ctx = store_ctx(&tmp);
+        let old_source = tmp.path().join("old.jar");
+        fs::write(&old_source, b"packA").unwrap();
+        let old_stored = crate::content_bridge::store_and_place_file(
+            &ctx,
+            &inst,
+            "mods/packmod.jar",
+            &old_source,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a mod is tracked content");
+        write_manifest_with_mods(&inst, "inst", vec![linked_mod("packmod.jar", &old_stored)]);
+
+        // A normal update replaces the linked file and records its new item.
+        let staged = staged_update(b"packB");
+        let (plan, reconciled, _dbtmp, conn) =
+            update_plan_and_reconcile(&inst, b"packA", staged.path());
+        assert_eq!(plan.actions.len(), 1);
+        apply_merge(
+            Some(&ctx),
+            &conn,
+            "inst",
+            &inst,
+            staged.path(),
+            &plan,
+            &BTreeMap::new(),
+            &reconciled,
+        )
+        .unwrap();
+        assert_eq!(fs::read(inst.join("mods/packmod.jar")).unwrap(), b"packB");
+        let manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let entry = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "packmod.jar")
+            .unwrap();
+        let new_object = entry
+            .object_sha256
+            .clone()
+            .expect("the new object is recorded");
+        assert!(entry.content_item_id.is_some());
+        assert_ne!(new_object, old_stored.sha256);
+        assert!(ctx.paths.content_object_path(&new_object).is_file());
+
+        // A failure after the replacement rolls back to the previous file and its entry.
+        let staged = staged_update(b"packC");
+        let (plan, reconciled, _dbtmp, conn) =
+            update_plan_and_reconcile(&inst, b"packB", staged.path());
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
+        let error = apply_merge(
+            Some(&ctx),
+            &conn,
+            "inst",
+            &inst,
+            staged.path(),
+            &plan,
+            &BTreeMap::new(),
+            &reconciled,
+        )
+        .unwrap_err();
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = None);
+        assert!(error.contains("injected pack-update failpoint"), "{error}");
+        assert_eq!(
+            fs::read(inst.join("mods/packmod.jar")).unwrap(),
+            b"packB",
+            "rollback restores the previous file"
+        );
+        let manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let entry = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "packmod.jar")
+            .unwrap();
+        assert_eq!(entry.object_sha256.as_deref(), Some(new_object.as_str()));
+        assert!(ctx.paths.content_object_path(&old_stored.sha256).is_file());
+    }
+
+    #[test]
+    fn a_pack_update_keeps_a_user_changed_file() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        let ctx = store_ctx(&tmp);
+        write(&inst, "mods/packmod.jar", b"packA");
+        let staged = staged_update(b"packB");
+        let (plan, reconciled, _dbtmp, conn) =
+            update_plan_and_reconcile(&inst, b"packA", staged.path());
+
+        // The user edits the file after the preview, before the apply.
+        write(&inst, "mods/packmod.jar", b"user edit");
+        let error = apply_merge(
+            Some(&ctx),
+            &conn,
+            "inst",
+            &inst,
+            staged.path(),
+            &plan,
+            &BTreeMap::new(),
+            &reconciled,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("changed after the update was reviewed"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(inst.join("mods/packmod.jar")).unwrap(),
+            b"user edit",
+            "the user's file is never replaced"
+        );
+    }
+
+    // ---- Review proofs (store-packs review) --------------------------------
+
+    /// Hard links to one file, counting the name asked about.
+    fn name_count(path: &Path) -> usize {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(path).unwrap().nlink() as usize
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("fsutil")
+                .args(["hardlink", "list"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "fsutil hardlink list failed");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        }
+    }
+
+    fn place_linked(
+        ctx: &Ctx,
+        inst: &Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> crate::content_bridge::StoredFile {
+        let source = inst.parent().unwrap().join(format!("src-{name}"));
+        fs::write(&source, bytes).unwrap();
+        crate::content_bridge::store_and_place_file(
+            ctx,
+            inst,
+            &format!("mods/{name}"),
+            &source,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a mod is tracked content")
+    }
+
+    #[test]
+    fn a_failed_pack_update_leaves_untouched_linked_mods_linked() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        let ctx = store_ctx(&tmp);
+        let packmod = place_linked(&ctx, &inst, "packmod.jar", b"packA");
+        let bystander = place_linked(&ctx, &inst, "bystander.jar", b"bystander bytes");
+        write_manifest_with_mods(
+            &inst,
+            "inst",
+            vec![
+                linked_mod("packmod.jar", &packmod),
+                linked_mod("bystander.jar", &bystander),
+            ],
+        );
+        let bystander_path = inst.join("mods/bystander.jar");
+        assert!(
+            name_count(&bystander_path) >= 2,
+            "precondition: the bystander is a link to its store object"
+        );
+
+        let staged = staged_update(b"packB");
+        let (plan, reconciled, _dbtmp, conn) =
+            update_plan_and_reconcile(&inst, b"packA", staged.path());
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
+        let error = apply_merge(
+            Some(&ctx),
+            &conn,
+            "inst",
+            &inst,
+            staged.path(),
+            &plan,
+            &BTreeMap::new(),
+            &reconciled,
+        )
+        .unwrap_err();
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = None);
+        assert!(error.contains("injected pack-update failpoint"), "{error}");
+
+        assert_eq!(fs::read(&bystander_path).unwrap(), b"bystander bytes");
+        let manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let entry = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "bystander.jar")
+            .unwrap();
+        assert_eq!(
+            entry.object_sha256.as_deref(),
+            Some(bystander.sha256.as_str())
+        );
+        assert!(
+            name_count(&bystander_path) >= 2,
+            "a failed update must leave a file it never touched exactly as it was (still a link), \
+             but the rollback restored the whole mods/ folder as copies"
+        );
+    }
+
+    fn apply_conflict_update(
+        inst: &Path,
+        base: Vec<InstancePackFile>,
+        theirs: Vec<InstancePackFile>,
+        staged_files: &[(&str, &[u8])],
+        resolution: ConflictResolution,
+    ) -> Result<MergeOutcome, String> {
+        let ours = crate::pack_inventory::collect_pack_inventory(inst).unwrap();
+        let plan = crate::pack_merge::plan_pack_update(&base, &theirs, &ours);
+        assert!(
+            !plan.conflicts.is_empty(),
+            "the user's change must be a conflict the user decides"
+        );
+        let staged = TempDir::new().unwrap();
+        for (rel, bytes) in staged_files {
+            write(staged.path(), rel, bytes);
+        }
+        let (conn, _dbtmp) = test_conn();
+        seed_instance_row(&conn, "inst");
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let mut resolutions = BTreeMap::new();
+        for conflict in &plan.conflicts {
+            resolutions.insert(conflict.key.clone(), resolution);
+        }
+        let reconciled = reconcile_manifest(
+            &old_manifest,
+            &plan,
+            &resolutions,
+            &theirs_struct_for(theirs),
+            staged.path(),
+        )
+        .unwrap();
+        apply_merge(
+            None,
+            &conn,
+            "inst",
+            inst,
+            staged.path(),
+            &plan,
+            &resolutions,
+            &reconciled,
+        )
+    }
+
+    #[test]
+    fn a_pack_update_keeps_a_mod_the_user_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        // Deliberately absent: the user deleted it by hand.
+        let base = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha2_256_hex(b"packA"),
+            size: 5,
+        }];
+        let theirs = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha('b'),
+            size: 5,
+        }];
+        let outcome = apply_conflict_update(
+            &inst,
+            base,
+            theirs,
+            &[("mods/packmod.jar", b"packB")],
+            ConflictResolution::KeepOurs,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !inst.join("mods/packmod.jar").exists(),
+            "today's rule: a deletion the user made stays a deletion unless they choose TakeTheirs"
+        );
+    }
+
+    #[test]
+    fn a_pack_update_keeps_a_user_replaced_mod() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        write(&inst, "mods/packmod.jar", b"my own build");
+        let base = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha2_256_hex(b"packA"),
+            size: 5,
+        }];
+        let theirs = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha('b'),
+            size: 5,
+        }];
+        let outcome = apply_conflict_update(
+            &inst,
+            base,
+            theirs,
+            &[("mods/packmod.jar", b"packB")],
+            ConflictResolution::KeepOurs,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            fs::read(inst.join("mods/packmod.jar")).unwrap(),
+            b"my own build",
+            "today's rule: a user-replaced file is a conflict, and KeepOurs keeps it"
+        );
+    }
+
+    #[test]
+    fn a_pack_update_keeps_a_user_edited_config() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        write(&inst, "config/foo.toml", b"my setting = true");
+        let base = vec![InstancePackFile {
+            relative_path: "config/foo.toml".into(),
+            sha256: sha2_256_hex(b"packA"),
+            size: 5,
+        }];
+        let theirs = vec![InstancePackFile {
+            relative_path: "config/foo.toml".into(),
+            sha256: sha('b'),
+            size: 5,
+        }];
+        let outcome = apply_conflict_update(
+            &inst,
+            base,
+            theirs,
+            &[("config/foo.toml", b"pack setting = false")],
+            ConflictResolution::KeepOurs,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            fs::read(inst.join("config/foo.toml")).unwrap(),
+            b"my setting = true",
+            "today's rule: a user-edited config is a conflict, and KeepOurs keeps the edit"
+        );
+    }
+
+    #[test]
+    fn a_failed_pack_update_restores_copies_when_sharing_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        let ctx = store_ctx(&tmp);
+        crate::content_bridge::set_sharing(&ctx, false).unwrap();
+        let packmod = place_linked(&ctx, &inst, "packmod.jar", b"packA");
+        let bystander = place_linked(&ctx, &inst, "bystander.jar", b"bystander bytes");
+        write_manifest_with_mods(
+            &inst,
+            "inst",
+            vec![
+                linked_mod("packmod.jar", &packmod),
+                linked_mod("bystander.jar", &bystander),
+            ],
+        );
+        let bystander_path = inst.join("mods/bystander.jar");
+        assert_eq!(
+            name_count(&bystander_path),
+            1,
+            "precondition: sharing off made an ordinary copy"
+        );
+
+        let staged = staged_update(b"packB");
+        let (plan, reconciled, _dbtmp, conn) =
+            update_plan_and_reconcile(&inst, b"packA", staged.path());
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
+        apply_merge(
+            Some(&ctx),
+            &conn,
+            "inst",
+            &inst,
+            staged.path(),
+            &plan,
+            &BTreeMap::new(),
+            &reconciled,
+        )
+        .unwrap_err();
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = None);
+
+        assert_eq!(fs::read(&bystander_path).unwrap(), b"bystander bytes");
+        assert_eq!(
+            name_count(&bystander_path),
+            1,
+            "with sharing off, the restored placement is a copy again"
+        );
+        let manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let entry = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "bystander.jar")
+            .unwrap();
+        assert_eq!(
+            entry.object_sha256.as_deref(),
+            Some(bystander.sha256.as_str())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removing_a_config_does_not_change_the_folder_acl() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        write(&inst, "config/foo.toml", b"user config");
+        let config_dir = inst.join("config");
+        // Strip inheritance and grant only Modify: no FILE_DELETE_CHILD, the state a user
+        // folder has when Agora has never placed a link in it.
+        let user = std::env::var("USERNAME").expect("a Windows user name");
+        let status = std::process::Command::new("icacls")
+            .arg(&config_dir)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:(OI)(CI)M"))
+            .status()
+            .expect("run icacls");
+        assert!(
+            status.success(),
+            "icacls could not set the test folder's ACL"
+        );
+        let before = crate::content_bridge::folder_grants_delete_child(&config_dir);
+        assert!(
+            !before,
+            "precondition: the config folder has no delete-child right"
+        );
+
+        remove_instance_file(&inst, &config_dir.join("foo.toml")).unwrap();
+
+        let after = crate::content_bridge::folder_grants_delete_child(&config_dir);
+        assert_eq!(
+            before, after,
+            "removing a user's config must not rewrite the config folder's ACL"
+        );
+        assert!(!config_dir.join("foo.toml").exists());
     }
 }

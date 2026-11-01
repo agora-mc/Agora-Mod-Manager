@@ -1,6 +1,5 @@
-use crate::mod_cache::ModCache;
 use crate::override_sanitizer;
-use agora_core::download;
+use agora_core::{ctx::Ctx, download};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -241,17 +240,44 @@ fn extract_verified_overrides(
     Ok(true)
 }
 
+/// Place one verified download as a tracked mod: the bytes go into the shared content store
+/// and the store links or copies the object into `mods/`, by the user's sharing choice. The
+/// old `<instance>/.cache` copy is gone; the store is the only cache now.
+fn place_downloaded_mod(
+    ctx: &Ctx,
+    instance_dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+    version: Option<&str>,
+    page_url: Option<&str>,
+) -> Result<(), String> {
+    let key = format!("mods/{filename}");
+    let stored = crate::content_bridge::store_and_place_bytes(
+        ctx,
+        instance_dir,
+        &key,
+        bytes,
+        version,
+        page_url,
+    )
+    .map_err(|error| error.to_string())?;
+    if stored.is_none() {
+        let dest = instance_dir.join("mods").join(filename);
+        std::fs::write(&dest, bytes).map_err(|e| format!("cannot write {filename:?}: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Install a simple pack (Tier 1) — just the mod list.
 ///
 /// Internal compatibility helper. Prefer [`crate::import_service::ImportService::install_pack`].
 #[doc(hidden)]
 pub async fn install_simple_pack(
+    ctx: &Ctx,
     _client: &reqwest::Client,
     manifest: &PackManifest,
     target_dir: &Path,
 ) -> Result<PackInstallResult, String> {
-    let cache_dir = target_dir.join(".cache");
-    let cache = ModCache::new(cache_dir);
     let mods_dir = target_dir.join("mods");
     std::fs::create_dir_all(&mods_dir)
         .map_err(|e| format!("Failed to create mods directory: {}", e))?;
@@ -289,15 +315,15 @@ pub async fn install_simple_pack(
                     }
                 }
 
-                let jar_path = mods_dir.join(&filename);
-                let actual_sha256 = download::sha256_hex(&data);
-
-                std::fs::write(&jar_path, &data)
-                    .map_err(|e| format!("Failed to write mod file: {}", e))?;
-
-                cache
-                    .store_jar(&jar_path, &actual_sha256)
-                    .map_err(|e| format!("Failed to cache mod: {}", e))?;
+                place_downloaded_mod(
+                    ctx,
+                    target_dir,
+                    &filename,
+                    &data,
+                    entry.version.as_deref(),
+                    Some(download_url.as_str()),
+                )
+                .map_err(|e| format!("Failed to install mod {}: {e}", entry.id))?;
 
                 mods_installed += 1;
             }
@@ -328,11 +354,12 @@ pub async fn install_simple_pack(
 /// Internal compatibility helper. Prefer [`crate::import_service::ImportService::install_pack`].
 #[doc(hidden)]
 pub async fn install_complex_pack(
+    ctx: &Ctx,
     client: &reqwest::Client,
     manifest: &PackManifest,
     target_dir: &Path,
 ) -> Result<PackInstallResult, String> {
-    let mut result = install_simple_pack(client, manifest, target_dir).await?;
+    let mut result = install_simple_pack(ctx, client, manifest, target_dir).await?;
 
     if let Some(ref overrides) = manifest.override_source {
         let extracted = download_and_extract_overrides(client, overrides, target_dir).await?;
@@ -516,5 +543,43 @@ mod tests {
             std::fs::read_to_string(target_dir.join("config/test.cfg")).unwrap(),
             "test config"
         );
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[test]
+    fn the_legacy_pack_no_longer_writes_a_cache_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::testing_context(tmp.path().join("data"));
+        ctx.paths.create_required_dirs().unwrap();
+        crate::content_bridge::init_local_state(&ctx);
+        let instance_dir = tmp.path().join("instance");
+        std::fs::create_dir_all(instance_dir.join("mods")).unwrap();
+
+        place_downloaded_mod(&ctx, &instance_dir, "legacy.jar", b"legacy jar", None, None).unwrap();
+
+        assert!(
+            !instance_dir.join(".cache").exists(),
+            "the old per-instance cache copy is gone"
+        );
+        assert_eq!(
+            std::fs::read(instance_dir.join("mods/legacy.jar")).unwrap(),
+            b"legacy jar"
+        );
+        assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert!(
+                std::fs::metadata(instance_dir.join("mods/legacy.jar"))
+                    .unwrap()
+                    .nlink()
+                    >= 2,
+                "the legacy pack links the stored object"
+            );
+        }
     }
 }

@@ -92,7 +92,7 @@ use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::models::{InstalledMod, InstanceManifest};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -726,6 +726,7 @@ pub async fn execute_migration(
         .join("staging")
         .join(format!("migration-{}", plan.fingerprint));
     let artifacts_dir = staging_dir.join("artifacts");
+    let mut stored_artifacts: BTreeMap<String, crate::content_bridge::StoredFile> = BTreeMap::new();
 
     // 2. Stage + verify every replacement artifact.
     if let Err(error) = std::fs::create_dir_all(&artifacts_dir) {
@@ -757,12 +758,32 @@ pub async fn execute_migration(
             let _ = std::fs::remove_dir_all(&staging_dir);
             return failed("staging", error);
         }
+        let stored = match crate::content_bridge::store_bytes(
+            ctx,
+            &format!(
+                "{}/{}",
+                content_subdir(&swap.content_type),
+                swap.new_filename
+            ),
+            &bytes,
+            Some(swap.target.version_number.as_str()),
+            Some(swap.target.download_url.as_str()),
+        ) {
+            Ok(stored) => stored,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                return failed("staging", error.to_string());
+            }
+        };
+        if let Some(stored) = stored {
+            stored_artifacts.insert(staging_artifact_name(swap), stored);
+        }
     }
 
     // 3. Build the future manifest (content + version fields) and serialize
     //    it before any mutation, so serialization/disk failures are free.
     let (future_manifest, future_manifest_bytes) =
-        match build_future_manifest(plan, &manifest, &artifacts_dir) {
+        match build_future_manifest(plan, &manifest, &artifacts_dir, &stored_artifacts) {
             Ok(pair) => pair,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&staging_dir);
@@ -809,7 +830,14 @@ pub async fn execute_migration(
         "instance_manifest.json.tmp.migration-{}",
         &plan.fingerprint[..16.min(plan.fingerprint.len())]
     ));
-    let applied = apply_migration_moves(plan, &instance_dir, &staging_dir, &mut journal);
+    let applied = apply_migration_moves(
+        plan,
+        ctx,
+        &instance_dir,
+        &staging_dir,
+        &stored_artifacts,
+        &mut journal,
+    );
     if let Err(error) = applied {
         let undo = undo_migration(
             &journal,
@@ -1343,6 +1371,7 @@ fn build_future_manifest(
     plan: &MigrationPlan,
     current: &InstanceManifest,
     artifacts_dir: &Path,
+    stored: &BTreeMap<String, crate::content_bridge::StoredFile>,
 ) -> Result<(InstanceManifest, Vec<u8>), String> {
     check_failpoint("prepare-manifest")?;
     let mut future = current.clone();
@@ -1363,6 +1392,7 @@ fn build_future_manifest(
             agora_core::dependency_ops::JarDeps::default()
         };
         let entry_filename = base_filename(&swap.new_filename).to_string();
+        let stored_file = stored.get(&staging_artifact_name(swap));
         let installed = InstalledMod {
             provider: None,
             update_pinned: false,
@@ -1393,8 +1423,8 @@ fn build_future_manifest(
             enabled: old.enabled,
             content_type: normalized_content_type(&swap.content_type).to_string(),
 
-            content_item_id: None,
-            object_sha256: None,
+            content_item_id: stored_file.map(|file| file.item_id.clone()),
+            object_sha256: stored_file.map(|file| file.sha256.clone()),
         };
         // Drop every stale record of this identity across all buckets (the
         // pipeline applies the same rule at `prepare_manifest`).
@@ -1430,14 +1460,16 @@ fn build_future_manifest(
 struct ApplyJournal {
     /// (trash backup path, live original path)
     removed: Vec<(PathBuf, PathBuf)>,
-    /// (live destination, staged source)
-    added: Vec<(PathBuf, PathBuf)>,
+    /// (live destination, staged source, placed from the store)
+    added: Vec<(PathBuf, PathBuf, bool)>,
 }
 
 fn apply_migration_moves(
     plan: &MigrationPlan,
+    ctx: &Ctx,
     instance_dir: &Path,
     staging_dir: &Path,
+    stored: &BTreeMap<String, crate::content_bridge::StoredFile>,
     journal: &mut ApplyJournal,
 ) -> Result<(), String> {
     let manifest_path = instance_dir.join("instance_manifest.json");
@@ -1509,9 +1541,24 @@ fn apply_migration_moves(
                 .map_err(|e| format!("failed to create content directory: {e}"))?;
         }
         check_failpoint("artifact-move")?;
-        std::fs::rename(&staged, &live)
-            .map_err(|e| format!("failed to promote {}: {e}", swap.new_filename))?;
-        journal.added.push((live, staged));
+        match stored.get(&staging_artifact_name(swap)) {
+            Some(stored) => {
+                crate::content_bridge::place_file(
+                    ctx,
+                    &stored.sha256,
+                    instance_dir,
+                    &swap.content_type,
+                    &swap.new_filename,
+                )
+                .map_err(|error| format!("failed to promote {}: {error}", swap.new_filename))?;
+                journal.added.push((live, staged, true));
+            }
+            None => {
+                std::fs::rename(&staged, &live)
+                    .map_err(|e| format!("failed to promote {}: {e}", swap.new_filename))?;
+                journal.added.push((live, staged, false));
+            }
+        }
     }
 
     // Commit through the canonical writer, including the schema upgrade backup.
@@ -1534,14 +1581,23 @@ fn undo_migration(
     commit_temp_path: &Path,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    for (live, staged) in journal.added.iter().rev() {
-        if live.exists() {
-            if let Some(parent) = staged.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(error) = std::fs::rename(live, staged) {
+    for (live, staged, placed) in journal.added.iter().rev() {
+        if !live.exists() {
+            continue;
+        }
+        if *placed {
+            // A store placement is a new directory entry; the object is the store's, so undo
+            // removes the entry rather than renaming it over the untouched staged file.
+            if let Err(error) = std::fs::remove_file(live) {
                 errors.push(format!("added {}: {error}", live.display()));
             }
+            continue;
+        }
+        if let Some(parent) = staged.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::rename(live, staged) {
+            errors.push(format!("added {}: {error}", live.display()));
         }
     }
     for (backup, original) in journal.removed.iter().rev() {
@@ -2860,6 +2916,157 @@ mod tests {
         assert_eq!(phase, "staging");
         assert!(error.contains("SHA-512 mismatch"));
         assert_untouched(&ctx, "tamper");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- Migration keeps stored links -------------------------------------
+
+    fn link_seeded_mod(
+        ctx: &Ctx,
+        instance_dir: &Path,
+        filename: &str,
+    ) -> crate::content_bridge::StoredFile {
+        let live = instance_dir.join("mods").join(filename);
+        let source = instance_dir.join(".agora").join(format!("seed-{filename}"));
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::copy(&live, &source).unwrap();
+        std::fs::remove_file(&live).unwrap();
+        let stored = crate::content_bridge::store_and_place_file(
+            ctx,
+            instance_dir,
+            &format!("mods/{filename}"),
+            &source,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a mod is tracked content");
+        let _ = std::fs::remove_file(&source);
+        stored
+    }
+
+    fn mark_linked(
+        ctx: &Ctx,
+        instance_id: &str,
+        links: &BTreeMap<String, crate::content_bridge::StoredFile>,
+    ) {
+        let mut manifest = read_manifest_of(ctx, instance_id);
+        for entry in &mut manifest.mods {
+            if let Some(stored) = links.get(&entry.filename) {
+                entry.sha256 = stored.sha256.clone();
+                entry.object_sha256 = Some(stored.sha256.clone());
+                entry.content_item_id = Some(stored.item_id.clone());
+            }
+        }
+        std::fs::write(
+            ctx.paths.instance_manifest(instance_id).unwrap(),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_migration_leaves_linked_files_linked() {
+        let (ctx, root) = context();
+        let old_a = fabric_jar("moda", "1.0", None);
+        let old_b = fabric_jar("modb", "1.0", None);
+        seed_instance(
+            &ctx,
+            "linked",
+            &[
+                Seed {
+                    filename: "moda-1.0.jar",
+                    modrinth_id: Some("proj-a"),
+                    content_type: "mod",
+                    bytes: old_a,
+                },
+                Seed {
+                    filename: "modb-1.0.jar",
+                    modrinth_id: Some("proj-b"),
+                    content_type: "mod",
+                    bytes: old_b,
+                },
+            ],
+            |_, _| {},
+        );
+        let dir = ctx.paths.instance_dir("linked").unwrap();
+        let stored_a = link_seeded_mod(&ctx, &dir, "moda-1.0.jar");
+        let stored_b = link_seeded_mod(&ctx, &dir, "modb-1.0.jar");
+        mark_linked(
+            &ctx,
+            "linked",
+            &BTreeMap::from([
+                ("moda-1.0.jar".to_string(), stored_a.clone()),
+                ("modb-1.0.jar".to_string(), stored_b.clone()),
+            ]),
+        );
+
+        let new_a = fabric_jar("moda", "2.0", None);
+        let new_b = fabric_jar("modb", "2.0", None);
+        let build_a = target_build("moda-2.0.jar", "2.0", &new_a);
+        let build_b = target_build("modb-2.0.jar", "2.0", &new_b);
+        let checker = MockChecker::new()
+            .ready_with_build("proj-a", build_a.clone())
+            .ready_with_build("proj-b", build_b.clone());
+        let provisioner = MockProvisioner::ok();
+        let fetcher = MockFetcher::new()
+            .with(&build_a, new_a.clone())
+            .with(&build_b, new_b.clone());
+        let outcome = migrate_instance(
+            &ctx,
+            "linked",
+            TARGET_MC,
+            &services(&checker, &provisioner, &fetcher),
+            false,
+        )
+        .await;
+        let MigrationOutcome::Migrated { .. } = outcome else {
+            panic!("expected Migrated, got {outcome:?}");
+        };
+
+        let manifest = read_manifest_of(&ctx, "linked");
+        let replaced = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "moda-2.0.jar")
+            .expect("the replacement is installed");
+        let new_object = replaced
+            .object_sha256
+            .clone()
+            .expect("the replacement goes through the store");
+        assert!(replaced.content_item_id.is_some());
+        assert!(ctx.paths.content_object_path(&new_object).is_file());
+        assert_ne!(new_object, stored_a.sha256);
+
+        // Every replacement is a link to its store object, never a plain copy.
+        let replaced_b = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "modb-2.0.jar")
+            .expect("the second replacement is installed");
+        let new_b_object = replaced_b
+            .object_sha256
+            .clone()
+            .expect("the replacement goes through the store");
+        assert!(replaced_b.content_item_id.is_some());
+        assert_ne!(new_b_object, stored_b.sha256);
+        assert!(ctx.paths.content_object_path(&new_b_object).is_file());
+        // The old linked objects are untouched; migration never rewrites them.
+        assert!(ctx.paths.content_object_path(&stored_a.sha256).is_file());
+        assert!(ctx.paths.content_object_path(&stored_b.sha256).is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            for name in ["moda-2.0.jar", "modb-2.0.jar"] {
+                assert!(
+                    std::fs::metadata(dir.join("mods").join(name))
+                        .unwrap()
+                        .nlink()
+                        >= 2,
+                    "{name} stays a link to its object"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 }

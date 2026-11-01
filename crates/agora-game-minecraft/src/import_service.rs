@@ -529,6 +529,7 @@ impl ImportService {
             request.source.clone(),
             request.symlink_saves,
         );
+        let blocking_ctx = self.ctx.clone();
         let blocking_sink = sink.clone();
         let blocking_operation_id = op_id.clone();
 
@@ -549,12 +550,14 @@ impl ImportService {
                 name_override.as_deref(),
                 skip_unfetchable,
                 install_anyway,
+                Some(&blocking_ctx),
             ),
             ImportSource::PrismZip(path) => crate::import::import_prism_zip_named(
                 &path,
                 &blocking_instances_root,
                 blocking_symlink,
                 name_override.as_deref(),
+                Some(&blocking_ctx),
             ),
             ImportSource::Directory(path) => crate::import::import_directory_named(
                 &path,
@@ -571,17 +574,20 @@ impl ImportService {
                 &pack,
                 &blocking_instances_root,
                 name_override.as_deref(),
+                Some(&blocking_ctx),
             ),
             ImportSource::TechnicZip(pack) => crate::import::import_technic_zip_pack(
                 &pack,
                 &blocking_instances_root,
                 override_policy,
                 name_override.as_deref(),
+                Some(&blocking_ctx),
             ),
             ImportSource::ProviderPack(pack) => crate::import::import_provider_pack(
                 &pack,
                 &blocking_instances_root,
                 name_override.as_deref(),
+                Some(&blocking_ctx),
             ),
         })
         .await
@@ -1009,9 +1015,11 @@ impl ImportService {
 
         let client = reqwest::Client::new();
         let result = if manifest.override_source.is_some() {
-            crate::pack_install::install_complex_pack(&client, &manifest, &instance_dir).await
+            crate::pack_install::install_complex_pack(&self.ctx, &client, &manifest, &instance_dir)
+                .await
         } else {
-            crate::pack_install::install_simple_pack(&client, &manifest, &instance_dir).await
+            crate::pack_install::install_simple_pack(&self.ctx, &client, &manifest, &instance_dir)
+                .await
         };
         match result {
             Ok(r) => {
