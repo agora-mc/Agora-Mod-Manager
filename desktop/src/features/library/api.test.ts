@@ -9,6 +9,7 @@ import {
   instancesForItem,
   listLibrary,
   listLibraryInstances,
+  loadLibraryIcon,
   searchLibrary,
   type LibraryItem,
 } from './api';
@@ -21,7 +22,6 @@ const first: LibraryItem = {
   gameId: 'minecraft',
   pageUrl: null,
   iconSha256: null,
-  iconDataUrl: null,
   sourceKind: 'file',
   sourceLabel: 'File: first.jar',
   instances: [],
@@ -102,6 +102,32 @@ describe('addLibraryItem', () => {
     await expect(addLibraryItem(second, skyrimInstance)).resolves.toEqual({
       status: 'needs_installer',
     });
+  });
+});
+
+describe('loadLibraryIcon', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('reads one icon by hash and keeps it for the session', async () => {
+    const hash = 'd'.repeat(64);
+    const dataUrl = 'data:image/png;base64,AAAA';
+    invokeMock.mockResolvedValue(dataUrl);
+    await expect(loadLibraryIcon(hash)).resolves.toBe(dataUrl);
+    await expect(loadLibraryIcon(hash)).resolves.toBe(dataUrl);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith('games_library_icon', { sha256: hash });
+  });
+
+  it('treats a reply that is not an image as no icon', async () => {
+    invokeMock.mockResolvedValue('not an image');
+    await expect(loadLibraryIcon('e'.repeat(64))).resolves.toBeNull();
+  });
+
+  it('treats a failed read as no icon', async () => {
+    invokeMock.mockRejectedValue({ code: 'core_failed', message: 'damaged' });
+    await expect(loadLibraryIcon('f'.repeat(64))).resolves.toBeNull();
   });
 });
 

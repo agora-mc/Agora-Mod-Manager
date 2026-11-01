@@ -15,7 +15,6 @@ const item = {
   gameId: 'minecraft',
   pageUrl: null,
   iconSha256: null,
-  iconDataUrl: null,
   sourceKind: 'file',
   sourceLabel: 'File: saved.jar',
   instances: [],
@@ -43,6 +42,7 @@ const BOOT_REPLIES = {
     instances: [{ instanceId: 'mc1', name: 'My Minecraft', gameId: 'minecraft' }],
     warnings: [],
   },
+  games_library_icon: null,
   minecraft_add_stored_content: {},
 };
 

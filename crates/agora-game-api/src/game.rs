@@ -1356,12 +1356,17 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 // Thunderstore Package Support (BepInEx)
 // ---------------------------------------------------------------------------
 
-/// The fields of a Thunderstore `manifest.json` that placement needs. Parsing it is the caller's
-/// job (core, with a parser that bounds nesting); other fields are ignored.
+/// The fields of a Thunderstore `manifest.json` that placement and the library need. Parsing it is
+/// the caller's job (core, with a parser that bounds nesting); other fields are ignored.
+///
+/// `description` is the author's short package description (250 characters max), not Agora's own
+/// mapping text. Source: <https://wiki.thunderstore.io/mods/creating-a-package#description>.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThunderstoreManifest {
     pub name: String,
     pub version_number: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub dependencies: Vec<String>,
 }
 

@@ -23,6 +23,7 @@ import {
   libraryGames,
   listLibrary,
   listLibraryInstances,
+  loadLibraryIcon,
   searchLibrary,
   type LibraryInstance,
   type LibraryItem,
@@ -46,10 +47,26 @@ function gameLabel(gameId: string): string {
 }
 
 function LibraryIcon({ item }: { item: LibraryItem }) {
-  if (item.iconDataUrl) {
+  const [iconSrc, setIconSrc] = useState<string | null>(null);
+
+  // The listing carries only the hash; the bytes are read when this row renders.
+  useEffect(() => {
+    let cancelled = false;
+    setIconSrc(null);
+    if (item.iconSha256) {
+      void loadLibraryIcon(item.iconSha256).then((src) => {
+        if (!cancelled && src) setIconSrc(src);
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [item.iconSha256]);
+
+  if (iconSrc) {
     return (
       <img
-        src={item.iconDataUrl}
+        src={iconSrc}
         alt=""
         aria-hidden="true"
         className="h-12 w-12 shrink-0 rounded-lg border border-border object-cover"

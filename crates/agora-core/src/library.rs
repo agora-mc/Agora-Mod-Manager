@@ -148,14 +148,20 @@ pub fn list(ctx: &Ctx) -> Result<LibraryListing, ContentError> {
 /// an error for the caller to report, not a silently empty icon.
 pub fn read_icon(ctx: &Ctx, item_id_or_prefix: &str) -> Result<Option<LibraryIcon>, ContentError> {
     let item = content_store::get_item(ctx, item_id_or_prefix)?;
-    let Some(sha256) = item.icon_sha256.as_deref() else {
-        return Ok(None);
-    };
-    let bytes = content_store::read_object_bytes(ctx, sha256)?;
+    match item.icon_sha256.as_deref() {
+        Some(sha256) => read_icon_by_hash(ctx, sha256),
+        None => Ok(None),
+    }
+}
+
+/// Read one saved icon by its object hash. The hash is validated, the bytes come only from the
+/// store's objects, and the read is capped before any bytes are loaded.
+pub fn read_icon_by_hash(ctx: &Ctx, sha256: &str) -> Result<Option<LibraryIcon>, ContentError> {
+    let bytes =
+        content_store::read_object_bytes_limited(ctx, sha256, community_image::MAX_IMAGE_BYTES)?;
     let Some(mime) = community_image::sniff_image(&bytes) else {
         return Err(ContentError::Other(format!(
-            "the saved icon for item {} is not an image",
-            item.item_id
+            "the saved object {sha256} is not an image"
         )));
     };
     Ok(Some(LibraryIcon { mime, bytes }))
@@ -484,29 +490,27 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
         };
 
         let game_id = manifest.game_data.game.as_str().to_string();
-        let mut hashes = HashSet::new();
         let mut item_ids = HashSet::new();
-        for installed in manifest
+        for layer in manifest.game_data.layers.iter() {
+            if let LayerSource::Content { content } = &layer.source {
+                item_ids.insert(content.clone());
+            }
+        }
+        let typed_hashes: HashSet<String> = manifest
             .mods
             .iter()
             .chain(manifest.resourcepacks.iter())
             .chain(manifest.shaders.iter())
             .chain(manifest.datapacks.iter())
             .chain(manifest.worlds.iter())
-        {
-            if !installed.sha256.is_empty() {
-                hashes.insert(installed.sha256.to_ascii_lowercase());
-            }
-        }
-        for layer in manifest.game_data.layers.iter() {
-            if let LayerSource::Content { content } = &layer.source {
-                item_ids.insert(content.clone());
-            }
-        }
-        // The Minecraft slice records the store item id on the installed entry. Read it from the
-        // manifest text until that field is part of the typed model, so the join prefers it while
-        // a bare hash still works.
-        collect_recorded_item_ids(&manifest_path, &mut item_ids);
+            .filter(|installed| !installed.sha256.is_empty())
+            .map(|installed| installed.sha256.to_ascii_lowercase())
+            .collect();
+        // TODO(integrator): use typed `InstalledMod.content_item_id`/`object_sha256` once the
+        // parallel Minecraft slice lands; this raw read matches those field names today.
+        let recorded = read_recorded_join_keys(&manifest_path);
+        let hashes = recorded.hashes.unwrap_or(typed_hashes);
+        item_ids.extend(recorded.item_ids);
 
         scan.instances.push(ScannedInstance {
             reference: LibraryInstanceRef {
@@ -521,23 +525,47 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
     scan
 }
 
-fn collect_recorded_item_ids(manifest_path: &Path, item_ids: &mut HashSet<String>) {
+/// What an instance manifest records for the store, read from its text because the typed model
+/// does not carry these fields yet. `hashes` is `None` when the manifest cannot be read, so the
+/// caller can fall back to the typed `sha256` values.
+struct RecordedJoinKeys {
+    hashes: Option<HashSet<String>>,
+    item_ids: HashSet<String>,
+}
+
+fn read_recorded_join_keys(manifest_path: &Path) -> RecordedJoinKeys {
+    let mut keys = RecordedJoinKeys {
+        hashes: None,
+        item_ids: HashSet::new(),
+    };
     let Ok(text) = std::fs::read_to_string(manifest_path) else {
-        return;
+        return keys;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
+        return keys;
     };
+    let mut hashes = HashSet::new();
     for key in ["mods", "resourcepacks", "shaders", "datapacks", "worlds"] {
         let Some(entries) = value.get(key).and_then(|entries| entries.as_array()) else {
             continue;
         };
         for entry in entries {
-            if let Some(id) = entry.get("content_item_id").and_then(|id| id.as_str()) {
-                if !id.is_empty() {
-                    item_ids.insert(id.to_string());
-                }
+            let text_field = |name: &str| {
+                entry
+                    .get(name)
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            };
+            // The store object hash is the file's real identity; `sha256` is the download's.
+            if let Some(hash) = text_field("object_sha256").or_else(|| text_field("sha256")) {
+                hashes.insert(hash.to_ascii_lowercase());
+            }
+            if let Some(id) = text_field("content_item_id") {
+                keys.item_ids.insert(id.to_string());
             }
         }
     }
+    keys.hashes = Some(hashes);
+    keys
 }

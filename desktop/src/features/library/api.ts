@@ -17,9 +17,8 @@ export interface LibraryItem {
   version: string | null;
   gameId: string | null;
   pageUrl: string | null;
+  /** The saved icon's object hash. Its bytes are loaded lazily by `loadLibraryIcon`. */
   iconSha256: string | null;
-  /** A `data:` URL for the saved icon, when one was stored. */
-  iconDataUrl: string | null;
   sourceKind: string;
   sourceLabel: string;
   instances: LibraryInstance[];
@@ -74,7 +73,6 @@ function isLibraryItem(value: unknown): value is LibraryItem {
     && (row.gameId === null || typeof row.gameId === 'string')
     && (row.pageUrl === null || typeof row.pageUrl === 'string')
     && (row.iconSha256 === null || typeof row.iconSha256 === 'string')
-    && (row.iconDataUrl === null || typeof row.iconDataUrl === 'string')
     && typeof row.sourceKind === 'string'
     && typeof row.sourceLabel === 'string'
     && Array.isArray(row.instances)
@@ -189,6 +187,35 @@ export function searchLibrary(items: LibraryItem[], query: string): LibraryItem[
       .toLowerCase();
     return words.every((word) => haystack.includes(word));
   });
+}
+
+const iconByHash = new Map<string, string>();
+const iconReads = new Map<string, Promise<string | null>>();
+
+/**
+ * Read one saved icon by its object hash. The listing carries only the hash; a row asks for the
+ * bytes when it renders. Results (including a failure) are kept for the session.
+ */
+export function loadLibraryIcon(sha256: string | null): Promise<string | null> {
+  if (!sha256) return Promise.resolve(null);
+  const cached = iconByHash.get(sha256);
+  if (cached) return Promise.resolve(cached);
+  const pending = iconReads.get(sha256);
+  if (pending) return pending;
+  const read = invoke<string | null>('games_library_icon', { sha256 })
+    .then((reply) => {
+      if (typeof reply === 'string' && reply.startsWith('data:image/')) {
+        iconByHash.set(sha256, reply);
+        return reply;
+      }
+      return null;
+    })
+    .catch(() => null)
+    .finally(() => {
+      iconReads.delete(sha256);
+    });
+  iconReads.set(sha256, read);
+  return read;
 }
 
 /** Icons already asked for this session, so a shown row does not ask again. */

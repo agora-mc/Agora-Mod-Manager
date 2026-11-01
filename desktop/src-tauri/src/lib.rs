@@ -522,6 +522,7 @@ pub fn run() {
             games::content::games_instance_content_move,
             games::library::games_library_list,
             games::library::games_library_instances,
+            games::library::games_library_icon,
             games::library::games_library_cache_icon,
             games::fomod::games_fomod_show,
             games::fomod::games_fomod_install,

@@ -14,7 +14,6 @@ const first = {
   gameId: 'minecraft',
   pageUrl: null,
   iconSha256: null,
-  iconDataUrl: null,
   sourceKind: 'file',
   sourceLabel: 'File: first.jar',
   instances: [],
@@ -40,6 +39,8 @@ function route() {
           instances: [{ instanceId: 'mc1', name: 'Minecraft One', gameId: 'minecraft' }],
           warnings: [],
         };
+      case 'games_library_icon':
+        return null;
       case 'minecraft_add_stored_content':
         return {};
       case 'games_instance_content_add':
@@ -73,6 +74,31 @@ describe('LibraryPage', () => {
       expect(screen.queryByText('First item')).not.toBeInTheDocument();
       expect(screen.getByText('Second item')).toBeInTheDocument();
     });
+  });
+
+  it('loads a saved icon by its hash when the row renders', async () => {
+    const iconHash = 'c'.repeat(64);
+    const iconDataUrl = 'data:image/png;base64,AAAA';
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'games_library_list') {
+        return {
+          items: [{ ...first, iconSha256: iconHash }],
+          damaged: [],
+          warnings: [],
+        };
+      }
+      if (command === 'games_library_instances') {
+        return { instances: [], warnings: [] };
+      }
+      if (command === 'games_library_icon') return iconDataUrl;
+      throw new Error(`unmocked command in a library test: ${command}`);
+    });
+    const { container } = render(<LibraryPage />);
+    await screen.findByText('A saved description.');
+    await waitFor(() => {
+      expect(container.querySelector(`img[src="${iconDataUrl}"]`)).toBeTruthy();
+    });
+    expect(invokeMock).toHaveBeenCalledWith('games_library_icon', { sha256: iconHash });
   });
 
   it('adds a Minecraft item to a Minecraft instance and says so', async () => {

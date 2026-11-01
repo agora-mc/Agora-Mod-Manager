@@ -7,7 +7,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use agora_core::content_store::{add_archive, add_file, get_item, set_item_metadata, ItemMetadata};
+use agora_core::content_store::{
+    add_archive, add_file, get_item, set_item_metadata, ContentError, ItemMetadata,
+};
 use agora_core::ctx::Ctx;
 use agora_core::error::LauncherError;
 use agora_core::game_instance::{self, GameInstanceManifest, SavesChoice};
@@ -199,6 +201,56 @@ fn the_library_lists_items_with_their_saved_metadata() {
 }
 
 #[test]
+fn the_listing_reply_carries_no_image_bytes() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let file = work.path().join("example.bin");
+    std::fs::write(&file, b"payload").unwrap();
+    let item_id = add_file(&ctx, &file, None, None)
+        .unwrap()
+        .item()
+        .item_id
+        .clone();
+    library::save_icon(&ctx, &item_id, b"\x89PNG\r\n\x1a\nicon bytes").unwrap();
+
+    let listing = library::list(&ctx).unwrap();
+    let text = serde_json::to_string(&listing).unwrap();
+    assert!(
+        !text.contains("data:image")
+            && !text.contains("iconDataUrl")
+            && !text.contains("icon_data_url"),
+        "the listing carries only the icon hash, not its bytes: {text}"
+    );
+    let listed = &listing.items[0];
+    let hash = listed.icon_sha256.as_deref().expect("the hash is listed");
+    let icon = library::read_icon_by_hash(&ctx, hash)
+        .unwrap()
+        .expect("the icon reads by hash");
+    assert_eq!(icon.bytes, b"\x89PNG\r\n\x1a\nicon bytes");
+}
+
+#[test]
+fn a_bad_icon_hash_is_refused() {
+    let (_tmp, ctx) = test_ctx();
+    assert!(matches!(
+        library::read_icon_by_hash(&ctx, "not-a-hash"),
+        Err(ContentError::InvalidHash(_))
+    ));
+    assert!(matches!(
+        library::read_icon_by_hash(&ctx, &"0".repeat(64)),
+        Err(ContentError::MissingObject(_))
+    ));
+}
+
+#[test]
+fn a_read_limit_refuses_a_larger_object_before_reading_it() {
+    let (_tmp, ctx) = test_ctx();
+    let sha = agora_core::content_store::store_object_bytes(&ctx, b"0123456789").unwrap();
+    let error = agora_core::content_store::read_object_bytes_limited(&ctx, &sha, 4).unwrap_err();
+    assert!(matches!(error, ContentError::Other(_)), "{error}");
+}
+
+#[test]
 fn an_icon_that_is_not_an_image_is_not_saved() {
     let (_tmp, ctx) = test_ctx();
     let work = tempfile::tempdir().unwrap();
@@ -384,21 +436,84 @@ fn which_instances_use_an_item() {
     );
 }
 
+#[test]
+fn an_object_sha256_is_preferred_for_the_minecraft_join() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+
+    // Two items with different bytes. The manifest records the second file's download hash but
+    // names the first item's object hash, so only the first item is the one installed.
+    let first_file = work.path().join("first.jar");
+    std::fs::write(&first_file, b"first bytes").unwrap();
+    let first_id = add_file(&ctx, &first_file, None, None)
+        .unwrap()
+        .item()
+        .item_id
+        .clone();
+    let first_hash = sha256_hex(b"first bytes");
+
+    let second_file = work.path().join("second.jar");
+    std::fs::write(&second_file, b"second bytes").unwrap();
+    let second_id = add_file(&ctx, &second_file, None, None)
+        .unwrap()
+        .item()
+        .item_id
+        .clone();
+    let second_hash = sha256_hex(b"second bytes");
+
+    let dir = ctx.paths.instance_dir("mc1").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 2,
+        "instance_id": "mc1",
+        "name": "Minecraft One",
+        "minecraft_version": "1.20.1",
+        "loader": "fabric",
+        "loader_version": "0.15.11",
+        "mods": [{
+            "filename": "second.jar",
+            "registry_id": null,
+            "modrinth_id": null,
+            "source": "manual",
+            "source_url": null,
+            "version": "1.0.0",
+            "sha256": second_hash,
+            "object_sha256": first_hash,
+            "hash_verified": true,
+            "installed_at": "2026-01-01T00:00:00Z"
+        }]
+    });
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let listing = library::list(&ctx).unwrap();
+    let first = listing
+        .items
+        .iter()
+        .find(|item| item.item_id == first_id)
+        .unwrap();
+    let second = listing
+        .items
+        .iter()
+        .find(|item| item.item_id == second_id)
+        .unwrap();
+    assert_eq!(first.instances.len(), 1, "the object hash joins the item");
+    assert!(second.instances.is_empty(), "the download hash does not");
+}
+
 // ---------------------------------------------------------------------------
 // 6. Importers save what they know
 // ---------------------------------------------------------------------------
 
-#[test]
-fn a_thunderstore_import_saves_its_summary() {
-    let (_tmp, ctx) = test_ctx();
-    write_generic_instance(&ctx, "gen1", "Skyrim One", "skyrim-se", &[]);
-
+/// Add a Thunderstore package with `manifest` and install it into `gen1`.
+fn import_thunderstore(
+    ctx: &Ctx,
+    manifest: serde_json::Value,
+) -> agora_core::content_thunderstore::ThunderstoreInstallOutcome {
     let work = tempfile::tempdir().unwrap();
-    let manifest = serde_json::json!({
-        "name": "Thing",
-        "version_number": "1.2.3",
-        "dependencies": []
-    });
     let zip_path = work.path().join("Thing.zip");
     create_zip(
         &zip_path,
@@ -407,19 +522,38 @@ fn a_thunderstore_import_saves_its_summary() {
             ("plugins/Thing.dll", b"plugin bytes"),
         ],
     );
-    let item_id = add_archive(&ctx, &zip_path, None)
+    let item_id = add_archive(ctx, &zip_path, None)
         .unwrap()
         .item()
         .item_id
         .clone();
+    agora_core::content_thunderstore::install_thunderstore(ctx, "gen1", &item_id).unwrap()
+}
 
-    let outcome =
-        agora_core::content_thunderstore::install_thunderstore(&ctx, "gen1", &item_id).unwrap();
+#[test]
+fn a_thunderstore_import_saves_its_manifest_description() {
+    let (_tmp, ctx) = test_ctx();
+    write_generic_instance(&ctx, "gen1", "Skyrim One", "skyrim-se", &[]);
+
+    // The author's short description, as Thunderstore's manifest defines it (250 chars max).
+    let outcome = import_thunderstore(
+        &ctx,
+        serde_json::json!({
+            "name": "Thing",
+            "version_number": "1.2.3",
+            "description": "A thing that does the thing.",
+            "dependencies": []
+        }),
+    );
     let derived = get_item(&ctx, &outcome.derived_item.item_id).unwrap();
     assert_eq!(
         derived.description.as_deref(),
-        Some(outcome.summary.as_str()),
-        "the summary the importer built is saved on the item"
+        Some("A thing that does the thing."),
+        "the manifest's own description is saved, not Agora's mapping summary"
+    );
+    assert_ne!(
+        derived.description.as_deref(),
+        Some(outcome.summary.as_str())
     );
     assert_eq!(derived.version.as_deref(), Some("1.2.3"));
 
@@ -432,4 +566,25 @@ fn a_thunderstore_import_saves_its_summary() {
             .any(|layer| matches!(&layer.source, LayerSource::Content { content } if content == &outcome.derived_item.item_id)),
         "the derived item is added to the instance"
     );
+}
+
+#[test]
+fn a_thunderstore_import_without_a_description_saves_none() {
+    let (_tmp, ctx) = test_ctx();
+    write_generic_instance(&ctx, "gen1", "Skyrim One", "skyrim-se", &[]);
+
+    let outcome = import_thunderstore(
+        &ctx,
+        serde_json::json!({
+            "name": "Thing",
+            "version_number": "1.2.3",
+            "dependencies": []
+        }),
+    );
+    let derived = get_item(&ctx, &outcome.derived_item.item_id).unwrap();
+    assert!(
+        derived.description.is_none(),
+        "no description is invented when the manifest has none"
+    );
+    assert_eq!(derived.version.as_deref(), Some("1.2.3"));
 }

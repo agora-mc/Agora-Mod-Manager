@@ -176,8 +176,8 @@ pub fn install_thunderstore(
         }
     }
 
-    // Build human-readable summary of mappings. It is saved as the derived item's description:
-    // it is what this importer already knows about the package, and nothing is fetched.
+    // Build human-readable summary of mappings. It stays a summary for the caller; it is not the
+    // package's description (that comes from the author's manifest, below).
     let summary = build_mapping_summary(&file_paths, &mappings, &package_id);
 
     // Derive item in content store
@@ -189,7 +189,7 @@ pub fn install_thunderstore(
         added_at_unix_ms: content_store::now_unix_ms(),
     };
     let outcome = content_store::derive_item(ctx, item_id, derived_files, &derived_name, source)?;
-    let derived = save_import_metadata(ctx, outcome.item(), &summary, &manifest.version_number)?;
+    let derived = save_import_metadata(ctx, outcome.item(), &manifest)?;
 
     // Add derived item to instance with mount_path "" and source_path ""
     let layer = game_deploy::add_content(ctx, instance_id, &derived.item_id, Some(""), Some(""))?;
@@ -252,21 +252,27 @@ pub fn install_thunderstore(
     })
 }
 
-/// Save what the importer knew when it created the item: its mapping summary and version. Anything
-/// the item already recorded is kept, so a reinstall does not erase a description from elsewhere.
+/// Save what the package's own manifest knows: the author's description and the version. Anything
+/// the item already recorded is kept, so a reinstall does not erase metadata from elsewhere. A
+/// manifest without a description leaves it absent; Agora's mapping summary is not used instead.
 fn save_import_metadata(
     ctx: &Ctx,
     item: &ContentItem,
-    summary: &str,
-    version: &str,
+    manifest: &ThunderstoreManifest,
 ) -> Result<ContentItem, ContentError> {
+    let description = manifest
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
     let metadata = content_store::ItemMetadata {
-        description: item
-            .description
-            .clone()
-            .or_else(|| Some(summary.to_string())),
+        description: item.description.clone().or(description),
         page_url: item.page_url.clone(),
-        version: item.version.clone().or_else(|| Some(version.to_string())),
+        version: item
+            .version
+            .clone()
+            .or_else(|| Some(manifest.version_number.clone())),
         game_id: item.game_id.clone(),
         catalog_id: item.catalog_id.clone(),
         icon_sha256: item.icon_sha256.clone(),

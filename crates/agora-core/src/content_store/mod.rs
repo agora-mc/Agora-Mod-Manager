@@ -1617,8 +1617,18 @@ pub fn store_object_bytes(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentErro
 }
 
 /// Read a stored object's bytes, refusing a hash that is not an object name and an object that no
-/// longer holds what its name says. Icons are read through this rather than straight off disk.
+/// longer holds what its name says.
 pub fn read_object_bytes(ctx: &Ctx, sha256: &str) -> Result<Vec<u8>, ContentError> {
+    read_object_bytes_limited(ctx, sha256, u64::MAX)
+}
+
+/// [`read_object_bytes`] with a size cap, checked before any bytes are read. Used for content that
+/// a caller only expects to be small, such as a saved icon.
+pub fn read_object_bytes_limited(
+    ctx: &Ctx,
+    sha256: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ContentError> {
     if !is_sha256_hex(sha256) {
         return Err(ContentError::InvalidHash(sha256.to_string()));
     }
@@ -1627,6 +1637,11 @@ pub fn read_object_bytes(ctx: &Ctx, sha256: &str) -> Result<Vec<u8>, ContentErro
         return Err(ContentError::MissingObject(sha256.to_string()));
     }
     let size = std::fs::metadata(&path)?.len();
+    if size > max_bytes {
+        return Err(ContentError::Other(format!(
+            "the stored object named {sha256} is {size} bytes; the limit is {max_bytes}"
+        )));
+    }
     if !object_is_trustworthy(&path, size, sha256)? {
         return Err(ContentError::DamagedObject(format!(
             "the object named {sha256} no longer holds those bytes"
