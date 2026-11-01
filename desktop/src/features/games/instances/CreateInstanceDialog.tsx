@@ -5,6 +5,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { listInstalledGames } from '../discovery/api';
 import type { GameListing, InstallSummary } from '../shared/types';
+import { listGameSupport, type GameSupportRow } from '../support/api';
+import { isGameTurnedOff } from '../support/enabled';
+import { loadGameSettingsOrDefaults, type GameSettings } from '../settings/gameSettings';
 import {
   createGameInstance,
   gamesErrorMessage,
@@ -25,7 +28,7 @@ interface CreateInstanceDialogProps {
 type InstallsState =
   | { status: 'loading' }
   | { status: 'failed'; message: string }
-  | { status: 'loaded'; game: GameListing | null };
+  | { status: 'loaded'; game: GameListing | null; turnedOff: boolean };
 
 const BASE_MODES: readonly BaseMode[] = ['linked', 'copied'];
 
@@ -37,10 +40,12 @@ const BASE_MODES: readonly BaseMode[] = ['linked', 'copied'];
 export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: CreateInstanceDialogProps) {
   const nameId = useId();
   const installId = useId();
+  const deploymentId = useId();
   const [installs, setInstalls] = useState<InstallsState>({ status: 'loading' });
   const [name, setName] = useState('');
   const [chosenInstall, setChosenInstall] = useState('');
   const [baseMode, setBaseMode] = useState<BaseMode>('linked');
+  const [deployment, setDeployment] = useState<GameSettings['deployment']>('auto');
   const [creating, setCreating] = useState(false);
   const [progress, setProgress] = useState<CreateProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -49,11 +54,21 @@ export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: 
     if (!open) return;
     setInstalls({ status: 'loading' });
     setError(null);
-    listInstalledGames()
-      .then((list) => {
-        const game = list.games.find((listing) => listing.gameId === gameId) ?? null;
-        setInstalls({ status: 'loaded', game });
+    Promise.all([
+      listInstalledGames(),
+      // A support list that could not be read hides nothing, the same as in the game switcher.
+      listGameSupport().catch((): GameSupportRow[] | null => null),
+      loadGameSettingsOrDefaults(gameId),
+    ])
+      .then(([list, support, defaults]) => {
+        const turnedOff = isGameTurnedOff(gameId, support);
+        const game = turnedOff
+          ? null
+          : list.games.find((listing) => listing.gameId === gameId) ?? null;
+        setInstalls({ status: 'loaded', game, turnedOff });
         setChosenInstall(game?.installs[0]?.installId ?? '');
+        setBaseMode(defaults.baseType);
+        setDeployment(defaults.deployment);
       })
       .catch((failure: unknown) => setInstalls({ status: 'failed', message: gamesErrorMessage(failure) }));
   }, [open, gameId]);
@@ -70,7 +85,7 @@ export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: 
     setProgress(null);
     const unlisten = await onCreateProgress(setProgress).catch(() => null);
     try {
-      const created = await createGameInstance(gameId, selected.installId, name, baseMode);
+      const created = await createGameInstance(gameId, selected.installId, name, baseMode, deployment);
       onCreated(created.instanceId);
     } catch (failure) {
       setError(`The instance was not created. ${gamesErrorMessage(failure)}`);
@@ -98,13 +113,19 @@ export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: 
           </p>
         )}
 
-        {installs.status === 'loaded' && available.length === 0 && (
+        {installs.status === 'loaded' && installs.turnedOff && (
+          <p role="alert" className="rounded-lg border border-border p-3 text-sm">
+            This game is turned off, so it is not offered here. Turn it on in Settings, Game support, to create an instance.
+          </p>
+        )}
+
+        {installs.status === 'loaded' && !installs.turnedOff && available.length === 0 && (
           <p role="alert" className="rounded-lg border border-border p-3 text-sm">
             Agora has not found an install of {gameName} on this machine. Rescan the installs in Setup, then try again.
           </p>
         )}
 
-        {installs.status === 'loaded' && available.length > 0 && (
+        {installs.status === 'loaded' && !installs.turnedOff && available.length > 0 && (
           <form
             className="space-y-5"
             onSubmit={(event) => {
@@ -172,19 +193,24 @@ export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: 
               </div>
             </fieldset>
 
-            <section className="space-y-2" aria-labelledby="deployment-heading">
-              <h3 id="deployment-heading" className="text-sm font-medium">How the instance will run</h3>
-              <p className="text-xs text-muted-foreground">
-                Agora picks the way the game runs from the list below. Automatic is the default. You can change this later, on the instance's Overview.
-              </p>
-              <ul className="space-y-1 text-xs text-muted-foreground">
+            <div className="space-y-2">
+              <Label htmlFor={deploymentId}>How it will run</Label>
+              <select
+                id={deploymentId}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={deployment}
+                onChange={(event) => setDeployment(event.target.value as GameSettings['deployment'])}
+                disabled={creating}
+              >
                 {DEPLOYMENT_OPTIONS.map((option) => (
-                  <li key={option.id}>
-                    <span className="font-semibold text-foreground">{option.label}.</span> {option.explain}
-                  </li>
+                  <option key={option.id} value={option.id}>{option.label}</option>
                 ))}
-              </ul>
-            </section>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {DEPLOYMENT_OPTIONS.find((option) => option.id === deployment)?.explain}
+                {' '}You can change this later on the instance's Overview.
+              </p>
+            </div>
 
             {creating && (
               <p role="status" className="text-sm">

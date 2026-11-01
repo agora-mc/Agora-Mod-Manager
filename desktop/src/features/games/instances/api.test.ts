@@ -200,12 +200,13 @@ describe('create, delete and deployment wrappers', () => {
 
   it('sends the install, name and base mode the backend reads', async () => {
     invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', name: 'Grounded', base: 'pinned', reusedBase: true, baseId: 'b', unpinnedReason: null });
-    await createGameInstance('skyrim-se', 'steam-489830', 'Grounded', 'linked');
+    await createGameInstance('skyrim-se', 'steam-489830', 'Grounded', 'linked', 'links');
     expect(invokeMock).toHaveBeenCalledWith('games_instance_create', {
       gameId: 'skyrim-se',
       installId: 'steam-489830',
       name: 'Grounded',
       baseMode: 'linked',
+      deployment: 'links',
     });
   });
 

@@ -275,8 +275,8 @@ test('creating an instance needs a name, explains how it runs, and opens the new
   await page.getByRole('button', { name: 'Create the first instance' }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByRole('heading', { name: 'New instance of Skyrim Special Edition' })).toBeVisible();
-  await expect(dialog).toContainText('Automatic is the default');
-  await expect(dialog).toContainText('Virtual file system.');
+  await expect(dialog.getByLabel('How it will run')).toHaveValue('auto');
+  await expect(dialog.getByLabel('How it will run')).toContainText('Virtual file system');
   await expect(dialog.getByRole('button', { name: 'Create instance' })).toBeDisabled();
 
   // A name of only spaces is still no name.

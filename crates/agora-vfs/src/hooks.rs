@@ -329,7 +329,7 @@ fn note_open(t: &Tracked, path: &Path, cfg: &RuntimeConfig) {
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap()
-        .insert(t.rel.to_lowercase());
+        .insert(agora_game_api::fold_path_case(&t.rel));
     if first {
         guarded(|| log(format!("opened {} -> {}", t.rel, path.display())));
     }

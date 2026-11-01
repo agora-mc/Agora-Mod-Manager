@@ -11,13 +11,19 @@ import {
   gameToolSwapCosts,
   removeGameTool,
   rollbackGameTool,
+  listToolOutputs,
+  listUserToolOutputs,
   runGameTool,
+  runUserTool,
+  useToolOutput,
+  useUserToolOutput,
   type CaptureChoice,
   type DiffReport,
   type RunReport,
   type RunResult,
   type SwapCosts,
   type ToolOffer,
+  type ToolOutput,
   type ToolRow,
   type ToolsView,
 } from './api';
@@ -53,12 +59,14 @@ interface ToolCardProps {
   setBusy: (busy: boolean) => void;
   onView: (view: ToolsView) => void;
   onChanged: () => void;
+  /** Set when the card is one of the person's own tools, run through the user-tool command. */
+  userToolId?: string;
 }
 
 const SWAP_WHY_CHOSEN = 'You chose the full-copy swap.';
 const SWAP_WHY_REAL_INSTALL = 'This tool works on the game’s real install folder, which the other captures would miss.';
 
-export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: ToolCardProps) {
+export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged, userToolId }: ToolCardProps) {
   const { confirm } = useConfirm();
   const [capture, setCapture] = useState<CaptureChoice>('auto');
   const [question, setQuestion] = useState<Question | null>(null);
@@ -67,6 +75,9 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
   const [actionError, setActionError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [diff, setDiff] = useState<DiffReport | null>(null);
+  const [moveAside, setMoveAside] = useState<{ folder: string; aside: string } | null>(null);
+  const [outputs, setOutputs] = useState<ToolOutput[] | null>(null);
+  const [outputsError, setOutputsError] = useState<string | null>(null);
 
   const runLabel = row.status === null ? `Build ${row.name}` : row.status === 'current' ? `Run ${row.name} again` : `Rebuild ${row.name}`;
   const helpText = CAPTURE_CHOICES.find((choice) => choice.value === capture)?.help ?? '';
@@ -93,6 +104,11 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
       onChanged();
       return;
     }
+    if (result.status === 'outputFolderNotEmpty') {
+      setOutcome(null);
+      setMoveAside({ folder: result.folder, aside: result.aside });
+      return;
+    }
     if (result.status === 'vfsRefused') {
       setOutcome(null);
       setQuestion({ kind: 'refused', reason: result.reason, next: result.next });
@@ -103,12 +119,14 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
     openSwap(null, SWAP_WHY_REAL_INSTALL);
   };
 
-  const run = async (choice: CaptureChoice, options: { refusal?: string; confirmSwap?: boolean } = {}) => {
+  const run = async (choice: CaptureChoice, options: { refusal?: string; confirmSwap?: boolean; moveAside?: boolean } = {}) => {
     setBusy(true);
     setActionError(null);
     setNote(null);
     try {
-      handle(await runGameTool(instanceId, row.toolId, choice, options));
+      handle(userToolId
+        ? await runUserTool(instanceId, userToolId, choice, options)
+        : await runGameTool(instanceId, row.toolId, choice, options));
     } catch (error) {
       setActionError(messageOf(error));
     } finally {
@@ -130,6 +148,41 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
   const confirmSwap = (current: Question & { kind: 'swap' }) => {
     if (!current.costs) return;
     void run('swap', { refusal: current.refusal ?? undefined, confirmSwap: true });
+  };
+
+  const confirmMoveAside = () => {
+    if (!moveAside) return;
+    setMoveAside(null);
+    void run(capture, { moveAside: true });
+  };
+
+  const loadOutputs = async () => {
+    setOutputsError(null);
+    try {
+      const loaded = userToolId
+        ? await listUserToolOutputs(instanceId, userToolId)
+        : await listToolOutputs(instanceId, row.toolId);
+      setOutputs(loaded);
+    } catch (error) {
+      setOutputsError(messageOf(error));
+    }
+  };
+
+  const chooseOutput = async (itemId: string) => {
+    setBusy(true);
+    setOutputsError(null);
+    try {
+      const loaded = userToolId
+        ? await useUserToolOutput(instanceId, userToolId, itemId)
+        : await useToolOutput(instanceId, row.toolId, itemId);
+      setOutputs(loaded);
+      setNote('The tool’s output now points at the chosen item. The game reads it on its next launch.');
+      onChanged();
+    } catch (error) {
+      setOutputsError(messageOf(error));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const rollBack = async () => {
@@ -230,7 +283,7 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
         >
           {runLabel}
         </button>
-        {row.previous && (
+        {!userToolId && row.previous && (
           <button
             type="button"
             disabled={busy}
@@ -240,7 +293,7 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
             Roll back
           </button>
         )}
-        {row.previous && (
+        {!userToolId && row.previous && (
           <button
             type="button"
             disabled={busy}
@@ -250,7 +303,17 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
             Show changes
           </button>
         )}
-        {row.current !== null && (
+        {row.outputKind === 'mod' && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void loadOutputs()}
+            className="rounded-lg border border-border px-3 py-1.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            Use an earlier output
+          </button>
+        )}
+        {!userToolId && row.current !== null && (
           <button
             type="button"
             disabled={busy}
@@ -339,6 +402,67 @@ export function ToolCard({ instanceId, row, busy, setBusy, onView, onChanged }: 
           <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
             {runDetailLines(outcome).map((line) => <li key={line}>{line}</li>)}
           </ul>
+        </section>
+      )}
+
+      {moveAside && (
+        <section role="region" aria-label="The output folder already has files" className="space-y-3 rounded-lg border border-border p-4 text-sm" data-testid="tool-output-folder">
+          <p className="font-medium">The output folder already has files: {moveAside.folder}</p>
+          <p className="text-muted-foreground">
+            Nothing was deleted. Move the old files to {moveAside.aside} and run again, or cancel.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={confirmMoveAside}
+              className="rounded-lg bg-primary px-3 py-1.5 font-medium text-primary-foreground shadow-sm disabled:opacity-50"
+            >
+              Move it aside and run
+            </button>
+            <button
+              type="button"
+              onClick={() => setMoveAside(null)}
+              className="rounded-lg border border-border px-3 py-1.5 font-medium hover:bg-accent"
+            >
+              Cancel
+            </button>
+          </div>
+        </section>
+      )}
+
+      {outputsError && (
+        <p role="alert" className="rounded-lg border border-destructive bg-destructive/10 p-3 text-sm">{outputsError}</p>
+      )}
+      {outputs && (
+        <section aria-label="Earlier outputs" className="space-y-2 rounded-lg border border-border p-4 text-sm" data-testid="tool-outputs">
+          <p className="font-medium">Earlier outputs</p>
+          {outputs.length === 0 ? (
+            <p className="text-muted-foreground">This tool has no earlier outputs yet.</p>
+          ) : (
+            <ul className="space-y-2">
+              {outputs.map((output) => (
+                <li key={output.itemId} className="flex flex-wrap items-center gap-2">
+                  <span className="break-all">{output.name}</span>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void chooseOutput(output.itemId)}
+                    className="rounded-lg border border-border px-2 py-1 text-xs font-medium hover:bg-accent disabled:opacity-50"
+                  >
+                    Use this output
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button
+            type="button"
+            onClick={() => setOutputs(null)}
+            className="rounded-lg border border-border px-3 py-1.5 font-medium hover:bg-accent"
+          >
+            Close
+          </button>
         </section>
       )}
 

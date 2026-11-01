@@ -27,7 +27,7 @@ use agora_core::game_saves;
 use agora_game_api::{
     ContentLayout, GameDefinition, GameId, GamePackage, GamePath, InputFingerprint, InstallId,
     InstallKind, LaunchRecipe, LayerSource, PackageDefinition, PluginListRule, RelPath,
-    RuntimeIdentity, StoreId, ToolDefinition, ToolId,
+    RuntimeIdentity, StoreId, ToolDefinition, ToolId, ToolOutput,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -101,6 +101,7 @@ fn skyrim_like() -> GameDefinition {
         semantics: None,
         implicit: vec!["Skyrim.esm".into(), "Update.esm".into()],
         implicit_list_file: None,
+        loot: None,
     });
     def.tool_ids = vec![ToolId::new("nemesis").unwrap()];
     def.launch = Some(LaunchRecipe {
@@ -118,6 +119,8 @@ fn skyrim_like() -> GameDefinition {
 
 fn nemesis() -> ToolDefinition {
     ToolDefinition {
+        output: ToolOutput::GeneratedLayer,
+        output_arg: None,
         output_patterns: NEMESIS_PATTERNS.iter().map(|p| p.to_string()).collect(),
         id: ToolId::new("nemesis").unwrap(),
         game: GameId::new(GAME).unwrap(),

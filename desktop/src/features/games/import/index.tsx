@@ -21,6 +21,7 @@ import {
   type Mo2RunDto,
   type SetupFound,
 } from './api';
+import { loadGameSettingsOrDefaults } from '../settings/gameSettings';
 import { planBlockReason } from './planRules';
 import { PlanView } from './PlanView';
 
@@ -49,6 +50,8 @@ export function GameImportPage({ gameId }: { gameId: string }) {
   const [profile, setProfile] = useState('');
   const [instanceName, setInstanceName] = useState('');
   const [copySaves, setCopySaves] = useState(false);
+  // The default for this game, applied to every setup the user chooses.
+  const [copySavesDefault, setCopySavesDefault] = useState(false);
   const [plan, setPlan] = useState<PlanState>({ status: 'idle' });
   const [run, setRun] = useState<RunState>({ status: 'idle' });
   const mounted = useRef(true);
@@ -72,6 +75,21 @@ export function GameImportPage({ gameId }: { gameId: string }) {
   };
 
   useEffect(() => {
+    let cancelled = false;
+    loadGameSettingsOrDefaults(gameId)
+      .then((settings) => {
+        if (cancelled) return;
+        const wanted = settings.importCopySaves === 'on';
+        setCopySavesDefault(wanted);
+        setCopySaves(wanted);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [gameId]);
+
+  useEffect(() => {
     loadSetups();
     // Looked up when the tab opens; "Look again" looks again.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -81,7 +99,7 @@ export function GameImportPage({ gameId }: { gameId: string }) {
     setChosen(setup);
     setProfile(setup.profiles[0] ?? '');
     setInstanceName('');
-    setCopySaves(false);
+    setCopySaves(copySavesDefault);
     setPlan({ status: 'idle' });
     setRun({ status: 'idle' });
   };

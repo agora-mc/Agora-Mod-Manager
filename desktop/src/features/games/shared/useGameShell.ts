@@ -19,6 +19,11 @@ export interface GameShell {
   foundGames: GameListing[];
   /** The header switcher is shown only when there is another game to switch to. */
   switcherVisible: boolean;
+  /**
+   * The games the user turned off, with the support list's names. Empty while the list loads and
+   * when it failed (a failed list hides nothing).
+   */
+  turnedOffGames: { gameId: string; name: string }[];
   /** True once the stored choice, discovery and the support list have all settled (answered or failed). */
   ready: boolean;
   /** Choose a game and remember the choice across restarts. */
@@ -113,6 +118,12 @@ export function useGameShell(): GameShell {
     () => (discovery.status === 'loaded' ? visibleGames(discovery.games, support ?? null) : []),
     [discovery, support],
   );
+  const turnedOffGames = useMemo(
+    () => (support ?? [])
+      .filter((row) => !row.enabled)
+      .map((row) => ({ gameId: row.gameId, name: row.name })),
+    [support],
+  );
   const activeGame = stored ?? MINECRAFT_GAME_ID;
   const ready = stored !== null && discovery.status !== 'loading' && support !== undefined;
   const isFound = foundGames.some((game) => game.gameId === activeGame);
@@ -127,6 +138,7 @@ export function useGameShell(): GameShell {
     shownGame,
     foundGames,
     switcherVisible: foundGames.length > 0,
+    turnedOffGames,
     ready,
     setActiveGame,
   };

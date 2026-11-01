@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use agora_game_api::{GameDefinition, InstallId, RuntimeIdentity, VolumeInfo};
+use agora_game_api::{fold_path_case, GameDefinition, InstallId, RuntimeIdentity, VolumeInfo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1187,7 +1187,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
                     y.as_os_str().to_string_lossy(),
                 );
                 let equal = if cfg!(windows) {
-                    x.eq_ignore_ascii_case(&y)
+                    fold_path_case(&x) == fold_path_case(&y)
                 } else {
                     x == y
                 };

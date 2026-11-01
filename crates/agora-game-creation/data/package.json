@@ -77,7 +77,10 @@
       "tool_ids": [
         "nemesis",
         "bodyslide",
-        "pandora"
+        "pandora",
+        "texgen",
+        "dyndolod",
+        "pgpatcher"
       ],
       "launch": {
         "executable": {
@@ -265,7 +268,13 @@
           "HearthFires.esm",
           "Dragonborn.esm"
         ],
-        "implicit_list_file": "Skyrim.ccc"
+        "implicit_list_file": "Skyrim.ccc",
+        "loot": {
+          "masterlist_repo": "loot/skyrimse",
+          "prelude_repo": "loot/prelude",
+          "branch": "v0.29",
+          "game_type": "SkyrimSE"
+        }
       },
       "launch_alternatives": [
         {
@@ -453,6 +462,91 @@
           "magic": "57e0e05710c0c010"
         }
       ]
+    },
+    {
+      "id": "texgen",
+      "game": "skyrim-se",
+      "name": "TexGen",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD/TexGenx64.exe"
+        },
+        "arguments": [
+          {
+            "kind": "literal",
+            "value": "-sse"
+          }
+        ],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "output_arg": "-o:\"{output}\"",
+      "output": {
+        "kind": "mod",
+        "folder": ""
+      }
+    },
+    {
+      "id": "dyndolod",
+      "game": "skyrim-se",
+      "name": "DynDOLOD",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD/DynDOLODx64.exe"
+        },
+        "arguments": [
+          {
+            "kind": "literal",
+            "value": "-sse"
+          }
+        ],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/DynDOLOD"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "output_arg": "-o:\"{output}\"",
+      "output": {
+        "kind": "mod",
+        "folder": ""
+      }
+    },
+    {
+      "id": "pgpatcher",
+      "game": "skyrim-se",
+      "name": "PGPatcher",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/PGPatcher/PGPatcher.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/PGPatcher"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "output": {
+        "kind": "mod",
+        "folder": "",
+        "user_configured": true
+      }
     }
   ]
 }

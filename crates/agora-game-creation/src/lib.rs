@@ -173,15 +173,19 @@ mod tests {
         // Nemesis, BodySlide and Pandora are the tools Skyrim SE declares (MASTER_SPEC §26.9): Nemesis's
         // engine sits in the deployed Nemesis mod folder and runs from there. All three read the install
         // path, so all three run by the real-path view or, failing that, the swap (MASTER_SPEC §26.9, slice 4c).
+        // TexGen, DynDOLOD and PGPatcher write whole mods, which a successful run imports as a layer.
         assert_eq!(
             game.tool_ids,
             vec![
                 agora_game_api::ToolId::new("nemesis").unwrap(),
                 agora_game_api::ToolId::new("bodyslide").unwrap(),
                 agora_game_api::ToolId::new("pandora").unwrap(),
+                agora_game_api::ToolId::new("texgen").unwrap(),
+                agora_game_api::ToolId::new("dyndolod").unwrap(),
+                agora_game_api::ToolId::new("pgpatcher").unwrap(),
             ]
         );
-        assert_eq!(def.tools.len(), 3);
+        assert_eq!(def.tools.len(), 6);
         let nemesis = &def.tools[0];
         assert!(nemesis.uses_install_path);
         let bodyslide = &def.tools[1];

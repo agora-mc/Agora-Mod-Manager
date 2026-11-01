@@ -11,6 +11,7 @@ import {
   setGamePluginActive,
   setGamePluginLocked,
   sortGamePlugins,
+  updateGameMasterlist,
   type PluginsView,
 } from './api';
 
@@ -35,6 +36,7 @@ const view: PluginsView = {
   listExists: true,
   rows: [row],
   findings: [],
+  masterlist: null,
 };
 
 describe('plugin commands', () => {
@@ -58,9 +60,16 @@ describe('plugin commands', () => {
   });
 
   it('sends a sort as a dry run or for real, as it is asked', async () => {
-    invokeMock.mockResolvedValueOnce({ report: { moves: [], blocked: [], written: false }, plugins: view });
+    invokeMock.mockResolvedValueOnce({ report: { moves: [], blocked: [], written: false, mode: 'loot', message: null }, plugins: view });
     await sortGamePlugins('inst-1', true);
     expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_sort', { instanceId: 'inst-1', dryRun: true });
+  });
+
+  it('downloads the masterlist and reads its date back', async () => {
+    const masterlist = { fetchedAt: '2026-01-02T03:04:05Z', source: 'https://api.github.com/repos/loot/skyrimse' };
+    invokeMock.mockResolvedValueOnce(masterlist);
+    await expect(updateGameMasterlist('inst-1')).resolves.toEqual(masterlist);
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_update_masterlist', { instanceId: 'inst-1' });
   });
 
   it('sends the lock and active flags as they are asked', async () => {
@@ -98,6 +107,11 @@ describe('plugin commands', () => {
   ])('rejects %s rather than reading it as an empty list', async (_label, reply) => {
     invokeMock.mockResolvedValueOnce(reply);
     await expect(listGamePlugins('inst-1')).rejects.toThrow('games_plugins_list did not return the expected plugin data.');
+  });
+
+  it('rejects a sort that does not say what it used', async () => {
+    invokeMock.mockResolvedValueOnce({ report: { moves: [], blocked: [], written: false }, plugins: view });
+    await expect(sortGamePlugins('inst-1', true)).rejects.toThrow('games_plugins_sort did not return');
   });
 
   it('rejects a check whose status is not one the tab knows', async () => {

@@ -29,6 +29,8 @@ const row = {
   previous: '1',
   status: 'current',
   conflicts: false,
+  outputKind: 'generated_layer',
+  outputFolder: null,
 };
 
 const costs = {
@@ -211,10 +213,13 @@ describe('the other tool commands', () => {
 
 const userTool = {
   id: 'tool-1',
+  toolId: 'user-tool1',
   name: 'FNIS',
   exe: 'Data/tools/FNIS.exe',
   args: ['-a'],
   knownToolId: null,
+  outputIsMod: false,
+  outputFolder: null,
 };
 
 const candidate = {
@@ -253,6 +258,8 @@ describe('the user tool commands', () => {
       name: 'FNIS',
       exe: 'Data/tools/FNIS.exe',
       args: ['-a'],
+      outputIsMod: false,
+      outputFolder: null,
     });
   });
 

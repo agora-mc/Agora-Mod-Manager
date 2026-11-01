@@ -742,6 +742,11 @@ enum InstancePluginsCmd {
         /// Instance ID.
         instance_id: String,
     },
+    /// Download and verify LOOT's masterlist for the game, if one is not saved yet or it is stale.
+    Masterlist {
+        /// Instance ID.
+        instance_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -9057,6 +9062,7 @@ impl InstancePluginsCmd {
                 | InstancePluginsCmd::Lock { .. }
                 | InstancePluginsCmd::Unlock { .. }
                 | InstancePluginsCmd::Check { .. }
+                | InstancePluginsCmd::Masterlist { .. }
         )
     }
 }
@@ -10255,7 +10261,8 @@ fn plugins_load_order_command(
         | InstancePluginsCmd::Move { instance_id, .. }
         | InstancePluginsCmd::Lock { instance_id, .. }
         | InstancePluginsCmd::Unlock { instance_id, .. }
-        | InstancePluginsCmd::Check { instance_id } => instance_id.clone(),
+        | InstancePluginsCmd::Check { instance_id }
+        | InstancePluginsCmd::Masterlist { instance_id } => instance_id.clone(),
         InstancePluginsCmd::Enable { .. } | InstancePluginsCmd::Disable { .. } => {
             fail("not a load order command".to_string())
         }
@@ -10272,8 +10279,8 @@ fn plugins_load_order_command(
     let locking = matches!(cmd, InstancePluginsCmd::Lock { .. });
     match cmd {
         InstancePluginsCmd::Sort { dry_run, .. } => {
-            match load_order::sort(ctx, &instance_id, game_def, dry_run) {
-                Ok(report) => {
+            match load_order::sort_and_order(ctx, &instance_id, game_def, dry_run) {
+                Ok((report, order)) => {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
@@ -10301,6 +10308,27 @@ fn plugins_load_order_command(
                                 b.plugin, b.master
                             );
                         }
+                        if let Some(message) = &report.message {
+                            println!("{message}");
+                        }
+                        for note in &order.notes {
+                            println!("LOOT: '{}': {}", note.plugin, note.message);
+                        }
+                    }
+                }
+                Err(e) => fail(e.to_string()),
+            }
+        }
+        InstancePluginsCmd::Masterlist { .. } => {
+            match agora_core::loot_masterlist::update(ctx, game_def) {
+                Ok(status) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    } else {
+                        println!(
+                            "Masterlist updated from {} (commit {}).",
+                            status.source_url, status.commit_sha
+                        );
                     }
                 }
                 Err(e) => fail(e.to_string()),

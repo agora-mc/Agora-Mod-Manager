@@ -481,7 +481,9 @@ fn mapping_for<'a>(
     file: &RelPath,
 ) -> Option<&'a UserFileMapping> {
     definition.user_files.iter().find(|m| {
-        m.applies_to_store(store) && m.instance_path.as_str().eq_ignore_ascii_case(file.as_str())
+        m.applies_to_store(store)
+            && agora_game_api::fold_path_case(m.instance_path.as_str())
+                == agora_game_api::fold_path_case(file.as_str())
     })
 }
 

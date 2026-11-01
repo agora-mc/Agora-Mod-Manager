@@ -28,8 +28,8 @@ use agora_core::game_tools::{self, CaptureMode};
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
     LaunchRecipe, LaunchValue, PackageDefinition, PluginListRule, RelPath, RuntimeIdentity,
-    StoreId, StoreIdentifier, ToolDefinition, ToolId, UserDataLocation, UserFileMapping,
-    UserFileStrategy,
+    StoreId, StoreIdentifier, ToolDefinition, ToolId, ToolOutput, UserDataLocation,
+    UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -70,6 +70,8 @@ fn literal_args(args: &[&str]) -> Vec<LaunchValue> {
 /// A tool that writes `Data\<name>.txt` into its staging folder.
 fn writes_a_file(id: &str, file: &str) -> ToolDefinition {
     ToolDefinition {
+        output: ToolOutput::GeneratedLayer,
+        output_arg: None,
         output_patterns: Vec::new(),
         id: ToolId::new(id).unwrap(),
         game: GameId::new(GAME).unwrap(),
@@ -153,6 +155,7 @@ fn definition(tools: &[ToolDefinition]) -> GameDefinition {
             semantics: Some("creation_engine".to_string()),
             implicit: Vec::new(),
             implicit_list_file: None,
+            loot: None,
         }),
         runtime_files: Vec::new(),
         save_location: Vec::new(),

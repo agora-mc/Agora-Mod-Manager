@@ -222,8 +222,13 @@ pub async fn games_instance_create(
     install_id: String,
     name: String,
     base_mode: String,
+    deployment: Option<String>,
 ) -> Result<CreatedInstance, GamesError> {
-    blocking(move || create_instance(&app, &game_id, &install_id, &name, &base_mode)).await
+    let chosen = match deployment {
+        Some(word) => parse_deployment(&word)?,
+        None => None,
+    };
+    blocking(move || create_instance(&app, &game_id, &install_id, &name, &base_mode, chosen)).await
 }
 
 /// Delete an instance and its folder. Refused while the game is running.
@@ -348,6 +353,7 @@ fn create_instance(
     install_id: &str,
     name: &str,
     base_mode: &str,
+    deployment: Option<DeployMode>,
 ) -> Result<CreatedInstance, GamesError> {
     let game = parse_game_id(game_id)?;
     let mode = parse_base_mode(base_mode)?;
@@ -404,6 +410,20 @@ fn create_instance(
         },
     )
     .map_err(map_error)?;
+
+    // Apply the defaults the user chose for this game. A failure here removes the instance Agora
+    // just made (nothing the user owned), so a half-set-up instance is never left behind.
+    let preferences: Result<(), GamesError> = (|| {
+        if let Some(mode) = deployment {
+            agora_core::game_deploy::set_deployment(&ctx, &record.instance_id, Some(mode))
+                .map_err(core_failed)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = preferences {
+        let _ = game_instance::delete(&ctx, &record.instance_id);
+        return Err(error);
+    }
 
     Ok(created_for(
         &record,
