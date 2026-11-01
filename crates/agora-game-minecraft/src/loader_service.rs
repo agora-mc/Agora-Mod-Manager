@@ -1182,9 +1182,10 @@ mod tests {
                     provided_mod_ids: vec![],
                     enabled: true,
                     content_type: "mod".into(),
-                
+
                     content_item_id: None,
-                    object_sha256: None,})
+                    object_sha256: None,
+                })
                 .collect(),
             resourcepacks: vec![],
             shaders: vec![],

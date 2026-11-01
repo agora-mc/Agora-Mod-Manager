@@ -708,6 +708,22 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_without_store_fields_still_loads() {
+        let json = r#"{
+            "filename": "old.jar",
+            "source": "local",
+            "sha256": "abc123",
+            "installed_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let mod_: InstalledMod = serde_json::from_str(json).unwrap();
+        assert!(mod_.content_item_id.is_none());
+        assert!(mod_.object_sha256.is_none());
+        let written = serde_json::to_value(&mod_).unwrap();
+        assert!(written.get("content_item_id").is_none());
+        assert!(written.get("object_sha256").is_none());
+    }
+
+    #[test]
     fn test_installed_mod_minimal_fields() {
         let json = r#"{
             "filename": "test.jar",
@@ -793,9 +809,10 @@ mod tests {
                 provided_mod_ids: vec!["nested_api".to_string(), "legacy_alias".to_string()],
                 enabled: true,
                 content_type: "mod".to_string(),
-            
+
                 content_item_id: None,
-                object_sha256: None,}],
+                object_sha256: None,
+            }],
             resourcepacks: vec![],
             shaders: vec![],
             datapacks: vec![],

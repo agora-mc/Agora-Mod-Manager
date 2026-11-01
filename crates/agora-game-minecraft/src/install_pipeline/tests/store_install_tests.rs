@@ -46,8 +46,9 @@ fn read_instance_manifest(dir: &Path) -> InstanceManifest {
 }
 
 fn run_store_plan(plan: &ResolvedInstallPlan, dir: &Path, ctx: &Ctx) -> InstallOutcome {
-    tokio::runtime::Runtime::new().unwrap().block_on(
-        InstallPipeline.execute_plan_with_scheduler(
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(InstallPipeline.execute_plan_with_scheduler(
             plan,
             dir,
             "registry-rev",
@@ -57,8 +58,7 @@ fn run_store_plan(plan: &ResolvedInstallPlan, dir: &Path, ctx: &Ctx) -> InstallO
                 content_store: Some(ctx),
                 ..Default::default()
             },
-        ),
-    )
+        ))
 }
 
 fn write_mod_jar(dir: &Path, id: &str, version: &str) -> std::path::PathBuf {
@@ -116,7 +116,7 @@ fn success_warnings(outcome: &InstallOutcome) -> Vec<PlanWarning> {
 fn a_browse_install_links_the_jar_from_the_store() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let plan = resolve_local_plan(&dir, &source, "sodium.jar", None);
 
     assert_success(run_store_plan(&plan, &dir, &ctx));
@@ -153,7 +153,7 @@ fn a_browse_install_copies_when_sharing_is_off() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
     crate::content_bridge::set_sharing(&ctx, false).unwrap();
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let plan = resolve_local_plan(&dir, &source, "sodium.jar", None);
 
     assert_success(run_store_plan(&plan, &dir, &ctx));
@@ -198,7 +198,7 @@ fn two_instances_installing_the_same_mod_share_one_object() {
     )
     .unwrap();
 
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     for dir in [&first, &second] {
         let plan = resolve_local_plan(dir, &source, "shared.jar", None);
         assert_success(run_store_plan(&plan, dir, &ctx));
@@ -221,13 +221,13 @@ fn two_instances_installing_the_same_mod_share_one_object() {
 fn updating_a_linked_mod_replaces_it_and_rollback_restores_it() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
-    let older = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let older = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let first = resolve_local_plan(&dir, &older, "sodium.jar", None);
     assert_success(run_store_plan(&first, &dir, &ctx));
     let before = read_instance_manifest(&dir).mods[0].clone();
     let old_bytes = std::fs::read(dir.join("mods/sodium.jar")).unwrap();
 
-    let newer = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "2.0.0");
+    let newer = write_mod_jar(tmp.path(), "manual-item", "2.0.0");
     let update = resolve_local_plan(&dir, &newer, "sodium.jar", None);
     assert_eq!(update.files_to_remove.len(), 1, "the old file is replaced");
     set_install_failpoint(Some("manifest-rename"));
@@ -259,14 +259,47 @@ fn updating_a_linked_mod_replaces_it_and_rollback_restores_it() {
     );
     let updated = read_instance_manifest(&dir);
     assert_eq!(updated.mods.len(), 1, "the update leaves one entry");
-    assert_eq!(updated.mods[0].version.as_deref(), Some("2.0.0"));
+    assert_ne!(updated.mods[0].sha256, before.sha256);
+}
+
+#[test]
+fn a_failed_apply_rolls_a_linked_update_back_without_the_snapshot() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let older = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
+    let first = resolve_local_plan(&dir, &older, "sodium.jar", None);
+    assert_success(run_store_plan(&first, &dir, &ctx));
+    let old_bytes = std::fs::read(dir.join("mods/sodium.jar")).unwrap();
+
+    let newer = write_mod_jar(tmp.path(), "manual-item", "2.0.0");
+    let update = resolve_local_plan(&dir, &newer, "sodium.jar", None);
+    let staging = dir.join(".agora").join("staging").join("direct-test");
+    std::fs::create_dir_all(staging.join("artifacts")).unwrap();
+    for add in &update.files_to_add {
+        std::fs::copy(
+            &newer,
+            staging.join("artifacts").join(&add.staging_filename),
+        )
+        .unwrap();
+    }
+    prepare_manifest(&update, &dir, &staging, Some(&ctx)).unwrap();
+    set_install_failpoint(Some("manifest-rename"));
+    let result = apply_transaction(&update, &dir, &staging, Some(&ctx));
+    set_install_failpoint(None);
+
+    assert!(result.is_err(), "the injected failure must surface");
+    assert_eq!(
+        std::fs::read(dir.join("mods/sodium.jar")).unwrap(),
+        old_bytes,
+        "the fast rollback puts the linked file back"
+    );
 }
 
 #[test]
 fn removing_a_linked_mod_leaves_the_store_object() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let plan = resolve_local_plan(&dir, &source, "sodium.jar", None);
     assert_success(run_store_plan(&plan, &dir, &ctx));
     let object = read_instance_manifest(&dir).mods[0]
@@ -289,7 +322,7 @@ fn removing_a_linked_mod_leaves_the_store_object() {
 fn a_user_replaced_file_is_never_deleted() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let plan = resolve_local_plan(&dir, &source, "sodium.jar", None);
     assert_success(run_store_plan(&plan, &dir, &ctx));
 
@@ -308,13 +341,13 @@ fn a_user_replaced_file_is_never_deleted() {
 fn a_user_replaced_file_is_moved_aside_by_an_update() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
-    let older = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let older = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let first = resolve_local_plan(&dir, &older, "sodium.jar", None);
     assert_success(run_store_plan(&first, &dir, &ctx));
 
     std::fs::remove_file(dir.join("mods/sodium.jar")).unwrap();
     std::fs::write(dir.join("mods/sodium.jar"), b"the user's new bytes").unwrap();
-    let newer = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "2.0.0");
+    let newer = write_mod_jar(tmp.path(), "manual-item", "2.0.0");
     let update = resolve_local_plan(&dir, &newer, "sodium.jar", None);
     let outcome = run_store_plan(&update, &dir, &ctx);
     assert_success(outcome.clone());
@@ -339,7 +372,7 @@ fn a_user_replaced_file_is_moved_aside_by_an_update() {
 fn disabling_and_enabling_a_linked_mod_works() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let plan = resolve_local_plan(&dir, &source, "sodium.jar", None);
     assert_success(run_store_plan(&plan, &dir, &ctx));
 
@@ -358,7 +391,7 @@ fn disabling_and_enabling_a_linked_mod_works() {
 fn a_mod_deleted_by_hand_can_be_installed_again() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "manual-item", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
     let plan = resolve_local_plan(&dir, &source, "sodium.jar", None);
     assert_success(run_store_plan(&plan, &dir, &ctx));
     std::fs::remove_file(dir.join("mods/sodium.jar")).unwrap();
@@ -370,10 +403,106 @@ fn a_mod_deleted_by_hand_can_be_installed_again() {
 }
 
 #[test]
+fn a_direct_artifact_install_links_from_the_store() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
+    let bytes = std::fs::read(&source).unwrap();
+    let sha = super::sha256_hex(&bytes);
+    let service = crate::install_service::InstallService::new(ctx.clone());
+
+    let installed = service
+        .commit_verified_artifact(
+            "test",
+            "manual.jar",
+            "mod",
+            "https://example.invalid/manual.jar",
+            None,
+            None,
+            "registry",
+            Some("1.0.0"),
+            None,
+            Some(&sha),
+            None,
+            None,
+            None,
+            false,
+            bytes,
+        )
+        .unwrap();
+
+    assert!(installed.content_item_id.is_some());
+    let object = installed.object_sha256.clone().unwrap();
+    assert!(ctx.paths.content_object_path(&object).is_file());
+    assert_eq!(
+        std::fs::read(dir.join("mods/manual.jar")).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert_eq!(
+        read_instance_manifest(&dir).mods[0]
+            .content_item_id
+            .as_deref(),
+        installed.content_item_id.as_deref()
+    );
+}
+
+#[test]
+fn a_manual_drop_links_from_the_store() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "manual-drop", "1.0.0");
+
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let installed = service
+        .add_manual_artifact("test", source.to_str().unwrap())
+        .unwrap();
+
+    assert_eq!(installed.source, "manual_drag_drop");
+    assert!(installed.content_item_id.is_some());
+    let object = installed.object_sha256.clone().unwrap();
+    assert!(ctx.paths.content_object_path(&object).is_file());
+    assert_eq!(
+        std::fs::read(dir.join("mods").join(&installed.filename)).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+}
+
+#[test]
+fn a_hard_link_clone_of_a_linked_mod_stays_removable() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
+    let plan = resolve_local_plan(&dir, &source, "sodium.jar", None);
+    assert_success(run_store_plan(&plan, &dir, &ctx));
+
+    let prefs = crate::clone::ClonePrefs {
+        copy_saves: false,
+        copy_mods: true,
+        copy_resource_packs: false,
+        copy_shader_packs: false,
+        copy_screenshots: false,
+        copy_config: false,
+        copy_servers: false,
+        copy_options: false,
+        use_hard_links: true,
+        use_sym_links: false,
+    };
+    let clone_dir = tmp.path().join("clone");
+    crate::clone::clone_instance(&dir, &clone_dir, &prefs).unwrap();
+
+    let cloned = clone_dir.join("mods").join("sodium.jar");
+    assert_eq!(
+        std::fs::read(&cloned).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    std::fs::remove_file(&cloned).expect("a cloned link can be deleted");
+}
+
+#[test]
 fn adding_a_stored_item_offline_needs_no_network() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut ctx, dir) = ctx_instance(&tmp, "test");
-    let source = write_mod_jar(&tmp.path().to_path_buf(), "offline", "1.0.0");
+    let source = write_mod_jar(tmp.path(), "offline", "1.0.0");
     let stored = crate::content_bridge::store_file(
         &ctx,
         &source,

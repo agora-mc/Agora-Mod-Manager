@@ -594,10 +594,18 @@ impl InstallService {
         if !stored.sha256.eq_ignore_ascii_case(&installed_sha256) {
             return Err(LauncherError::Generic {
                 code: "ERR_CONTENT_STORE".into(),
-                message: "The stored object does not match the verified download; nothing was installed.".into(),
+                message:
+                    "The stored object does not match the verified download; nothing was installed."
+                        .into(),
             });
         }
-        let _ = crate::content_bridge::place_file(&self.ctx, &stored.sha256, &dir, content_type, filename)?;
+        let _ = crate::content_bridge::place_file(
+            &self.ctx,
+            &stored.sha256,
+            &dir,
+            content_type,
+            filename,
+        )?;
 
         let metadata =
             crate::jar_metadata::parse_jar_metadata_for_loader(&item_path, &manifest.loader);

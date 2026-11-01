@@ -1772,19 +1772,18 @@ impl InstallPipeline {
         let apply_staging = staging_dir.clone();
         let mut moved_aside = Vec::new();
         let apply_store = content_store.clone();
-        let apply_result =
-            run_blocking_phase(scheduler, "install transaction apply", move || {
-                apply_transaction(
-                    &apply_plan,
-                    &apply_dir,
-                    &apply_staging,
-                    apply_store.as_ref(),
-                )
-            })
-            .await
-            .map(|moved| {
-                moved_aside = moved;
-            });
+        let apply_result = run_blocking_phase(scheduler, "install transaction apply", move || {
+            apply_transaction(
+                &apply_plan,
+                &apply_dir,
+                &apply_staging,
+                apply_store.as_ref(),
+            )
+        })
+        .await
+        .map(|moved| {
+            moved_aside = moved;
+        });
         if let Err(apply_error) = apply_result {
             let fast_rollback_performed =
                 apply_error.contains("pre-commit file moves were reversed");
@@ -3894,9 +3893,7 @@ fn apply_transaction(
     let placed_targets = if content_store.is_some() {
         let prepared =
             agora_core::helpers::read_manifest(&staging_dir.join("instance_manifest.next.json"))
-                .map_err(|e| {
-                    format!("failed to read the prepared manifest during apply: {e}")
-                })?;
+                .map_err(|e| format!("failed to read the prepared manifest during apply: {e}"))?;
         all_installed(&prepared)
             .into_iter()
             .filter_map(|entry| {
@@ -7330,9 +7327,10 @@ mod tests {
             optional_deps: vec![],
             incompatible_deps: vec![],
             provided_mod_ids: vec![],
-        
+
             content_item_id: None,
-            object_sha256: None,});
+            object_sha256: None,
+        });
         std::fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).unwrap(),

@@ -332,9 +332,10 @@ fn inventory_pack_content(
             depends_on: Vec::new(),
             optional_deps: Vec::new(),
             incompatible_deps: Vec::new(),
-        
+
             content_item_id: None,
-            object_sha256: None,});
+            object_sha256: None,
+        });
     }
     installed.sort_by(|a, b| a.filename.cmp(&b.filename));
     refuse_duplicate_names(&installed, directory)?;

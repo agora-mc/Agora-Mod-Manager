@@ -569,9 +569,10 @@ mod tests {
                 provided_mod_ids: vec![],
                 enabled: true,
                 content_type: "mod".into(),
-            
+
                 content_item_id: None,
-                object_sha256: None,}],
+                object_sha256: None,
+            }],
             resourcepacks: vec![],
             shaders: vec![],
             datapacks: vec![],
@@ -752,9 +753,10 @@ mod tests {
             enabled: true,
             content_type: "mod".into(),
             hash_verified: true,
-        
+
             content_item_id: None,
-            object_sha256: None,});
+            object_sha256: None,
+        });
         let out = tmp.path().join("pack.mrpack");
 
         let result = export_instance_pack_to(&instance_dir, &manifest, &out, "mrpack").await;
@@ -1081,9 +1083,10 @@ mod tests {
                 provided_mod_ids: vec![],
                 enabled: true,
                 content_type: "mod".into(),
-            
+
                 content_item_id: None,
-                object_sha256: None,}];
+                object_sha256: None,
+            }];
         }
         manifest
     }

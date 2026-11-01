@@ -4632,9 +4632,10 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
-        
+
             content_item_id: None,
-            object_sha256: None,};
+            object_sha256: None,
+        };
         assert!(!manifest_has_shader_loader(&manifest));
         manifest
             .shaders
@@ -5010,9 +5011,10 @@ mod tests {
                 depends_on: vec![],
                 optional_deps: vec![],
                 incompatible_deps: vec![],
-            
+
                 content_item_id: None,
-                object_sha256: None,}],
+                object_sha256: None,
+            }],
             resourcepacks: vec![InstalledMod {
                 provider: None,
                 update_pinned: false,
@@ -5035,9 +5037,10 @@ mod tests {
                 depends_on: vec![],
                 optional_deps: vec![],
                 incompatible_deps: vec![],
-            
+
                 content_item_id: None,
-                object_sha256: None,}],
+                object_sha256: None,
+            }],
             shaders: vec![],
             datapacks: vec![],
             worlds: vec![],

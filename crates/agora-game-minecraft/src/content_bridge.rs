@@ -14,8 +14,7 @@ use agora_core::{
     helpers,
     lock_manager::LockResource,
     models::InstalledMod,
-    paths,
-    snapshot,
+    paths, snapshot,
 };
 
 /// What an install path already knows about the file it is storing.
@@ -82,7 +81,8 @@ pub fn store_file(
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| details.filename.to_string());
-    let outcome = store::add_file(ctx, file_path, Some(&name), Some(&rel)).map_err(content_error)?;
+    let outcome =
+        store::add_file(ctx, file_path, Some(&name), Some(&rel)).map_err(content_error)?;
     let item = outcome.item();
     let file = item
         .files
@@ -159,12 +159,13 @@ pub fn stored_mod_fields(item: &store::ContentItem) -> LauncherResult<(String, S
             "'{path}' is not in a Minecraft content folder; this item cannot be added to an instance."
         ),
     })?;
-    let filename = parts.next().filter(|name| !name.is_empty()).ok_or_else(|| {
-        LauncherError::Generic {
+    let filename = parts
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| LauncherError::Generic {
             code: "ERR_CONTENT_ITEM_NOT_MINECRAFT".into(),
             message: format!("'{path}' has no file name."),
-        }
-    })?;
+        })?;
     if parts.next().is_some() {
         return Err(LauncherError::Generic {
             code: "ERR_CONTENT_ITEM_NOT_MINECRAFT".into(),
@@ -186,9 +187,10 @@ pub fn add_item_to_instance(
     item_id: &str,
 ) -> LauncherResult<InstalledMod> {
     let sanitized = paths::sanitize_id(instance_id);
-    let _guard = ctx
-        .lock_manager
-        .acquire(LockResource::Instance(sanitized.clone()), "add_stored_content")?;
+    let _guard = ctx.lock_manager.acquire(
+        LockResource::Instance(sanitized.clone()),
+        "add_stored_content",
+    )?;
     let dir = ctx.paths.instance_dir(&sanitized)?;
     let manifest_path = ctx.paths.instance_manifest(&sanitized)?;
     if !manifest_path.exists() {
@@ -256,10 +258,7 @@ pub fn add_item_to_instance(
 #[cfg(test)]
 pub fn forbid_network(ctx: &mut Ctx) {
     let client = reqwest::Client::builder()
-        .proxy(
-            reqwest::Proxy::all("http://127.0.0.1:9")
-                .expect("a local proxy address is valid"),
-        )
+        .proxy(reqwest::Proxy::all("http://127.0.0.1:9").expect("a local proxy address is valid"))
         .timeout(std::time::Duration::from_millis(250))
         .build()
         .expect("test HTTP client");

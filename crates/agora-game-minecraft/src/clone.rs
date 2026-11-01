@@ -1,4 +1,4 @@
-use agora_core::paths;
+use agora_core::{content_store::protect, paths};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -273,6 +273,20 @@ fn copy_entry(
                     item.src, item.dst
                 )
             })?;
+            // A link to a protected store object can only be removed from a folder that grants the
+            // delete-child right. Make sure the folder this clone created has it, or take the link
+            // back and say why: a clone whose files cannot be removed later is worse than a copy.
+            if let Some(parent) = item.dst.parent() {
+                let granted = protect::grants_delete_child(parent).unwrap_or(false)
+                    || protect::grant_delete_child(parent).is_ok();
+                if !granted {
+                    let _ = fs::remove_file(&item.dst);
+                    return Err(format!(
+                        "Cannot make {:?} safe to delete after a hard-link clone; refusing to leave a file that cannot be removed",
+                        item.dst
+                    ));
+                }
+            }
             continue;
         }
 

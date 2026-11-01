@@ -2070,9 +2070,10 @@ mod tests {
                 provided_mod_ids: vec![],
                 enabled: true,
                 content_type: "mod".into(),
-            
+
                 content_item_id: None,
-                object_sha256: None,}],
+                object_sha256: None,
+            }],
             resourcepacks: vec![],
             shaders: vec![],
             datapacks: vec![],
@@ -2238,9 +2239,10 @@ mod tests {
                 provided_mod_ids: vec![],
                 enabled: true,
                 content_type: "mod".into(),
-            
+
                 content_item_id: None,
-                object_sha256: None,})
+                object_sha256: None,
+            })
             .collect();
         InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
