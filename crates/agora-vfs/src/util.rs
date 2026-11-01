@@ -21,9 +21,16 @@ pub fn guarded<T>(f: impl FnOnce() -> T) -> Option<T> {
     if INSIDE.with(|i| i.replace(true)) {
         return None;
     }
-    let r = f();
-    INSIDE.with(|i| i.set(false));
-    Some(r)
+    // Restore the flag on the way out even if `f` panics: `catch_hook_panic` answers that one call
+    // with ACCESS_DENIED, and the thread must still redirect the next one.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INSIDE.with(|i| i.set(false));
+        }
+    }
+    let _restore = Restore;
+    Some(f())
 }
 
 pub fn log(msg: impl AsRef<str>) {

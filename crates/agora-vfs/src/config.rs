@@ -100,11 +100,26 @@ impl VfsConfig {
         }
         let mount_len = mount_clean.len();
         let upper_clean = normalize_win_path(&self.upper.to_string_lossy());
+        if upper_clean.is_empty() {
+            return Err("Upper path cannot be empty".to_string());
+        }
         let lowers: Vec<String> = self
             .lowers
             .iter()
             .map(|p| normalize_win_path(&p.to_string_lossy()))
             .collect();
+        for lower in &lowers {
+            if lower.is_empty() {
+                return Err("Lower path cannot be empty".to_string());
+            }
+            // Writes must never land in a layer that is read-only: an upper inside a lower (or
+            // the reverse, or the same folder) would make every write change a base file.
+            if overlaps(&upper_clean, lower) {
+                return Err(format!(
+                    "upper '{upper_clean}' overlaps the lower '{lower}'"
+                ));
+            }
+        }
         let aliases: Vec<String> = self.aliases.iter().map(|a| normalize_win_path(a)).collect();
 
         for (i, alias) in aliases.iter().enumerate() {

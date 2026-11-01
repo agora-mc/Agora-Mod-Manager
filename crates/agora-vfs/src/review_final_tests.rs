@@ -1,12 +1,15 @@
 //! Final-review probes of the pure mapping and decision functions (no injected process).
 //!
-//! Each test whose name starts `bug_` proves a bug and is `#[ignore]`d so the suite stays green;
-//! run them with `cargo test -p agora-vfs --lib review_final -- --ignored`.
+//! Each test whose name starts `bug_` proved a bug and now guards its fix.
 
 use crate::config::{RuntimeConfig, VfsConfig};
 use crate::hooks::{plan_open, Plan};
 use crate::nt::*;
-use crate::paths::{add_whiteout, resolve, Resolved, Via};
+use crate::paths::{
+    add_whiteout, normalize_rel, note_close, rel_of_handle, resolve, upper_for_write, whited_out,
+    Resolved, Via,
+};
+use crate::Tracked;
 use std::path::{Path, PathBuf};
 
 fn temp_root(name: &str) -> PathBuf {
@@ -60,7 +63,6 @@ fn a_plain_write_to_a_lower_file_is_copied_up_and_leaves_the_lower_alone() {
 /// Win32 and does resolve `..`: it puts a copy of a lower-side file at any path the `..` reaches on
 /// the upper side (and `upper_for_write` creates the folders on the way).
 #[test]
-#[ignore = "proves bug: a '..' in the rel makes copy-up write a file outside the upper layer"]
 fn bug_dotdot_in_rel_copies_a_file_outside_the_upper_layer() {
     let root = temp_root("dotdot");
     // lower is three folders deep, upper two, so the same rel names different files on each side.
@@ -96,7 +98,6 @@ fn bug_dotdot_in_rel_copies_a_file_outside_the_upper_layer() {
 /// in any lower, so the open is a create in the upper layer. NTFS creates `upper\Data\a.esp` as an
 /// empty file carrying the stream, and that empty file now wins over the real `a.esp` below.
 #[test]
-#[ignore = "proves bug: creating an alternate data stream on a lower file leaves an empty upper file that shadows it"]
 fn bug_creating_a_stream_on_a_lower_file_shadows_the_file_with_an_empty_one() {
     let root = temp_root("ads");
     let game = root.join("game");
@@ -138,7 +139,6 @@ fn bug_creating_a_stream_on_a_lower_file_shadows_the_file_with_an_empty_one() {
 /// delete hook reports success for a non-empty lower directory). The core's own deployment read
 /// of the same markers treats a marker as a prefix (`game_deploy.rs`, "key.starts_with(&prefix)").
 #[test]
-#[ignore = "proves bug: a directory whiteout does not hide the lower files below it"]
 fn bug_a_directory_whiteout_leaves_the_files_below_it_reachable() {
     let root = temp_root("dirwh");
     let game = root.join("game");
@@ -160,7 +160,6 @@ fn bug_a_directory_whiteout_leaves_the_files_below_it_reachable() {
 /// as an upper (writable) one. A rename or delete through it then passes to the real folder:
 /// `nt_set_information_file` only intercepts handles with `lower: true`.
 #[test]
-#[ignore = "proves bug: the real mount folder is opened with DELETE/write rights and tracked as writable"]
 fn bug_the_mount_folder_handle_keeps_delete_and_write_rights() {
     let root = temp_root("mount");
     let game = root.join("game");
@@ -191,7 +190,6 @@ fn bug_the_mount_folder_handle_keeps_delete_and_write_rights() {
 /// meant to be read-only. The configuration checks aliases against everything, but not the upper
 /// against the lowers.
 #[test]
-#[ignore = "proves bug: the config accepts an upper layer that is also a lower layer"]
 fn bug_config_accepts_the_upper_layer_as_a_lower_layer() {
     let json = r#"{"version": 1, "mount": "D:\\Games\\G", "upper": "D:\\Bases\\base",
         "lowers": ["D:\\Games\\G", "D:\\Bases\\base"], "dll": "C:\\d.dll"}"#;
@@ -204,7 +202,6 @@ fn bug_config_accepts_the_upper_layer_as_a_lower_layer() {
 /// An empty upper layer is accepted: `upper = ""` becomes a relative path, so writes would go to
 /// the process's current directory (the mount path, by contrast, is checked for emptiness).
 #[test]
-#[ignore = "proves bug: the config accepts an empty upper layer (writes go to the current directory)"]
 fn bug_config_accepts_an_empty_upper_layer() {
     let json = r#"{"version": 1, "mount": "D:\\Games\\G", "upper": "",
         "lowers": ["D:\\Games\\G"], "dll": "C:\\d.dll"}"#;
@@ -217,7 +214,6 @@ fn bug_config_accepts_an_empty_upper_layer() {
 /// set: from then on every hook on that thread sees `is_inside()`, plans nothing and passes the
 /// call straight to the real file system, so the thread's writes are no longer redirected.
 #[test]
-#[ignore = "proves bug: a panic inside guarded() leaves the thread unprotected (hooks pass through for good)"]
 fn bug_a_panic_inside_guarded_leaves_the_thread_unprotected() {
     use crate::util::{catch_hook_panic, guarded, is_inside};
     assert!(!is_inside());
@@ -232,4 +228,86 @@ fn bug_a_panic_inside_guarded_leaves_the_thread_unprotected() {
         !is_inside(),
         "after the caught panic the thread still skips every hook"
     );
+}
+
+/// A path longer than the old 1024-unit buffer made `GetFinalPathNameByHandleW` fail, so the call
+/// passed through to the real file system unredirected. The lookup now grows the buffer (and a
+/// write whose path still cannot be read is refused, not passed through; the hook is the only way
+/// to prove that part, see the hand-back).
+#[test]
+fn a_handle_path_over_1023_characters_is_still_located() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    let root = temp_root("longpath");
+    let mut deep = root.clone();
+    for _ in 0..6 {
+        deep = deep.join("d".repeat(200));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    assert!(deep.as_os_str().len() > 1023);
+    let c = config(&root, &temp_root("longpath-upper"), &[&root]);
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&deep)
+        .unwrap();
+    let handle = dir.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let located = unsafe { rel_of_handle(handle, &c) }
+        .expect("the handle's path is readable")
+        .expect("the path is inside the mount");
+    assert_eq!(located.rel.split('\\').count(), 6);
+    drop(dir);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Delete-on-close of a copied-up file deletes the upper copy at `NtClose`; without a marker the
+/// lower original reappears. `note_close` is the decision the hook makes (the hook itself only
+/// runs under injection).
+#[test]
+fn delete_on_close_of_a_copied_up_file_leaves_a_whiteout() {
+    let root = temp_root("delclose");
+    let game = root.join("game");
+    std::fs::create_dir_all(game.join("Data")).unwrap();
+    std::fs::write(game.join("Data").join("a.esp"), b"LOWER").unwrap();
+    let c = config(&game, &root.join("upper"), &[&game]);
+    let upper = upper_for_write(r"Data\a.esp", &c.upper);
+    std::fs::write(&upper, b"UPPER COPY").unwrap();
+    std::fs::remove_file(&upper).unwrap();
+    let t = Tracked {
+        rel: r"Data\a.esp".to_string(),
+        via: Via::Mount,
+        lower: false,
+        delete_on_close: true,
+        dir: false,
+    };
+    note_close(&t, &c);
+    assert!(whited_out(r"Data\a.esp", &c.upper));
+    assert_eq!(resolve(r"Data\a.esp", &c), Resolved::WhitedOut);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `..` (above the root), a leading separator, a stream or a device name must never become a path
+/// on disk.
+#[test]
+fn names_that_could_leave_the_upper_layer_are_refused() {
+    assert_eq!(
+        normalize_rel(r"Data\mod.esp"),
+        Some(r"Data\mod.esp".to_string())
+    );
+    assert_eq!(
+        normalize_rel(r".\Data\..\mod.esp"),
+        Some(r"mod.esp".to_string())
+    );
+    for bad in [
+        r"..\x",
+        r"a\..\..\x",
+        r"\x",
+        r"/x",
+        r"C:x",
+        r"Data\a.esp:stream",
+        r"CON",
+        r"Data\NUL.txt",
+    ] {
+        assert_eq!(normalize_rel(bad), None, "{bad}");
+    }
 }

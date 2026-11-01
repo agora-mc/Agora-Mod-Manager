@@ -28,6 +28,7 @@ pub const WRITE_DAC: u32 = 0x4_0000;
 pub const WRITE_OWNER: u32 = 0x8_0000;
 pub const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 pub const GENERIC_ALL: u32 = 0x1000_0000;
+pub const GENERIC_EXECUTE: u32 = 0x2000_0000;
 pub const GENERIC_WRITE: u32 = 0x4000_0000;
 pub const GENERIC_READ: u32 = 0x8000_0000;
 pub const SYNCHRONIZE: u32 = 0x10_0000;
