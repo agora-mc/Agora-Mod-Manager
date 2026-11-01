@@ -69,6 +69,25 @@ pub struct LibraryInstanceOptions {
     pub warnings: Vec<String>,
 }
 
+/// One item no instance uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnusedItemRow {
+    pub item_id: String,
+    pub name: String,
+    pub total_size: u64,
+    pub game_id: Option<String>,
+}
+
+/// Items no instance uses, with their total size and any manifest that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnusedListing {
+    pub items: Vec<UnusedItemRow>,
+    pub total_size: u64,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryIconCached {
@@ -129,6 +148,33 @@ pub async fn games_library_list(app: tauri::AppHandle) -> Result<LibraryListing,
     })
     .await
     .map_err(|_| GamesError::new(TASK_FAILED, "Reading the library did not finish."))?
+}
+
+/// Every item no instance uses, so the Library can offer to free the space. Removal still goes
+/// through `games_content_remove`, which refuses an item an instance uses or a store with an
+/// unreadable instance manifest.
+#[tauri::command]
+pub async fn games_library_unused(app: tauri::AppHandle) -> Result<UnusedListing, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<UnusedListing, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let listing = core_library::list_unused(&ctx).map_err(library_error)?;
+        Ok(UnusedListing {
+            items: listing
+                .items
+                .into_iter()
+                .map(|item| UnusedItemRow {
+                    item_id: item.item_id,
+                    name: item.name,
+                    total_size: item.total_size,
+                    game_id: item.game_id,
+                })
+                .collect(),
+            total_size: listing.total_size,
+            warnings: listing.warnings,
+        })
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Reading the unused items did not finish."))?
 }
 
 /// One saved icon's bytes as a `data:` URL. Only the store's objects are read, the hash is

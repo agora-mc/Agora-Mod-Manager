@@ -290,7 +290,13 @@ pub enum ContentError {
     #[error("insufficient disk space: need {required} bytes (including 1 GiB headroom), but only {available} bytes available")]
     InsufficientSpace { required: u64, available: u64 },
     #[error("cannot remove item {item_id}: in use by instance(s): {instances}")]
-    InUse { item_id: String, instances: String },
+    InUse {
+        item_id: String,
+        /// The instances' display names, for people (the Library and CLI show this).
+        instances: String,
+        /// The instances' ids, for code.
+        instance_ids: Vec<String>,
+    },
     #[error("cannot remove item {item_id}: manifest '{manifest}' is unreadable: {error}")]
     UnreadableManifest {
         item_id: String,
@@ -2137,39 +2143,52 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
         return Err(ContentError::NotFound(item_id));
     }
 
-    // 0. Check every generic game instance first; refuse if one uses the item, or if any of them
-    //    cannot be listed or read (fail closed). Minecraft instances share the instances folder
-    //    and the manifest file name in their own format, and never hold content layers, so they
-    //    are found through the generic instance table rather than by parsing every folder.
-    let mut using_instances = Vec::new();
-    let records =
-        crate::game_instance::list(ctx).map_err(|e| ContentError::UnreadableManifest {
-            item_id: item_id.clone(),
-            manifest: "game instance list".into(),
-            error: e.to_string(),
-        })?;
-    for record in records {
-        let manifest =
-            crate::game_instance::get_manifest(ctx, &record.instance_id).map_err(|e| {
-                ContentError::UnreadableManifest {
-                    item_id: item_id.clone(),
-                    manifest: format!("instance {}", record.instance_id),
-                    error: e.to_string(),
-                }
-            })?;
-        let uses_item = manifest.layers.layers().iter().any(|layer| {
-            matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &item_id)
+    // 0. Check every instance first (Minecraft and generic), through the same join the Library
+    //    uses. A generic instance names the item in a Content layer; a Minecraft instance records
+    //    the item id, or the object hash its installed file came from. If an instance uses the
+    //    item, removal refuses naming the instances. If any manifest cannot be read, removal
+    //    refuses too (fail closed), naming the file.
+    //
+    //    The target's own record is read only to learn its object hashes; a damaged record still
+    //    can be removed, and is checked by its id alone.
+    let target_hashes: Vec<String> = std::fs::read_to_string(&target_manifest_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<ContentItem>(&content).ok())
+        .map(|item| item.files.into_iter().map(|file| file.sha256).collect())
+        .unwrap_or_default();
+    let usage = crate::library::instances_using(ctx, &item_id, &target_hashes);
+
+    if let Some(unreadable) = usage.unreadable.first() {
+        return Err(ContentError::UnreadableManifest {
+            item_id,
+            manifest: unreadable.manifest_path.clone(),
+            error: unreadable.error.clone(),
         });
-        if uses_item {
-            using_instances.push(manifest.instance_id.clone());
-        }
     }
 
-    if !using_instances.is_empty() {
-        using_instances.sort();
+    if !usage.instances.is_empty() {
+        let mut using: Vec<(String, String)> = usage
+            .instances
+            .iter()
+            .map(|instance| {
+                let name = instance.name.trim();
+                let label = if name.is_empty() {
+                    instance.instance_id.clone()
+                } else {
+                    name.to_string()
+                };
+                (label, instance.instance_id.clone())
+            })
+            .collect();
+        using.sort();
         return Err(ContentError::InUse {
             item_id,
-            instances: using_instances.join(", "),
+            instances: using
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            instance_ids: using.into_iter().map(|(_, id)| id).collect(),
         });
     }
 

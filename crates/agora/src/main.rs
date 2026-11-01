@@ -875,6 +875,8 @@ enum ContentCmd {
     },
     /// List all items in the content store.
     List,
+    /// List items no instance uses, with their size.
+    Unused,
     /// Show files in a content item.
     Show {
         /// Item ID or unique prefix.
@@ -6292,6 +6294,45 @@ async fn run_command(
                         }
                     }
                 }
+                ContentCmd::Unused => match agora_core::library::list_unused(ctx) {
+                    Ok(listing) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&listing)?);
+                        } else if listing.items.is_empty() {
+                            println!("No unused content items.");
+                        } else {
+                            for item in &listing.items {
+                                let short_id = &item.item_id[..12.min(item.item_id.len())];
+                                println!(
+                                    "{} ({}, {})",
+                                    item.name,
+                                    short_id,
+                                    format_size(item.total_size)
+                                );
+                            }
+                            println!(
+                                "{} unused item(s), {}.",
+                                listing.items.len(),
+                                format_size(listing.total_size)
+                            );
+                            for warning in &listing.warnings {
+                                eprintln!("Warning: {warning}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            let out = serde_json::json!({
+                                "error": e.to_string(),
+                                "exitCode": 1,
+                            });
+                            eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                        } else {
+                            eprintln!("Error: {e}");
+                        }
+                        std::process::exit(1);
+                    }
+                },
                 ContentCmd::Show { item } => {
                     match agora_core::content_store::get_item(ctx, &item) {
                         Ok(it) => {

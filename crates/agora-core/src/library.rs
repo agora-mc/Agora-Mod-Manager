@@ -72,6 +72,41 @@ pub struct LibraryListing {
     pub warnings: Vec<String>,
 }
 
+/// An instance manifest that could not be read. Removal refuses while one exists, naming the file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreadableInstanceManifest {
+    pub manifest_path: String,
+    pub error: String,
+}
+
+/// The instances that use one item, plus any manifest that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InstanceUsage {
+    pub instances: Vec<LibraryInstanceRef>,
+    pub unreadable: Vec<UnreadableInstanceManifest>,
+}
+
+/// One item no instance uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnusedItem {
+    pub item_id: String,
+    pub name: String,
+    pub total_size: u64,
+    pub game_id: Option<String>,
+}
+
+/// Items no instance uses, with their total size. Unreadable instance manifests are warnings: the
+/// list may be incomplete, and `content_store::remove_item` refuses while one exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnusedListing {
+    pub items: Vec<UnusedItem>,
+    pub total_size: u64,
+    pub warnings: Vec<String>,
+}
+
 /// A stored icon whose bytes were identified as an image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryIcon {
@@ -106,7 +141,9 @@ pub fn list(ctx: &Ctx) -> Result<LibraryListing, ContentError> {
                 error: record.error,
             }),
             ItemEntry::Readable(item) => {
-                let using = scan.using(&item);
+                let hashes: HashSet<&str> =
+                    item.files.iter().map(|file| file.sha256.as_str()).collect();
+                let using = scan.using(&item.item_id, &hashes);
                 let game_id = item
                     .game_id
                     .clone()
@@ -423,16 +460,18 @@ struct ScannedInstance {
 struct InstanceScan {
     instances: Vec<ScannedInstance>,
     warnings: Vec<String>,
+    unreadable: Vec<UnreadableInstanceManifest>,
 }
 
 impl InstanceScan {
-    fn using(&self, item: &ContentItem) -> Vec<LibraryInstanceRef> {
-        let hashes: HashSet<&str> = item.files.iter().map(|file| file.sha256.as_str()).collect();
+    /// Instances that use `item_id`: directly by a Content layer or a recorded store id, or, for
+    /// Minecraft, by one of `hashes` (the item's object hashes).
+    fn using(&self, item_id: &str, hashes: &HashSet<&str>) -> Vec<LibraryInstanceRef> {
         let mut using: Vec<LibraryInstanceRef> = self
             .instances
             .iter()
             .filter(|instance| {
-                instance.item_ids.contains(&item.item_id)
+                instance.item_ids.contains(item_id)
                     || (instance.reference.game_id == "minecraft"
                         && instance
                             .hashes
@@ -451,12 +490,68 @@ impl InstanceScan {
     }
 }
 
+/// Which instances use one item. Scans every instance manifest (Minecraft and generic alike); an
+/// unreadable manifest is returned, never treated as "no instance uses it".
+pub fn instances_using(ctx: &Ctx, item_id: &str, object_hashes: &[String]) -> InstanceUsage {
+    let scan = scan_instances(ctx);
+    let hashes: HashSet<&str> = object_hashes.iter().map(String::as_str).collect();
+    InstanceUsage {
+        instances: scan.using(item_id, &hashes),
+        unreadable: scan.unreadable,
+    }
+}
+
+/// Every item no instance uses, with its size. When an instance manifest cannot be read, nothing
+/// is offered: the unreadable instance might use any item, so the listing is empty and the
+/// warnings say which instance could not be read (fail closed, like removal).
+pub fn list_unused(ctx: &Ctx) -> Result<UnusedListing, ContentError> {
+    let entries = content_store::list_items(ctx)?;
+    let scan = scan_instances(ctx);
+    if !scan.unreadable.is_empty() {
+        return Ok(UnusedListing {
+            items: Vec::new(),
+            total_size: 0,
+            warnings: scan.warnings,
+        });
+    }
+    let mut items = Vec::new();
+    let mut total_size = 0u64;
+    for entry in entries {
+        let Some(item) = entry.readable() else {
+            continue;
+        };
+        let hashes: HashSet<&str> = item.files.iter().map(|file| file.sha256.as_str()).collect();
+        if !scan.using(&item.item_id, &hashes).is_empty() {
+            continue;
+        }
+        total_size = total_size.saturating_add(item.total_size);
+        items.push(UnusedItem {
+            item_id: item.item_id.clone(),
+            name: item.name.clone(),
+            total_size: item.total_size,
+            game_id: item.game_id.clone().or_else(|| catalog_game(item)),
+        });
+    }
+    items.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.item_id.cmp(&b.item_id))
+    });
+    Ok(UnusedListing {
+        items,
+        total_size,
+        warnings: scan.warnings,
+    })
+}
+
 /// Read every instance manifest under the data root. An unreadable manifest is a warning, never a
 /// vanished instance.
 fn scan_instances(ctx: &Ctx) -> InstanceScan {
     let mut scan = InstanceScan {
         instances: Vec::new(),
         warnings: Vec::new(),
+        unreadable: Vec::new(),
     };
     let root = ctx.paths.instances_root();
     if !root.exists() {
@@ -465,8 +560,12 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) => {
-            scan.warnings
-                .push(format!("Instances could not be listed: {error}"));
+            let message = format!("Instances could not be listed: {error}");
+            scan.warnings.push(message.clone());
+            scan.unreadable.push(UnreadableInstanceManifest {
+                manifest_path: root.display().to_string(),
+                error: message,
+            });
             return scan;
         }
     };
@@ -482,12 +581,17 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
         let manifest = match read_manifest(&manifest_path) {
             Ok(manifest) => manifest,
             Err(error) => {
+                let error = error.to_string();
                 scan.warnings.push(format!(
                     "Instance '{}' could not be read: {error}",
                     dir.file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default()
                 ));
+                scan.unreadable.push(UnreadableInstanceManifest {
+                    manifest_path: manifest_path.display().to_string(),
+                    error,
+                });
                 continue;
             }
         };

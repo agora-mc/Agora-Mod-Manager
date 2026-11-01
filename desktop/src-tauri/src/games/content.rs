@@ -934,10 +934,11 @@ mod tests {
     fn a_store_refusal_names_the_instances_and_is_not_a_core_failure() {
         let error = content_error(ContentError::InUse {
             item_id: "aaaa".into(),
-            instances: "skyrim-a, skyrim-b".into(),
+            instances: "Skyrim A, Skyrim B".into(),
+            instance_ids: vec!["skyrim-a".into(), "skyrim-b".into()],
         });
         assert_eq!(error.code, IN_USE);
-        assert!(error.message.contains("skyrim-a, skyrim-b"));
+        assert!(error.message.contains("Skyrim A, Skyrim B"));
     }
 
     /// Reads two real instances from the bench (read only, nothing is written) and checks that
