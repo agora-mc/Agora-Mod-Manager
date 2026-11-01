@@ -49,6 +49,8 @@ export function LibraryCatalogSection({ gameId }: { gameId: string }) {
   };
 
   useEffect(() => {
+    // The selection belongs to the game: a game switch must not keep the previous game's instance.
+    setInstanceId('');
     load();
     // Loaded again only when the game changes; "Try again" calls load().
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -140,7 +142,6 @@ export function LibraryCatalogSection({ gameId }: { gameId: string }) {
                   key={entry.id}
                   entry={entry}
                   canInstall={instanceId !== ''}
-                  instanceId={instanceId}
                   result={results[entry.id]}
                   onPreview={() => act(entry, true)}
                   onInstall={() => act(entry, false)}
@@ -157,14 +158,12 @@ export function LibraryCatalogSection({ gameId }: { gameId: string }) {
 interface CatalogRowProps {
   entry: CatalogEntry;
   canInstall: boolean;
-  /** The instance the entry installs into; a FOMOD install adds its result to the same one. */
-  instanceId: string;
   result: EntryState | undefined;
   onPreview: () => void;
   onInstall: () => void;
 }
 
-function CatalogRow({ entry, canInstall, instanceId, result, onPreview, onInstall }: CatalogRowProps) {
+function CatalogRow({ entry, canInstall, result, onPreview, onInstall }: CatalogRowProps) {
   const busy = result?.status === 'busy';
   const previewing = result?.status === 'busy' && result.dryRun;
   const installing = result?.status === 'busy' && !result.dryRun;
@@ -211,12 +210,12 @@ function CatalogRow({ entry, canInstall, instanceId, result, onPreview, onInstal
         </p>
       )}
 
-      {result?.status === 'done' && <CatalogResult reply={result.reply} instanceId={instanceId} />}
+      {result?.status === 'done' && <CatalogResult reply={result.reply} />}
     </li>
   );
 }
 
-function CatalogResult({ reply, instanceId }: { reply: CatalogInstallReply; instanceId: string }) {
+function CatalogResult({ reply }: { reply: CatalogInstallReply }) {
   // The wizard's state. This component only renders once the install is done, and a new install
   // unmounts it first, so each run starts with the wizard open.
   const [wizard, setWizard] = useState<'open' | 'closed' | 'installed'>('open');
@@ -279,7 +278,7 @@ function CatalogResult({ reply, instanceId }: { reply: CatalogInstallReply; inst
           {wizard === 'open' && (
             <FomodWizard
               contentId={reply.contentItemId}
-              instanceId={instanceId}
+              instanceId={reply.instanceId}
               onClose={() => setWizard('closed')}
               onInstalled={() => setWizard('installed')}
             />

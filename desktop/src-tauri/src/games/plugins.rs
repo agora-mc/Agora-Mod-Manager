@@ -242,7 +242,31 @@ fn check_status(findings: &[PluginFinding]) -> &'static str {
 pub struct PluginChange {
     /// Whether the line or the lock actually changed. False when it already had that state.
     pub changed: bool,
-    pub plugins: PluginsView,
+    /// The list as it is after the change. `None` only when the change was saved but the re-read
+    /// failed; `reload_error` then says why, so a saved change is not reported as a failure.
+    pub plugins: Option<PluginsView>,
+    /// Why the list could not be read back after a change that was saved.
+    pub reload_error: Option<String>,
+}
+
+/// The reply after a change that core has already saved, with whatever reading the list back gave.
+/// A failed re-read keeps the reply a success over the change, and names why the list is missing.
+fn plugin_change_after_save<E: std::fmt::Display>(
+    changed: bool,
+    order: Result<LoadOrder, E>,
+) -> Result<PluginChange, GamesError> {
+    match order {
+        Ok(order) => Ok(PluginChange {
+            changed,
+            plugins: Some(PluginsView::from_order(&order)),
+            reload_error: None,
+        }),
+        Err(error) => Ok(PluginChange {
+            changed,
+            plugins: None,
+            reload_error: Some(error.to_string()),
+        }),
+    }
 }
 
 /// A move, with the list as it is after the move.
@@ -315,11 +339,8 @@ pub async fn games_plugins_set_active(
         game_definition!(&ctx, &instance_id, definition);
         let changed = game_plugins::set_active(&ctx, &instance_id, definition, &plugin, active)
             .map_err(core_failed)?;
-        let order = load_order::order(&ctx, &instance_id, definition).map_err(core_failed)?;
-        Ok(PluginChange {
-            changed,
-            plugins: PluginsView::from_order(&order),
-        })
+        // The change is saved: a failed re-read must not turn it into a reported failure.
+        plugin_change_after_save(changed, load_order::order(&ctx, &instance_id, definition))
     })
     .await
 }
@@ -336,11 +357,8 @@ pub async fn games_plugins_set_locked(
         game_definition!(&ctx, &instance_id, definition);
         let changed = game_plugins::set_locked(&ctx, &instance_id, definition, &plugin, locked)
             .map_err(core_failed)?;
-        let order = load_order::order(&ctx, &instance_id, definition).map_err(core_failed)?;
-        Ok(PluginChange {
-            changed,
-            plugins: PluginsView::from_order(&order),
-        })
+        // The change is saved: a failed re-read must not turn it into a reported failure.
+        plugin_change_after_save(changed, load_order::order(&ctx, &instance_id, definition))
     })
     .await
 }
@@ -547,6 +565,47 @@ mod tests {
         let view = PluginsView::from_order(&no_list);
         assert!(view.supported);
         assert!(!view.list_exists);
+    }
+
+    #[test]
+    fn a_saved_change_whose_re_read_fails_is_reported_as_saved() {
+        let failure = agora_core::game_load_order::LoadOrderError::NoRules("skyrim-se".into());
+        let change = plugin_change_after_save(true, Err(failure))
+            .expect("a saved change is not a failed change");
+
+        assert!(change.changed);
+        assert!(change.plugins.is_none());
+        assert!(
+            change
+                .reload_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("declares no load order rules"),
+            "{:?}",
+            change.reload_error
+        );
+        let json = serde_json::to_value(&change).unwrap();
+        assert!(json["plugins"].is_null());
+        assert!(json["reloadError"].as_str().is_some());
+    }
+
+    #[test]
+    fn a_saved_change_with_a_readable_order_reports_the_new_list() {
+        let change = plugin_change_after_save(
+            true,
+            Ok::<_, agora_core::game_load_order::LoadOrderError>(order(
+                vec![entry("SkyUI.esp")],
+                Vec::new(),
+            )),
+        )
+        .expect("a saved change with a readable order is a success");
+
+        assert!(change.changed);
+        assert_eq!(
+            change.plugins.as_ref().map(|plugins| plugins.rows.len()),
+            Some(1)
+        );
+        assert!(change.reload_error.is_none());
     }
 
     #[test]

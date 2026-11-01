@@ -88,6 +88,20 @@ describe('plugin commands', () => {
     });
   });
 
+  it('accepts a change that was saved when only the re-read failed, and never as a clean list', async () => {
+    invokeMock.mockResolvedValueOnce({ changed: true, plugins: null, reloadError: 'The list could not be read.' });
+    await expect(setGamePluginActive('inst-1', 'SkyUI.esp', false)).resolves.toMatchObject({
+      changed: true,
+      plugins: null,
+      reloadError: 'The list could not be read.',
+    });
+
+    invokeMock.mockResolvedValueOnce({ changed: true, plugins: null });
+    await expect(setGamePluginActive('inst-1', 'SkyUI.esp', false)).rejects.toThrow(
+      'games_plugins_set_active did not return the expected plugin data.',
+    );
+  });
+
   it('reads a check into its status and findings', async () => {
     invokeMock.mockResolvedValueOnce({
       status: 'findings',

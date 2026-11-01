@@ -253,11 +253,12 @@ pub struct ToolCandidateRow {
     pub already_added: bool,
 }
 
-fn user_tool_row(tool: UserTool) -> UserToolRow {
+fn user_tool_row(tool: UserTool) -> Result<UserToolRow, GamesError> {
+    // A saved id Agora cannot read is a broken record, not a tool with no id: say so.
     let tool_id = game_tools::user_tool_id(&tool.id)
         .map(|id| id.to_string())
-        .unwrap_or_default();
-    UserToolRow {
+        .map_err(core_error)?;
+    Ok(UserToolRow {
         id: tool.id,
         tool_id,
         name: tool.name,
@@ -266,14 +267,17 @@ fn user_tool_row(tool: UserTool) -> UserToolRow {
         known_tool_id: tool.known_tool_id,
         output_is_mod: tool.output_is_mod,
         output_folder: tool.output_folder,
-    }
+    })
 }
 
-fn user_tools_view(instance_id: &str, tools: Vec<UserTool>) -> UserToolsView {
-    UserToolsView {
+fn user_tools_view(instance_id: &str, tools: Vec<UserTool>) -> Result<UserToolsView, GamesError> {
+    Ok(UserToolsView {
         instance_id: instance_id.to_string(),
-        tools: tools.into_iter().map(user_tool_row).collect(),
-    }
+        tools: tools
+            .into_iter()
+            .map(user_tool_row)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 fn candidate_row(candidate: ToolCandidate) -> ToolCandidateRow {
@@ -687,7 +691,7 @@ pub async fn games_user_tools_list(
 ) -> Result<UserToolsView, GamesError> {
     with_ctx(app, move |ctx| {
         let tools = game_user_tools::list(&ctx, &instance_id).map_err(core_error)?;
-        Ok(user_tools_view(&instance_id, tools))
+        user_tools_view(&instance_id, tools)
     })
     .await
 }
@@ -716,7 +720,7 @@ pub async fn games_user_tools_add(
             },
         )
         .map_err(core_error)?;
-        Ok(user_tool_row(tool))
+        user_tool_row(tool)
     })
     .await
 }
@@ -730,7 +734,7 @@ pub async fn games_user_tools_remove(
 ) -> Result<UserToolsView, GamesError> {
     with_ctx(app, move |ctx| {
         let tools = game_user_tools::remove(&ctx, &instance_id, &id).map_err(core_error)?;
-        Ok(user_tools_view(&instance_id, tools))
+        user_tools_view(&instance_id, tools)
     })
     .await
 }
@@ -1172,6 +1176,43 @@ mod tests {
         assert_eq!(mine.tool.as_deref(), Some("bodyslide"));
         assert_eq!(interrupted_for(&pending, "skyrim-se", "sk-2"), None);
         assert_eq!(interrupted_for(&pending, "fallout-4", "sk-1"), None);
+    }
+
+    #[test]
+    fn an_unidentifiable_user_tool_is_an_error_not_a_row_with_an_empty_id() {
+        let broken = UserTool {
+            id: String::new(),
+            name: "Mystery tool".into(),
+            exe: "Data/tools/mystery.exe".into(),
+            args: Vec::new(),
+            known_tool_id: None,
+            output_is_mod: false,
+            output_folder: None,
+        };
+
+        let error = user_tool_row(broken).expect_err("an unreadable tool id is an error");
+        assert_eq!(error.code, CORE_FAILED);
+        assert!(
+            error.message.contains("not a valid tool id"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_user_tools_view_names_each_tool_by_its_namespaced_id() {
+        let tool = UserTool {
+            id: "tool-1".into(),
+            name: "FNIS".into(),
+            exe: "Data/tools/fnis.exe".into(),
+            args: vec!["-a".into()],
+            known_tool_id: None,
+            output_is_mod: false,
+            output_folder: None,
+        };
+
+        let view = user_tools_view("sk-1", vec![tool]).expect("a readable tool lists");
+        assert_eq!(view.tools[0].tool_id, "user-tool-1");
     }
 
     #[test]

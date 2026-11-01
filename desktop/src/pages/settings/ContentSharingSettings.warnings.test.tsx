@@ -19,8 +19,7 @@ describe('ContentSharingSettings: core warnings', () => {
   // "Converted 0 files." (a success toast) or nothing at all, and believes every instance is converted.
   // Run: npx vitest run src/pages/settings/ContentSharingSettings.warnings.test.tsx (un-skip first)
   // proves bug: ContentSharingSettings drops core's conversion `warnings`, so an unlistable instances folder reads as "converted 0 files"
-  it.skip(
-  'tells the user when core could not list the instances to convert', async () => {
+  it('tells the user when core could not list the instances to convert', async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === 'get_content_sharing') return 'link';
       if (command === 'preview_content_sharing_conversion') {

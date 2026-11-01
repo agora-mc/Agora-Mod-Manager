@@ -27,7 +27,7 @@ describe('GameInstancesPage: out-of-order replies', () => {
   // reply overwrites it, so game B's Instances tab lists game A's instances (with Launch/Delete).
   // Run: npx vitest run src/features/games/instances/InstancesTab.race.test.tsx (un-skip first)
   // proves bug: GameInstancesPage lets a slow reply for the previous game overwrite the current game's list
-  it.skip('shows only the current game\'s instances when replies arrive out of order', async () => {
+  it('shows only the current game\'s instances when replies arrive out of order', async () => {
     const pending: Record<string, (value: unknown) => void> = {};
     invokeMock.mockImplementation((command: string, args: { gameId: string }) => {
       if (command !== 'games_instance_list') return Promise.resolve(null);

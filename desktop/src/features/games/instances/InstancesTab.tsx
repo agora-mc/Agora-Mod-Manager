@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Boxes, Play, Plus, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { InstanceIcon, MetaChip } from '@/components/InstanceIcon';
@@ -31,12 +31,19 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Only the newest request may answer: a slow list must not overwrite a newer one.
+  const latest = useRef(0);
 
   const load = useCallback(() => {
+    const request = ++latest.current;
     setState({ status: 'loading' });
     listGameInstances(gameId)
-      .then((list) => setState({ status: 'loaded', instances: list.instances }))
-      .catch((error: unknown) => setState({ status: 'failed', message: gamesErrorMessage(error) }));
+      .then((list) => {
+        if (request === latest.current) setState({ status: 'loaded', instances: list.instances });
+      })
+      .catch((error: unknown) => {
+        if (request === latest.current) setState({ status: 'failed', message: gamesErrorMessage(error) });
+      });
   }, [gameId]);
 
   useEffect(() => {

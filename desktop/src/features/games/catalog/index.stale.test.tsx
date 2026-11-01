@@ -40,7 +40,7 @@ describe('LibraryCatalogSection: stale selection when the game changes', () => {
   // new game's first instance in the select but sends the OLD game's instance id with Install.
   // Run: npx vitest run src/features/games/catalog/index.stale.test.tsx (un-skip first)
   // proves bug: LibraryCatalogSection keeps the previous game's instanceId after a game switch
-  it.skip('installs into the instance the select shows after the game changes', async () => {
+  it('installs into the instance the select shows after the game changes', async () => {
     const { rerender } = render(<LibraryCatalogSection gameId="game-a" />);
     await screen.findByText('Entry game-a-entry');
     rerender(<LibraryCatalogSection gameId="game-b" />);
