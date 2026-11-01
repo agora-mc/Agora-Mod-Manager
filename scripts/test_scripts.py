@@ -6,16 +6,19 @@ import http.client
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 import urllib.error
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import build_official_plugin as bop
 import fetch_loader_manifests
 import deploy_release_assets
 import finalize_release_assets as fra
@@ -2633,6 +2636,67 @@ class TestStageVfsFiles(unittest.TestCase):
         stale.write_bytes(b"stale")
         stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
         self.assertFalse(stale.exists())
+
+
+class OfficialPluginPackageTests(unittest.TestCase):
+    """The official plugin zip and the registry entry that pins it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.out = self.root / "out"
+        self.folder = self.root / "skyrim-se"
+        shutil.copytree(bop.OFFICIAL_ROOT / "skyrim-se", self.folder)
+
+    def test_the_skyrim_plugin_declares_one_game_and_game_define(self):
+        manifest = bop.plugin_manifest(bop.OFFICIAL_ROOT / "skyrim-se")
+        self.assertEqual(manifest["id"], "agora.creation-engine")
+        self.assertIn("game:define", manifest["capabilities"]["required"])
+        self.assertEqual(
+            bop.game_ids(bop.OFFICIAL_ROOT / "skyrim-se", manifest), ["skyrim-se"]
+        )
+
+    def test_the_zip_is_identical_across_builds_and_mtimes(self):
+        first = bop.build_zip(self.folder, self.out, "0.1.0").read_bytes()
+        for path in self.folder.rglob("*"):
+            os.utime(path, (1_234_567_890, 1_234_567_890))
+        second = bop.build_zip(self.folder, self.out, "0.1.0").read_bytes()
+        self.assertEqual(first, second)
+
+    def test_entries_are_sorted_stored_and_fixed(self):
+        archive = bop.build_zip(self.folder, self.out, "0.1.0")
+        with zipfile.ZipFile(archive) as bundle:
+            infos = bundle.infolist()
+        names = [info.filename for info in infos]
+        self.assertEqual(names, sorted(names))
+        for info in infos:
+            self.assertEqual(info.date_time, bop.FIXED_DATE)
+            self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(info.external_attr, bop.FIXED_MODE << 16)
+
+    def test_the_registry_entry_is_derived_from_the_built_zip(self):
+        built = bop.describe(bop.OFFICIAL_ROOT / "skyrim-se", self.out)
+        entry = bop.read_json(bop.registry_path(built["id"]))
+        self.assertEqual(entry["current"]["sha256"], built["sha256"])
+        self.assertEqual(entry["current"]["size"], built["size"])
+        self.assertEqual(entry["current"]["package_url"], built["package_url"])
+        self.assertEqual(
+            entry, bop.registry_entry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+        )
+        bop.verify_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+
+    def test_verify_refuses_a_stale_hash(self):
+        built = bop.describe(bop.OFFICIAL_ROOT / "skyrim-se", self.out)
+        registry = self.root / "registry"
+        with mock.patch.object(bop, "REGISTRY_ROOT", registry):
+            path = bop.update_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["current"]["sha256"] = "0" * 64
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                bop.verify_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+        self.assertIn("current.sha256", str(caught.exception))
 
 
 if __name__ == "__main__":

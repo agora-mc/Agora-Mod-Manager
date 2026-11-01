@@ -1954,18 +1954,11 @@ async fn async_main() {
         return;
     }
 
-    // A refused compiled package is a build bug, not user input.
+    // A refused compiled package is a build bug, not user input. Skyrim is not
+    // compiled in: it arrives through the installed official plugin.
     let mut registry_builder = agora_core::game_registry::GameRegistry::builder();
     agora_game_minecraft::register_into(&mut registry_builder)
         .expect("build bug: the Minecraft package was refused");
-    registry_builder
-        .add(
-            agora_core::game_registry::PackageSource::Compiled {
-                crate_name: "agora-game-creation".to_string(),
-            },
-            agora_game_creation::game_package(),
-        )
-        .expect("build bug: the Creation Engine package was refused");
 
     let (ctx, warnings) =
         match agora_core::ctx::CoreContext::initialize(paths.clone(), registry_builder) {

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Creation Engine (Skyrim SE) game package for Agora"
+description = "Test helper that loads the Skyrim SE official plugin package"
 
 [lib]
 name = "agora_game_creation"

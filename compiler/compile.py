@@ -2582,8 +2582,10 @@ OTHER_GAME_FORBIDDEN_FIELDS = (
 OTHER_GAME_KINDS = ("mods",)
 
 # Where game packages live. Read as data; nothing in them is executed.
-GAME_PACKAGE_FILES = ("crates/agora-game-creation/data/package.json",)
-GAME_PACKAGE_GLOBS = ("packages/tracers/*/games/package.json",)
+GAME_PACKAGE_GLOBS = (
+    "packages/official/*/games/package.json",
+    "packages/tracers/*/games/package.json",
+)
 
 _GAME_VERSION_RE = re.compile(r"(?:[0-9]+|\*)(?:\.(?:[0-9]+|\*))*")
 _NUMERIC_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
@@ -2602,7 +2604,7 @@ class GameDeclaration:
 
 
 def game_package_paths() -> list[Path]:
-    paths = [REPO_ROOT / rel for rel in GAME_PACKAGE_FILES]
+    paths: list[Path] = []
     for pattern in GAME_PACKAGE_GLOBS:
         paths.extend(sorted(REPO_ROOT.glob(pattern)))
     return paths

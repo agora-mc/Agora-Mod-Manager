@@ -389,9 +389,9 @@ fn startup_warns_on_game_id_collision_with_compiled_and_succeeds() {
             crate_name: "test-compiled".into()
         })
     );
-    assert!(warnings
-        .iter()
-        .any(|w| w.contains("test.tracer") && w.contains("rejected game package")));
+    assert!(warnings.iter().any(|w| w.contains("test.tracer")
+        && w.contains("rejected game package")
+        && w.contains("compiled-game")));
 }
 
 /// The manifest stored at install was validated, but the database copy is

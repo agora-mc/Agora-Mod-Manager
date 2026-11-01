@@ -29,6 +29,8 @@ on:
       - "crates/**"
       - "desktop/**"
       - "compiler/**"
+      - "packages/**"
+      - "registry/official-plugins/**"
       # Embedded at compile time via include_str!/include_bytes! (agora-core's
       # crash_diagnostics.rs; agora-game-minecraft's loader_manifests.rs and
       # runtime_catalog.rs), so a
@@ -51,6 +53,8 @@ on:
       - "crates/**"
       - "desktop/**"
       - "compiler/**"
+      - "packages/**"
+      - "registry/official-plugins/**"
       # Embedded at compile time via include_str!/include_bytes! (agora-core's
       # crash_diagnostics.rs; agora-game-minecraft's loader_manifests.rs and
       # runtime_catalog.rs), so a

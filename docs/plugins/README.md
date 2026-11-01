@@ -12,6 +12,33 @@ Build the desktop application, open **Settings → Services → Plugins**, and e
 - `home-replacement`: offers to render Agora's home screen instead of adding a page. Installing it changes nothing until you choose it under **Who draws each screen**, and Agora's own screen comes back the moment you disable it.
 - `provider`: adds a small content source to Browse. Its projects appear next to curated and Modrinth results, have their own detail page, and install through the same reviewed install flow. Written up, with the trust model, in [`providers.md`](providers.md).
 
+## Official plugins in this repository
+
+Some plugins are Agora's own. They live under `packages/official/<name>/`, and the signed registry
+pins them in `registry/official-plugins/<plugin-id>.json`. Skyrim Special Edition is the first:
+`packages/official/skyrim-se/` (plugin id `agora.creation-engine`, game id `skyrim-se`). The app does
+not compile Skyrim in, so `agora games list` shows it only when the plugin is installed.
+
+To use it while developing, install the folder as a development plugin and turn community plugins
+on:
+
+```bash
+agora --data-dir ./tmp/agora-dev settings set plugins_enabled true
+agora --data-dir ./tmp/agora-dev plugin install --yes development packages/official/skyrim-se
+agora --data-dir ./tmp/agora-dev games list
+```
+
+The CLI tests install it the same way. To build the release zip reproducibly:
+
+```bash
+python scripts/build_official_plugin.py skyrim-se
+python scripts/build_official_plugin.py skyrim-se --verify-registry
+```
+
+`--update-registry` rewrites the signed-registry entry from the built bytes; `--verify-registry`
+refuses an entry that does not pin them. The release workflow attaches the zip to the
+`official-skyrim-se-v<version>` release, which is the URL the entry names.
+
 The same operations exist in the standalone CLI, which is usually faster while iterating:
 
 ```bash

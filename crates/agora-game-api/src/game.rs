@@ -1735,7 +1735,7 @@ pub enum LoadOrderRule {
 mod runtime_file_tests {
     use super::*;
 
-    /// The three rules Skyrim SE declares in `agora-game-creation/data/package.json`.
+    /// The three rules Skyrim SE declares in `packages/official/skyrim-se/games/package.json`.
     fn skyrim_rules() -> Vec<RuntimeFileRule> {
         vec![
             RuntimeFileRule {

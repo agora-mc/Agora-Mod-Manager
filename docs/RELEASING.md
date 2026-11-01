@@ -1,13 +1,35 @@
 # Releasing Agora
 
-Agora has two independent release streams:
+Agora has three independent release streams:
 
 | Stream | Typical tag | Contents |
 | --- | --- | --- |
 | Catalog | `registry-YYYY-MM-DD` | Signed catalog database and web export |
 | Desktop | `vX.Y.Z` | Platform installers and application bundles |
+| Official plugin | `official-<name>-v<version>` | One plugin package zip, such as Skyrim SE |
 
 Do not treat a successful catalog release as proof that a desktop package was built correctly, or vice versa.
+
+## Official plugin releases
+
+Skyrim SE is an official plugin (`packages/official/skyrim-se/`, plugin id
+`agora.creation-engine`), not part of the app build. The `Official plugins` workflow
+([`.github/workflows/official-plugins.yml`](../.github/workflows/official-plugins.yml)) runs when
+`packages/official/**` or `registry/official-plugins/**` changes. It builds each package zip
+reproducibly, verifies that `registry/official-plugins/<plugin-id>.json` pins those exact bytes, and
+attaches the zip to the `official-<name>-v<version>` release. That release URL is the one the signed
+registry names, so the asset must be published before a catalog that lists it.
+
+To release a new plugin version:
+
+1. bump `version` in the package's `agora-plugin.json`;
+2. run `python scripts/build_official_plugin.py <name> --update-registry`, which rebuilds the zip,
+   rotates the old `current` entry to `previous`, and rewrites the registry entry;
+3. commit both files. The workflow creates the new tag and uploads the asset; do not reuse a tag for
+   different bytes.
+
+`python scripts/build_official_plugin.py <name> --verify-registry` is the check to run before
+committing: it rebuilds the zip and refuses a registry entry whose hash, size or URL does not match.
 
 ## Desktop release checklist
 

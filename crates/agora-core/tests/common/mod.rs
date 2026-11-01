@@ -1,5 +1,5 @@
 //! Shared test fixtures for the INI and save tests. The Skyrim SE definition is written out here
-//! as the app's own package declares it (`agora-game-creation/data/package.json`), so core's tests
+//! as the official package declares it (`packages/official/skyrim-se/games/package.json`), so core's tests
 //! do not reach into a game package. The CLI tests check the shipped file itself.
 
 // Not every test binary that includes this module uses the data root.

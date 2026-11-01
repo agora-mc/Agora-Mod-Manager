@@ -3788,6 +3788,59 @@ fn official_plugins_offer_nothing_without_a_verified_catalog() {
 }
 
 #[test]
+fn games_list_shows_skyrim_only_after_the_plugin_is_installed() {
+    let (_tmp, data_dir) = temp_data_dir();
+
+    let before = run_agora(&data_dir, &["games", "list"]);
+    assert!(
+        before.status.success(),
+        "games list without Skyrim failed: {}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let before_text = String::from_utf8_lossy(&before.stdout);
+    assert!(before_text.contains("minecraft"), "{before_text}");
+    assert!(!before_text.contains("skyrim-se"), "{before_text}");
+
+    let enable = run_agora(&data_dir, &["settings", "set", "plugins_enabled", "true"]);
+    assert!(
+        enable.status.success(),
+        "enabling plugins failed: {}",
+        String::from_utf8_lossy(&enable.stderr)
+    );
+
+    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
+    let package = package.to_string_lossy().to_string();
+    let install = run_agora(
+        &data_dir,
+        &[
+            "plugin",
+            "install",
+            "--yes",
+            "development",
+            package.as_str(),
+        ],
+    );
+    assert!(
+        install.status.success(),
+        "installing the Skyrim plugin failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let after = run_agora(&data_dir, &["games", "list"]);
+    assert!(
+        after.status.success(),
+        "games list with Skyrim failed: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let after_text = String::from_utf8_lossy(&after.stdout);
+    assert!(after_text.contains("skyrim-se"), "{after_text}");
+    assert!(
+        after_text.contains("plugin: agora.creation-engine"),
+        "the list must say which source provides Skyrim: {after_text}"
+    );
+}
+
+#[test]
 fn games_base_cli_list_verify_remove() {
     let (_tmp, data_dir) = temp_data_dir();
 
@@ -4514,6 +4567,48 @@ fn vfs_fixture() -> VfsFixture {
     skyrim_fixture("1.6.1170.0", &[])
 }
 
+/// Install the Skyrim official plugin as a development plugin in `paths`, so a
+/// separate CLI process sees the same game definition these tests build in process.
+fn install_skyrim_development_plugin(paths: &agora_core::app_paths::AppPaths) {
+    use agora_core::plugins::store::{self, PluginSource};
+    use agora_plugin_api::capability::{Capability, CapabilitySet};
+    use agora_plugin_api::manifest::PluginManifest;
+
+    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
+    let manifest: PluginManifest =
+        serde_json::from_str(&std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap())
+            .unwrap();
+    let mut granted = CapabilitySet::new();
+    granted.insert(Capability::GameDefine);
+    let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+    agora_core::db::set_setting(
+        &conn,
+        agora_core::plugins::PLUGINS_ENABLED_SETTING,
+        &serde_json::Value::Bool(true),
+    )
+    .unwrap();
+    store::upsert(
+        &conn,
+        &manifest,
+        &granted,
+        &PluginSource::Development {
+            path: folder.clone(),
+        },
+        &folder,
+        true,
+        "2026-01-01T00:00:00Z",
+    )
+    .unwrap();
+}
+
+/// The same development install, in a data root the CLI binary will open itself.
+fn install_skyrim_development_plugin_in(data_dir: &Path) {
+    let paths = agora_core::app_paths::AppPaths::from_root(data_dir.to_path_buf());
+    paths.create_required_dirs().unwrap();
+    agora_core::db::init_local_state_db(&paths.local_state_db()).unwrap();
+    install_skyrim_development_plugin(&paths);
+}
+
 /// A Skyrim SE instance (no content) whose runtime is `version`. Each of `extra_files`, a path
 /// relative to the install folder, is written into the install before the instance is created.
 fn skyrim_fixture(version: &str, extra_files: &[&str]) -> VfsFixture {
@@ -4549,10 +4644,11 @@ fn skyrim_fixture(version: &str, extra_files: &[&str]) -> VfsFixture {
             },
             agora_game_creation::game_package(),
         )
-        .expect("register the Creation Engine package");
+        .expect("register the Skyrim package definition");
     let ctx = agora_core::ctx::CoreContext::for_testing(data_dir.clone())
         .with_games(std::sync::Arc::new(builder.build()));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    install_skyrim_development_plugin(&ctx.paths);
 
     let store = StoreId::new("steam").unwrap();
     let runtime = RuntimeIdentity {
@@ -5185,6 +5281,7 @@ fn games_catalog_list_shows_the_other_game_entries_human_and_json() {
     let catalog = tempfile::tempdir().unwrap();
     let catalog_db = catalog.path().join("registry.db");
     write_catalog_fixture(&catalog_db);
+    install_skyrim_development_plugin_in(&data_dir);
 
     let output = run_agora_with_catalog(
         &data_dir,
