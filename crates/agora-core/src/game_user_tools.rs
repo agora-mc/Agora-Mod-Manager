@@ -125,9 +125,10 @@ pub fn list(ctx: &Ctx, instance_id: &str) -> Result<Vec<UserTool>, UserToolError
 
 /// Add a tool to the instance's list.
 ///
-/// `exe` must be a path `find_candidates` returns for this instance right now, or a known tool's
-/// executable: not absolute, not traversing, no device name, and not an executable from a disabled
-/// mod. The same executable twice is refused.
+/// `exe` must be a path `find_candidates` returns for this instance right now, a known tool's
+/// executable (relative, not traversing, no device name, not from a disabled mod), or an absolute
+/// path to an existing `.exe` the user chose outside the game folder (see [`is_absolute_exe`]).
+/// The same executable twice is refused.
 pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, UserToolError> {
     let definition = definition_of(ctx, instance_id)?;
     let instance_dir = instance_dir(ctx, instance_id)?;
