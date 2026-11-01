@@ -4122,6 +4122,22 @@ where manifest upgrades already happen (`models.rs`, which already upgrades vers
 - instance contents are not touched: a migrated Minecraft instance is byte-for-byte the same on disk
   apart from the manifest.
 
+**Minecraft content in the shared store (2026-11-01).** Every Minecraft install will put its
+content into the content store §26.6 describes, instead of writing a private copy into each
+instance: one object per file, shared by content hash. An instance's `mods/`, `resourcepacks/`,
+`shaderpacks/` and `datapacks/` hold hard links to those objects by default. A setting, "Share mod
+files between instances", defaults on; turning it off makes new placements plain copies. Both
+modes are first-class: if players find links confusing, the default can flip later without a
+one-off fallback. On Windows (NTFS), a hard link to a protected object may be deleted only from a
+folder that grants the user `FILE_DELETE_CHILD`: a folder inheriting only `Modify` refuses the
+delete, and one granting Full Control allows it. A placement therefore grants that right on its
+target folder (reusing `protect::grant_delete_child`) before linking, and places an owned copy when
+the grant or the link fails (another volume, a file system without links, the 1,023-link NTFS
+limit). An existing file at the target is never replaced. Configs, overrides and saves stay
+ordinary per-instance files and are not content items. Relinking an existing instance is a
+separate, explicit user action, so the migration promise above still holds: automatic migration
+leaves an instance's contents byte-for-byte unchanged.
+
 **Enforced by script.** `scripts/check_architecture.py` gains three rules:
 - `agora-core` does not reference the Minecraft package.
 - `agora-game-api` depends only on `serde`, `semver` and `thiserror`. (The spec once said "like

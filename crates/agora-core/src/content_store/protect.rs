@@ -36,6 +36,7 @@ mod imp {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     pub const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+    pub const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
     /// FILE_WRITE_DATA (0x0002) | FILE_APPEND_DATA (0x0004) | FILE_WRITE_EA (0x0010) | DELETE (0x00010000)
     pub const DENY_MASK: u32 = 0x0001_0016;
@@ -424,6 +425,72 @@ mod imp {
 
         Ok(())
     }
+
+    /// Whether this folder already grants the current user `FILE_DELETE_CHILD`, from its own DACL
+    /// only. A deny entry for the user wins. A grant held through a group is not recognised, so the
+    /// caller adds an explicit one; that is cheap and leaves the folder in a known state.
+    pub fn grants_delete_child(path: &Path) -> Result<bool, std::io::Error> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
+
+        let user_sid = get_current_user_sid()?;
+        let wide_path = to_wide_null(path);
+
+        let mut p_sec_desc: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let mut p_dacl: *mut ACL = std::ptr::null_mut();
+
+        let ret = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut p_dacl,
+                std::ptr::null_mut(),
+                &mut p_sec_desc,
+            )
+        };
+        if ret != 0 {
+            // ERROR_NOT_SUPPORTED (50), ERROR_INVALID_FUNCTION (1): no ACLs on this volume.
+            if ret == 50 || ret == 1 {
+                return Ok(false);
+            }
+            return Err(std::io::Error::from_raw_os_error(ret as i32));
+        }
+
+        if p_dacl.is_null() {
+            unsafe { LocalFree(p_sec_desc as _) };
+            return Ok(false);
+        }
+
+        let count = unsafe { (*p_dacl).AceCount };
+        let mut allowed = false;
+        for i in 0..count {
+            let mut p_ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            if unsafe { GetAce(p_dacl, i as u32, &mut p_ace) } != 0 {
+                let header = unsafe { &*(p_ace as *const ACE_HEADER) };
+                if header.AceType == ACCESS_DENIED_ACE_TYPE
+                    || header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                {
+                    // Allowed and denied ACEs have the same layout after their header.
+                    let ace = unsafe { &*(p_ace as *const ACCESS_DENIED_ACE) };
+                    let ace_sid = &ace.SidStart as *const u32 as PSID;
+                    if unsafe { EqualSid(ace_sid, user_sid.as_ptr() as PSID) } != 0
+                        && (ace.Mask & FILE_DELETE_CHILD) != 0
+                    {
+                        if header.AceType == ACCESS_DENIED_ACE_TYPE {
+                            unsafe { LocalFree(p_sec_desc as _) };
+                            return Ok(false);
+                        }
+                        allowed = true;
+                    }
+                }
+            }
+        }
+
+        unsafe { LocalFree(p_sec_desc as _) };
+        Ok(allowed)
+    }
 }
 
 #[cfg(not(windows))]
@@ -470,6 +537,12 @@ mod imp {
     pub fn grant_delete_child(_path: &Path) -> Result<(), std::io::Error> {
         Ok(())
     }
+
+    /// Deleting a hard link needs only write permission on its folder, which the placement
+    /// already has (it created the link there). Nothing extra to grant.
+    pub fn grants_delete_child(_path: &Path) -> Result<bool, std::io::Error> {
+        Ok(true)
+    }
 }
 
 pub fn protect(path: &Path) -> Result<(), std::io::Error> {
@@ -492,4 +565,9 @@ pub fn protection(path: &Path) -> Result<Protection, std::io::Error> {
 
 pub fn grant_delete_child(path: &Path) -> Result<(), std::io::Error> {
     imp::grant_delete_child(path)
+}
+
+/// Whether `path` already grants the current user `FILE_DELETE_CHILD`. See `imp::grants_delete_child`.
+pub fn grants_delete_child(path: &Path) -> Result<bool, std::io::Error> {
+    imp::grants_delete_child(path)
 }

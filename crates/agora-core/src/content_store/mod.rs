@@ -5,6 +5,7 @@
 
 #[cfg(test)]
 mod import_bench;
+pub mod place;
 pub mod protect;
 mod rar;
 
@@ -23,6 +24,10 @@ use crate::ctx::Ctx;
 use crate::lock_manager::LockResource;
 
 pub use crate::game_base::VerifyDepth;
+pub use place::{
+    place_object_at, placement_mode, set_placement_mode, PlacedAs, PlacementMode,
+    SHARE_CONTENT_SETTING,
+};
 pub use protect::Protection;
 
 // ---------------------------------------------------------------------------
@@ -85,6 +90,12 @@ pub enum ContentSource {
         verified: bool,
         added_at_unix_ms: i64,
     },
+    /// One file added on its own, without unpacking it: a `.jar` or `.zip` is this one file, never
+    /// its entries.
+    File {
+        path: String,
+        added_at_unix_ms: i64,
+    },
 }
 
 /// What a mod's `meta.ini` claims about where it came from. An absent or unreadable `meta.ini` is
@@ -116,6 +127,40 @@ pub struct ContentItem {
     pub total_size: u64,
     pub sources: Vec<ContentSource>, // oldest first
     pub added_at_unix_ms: i64,
+    /// What the item is, in the user's or catalog's words. All metadata is optional; an item
+    /// written before these fields existed reads with every one of them absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_id: Option<String>,
+    /// The SHA-256 of a stored object holding the icon, never a URL alone: the bytes are in the
+    /// store like any other content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_sha256: Option<String>,
+}
+
+/// The optional description of an item that [`set_item_metadata`] replaces. Every field absent
+/// means the item carries no metadata for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemMetadata {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub page_url: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub game_id: Option<String>,
+    #[serde(default)]
+    pub catalog_id: Option<String>,
+    #[serde(default)]
+    pub icon_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +293,16 @@ pub enum ContentError {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Other(String),
+    #[error("not a SHA-256 hash: {0}")]
+    InvalidHash(String),
+    #[error("target already exists: {0}")]
+    TargetExists(String),
+    #[error("stored object is missing: {0}")]
+    MissingObject(String),
+    #[error("stored object is damaged or not what its hash says: {0}")]
+    DamagedObject(String),
+    #[error("content placement setting is invalid: {0}")]
+    InvalidSetting(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +506,11 @@ fn disk_free_space(path: &Path) -> Option<u64> {
 /// Whether an existing object can be kept as is. A protected object of the right size is trusted
 /// (the quick check, as `VerifyDepth::Quick`); one that was unprotected or has the wrong size may
 /// have been changed, so its bytes are re-hashed.
-fn object_is_trustworthy(path: &Path, size: u64, sha256: &str) -> Result<bool, ContentError> {
+pub(crate) fn object_is_trustworthy(
+    path: &Path,
+    size: u64,
+    sha256: &str,
+) -> Result<bool, ContentError> {
     if std::fs::metadata(path)?.len() != size {
         return Ok(false);
     }
@@ -1055,10 +1114,70 @@ pub(crate) fn add_folder_as(
     add_collected(ctx, &item_name, collected, source)
 }
 
+/// Add one file as an item, without unpacking it. A `.jar` or `.zip` is stored as that one file,
+/// never as its entries. `rel_path` is the path the item holds it under (the file's own name when
+/// `None`), and `name` is the item's display name (the file's stem when `None`). Identical bytes
+/// added again share the stored object.
+pub fn add_file(
+    ctx: &Ctx,
+    file_path: &Path,
+    name: Option<&str>,
+    rel_path: Option<&str>,
+) -> Result<AddOutcome, ContentError> {
+    let meta = std::fs::symlink_metadata(file_path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ContentError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("file not found: {}", file_path.display()),
+            ))
+        } else {
+            ContentError::Io(e)
+        }
+    })?;
+    if is_reparse_point_or_symlink(&meta) {
+        return Err(ContentError::InvalidPath {
+            path: file_path.display().to_string(),
+            reason: "symlinks or reparse points are not allowed".into(),
+        });
+    }
+    if !meta.is_file() {
+        return Err(ContentError::Other(format!(
+            "path is not a file: {}",
+            file_path.display()
+        )));
+    }
+
+    let default_rel = file_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| ContentError::Other(format!("file has no name: {}", file_path.display())))?;
+    let rel = validate_entry_path(rel_path.unwrap_or(&default_rel))?;
+
+    let item_name = name
+        .map(|s| s.to_string())
+        .or_else(|| {
+            file_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "content".into());
+    let source = ContentSource::File {
+        path: file_path.to_string_lossy().to_string(),
+        added_at_unix_ms: now_unix_ms(),
+    };
+
+    add_collected(
+        ctx,
+        &item_name,
+        vec![(rel, file_path.to_path_buf())],
+        source,
+    )
+}
+
 /// Store an explicit list of files as one item: each file is copied into staging, hashed, and kept
 /// as a protected object. Identical bytes are stored once. The paths must not clash, as a folder's
 /// would not.
-pub(crate) fn add_collected(
+pub fn add_collected(
     ctx: &Ctx,
     item_name: &str,
     collected: Vec<(RelPath, PathBuf)>,
@@ -1396,6 +1515,12 @@ fn commit_manifest(
                     } if i == item_id && r == release && a == asset && h == sha256
                 )
             }),
+            ContentSource::File { path, .. } => !existing_item.sources.iter().any(|s| {
+                matches!(
+                    s,
+                    ContentSource::File { path: p, .. } if p == path
+                )
+            }),
         };
 
         if is_new_source {
@@ -1412,10 +1537,38 @@ fn commit_manifest(
             total_size,
             sources: vec![source],
             added_at_unix_ms: now_unix_ms(),
+            description: None,
+            page_url: None,
+            version: None,
+            game_id: None,
+            catalog_id: None,
+            icon_sha256: None,
         };
         write_manifest_atomic(&ctx.paths, &item)?;
         Ok((item, false))
     }
+}
+
+/// Replace an item's optional metadata. The item's identity and files do not change, and a field
+/// passed as `None` is removed rather than kept. Returns the item as written.
+pub fn set_item_metadata(
+    ctx: &Ctx,
+    item_id_or_prefix: &str,
+    metadata: ItemMetadata,
+) -> Result<ContentItem, ContentError> {
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::ContentStore, "content-metadata")?;
+
+    let mut item = get_item(ctx, item_id_or_prefix)?;
+    item.description = metadata.description;
+    item.page_url = metadata.page_url;
+    item.version = metadata.version;
+    item.game_id = metadata.game_id;
+    item.catalog_id = metadata.catalog_id;
+    item.icon_sha256 = metadata.icon_sha256;
+    write_manifest_atomic(&ctx.paths, &item)?;
+    Ok(item)
 }
 
 /// Create an item from some of another item's files, under new paths, without extracting
