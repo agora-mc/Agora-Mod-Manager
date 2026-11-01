@@ -17,7 +17,6 @@ agora-core = { path = "../../crates/agora-core" }
 # The game contract's types (GameDefinition, ToolId) that the tools commands name.
 agora-game-api = { path = "../../crates/agora-game-api" }
 agora-game-minecraft = { path = "../../crates/agora-game-minecraft" }
-agora-game-creation = { path = "../../crates/agora-game-creation" }
 agora-plugin-api = { path = "../../crates/agora-plugin-api" }
 # The desktop adapter supplies the script host implementation core asks for.
 agora-plugin-host = { path = "../../crates/agora-plugin-host" }
@@ -62,3 +61,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 png = "0.18"
+
+[dev-dependencies]
+# Test helper only: the Skyrim definition ships as an official plugin.
+agora-game-creation = { path = "../../crates/agora-game-creation" }

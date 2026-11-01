@@ -752,7 +752,7 @@ gallery, the Modrinth body and source-update time, changelogs, `compatible_versi
   `"game": "minecraft"`. Only `mods/` is open for other games at present, and an entry for another
   game must have `"content_type": "mod"`.
 - The games a manifest may name are the ones game packages declare: `skyrim-se` from
-  `crates/agora-game-creation/data/package.json`, and the games under `packages/tracers/*/games/`.
+  `packages/official/skyrim-se/games/package.json`, and the games under `packages/tracers/*/games/`.
 - Item ids are unique across all games. Two entries with the same `id` fail the build, and the error
   names both files.
 

@@ -1,0 +1,19 @@
+{
+  "manifest": 1,
+  "id": "agora.creation-engine",
+  "name": "Skyrim Special Edition",
+  "version": "0.1.0",
+  "description": "Adds The Elder Scrolls V: Skyrim Special Edition to Agora.",
+  "license": "GPL-3.0-only",
+  "apiRange": ">=0.1, <0.2",
+  "capabilities": {
+    "required": ["game:define"]
+  },
+  "contributions": {
+    "gamePackages": [
+      {
+        "path": "games/package.json"
+      }
+    ]
+  }
+}

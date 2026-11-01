@@ -8,7 +8,8 @@ This page covers local builds and validation. Player instructions belong in the 
 | --- | --- |
 | `crates/agora-core/` | Shared, game-agnostic business logic |
 | `crates/agora-game-minecraft/` | Minecraft support, as a game package that registers into core |
-| `crates/agora-game-creation/` | Creation Engine support (Skyrim SE), as a game package that registers into core |
+| `crates/agora-game-creation/` | Test helper that loads the Skyrim definition from its official plugin |
+| `packages/official/` | Official plugin packages released separately from the app (Skyrim SE) |
 | `crates/agora/` | Standalone CLI |
 | `crates/agora-plugin-api/`, `crates/agora-plugin-host/` | Plugin contract, and the QuickJS host that runs plugin scripts |
 | `crates/agora-game-api/` | Experimental game package/host contract; [manifest v3 design](architecture/game-api.md) |
@@ -86,6 +87,20 @@ python ../scripts/verify_db.py
 ```
 
 Use `--skip-sign` only for local development. Production clients must not trust unsigned catalog output.
+
+## Official plugin packages
+
+Skyrim SE ships as an official plugin in `packages/official/skyrim-se/`, not as a compiled package.
+The desktop and CLI register only Minecraft; Skyrim arrives from the installed plugin. To use it
+locally, install the folder as a development plugin and turn community plugins on, as described in
+[plugins/README.md](plugins/README.md#official-plugins-in-this-repository).
+
+Build the release zip with `python scripts/build_official_plugin.py skyrim-se`. Entries are sorted,
+stored uncompressed and given a fixed timestamp and mode, so the SHA-256 is the same across builds
+and checkouts. `--verify-registry` checks that
+`registry/official-plugins/agora.creation-engine.json` pins those exact bytes;
+`--update-registry` rewrites the entry from the build. The `Official plugins` workflow attaches the
+zip to an `official-skyrim-se-v<version>` release.
 
 ## Environment boundaries
 

@@ -32,19 +32,12 @@ use tauri::Manager;
 type ManagedCoreContext = std::sync::Arc<std::sync::Mutex<agora_core::ctx::CoreContext>>;
 
 /// The games this build supports. A refused compiled package is a build bug,
-/// not user input.
+/// not user input. Skyrim is not compiled in: it arrives through the installed
+/// official plugin.
 fn build_game_registry() -> agora_core::game_registry::GameRegistryBuilder {
     let mut builder = agora_core::game_registry::GameRegistry::builder();
     agora_game_minecraft::register_into(&mut builder)
         .expect("build bug: the Minecraft package was refused");
-    builder
-        .add(
-            agora_core::game_registry::PackageSource::Compiled {
-                crate_name: "agora-game-creation".to_string(),
-            },
-            agora_game_creation::game_package(),
-        )
-        .expect("build bug: the Creation Engine package was refused");
     builder
 }
 
@@ -752,4 +745,21 @@ pub fn run() {
         })
         .run(context)
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use agora_game_api::GameId;
+
+    /// Skyrim ships as an official plugin, so a build that registers it at
+    /// startup would be the old compiled package sneaking back in.
+    #[test]
+    fn the_shipped_registry_does_not_compile_in_skyrim() {
+        let registry = super::build_game_registry().build();
+        assert!(registry.game(&GameId::minecraft()).is_some());
+        assert!(
+            registry.game(&GameId::new("skyrim-se").unwrap()).is_none(),
+            "Skyrim must come from the official plugin, not the compiled registry"
+        );
+    }
 }

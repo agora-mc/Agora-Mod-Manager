@@ -10,7 +10,7 @@ use agora_core::ctx::CoreContext;
 use agora_core::game_load_order::{self, Finding};
 use agora_game_api::GameDefinition;
 
-/// The Skyrim SE definition the app ships, from the Creation Engine package.
+/// The Skyrim SE definition the official plugin ships.
 fn skyrim() -> GameDefinition {
     agora_game_creation::game_package()
         .definition()

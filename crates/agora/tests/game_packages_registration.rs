@@ -1,5 +1,7 @@
 use agora_core::game_discovery::discover_all;
-use agora_core::game_registry::{identify_installs, GameRegistry, PackageSource};
+use agora_core::game_registry::{
+    identify_installs, GameRegistry, GameRegistryError, PackageSource,
+};
 use agora_game_api::{GameId, StoreId};
 
 #[test]
@@ -72,6 +74,74 @@ fn registers_minecraft_and_skyrim_packages_together() {
         }
         other => panic!("unexpected source for skyrim: {other:?}"),
     }
+}
+
+#[test]
+fn the_official_plugin_loads_the_same_skyrim_definition() {
+    use agora_plugin_api::manifest::PluginManifest;
+
+    let folder =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
+    let manifest_text = std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap();
+    let manifest: PluginManifest = serde_json::from_str(&manifest_text).unwrap();
+    let contribution = manifest
+        .contributions
+        .game_packages
+        .first()
+        .expect("the plugin contributes a game package");
+    let package_text = std::fs::read_to_string(folder.join(&contribution.path)).unwrap();
+    let definition: agora_game_api::PackageDefinition =
+        serde_json::from_str(&package_text).unwrap();
+
+    assert_eq!(
+        definition,
+        *agora_game_creation::game_package().definition(),
+        "the plugin package and the test helper must describe the same game"
+    );
+}
+
+#[test]
+fn a_compiled_and_a_plugin_skyrim_se_never_both_load() {
+    let mut builder = GameRegistry::builder();
+    builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "agora-game-creation".to_string(),
+            },
+            agora_game_creation::game_package(),
+        )
+        .expect("the first Skyrim package registers");
+
+    let error = builder
+        .add(
+            PackageSource::Plugin {
+                plugin_id: "agora.creation-engine".to_string(),
+            },
+            agora_game_creation::game_package(),
+        )
+        .expect_err("the second Skyrim package must be refused");
+    match error {
+        GameRegistryError::GameAlreadyRegistered { game_id } => {
+            assert_eq!(game_id.as_str(), "skyrim-se")
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+
+    let registry = builder.build();
+    assert_eq!(
+        registry
+            .games()
+            .filter(|game| game.id.as_str() == "skyrim-se")
+            .count(),
+        1,
+        "only one source may win"
+    );
+    assert_eq!(
+        registry.source_for(&GameId::new("skyrim-se").unwrap()),
+        Some(&PackageSource::Compiled {
+            crate_name: "agora-game-creation".to_string()
+        })
+    );
 }
 
 #[test]

@@ -1,4 +1,9 @@
-//! Creation Engine (Skyrim SE) support for Agora (MASTER_SPEC §26.11-§26.12).
+//! Test helper for the Creation Engine (Skyrim SE) game package.
+//!
+//! Skyrim ships as the official plugin in `packages/official/skyrim-se/`, not as
+//! a compiled package. Shipped binaries do not depend on this crate; it exists
+//! so tests can load the same definition from the package's own file instead of
+//! embedding a second copy.
 
 use agora_game_api::{GamePackage, PackageDefinition};
 use std::sync::{Arc, OnceLock};
@@ -11,14 +16,17 @@ impl GamePackage for CreationEnginePackage {
     }
 }
 
-/// The compiled game package for Creation Engine games (Skyrim Special Edition).
+/// The Skyrim SE package definition, read from the official plugin's package file.
 pub fn game_package() -> Arc<dyn GamePackage> {
     static PACKAGE: OnceLock<Arc<dyn GamePackage>> = OnceLock::new();
     PACKAGE
         .get_or_init(|| {
-            let json_str = include_str!("../data/package.json");
-            let def: PackageDefinition = serde_json::from_str(json_str)
-                .expect("failed to deserialize agora-game-creation package.json");
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packages/official/skyrim-se/games/package.json");
+            let json_str = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            let def: PackageDefinition = serde_json::from_str(&json_str)
+                .unwrap_or_else(|error| panic!("cannot parse {}: {error}", path.display()));
             Arc::new(CreationEnginePackage(def))
         })
         .clone()
@@ -32,7 +40,7 @@ mod tests {
     };
 
     #[test]
-    fn parses_embedded_package_json() {
+    fn parses_the_package_file() {
         let pkg = game_package();
         let def = pkg.definition();
 
@@ -325,7 +333,7 @@ mod tests {
         assert!(game.save_paths.is_empty());
     }
 
-    /// The three runtime-file rules the embedded Skyrim SE definition declares.
+    /// The three runtime-file rules the Skyrim SE package declares.
     fn skyrim_runtime_rules() -> Vec<agora_game_api::RuntimeFileRule> {
         game_package().definition().games[0].runtime_files.clone()
     }
