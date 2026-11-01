@@ -819,8 +819,16 @@ fn test_content_removal_refused_when_in_use() {
     // 1. Content removal refused naming instance
     let err = agora_core::content_store::remove_item(&ctx, &item_id).unwrap_err();
     match err {
-        agora_core::content_store::ContentError::InUse { instances, .. } => {
-            assert!(instances.contains(&inst.instance_id));
+        agora_core::content_store::ContentError::InUse {
+            instances,
+            instance_ids,
+            ..
+        } => {
+            assert!(
+                instances.contains("InUseTest"),
+                "shows the name: {instances}"
+            );
+            assert!(instance_ids.contains(&inst.instance_id), "keeps the id");
         }
         other => panic!("expected ContentError::InUse, got {other:?}"),
     }

@@ -3990,6 +3990,67 @@ fn games_content_cli_lifecycle() {
 }
 
 #[test]
+fn games_content_remove_refusal_shows_the_instance_name() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let mod_dir = tempfile::tempdir().unwrap();
+    std::fs::write(mod_dir.path().join("readme.txt"), b"mod content").unwrap();
+    let added = run_agora(
+        &data_dir,
+        &[
+            "games",
+            "content",
+            "add",
+            mod_dir.path().to_str().unwrap(),
+            "--name",
+            "used-mod",
+        ],
+    );
+    assert!(added.status.success());
+
+    let list = run_agora_json(&data_dir, &["games", "content", "list"]);
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let item_id = list[0]["item_id"].as_str().unwrap().to_string();
+
+    // A Minecraft instance whose manifest records the item.
+    let instance_dir = data_dir.join("instances").join("mc1");
+    std::fs::create_dir_all(&instance_dir).unwrap();
+    let manifest = serde_json::json!({
+        "manifest_version": 2,
+        "instance_id": "mc1",
+        "name": "My Survival",
+        "minecraft_version": "1.20.1",
+        "loader": "fabric",
+        "loader_version": "0.15.11",
+        "mods": [{
+            "filename": "used.jar",
+            "source": "manual",
+            "version": "1.0.0",
+            "sha256": "",
+            "content_item_id": item_id,
+            "installed_at": "2026-01-01T00:00:00Z"
+        }],
+        "resourcepacks": [],
+        "shaders": [],
+        "datapacks": [],
+        "worlds": []
+    });
+    std::fs::write(
+        instance_dir.join("instance_manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let refused = run_agora(&data_dir, &["games", "content", "remove", &item_id[..8]]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("My Survival"),
+        "the CLI message shows the instance name: {stderr}"
+    );
+    assert!(!stderr.contains("mc1"), "it does not show the id: {stderr}");
+}
+
+#[test]
 fn games_content_list_shows_an_unreadable_record_as_damaged() {
     let (_tmp, data_dir) = temp_data_dir();
     let mod_dir = tempfile::tempdir().unwrap();

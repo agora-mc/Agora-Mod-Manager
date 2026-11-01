@@ -291,23 +291,38 @@ export function LibraryPage() {
         </div>
       )}
 
-      {unused && unused.items.length > 0 && (
+      {unused && (unused.items.length > 0 || unused.warnings.length > 0) && (
         <div
           className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4 sm:flex-row sm:items-center sm:justify-between"
           data-testid="unused-summary"
         >
-          <div>
-            <p className="text-sm font-medium">
-              Unused: {itemCount(unused.items.length)}, {formatSize(unused.totalSize)}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              No instance uses these. Removing one frees its space; instances keep the files they
-              already have.
-            </p>
-          </div>
-          <Button variant="outline" onClick={openUnused}>
-            Review unused items
-          </Button>
+          {unused.warnings.length > 0 ? (
+            <div>
+              <p className="text-sm font-medium">Unused items could not be checked</p>
+              <p className="text-xs text-muted-foreground">
+                Some instances could not be read, so nothing is offered for removal. Fix or remove
+                those instances first.
+              </p>
+              <ul className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+                {unused.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+              </ul>
+            </div>
+          ) : (
+            <>
+              <div>
+                <p className="text-sm font-medium">
+                  Unused: {itemCount(unused.items.length)}, {formatSize(unused.totalSize)}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  No instance uses these. Removing one frees its space; instances keep the files
+                  they already have.
+                </p>
+              </div>
+              <Button variant="outline" onClick={openUnused}>
+                Review unused items
+              </Button>
+            </>
+          )}
         </div>
       )}
 

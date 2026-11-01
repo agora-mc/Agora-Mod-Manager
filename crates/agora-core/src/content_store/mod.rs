@@ -290,7 +290,13 @@ pub enum ContentError {
     #[error("insufficient disk space: need {required} bytes (including 1 GiB headroom), but only {available} bytes available")]
     InsufficientSpace { required: u64, available: u64 },
     #[error("cannot remove item {item_id}: in use by instance(s): {instances}")]
-    InUse { item_id: String, instances: String },
+    InUse {
+        item_id: String,
+        /// The instances' display names, for people (the Library and CLI show this).
+        instances: String,
+        /// The instances' ids, for code.
+        instance_ids: Vec<String>,
+    },
     #[error("cannot remove item {item_id}: manifest '{manifest}' is unreadable: {error}")]
     UnreadableManifest {
         item_id: String,
@@ -2161,15 +2167,28 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
     }
 
     if !usage.instances.is_empty() {
-        let mut using_instances: Vec<String> = usage
+        let mut using: Vec<(String, String)> = usage
             .instances
             .iter()
-            .map(|instance| instance.instance_id.clone())
+            .map(|instance| {
+                let name = instance.name.trim();
+                let label = if name.is_empty() {
+                    instance.instance_id.clone()
+                } else {
+                    name.to_string()
+                };
+                (label, instance.instance_id.clone())
+            })
             .collect();
-        using_instances.sort();
+        using.sort();
         return Err(ContentError::InUse {
             item_id,
-            instances: using_instances.join(", "),
+            instances: using
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            instance_ids: using.into_iter().map(|(_, id)| id).collect(),
         });
     }
 

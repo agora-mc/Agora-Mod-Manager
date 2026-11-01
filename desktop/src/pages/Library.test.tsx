@@ -209,4 +209,30 @@ describe('LibraryPage', () => {
       expect(screen.queryByTestId('unused-summary')).not.toBeInTheDocument();
     });
   });
+
+  it('offers nothing unused while an instance cannot be read, and says which one', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      switch (command) {
+        case 'games_library_list':
+          return { items: [first], damaged: [], warnings: [] };
+        case 'games_library_instances':
+          return { instances: [], warnings: [] };
+        case 'games_library_unused':
+          return {
+            items: [],
+            totalSize: 0,
+            warnings: ["Instance 'mc-broken' could not be read: bad manifest"],
+          };
+        default:
+          throw new Error(`unmocked command in a library test: ${command}`);
+      }
+    });
+
+    render(<LibraryPage />);
+    const summary = await screen.findByTestId('unused-summary');
+    expect(summary).toHaveTextContent('Unused items could not be checked');
+    expect(summary).toHaveTextContent("Instance 'mc-broken' could not be read");
+    expect(within(summary).queryByRole('button', { name: 'Review unused items' }))
+      .not.toBeInTheDocument();
+  });
 });

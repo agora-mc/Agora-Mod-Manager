@@ -501,11 +501,19 @@ pub fn instances_using(ctx: &Ctx, item_id: &str, object_hashes: &[String]) -> In
     }
 }
 
-/// Every item no instance uses, with its size. Unreadable instance manifests are reported as
-/// warnings so a caller can say the list may be incomplete; removal still refuses while one exists.
+/// Every item no instance uses, with its size. When an instance manifest cannot be read, nothing
+/// is offered: the unreadable instance might use any item, so the listing is empty and the
+/// warnings say which instance could not be read (fail closed, like removal).
 pub fn list_unused(ctx: &Ctx) -> Result<UnusedListing, ContentError> {
     let entries = content_store::list_items(ctx)?;
     let scan = scan_instances(ctx);
+    if !scan.unreadable.is_empty() {
+        return Ok(UnusedListing {
+            items: Vec::new(),
+            total_size: 0,
+            warnings: scan.warnings,
+        });
+    }
     let mut items = Vec::new();
     let mut total_size = 0u64;
     for entry in entries {
@@ -552,8 +560,12 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
     let entries = match std::fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) => {
-            scan.warnings
-                .push(format!("Instances could not be listed: {error}"));
+            let message = format!("Instances could not be listed: {error}");
+            scan.warnings.push(message.clone());
+            scan.unreadable.push(UnreadableInstanceManifest {
+                manifest_path: root.display().to_string(),
+                error: message,
+            });
             return scan;
         }
     };

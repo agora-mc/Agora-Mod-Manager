@@ -50,7 +50,10 @@ const BOOT_REPLIES = {
   games_content_remove: null,
 };
 
-async function bootOffline(page: Page) {
+async function bootOffline(page: Page, unusedReplies: unknown[] = [
+  { items: [unusedItem], totalSize: unusedItem.totalSize, warnings: [] },
+  { items: [], totalSize: 0, warnings: [] },
+]) {
   await page.route('**/*', (route) => {
     const url = route.request().url();
     if (url.startsWith('http://localhost') || url.startsWith('http://127.0.0.1')) {
@@ -60,12 +63,7 @@ async function bootOffline(page: Page) {
   });
   await installGamesMock(page, {
     replies: { ...BOOT_REPLIES, games_list: { games: [] } },
-    sequences: {
-      games_library_unused: [
-        { items: [unusedItem], totalSize: unusedItem.totalSize, warnings: [] },
-        { items: [], totalSize: 0, warnings: [] },
-      ],
-    },
+    sequences: { games_library_unused: unusedReplies },
   });
 }
 
@@ -96,4 +94,25 @@ test('the library reviews unused items and removes only after confirmation', asy
 
   await expect(page.getByRole('status')).toContainText('Removed 1 item.');
   await expect(summary).toHaveCount(0);
+});
+
+test('an unreadable instance makes the library offer nothing for removal', async ({ page }) => {
+  await bootOffline(page, [
+    {
+      items: [],
+      totalSize: 0,
+      warnings: ["Instance 'mc-broken' could not be read: bad manifest"],
+    },
+  ]);
+  await page.goto('/');
+
+  await page
+    .getByRole('navigation', { name: 'Main navigation' })
+    .getByRole('button', { name: 'Library', exact: true })
+    .click();
+
+  const summary = page.getByTestId('unused-summary');
+  await expect(summary).toContainText('Unused items could not be checked');
+  await expect(summary).toContainText("Instance 'mc-broken' could not be read");
+  await expect(summary.getByRole('button', { name: 'Review unused items' })).toHaveCount(0);
 });

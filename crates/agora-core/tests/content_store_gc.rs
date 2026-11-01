@@ -132,15 +132,28 @@ fn an_item_a_minecraft_instance_uses_cannot_be_removed() {
     );
 
     let error = remove_item(&ctx, &item_id).unwrap_err();
-    match error {
-        ContentError::InUse { instances, .. } => {
-            assert!(
-                instances.contains("mc1"),
-                "the refusal names the Minecraft instance: {instances}"
+    match &error {
+        ContentError::InUse {
+            instances,
+            instance_ids,
+            ..
+        } => {
+            assert_eq!(
+                instances, "Survival World",
+                "the refusal shows the instance's name, not its id"
+            );
+            assert_eq!(
+                instance_ids,
+                &vec!["mc1".to_string()],
+                "ids stay in the data"
             );
         }
         other => panic!("expected ContentError::InUse, got {other:?}"),
     }
+    assert!(
+        error.to_string().contains("Survival World"),
+        "the CLI message shows the name: {error}"
+    );
 
     assert!(
         ctx.paths.content_item_path(&item_id).exists(),
@@ -244,6 +257,37 @@ fn unused_items_lists_only_items_no_instance_uses() {
     assert_eq!(listing.items[0].total_size, unused_size);
     assert_eq!(listing.total_size, unused_size);
     assert!(listing.warnings.is_empty(), "{:?}", listing.warnings);
+}
+
+// ---------------------------------------------------------------------------
+// 3b. An unreadable instance makes the unused listing offer nothing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unreadable_instance_makes_the_unused_list_offer_nothing() {
+    let (_tmp, ctx) = test_ctx();
+    let item_id = add_bytes(&ctx, "Might Be Used", b"nobody readable uses this");
+
+    // The unreadable instance is Minecraft's, but either game family counts.
+    let dir = ctx.paths.instance_dir("mc-broken").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("instance_manifest.json"), b"{ not a manifest").unwrap();
+
+    let listing = library::list_unused(&ctx).unwrap();
+    assert!(
+        listing.items.is_empty(),
+        "nothing is offered while an instance cannot be read: {listing:?}"
+    );
+    assert_eq!(listing.total_size, 0);
+    assert!(
+        listing
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mc-broken")),
+        "the listing says which instance could not be read: {:?}",
+        listing.warnings
+    );
+    assert!(ctx.paths.content_item_path(&item_id).exists());
 }
 
 // ---------------------------------------------------------------------------
