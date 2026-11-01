@@ -29,6 +29,20 @@ const second = {
   sourceLabel: 'Archive: second.zip',
 };
 
+const installedMod = {
+  filename: 'first.jar',
+  registry_id: null,
+  modrinth_id: null,
+  source: 'manual',
+  version: '1.0.0',
+  sha256: 'd'.repeat(64),
+  installed_at: '2026-01-01T00:00:00Z',
+  enabled: true,
+  content_type: 'mod',
+  content_item_id: first.itemId,
+  object_sha256: 'd'.repeat(64),
+};
+
 function route() {
   invokeMock.mockImplementation(async (command: string) => {
     switch (command) {
@@ -42,7 +56,7 @@ function route() {
       case 'games_library_icon':
         return null;
       case 'minecraft_add_stored_content':
-        return {};
+        return installedMod;
       case 'games_instance_content_add':
         return { status: 'added' };
       default:
@@ -117,5 +131,25 @@ describe('LibraryPage', () => {
       instanceId: 'mc1',
       itemId: first.itemId,
     });
+  });
+
+  it('shows the error the Minecraft command returns', async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command: string, args: unknown) => {
+      if (command === 'minecraft_add_stored_content') {
+        throw { code: 'ERR_CONTENT_ITEM_MISSING', message: 'The store item is missing.' };
+      }
+      return base(command, args);
+    });
+
+    render(<LibraryPage />);
+    await screen.findByText('A saved description.');
+    const rows = screen.getAllByTestId('library-item');
+    fireEvent.click(within(rows[0]).getByRole('button', { name: /Add to instance/ }));
+
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Add to instance' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The store item is missing.');
   });
 });

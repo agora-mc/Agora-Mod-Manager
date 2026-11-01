@@ -396,6 +396,10 @@ export interface InstalledMod {
   update_pinned?: boolean;
   /** True when Agora installed this only to satisfy another mod's dependency. */
   installed_as_dependency?: boolean;
+  /** The shared content store item this file was placed from. */
+  content_item_id?: string | null;
+  /** The SHA-256 of the stored object the file was placed from. */
+  object_sha256?: string | null;
 }
 
 export interface InstanceManifest {

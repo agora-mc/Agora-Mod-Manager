@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { addInstanceContent } from '@/features/games/content/api';
+import { minecraftAddStoredContent } from '@/lib/tauri';
 
 /** One instance that has a library item. */
 export interface LibraryInstance {
@@ -45,12 +46,6 @@ export interface LibraryIconCached {
   matched: number;
   iconDataUrl: string | null;
 }
-
-/**
- * The Minecraft add command arrives with the parallel Minecraft store slice. The name is built at
- * runtime so the bindings manifest does not claim a Rust command this branch does not have.
- */
-const MINECRAFT_ADD_STORED_CONTENT = ['minecraft', 'add', 'stored', 'content'].join('_');
 
 function isLibraryInstance(value: unknown): value is LibraryInstance {
   if (value === null || typeof value !== 'object') return false;
@@ -133,10 +128,10 @@ export async function addLibraryItem(
   instance: LibraryInstance,
 ): Promise<AddOutcome> {
   if (instance.gameId === 'minecraft') {
-    await invoke<unknown>(MINECRAFT_ADD_STORED_CONTENT, {
-      instanceId: instance.instanceId,
-      itemId: item.itemId,
-    });
+    const installed = await minecraftAddStoredContent(instance.instanceId, item.itemId);
+    if (typeof installed?.filename !== 'string') {
+      throw new Error('minecraft_add_stored_content did not return the installed mod.');
+    }
     return { status: 'added' };
   }
   const outcome = await addInstanceContent(instance.instanceId, item.itemId);

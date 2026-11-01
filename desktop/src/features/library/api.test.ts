@@ -37,6 +37,20 @@ const second: LibraryItem = {
   sourceLabel: 'Archive: second.zip',
 };
 
+const installedMod = {
+  filename: 'first.jar',
+  registry_id: null,
+  modrinth_id: null,
+  source: 'manual',
+  version: '1.0.0',
+  sha256: 'd'.repeat(64),
+  installed_at: '2026-01-01T00:00:00Z',
+  enabled: true,
+  content_type: 'mod',
+  content_item_id: first.itemId,
+  object_sha256: 'd'.repeat(64),
+};
+
 const minecraftInstance = { instanceId: 'mc1', name: 'Minecraft One', gameId: 'minecraft' };
 const skyrimInstance = { instanceId: 'sky1', name: 'Skyrim One', gameId: 'skyrim-se' };
 
@@ -80,12 +94,29 @@ describe('addLibraryItem', () => {
   });
 
   it('adds a Minecraft item with the Minecraft store command', async () => {
-    invokeMock.mockResolvedValueOnce({});
+    invokeMock.mockResolvedValueOnce(installedMod);
     await expect(addLibraryItem(first, minecraftInstance)).resolves.toEqual({ status: 'added' });
     expect(invokeMock).toHaveBeenCalledWith('minecraft_add_stored_content', {
       instanceId: 'mc1',
       itemId: first.itemId,
     });
+  });
+
+  it('passes the Minecraft command failure through', async () => {
+    invokeMock.mockRejectedValueOnce({
+      code: 'ERR_CONTENT_ITEM_MISSING',
+      message: 'The store item is missing.',
+    });
+    await expect(addLibraryItem(first, minecraftInstance)).rejects.toMatchObject({
+      code: 'ERR_CONTENT_ITEM_MISSING',
+    });
+  });
+
+  it('rejects a Minecraft reply that is not an installed mod', async () => {
+    invokeMock.mockResolvedValueOnce({});
+    await expect(addLibraryItem(first, minecraftInstance)).rejects.toThrow(
+      'minecraft_add_stored_content did not return the installed mod.',
+    );
   });
 
   it('adds another game’s item with the generic content command', async () => {

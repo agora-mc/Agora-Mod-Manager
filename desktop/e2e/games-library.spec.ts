@@ -43,7 +43,19 @@ const BOOT_REPLIES = {
     warnings: [],
   },
   games_library_icon: null,
-  minecraft_add_stored_content: {},
+  minecraft_add_stored_content: {
+    filename: 'saved.jar',
+    registry_id: null,
+    modrinth_id: null,
+    source: 'manual',
+    version: '1.0.0',
+    sha256: 'a'.repeat(64),
+    installed_at: '2026-01-01T00:00:00Z',
+    enabled: true,
+    content_type: 'mod',
+    content_item_id: item.itemId,
+    object_sha256: 'a'.repeat(64),
+  },
 };
 
 async function bootOffline(page: Page) {
