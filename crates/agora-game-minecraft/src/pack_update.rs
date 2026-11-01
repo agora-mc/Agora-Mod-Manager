@@ -4752,4 +4752,106 @@ mod tests {
             "the user's file is never replaced"
         );
     }
+
+    // ---- Review proofs (store-packs review) --------------------------------
+
+    /// Hard links to one file, counting the name asked about.
+    fn name_count(path: &Path) -> usize {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(path).unwrap().nlink() as usize
+        }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("fsutil")
+                .args(["hardlink", "list"])
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "fsutil hardlink list failed");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        }
+    }
+
+    fn place_linked(
+        ctx: &Ctx,
+        inst: &Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> crate::content_bridge::StoredFile {
+        let source = inst.parent().unwrap().join(format!("src-{name}"));
+        fs::write(&source, bytes).unwrap();
+        crate::content_bridge::store_and_place_file(
+            ctx,
+            inst,
+            &format!("mods/{name}"),
+            &source,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("a mod is tracked content")
+    }
+
+    #[test]
+    #[ignore = "proves bug: a failed pack update's rollback turns every untouched linked mod in mods/ into a plain copy while the manifest still records the store object"]
+    fn a_failed_pack_update_leaves_untouched_linked_mods_linked() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        let ctx = store_ctx(&tmp);
+        let packmod = place_linked(&ctx, &inst, "packmod.jar", b"packA");
+        let bystander = place_linked(&ctx, &inst, "bystander.jar", b"bystander bytes");
+        write_manifest_with_mods(
+            &inst,
+            "inst",
+            vec![
+                linked_mod("packmod.jar", &packmod),
+                linked_mod("bystander.jar", &bystander),
+            ],
+        );
+        let bystander_path = inst.join("mods/bystander.jar");
+        assert!(
+            name_count(&bystander_path) >= 2,
+            "precondition: the bystander is a link to its store object"
+        );
+
+        let staged = staged_update(b"packB");
+        let (plan, reconciled, _dbtmp, conn) =
+            update_plan_and_reconcile(&inst, b"packA", staged.path());
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
+        let error = apply_merge(
+            Some(&ctx),
+            &conn,
+            "inst",
+            &inst,
+            staged.path(),
+            &plan,
+            &BTreeMap::new(),
+            &reconciled,
+        )
+        .unwrap_err();
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = None);
+        assert!(error.contains("injected pack-update failpoint"), "{error}");
+
+        assert_eq!(fs::read(&bystander_path).unwrap(), b"bystander bytes");
+        let manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let entry = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "bystander.jar")
+            .unwrap();
+        assert_eq!(
+            entry.object_sha256.as_deref(),
+            Some(bystander.sha256.as_str())
+        );
+        assert!(
+            name_count(&bystander_path) >= 2,
+            "a failed update must leave a file it never touched exactly as it was (still a link), \
+             but the rollback restored the whole mods/ folder as copies"
+        );
+    }
 }

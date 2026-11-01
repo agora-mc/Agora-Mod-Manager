@@ -280,3 +280,136 @@ fn an_unverifiable_pack_file_is_handled_as_before() {
     assert!(entry.content_item_id.is_some());
     assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
 }
+
+// ---- Review proofs (store-packs review) ----------------------------------------------------
+
+/// An mrpack whose index lists `files` (embedded, hashed) and which also ships `overrides`.
+fn write_mrpack_with_overrides(
+    dir: &Path,
+    files: &[(&str, &[u8])],
+    overrides: &[(&str, &[u8])],
+) -> PathBuf {
+    let path = dir.join("override-pack.mrpack");
+    let listed: Vec<String> = files
+        .iter()
+        .map(|(rel, bytes)| {
+            format!(
+                r#"{{"path":"{rel}","hashes":{},"env":{{"client":"required","server":"required"}},"downloads":[],"fileSize":{}}}"#,
+                both_hashes(bytes),
+                bytes.len()
+            )
+        })
+        .collect();
+    let index = format!(
+        r#"{{"formatVersion":1,"game":"minecraft","versionId":"1.0.0","name":"Override Pack","summary":"","files":[{}],
+            "dependencies":{{"minecraft":"1.20.4","fabric-loader":"0.15.0"}}}}"#,
+        listed.join(",")
+    );
+    let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let opts = zip::write::SimpleFileOptions::default();
+    writer.start_file("modrinth.index.json", opts).unwrap();
+    writer.write_all(index.as_bytes()).unwrap();
+    for (rel, bytes) in files {
+        writer.start_file(*rel, opts).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    for (rel, bytes) in overrides {
+        writer.start_file(format!("overrides/{rel}"), opts).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap();
+    path
+}
+
+#[test]
+#[ignore = "proves bug: a nested pack path (mods/sub/x.jar) is stored under the file name only and lands in mods/x.jar, not where the pack put it"]
+fn a_nested_pack_path_is_placed_where_the_pack_put_it() {
+    let (ctx, tmp) = store_ctx();
+    let jar = b"nested mod bytes".to_vec();
+    let path = write_hashed_mrpack(tmp.path(), &[("mods/sub/x.jar", &jar, both_hashes(&jar))]);
+    let root = ctx.paths.instances_root();
+    let imported = import_mrpack_with(Some(&ctx), &path, &root, None, false).unwrap();
+    let instance_dir = root.join(&imported.instance_id);
+    assert!(
+        instance_dir.join("mods/sub/x.jar").is_file(),
+        "the pack asked for mods/sub/x.jar (what an import without the store writes)"
+    );
+    assert!(
+        !instance_dir.join("mods/x.jar").exists(),
+        "the store placement must not invent mods/x.jar"
+    );
+}
+
+#[test]
+#[ignore = "proves bug: two nested pack files with the same name (mods/a/x.jar, mods/b/x.jar) collide on mods/x.jar and fail the whole import"]
+fn same_named_files_in_different_pack_folders_do_not_collide() {
+    let (ctx, tmp) = store_ctx();
+    let one = b"first x".to_vec();
+    let two = b"second x".to_vec();
+    let path = write_hashed_mrpack(
+        tmp.path(),
+        &[
+            ("resourcepacks/a/x.zip", &one, both_hashes(&one)),
+            ("resourcepacks/b/x.zip", &two, both_hashes(&two)),
+        ],
+    );
+    let root = ctx.paths.instances_root();
+    let imported = import_mrpack_with(Some(&ctx), &path, &root, None, false)
+        .expect("different folders are different files");
+    let instance_dir = root.join(&imported.instance_id);
+    assert_eq!(
+        fs::read(instance_dir.join("resourcepacks/a/x.zip")).unwrap(),
+        one
+    );
+    assert_eq!(
+        fs::read(instance_dir.join("resourcepacks/b/x.zip")).unwrap(),
+        two
+    );
+}
+
+#[test]
+#[ignore = "proves bug: an override with the same path as an index file now fails the import (TargetExists); before the store the override overwrote it"]
+fn an_override_replaces_an_index_file_of_the_same_name() {
+    let (ctx, tmp) = store_ctx();
+    let indexed = b"index version".to_vec();
+    let overridden = b"override version".to_vec();
+    let path = write_mrpack_with_overrides(
+        tmp.path(),
+        &[("resourcepacks/pack.zip", &indexed)],
+        &[("resourcepacks/pack.zip", &overridden)],
+    );
+    let root = ctx.paths.instances_root();
+    let imported = import_mrpack_with(Some(&ctx), &path, &root, None, false)
+        .expect("a pack override over an index file is a normal .mrpack");
+    let instance_dir = root.join(&imported.instance_id);
+    assert_eq!(
+        fs::read(instance_dir.join("resourcepacks/pack.zip")).unwrap(),
+        overridden,
+        "overrides are applied after the index files and win"
+    );
+}
+
+#[test]
+#[ignore = "proves bug: a download that fails its published hash is still added to the shared store before the import stops"]
+fn a_hash_stopped_import_leaves_nothing_in_the_store() {
+    let (ctx, tmp) = store_ctx();
+    let good = b"good bytes".to_vec();
+    let bad = b"bytes that do not match".to_vec();
+    let wrong = both_hashes(b"something else entirely");
+    let path = write_hashed_mrpack(
+        tmp.path(),
+        &[
+            ("mods/good.jar", &good, both_hashes(&good)),
+            ("mods/bad.jar", &bad, wrong),
+        ],
+    );
+    let root = ctx.paths.instances_root();
+    let stop = import_mrpack_with(Some(&ctx), &path, &root, None, false).unwrap_err();
+    assert_eq!(stop.code(), MRPACK_HASH_STOP_CODE);
+    assert!(!root.exists() || fs::read_dir(&root).unwrap().next().is_none());
+    // The bad file failed its published hash; it must never become store content.
+    assert!(
+        !ctx.paths.content_object_path(&sha256_hex(&bad)).exists(),
+        "the mismatching download was stored as a trusted object before the import stopped"
+    );
+}
