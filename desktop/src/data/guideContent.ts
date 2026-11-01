@@ -629,6 +629,20 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           },
         },
         {
+          title: 'One copy of each mod',
+          body: 'Agora keeps one copy of each mod and shares it between the instances that use it. The files in an instance\'s mods, resource packs, shaders and data packs folders point at that shared copy, which is protected so a change in one instance cannot break another.',
+          bullets: [
+            'Deleting or renaming a mod file in File Explorer works.',
+            'Replacing a mod file with a newer one of the same name, or a tool editing a mod file, can fail with "Access denied". Update it in Agora instead, or delete the old file first.',
+            'Configs, saves and screenshots are ordinary files you can edit freely.',
+          ],
+          callout: {
+            tone: 'note',
+            title: 'Prefer separate copies?',
+            text: 'Turn off "Share mod files between instances" in Settings, and new installs get their own copy in each instance. It uses more disk space.',
+          },
+        },
+        {
           title: 'Group a long list',
           body: 'A large instance is easier to read the list of mods grouped, rather than only alphabetically. In the content toolbar, next to the search and filter controls, the Group dropdown re-sorts the list into sections. Each group header has its own enable and disable button, so you can switch a whole set at once.',
           steps: [
@@ -1479,6 +1493,10 @@ export const GUIDE_TOPICS: GuideTopic[] = [
             title: 'If the scan finds nothing',
             text: 'If Agora cannot read one of your instances, it will not offer to remove anything, in case that instance needs it. Fix or remove the instance it could not read, then scan again.',
           },
+        },
+        {
+          title: 'Mods are stored once',
+          body: 'An instance\'s mods, resource packs, shaders and data packs point at one shared copy, so the same mod in ten instances takes the space of one. File Explorer does not know this and shows each instance at its full size.',
         },
         {
           title: 'Put an instance on your desktop',
