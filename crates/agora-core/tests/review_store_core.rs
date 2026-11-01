@@ -10,8 +10,8 @@ use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
-    DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
-    InstallKind, LaunchRecipe, LaunchValue, PackageDefinition, RelPath, RuntimeIdentity, StoreId,
+    DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
+    LaunchRecipe, LaunchValue, PackageDefinition, RelPath, RuntimeIdentity, StoreId,
     StoreIdentifier,
 };
 use tempfile::TempDir;
@@ -206,7 +206,9 @@ fn removing_one_item_deletes_another_items_saved_icon() {
     let saved = agora_core::library::save_icon(&ctx, &keep, &png_bytes(7)).unwrap();
     assert!(saved, "a PNG is saved as the icon");
     assert!(
-        agora_core::library::read_icon(&ctx, &keep).unwrap().is_some(),
+        agora_core::library::read_icon(&ctx, &keep)
+            .unwrap()
+            .is_some(),
         "the icon reads before any removal"
     );
 

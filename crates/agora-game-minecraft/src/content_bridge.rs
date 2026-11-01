@@ -688,3 +688,59 @@ pub fn store_review_item(ctx: &Ctx, source: &Path, rel: &str, game_id: Option<&s
     .expect("set review metadata");
     item.item_id
 }
+
+#[cfg(test)]
+mod review_store_metadata {
+    use super::*;
+
+    /// A PNG signature plus filler: enough for the library's image sniffing.
+    fn png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[3u8; 32]);
+        bytes
+    }
+
+    #[test]
+    #[ignore = "proves bug: store_file rewrites ALL item metadata (icon_sha256: None, description from the install), so re-installing a file already in the store erases its saved icon"]
+    fn storing_the_same_file_again_keeps_the_saved_icon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        let work = tempfile::tempdir().unwrap();
+        let jar = work.path().join("cool.jar");
+        std::fs::write(&jar, b"jar bytes for the review").unwrap();
+
+        let details = StoreDetails {
+            content_type: "mod",
+            filename: "cool.jar",
+            version: Some("1.0.0"),
+            page_url: None,
+            description: Some("Adds cool things"),
+            catalog_id: None,
+            provider: None,
+            provider_id: None,
+            provider_origin: None,
+        };
+        let first = store_file(&ctx, &jar, &details).unwrap();
+        assert!(agora_core::library::save_icon(&ctx, &first.item_id, &png()).unwrap());
+        let before = store::get_item(&ctx, &first.item_id).unwrap();
+        assert!(before.icon_sha256.is_some());
+
+        // The same file installed again (second instance, or a reinstall) from a source that
+        // does not know the icon.
+        let again = StoreDetails {
+            description: None,
+            ..details
+        };
+        let second = store_file(&ctx, &jar, &again).unwrap();
+        assert_eq!(
+            first.item_id, second.item_id,
+            "identical bytes are one item"
+        );
+
+        let after = store::get_item(&ctx, &first.item_id).unwrap();
+        assert_eq!(
+            after.icon_sha256, before.icon_sha256,
+            "the saved icon was erased by re-storing the same file"
+        );
+    }
+}
