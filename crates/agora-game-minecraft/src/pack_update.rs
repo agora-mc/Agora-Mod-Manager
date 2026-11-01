@@ -4879,4 +4879,231 @@ mod tests {
              but the rollback restored the whole mods/ folder as copies"
         );
     }
+
+    fn apply_conflict_update(
+        inst: &Path,
+        base: Vec<InstancePackFile>,
+        theirs: Vec<InstancePackFile>,
+        staged_files: &[(&str, &[u8])],
+        resolution: ConflictResolution,
+    ) -> Result<MergeOutcome, String> {
+        let ours = crate::pack_inventory::collect_pack_inventory(inst).unwrap();
+        let plan = crate::pack_merge::plan_pack_update(&base, &theirs, &ours);
+        assert!(
+            !plan.conflicts.is_empty(),
+            "the user's change must be a conflict the user decides"
+        );
+        let staged = TempDir::new().unwrap();
+        for (rel, bytes) in staged_files {
+            write(staged.path(), rel, bytes);
+        }
+        let (conn, _dbtmp) = test_conn();
+        seed_instance_row(&conn, "inst");
+        let old_manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let mut resolutions = BTreeMap::new();
+        for conflict in &plan.conflicts {
+            resolutions.insert(conflict.key.clone(), resolution);
+        }
+        let reconciled = reconcile_manifest(
+            &old_manifest,
+            &plan,
+            &resolutions,
+            &theirs_struct_for(theirs),
+            staged.path(),
+        )
+        .unwrap();
+        apply_merge(
+            None,
+            &conn,
+            "inst",
+            inst,
+            staged.path(),
+            &plan,
+            &resolutions,
+            &reconciled,
+        )
+    }
+
+    #[test]
+    fn a_pack_update_keeps_a_mod_the_user_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        // Deliberately absent: the user deleted it by hand.
+        let base = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha2_256_hex(b"packA"),
+            size: 5,
+        }];
+        let theirs = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha('b'),
+            size: 5,
+        }];
+        let outcome = apply_conflict_update(
+            &inst,
+            base,
+            theirs,
+            &[("mods/packmod.jar", b"packB")],
+            ConflictResolution::KeepOurs,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !inst.join("mods/packmod.jar").exists(),
+            "today's rule: a deletion the user made stays a deletion unless they choose TakeTheirs"
+        );
+    }
+
+    #[test]
+    fn a_pack_update_keeps_a_user_replaced_mod() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        write(&inst, "mods/packmod.jar", b"my own build");
+        let base = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha2_256_hex(b"packA"),
+            size: 5,
+        }];
+        let theirs = vec![InstancePackFile {
+            relative_path: "mods/packmod.jar".into(),
+            sha256: sha('b'),
+            size: 5,
+        }];
+        let outcome = apply_conflict_update(
+            &inst,
+            base,
+            theirs,
+            &[("mods/packmod.jar", b"packB")],
+            ConflictResolution::KeepOurs,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            fs::read(inst.join("mods/packmod.jar")).unwrap(),
+            b"my own build",
+            "today's rule: a user-replaced file is a conflict, and KeepOurs keeps it"
+        );
+    }
+
+    #[test]
+    fn a_pack_update_keeps_a_user_edited_config() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        write(&inst, "config/foo.toml", b"my setting = true");
+        let base = vec![InstancePackFile {
+            relative_path: "config/foo.toml".into(),
+            sha256: sha2_256_hex(b"packA"),
+            size: 5,
+        }];
+        let theirs = vec![InstancePackFile {
+            relative_path: "config/foo.toml".into(),
+            sha256: sha('b'),
+            size: 5,
+        }];
+        let outcome = apply_conflict_update(
+            &inst,
+            base,
+            theirs,
+            &[("config/foo.toml", b"pack setting = false")],
+            ConflictResolution::KeepOurs,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(
+            fs::read(inst.join("config/foo.toml")).unwrap(),
+            b"my setting = true",
+            "today's rule: a user-edited config is a conflict, and KeepOurs keeps the edit"
+        );
+    }
+
+    #[test]
+    fn a_failed_pack_update_restores_copies_when_sharing_is_off() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        let ctx = store_ctx(&tmp);
+        crate::content_bridge::set_sharing(&ctx, false).unwrap();
+        let packmod = place_linked(&ctx, &inst, "packmod.jar", b"packA");
+        let bystander = place_linked(&ctx, &inst, "bystander.jar", b"bystander bytes");
+        write_manifest_with_mods(
+            &inst,
+            "inst",
+            vec![
+                linked_mod("packmod.jar", &packmod),
+                linked_mod("bystander.jar", &bystander),
+            ],
+        );
+        let bystander_path = inst.join("mods/bystander.jar");
+        assert_eq!(
+            name_count(&bystander_path),
+            1,
+            "precondition: sharing off made an ordinary copy"
+        );
+
+        let staged = staged_update(b"packB");
+        let (plan, reconciled, _dbtmp, conn) =
+            update_plan_and_reconcile(&inst, b"packA", staged.path());
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = Some("apply-one"));
+        apply_merge(
+            Some(&ctx),
+            &conn,
+            "inst",
+            &inst,
+            staged.path(),
+            &plan,
+            &BTreeMap::new(),
+            &reconciled,
+        )
+        .unwrap_err();
+        PACK_UPDATE_TEST_FAILPOINT.with(|s| *s.borrow_mut() = None);
+
+        assert_eq!(fs::read(&bystander_path).unwrap(), b"bystander bytes");
+        assert_eq!(
+            name_count(&bystander_path),
+            1,
+            "with sharing off, the restored placement is a copy again"
+        );
+        let manifest = helpers::read_manifest(&inst.join("instance_manifest.json")).unwrap();
+        let entry = manifest
+            .mods
+            .iter()
+            .find(|entry| entry.filename == "bystander.jar")
+            .unwrap();
+        assert_eq!(
+            entry.object_sha256.as_deref(),
+            Some(bystander.sha256.as_str())
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn removing_a_config_does_not_change_the_folder_acl() {
+        let tmp = TempDir::new().unwrap();
+        let inst = seed_instance(&tmp, "inst");
+        write(&inst, "config/foo.toml", b"user config");
+        let config_dir = inst.join("config");
+        // Strip inheritance and grant only Modify: no FILE_DELETE_CHILD, the state a user
+        // folder has when Agora has never placed a link in it.
+        let user = std::env::var("USERNAME").expect("a Windows user name");
+        let status = std::process::Command::new("icacls")
+            .arg(&config_dir)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:(OI)(CI)M"))
+            .status()
+            .expect("run icacls");
+        assert!(
+            status.success(),
+            "icacls could not set the test folder's ACL"
+        );
+        let before = crate::content_bridge::folder_grants_delete_child(&config_dir);
+        assert!(
+            !before,
+            "precondition: the config folder has no delete-child right"
+        );
+
+        remove_instance_file(&inst, &config_dir.join("foo.toml")).unwrap();
+
+        let after = crate::content_bridge::folder_grants_delete_child(&config_dir);
+        assert_eq!(
+            before, after,
+            "removing a user's config must not rewrite the config folder's ACL"
+        );
+        assert!(!config_dir.join("foo.toml").exists());
+    }
 }

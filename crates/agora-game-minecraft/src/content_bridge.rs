@@ -260,12 +260,7 @@ pub fn store_bytes(
     let stored = store_file_at(
         ctx,
         &temp,
-        &store_details(
-            content_type,
-            file_name_of(relative_path),
-            version,
-            page_url,
-        ),
+        &store_details(content_type, file_name_of(relative_path), version, page_url),
         Some(relative_path),
     );
     let _ = std::fs::remove_file(&temp);
@@ -307,12 +302,7 @@ pub fn store_and_place_file(
     let stored = store_file_at(
         ctx,
         source,
-        &store_details(
-            content_type,
-            file_name_of(relative_path),
-            version,
-            page_url,
-        ),
+        &store_details(content_type, file_name_of(relative_path), version, page_url),
         Some(relative_path),
     )?;
     place_at_relative(ctx, &stored.sha256, instance_dir, relative_path)?;

@@ -988,10 +988,7 @@ pub fn import_mrpack_inner(
                 message: format!("Cannot write {:?}: {e}", dest),
             })?;
             if crate::content_bridge::tracked_content_type(&key).is_some() {
-                content_candidates.insert(
-                    key,
-                    file_entry.downloads.first().cloned(),
-                );
+                content_candidates.insert(key, file_entry.downloads.first().cloned());
             }
             completed_files += 1;
             if let (Some(sink), Some(operation_id)) = (&progress_sink, &operation_id) {
