@@ -9,7 +9,7 @@
 
 use agora_core::ctx::Ctx;
 use agora_core::models::InstanceManifest;
-use agora_core::plugins::{PluginService, PLUGINS_ENABLED_SETTING};
+use agora_core::plugins::PluginService;
 use agora_core::providers::{
     ProviderOrigin, ProviderRegistry, ResolveRequest, SearchRequest, VersionsRequest,
 };
@@ -33,7 +33,6 @@ fn world() -> World {
     let ctx = agora_game_minecraft::testing_context(dir.path().to_path_buf());
     ctx.paths.create_required_dirs().expect("data dirs");
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).expect("db");
-    set(&ctx, PLUGINS_ENABLED_SETTING, true);
     let host: Arc<dyn ScriptHost> = Arc::new(QuickJsHost::new());
     let service = PluginService::headless(ctx.clone(), host);
     World { dir, ctx, service }

@@ -26,9 +26,12 @@
 //!
 //! # The three properties everything else rests on
 //!
-//! 1. **Nothing runs unless the user opted in.** `plugins_enabled` defaults to
-//!    off, and a user who never turns it on never has a plugin runtime in
-//!    their process.
+//! 1. **No plugin code runs unless the user allowed that plugin to run it.**
+//!    The choice is asked once, with the install, and stored per plugin; the
+//!    emergency stop (`plugins_emergency_stop`, not engaged by default) overrides
+//!    it for every plugin, official included. A plugin that has no code (a game
+//!    package, a theme) runs nothing, so neither applies to it. A user who
+//!    never allows a plugin's code never has a plugin runtime in their process.
 //! 2. **A plugin proposes; core disposes.** Plugins return descriptions of
 //!    operations. Core re-validates and executes them through the same
 //!    services the GUI uses, with the same locks and the same user decisions.
@@ -58,9 +61,9 @@ pub use official::{
 };
 pub use registry::{NamespacedContribution, PluginStatus, Resolution};
 pub use service::{
-    LaunchCheckOutcome, LaunchCheckResult, PluginContentProvider, PluginService,
+    Consent, LaunchCheckOutcome, LaunchCheckResult, PluginContentProvider, PluginService,
     PluginSettingsView, PluginSummary, RepairConflict, RepairOutcome, ReplacementOffer,
-    SurfaceChoice, UpdateCheckRecord, UpdateOutcome, PLUGINS_ENABLED_SETTING,
+    SurfaceChoice, UpdateCheckRecord, UpdateOutcome, PLUGINS_EMERGENCY_STOP_SETTING,
     PLUGIN_UPDATES_ENABLED_SETTING, SURFACE_SELECTIONS_SETTING,
 };
 pub use store::{CheckpointSummary, PluginRecord, PluginSource, StorageKind};

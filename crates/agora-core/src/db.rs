@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 19;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 20;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -113,10 +113,10 @@ pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         "ai_mcp_enabled",
         "install_auto_confirm_clean",
         "install_always_auto_confirm",
-        // Community plugins, and their outbound network access, are both
-        // opt-in. Neither is a prerequisite for using Agora, and a default-on
-        // extension system is a default-on attack surface.
-        "plugins_enabled",
+        // A plugin's outbound network access is opt-in. (The old `plugins_enabled`
+        // key is no longer seeded or read: it meant "community plugins on", the
+        // opposite of the emergency stop that replaced it. A stored value is
+        // ignored, so it cannot engage or release the stop by accident.)
         "network_plugins_enabled",
         // This governs automatic background checking only. A manual check
         // works whenever plugins are on.
@@ -755,6 +755,25 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (19)",
+            [],
+        )?;
+    }
+
+    if current < 20 {
+        // Whether the user allowed an installed plugin's code to run. One row per
+        // plugin with code; no row means never allowed. Beside `plugin_installs`
+        // rather than in it, so the manifest-derived record stays exactly what
+        // the package said and permission is only what the user chose.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plugin_script_consent (
+                 plugin_id TEXT PRIMARY KEY,
+                 allowed INTEGER NOT NULL,
+                 decided_at TEXT NOT NULL,
+                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+             );",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (20)",
             [],
         )?;
     }

@@ -15,21 +15,27 @@
 //!    `rollback`), which recorded the signed entry it matched;
 //! 2. the signed registry still lists that id and version, pinning the same
 //!    package hash;
-//! 3. the files in its folder still hash to what they were when they were written.
+//! 3. the files in its folder, in the folder the installer uses, still hash to the
+//!    **tree digest the signed entry pins** (not one remembered in `local_state.db`,
+//!    which is not signed), and its stored manifest and grants are what that
+//!    folder's `agora-plugin.json` says they should be.
 //!
-//! Lose any one and the plugin falls back to the community rules (it needs the
-//! community-plugins switch, and has no badge), and [`OfficialStatus::Unverified`]
-//! carries the reason so the user is told rather than left guessing.
+//! Lose any one and the plugin is [`OfficialStatus::Unverified`], with the reason.
+//! An unverified plugin is **blocked**, not demoted to a community plugin: it is
+//! not loaded, whatever the emergency stop says, until it is updated, rolled back
+//! or reinstalled. The same goes for any plugin that uses an official plugin's id
+//! without being that plugin.
 //!
 //! # What an official install does differently
 //!
 //! It fetches the package from the URL the signed entry names, and checks size and
 //! SHA-256 against that entry **before a single byte is written** under the
 //! plugins folder. After that it is the same installer as any package, with the
-//! same capability consent. Official plugins skip only the *community-plugins
-//! switch*; they never skip consent.
+//! same capability consent, and the same per-plugin "<name> runs code. Allow it?"
+//! for a plugin that has scripts. Official status buys verification and
+//! registration order, not exemption from consent or from the emergency stop.
 
-use super::service::{PluginService, PluginSummary, UpdateOutcome};
+use super::service::{Consent, PluginService, PluginSummary, UpdateOutcome};
 use super::store::{self, OfficialProvenance};
 use super::{install, InstallPreview};
 use crate::error::{LauncherError, LauncherResult};
@@ -120,6 +126,11 @@ pub struct OfficialEntry {
     pub package_url: String,
     /// Lowercase hex SHA-256 of the package zip.
     pub package_sha256: String,
+    /// Lowercase hex [`tree_digest`] of the files the package unpacks to.
+    ///
+    /// Pinned here, in the signed registry, so an installed copy is checked
+    /// against something local state cannot rewrite.
+    pub package_tree_sha256: String,
     pub package_size: u64,
     pub min_agora_version: String,
 }
@@ -148,13 +159,11 @@ impl OfficialEntry {
                 self.package_url
             ));
         }
-        let hash_ok = self.package_sha256.len() == 64
-            && self
-                .package_sha256
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !hash_ok {
+        if !is_lower_hex_64(&self.package_sha256) {
             return Err("the package SHA-256 is not 64 lowercase hex characters".into());
+        }
+        if !is_lower_hex_64(&self.package_tree_sha256) {
+            return Err("the package tree digest is not 64 lowercase hex characters".into());
         }
         if self.package_size == 0 || self.package_size > install::MAX_TOTAL_BYTES {
             return Err(format!(
@@ -179,6 +188,13 @@ impl OfficialEntry {
         let running = semver::Version::new(running.major, running.minor, running.patch);
         (running < minimum).then(|| format!("it needs Agora {minimum} or newer"))
     }
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The host of an `https://` URL that has nothing in its authority but a host.
@@ -231,7 +247,8 @@ impl OfficialCatalog {
         let mut stmt = conn
             .prepare(
                 "SELECT plugin_id, version, channel, name, description, game_ids_json,
-                        package_url, package_sha256, package_size, min_agora_version
+                        package_url, package_sha256, package_size, min_agora_version,
+                        package_tree_sha256
                  FROM official_plugins ORDER BY plugin_id, channel, version",
             )
             .map_err(unreadable)?;
@@ -248,12 +265,13 @@ impl OfficialCatalog {
                     row.get::<_, String>(7)?,
                     row.get::<_, i64>(8)?,
                     row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             })
             .map_err(unreadable)?;
         let mut entries = Vec::new();
         for row in rows {
-            let (id, version, channel, name, description, games, url, sha, size, min) =
+            let (id, version, channel, name, description, games, url, sha, size, min, tree) =
                 row.map_err(unreadable)?;
             let channel = match channel.as_str() {
                 "current" => EntryChannel::Current,
@@ -280,6 +298,7 @@ impl OfficialCatalog {
                 game_ids,
                 package_url: url,
                 package_sha256: sha,
+                package_tree_sha256: tree,
                 // A negative size is not a size; 0 fails `check`.
                 package_size: u64::try_from(size).unwrap_or(0),
                 min_agora_version: min,
@@ -306,6 +325,13 @@ impl OfficialCatalog {
         self.entries
             .iter()
             .find(|entry| entry.plugin_id == plugin_id && entry.channel == channel)
+    }
+
+    /// Whether the catalog lists this exact id at all, in either channel.
+    pub fn has_id(&self, plugin_id: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.plugin_id == plugin_id)
     }
 
     /// The entry for exactly this id and version, in either channel.
@@ -349,13 +375,14 @@ fn unavailable_reason(error: &LauncherError) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "state")]
 pub enum OfficialStatus {
-    /// Matches a signed entry: shown with the Official badge, loads without the
-    /// community-plugins switch.
+    /// Matches a signed entry: shown with the Official badge.
     Official { version: String },
-    /// Not installed from a signed entry: a community plugin.
+    /// Not installed from a signed entry and not using an official id: a
+    /// community plugin.
     Community,
-    /// It was installed as official and no longer verifies. It follows the
-    /// community rules until it does again, and `reason` says why.
+    /// The id is an official plugin's, or the plugin was installed as official,
+    /// and it does not verify (edited, revoked, re-pinned, or never was the
+    /// official package). It is blocked from loading, and `reason` says why.
     Unverified { reason: String },
 }
 
@@ -375,7 +402,7 @@ pub fn tree_digest(root: &Path) -> LauncherResult<String> {
     fn walk(
         root: &Path,
         dir: &Path,
-        entries: &mut Vec<(String, &'static str, String)>,
+        entries: &mut Vec<DigestEntry>,
         total: &mut u64,
     ) -> LauncherResult<()> {
         let read = std::fs::read_dir(dir)
@@ -431,6 +458,13 @@ pub fn tree_digest(root: &Path) -> LauncherResult<String> {
     let mut entries = Vec::new();
     let mut total = 0u64;
     walk(root, root, &mut entries, &mut total)?;
+    Ok(finish_digest(entries))
+}
+
+/// One line of a digest: relative path, kind (`file`, `dir`, `other`), content hash.
+type DigestEntry = (String, &'static str, String);
+
+fn finish_digest(mut entries: Vec<DigestEntry>) -> String {
     entries.sort();
     let mut hasher = Sha256::new();
     for (rel, kind, hash) in &entries {
@@ -441,23 +475,131 @@ pub fn tree_digest(root: &Path) -> LauncherResult<String> {
         hasher.update(hash.as_bytes());
         hasher.update(b"\n");
     }
-    Ok(hex::encode(hasher.finalize()))
+    hex::encode(hasher.finalize())
+}
+
+/// The [`tree_digest`] a package will have once it is unpacked, computed from
+/// the zip bytes without writing anything.
+///
+/// This is what a curator pins in `registry/official-plugins/<id>.json`
+/// (`scripts/official_plugin_digest.py` computes the same value), and what the
+/// installer compares to the signed entry before unpacking. Unpacking writes
+/// the files and the folders above them, and nothing else, so the two agree.
+pub fn zip_tree_digest(bytes: &[u8]) -> LauncherResult<String> {
+    use std::io::Read;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| {
+        refused(
+            "ERR_PLUGIN_PACKAGE_INVALID",
+            format!("not a readable plugin package: {e}"),
+        )
+    })?;
+    if zip.len() > install::MAX_ENTRIES {
+        return Err(refused(
+            "ERR_PLUGIN_PACKAGE_INVALID",
+            "the package holds too many files",
+        ));
+    }
+    let mut files: BTreeMap<String, String> = BTreeMap::new();
+    let mut folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut total = 0u64;
+    for index in 0..zip.len() {
+        let mut entry = zip.by_index(index).map_err(|e| {
+            refused(
+                "ERR_PLUGIN_PACKAGE_INVALID",
+                format!("unreadable entry in the package: {e}"),
+            )
+        })?;
+        let name = entry
+            .name()
+            .map_err(|e| {
+                refused(
+                    "ERR_PLUGIN_PACKAGE_INVALID",
+                    format!("unreadable entry in the package: {e}"),
+                )
+            })?
+            .into_owned();
+        if entry.is_dir() {
+            continue;
+        }
+        install::validate_entry_path(&name)?;
+        let parts: Vec<&str> = name
+            .split(['/', '\\'])
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        let Some((_, ancestors)) = parts.split_last() else {
+            return Err(refused(
+                "ERR_PLUGIN_PACKAGE_INVALID",
+                "the package contains an unnamed entry",
+            ));
+        };
+        for depth in 1..=ancestors.len() {
+            folders.insert(parts[..depth].join("/"));
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut read_here = 0u64;
+        loop {
+            let n = entry.read(&mut buffer).map_err(|e| {
+                refused(
+                    "ERR_PLUGIN_PACKAGE_INVALID",
+                    format!("could not read `{name}`: {e}"),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
+            read_here += n as u64;
+            total += n as u64;
+            if read_here > install::MAX_ENTRY_BYTES || total > install::MAX_TOTAL_BYTES {
+                return Err(refused(
+                    "ERR_PLUGIN_PACKAGE_INVALID",
+                    "the package expands past its size limit",
+                ));
+            }
+            hasher.update(&buffer[..n]);
+        }
+        // A later entry with the same path replaces an earlier one, as unpacking does.
+        files.insert(parts.join("/"), hex::encode(hasher.finalize()));
+    }
+    let mut entries: Vec<DigestEntry> = Vec::new();
+    for folder in folders {
+        entries.push((folder, "dir", String::new()));
+    }
+    for (path, hash) in files {
+        entries.push((path, "file", hash));
+    }
+    Ok(finish_digest(entries))
 }
 
 /// Decide one installed plugin's status against a catalog that was read from a
 /// verified registry.
+///
+/// `local_state.db` is not signed, so nothing in it is believed on its own: the
+/// files are hashed against the digest the *signed* entry pins, the manifest the
+/// record carries must equal the one in those hashed files, and the grants must
+/// be a subset of what that manifest asks for.
 fn evaluate(
-    provenance: &OfficialProvenance,
+    provenance: Option<&OfficialProvenance>,
     record: &store::PluginRecord,
     catalog: &OfficialCatalog,
+    packages_root: &Path,
 ) -> OfficialStatus {
     let unverified = |reason: String| OfficialStatus::Unverified { reason };
     let id = record.id().as_str();
     let version = record.manifest.version.to_string();
 
     if record.source.is_development() {
-        return unverified("it is a development folder, not an installed package".into());
+        return unverified(format!(
+            "`{id}` is an official plugin's id, but this is a development folder, not the \
+             official package"
+        ));
     }
+    let Some(provenance) = provenance else {
+        return unverified(format!(
+            "`{id}` is the id of an official plugin, but this copy was not installed from the \
+             official package"
+        ));
+    };
     if provenance.entry_id != id {
         return unverified("its install record names a different plugin".into());
     }
@@ -480,52 +622,111 @@ fn evaluate(
             "the signed catalog now pins a different package for version {version}"
         ));
     }
-    match tree_digest(&record.install_dir) {
-        Ok(digest) if digest == provenance.tree_sha256 => OfficialStatus::Official { version },
-        Ok(_) => unverified(
-            "files in the plugin's folder changed after it was installed from the official \
-             package"
-                .into(),
-        ),
-        Err(e) => unverified(format!("its installed files could not be verified: {e}")),
+    if record.install_dir != install::package_dir(packages_root, record.id()) {
+        return unverified(
+            "its files are not in the folder the official installer puts them in".into(),
+        );
     }
+    match tree_digest(&record.install_dir) {
+        Ok(digest) if digest == entry.package_tree_sha256 => {}
+        Ok(_) => {
+            return unverified(
+                "files in the plugin's folder changed after it was installed from the official \
+                 package"
+                    .into(),
+            )
+        }
+        Err(e) => return unverified(format!("its installed files could not be verified: {e}")),
+    }
+    // The folder is now known to be the signed one. The record in local state
+    // must say what that folder says.
+    let on_disk = std::fs::read_to_string(
+        record
+            .install_dir
+            .join(agora_plugin_api::manifest::MANIFEST_FILENAME),
+    )
+    .map_err(|e| e.to_string())
+    .and_then(|text| {
+        agora_plugin_api::manifest::PluginManifest::parse(&text).map_err(|e| e.message)
+    });
+    match on_disk {
+        Ok(manifest) if manifest == record.manifest => {}
+        Ok(_) => {
+            return unverified(
+                "the plugin's stored manifest differs from the one in its official package".into(),
+            )
+        }
+        Err(e) => return unverified(format!("the manifest in its folder could not be read: {e}")),
+    }
+    let asked: std::collections::BTreeSet<agora_plugin_api::Capability> = record
+        .manifest
+        .capabilities
+        .required
+        .iter()
+        .chain(record.manifest.capabilities.optional.iter())
+        .filter_map(|name| name.parse::<agora_plugin_api::Capability>().ok())
+        .collect();
+    if let Some(extra) = record.granted.iter().find(|cap| !asked.contains(cap)) {
+        return unverified(format!(
+            "it holds the capability `{}`, which its official manifest never asks for",
+            extra.as_str()
+        ));
+    }
+    OfficialStatus::Official { version }
 }
 
-/// The status of every installed plugin that was installed as official.
+/// The standing of every installed plugin that is official, or uses an official
+/// plugin's id.
 ///
-/// Plugins with no official install record are absent from the map (community).
-/// The signed registry is read only when there is at least one such plugin, so
-/// someone who never installs an official plugin never pays for it.
+/// A plugin that is neither is absent from the map (community). The signed
+/// registry is read only when something is installed, and only the plugins that
+/// were installed as official, or whose id the catalog lists, are evaluated.
 ///
-/// If the registry cannot be verified, every official plugin is reported
-/// [`OfficialStatus::Unverified`] with that reason; the error is not swallowed
-/// into "no official plugins".
+/// If the registry cannot be verified, every plugin installed as official is
+/// reported [`OfficialStatus::Unverified`] with that reason; the error is not
+/// swallowed into "no official plugins". Plugins that were never installed as
+/// official cannot be told from community plugins without a catalog, so they stay
+/// community.
 pub fn verify_installed(
     conn: &Connection,
     app_data_dir: &Path,
     trust: &RegistryTrust,
 ) -> LauncherResult<BTreeMap<String, OfficialStatus>> {
-    let provenance = store::list_official(conn)?;
-    if provenance.is_empty() {
+    let records: Vec<store::PluginRecord> = store::list(conn)?
+        .into_iter()
+        .filter(|record| !store::is_tombstone(record))
+        .collect();
+    if records.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let records = store::list(conn)?;
+    let provenance = store::list_official(conn)?;
     let catalog = load_signed_catalog(trust, app_data_dir);
+    let packages_root =
+        crate::app_paths::AppPaths::from_root(app_data_dir.to_path_buf()).plugin_packages_root();
     let mut out = BTreeMap::new();
-    for (id, prov) in &provenance {
-        let Some(record) = records
-            .iter()
-            .find(|record| record.id().as_str() == id && !store::is_tombstone(record))
-        else {
-            continue;
-        };
-        let status = match &catalog {
-            Ok(catalog) => evaluate(prov, record, catalog),
-            Err(e) => OfficialStatus::Unverified {
-                reason: unavailable_reason(e),
-            },
-        };
-        out.insert(id.clone(), status);
+    for record in &records {
+        let id = record.id().as_str();
+        let recorded = provenance.get(id);
+        match &catalog {
+            Ok(catalog) => {
+                if recorded.is_some() || catalog.has_id(id) {
+                    out.insert(
+                        id.to_string(),
+                        evaluate(recorded, record, catalog, &packages_root),
+                    );
+                }
+            }
+            Err(e) => {
+                if recorded.is_some() {
+                    out.insert(
+                        id.to_string(),
+                        OfficialStatus::Unverified {
+                            reason: unavailable_reason(e),
+                        },
+                    );
+                }
+            }
+        }
     }
     Ok(out)
 }
@@ -654,30 +855,6 @@ impl PluginService {
             .unwrap_or(OfficialStatus::Community))
     }
 
-    /// Statuses for every plugin installed as official, for the manager's list.
-    ///
-    /// A failure to read the records is reported as nothing being official,
-    /// which is the safe direction for a display; the loading path in
-    /// `CoreContext::initialize` reports its own failures as warnings.
-    pub(super) fn official_statuses_for_display(&self) -> BTreeMap<String, OfficialStatus> {
-        let verified = self.inner.conn().and_then(|conn| {
-            verify_installed(
-                &conn,
-                self.inner.ctx.paths.root(),
-                &self.inner.registry_trust,
-            )
-        });
-        match verified {
-            Ok(statuses) => statuses,
-            // Nothing is shown as official that could not be verified. The
-            // list still renders, and nothing is *granted* on this path.
-            Err(e) => {
-                eprintln!("[plugins] could not verify official plugins: {e}");
-                BTreeMap::new()
-            }
-        }
-    }
-
     /// The official plugins the signed catalog offers, and where each stands.
     pub fn official_plugins(&self) -> LauncherResult<OfficialPluginList> {
         let catalog =
@@ -770,9 +947,10 @@ impl PluginService {
     pub async fn install_official(
         &self,
         plugin_id: &str,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
         fetcher: &dyn PackageFetcher,
     ) -> LauncherResult<UpdateOutcome> {
+        let consent: Consent = consent.into();
         let catalog = self.signed_catalog()?;
         let entry = known_entry(catalog.current(plugin_id), plugin_id)?;
         if self.live_version(&entry.plugin_id)?.is_some() {
@@ -784,8 +962,7 @@ impl PluginService {
                 ),
             ));
         }
-        self.install_entry(entry, accept_capabilities, fetcher)
-            .await
+        self.install_entry(entry, consent, fetcher).await
     }
 
     /// Move an installed plugin to the catalog's current official version.
@@ -795,9 +972,10 @@ impl PluginService {
     pub async fn update_official(
         &self,
         plugin_id: &str,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
         fetcher: &dyn PackageFetcher,
     ) -> LauncherResult<UpdateOutcome> {
+        let consent: Consent = consent.into();
         let catalog = self.signed_catalog()?;
         let entry = known_entry(catalog.current(plugin_id), plugin_id)?;
         let Some(installed) = self.live_version(&entry.plugin_id)? else {
@@ -814,8 +992,7 @@ impl PluginService {
                 format!("`{plugin_id}` is already at the current official version {installed}."),
             ));
         }
-        self.install_entry(entry, accept_capabilities, fetcher)
-            .await
+        self.install_entry(entry, consent, fetcher).await
     }
 
     /// Return an official plugin to the version before the current one.
@@ -826,9 +1003,10 @@ impl PluginService {
     pub async fn rollback_official(
         &self,
         plugin_id: &str,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
         fetcher: &dyn PackageFetcher,
     ) -> LauncherResult<UpdateOutcome> {
+        let consent: Consent = consent.into();
         let catalog = self.signed_catalog()?;
         // Existence is checked through the current entry so an unknown id gets
         // the same answer here as everywhere else.
@@ -862,8 +1040,7 @@ impl PluginService {
                 format!("`{plugin_id}` is already at the previous version {installed}."),
             ));
         }
-        self.install_entry(previous, accept_capabilities, fetcher)
-            .await
+        self.install_entry(previous, consent, fetcher).await
     }
 
     /// The signed catalog, or the reason there is not one. Never an empty fallback.
@@ -892,9 +1069,10 @@ impl PluginService {
     async fn install_entry(
         &self,
         entry: &OfficialEntry,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
         fetcher: &dyn PackageFetcher,
     ) -> LauncherResult<UpdateOutcome> {
+        let consent: Consent = consent.into();
         entry.check().map_err(|problem| {
             refused(
                 "ERR_OFFICIAL_PLUGIN_ENTRY",
@@ -924,37 +1102,33 @@ impl PluginService {
         let bytes = fetcher.fetch(&entry.package_url, &host).await?;
         // Before anything is written anywhere.
         verify_package_bytes(entry, &bytes)?;
-
-        let staging = self
-            .inner
-            .ctx
-            .paths
-            .plugin_rollback_root()
-            .join("downloads");
-        std::fs::create_dir_all(&staging)
-            .map_err(|e| io_error(format!("could not prepare {}: {e}", staging.display())))?;
-        let archive = staging.join(format!(
-            "official-{}-{}.zip",
-            entry.plugin_id, entry.version
-        ));
-        std::fs::write(&archive, &bytes)
-            .map_err(|e| io_error(format!("could not write the downloaded package: {e}")))?;
-
-        let result = self.install_staged(entry, &archive, accept_capabilities);
-
-        let _ = std::fs::remove_file(&archive);
-        // Only if empty: another download may share the folder.
-        let _ = std::fs::remove_dir(&staging);
-        result
+        // The bytes are what the entry pins; the files they unpack to must be
+        // what it pins too, or the installed copy could never verify.
+        if zip_tree_digest(&bytes)? != entry.package_tree_sha256 {
+            return Err(refused(
+                "ERR_OFFICIAL_PLUGIN_TREE",
+                format!(
+                    "The files in the package for `{}` {} are not the ones the signed catalog \
+                     pins. Nothing was installed.",
+                    entry.plugin_id, entry.version
+                ),
+            ));
+        }
+        self.install_verified(entry, &bytes, consent)
     }
 
-    fn install_staged(
+    /// Install bytes that have been checked against `entry`, from memory.
+    ///
+    /// The manifest is read from, and the files are unpacked from, these same
+    /// bytes: no file is written and re-opened by path in between.
+    fn install_verified(
         &self,
         entry: &OfficialEntry,
-        archive: &Path,
-        accept_capabilities: bool,
+        bytes: &[u8],
+        consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
-        let preview: InstallPreview = self.preview_package(archive)?;
+        let consent: Consent = consent.into();
+        let preview: InstallPreview = self.preview_package_bytes(bytes)?;
         // The signed entry decides what these bytes are meant to be. A package
         // that says it is something else is refused even though its hash matched.
         if preview.manifest.id.as_str() != entry.plugin_id
@@ -968,7 +1142,7 @@ impl PluginService {
                 ),
             ));
         }
-        if preview.requires_capability_consent() && !accept_capabilities {
+        if preview.requires_capability_consent() && !consent.capabilities {
             return Ok(UpdateOutcome::NeedsConsent {
                 preview: Box::new(preview),
             });
@@ -977,7 +1151,7 @@ impl PluginService {
         // The ordinary installer: same consent comparison, data checkpoint,
         // staging and rollback as any package. It also clears any earlier
         // official record, which is rewritten below only on success.
-        let installed: PluginSummary = self.install_package(archive, accept_capabilities)?;
+        let installed: PluginSummary = self.install_package_bytes(bytes, consent)?;
         let id = PluginId::parse(&installed.id)
             .map_err(|e| refused("ERR_OFFICIAL_PLUGIN_ENTRY", e.message))?;
 
@@ -988,15 +1162,25 @@ impl PluginService {
                 format!("`{id}` is not installed after installing it"),
             )
         })?;
-        let tree_sha256 = tree_digest(&record.install_dir).map_err(|e| {
+        let unpacked = tree_digest(&record.install_dir).map_err(|e| {
             refused(
                 "ERR_OFFICIAL_PLUGIN_RECORD",
                 format!(
-                    "`{id}` was installed but could not be recorded as official, so it is \
-                     treated as a community plugin: {e}"
+                    "`{id}` was installed but its files could not be verified, so it is \
+                     blocked: {e}"
                 ),
             )
         })?;
+        if unpacked != entry.package_tree_sha256 {
+            // Not recorded as official: it will not verify, and says so.
+            return Err(refused(
+                "ERR_OFFICIAL_PLUGIN_TREE",
+                format!(
+                    "`{id}` unpacked to files that are not the ones the signed catalog pins, so \
+                     it is blocked. Update or reinstall it."
+                ),
+            ));
+        }
         store::set_official(
             &conn,
             &id,
@@ -1004,12 +1188,15 @@ impl PluginService {
                 entry_id: entry.plugin_id.clone(),
                 entry_version: entry.version.clone(),
                 entry_sha256: entry.package_sha256.clone(),
-                tree_sha256,
+                // Informational: the check uses the digest the signed entry pins.
+                tree_sha256: unpacked,
                 recorded_at: chrono::DateTime::<chrono::Utc>::from(self.inner.ctx.clock.now())
                     .to_rfc3339(),
             },
         )?;
         drop(conn);
+        // Resolution was last computed before the record above existed.
+        self.reload()?;
 
         Ok(UpdateOutcome::Installed {
             plugin: Box::new(self.summary(&id)?),

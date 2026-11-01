@@ -395,7 +395,7 @@ pub async fn install_provider_pack(
 ) -> anyhow::Result<()> {
     let service = crate::plugin_service(ctx);
     service.reload()?;
-    let plugins = service.is_enabled().then_some(&service);
+    let plugins = service.plugin_code_allowed().then_some(&service);
     let registry = ProviderRegistry::new(ctx, plugins);
     let item = providers::item_id(provider, project);
     let result = agora_game_minecraft::providers::install::install_pack(

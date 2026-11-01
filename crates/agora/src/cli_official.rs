@@ -17,8 +17,13 @@ pub enum OfficialCmd {
     Install {
         /// Plugin id, for example `acme.fixture`.
         id: String,
-        #[arg(long, help = "Accept the capabilities the package asks for")]
+        #[arg(
+            long,
+            help = "Accept the capabilities the package asks for, and let it run its code if it has any"
+        )]
         yes: bool,
+        #[arg(long, help = "Install without allowing the plugin's code to run")]
+        no_code: bool,
     },
     /// Move an installed plugin to the catalog's current official version.
     Update {
@@ -88,10 +93,16 @@ pub async fn run(service: &PluginService, action: OfficialCmd, json: bool) -> an
                 &rows,
             );
         }
-        OfficialCmd::Install { id, yes } => {
+        OfficialCmd::Install { id, yes, no_code } => {
             let plugin_id = crate::parse_plugin_id(&id)?;
+            // `--yes` is the answer to both questions; `--no-code` withholds the
+            // second. Core only applies the code answer to a first install.
+            let consent = agora_core::plugins::Consent {
+                capabilities: yes,
+                scripts: yes && !no_code,
+            };
             let outcome = service
-                .install_official(plugin_id.as_str(), yes, &service.http_fetcher())
+                .install_official(plugin_id.as_str(), consent, &service.http_fetcher())
                 .await?;
             report(&id, outcome, "Installed", json)?;
         }

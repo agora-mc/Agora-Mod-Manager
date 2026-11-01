@@ -348,8 +348,20 @@ an issue asking for a new block type. It is not a reason to reintroduce a second
 right fix adds a component every plugin can use, themed and navigable, rather than one plugin's
 private HTML.
 
+## Who may run code: one answer per plugin, and an emergency stop
+
+A plugin's **scripts** (anything with an `entrypoint`) run only if the user allowed *that plugin* to run code. This is asked once, with the install, as part of the install consent: "<name> runs code. Allow it?" The user can allow it, or install the plugin without running its code. The answer is stored per plugin in local state (never in the manifest) and can be changed later in Settings -> Plugins (the "Allow code" switch on the plugin's row) or with `agora plugin scripts <ID> allow|deny`. Turning it off stops that plugin now. One plugin's answer never affects another's, and it is the same rule for official and community plugins. Updating a plugin keeps the answer it already has; a version that newly has code is not allowed to run it until the user says so.
+
+Above that sits the **emergency stop**, Settings -> Plugins -> "Stop all plugin code" (`agora plugin stop` / `agora plugin resume`). It is **not engaged** by default. While it is engaged no plugin script runs, official plugins included, whatever each plugin was allowed. Engaging it also stops what is running right now. It is stored as `plugins_emergency_stop`. An unreadable or malformed value counts as engaged.
+
+**Data-only plugins run no code**, so neither of these applies to them: a plugin that only contributes game packages (Skyrim support, for example) loads whatever the stop says, and has no code to allow. Their install consent (the capabilities, `game:define`) is the opt-in. A plugin that has both a game package and scripts loads the game package regardless and runs its scripts only under the two rules above.
+
+The old `plugins_enabled` setting ("community plugins on", off by default) is gone. It meant the opposite of the stop and was seeded `false` in every database, so reading it with the new meaning would have engaged the stop for everyone. It is ignored and treated as absent, whatever value it holds.
+
+Official plugins (listed in Agora's signed registry) get no exemption from any of this for their scripts. What official status changes is verification and loading: an official plugin whose files, version or hash no longer match the signed entry, and any plugin that uses an official plugin's id without being it, is **blocked** (status "Blocked", with the reason) and neither its scripts nor its game packages load.
+
 ## Recovery and compatibility
 
-Per-plugin disable removes contributions and subscriptions; uninstall asks separately about retained data. **Turn all off** is the recovery control. The global switch disables all currently enabled plugins when turned off, so re-enable individual plugins afterward. Built-in destinations remain available. Saved plugin destinations show an actionable fallback if unavailable.
+Per-plugin disable removes contributions and subscriptions; uninstall asks separately about retained data. **Turn all off** disables every plugin; the emergency stop (above) stops all plugin code without changing which plugins are enabled or allowed, so releasing it puts things back the way they were. Built-in destinations remain available. Saved plugin destinations show an actionable fallback if unavailable.
 
 API 0.1 is experimental. Pin its range and keep data migrations backward compatible. The implementation does not yet provide complete update rollback, signed package distribution, or a stable support window. Do not use package bytes alone as proof that plugin data can be rolled back. These limitations must be resolved before API v1 is advertised as stable.

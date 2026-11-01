@@ -256,6 +256,59 @@ pub fn upsert(
     Ok(())
 }
 
+/// Record whether the user allowed this plugin's code to run. Per plugin; one
+/// plugin's answer never touches another's.
+pub fn set_script_consent(
+    conn: &Connection,
+    plugin_id: &PluginId,
+    allowed: bool,
+    now: &str,
+) -> LauncherResult<()> {
+    conn.execute(
+        "INSERT INTO plugin_script_consent (plugin_id, allowed, decided_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(plugin_id) DO UPDATE SET
+             allowed = excluded.allowed,
+             decided_at = excluded.decided_at",
+        params![plugin_id.as_str(), allowed as i64, now],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// The user's answer for this plugin, or `None` if it has never been given one
+/// (which is not permission).
+pub fn script_consent(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<Option<bool>> {
+    conn.query_row(
+        "SELECT allowed FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|answer| answer.map(|allowed| allowed != 0))
+    .map_err(db_error)
+}
+
+/// Every recorded answer, keyed by plugin id.
+pub fn list_script_consent(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, bool>> {
+    let mut stmt = conn
+        .prepare("SELECT plugin_id, allowed FROM plugin_script_consent")
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, allowed) = row.map_err(db_error)?;
+        out.insert(id, allowed);
+    }
+    Ok(out)
+}
+
 /// Where an installed plugin came from, when it came from a signed registry
 /// entry: the entry that was matched, the package hash that entry pinned, and a
 /// digest of the files as they were written, so a later edit is noticed.
@@ -487,8 +540,14 @@ pub fn remove(conn: &Connection, plugin_id: &PluginId, purge_data: bool) -> Laun
         params![plugin_id.as_str()],
     )
     .map_err(db_error)?;
-    // The files are gone, so whatever vouched for them no longer applies.
+    // The files are gone, so whatever vouched for them no longer applies, and
+    // so does permission to run them: a reinstall asks again, like the grants.
     clear_official(conn, plugin_id)?;
+    conn.execute(
+        "DELETE FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+    )
+    .map_err(db_error)?;
     Ok(())
 }
 

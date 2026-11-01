@@ -9,7 +9,7 @@
 
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::plugins::{
-    InstallPreview, LaunchCheckOutcome, OfficialPluginList, PluginService, PluginSummary,
+    Consent, InstallPreview, LaunchCheckOutcome, OfficialPluginList, PluginService, PluginSummary,
     PluginUiSink, RepairOutcome, UpdateOutcome, UpdateVerdict,
 };
 use agora_plugin_api::diagnostics::{DiagnosticReport, RepairProposal};
@@ -112,10 +112,37 @@ fn from_plugin_error(error: agora_plugin_api::PluginError) -> LauncherError {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Whether the user has turned the plugin system on.
+/// Whether the emergency stop is engaged ("Stop all plugin code"): while it is,
+/// no plugin script runs, official included. Not engaged by default.
 #[tauri::command]
-pub async fn plugins_enabled(app: AppHandle) -> LauncherResult<bool> {
-    Ok(service(&app)?.is_enabled())
+pub async fn plugins_emergency_stop(app: AppHandle) -> LauncherResult<bool> {
+    Ok(service(&app)?.emergency_stop_engaged())
+}
+
+/// Engage or release the emergency stop. Engaging also stops what is running now.
+#[tauri::command]
+pub async fn set_plugins_emergency_stop(app: AppHandle, engaged: bool) -> LauncherResult<()> {
+    service(&app)?.set_emergency_stop(engaged)
+}
+
+/// Allow or disallow one plugin's code. Independent per plugin.
+#[tauri::command]
+pub async fn set_plugin_scripts_allowed(
+    app: AppHandle,
+    plugin_id: String,
+    allowed: bool,
+) -> LauncherResult<PluginSummary> {
+    service(&app)?.set_scripts_allowed(&parse_id(&plugin_id)?, allowed)
+}
+
+/// The answers the install prompt collected. `allow_scripts` is the separate
+/// "<name> runs code. Allow it?" choice; when the page does not send it, the
+/// answer to the permission prompt stands for both.
+fn consent(accept_capabilities: bool, allow_scripts: Option<bool>) -> Consent {
+    Consent {
+        capabilities: accept_capabilities,
+        scripts: allow_scripts.unwrap_or(accept_capabilities),
+    }
 }
 
 /// Start the plugins that asked to run at startup. Idempotent across reloads.
@@ -213,8 +240,12 @@ pub async fn install_plugin_package(
     app: AppHandle,
     path: String,
     accept_capabilities: bool,
+    allow_scripts: Option<bool>,
 ) -> LauncherResult<PluginSummary> {
-    service(&app)?.install_package(&PathBuf::from(path), accept_capabilities)
+    service(&app)?.install_package(
+        &PathBuf::from(path),
+        consent(accept_capabilities, allow_scripts),
+    )
 }
 
 #[tauri::command]
@@ -252,10 +283,15 @@ pub async fn install_official_plugin(
     app: AppHandle,
     plugin_id: String,
     accept_capabilities: bool,
+    allow_scripts: Option<bool>,
 ) -> LauncherResult<UpdateOutcome> {
     let service = service(&app)?;
     service
-        .install_official(&plugin_id, accept_capabilities, &service.http_fetcher())
+        .install_official(
+            &plugin_id,
+            consent(accept_capabilities, allow_scripts),
+            &service.http_fetcher(),
+        )
         .await
 }
 
@@ -290,8 +326,12 @@ pub async fn add_plugin_development_folder(
     app: AppHandle,
     path: String,
     accept_capabilities: bool,
+    allow_scripts: Option<bool>,
 ) -> LauncherResult<PluginSummary> {
-    service(&app)?.add_development_folder(&PathBuf::from(path), accept_capabilities)
+    service(&app)?.add_development_folder(
+        &PathBuf::from(path),
+        consent(accept_capabilities, allow_scripts),
+    )
 }
 
 #[tauri::command]

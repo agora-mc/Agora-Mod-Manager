@@ -583,8 +583,11 @@ agora plugin list
 agora plugin status                         # alias for list
 agora plugin preview package <PATH>
 agora plugin preview development <PATH>
-agora plugin install package <PATH>
-agora plugin install development <PATH>
+agora plugin install package <PATH> [--yes] [--no-code]
+agora plugin install development <PATH> [--yes] [--no-code]
+agora plugin scripts <PLUGIN_ID> allow|deny
+agora plugin stop
+agora plugin resume
 agora plugin enable <PLUGIN_ID>
 agora plugin disable <PLUGIN_ID>
 agora plugin remove <PLUGIN_ID>
@@ -613,6 +616,8 @@ agora plugin install package ./example-plugin.zip --yes
 agora plugin install development ./example-plugin --yes
 ```
 
+A plugin that has code (an `entrypoint`) also gets one more question, asked once with the install: `<name> runs code. Allow it? [y/N]`. `--yes` answers yes to both, `--no-code` installs it without allowing its code to run (its permissions are still granted), and with no terminal and no `--yes` the answer is no. The answer is per plugin and changeable later: `plugin scripts <ID> allow` or `deny` (deny also stops it now). `plugin list` shows each plugin's `Code` as `none` (data only), `allowed` or `not allowed`. `plugin stop` engages the emergency stop, under which no plugin code runs, official plugins included, whatever each was allowed; `plugin resume` releases it. The stop is the `plugins_emergency_stop` setting, not engaged by default. Data-only plugins (game packages) run no code and are not affected by it. The old `plugins_enabled` setting is ignored.
+
 Without `--yes`, a non-interactive invocation cannot grant capabilities. The CLI shows the preview and passes a negative consent answer to core, so `PluginService` refuses the install. This keeps scripting fail-closed; do not use `--yes` unless the package's preview is trusted. In JSON mode, a pending interactive preview and prompt are written to standard error; the completed plugin summary is the single JSON value on standard output.
 
 ### Official plugins
@@ -628,7 +633,7 @@ An official plugin is an ordinary plugin package whose id, version and package S
 
 `install`, `update` and `rollback` download the package from the URL the catalog names (HTTPS only, pinned to that host), refuse it unless its size and SHA-256 match the catalog entry **before anything is unpacked**, and then use the same installer as `plugin install package`, so the same capability consent applies: without `--yes` the command prints what the package asks for and stops. `install` is for a plugin that is not installed, `update` moves an installed one to the catalog's current version (and replaces a same-id community copy with the official package), and `rollback` returns an official install to the previous version the catalog keeps. An id is matched exactly: an empty id, a path, or a different capitalisation matches nothing.
 
-An installed plugin counts as official only while its id, version and installed package hash still match a signed catalog entry and its files are unchanged since they were installed. While it does, it loads at startup even when the community-plugins switch (`plugins_enabled`) is off. If it stops matching (the files were edited, the catalog no longer lists that version or pins a different package, the catalog cannot be verified), it follows the community rules again, and the reason appears in `plugin list --json` (`official.reason`) and in the startup warnings. Installing a package through `plugin install package`, even one with the same id and version, makes it a community plugin.
+An installed plugin counts as official only while its id, version and installed package hash still match a signed catalog entry and its files are unchanged since they were installed. Its files are checked against the tree digest the signed entry pins, not against anything stored in the local database. If it stops matching (the files were edited, the catalog no longer lists that version or pins a different package, the catalog cannot be verified), it is **blocked**: its game packages do not load and its scripts do not run, whatever the emergency stop says, and the reason appears in `plugin list --json` (`official.reason`, and a `Blocked` status) and in the startup warnings. The same applies to a plugin installed through `plugin install package` that uses an official plugin's id without being that plugin. Official plugins register their games before community plugins, so a community plugin can never claim an official game id or store product id. Official status does not change who may run code: a scripted official plugin is asked about at install (`--yes` allows it, `--no-code` does not) and can be stopped like any other.
 
 ### Content providers
 

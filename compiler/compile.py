@@ -2009,6 +2009,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             game_ids_json TEXT NOT NULL DEFAULT '[]',
             package_url TEXT NOT NULL,
             package_sha256 TEXT NOT NULL,
+            package_tree_sha256 TEXT NOT NULL,
             package_size INTEGER NOT NULL,
             min_agora_version TEXT NOT NULL,
             PRIMARY KEY (plugin_id, version)
@@ -2953,7 +2954,7 @@ OFFICIAL_VERSION_RE = re.compile(
 OFFICIAL_GAME_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # Matches the 64 MiB a plugin package may expand to; the zip is smaller still.
 OFFICIAL_PACKAGE_MAX_BYTES = 64 * 1024 * 1024
-OFFICIAL_PLUGIN_RELEASE_KEYS = {"version", "package_url", "sha256", "size"}
+OFFICIAL_PLUGIN_RELEASE_KEYS = {"version", "package_url", "sha256", "tree_sha256", "size"}
 OFFICIAL_PLUGIN_KEYS = {
     "id", "name", "description", "game_ids", "min_agora_version", "current", "previous",
 }
@@ -2986,6 +2987,15 @@ def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
         raise SystemExit(
             f"{path}: {label}.sha256 must be exactly 64 lowercase hex characters, got {sha256!r}"
         )
+    # The digest of the files the zip unpacks to. Pinning it here, in the signed
+    # registry, is what lets the app check an installed folder against something
+    # local state cannot rewrite. scripts/official_plugin_digest.py computes it.
+    tree_sha256 = release["tree_sha256"]
+    if not isinstance(tree_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", tree_sha256):
+        raise SystemExit(
+            f"{path}: {label}.tree_sha256 must be exactly 64 lowercase hex characters, "
+            f"got {tree_sha256!r}"
+        )
     size = release["size"]
     if (
         isinstance(size, bool)
@@ -2997,7 +3007,13 @@ def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
             f"{path}: {label}.size must be a whole number of bytes between 1 and "
             f"{OFFICIAL_PACKAGE_MAX_BYTES}, got {size!r}"
         )
-    return {"version": version, "package_url": url, "sha256": sha256, "size": size}
+    return {
+        "version": version,
+        "package_url": url,
+        "sha256": sha256,
+        "tree_sha256": tree_sha256,
+        "size": size,
+    }
 
 
 def load_official_plugins() -> list[tuple[Path, dict[str, Any]]]:
@@ -3101,8 +3117,9 @@ def insert_official_plugins(
                 """
                 INSERT INTO official_plugins (
                     plugin_id, version, channel, name, description, game_ids_json,
-                    package_url, package_sha256, package_size, min_agora_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    package_url, package_sha256, package_tree_sha256, package_size,
+                    min_agora_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry["id"],
@@ -3113,6 +3130,7 @@ def insert_official_plugins(
                     json.dumps(entry["game_ids"], separators=(",", ":")),
                     release["package_url"],
                     release["sha256"],
+                    release["tree_sha256"],
                     release["size"],
                     entry["min_agora_version"],
                 ),

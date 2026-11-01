@@ -137,6 +137,8 @@ pub struct ExistingInstall<'a> {
     /// host list are two different agreements. Keeping the capability while
     /// changing the list is still asking for something new.
     pub hosts: &'a [String],
+    /// The installed version has code.
+    pub runs_code: bool,
 }
 
 /// What the user is agreeing to when they install something.
@@ -182,6 +184,12 @@ pub struct InstallPreview {
     pub needs_reduced_security: bool,
     pub file_count: usize,
     pub uncompressed_bytes: u64,
+    /// The plugin has code (an entrypoint). The install prompt asks, once,
+    /// whether to allow it to run ("<name> runs code. Allow it?").
+    pub runs_code: bool,
+    /// The plugin has code and the installed version did not, or nothing is
+    /// installed. An update that adds code does not inherit permission to run it.
+    pub adds_code: bool,
 }
 
 impl InstallPreview {
@@ -315,12 +323,34 @@ pub struct PackageContents {
     pub uncompressed_bytes: u64,
 }
 
+/// Read a package file into memory, once.
+///
+/// Every later step (reading the manifest, extracting) works from these bytes
+/// rather than re-opening the path, so the file cannot change between the check
+/// and the use. A package larger than the expanded-size limit cannot be valid,
+/// so it is refused before it is read.
+pub fn read_package_file(archive: &Path) -> LauncherResult<Vec<u8>> {
+    let length = std::fs::metadata(archive)
+        .map_err(|e| io_error(format!("could not open {}: {e}", archive.display())))?
+        .len();
+    if length > MAX_TOTAL_BYTES {
+        return Err(invalid_package(format!(
+            "the package file is {length} bytes; a plugin package may not exceed {MAX_TOTAL_BYTES}"
+        )));
+    }
+    std::fs::read(archive)
+        .map_err(|e| io_error(format!("could not read {}: {e}", archive.display())))
+}
+
 /// Read and validate a package without extracting it.
 pub fn read_package_manifest(archive: &Path) -> LauncherResult<PackageContents> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| io_error(format!("could not open {}: {e}", archive.display())))?;
-    let compressed = file.metadata().map(|meta| meta.len()).unwrap_or(0).max(1);
-    let mut zip = zip::ZipArchive::new(file)
+    read_package_manifest_bytes(&read_package_file(archive)?)
+}
+
+/// [`read_package_manifest`] over bytes already in memory.
+pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageContents> {
+    let compressed = (bytes.len() as u64).max(1);
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| invalid_package(format!("not a readable plugin package: {e}")))?;
 
     if zip.len() > MAX_ENTRIES {
@@ -426,7 +456,15 @@ pub fn preview_package(
     archive: &Path,
     existing: Option<&ExistingInstall<'_>>,
 ) -> LauncherResult<InstallPreview> {
-    let contents = read_package_manifest(archive)?;
+    preview_package_bytes(&read_package_file(archive)?, existing)
+}
+
+/// [`preview_package`] over bytes already in memory.
+pub fn preview_package_bytes(
+    bytes: &[u8],
+    existing: Option<&ExistingInstall<'_>>,
+) -> LauncherResult<InstallPreview> {
+    let contents = read_package_manifest_bytes(bytes)?;
     Ok(build_preview(
         contents.manifest,
         contents.update_source,
@@ -457,6 +495,8 @@ fn build_preview(
 ) -> InstallPreview {
     let (required, optional, unsupported) = describe(&manifest.capabilities);
     InstallPreview {
+        runs_code: !manifest.is_declarative_only(),
+        adds_code: !manifest.is_declarative_only() && !existing.is_some_and(|e| e.runs_code),
         replaces_version: existing.map(|current| current.version.to_string()),
         added_capabilities: added_capabilities(existing.map(|current| current.granted), &manifest),
         added_hosts: added_hosts(existing.map(|current| current.hosts), &manifest),
@@ -484,7 +524,7 @@ fn build_preview(
 /// `destination` must not exist. Extraction goes to a sibling staging
 /// directory and is renamed into place at the end, so an interrupted install
 /// leaves either the old plugin or nothing — never a partial one.
-pub fn extract_package(archive: &Path, destination: &Path) -> LauncherResult<()> {
+pub fn extract_package(bytes: &[u8], destination: &Path) -> LauncherResult<()> {
     if destination.exists() {
         return Err(io_error(format!(
             "{} already exists",
@@ -510,7 +550,7 @@ pub fn extract_package(archive: &Path, destination: &Path) -> LauncherResult<()>
     std::fs::create_dir_all(&staging)
         .map_err(|e| io_error(format!("could not create {}: {e}", staging.display())))?;
 
-    let result = extract_into(archive, &staging);
+    let result = extract_into(bytes, &staging);
     if let Err(error) = result {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(error);
@@ -525,10 +565,8 @@ pub fn extract_package(archive: &Path, destination: &Path) -> LauncherResult<()>
     })
 }
 
-fn extract_into(archive: &Path, staging: &Path) -> LauncherResult<()> {
-    let file = std::fs::File::open(archive)
-        .map_err(|e| io_error(format!("could not open {}: {e}", archive.display())))?;
-    let mut zip = zip::ZipArchive::new(file)
+fn extract_into(bytes: &[u8], staging: &Path) -> LauncherResult<()> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| invalid_package(format!("not a readable plugin package: {e}")))?;
 
     let mut written = 0u64;
@@ -543,9 +581,7 @@ fn extract_into(archive: &Path, staging: &Path) -> LauncherResult<()> {
         if entry.is_dir() {
             continue;
         }
-        // Re-validated here rather than trusted from the preview pass: the
-        // file on disk could have been swapped between the two reads, and this
-        // is the pass that actually creates files.
+        // Re-validated here: this is the pass that actually creates files.
         validate_entry_path(&name)?;
         let target = staging.join(name.replace('\\', "/"));
         if !target.starts_with(staging) {
@@ -797,7 +833,7 @@ mod tests {
         ]);
         let target = tempfile::tempdir().unwrap();
         let destination = target.path().join("acme.one");
-        extract_package(&path, &destination).unwrap();
+        extract_package(&std::fs::read(&path).unwrap(), &destination).unwrap();
         assert!(destination.join(MANIFEST_FILENAME).is_file());
         assert!(destination.join("main.js").is_file());
         assert!(destination.join("lib/util.js").is_file());
@@ -812,7 +848,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let destination = target.path().join("acme.one");
         std::fs::create_dir_all(&destination).unwrap();
-        assert!(extract_package(&path, &destination).is_err());
+        assert!(extract_package(&std::fs::read(&path).unwrap(), &destination).is_err());
     }
 
     #[test]
@@ -824,7 +860,7 @@ mod tests {
         ]);
         let target = tempfile::tempdir().unwrap();
         let destination = target.path().join("acme.one");
-        assert!(extract_package(&path, &destination).is_err());
+        assert!(extract_package(&std::fs::read(&path).unwrap(), &destination).is_err());
         assert!(!destination.exists());
         // The staging directory goes too.
         let leftovers: Vec<_> = std::fs::read_dir(target.path())
@@ -946,6 +982,7 @@ mod tests {
                 data_version: 1,
                 granted: &granted,
                 hosts: &[],
+                runs_code: false,
             }),
             2,
             100,
@@ -970,6 +1007,7 @@ mod tests {
             data_version: 1,
             granted: &granted,
             hosts: &[],
+            runs_code: false,
         };
 
         let same: PluginManifest = serde_json::from_value(serde_json::json!({

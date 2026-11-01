@@ -180,18 +180,14 @@ impl CoreContext {
         match crate::db::local_state_connection(&db_path) {
             Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
             Ok(conn) => {
-                let plugins_enabled =
-                    crate::db::get_setting(&conn, crate::plugins::PLUGINS_ENABLED_SETTING)
-                        .ok()
-                        .flatten()
-                        .and_then(|val| val.as_bool())
-                        .unwrap_or(false);
-
-                // A plugin installed from a signed registry entry and still matching
-                // it is official, and official plugins do not need the community
-                // switch. Everything else follows the switch, as before. One that was
-                // installed as official and no longer verifies is not silently
-                // demoted: it is named in the warnings with the reason.
+                // A game package is data: it runs no code, so it loads whatever the
+                // emergency stop says and needs no script permission; installing the
+                // plugin (and granting `game:define`) was the opt-in. The one filter
+                // is official status. A plugin that was installed as official, or
+                // that uses an official plugin's id, and does not verify is blocked:
+                // not loaded, and named in the warnings with the reason. It is not
+                // demoted to a community plugin, which would let a revoked or
+                // tampered package keep loading.
                 let official = match crate::plugins::official::verify_installed(
                     &conn,
                     paths.root(),
@@ -202,14 +198,26 @@ impl CoreContext {
                         warnings.push(format!(
                             "Cannot verify official plugins, so none is treated as official: {e}"
                         ));
-                        Default::default()
+                        std::collections::BTreeMap::new()
                     }
                 };
 
                 {
                     match crate::plugins::store::list(&conn) {
                         Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
-                        Ok(records) => {
+                        Ok(mut records) => {
+                            // Official plugins register first. A game id or a store
+                            // product id goes to whoever claims it first, and the
+                            // records come back in plugin-id order, so without this
+                            // a community plugin named `aaaa.x` could take
+                            // `skyrim-se` before the official plugin was read.
+                            // Stable, so each group stays in plugin-id order.
+                            records.sort_by_key(|record| {
+                                !matches!(
+                                    official.get(record.id().as_str()),
+                                    Some(crate::plugins::official::OfficialStatus::Official { .. })
+                                )
+                            });
                             for record in records {
                                 if !record.enabled
                                     || crate::plugins::store::is_tombstone(&record)
@@ -229,25 +237,14 @@ impl CoreContext {
                                             reason,
                                         },
                                     ) => {
-                                        let consequence = if plugins_enabled {
-                                            "it is treated as a community plugin"
-                                        } else {
-                                            "it is treated as a community plugin and is not loaded while community plugins are switched off"
-                                        };
                                         warnings.push(format!(
-                                            "Plugin {} was installed as an official plugin but no longer verifies ({reason}); {consequence}.",
+                                            "Plugin {} is blocked and its games are not loaded: {reason}.",
                                             record.id()
                                         ));
-                                        if !plugins_enabled {
-                                            continue;
-                                        }
+                                        continue;
                                     }
                                     Some(crate::plugins::official::OfficialStatus::Community)
-                                    | None => {
-                                        if !plugins_enabled {
-                                            continue;
-                                        }
-                                    }
+                                    | None => {}
                                 }
 
                                 for pkg_contrib in &record.manifest.contributions.game_packages {
@@ -295,7 +292,9 @@ impl CoreContext {
                                         )),
                                     ) {
                                         warnings.push(format!(
-                                            "Plugin {}: rejected game package {}: {err}",
+                                            "Plugin {}: rejected game package {}: {err}. \
+                                             A game or store product already claimed (official \
+                                             plugins register first) cannot be claimed again.",
                                             record.id(),
                                             file_path.display()
                                         ));

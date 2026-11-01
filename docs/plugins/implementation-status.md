@@ -4,8 +4,9 @@ What is actually built, what is prototype, and what is not there at all. Kept se
 `README.md` so the author guide can describe the feature while this file stays blunt about its
 limits.
 
-API version: **0.1.1** (content providers; additive over 0.1.0). Manifest schema: **1**. Both `plugins_enabled` and
-`network_plugins_enabled` ship **off**.
+API version: **0.1.1** (content providers; additive over 0.1.0). Manifest schema: **1**. Plugin code runs
+only for a plugin the user allowed it for (asked at install, off until then), the emergency stop
+(`plugins_emergency_stop`) ships **not engaged**, and `network_plugins_enabled` ships **off**.
 
 ## Milestones
 
@@ -91,14 +92,15 @@ an older one is refused — but that is a narrower guarantee than it sounds.
 
 **Official plugins are the one exception, and the trust root is the signed registry, not the
 plugin.** A plugin is official only while its id, version and package SHA-256 are listed in the
-`official_plugins` table of the Ed25519-signed `registry.db` and its installed files are
-unchanged since the official installer wrote them (`agora plugin official list`,
-`crates/agora-core/src/plugins/official.rs`). Nothing in the manifest can claim it. Official
-plugins load at startup without `plugins_enabled`; if one stops verifying it falls back to the
-community rules and the reason is shown. This covers game-package contributions loaded at
-startup. A script-backed (QuickJS) plugin still runs only while `plugins_enabled` is on. The
-catalog can keep a previous version per plugin, so an official update can be rolled back; community
-plugins still cannot.
+`official_plugins` table of the Ed25519-signed `registry.db` and its installed files hash to the
+tree digest that signed entry pins (`agora plugin official list`,
+`crates/agora-core/src/plugins/official.rs`). Nothing in the manifest, and nothing remembered in
+`local_state.db`, can claim it. One that stops verifying, and any plugin that uses an official
+plugin's id without being it, is blocked: it does not load, and the reason is shown. Official status
+does not change who may run code: scripts follow the same per-plugin permission and emergency stop
+as any plugin (see the README), and data-only plugins load regardless. The catalog can keep a
+previous version per plugin, so an official update can be rolled back; community plugins still
+cannot.
 
 **The update path has now run against a real host, and doing it found a bug no test could.**
 Every real call panicked — `Cannot drop a runtime in a context where blocking is not allowed` —

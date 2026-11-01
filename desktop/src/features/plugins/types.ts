@@ -38,7 +38,9 @@ export type PluginStatus =
   | { state: 'incompatibleApi'; detail: { required: string; host: string } }
   | { state: 'unresolvedDependency'; detail: { dependency: string; reason: string } }
   | { state: 'dependencyCycle'; detail: { cycle: string[] } }
-  | { state: 'failed'; detail: { message: string } };
+  | { state: 'failed'; detail: { message: string } }
+  /** An official plugin, or one using an official id, that does not verify; never runs. */
+  | { state: 'blocked'; detail: { reason: string } };
 
 export interface ReplacementOffer {
   id: string;
@@ -121,6 +123,10 @@ export interface PluginSummary {
    * core, never read from the manifest; absent on builds that predate it.
    */
   official?: OfficialStatus;
+  /** The plugin has code (scripts). A data-only plugin, such as game support, runs none. */
+  runsCode?: boolean;
+  /** The user allowed this plugin's code to run. Per plugin; the emergency stop overrides it. */
+  scriptsAllowed?: boolean;
 }
 
 /** Standing of an installed plugin as an official one. */
@@ -187,6 +193,10 @@ export interface InstallPreview {
   needsReducedSecurity?: boolean;
   fileCount: number;
   uncompressedBytes: number;
+  /** The plugin has code: the prompt asks "<name> runs code. Allow it?". */
+  runsCode?: boolean;
+  /** The plugin has code and the installed version did not. */
+  addsCode?: boolean;
 }
 
 export type UpdateVerdict =

@@ -2228,6 +2228,8 @@ class OfficialPluginTests(unittest.TestCase):
         self.assertEqual(json.loads(current["game_ids_json"]), ["fixture-game"])
         self.assertEqual(current["package_url"], "https://plugins.example.org/acme.fixture-1.1.0.zip")
         self.assertEqual(current["package_sha256"], "1" * 64)
+        self.assertEqual(current["package_tree_sha256"], "3" * 64)
+        self.assertEqual(by_version["1.0.0"]["package_tree_sha256"], "4" * 64)
         self.assertEqual(current["package_size"], 4096)
         self.assertEqual(current["min_agora_version"], "0.1.0")
 
@@ -2279,6 +2281,18 @@ class OfficialPluginTests(unittest.TestCase):
                 data["previous"]["sha256"] = bad
                 self.write(data)
                 self.assertRefused("previous.sha256")
+
+    def test_a_missing_or_malformed_tree_digest_is_refused(self):
+        for bad in ["", "abc", "3" * 63, "3" * 65, "G" * 64, "A" * 64, None, 5]:
+            with self.subTest(tree_sha256=bad):
+                data = self.entry()
+                data["current"]["tree_sha256"] = bad
+                self.write(data)
+                self.assertRefused("current.tree_sha256")
+        data = self.entry()
+        del data["previous"]["tree_sha256"]
+        self.write(data)
+        self.assertRefused("missing", "tree_sha256")
 
     def test_a_bad_size_is_refused(self):
         for bad in [0, -1, 64 * 1024 * 1024 + 1, 1.5, "10", True, None]:
@@ -2339,6 +2353,82 @@ class OfficialPluginTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps(data), encoding="utf-8")
         self.assertEqual(self.rows(self.compile()), [])
+
+
+class OfficialPluginDigestTests(unittest.TestCase):
+    """scripts/official_plugin_digest.py computes the tree digest the signed entry pins. The app
+    computes it too (official.rs), so a shared vector keeps the two in step."""
+
+    # The same two files, hashed by tree_digest and zip_tree_digest in
+    # crates/agora-core/src/plugins/official.rs (test `the_tree_digest_matches_the_python_script`).
+    GOLDEN = "edf96c2334a03f422f09963524f136c27b969682ebead88f3d40865741d830a8"
+
+    def setUp(self):
+        scripts = str(Path(__file__).resolve().parent.parent / "scripts")
+        sys.path.insert(0, scripts)
+        self.addCleanup(sys.path.remove, scripts)
+        import official_plugin_digest
+
+        self.digest = official_plugin_digest
+
+    def make_zip(self, entries):
+        import io
+        import zipfile
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def test_the_shared_vector(self):
+        files = {"agora-plugin.json": b"{}", "games/package.json": b"[]"}
+        self.assertEqual(self.digest.tree_digest(files), self.GOLDEN)
+
+    def test_a_zip_and_a_folder_of_the_same_files_agree(self):
+        data = self.make_zip([("agora-plugin.json", b"{}"), ("games/package.json", b"[]")])
+        self.assertEqual(self.digest.tree_digest(self.digest.files_of_zip(data)), self.GOLDEN)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "games").mkdir()
+            (root / "agora-plugin.json").write_bytes(b"{}")
+            (root / "games" / "package.json").write_bytes(b"[]")
+            self.assertEqual(self.digest.describe(root)["tree_sha256"], self.GOLDEN)
+
+    def test_backslash_and_dot_segments_unpack_to_the_same_path(self):
+        data = self.make_zip([("./agora-plugin.json", b"{}"), ("games\\package.json", b"[]")])
+        self.assertEqual(self.digest.tree_digest(self.digest.files_of_zip(data)), self.GOLDEN)
+
+    def test_any_change_moves_the_digest(self):
+        base = {"a.json": b"1", "d/b.json": b"2"}
+        digest = self.digest.tree_digest(base)
+        self.assertNotEqual(digest, self.digest.tree_digest({**base, "a.json": b"3"}))
+        self.assertNotEqual(digest, self.digest.tree_digest({**base, "c.json": b""}))
+        self.assertNotEqual(
+            digest, self.digest.tree_digest({"a.json": b"1", "e/b.json": b"2"})
+        )
+
+    def test_a_later_duplicate_entry_wins_as_unpacking_does(self):
+        data = self.make_zip([("a.json", b"old"), ("a.json", b"new")])
+        self.assertEqual(self.digest.files_of_zip(data), {"a.json": b"new"})
+
+    def test_hostile_entry_names_are_refused(self):
+        for bad in ["../x", "a/../../x", "/etc/passwd", "C:/x", "a/b:c", ""]:
+            with self.subTest(name=bad):
+                with self.assertRaises(SystemExit):
+                    self.digest.files_of_zip(self.make_zip([(bad, b"x")]))
+
+    def test_describe_reports_the_zip_hash_and_size(self):
+        import hashlib
+
+        data = self.make_zip([("agora-plugin.json", b"{}"), ("games/package.json", b"[]")])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "p.zip"
+            path.write_bytes(data)
+            described = self.digest.describe(path)
+        self.assertEqual(described["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(described["size"], len(data))
+        self.assertEqual(described["tree_sha256"], self.GOLDEN)
 
 
 if __name__ == "__main__":

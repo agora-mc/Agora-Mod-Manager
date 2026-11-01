@@ -4,7 +4,7 @@ use agora_core::app_paths::AppPaths;
 use agora_core::ctx::CoreContext;
 use agora_core::game_registry::{DeclarativePackage, GameRegistry, PackageSource};
 use agora_core::plugins::store::{self, PluginSource};
-use agora_core::plugins::PLUGINS_ENABLED_SETTING;
+use agora_core::plugins::PLUGINS_EMERGENCY_STOP_SETTING;
 use agora_game_api::{DeploymentStrategy, GameDefinition, GameId, PackageDefinition};
 use agora_plugin_api::capability::{Capability, CapabilitySet};
 use agora_plugin_api::manifest::PluginManifest;
@@ -84,8 +84,8 @@ fn startup_loads_enabled_granted_plugin_package() {
 
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(false),
     )
     .unwrap();
 
@@ -123,18 +123,18 @@ fn startup_loads_enabled_granted_plugin_package() {
 }
 
 #[test]
-fn startup_silently_ignores_when_plugin_system_disabled() {
+fn startup_loads_a_data_only_plugin_even_with_the_emergency_stop_engaged() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = AppPaths::from_root(tmp.path().to_path_buf());
     paths.create_required_dirs().unwrap();
     agora_core::db::init_local_state_db(&paths.local_state_db()).unwrap();
     let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
 
-    // Plugin system disabled
+    // Emergency stop engaged: no plugin script runs, but a game package is data.
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(false),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(true),
     )
     .unwrap();
 
@@ -161,7 +161,7 @@ fn startup_silently_ignores_when_plugin_system_disabled() {
 
     let (ctx, warnings) = CoreContext::initialize(paths, GameRegistry::builder()).unwrap();
     let game_id = GameId::new("tracer-game").unwrap();
-    assert!(ctx.games.game(&game_id).is_none());
+    assert!(ctx.games.game(&game_id).is_some());
     assert!(!warnings.iter().any(|w| w.contains("test.tracer")));
 }
 
@@ -175,8 +175,8 @@ fn startup_silently_ignores_disabled_plugin() {
 
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(false),
     )
     .unwrap();
 
@@ -217,8 +217,8 @@ fn startup_silently_ignores_plugin_without_granted_game_define() {
 
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(false),
     )
     .unwrap();
 
@@ -258,8 +258,8 @@ fn startup_warns_on_missing_file_and_succeeds() {
 
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(false),
     )
     .unwrap();
 
@@ -301,8 +301,8 @@ fn startup_warns_on_bad_json_and_succeeds() {
 
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(false),
     )
     .unwrap();
 
@@ -344,8 +344,8 @@ fn startup_warns_on_game_id_collision_with_compiled_and_succeeds() {
 
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(false),
     )
     .unwrap();
 
@@ -406,8 +406,8 @@ fn a_tampered_package_path_is_refused_at_load() {
     let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
     agora_core::db::set_setting(
         &conn,
-        PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::Value::Bool(false),
     )
     .unwrap();
     let plugin_dir = tmp.path().join("plugins").join("sly");

@@ -2,18 +2,22 @@
   "id": "acme.fixture",
   "name": "Acme Fixture",
   "description": "An example entry showing every field. It is not a real plugin: the URL and hashes are placeholders, and this folder is never compiled into the catalog.",
-  "game_ids": ["fixture-game"],
+  "game_ids": [
+    "fixture-game"
+  ],
   "min_agora_version": "0.1.0",
   "current": {
     "version": "1.1.0",
     "package_url": "https://plugins.example.org/acme.fixture-1.1.0.zip",
     "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "tree_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
     "size": 4096
   },
   "previous": {
     "version": "1.0.0",
     "package_url": "https://plugins.example.org/acme.fixture-1.0.0.zip",
     "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "tree_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
     "size": 4000
   }
 }

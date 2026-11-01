@@ -203,7 +203,9 @@ pub fn run() {
             }
         }))
         .invoke_handler(tauri::generate_handler![
-            plugins::plugins_enabled,
+            plugins::plugins_emergency_stop,
+            plugins::set_plugins_emergency_stop,
+            plugins::set_plugin_scripts_allowed,
             plugins::start_plugins,
             plugins::list_plugins,
             plugins::list_plugin_contributions,
