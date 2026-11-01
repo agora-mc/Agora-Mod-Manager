@@ -242,3 +242,31 @@ fn rerun_of_an_interrupted_restore_overwrites_the_sessions_instance_copy() {
         "the instance's saved Plugins.txt was replaced by the user's original on the re-run"
     );
 }
+
+#[test]
+#[ignore = "proves bug: a read-only user INI (the usual Skyrim advice) makes restore fail on every session, which then blocks every later launch"]
+fn read_only_user_file_blocks_restore_and_every_later_launch() {
+    let h = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ini = ini_real(&h);
+    put(&ini, "orig-ini\n");
+    // First launch of a new instance: there is no instance copy, so swap_in writes nothing.
+    let mut perms = std::fs::metadata(&ini).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&ini, perms).unwrap();
+    swap_in(&h.ctx, "final-c", &def, &StoreId::steam(), &h.running_from).unwrap();
+
+    // The game ends without touching the file. Restore only has to put the same bytes back.
+    let restored = restore(&h.ctx, &def, &StoreId::steam());
+    let next = swap_in(&h.ctx, "final-c", &def, &StoreId::steam(), &h.running_from);
+
+    let mut perms = std::fs::metadata(&ini).unwrap().permissions();
+    perms.set_readonly(false);
+    let _ = std::fs::set_permissions(&ini, perms);
+    assert!(
+        restored.is_ok() && next.is_ok(),
+        "restore of an unchanged read-only file failed ({:?}) and the next launch is refused ({:?})",
+        restored.err().map(|e| e.to_string()),
+        next.err().map(|e| e.to_string())
+    );
+}

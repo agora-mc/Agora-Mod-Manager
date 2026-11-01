@@ -237,3 +237,44 @@ fn interrupted_farm_removal_makes_the_next_harvest_delete_writable_files() {
         "the game's save in the writable layer was deleted because a half-removed farm looked like the game deleted it"
     );
 }
+
+#[test]
+#[ignore = "proves bug: deleting an instance leaves its deployed game folder (and any unharvested game writes) behind forever"]
+fn deleting_an_instance_removes_its_deployed_farm() {
+    let tmp = TempDir::new().unwrap();
+    let (ctx, def, inst) = setup(&tmp);
+    let item = add_content_folder(&ctx, "M", &[("a.txt", b"a")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+    deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    let farm = deployment_dir(&ctx, &inst.instance_id).unwrap().unwrap();
+    let deployment = farm.parent().unwrap().to_path_buf();
+    assert!(deployment.join("deployment.json").exists());
+
+    agora_core::game_instance::delete(&ctx, &inst.instance_id).unwrap();
+
+    assert!(
+        !deployment.exists(),
+        "the deleted instance's deployment folder is still on disk: {}",
+        deployment.display()
+    );
+}
+
+#[test]
+#[ignore = "proves bug: a deploy killed between renaming the new farm into place and writing its record leaves a farm no deploy can replace and no undeploy can clean"]
+fn farm_without_a_record_blocks_every_later_deploy() {
+    let tmp = TempDir::new().unwrap();
+    let (ctx, def, inst) = setup(&tmp);
+    let item = add_content_folder(&ctx, "M", &[("a.txt", b"a")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+    deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    // The state a crash (or a full disk) leaves between `rename(staging, game)` and the record write.
+    std::fs::remove_file(record_path(&ctx, &inst.instance_id)).unwrap();
+
+    // A re-run must finish the job or put things back.
+    let again = deploy(&ctx, &inst.instance_id, &def, DeployMode::Links);
+    assert!(
+        again.is_ok(),
+        "deploy is stuck behind the record-less farm: {:?}",
+        again.err()
+    );
+}
