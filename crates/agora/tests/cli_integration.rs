@@ -4576,12 +4576,6 @@ fn install_skyrim_development_plugin(paths: &agora_core::app_paths::AppPaths) {
     let mut granted = CapabilitySet::new();
     granted.insert(Capability::GameDefine);
     let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
-    agora_core::db::set_setting(
-        &conn,
-        agora_core::plugins::PLUGINS_ENABLED_SETTING,
-        &serde_json::Value::Bool(true),
-    )
-    .unwrap();
     store::upsert(
         &conn,
         &manifest,
