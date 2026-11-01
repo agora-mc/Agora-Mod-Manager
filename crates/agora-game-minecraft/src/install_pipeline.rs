@@ -3823,6 +3823,18 @@ fn prepare_manifest(
             object_sha256: None,
         };
         if let Some(ctx) = content_store {
+            let (provider, provider_id) = match &metadata.source_type {
+                SourceType::Curated => ("catalog", metadata.registry_id.as_deref()),
+                SourceType::Modrinth => ("modrinth", metadata.modrinth_id.as_deref()),
+                SourceType::Manual => ("manual", None),
+                SourceType::Provider => (
+                    "provider",
+                    metadata
+                        .registry_id
+                        .as_deref()
+                        .or(metadata.modrinth_id.as_deref()),
+                ),
+            };
             let details = crate::content_bridge::StoreDetails {
                 content_type: &content_type,
                 filename: &installed_filename,
@@ -3834,6 +3846,8 @@ fn prepare_manifest(
                     .registry_id
                     .as_deref()
                     .or(metadata.modrinth_id.as_deref()),
+                provider: Some(provider),
+                provider_id,
             };
             let stored = crate::content_bridge::store_file(ctx, &staged, &details)
                 .map_err(|error| format!("could not store {}: {error}", add.target_filename))?;
@@ -3964,6 +3978,12 @@ fn apply_transaction(
             if let Some(parent) = backup.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("failed to create transaction trash: {e}"))?;
+                // A link to a protected object cannot be deleted from a folder that only grants
+                // Modify. The trash is outside the folder the placement granted, so grant it here
+                // before the old file moves in; the same right is needed to rename it back.
+                crate::content_bridge::ensure_folder_can_delete_children(parent).map_err(
+                    |error| format!("could not make the transaction trash safe to clean: {error}"),
+                )?;
             }
             std::fs::rename(&live, &backup)
                 .map_err(|e| format!("failed to stage removal of {}: {e}", remove.filename))?;

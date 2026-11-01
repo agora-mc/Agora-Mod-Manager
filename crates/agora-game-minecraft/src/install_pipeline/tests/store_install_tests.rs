@@ -42,6 +42,7 @@ fn ctx_instance(tmp: &tempfile::TempDir, id: &str) -> (Ctx, std::path::PathBuf) 
 }
 
 fn read_instance_manifest(dir: &Path) -> InstanceManifest {
+    // allow-raw-instance-manifest
     serde_json::from_slice(&std::fs::read(dir.join("instance_manifest.json")).unwrap()).unwrap()
 }
 
@@ -499,6 +500,176 @@ fn a_hard_link_clone_of_a_linked_mod_stays_removable() {
 }
 
 #[test]
+fn catalog_and_modrinth_provenance_survive_an_offline_add() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, first) = ctx_instance(&tmp, "first");
+    let second = ctx.paths.instance_dir("second").unwrap();
+    std::fs::create_dir_all(second.join("mods")).unwrap();
+    let mut manifest = read_instance_manifest(&first);
+    manifest.instance_id = "second".into();
+    std::fs::write(
+        second.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let service = crate::install_service::InstallService::new(ctx.clone());
+
+    let catalog_jar = write_mod_jar(tmp.path(), "catalog-mod", "1.0.0");
+    let catalog_bytes = std::fs::read(&catalog_jar).unwrap();
+    let catalog_sha = super::sha256_hex(&catalog_bytes);
+    let catalog = service
+        .commit_verified_artifact(
+            "first",
+            "catalog.jar",
+            "mod",
+            "https://example.invalid/catalog.jar",
+            Some("catalog-mod"),
+            None,
+            "registry",
+            Some("1.0.0"),
+            None,
+            Some(&catalog_sha),
+            None,
+            None,
+            None,
+            false,
+            catalog_bytes,
+        )
+        .unwrap();
+
+    let raw_jar = write_mod_jar(tmp.path(), "modrinth-raw", "1.0.0");
+    let raw_bytes = std::fs::read(&raw_jar).unwrap();
+    let raw_sha = super::sha256_hex(&raw_bytes);
+    let raw = service
+        .commit_verified_artifact(
+            "first",
+            "raw.jar",
+            "mod",
+            "https://cdn.modrinth.com/data/modrinth-raw/versions/1/raw.jar",
+            None,
+            Some("modrinth-raw"),
+            "modrinth_raw",
+            Some("1.0.0"),
+            None,
+            Some(&raw_sha),
+            None,
+            None,
+            None,
+            false,
+            raw_bytes,
+        )
+        .unwrap();
+
+    let catalog_again = service
+        .install_stored_item("second", catalog.content_item_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(catalog_again.registry_id.as_deref(), Some("catalog-mod"));
+    assert!(catalog_again.modrinth_id.is_none());
+    assert_eq!(catalog_again.source, "registry");
+
+    let raw_again = service
+        .install_stored_item("second", raw.content_item_id.as_deref().unwrap())
+        .unwrap();
+    assert!(raw_again.registry_id.is_none());
+    assert_eq!(raw_again.modrinth_id.as_deref(), Some("modrinth-raw"));
+    assert_eq!(raw_again.source, "modrinth_raw");
+}
+
+#[cfg(windows)]
+fn restrict_folder_to_modify(dir: &Path) {
+    // `icacls /inheritance:r /grant:r <user>:(OI)(CI)M` keeps the default drive ACL (Modify),
+    // which does not include FILE_DELETE_CHILD. See the Windows icacls reference:
+    // https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/icacls
+    let user = std::env::var("USERNAME").expect("USERNAME");
+    let out = std::process::Command::new("icacls")
+        .arg(dir)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:(OI)(CI)M"))
+        .output()
+        .expect("run icacls");
+    assert!(
+        out.status.success(),
+        "icacls could not restrict {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+fn restore_inherited_acl(dir: &Path) {
+    let _ = std::process::Command::new("icacls")
+        .arg(dir)
+        .arg("/inheritance:e")
+        .status();
+    let _ = std::process::Command::new("icacls")
+        .arg(dir)
+        .arg("/reset")
+        .status();
+}
+
+#[test]
+#[cfg(windows)]
+fn an_update_can_clean_the_trash_without_delete_child() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("restricted-data");
+    std::fs::create_dir_all(&root).unwrap();
+    restrict_folder_to_modify(&root);
+    let ctx = crate::context::testing_context(root.clone());
+    crate::content_bridge::init_local_state(&ctx);
+    ctx.paths.create_required_dirs().unwrap();
+    let dir = ctx.paths.instance_dir("test").unwrap();
+    std::fs::create_dir_all(dir.join("mods")).unwrap();
+    let manifest = InstanceManifest {
+        manifest_version: CURRENT_MANIFEST_VERSION,
+        game_data: Default::default(),
+        pack_origin: None,
+        instance_id: "test".into(),
+        name: "Test".into(),
+        created_from_pack: None,
+        minecraft_version: TEST_INSTANCE_MC_VERSION.into(),
+        loader: "fabric".into(),
+        loader_version: "0.16.0".into(),
+        is_locked: false,
+        mods: vec![],
+        resourcepacks: vec![],
+        shaders: vec![],
+        datapacks: vec![],
+        worlds: vec![],
+        user_preferences: serde_json::json!({}),
+    };
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let older = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
+    let first = resolve_local_plan(&dir, &older, "sodium.jar", None);
+    assert_success(run_store_plan(&first, &dir, &ctx));
+
+    let newer = write_mod_jar(tmp.path(), "manual-item", "2.0.0");
+    let update = resolve_local_plan(&dir, &newer, "sodium.jar", None);
+    assert_success(run_store_plan(&update, &dir, &ctx));
+
+    assert_eq!(
+        std::fs::read(dir.join("mods/sodium.jar")).unwrap(),
+        std::fs::read(&newer).unwrap()
+    );
+    let staging_left: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join(".agora/staging"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        staging_left.is_empty(),
+        "the trash holding the old link was cleaned; left: {staging_left:?}"
+    );
+    restore_inherited_acl(&root);
+}
+
+#[test]
 fn adding_a_stored_item_offline_needs_no_network() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (mut ctx, dir) = ctx_instance(&tmp, "test");
@@ -513,6 +684,8 @@ fn adding_a_stored_item_offline_needs_no_network() {
             page_url: None,
             description: None,
             catalog_id: None,
+            provider: None,
+            provider_id: None,
         },
     )
     .unwrap();

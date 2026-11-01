@@ -26,6 +26,9 @@ pub struct StoreDetails<'a> {
     pub page_url: Option<&'a str>,
     pub description: Option<&'a str>,
     pub catalog_id: Option<&'a str>,
+    /// Generic provenance kind (`catalog`, `modrinth`, `manual`, `provider`).
+    pub provider: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
 }
 
 /// The store item a file was added as, and the object it was placed from.
@@ -101,6 +104,8 @@ pub fn store_file(
             version: details.version.map(str::to_string),
             game_id: Some("minecraft".to_string()),
             catalog_id: details.catalog_id.map(str::to_string),
+            provider: details.provider.map(str::to_string),
+            provider_id: details.provider_id.map(str::to_string),
             icon_sha256: None,
         },
     )
@@ -131,6 +136,21 @@ pub fn file_matches_recorded(path: &Path, recorded_sha256: &str) -> LauncherResu
         message: format!("Could not read {}: {error}", path.display()),
     })?;
     Ok(actual.eq_ignore_ascii_case(recorded_sha256))
+}
+
+/// Make sure a folder can have files deleted from it. A link to a protected object cannot be
+/// deleted from a folder that only grants Modify; the store's placement grants the missing right.
+pub fn ensure_folder_can_delete_children(folder: &Path) -> LauncherResult<()> {
+    if store::protect::grants_delete_child(folder).map_err(|error| LauncherError::Generic {
+        code: "ERR_CONTENT_STORE".into(),
+        message: error.to_string(),
+    })? {
+        return Ok(());
+    }
+    store::protect::grant_delete_child(folder).map_err(|error| LauncherError::Generic {
+        code: "ERR_CONTENT_STORE".into(),
+        message: error.to_string(),
+    })
 }
 
 /// Read a stored item by id or unique prefix.
@@ -218,6 +238,15 @@ pub fn add_item_to_instance(
         .join(helpers::content_subdir(&content_type))
         .join(&filename);
     let metadata = crate::jar_metadata::parse_jar_metadata_for_loader(&target, &manifest.loader);
+    // Restore the provenance the install recorded, so a catalog item comes back as a catalog item
+    // and a raw Modrinth item as a raw Modrinth item.
+    let (registry_id, modrinth_id, source) = match item.provider.as_deref() {
+        Some("catalog") => (item.provider_id.clone(), None, "registry"),
+        Some("modrinth") => (None, item.provider_id.clone(), "modrinth_raw"),
+        Some("provider") => (item.provider_id.clone(), None, "provider"),
+        Some("manual") => (None, None, "manual"),
+        _ => (item.catalog_id.clone(), None, "content_store"),
+    };
     let installed = InstalledMod {
         hash_verified: false,
         provider: None,
@@ -225,9 +254,9 @@ pub fn add_item_to_instance(
         pack_managed: false,
         installed_as_dependency: false,
         filename,
-        registry_id: item.catalog_id.clone(),
-        modrinth_id: None,
-        source: "content_store".to_string(),
+        registry_id,
+        modrinth_id,
+        source: source.to_string(),
         source_url: item.page_url.clone(),
         version: item.version.clone(),
         sha256: sha256.clone(),

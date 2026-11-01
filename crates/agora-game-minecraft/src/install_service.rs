@@ -577,6 +577,17 @@ impl InstallService {
         std::fs::create_dir_all(&incoming).map_err(|_| LauncherError::InstanceCreateFailed)?;
         let temp = incoming.join(format!("{}.bin", uuid::Uuid::new_v4().simple()));
         std::fs::write(&temp, &bytes).map_err(|_| LauncherError::InstanceCreateFailed)?;
+        let (provider, provider_id) = if source == "registry" || source == "curated" {
+            (Some("catalog"), registry_id)
+        } else if source == "modrinth_raw" || source == "modrinth" {
+            (Some("modrinth"), modrinth_id)
+        } else if source == "provider" {
+            (Some("provider"), registry_id.or(modrinth_id))
+        } else if source == "manual" || source == "manual_drag_drop" {
+            (Some("manual"), None)
+        } else {
+            (None, None)
+        };
         let stored = crate::content_bridge::store_file(
             &self.ctx,
             &temp,
@@ -587,6 +598,8 @@ impl InstallService {
                 page_url: Some(download_url),
                 description: None,
                 catalog_id: registry_id.or(modrinth_id),
+                provider,
+                provider_id,
             },
         );
         let _ = std::fs::remove_file(&temp);
@@ -798,6 +811,8 @@ impl InstallService {
                 page_url: None,
                 description: None,
                 catalog_id: None,
+                provider: Some("manual"),
+                provider_id: None,
             },
         )?;
         crate::content_bridge::place_file(&self.ctx, &stored.sha256, &dir, "mod", file_name)?;
