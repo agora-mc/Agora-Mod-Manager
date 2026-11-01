@@ -15,6 +15,7 @@ use agora_game_api::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::content_store::place::copy_owned;
 use crate::content_store::protect;
 use crate::ctx::Ctx;
 use crate::game_base::{get_modified_unix_ms, BaseManifest};
@@ -2213,15 +2214,6 @@ pub(crate) fn discard_deployment(
     Ok(())
 }
 
-/// Copy a file the game may then write. `fs::copy` carries the source's permissions, and on Unix
-/// a content store object is read-only; on Windows its protection is an ACL a copy does not take.
-fn copy_owned(source: &Path, dest: &Path) -> std::io::Result<u64> {
-    let bytes = std::fs::copy(source, dest)?;
-    #[cfg(unix)]
-    crate::content_store::protect::unprotect(dest)?;
-    Ok(bytes)
-}
-
 /// Copy a changed or new game file into the writable layer, and clear any deletion marker for it.
 fn copy_to_writable(
     writable_dir: &Path,
@@ -2657,33 +2649,11 @@ fn plan_in_place(
 /// reason, such as an own-copy setting since turned off, is replaced by the link a rebuild would make.
 /// Answered once per source.
 fn at_link_limit(cache: &mut HashMap<String, bool>, ctx: &Ctx, source: &FileSource) -> bool {
-    const NTFS_LINK_LIMIT: u32 = 1023;
     let path = source_path(ctx, source);
     let key = path.to_string_lossy().into_owned();
     *cache
         .entry(key)
-        .or_insert_with(|| link_count(&path).is_some_and(|n| n >= NTFS_LINK_LIMIT))
-}
-
-#[cfg(windows)]
-fn link_count(path: &Path) -> Option<u32> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    };
-    let file = std::fs::File::open(path).ok()?;
-    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is valid, and the handle is open for the call.
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
-    (ok != 0).then_some(info.nNumberOfLinks)
-}
-
-#[cfg(unix)]
-fn link_count(path: &Path) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path)
-        .ok()
-        .map(|m| u32::try_from(m.nlink()).unwrap_or(u32::MAX))
+        .or_insert_with(|| crate::content_store::place::at_link_limit(&path))
 }
 
 /// Remove one file of a farm. A file that is already gone is not an error: the record may name a
