@@ -1,10 +1,13 @@
 //! Inventory rows for installed instance content.
 
-use agora_core::helpers::{content_subdir, hash_file_sha256};
-use agora_core::models::{InstalledMod, InstanceManifest};
-use agora_core::registry::{RegistryItem, RegistryService};
-use serde::Serialize;
-use std::path::Path;
+use agora_core::{
+    content_store::place::same_file,
+    helpers::{content_subdir, hash_file_sha256},
+    models::{InstalledMod, InstanceManifest},
+    registry::{RegistryItem, RegistryService},
+};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +41,26 @@ pub enum FileState {
     /// On disk in a content folder with no manifest entry (added by hand).
     Untracked,
 }
+
+/// The size, modification time and hash a file had when it was last verified. Unchanged since
+/// then means unchanged bytes, so listing an instance does not read every jar again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CachedFileState {
+    size: u64,
+    modified_ms: i64,
+    sha256: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct FileStateCache {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    files: std::collections::BTreeMap<String, CachedFileState>,
+}
+
+const FILE_STATE_CACHE_VERSION: u32 = 1;
+const FILE_STATE_CACHE_PATH: &str = ".agora/content-state.json";
 
 /// A manifest entry enriched with local filesystem and cached registry data.
 #[derive(Debug, Clone, Serialize)]
@@ -93,11 +116,17 @@ pub struct InstalledContentMetadata {
 
 /// Build all rows for an instance. Registry failures degrade to manifest and
 /// filesystem data so a stale or missing cache never hides installed content.
+///
+/// `content_objects_dir` is the shared store's object folder. A file that is the same inode as
+/// its stored object cannot have changed (the object is protected), so it is never hashed. Other
+/// files are hashed only when their size or modification time differs from the last verified
+/// values in the instance's `.agora/content-state.json`.
 pub fn list_installed_content(
     instance_dir: &Path,
     manifest: &InstanceManifest,
     content_type: Option<&str>,
     registry: Option<&RegistryService>,
+    content_objects_dir: Option<&Path>,
 ) -> Vec<InstalledContentRow> {
     let entries = manifest
         .mods
@@ -146,6 +175,7 @@ pub fn list_installed_content(
         Vec::new()
     };
 
+    let mut inspector = FileStateInspector::new(instance_dir, content_objects_dir);
     let mut rows = entries
         .into_iter()
         .map(|entry| {
@@ -164,13 +194,21 @@ pub fn list_installed_content(
                 .as_ref()
                 .and_then(|id| authors.get(id))
                 .cloned();
-            let mut row = build_row(instance_dir, entry, registry_item, item_categories, author);
+            let mut row = build_row(
+                instance_dir,
+                entry,
+                registry_item,
+                item_categories,
+                author,
+                &mut inspector,
+            );
             if row.content_type == "datapack" {
                 row.world_sync = Some(crate::datapack_sync::world_status(manifest, entry, &worlds));
             }
             row
         })
         .collect::<Vec<_>>();
+    inspector.save();
     rows.extend(untracked_rows(instance_dir, manifest, content_type));
     rows
 }
@@ -300,10 +338,11 @@ fn build_row(
     registry_item: Option<&RegistryItem>,
     categories: Vec<String>,
     author: Option<String>,
+    inspector: &mut FileStateInspector<'_>,
 ) -> InstalledContentRow {
     let (resolved_path, size_bytes) = resolve_file(instance_dir, entry);
     let file_present = resolved_path.is_some();
-    let file_state = file_state(entry, resolved_path.as_deref());
+    let file_state = inspector.inspect(entry, resolved_path.as_deref());
     let source_label = match &entry.provider {
         Some(origin) => provider_source_label(&origin.provider_id),
         None => source_label(&entry.source),
@@ -389,29 +428,185 @@ fn resolve_file(instance_dir: &Path, entry: &InstalledMod) -> (Option<String>, O
         .unwrap_or((None, None))
 }
 
-/// Compare a present file with the hash its manifest entry recorded. A world is a folder, so it is
-/// never hashed and never reported as changed.
-fn file_state(entry: &InstalledMod, resolved_path: Option<&str>) -> FileState {
-    let Some(path) = resolved_path else {
-        return FileState::Missing;
-    };
-    if normalize_content_type(&entry.content_type) == "world" {
-        return FileState::Ok;
+/// The per-instance cache that lets an unchanged file avoid being hashed again.
+struct FileStateInspector<'a> {
+    instance_dir: &'a Path,
+    content_objects_dir: Option<&'a Path>,
+    cache_path: PathBuf,
+    cache: FileStateCache,
+    changed: bool,
+}
+
+impl<'a> FileStateInspector<'a> {
+    fn new(instance_dir: &'a Path, content_objects_dir: Option<&'a Path>) -> Self {
+        let cache_path = instance_dir.join(FILE_STATE_CACHE_PATH);
+        let (cache, changed) = load_file_state_cache(&cache_path);
+        Self {
+            instance_dir,
+            content_objects_dir,
+            cache_path,
+            cache,
+            changed,
+        }
     }
-    let expected = entry
+
+    /// Compare a present file with the hash its manifest entry recorded. A world is a folder, so
+    /// it is never hashed and never reported as changed.
+    fn inspect(&mut self, entry: &InstalledMod, resolved_path: Option<&str>) -> FileState {
+        let Some(path) = resolved_path.map(Path::new) else {
+            return FileState::Missing;
+        };
+        if normalize_content_type(&entry.content_type) == "world" {
+            return FileState::Ok;
+        }
+        let Some(expected) = recorded_hash(entry) else {
+            return FileState::Ok;
+        };
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return FileState::Missing;
+        };
+        if !metadata.is_file() {
+            return FileState::Ok;
+        }
+
+        // A file that is the stored object itself cannot have been changed in place: the object
+        // is protected. Its identity is the cheapest possible "unchanged" answer.
+        if self
+            .store_object(expected)
+            .is_some_and(|object| same_file(path, &object))
+        {
+            return FileState::Ok;
+        }
+
+        let size = metadata.len();
+        let modified = modified_ms(&metadata);
+        let key = self.cache_key(path);
+        if let Some(modified) = modified {
+            if let Some(cached) = self.cache.files.get(&key) {
+                if cached.size == size && cached.modified_ms == modified {
+                    // Unchanged since the last hash: the cached hash answers the question.
+                    return if cached.sha256.eq_ignore_ascii_case(expected) {
+                        FileState::Ok
+                    } else {
+                        FileState::Modified
+                    };
+                }
+            }
+        }
+
+        let actual = match hash_file_for_state(path) {
+            Ok(actual) => actual,
+            Err(_) => return FileState::Missing,
+        };
+        if let Some(modified) = modified {
+            let verified = CachedFileState {
+                size,
+                modified_ms: modified,
+                sha256: actual.clone(),
+            };
+            if self.cache.files.get(&key) != Some(&verified) {
+                self.cache.files.insert(key, verified);
+                self.changed = true;
+            }
+        }
+        if actual.eq_ignore_ascii_case(expected) {
+            FileState::Ok
+        } else {
+            FileState::Modified
+        }
+    }
+
+    fn store_object(&self, hash: &str) -> Option<PathBuf> {
+        let objects = self.content_objects_dir?;
+        let hash = hash.to_ascii_lowercase();
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(objects.join(&hash[..2]).join(hash))
+    }
+
+    fn cache_key(&self, path: &Path) -> String {
+        path.strip_prefix(self.instance_dir)
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn save(mut self) {
+        if !self.changed {
+            return;
+        }
+        self.cache.version = FILE_STATE_CACHE_VERSION;
+        let Ok(bytes) = serde_json::to_vec(&self.cache) else {
+            return;
+        };
+        if let Some(parent) = self.cache_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let temp = self.cache_path.with_extension(format!(
+            "json.{}.tmp",
+            CACHE_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if std::fs::write(&temp, bytes).is_ok() && std::fs::rename(&temp, &self.cache_path).is_err()
+        {
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+}
+
+static CACHE_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn recorded_hash(entry: &InstalledMod) -> Option<&str> {
+    entry
         .object_sha256
         .as_deref()
         .or(Some(entry.sha256.as_str()))
         .map(str::trim)
-        .filter(|hash| !hash.is_empty());
-    let Some(expected) = expected else {
-        return FileState::Ok;
-    };
-    match hash_file_sha256(Path::new(path)) {
-        Ok(actual) if actual.eq_ignore_ascii_case(expected) => FileState::Ok,
-        Ok(_) => FileState::Modified,
-        Err(_) => FileState::Missing,
+        .filter(|hash| !hash.is_empty())
+}
+
+/// A corrupt, old or unreadable cache is ignored and rebuilt; it is never trusted.
+fn load_file_state_cache(path: &Path) -> (FileStateCache, bool) {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<FileStateCache>(&bytes) {
+            Ok(cache) if cache.version == FILE_STATE_CACHE_VERSION => (cache, false),
+            _ => (FileStateCache::default(), true),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (FileStateCache::default(), false)
+        }
+        Err(_) => (FileStateCache::default(), true),
     }
+}
+
+fn modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
+    let modified = metadata.modified().ok()?;
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).ok(),
+        Err(error) => i64::try_from(error.duration().as_millis())
+            .ok()
+            .map(|millis| -millis),
+    }
+}
+
+fn hash_file_for_state(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    FILE_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
+    hash_file_sha256(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILE_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_hash_calls() {
+    FILE_HASH_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn hash_calls() -> usize {
+    FILE_HASH_CALLS.with(std::cell::Cell::get)
 }
 
 fn safe_filename(filename: &str) -> bool {
@@ -500,7 +695,12 @@ fn curation_status(status: &str) -> CurationStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_core::models::CURRENT_MANIFEST_VERSION;
+    use agora_core::{
+        content_store::{add_file, place_object_at, PlacementMode},
+        ctx::Ctx,
+        models::CURRENT_MANIFEST_VERSION,
+    };
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -543,6 +743,37 @@ mod tests {
         path
     }
 
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn manifest_with(entries: Vec<InstalledMod>) -> InstanceManifest {
+        InstanceManifest {
+            manifest_version: CURRENT_MANIFEST_VERSION,
+            game_data: Default::default(),
+            pack_origin: None,
+            instance_id: "test".to_string(),
+            name: "Test".to_string(),
+            created_from_pack: None,
+            minecraft_version: "1.21".to_string(),
+            loader: "fabric".to_string(),
+            loader_version: "1".to_string(),
+            is_locked: false,
+            mods: entries,
+            resourcepacks: Vec::new(),
+            shaders: Vec::new(),
+            datapacks: Vec::new(),
+            worlds: Vec::new(),
+            user_preferences: serde_json::Value::Object(Default::default()),
+        }
+    }
+
+    fn entry_with_hash(filename: &str, sha256: &str) -> InstalledMod {
+        let mut entry = manifest_entry(filename, "mod", true);
+        entry.sha256 = sha256.to_string();
+        entry
+    }
+
     #[test]
     fn resolves_enabled_and_disabled_files_and_reports_missing_rows() {
         let dir = temp_dir();
@@ -574,7 +805,7 @@ mod tests {
             worlds: Vec::new(),
             user_preferences: serde_json::Value::Object(Default::default()),
         };
-        let rows = list_installed_content(&dir, &manifest, None, None);
+        let rows = list_installed_content(&dir, &manifest, None, None, None);
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].size_bytes, Some(5));
         assert_eq!(rows[1].size_bytes, Some(2));
@@ -584,7 +815,7 @@ mod tests {
         assert_eq!(provider_source_label("acme.cf/shelf"), "acme.cf");
         assert_eq!(provider_source_label("modrinth"), "Modrinth");
         manifest.mods.clear();
-        let filtered = list_installed_content(&dir, &manifest, Some("resourcepack"), None);
+        let filtered = list_installed_content(&dir, &manifest, Some("resourcepack"), None, None);
         assert_eq!(filtered.len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
@@ -612,7 +843,7 @@ mod tests {
             user_preferences: serde_json::Value::Object(Default::default()),
         };
 
-        let rows = list_installed_content(&dir, &manifest, None, None);
+        let rows = list_installed_content(&dir, &manifest, None, None, None);
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].file_present);
         assert_eq!(rows[0].file_state, FileState::Missing);
@@ -644,14 +875,14 @@ mod tests {
             user_preferences: serde_json::Value::Object(Default::default()),
         };
 
-        let rows = list_installed_content(&dir, &manifest, Some("mod"), None);
+        let rows = list_installed_content(&dir, &manifest, Some("mod"), None, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].filename, "hand-added.jar");
         assert_eq!(rows[0].file_state, FileState::Untracked);
         assert_eq!(rows[0].source_label, "Added by hand");
         assert_eq!(rows[0].size_bytes, Some(bytes.len() as u64));
         // The content type filter still applies to anything added by hand.
-        assert!(list_installed_content(&dir, &manifest, Some("shader"), None).is_empty());
+        assert!(list_installed_content(&dir, &manifest, Some("shader"), None, None).is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -677,5 +908,133 @@ mod tests {
             enriched_display_name(&MetadataStatus::Unavailable, None),
             None
         );
+    }
+
+    #[test]
+    fn listing_a_large_unchanged_instance_hashes_nothing() {
+        let dir = temp_dir();
+        let work = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_testing(work.path().to_path_buf());
+        fs::create_dir_all(dir.join("mods")).unwrap();
+
+        let mut entries = Vec::new();
+        let mut bytes_written = Vec::new();
+        // One placed link and many ordinary copies: only the copies may ever be hashed.
+        let linked_bytes = b"a linked mod whose object cannot change".repeat(8);
+        let linked_source = work.path().join("linked-source.jar");
+        fs::write(&linked_source, &linked_bytes).unwrap();
+        let stored = add_file(
+            &ctx,
+            &linked_source,
+            Some("linked"),
+            Some("mods/linked.jar"),
+        )
+        .unwrap();
+        let linked_hash = stored.item().files[0].sha256.clone();
+        entries.push(entry_with_hash("linked.jar", &linked_hash));
+        place_object_at(
+            &ctx,
+            &linked_hash,
+            &dir.join("mods/linked.jar"),
+            PlacementMode::Link,
+        )
+        .unwrap();
+
+        for index in 0..120 {
+            let filename = format!("mod-{index}.jar");
+            let bytes = format!("the unchanged bytes of mod {index}").into_bytes();
+            fs::write(dir.join("mods").join(&filename), &bytes).unwrap();
+            entries.push(entry_with_hash(&filename, &sha256_hex(&bytes)));
+            bytes_written.push(bytes);
+        }
+        let manifest = manifest_with(entries);
+        let objects = ctx.paths.content_objects_dir();
+
+        reset_hash_calls();
+        let first = list_installed_content(&dir, &manifest, None, None, Some(&objects));
+        assert_eq!(first.len(), 121);
+        assert!(first.iter().all(|row| row.file_state == FileState::Ok));
+        assert_eq!(
+            hash_calls(),
+            120,
+            "only the ordinary copies are hashed; the link is known unchanged"
+        );
+
+        reset_hash_calls();
+        let second = list_installed_content(&dir, &manifest, None, None, Some(&objects));
+        assert_eq!(second.len(), 121);
+        assert!(second.iter().all(|row| row.file_state == FileState::Ok));
+        assert_eq!(hash_calls(), 0, "an unchanged instance re-hashes nothing");
+        assert_eq!(bytes_written.len(), 120);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_changed_file_is_hashed_and_reported() {
+        let dir = temp_dir();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+        let mut entries = Vec::new();
+        for name in ["a.jar", "b.jar", "c.jar"] {
+            let bytes = format!("the original bytes of {name}").into_bytes();
+            fs::write(dir.join("mods").join(name), &bytes).unwrap();
+            entries.push(entry_with_hash(name, &sha256_hex(&bytes)));
+        }
+        let manifest = manifest_with(entries);
+
+        reset_hash_calls();
+        let first = list_installed_content(&dir, &manifest, None, None, None);
+        assert_eq!(hash_calls(), 3, "the first listing verifies each file once");
+        assert!(first.iter().all(|row| row.file_state == FileState::Ok));
+
+        // A different size guarantees the change is seen even where the clock is coarse.
+        fs::write(
+            dir.join("mods/b.jar"),
+            b"edited by hand, and longer than before",
+        )
+        .unwrap();
+        reset_hash_calls();
+        let second = list_installed_content(&dir, &manifest, None, None, None);
+        assert_eq!(hash_calls(), 1, "only the changed file is hashed");
+        assert_eq!(second[1].filename, "b.jar");
+        assert_eq!(second[1].file_state, FileState::Modified);
+        assert_eq!(second[0].file_state, FileState::Ok);
+        assert_eq!(second[2].file_state, FileState::Ok);
+
+        reset_hash_calls();
+        let third = list_installed_content(&dir, &manifest, None, None, None);
+        assert_eq!(hash_calls(), 0, "the new state is cached after hashing");
+        assert_eq!(third[1].file_state, FileState::Modified);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_corrupt_cache_is_rebuilt() {
+        let dir = temp_dir();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+        fs::create_dir_all(dir.join(".agora")).unwrap();
+        fs::write(dir.join(".agora/content-state.json"), b"{ this is not json").unwrap();
+        let bytes = b"a mod with only one file".to_vec();
+        fs::write(dir.join("mods/only.jar"), &bytes).unwrap();
+        let manifest = manifest_with(vec![entry_with_hash("only.jar", &sha256_hex(&bytes))]);
+
+        reset_hash_calls();
+        let first = list_installed_content(&dir, &manifest, None, None, None);
+        assert_eq!(hash_calls(), 1, "a corrupt cache is ignored, not trusted");
+        assert_eq!(first[0].file_state, FileState::Ok);
+
+        let rebuilt: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(".agora/content-state.json")).unwrap())
+                .expect("the rebuilt cache is valid JSON");
+        assert_eq!(rebuilt["version"], 1);
+        assert!(rebuilt["files"]["mods/only.jar"].is_object());
+
+        reset_hash_calls();
+        let second = list_installed_content(&dir, &manifest, None, None, None);
+        assert_eq!(hash_calls(), 0, "the rebuilt cache is used");
+        assert_eq!(second[0].file_state, FileState::Ok);
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

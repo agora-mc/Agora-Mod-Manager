@@ -3049,6 +3049,7 @@ pub async fn list_instance_content(
         let instance_dir = paths::instance_dir(&app, &sanitized)
             .map_err(|_| LauncherError::InstanceCreateFailed)?;
         let ctx = crate::core_context(&app)?;
+        let content_objects = ctx.paths.content_objects_dir();
         let registry = agora_core::registry::RegistryService::new(ctx);
         Ok(
             agora_game_minecraft::installed_content::list_installed_content(
@@ -3056,6 +3057,7 @@ pub async fn list_instance_content(
                 &manifest,
                 content_type.as_deref(),
                 Some(&registry),
+                Some(&content_objects),
             ),
         )
     })
@@ -3165,6 +3167,7 @@ pub async fn enrich_instance_content(
         let instance_dir = paths::instance_dir(&inventory_app, &sanitized)
             .map_err(|_| LauncherError::InstanceCreateFailed)?;
         let ctx = crate::core_context(&inventory_app)?;
+        let content_objects = ctx.paths.content_objects_dir();
         let registry = agora_core::registry::RegistryService::new(ctx);
         Ok::<Vec<InstalledContentRow>, LauncherError>(
             agora_game_minecraft::installed_content::list_installed_content(
@@ -3172,6 +3175,7 @@ pub async fn enrich_instance_content(
                 &manifest,
                 None,
                 Some(&registry),
+                Some(&content_objects),
             ),
         )
     })
