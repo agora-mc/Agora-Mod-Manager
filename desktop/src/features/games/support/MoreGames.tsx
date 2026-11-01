@@ -14,9 +14,10 @@ import type { InstallPreview, OfficialPluginInfo } from '@/features/plugins/type
  * yet. It is the way a player notices that Agora is not Minecraft-only, and the
  * way they add the game without opening the plugin manager.
  *
- * Official plugins are exempt from the community-plugins switch in core, so
- * this card never asks whether that switch is on. The consent prompt is the
- * same one every other install path uses.
+ * An official game package is data only, so it loads without plugin code consent
+ * and regardless of the emergency stop; this card never asks about either. The
+ * consent prompt is the same one every other install path uses, and it asks the
+ * per-plugin code question only when the package actually runs code.
  */
 
 /** The copy for the card, in one place so the wording can change without touching logic. */
@@ -156,12 +157,12 @@ export function MoreGamesCard({ surface }: { surface: 'home' | 'settings' }) {
     }
   }, [installed]);
 
-  const confirmInstall = useCallback(async () => {
+  const confirmInstall = useCallback(async (allowCode: boolean) => {
     if (!consent) return;
     setError(null);
     setInstallingId(consent.info.id);
     try {
-      const result = await installOfficialPlugin(consent.info.id, true);
+      const result = await installOfficialPlugin(consent.info.id, true, allowCode);
       if (isRecord(result) && result.outcome === 'needsConsent') {
         setError('Agora asked for the same permission again, so nothing was installed.');
         return;
@@ -263,7 +264,7 @@ export function MoreGamesCard({ surface }: { surface: 'home' | 'settings' }) {
             development={false}
             busy={installingId !== null}
             onCancel={() => setConsent(null)}
-            onConfirm={() => void confirmInstall()}
+            onConfirm={(allowCode) => void confirmInstall(allowCode)}
           />
         </div>
       ) : null}

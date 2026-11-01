@@ -103,7 +103,10 @@ describe('More games card', () => {
     expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
       pluginId: 'agora.skyrim',
       acceptCapabilities: false,
+      allowScripts: false,
     });
+    // Skyrim is data only, so the prompt never asks about running code.
+    expect(screen.queryByText(/runs code/)).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'Install' }));
 
@@ -111,6 +114,7 @@ describe('More games card', () => {
     expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
       pluginId: 'agora.skyrim',
       acceptCapabilities: true,
+      allowScripts: false,
     });
     expect(screen.queryByTestId('more-games')).not.toBeNull();
   });
@@ -178,11 +182,36 @@ describe('More games card', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(MORE_GAMES_COPY.hashMismatch);
   });
 
-  it('lists and installs without asking about the community-plugins switch', async () => {
+  it('asks the per-plugin code question only for a package that runs code', async () => {
+    answer({
+      install: (args) => {
+        if (args?.acceptCapabilities === true) {
+          return { outcome: 'installed', plugin: { id: 'agora.skyrim', name: 'Skyrim Special Edition' } };
+        }
+        return { outcome: 'needsConsent', preview: { ...consentPreview, runsCode: true } };
+      },
+    });
+    render(<MoreGamesCard surface="settings" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Install Skyrim Special Edition' }));
+
+    expect(await screen.findByText('Skyrim Special Edition runs code. Allow it?')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Install and allow code' }));
+
+    expect(await screen.findByText('Restart Agora to add Skyrim Special Edition.')).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
+      pluginId: 'agora.skyrim',
+      acceptCapabilities: true,
+      allowScripts: true,
+    });
+  });
+
+  it('lists without consulting a global plugin switch', async () => {
     answer({ plugins: [info()] });
     render(<MoreGamesCard surface="settings" />);
 
     expect(await screen.findByText('Skyrim Special Edition')).toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalledWith('plugins_enabled');
+    expect(invokeMock).not.toHaveBeenCalledWith('plugins_emergency_stop');
   });
 });
