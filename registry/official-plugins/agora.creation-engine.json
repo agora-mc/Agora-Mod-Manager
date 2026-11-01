@@ -9,7 +9,8 @@
   "current": {
     "version": "0.1.0",
     "package_url": "https://github.com/agora-mc/Agora-Launcher/releases/download/official-skyrim-se-v0.1.0/skyrim-se-0.1.0.zip",
-    "sha256": "d739e215cbda128e835ce35bd7fc339db27d189b72f89f0bdd06490d3c2fa678",
-    "size": 15834
+    "sha256": "29907e3da1ef433223bc468d2f3ec096dbf98528ccbfc8e54569d0a2f478db49",
+    "tree_sha256": "449f62222306533f7b7c979997e1f32dcb344334b7b9126553b2777cb320ffe8",
+    "size": 15282
   }
 }

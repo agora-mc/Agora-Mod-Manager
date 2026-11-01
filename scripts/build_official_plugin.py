@@ -33,6 +33,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import official_plugin_digest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OFFICIAL_ROOT = REPO_ROOT / "packages" / "official"
 REGISTRY_ROOT = REPO_ROOT / "registry" / "official-plugins"
@@ -153,6 +155,17 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def tree_sha256(path: Path) -> str:
+    """The tree digest the app checks an installed folder against.
+
+    Computed from the built zip's own bytes so the entry and the release asset
+    describe exactly the same files. Shared with the app's tree digest through
+    a common test vector (compiler/test_compile.py and plugins/official.rs).
+    """
+    files = official_plugin_digest.files_of_zip(path.read_bytes())
+    return official_plugin_digest.tree_digest(files)
+
+
 def describe(folder: Path, out_dir: Path, repo: str = DEFAULT_REPO) -> dict[str, Any]:
     manifest = plugin_manifest(folder)
     version = manifest["version"]
@@ -165,6 +178,7 @@ def describe(folder: Path, out_dir: Path, repo: str = DEFAULT_REPO) -> dict[str,
         "tag": tag,
         "zip": archive,
         "sha256": sha256(archive),
+        "tree_sha256": tree_sha256(archive),
         "size": archive.stat().st_size,
         "package_url": (
             f"https://github.com/{repo}/releases/download/{tag}/{archive.name}"
@@ -189,6 +203,7 @@ def registry_entry(built: dict[str, Any], folder: Path) -> dict[str, Any]:
                 "version": built["version"],
                 "package_url": built["package_url"],
                 "sha256": built["sha256"],
+                "tree_sha256": built["tree_sha256"],
                 "size": built["size"],
             },
         }
@@ -219,7 +234,7 @@ def verify_registry(built: dict[str, Any], folder: Path) -> dict[str, Any]:
     current = existing.get("current")
     if not isinstance(current, dict):
         raise SystemExit(f"{path}: current is missing")
-    for key in ("version", "package_url", "sha256", "size"):
+    for key in ("version", "package_url", "sha256", "tree_sha256", "size"):
         if current.get(key) != entry["current"][key]:
             raise SystemExit(
                 f"{path}: current.{key} is {current.get(key)!r}, but the built zip "
@@ -251,6 +266,7 @@ def summary(built: dict[str, Any]) -> dict[str, Any]:
         "tag": built["tag"],
         "zip": str(built["zip"]),
         "sha256": built["sha256"],
+        "tree_sha256": built["tree_sha256"],
         "size": built["size"],
         "package_url": built["package_url"],
     }

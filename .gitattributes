@@ -1,2 +1,7 @@
 # `agora skill` prints this file byte for byte; keep it identical on every OS.
 crates/agora/skills/** text eol=lf
+
+# Official plugin zips are hashed byte for byte by the release workflow and the
+# signed registry. A CRLF checkout would build a different zip, so keep the
+# package files LF on every OS.
+packages/official/** text=auto eol=lf
