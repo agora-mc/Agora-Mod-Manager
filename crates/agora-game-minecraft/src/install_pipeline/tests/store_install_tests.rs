@@ -710,3 +710,259 @@ fn adding_a_stored_item_offline_needs_no_network() {
     assert_eq!(again.filename, "offline.jar");
     assert_eq!(read_instance_manifest(&dir).mods.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Review tests (branch review/store-b). Each is `#[ignore]`d because it proves a bug; run with
+//   cargo nextest run -p agora-game-minecraft --lib --run-ignored only -E 'test(review_)'
+// ---------------------------------------------------------------------------
+
+fn review_store_item(
+    ctx: &Ctx,
+    source: &Path,
+    rel: &str,
+    game_id: Option<&str>,
+) -> agora_core::content_store::ContentItem {
+    use agora_core::content_store as store;
+    let outcome = store::add_file(ctx, source, Some("review"), Some(rel)).unwrap();
+    let item = outcome.item().clone();
+    store::set_item_metadata(
+        ctx,
+        &item.item_id,
+        store::ItemMetadata {
+            description: None,
+            page_url: None,
+            version: Some("1.0.0".into()),
+            game_id: game_id.map(str::to_string),
+            catalog_id: None,
+            icon_sha256: None,
+        },
+    )
+    .unwrap()
+}
+
+#[cfg(windows)]
+fn review_set_readonly(path: &Path, readonly: bool) {
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(readonly);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[test]
+#[ignore = "proves bug: the offline add ignores the item's game_id and adds a Skyrim item to a Minecraft instance"]
+fn review_offline_add_refuses_an_item_of_another_game() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "other", "1.0.0");
+    let item = review_store_item(&ctx, &source, "mods/other.jar", Some("skyrim"));
+
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let result = service.install_stored_item("test", &item.item_id);
+
+    assert!(
+        result.is_err(),
+        "an item stored for another game must be refused, not added"
+    );
+    assert!(!dir.join("mods/other.jar").exists());
+    assert!(read_instance_manifest(&dir).mods.is_empty());
+}
+
+#[test]
+#[ignore = "proves bug: adding an item that is already in the manifest returns the entry without checking its file exists"]
+fn review_offline_add_restores_a_file_deleted_by_hand() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "offline", "1.0.0");
+    let item = review_store_item(&ctx, &source, "mods/offline.jar", Some("minecraft"));
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    service.install_stored_item("test", &item.item_id).unwrap();
+    std::fs::remove_file(dir.join("mods/offline.jar")).unwrap();
+
+    service.install_stored_item("test", &item.item_id).unwrap();
+
+    assert!(
+        dir.join("mods/offline.jar").is_file(),
+        "the add reported success but the mod is not in the instance"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "proves bug: the offline add places the file before the manifest write, so a failed write leaves an unrecorded file"]
+fn review_offline_add_failing_manifest_write_leaves_no_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "offline", "1.0.0");
+    let item = review_store_item(&ctx, &source, "mods/offline.jar", Some("minecraft"));
+    let manifest_path = dir.join("instance_manifest.json");
+    review_set_readonly(&manifest_path, true);
+
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let result = service.install_stored_item("test", &item.item_id);
+    review_set_readonly(&manifest_path, false);
+
+    assert!(result.is_err(), "the manifest write was made to fail");
+    assert!(
+        !dir.join("mods/offline.jar").exists(),
+        "a failed add left a placed file with no manifest entry"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "proves bug: a manual reinstall removes the old file before the manifest write, so a failed write leaves new bytes under the old record"]
+fn review_failed_manual_reinstall_keeps_the_old_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let v1 = tmp.path().join("v1");
+    let v2 = tmp.path().join("v2");
+    std::fs::create_dir_all(&v1).unwrap();
+    std::fs::create_dir_all(&v2).unwrap();
+    std::fs::copy(
+        write_mod_jar(tmp.path(), "same", "1.0.0"),
+        v1.join("same.jar"),
+    )
+    .unwrap();
+    std::fs::copy(
+        write_mod_jar(tmp.path(), "same", "2.0.0"),
+        v2.join("same.jar"),
+    )
+    .unwrap();
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    service
+        .add_manual_artifact("test", v1.join("same.jar").to_str().unwrap())
+        .unwrap();
+    let old_bytes = std::fs::read(dir.join("mods/same.jar")).unwrap();
+    let manifest_path = dir.join("instance_manifest.json");
+    let manifest_before = std::fs::read(&manifest_path).unwrap();
+    review_set_readonly(&manifest_path, true);
+
+    let result = service.add_manual_artifact("test", v2.join("same.jar").to_str().unwrap());
+    review_set_readonly(&manifest_path, false);
+
+    assert!(result.is_err(), "the manifest write was made to fail");
+    assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(
+        std::fs::read(dir.join("mods/same.jar")).unwrap(),
+        old_bytes,
+        "the instance file no longer matches its manifest entry after a failed install"
+    );
+}
+
+#[test]
+#[ignore = "proves bug: a manual reinstall of a matching file appends a second manifest entry for the same filename"]
+fn review_manual_reinstall_leaves_one_manifest_entry() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "same", "1.0.0");
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    service
+        .add_manual_artifact("test", source.to_str().unwrap())
+        .unwrap();
+    service
+        .add_manual_artifact("test", source.to_str().unwrap())
+        .unwrap();
+
+    assert_eq!(
+        read_instance_manifest(&dir).mods.len(),
+        1,
+        "one file, one manifest entry"
+    );
+}
+
+#[test]
+#[ignore = "proves bug: remove_artifact falls back to deleting any same-named file in another content folder when the recorded file is gone"]
+fn review_remove_never_deletes_a_same_named_file_in_another_folder() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "pack", "1.0.0");
+    let bytes = std::fs::read(&source).unwrap();
+    let sha = super::sha256_hex(&bytes);
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    service
+        .commit_verified_artifact(
+            "test",
+            "Pack.zip",
+            "shader",
+            "https://example.invalid/Pack.zip",
+            None,
+            None,
+            "registry",
+            Some("1.0.0"),
+            None,
+            Some(&sha),
+            None,
+            None,
+            None,
+            false,
+            bytes,
+        )
+        .unwrap();
+    // The user deletes the shader by hand and keeps their own resource pack of the same name.
+    std::fs::remove_file(dir.join("shaderpacks/Pack.zip")).unwrap();
+    std::fs::create_dir_all(dir.join("resourcepacks")).unwrap();
+    std::fs::write(dir.join("resourcepacks/Pack.zip"), b"the users own pack").unwrap();
+
+    let _ = service.remove_artifact("test", "Pack.zip");
+
+    assert_eq!(
+        std::fs::read(dir.join("resourcepacks/Pack.zip"))
+            .ok()
+            .as_deref(),
+        Some(&b"the users own pack"[..]),
+        "a file Agora did not place was deleted"
+    );
+}
+
+#[test]
+#[ignore = "proves bug: remove_artifact deletes a file with no manifest entry (Agora never placed it)"]
+fn review_remove_never_deletes_an_untracked_file() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    std::fs::write(dir.join("mods/mine.jar"), b"the users own mod").unwrap();
+
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let _ = service.remove_artifact("test", "mine.jar");
+
+    assert_eq!(
+        std::fs::read(dir.join("mods/mine.jar")).ok().as_deref(),
+        Some(&b"the users own mod"[..]),
+        "a file Agora did not place was deleted"
+    );
+}
+
+#[test]
+#[ignore = "proves bug: an update only checks the bytes of entries that carry object_sha256, so a user-replaced file of any other entry is deleted"]
+fn review_update_keeps_a_user_replaced_file_of_an_entry_without_object_hash() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let older = write_mod_jar(tmp.path(), "manual-item", "1.0.0");
+    let first = resolve_local_plan(&dir, &older, "sodium.jar", None);
+    assert_success(run_store_plan(&first, &dir, &ctx));
+    // An entry written by an install path that does not record the store object (pack import).
+    let mut manifest = read_instance_manifest(&dir);
+    manifest.mods[0].content_item_id = None;
+    manifest.mods[0].object_sha256 = None;
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(dir.join("mods/sodium.jar")).unwrap();
+    std::fs::write(dir.join("mods/sodium.jar"), b"the users new bytes").unwrap();
+
+    let newer = write_mod_jar(tmp.path(), "manual-item", "2.0.0");
+    let update = resolve_local_plan(&dir, &newer, "sodium.jar", None);
+    assert_success(run_store_plan(&update, &dir, &ctx));
+
+    let aside = dir
+        .join(".agora")
+        .join("moved-aside")
+        .join("mods")
+        .join("sodium.jar");
+    assert_eq!(
+        std::fs::read(&aside).ok().as_deref(),
+        Some(&b"the users new bytes"[..]),
+        "the user's file was deleted instead of kept"
+    );
+}
