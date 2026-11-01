@@ -45,6 +45,12 @@ pub enum GameRegistryError {
     NoGamesDefined { package_id: String },
     #[error("game id {game_id} is already registered")]
     GameAlreadyRegistered { game_id: GameId },
+    #[error("game id {game_id} is held by an installed official plugin that is blocked")]
+    GameReservedByBlockedPlugin { game_id: GameId },
+    #[error(
+        "store product ({store}, {product}) is held by an installed official plugin that is blocked"
+    )]
+    StoreProductReservedByBlockedPlugin { store: StoreId, product: String },
     #[error("store product ({store}, {product}) is already claimed by game {claimed_by}")]
     StoreProductAlreadyClaimed {
         store: StoreId,
@@ -83,10 +89,30 @@ pub struct GameRegistryBuilder {
     packages: Vec<(PackageSource, Arc<dyn GamePackage>)>,
     games: BTreeMap<GameId, (usize, GameDefinition)>,
     store_products: HashMap<(StoreId, String), GameId>,
+    /// Game ids and store products an installed-but-blocked official plugin
+    /// still holds. They are not loaded, but nobody else may claim them: the
+    /// id belongs to that install until it is removed.
+    reserved_games: BTreeSet<GameId>,
+    reserved_store_products: BTreeSet<(StoreId, String)>,
     services: Vec<Arc<dyn CompiledServices>>,
 }
 
 impl GameRegistryBuilder {
+    /// Keep a blocked official plugin's game ids out of other packages' reach.
+    ///
+    /// The package is not registered (its files did not verify), but the ids it
+    /// declares stay reserved while the plugin is installed, so a community
+    /// package cannot take over a game by shadowing a blocked official one.
+    pub fn reserve_blocked(&mut self, package: &agora_game_api::PackageDefinition) {
+        for game in &package.games {
+            self.reserved_games.insert(game.id.clone());
+            for store in &game.stores {
+                self.reserved_store_products
+                    .insert((store.store.clone(), store.product.clone()));
+            }
+        }
+    }
+
     /// Register a compiled package together with the services it still
     /// provides through core's own types. Validated exactly like [`Self::add`];
     /// a refused package attaches no services.
@@ -129,9 +155,14 @@ impl GameRegistryBuilder {
             });
         }
 
-        // 3. Game IDs check (against existing and intra-package)
+        // 3. Game IDs check (against reserved, existing and intra-package)
         let mut new_game_ids = BTreeSet::new();
         for game in &def.games {
+            if self.reserved_games.contains(&game.id) {
+                return Err(GameRegistryError::GameReservedByBlockedPlugin {
+                    game_id: game.id.clone(),
+                });
+            }
             if self.games.contains_key(&game.id) || !new_game_ids.insert(game.id.clone()) {
                 return Err(GameRegistryError::GameAlreadyRegistered {
                     game_id: game.id.clone(),
@@ -144,6 +175,12 @@ impl GameRegistryBuilder {
         for game in &def.games {
             for store_id in &game.stores {
                 let key = (store_id.store.clone(), store_id.product.clone());
+                if self.reserved_store_products.contains(&key) {
+                    return Err(GameRegistryError::StoreProductReservedByBlockedPlugin {
+                        store: store_id.store.clone(),
+                        product: store_id.product.clone(),
+                    });
+                }
                 if let Some(claimed_by) = self.store_products.get(&key) {
                     return Err(GameRegistryError::StoreProductAlreadyClaimed {
                         store: store_id.store.clone(),

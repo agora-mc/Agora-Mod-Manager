@@ -476,16 +476,10 @@ impl PluginService {
     /// Engage or release the emergency stop. Engaging also stops every plugin
     /// that is running now, rather than waiting for a restart.
     pub fn set_emergency_stop(&self, engaged: bool) -> LauncherResult<()> {
-        let conn = self.inner.conn()?;
-        crate::db::set_setting(
-            &conn,
-            PLUGINS_EMERGENCY_STOP_SETTING,
-            &serde_json::Value::Bool(engaged),
-        )
-        .map_err(|e| LauncherError::Generic {
-            code: "ERR_LOCAL_STATE_FAILED".into(),
-            message: e.to_string(),
-        })?;
+        // Stop what is running first. The stop exists for the moment something
+        // is wrong, and it must not wait on the database write: if saving the
+        // setting fails, the scripts still stop and the caller is told the
+        // setting did not persist.
         if engaged {
             let ids: Vec<PluginId> = self
                 .inner
@@ -504,6 +498,16 @@ impl PluginService {
                 let _ = self.deactivate(&id);
             }
         }
+        let conn = self.inner.conn()?;
+        crate::db::set_setting(
+            &conn,
+            PLUGINS_EMERGENCY_STOP_SETTING,
+            &serde_json::Value::Bool(engaged),
+        )
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: e.to_string(),
+        })?;
         Ok(())
     }
 
@@ -552,7 +556,14 @@ impl PluginService {
                 message: format!("`{plugin_id}` has no code to allow or stop"),
             });
         }
-        store::set_script_consent(&conn, plugin_id, allowed, &now(&self.inner.ctx))?;
+        let code_digest = install::script_digest(&record.manifest, &record.install_dir)?;
+        store::set_script_consent(
+            &conn,
+            plugin_id,
+            allowed,
+            code_digest.as_deref(),
+            &now(&self.inner.ctx),
+        )?;
         drop(conn);
         if !allowed {
             self.inner.host.cancel(plugin_id);
@@ -964,6 +975,11 @@ impl PluginService {
                 data_version: record.data_version,
                 hosts: record.manifest.network.hosts.clone(),
                 granted: record.granted,
+                trusted_keys: store::get_trust(&conn, plugin_id)
+                    .ok()
+                    .flatten()
+                    .map(|trust| trust.keys)
+                    .unwrap_or_default(),
             }),
             _ => None,
         }
@@ -1011,7 +1027,20 @@ impl PluginService {
         let conn = self.inner.conn()?;
         let previous = store::get(&conn, &manifest.id)?;
         let live = self.existing_install(Some(&manifest.id));
-        self.guard_consent(&manifest, live.as_ref(), accept_capabilities)?;
+        // The keys pinned at install. A package naming different keys is a
+        // different publisher, and the user has to be told before it replaces
+        // the one they trusted.
+        let previous_trust = store::get_trust(&conn, &manifest.id)?;
+        let publisher_changed = install::publisher_changed(
+            previous_trust.as_ref().map(|trust| trust.keys.as_slice()),
+            contents.update_source.as_ref(),
+        );
+        self.guard_consent(
+            &manifest,
+            live.as_ref(),
+            accept_capabilities,
+            publisher_changed,
+        )?;
 
         // Resolved before anything moves. `grant_for` rejects a manifest that
         // requires a capability this build cannot provide, and discovering
@@ -1047,6 +1076,21 @@ impl PluginService {
             }
             return Err(error);
         }
+
+        // Read from the files that were just written, before the record says
+        // the install happened, so a failure here still rolls back cleanly.
+        let new_code_digest = match install::script_digest(&manifest, &destination) {
+            Ok(digest) => digest,
+            Err(error) => {
+                if had_files {
+                    let _ = std::fs::remove_dir_all(&destination);
+                    install::restore_rollback(&rollback, &destination)?;
+                } else {
+                    let _ = std::fs::remove_dir_all(&destination);
+                }
+                return Err(error);
+            }
+        };
 
         // Updating something the user had switched off must not switch it back
         // on. Only a first install defaults to enabled; a replacement inherits
@@ -1089,13 +1133,36 @@ impl PluginService {
             None => store::clear_trust(&conn, &manifest.id)?,
         }
 
-        // Whether its code may run is asked once, with the install, and kept in
-        // local state (not the manifest). A replacement keeps the answer already
-        // given; a version that newly has code, or a plugin never answered for,
-        // is denied until the user allows it.
+        // Whether its code may run is tied to the code it was given for. A
+        // replacement with the same entrypoint keeps the answer already given;
+        // a version that newly has code, changed code, or a plugin never
+        // answered for, is denied until the user allows it. A version with no
+        // code clears the answer, so code that comes back later asks again.
         let first_install = previous.as_ref().is_none_or(store::is_tombstone);
-        if !manifest.is_declarative_only() && first_install {
-            store::set_script_consent(&conn, &manifest.id, consent.scripts, &now(&self.inner.ctx))?;
+        if manifest.is_declarative_only() {
+            store::clear_script_consent(&conn, &manifest.id)?;
+        } else {
+            let previous_runs_code = previous
+                .as_ref()
+                .filter(|record| !store::is_tombstone(record))
+                .is_some_and(|record| !record.manifest.is_declarative_only());
+            let previous_digest = if first_install {
+                None
+            } else {
+                store::script_consent_code_hash(&conn, &manifest.id)?
+            };
+            let code_is_new = first_install
+                || !previous_runs_code
+                || previous_digest != new_code_digest;
+            if code_is_new || publisher_changed {
+                store::set_script_consent(
+                    &conn,
+                    &manifest.id,
+                    consent.scripts,
+                    new_code_digest.as_deref(),
+                    &now(&self.inner.ctx),
+                )?;
+            }
         }
 
         self.reload()?;
@@ -1481,7 +1548,7 @@ impl PluginService {
 
         let conn = self.inner.conn()?;
         let live = self.existing_install(Some(&manifest.id));
-        self.guard_consent(&manifest, live.as_ref(), accept_capabilities)?;
+        self.guard_consent(&manifest, live.as_ref(), accept_capabilities, false)?;
 
         if let Some(existing) = store::get(&conn, &manifest.id)? {
             if !store::is_tombstone(&existing) && !existing.source.is_development() {
@@ -1499,6 +1566,7 @@ impl PluginService {
         let _ = self.deactivate(&manifest.id);
         let granted = install::grant_for(&manifest)?;
         let first_install = live.is_none();
+        let code_digest = install::script_digest(&manifest, folder)?;
         store::upsert(
             &conn,
             &manifest,
@@ -1510,8 +1578,26 @@ impl PluginService {
             true,
             &now(&self.inner.ctx),
         )?;
-        if !manifest.is_declarative_only() && first_install {
-            store::set_script_consent(&conn, &manifest.id, consent.scripts, &now(&self.inner.ctx))?;
+        if manifest.is_declarative_only() {
+            store::clear_script_consent(&conn, &manifest.id)?;
+        } else {
+            let previous_runs_code = live.as_ref().is_some_and(|record| record.runs_code);
+            let previous_digest = if first_install {
+                None
+            } else {
+                store::script_consent_code_hash(&conn, &manifest.id)?
+            };
+            let code_is_new =
+                first_install || !previous_runs_code || previous_digest != code_digest;
+            if code_is_new {
+                store::set_script_consent(
+                    &conn,
+                    &manifest.id,
+                    consent.scripts,
+                    code_digest.as_deref(),
+                    &now(&self.inner.ctx),
+                )?;
+            }
         }
         self.reload()?;
         self.summary(&manifest.id)
@@ -1528,6 +1614,7 @@ impl PluginService {
         manifest: &agora_plugin_api::PluginManifest,
         previous: Option<&ExistingRecord>,
         accepted: bool,
+        publisher_changed: bool,
     ) -> LauncherResult<()> {
         // Reaching any host, or a list too long to review, is allowed — but
         // only once the user has chosen reduced security mode. Checked before
@@ -1547,6 +1634,19 @@ impl PluginService {
                     } else {
                         format!("{} websites", manifest.network.hosts.len())
                     }
+                ),
+            });
+        }
+        // A differently signed update is a new decision even when it asks for
+        // nothing new. Refused until the user says yes to the preview that
+        // names the publisher change.
+        if publisher_changed && !accepted {
+            return Err(LauncherError::Generic {
+                code: "ERR_PLUGIN_PUBLISHER_CHANGED".into(),
+                message: format!(
+                    "`{}` is now signed by a different publisher. It was not installed; \
+                     check where this update came from before allowing it.",
+                    manifest.id
                 ),
             });
         }
@@ -2451,6 +2551,7 @@ struct ExistingRecord {
     data_version: u32,
     hosts: Vec<String>,
     granted: CapabilitySet,
+    trusted_keys: Vec<agora_plugin_api::distribution::PublicKey>,
 }
 
 impl ExistingRecord {
@@ -2461,6 +2562,7 @@ impl ExistingRecord {
             granted: &self.granted,
             hosts: &self.hosts,
             runs_code: self.runs_code,
+            trusted_keys: Some(&self.trusted_keys),
         }
     }
 }

@@ -1142,6 +1142,25 @@ impl PluginService {
                 ),
             ));
         }
+        // Official plugins are data-only: they ship a game definition, not a
+        // script. A package with an entrypoint is Agora's own release mistake,
+        // not something a user could meaningfully consent to, so it is refused.
+        if preview.runs_code {
+            return Err(refused(
+                "ERR_OFFICIAL_PLUGIN_HAS_CODE",
+                format!(
+                    "The official package for `{}` {} contains code (`{}`). Official plugins \
+                     are data-only, so nothing was installed.",
+                    entry.plugin_id,
+                    entry.version,
+                    preview
+                        .manifest
+                        .entrypoint
+                        .as_deref()
+                        .unwrap_or("an entrypoint")
+                ),
+            ));
+        }
         if preview.requires_capability_consent() && !consent.capabilities {
             return Ok(UpdateOutcome::NeedsConsent {
                 preview: Box::new(preview),

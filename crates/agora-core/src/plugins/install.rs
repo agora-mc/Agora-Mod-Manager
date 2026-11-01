@@ -13,11 +13,12 @@
 //! install record all complete before anything is activated, so a plugin that
 //! crashes on activation is still a plugin the user can see and remove.
 
+use super::store;
 use super::store::PluginSource;
 use crate::error::{LauncherError, LauncherResult};
 use agora_plugin_api::capability::{CapabilityRequest, CapabilitySet};
-use agora_plugin_api::distribution::{UpdateSource, UPDATE_SOURCE_FILENAME};
-use agora_plugin_api::manifest::{PluginManifest, MANIFEST_FILENAME};
+use agora_plugin_api::distribution::{PublicKey, UpdateSource, UPDATE_SOURCE_FILENAME};
+use agora_plugin_api::manifest::{PluginId, PluginManifest, MANIFEST_FILENAME};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -139,6 +140,9 @@ pub struct ExistingInstall<'a> {
     pub hosts: &'a [String],
     /// The installed version has code.
     pub runs_code: bool,
+    /// The publisher keys pinned when this plugin was installed, if it had an
+    /// update source. A package naming different keys is a publisher change.
+    pub trusted_keys: Option<&'a [PublicKey]>,
 }
 
 /// What the user is agreeing to when they install something.
@@ -177,6 +181,10 @@ pub struct InstallPreview {
     /// is being agreed to, and because it is the only moment at which the key
     /// can be compared against something the author published elsewhere.
     pub update_source: Option<UpdateSourceSummary>,
+    /// This update is signed by a different publisher key than the install
+    /// pinned. The user has to confirm it explicitly, and script consent is
+    /// asked again because it was given for the old publisher's code.
+    pub publisher_changed: bool,
     /// True when the upgrade changes the plugin's stored data shape.
     pub migrates_data: bool,
     /// It asks to reach any host, or more hosts than can reasonably be
@@ -198,7 +206,9 @@ impl InstallPreview {
     /// Kept on the core-owned preview so adapters do not duplicate the
     /// consent rule while deciding whether to show their own prompt.
     pub fn requires_capability_consent(&self) -> bool {
-        !self.added_capabilities.is_empty() || !self.added_hosts.is_empty()
+        !self.added_capabilities.is_empty()
+            || !self.added_hosts.is_empty()
+            || self.publisher_changed
     }
 }
 
@@ -319,6 +329,9 @@ pub struct PackageContents {
     /// nothing to declare, and requiring a distribution block would make the
     /// simplest case carry the most complicated file.
     pub update_source: Option<UpdateSource>,
+    /// Digest of the manifest's entrypoint, so a preview can tell whether this
+    /// is code the user already answered for.
+    pub code_digest: Option<String>,
     pub file_count: usize,
     pub uncompressed_bytes: u64,
 }
@@ -500,6 +513,10 @@ fn build_preview(
         replaces_version: existing.map(|current| current.version.to_string()),
         added_capabilities: added_capabilities(existing.map(|current| current.granted), &manifest),
         added_hosts: added_hosts(existing.map(|current| current.hosts), &manifest),
+        publisher_changed: publisher_changed(
+            existing.and_then(|current| current.trusted_keys),
+            update_source.as_ref(),
+        ),
         update_source: update_source.as_ref().map(UpdateSourceSummary::of),
         // Only a *change* is a migration. A first install has nothing to
         // migrate, and a reinstall of the same data version does not either.
@@ -671,11 +688,132 @@ pub fn restore_rollback(rollback_dir: &Path, install_dir: &Path) -> LauncherResu
         .map_err(|e| io_error(format!("could not restore the previous version: {e}")))
 }
 
+/// Finish or undo an install that a crash interrupted.
+///
+/// An install moves the previous version into the rollback folder, unpacks the
+/// new one, then writes the record. If the process stops in between, the old
+/// files are stranded in the rollback folder and the record still points at a
+/// directory that may be missing, so the plugin (and its game) disappears.
+///
+/// Runs before the records are read. For each stashed folder: if the record
+/// already names the version that is on disk, the install finished and the
+/// stashed copy is stale; otherwise the previous version is put back. Both
+/// outcomes remove the rollback folder, so running it again does nothing.
+pub fn recover_interrupted_installs(
+    conn: &rusqlite::Connection,
+    paths: &crate::app_paths::AppPaths,
+) -> LauncherResult<Vec<String>> {
+    let mut warnings = Vec::new();
+    let rollback_root = paths.plugin_rollback_root();
+    let read = match std::fs::read_dir(&rollback_root) {
+        Ok(read) => read,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(warnings),
+        Err(error) => {
+            return Err(io_error(format!(
+                "could not read {}: {error}",
+                rollback_root.display()
+            )))
+        }
+    };
+    for item in read {
+        let item = item.map_err(|e| {
+            io_error(format!(
+                "could not read {}: {e}",
+                rollback_root.display()
+            ))
+        })?;
+        if !item.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = item.file_name();
+        let Some(id) = name.to_str().and_then(|name| PluginId::parse(name).ok()) else {
+            continue;
+        };
+        let rollback = rollback_root.join(id.as_str());
+        let destination = paths.plugin_packages_root().join(id.as_str());
+        let record = store::get(conn, &id)?;
+        let finished = record.as_ref().is_some_and(|record| {
+            !store::is_tombstone(record)
+                && installed_version(&destination)
+                    .is_some_and(|version| version == record.manifest.version.to_string())
+        });
+        if finished {
+            // The new version was recorded; the stashed copy did not need to
+            // come back.
+            std::fs::remove_dir_all(&rollback).map_err(|e| {
+                io_error(format!("could not clear {}: {e}", rollback.display()))
+            })?;
+            continue;
+        }
+        let restoring = installed_version(&rollback);
+        restore_rollback(&rollback, &destination)?;
+        warnings.push(format!(
+            "Recovered plugin {} from an interrupted install; the previous version{} is back.",
+            id,
+            restoring
+                .map(|version| format!(" ({version})"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(warnings)
+}
+
+/// The version a folder's manifest names, if it has a readable one.
+fn installed_version(folder: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(folder.join(MANIFEST_FILENAME)).ok()?;
+    PluginManifest::parse(&text)
+        .ok()
+        .map(|manifest| manifest.version.to_string())
+}
+
 /// The directory a package version is installed into.
 pub fn package_dir(packages_root: &Path, plugin_id: &agora_plugin_api::PluginId) -> PathBuf {
     // `PluginId` is already constrained to lowercase ASCII, digits, hyphens
     // and one dot, so it is a safe single path component by construction.
     packages_root.join(plugin_id.as_str())
+}
+
+/// Whether an update changes the publisher key it is signed by.
+///
+/// The keys are pinned when the plugin is first installed. If a later package
+/// under the same id names different keys, the person has to be told: the new
+/// key has not been vouched for by anyone they trusted.
+pub fn publisher_changed(
+    previous: Option<&[agora_plugin_api::distribution::PublicKey]>,
+    source: Option<&UpdateSource>,
+) -> bool {
+    use std::collections::BTreeSet;
+    let (Some(previous), Some(source)) = (previous, source) else {
+        return false;
+    };
+    let keys = |keys: &[agora_plugin_api::distribution::PublicKey]| -> BTreeSet<(String, String)> {
+        keys.iter()
+            .map(|key| (key.id.clone(), key.fingerprint()))
+            .collect()
+    };
+    let previous = keys(previous);
+    let next = keys(&source.keys);
+    !previous.is_empty() && !next.is_empty() && previous != next
+}
+
+/// A digest of the code the manifest names, for tying script consent to it.
+///
+/// The entrypoint is the file Agora starts, so it identifies the code the user
+/// allowed. A version that brings a different entrypoint file is new code and
+/// must be asked about again.
+pub fn script_digest(manifest: &PluginManifest, plugin_dir: &Path) -> LauncherResult<Option<String>> {
+    let Some(entrypoint) = &manifest.entrypoint else {
+        return Ok(None);
+    };
+    let path = plugin_dir.join(entrypoint);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        io_error(format!(
+            "could not read the plugin entrypoint {}: {e}",
+            path.display()
+        ))
+    })?;
+    use sha2::{Digest, Sha256};
+    Ok(Some(hex::encode(Sha256::digest(&bytes))))
 }
 
 /// Resolve which capabilities a fresh install should be granted.
@@ -983,6 +1121,7 @@ mod tests {
                 granted: &granted,
                 hosts: &[],
                 runs_code: false,
+                trusted_keys: None,
             }),
             2,
             100,
@@ -1008,6 +1147,7 @@ mod tests {
             granted: &granted,
             hosts: &[],
             runs_code: false,
+            trusted_keys: None,
         };
 
         let same: PluginManifest = serde_json::from_value(serde_json::json!({

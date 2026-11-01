@@ -21,6 +21,7 @@ use agora_core::plugins::{
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, PackageDefinition, StoreId, StoreIdentifier,
 };
+use agora_plugin_api::distribution::{PublicKey, UPDATE_SOURCE_FILENAME};
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_host::QuickJsHost;
 use ed25519_dalek::{Signer, SigningKey};
@@ -1470,6 +1471,53 @@ fn script_zip(id: &str, version: &str) -> Vec<u8> {
     buffer.into_inner()
 }
 
+/// A publisher key made from raw bytes, for update-source fixtures.
+fn publisher_key(seed: u8) -> PublicKey {
+    use base64::Engine as _;
+    PublicKey {
+        id: format!("key-{seed}"),
+        algorithm: "ed25519".into(),
+        public_key: base64::engine::general_purpose::STANDARD.encode([seed; 32]),
+    }
+}
+
+/// The script package above, plus an update source signed by `key`.
+fn script_zip_with_source(id: &str, version: &str, key: &PublicKey) -> Vec<u8> {
+    use std::io::Write;
+    let manifest = format!(
+        r#"{{
+        "manifest": 1,
+        "id": "{id}",
+        "name": "Scripted",
+        "version": "{version}",
+        "license": "GPL-3.0-only",
+        "apiRange": ">=0.1, <0.2",
+        "entrypoint": "main.js",
+        "activation": ["onStartup"],
+        "capabilities": {{ "required": ["instance:read"] }}
+    }}"#
+    );
+    let source = serde_json::json!({
+        "schema": 1,
+        "url": "https://plugins.example.org/updates.json",
+        "keys": [key],
+    });
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("agora-plugin.json", options).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.start_file("main.js", options).unwrap();
+        zip.write_all(b"export function noop() { return 1; }\n")
+            .unwrap();
+        zip.start_file(UPDATE_SOURCE_FILENAME, options).unwrap();
+        zip.write_all(source.to_string().as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    buffer.into_inner()
+}
+
 const COMMUNITY_SCRIPT: &str = "acme.community";
 
 impl World {
@@ -1494,10 +1542,11 @@ impl World {
 
 const SCRIPTED_B: &str = "acme.second";
 
-/// An official script plugin and two community ones, all installed with their code allowed.
+/// A data-only official plugin (official packages ship no code) and two
+/// community script plugins, all installed with their code allowed.
 async fn world_with_script_plugins() -> World {
     let world = World::new();
-    let official = script_zip(PLUGIN, "1.0.0");
+    let official = fixture_zip("1.0.0");
     world.publish(vec![(Release::of("1.0.0", "current", &official), official)]);
     installed(
         world
@@ -1614,34 +1663,43 @@ async fn an_allowed_scripted_plugin_runs_and_turning_it_off_stops_it() {
 }
 
 #[tokio::test]
-async fn the_emergency_stop_stops_official_and_community_scripts() {
+async fn the_emergency_stop_stops_every_script_and_data_only_plugins_still_load() {
     let world = world_with_script_plugins().await;
     world.service.activate_all().unwrap();
-    assert!(world.running(PLUGIN));
     assert!(world.running(COMMUNITY_SCRIPT));
+    assert!(world.running(SCRIPTED_B));
 
     world.service.set_emergency_stop(true).unwrap();
 
     assert!(world.service.emergency_stop_engaged());
-    assert!(!world.running(PLUGIN), "official included");
     assert!(!world.running(COMMUNITY_SCRIPT));
+    assert!(!world.running(SCRIPTED_B));
     world.service.activate_all().unwrap();
-    assert!(!world.running(PLUGIN));
     assert!(!world.running(COMMUNITY_SCRIPT));
-    assert!(world.service.activate(&World::id()).is_err());
+    assert!(!world.running(SCRIPTED_B));
+    assert!(world.service.activate(&plugin_id(COMMUNITY_SCRIPT)).is_err());
     assert!(world.service.contributions().is_empty());
+
+    // Data-only plugins run no code, so the stop does not take their games away.
+    let (ctx, _) = world.start();
+    assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_some());
 
     // Releasing it lets what each plugin was allowed to do run again.
     world.service.set_emergency_stop(false).unwrap();
     world.service.activate_all().unwrap();
-    assert!(world.running(PLUGIN));
     assert!(world.running(COMMUNITY_SCRIPT));
+    assert!(world.running(SCRIPTED_B));
     world.stop_everything();
 }
 
 #[tokio::test]
 async fn one_plugins_permission_does_not_affect_another() {
+    const SCRIPTED_C: &str = "acme.third";
     let world = world_with_script_plugins().await;
+    world
+        .service
+        .install_package_bytes(&script_zip(SCRIPTED_C, "1.0.0"), true)
+        .unwrap();
 
     world
         .service
@@ -1650,12 +1708,12 @@ async fn one_plugins_permission_does_not_affect_another() {
     world.service.activate_all().unwrap();
     assert!(!world.running(COMMUNITY_SCRIPT));
     assert!(
-        world.running(PLUGIN),
-        "the official plugin is its own decision"
+        world.running(SCRIPTED_B),
+        "another plugin is its own decision"
     );
-    assert!(world.running(SCRIPTED_B));
+    assert!(world.running(SCRIPTED_C));
 
-    // And the other way: stopping the official one leaves the community ones alone.
+    // And the other way: stopping one leaves the others alone.
     world.stop_everything();
     world
         .service
@@ -1663,33 +1721,41 @@ async fn one_plugins_permission_does_not_affect_another() {
         .unwrap();
     world
         .service
-        .set_scripts_allowed(&World::id(), false)
+        .set_scripts_allowed(&plugin_id(SCRIPTED_B), false)
         .unwrap();
     world.service.activate_all().unwrap();
-    assert!(!world.running(PLUGIN));
+    assert!(!world.running(SCRIPTED_B));
     assert!(world.running(COMMUNITY_SCRIPT));
-    assert!(world.running(SCRIPTED_B));
+    assert!(world.running(SCRIPTED_C));
     world.stop_everything();
 }
 
 #[tokio::test]
-async fn an_official_scripted_plugin_installed_without_code_runs_none() {
+async fn an_official_package_that_ships_code_is_refused() {
     let world = World::new();
     let zip = script_zip(PLUGIN, "1.0.0");
     world.publish(vec![(Release::of("1.0.0", "current", &zip), zip)]);
 
-    let plugin = installed(
-        world
-            .service
-            .install_official(PLUGIN, Consent::without_code(), &world.fetcher)
-            .await
-            .unwrap(),
+    // Official plugins are data-only. A release that ships an entrypoint is
+    // Agora's own mistake, so it is refused rather than offered to the user.
+    let error = world
+        .service
+        .install_official(PLUGIN, Consent::without_code(), &world.fetcher)
+        .await
+        .expect_err("an official package with code must be refused");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_HAS_CODE");
+    assert!(
+        error.to_string().contains("data-only"),
+        "the message says why: {error}"
     );
-
-    assert!(plugin.official.is_official());
-    assert!(!plugin.scripts_allowed);
-    world.service.activate_all().unwrap();
-    assert!(!world.running(PLUGIN));
+    assert!(
+        world.service.list().is_empty(),
+        "nothing was recorded as installed"
+    );
+    assert!(
+        !world.installed_dir().exists(),
+        "nothing was written to the plugin folder"
+    );
 }
 
 #[tokio::test]
@@ -1747,41 +1813,56 @@ async fn an_update_keeps_the_answer_and_a_new_install_over_an_uninstall_asks_aga
     assert!(!again.scripts_allowed);
 }
 
-/// A blocked (edited or revoked) official script plugin does not run, allowed or not.
+/// A blocked (edited) official plugin's game does not load, while community scripts are
+/// unaffected.
 #[tokio::test]
-async fn a_blocked_official_script_plugin_does_not_run() {
+async fn a_blocked_official_plugin_does_not_load_its_game() {
     let world = world_with_script_plugins().await;
-    std::fs::write(
-        world.installed_dir().join("main.js"),
-        b"export function evil() {}\n",
-    )
-    .unwrap();
+    std::fs::write(world.installed_dir().join("extra.txt"), b"edited").unwrap();
     world.service.reload().unwrap();
+    assert!(matches!(world.status(), OfficialStatus::Unverified { .. }));
 
     world.service.activate_all().unwrap();
-
-    assert!(!world.running(PLUGIN));
     assert!(world.running(COMMUNITY_SCRIPT));
+
+    let (ctx, warnings) = world.start();
+    assert!(warnings.iter().any(|w| w.contains("blocked")));
+    assert!(
+        ctx.games.game(&GameId::new(GAME).unwrap()).is_none(),
+        "a blocked official plugin's game is not loaded"
+    );
     world.stop_everything();
 }
 
-/// A newer registry that no longer lists an installed official version blocks it, and what is
-/// running of it stops at the next re-verification, not the next launch.
+/// A community plugin that borrows an official plugin's id is blocked by the signed catalog,
+/// and what is running of it stops at the next re-verification, not the next launch.
 #[tokio::test]
-async fn a_revocation_stops_a_running_official_script_plugin_at_the_next_reload() {
-    let world = world_with_script_plugins().await;
+async fn a_community_plugin_squatting_an_official_id_stops_at_the_next_reload() {
+    let world = World::new();
+    // No official catalog yet: this is an ordinary community plugin.
+    world
+        .service
+        .install_package_bytes(&script_zip(PLUGIN, "1.0.0"), true)
+        .unwrap();
+    world
+        .service
+        .install_package_bytes(&script_zip(COMMUNITY_SCRIPT, "1.0.0"), true)
+        .unwrap();
     world.service.activate_all().unwrap();
     assert!(world.running(PLUGIN));
+    assert!(world.running(COMMUNITY_SCRIPT));
 
-    // The registry now lists only another version.
-    let newer = script_zip(PLUGIN, "2.0.0");
-    world.publish(vec![(Release::of("2.0.0", "current", &newer), newer)]);
+    // The signed catalog now gives that id to an official package the installed
+    // files do not match, so the install loses its standing.
+    let signed = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &signed), signed)]);
     world.service.reload().unwrap();
 
-    assert!(!world.running(PLUGIN));
+    assert!(matches!(world.status(), OfficialStatus::Unverified { .. }));
+    assert!(!world.running(PLUGIN), "the squatter stops now");
     assert!(
         world.running(COMMUNITY_SCRIPT),
-        "only the revoked one stops"
+        "only the blocked one stops"
     );
     world.service.activate_all().unwrap();
     assert!(!world.running(PLUGIN));
@@ -1864,7 +1945,6 @@ async fn the_documented_development_install_of_skyrim_still_loads_the_game() {
 /// code in between does not end it: v1 (code, allowed) -> v2 (no code) -> v3 (new code) runs v3
 /// with the permission given for v1.
 #[tokio::test]
-#[ignore = "proves bug: script consent given for a plugin's v1 code survives a code-less v2 and is applied to v3's new code (service.rs:1096 only writes consent on a first install with code, never clears it)"]
 async fn script_consent_does_not_survive_a_version_with_no_code() {
     let world = World::new();
     let v1 = world
@@ -1907,7 +1987,6 @@ async fn script_consent_does_not_survive_a_version_with_no_code() {
 /// A tampered or revoked official plugin is Blocked and its games are not loaded; the game id it
 /// held is then free, and any community plugin that declares the same game id takes it over.
 #[tokio::test]
-#[ignore = "proves bug: a community plugin gets the game id of a blocked (demoted) official plugin (ctx.rs:235-245 skips the blocked plugin, so game_builder.add accepts the community claim)"]
 async fn a_blocked_official_plugin_does_not_hand_its_game_id_to_a_community_plugin() {
     let world = World::new();
     let signed = fixture_zip("1.0.0");
@@ -1949,5 +2028,179 @@ async fn a_blocked_official_plugin_does_not_hand_its_game_id_to_a_community_plug
             plugin_id: "aaa.community".into()
         }),
         "the community plugin must not take over the game of a blocked official plugin"
+    );
+}
+
+#[tokio::test]
+async fn engaging_the_stop_stops_scripts_even_when_saving_the_setting_fails() {
+    let world = world_with_script_plugins().await;
+    world.service.activate_all().unwrap();
+    assert!(world.running(COMMUNITY_SCRIPT));
+
+    // Make the setting write fail, as a full or read-only database would.
+    let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_stop_write BEFORE INSERT ON user_settings
+         BEGIN SELECT RAISE(ABORT, 'refused for the test'); END;",
+    )
+    .unwrap();
+
+    let error = world
+        .service
+        .set_emergency_stop(true)
+        .expect_err("the save failure is reported");
+    assert_eq!(error.code(), "ERR_LOCAL_STATE_FAILED");
+    assert!(
+        !world.running(COMMUNITY_SCRIPT),
+        "the script stopped even though the setting was not saved"
+    );
+    assert!(
+        !world.service.emergency_stop_engaged(),
+        "the setting did not persist, which the caller was told"
+    );
+}
+
+#[tokio::test]
+async fn a_differently_signed_update_is_flagged_and_asks_about_its_code_again() {
+    let world = World::new();
+    let first = publisher_key(7);
+    let second = publisher_key(8);
+
+    let installed = world
+        .service
+        .install_package_bytes(
+            &script_zip_with_source(COMMUNITY_SCRIPT, "1.0.0", &first),
+            true,
+        )
+        .unwrap();
+    assert!(installed.scripts_allowed);
+
+    let preview = world
+        .service
+        .preview_package_bytes(&script_zip_with_source(
+            COMMUNITY_SCRIPT,
+            "2.0.0",
+            &second,
+        ))
+        .unwrap();
+    assert!(
+        preview.publisher_changed,
+        "the preview says this is a different publisher"
+    );
+    assert!(
+        preview.requires_capability_consent(),
+        "so the user is asked, even though nothing else widened"
+    );
+
+    // Without an explicit yes to that preview it is refused.
+    let refused = world
+        .service
+        .install_package_bytes(
+            &script_zip_with_source(COMMUNITY_SCRIPT, "2.0.0", &second),
+            Consent {
+                capabilities: false,
+                scripts: false,
+            },
+        )
+        .expect_err("a different publisher needs an explicit yes");
+    assert_eq!(refused.code(), "ERR_PLUGIN_PUBLISHER_CHANGED");
+
+    // With the yes, the code question is asked again: v1's answer does not
+    // carry over to the new publisher's code.
+    let updated = world
+        .service
+        .install_package_bytes(
+            &script_zip_with_source(COMMUNITY_SCRIPT, "2.0.0", &second),
+            Consent {
+                capabilities: true,
+                scripts: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        !updated.scripts_allowed,
+        "the old permission belonged to the old publisher"
+    );
+    assert_eq!(
+        updated
+            .update_source
+            .as_ref()
+            .unwrap()
+            .keys
+            .iter()
+            .map(|key| key.fingerprint.clone())
+            .collect::<Vec<_>>(),
+        vec![second.fingerprint()],
+        "the new key is what is pinned now"
+    );
+}
+
+#[tokio::test]
+async fn a_crash_mid_install_restores_the_previous_version_at_startup() {
+    let world = World::new();
+    world
+        .service
+        .install_package_bytes(&fixture_zip("1.0.0"), true)
+        .unwrap();
+
+    // The half-done state: the old files are in the rollback folder, the new
+    // ones are unpacked, but the record still names v1.
+    let installed = world.installed_dir();
+    let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
+    std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
+    std::fs::rename(&installed, &rollback).unwrap();
+    agora_core::plugins::install::extract_package(&fixture_zip("2.0.0"), &installed).unwrap();
+
+    let (ctx, warnings) = world.start();
+    assert!(
+        warnings.iter().any(|w| w.contains("Recovered")),
+        "the recovery is reported: {warnings:?}"
+    );
+    assert!(
+        ctx.games.game(&GameId::new(GAME).unwrap()).is_some(),
+        "the game is back"
+    );
+    assert_eq!(
+        agora_core::plugins::install::read_folder_manifest(&installed)
+            .unwrap()
+            .version
+            .to_string(),
+        "1.0.0",
+        "the previous version is the one on disk"
+    );
+    assert!(!rollback.exists(), "the rollback folder is cleaned up");
+
+    // Running it again does nothing.
+    let (_ctx, warnings) = world.start();
+    assert!(!warnings.iter().any(|w| w.contains("Recovered")));
+}
+
+#[tokio::test]
+async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
+    let world = World::new();
+    world
+        .service
+        .install_package_bytes(&fixture_zip("1.0.0"), true)
+        .unwrap();
+    world
+        .service
+        .install_package_bytes(&fixture_zip("2.0.0"), true)
+        .unwrap();
+
+    // The record says v2 and v2 is on disk; only the stashed v1 is left.
+    let rollback = world.paths().plugin_rollback_root().join(PLUGIN);
+    std::fs::create_dir_all(rollback.parent().unwrap()).unwrap();
+    agora_core::plugins::install::extract_package(&fixture_zip("1.0.0"), &rollback).unwrap();
+
+    let (ctx, _) = world.start();
+    assert!(!rollback.exists());
+    assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_some());
+    assert_eq!(
+        agora_core::plugins::install::read_folder_manifest(&world.installed_dir())
+            .unwrap()
+            .version
+            .to_string(),
+        "2.0.0",
+        "the finished install is kept"
     );
 }
