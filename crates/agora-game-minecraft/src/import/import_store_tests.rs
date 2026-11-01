@@ -322,7 +322,6 @@ fn write_mrpack_with_overrides(
 }
 
 #[test]
-#[ignore = "proves bug: a nested pack path (mods/sub/x.jar) is stored under the file name only and lands in mods/x.jar, not where the pack put it"]
 fn a_nested_pack_path_is_placed_where_the_pack_put_it() {
     let (ctx, tmp) = store_ctx();
     let jar = b"nested mod bytes".to_vec();
@@ -341,7 +340,6 @@ fn a_nested_pack_path_is_placed_where_the_pack_put_it() {
 }
 
 #[test]
-#[ignore = "proves bug: two nested pack files with the same name (mods/a/x.jar, mods/b/x.jar) collide on mods/x.jar and fail the whole import"]
 fn same_named_files_in_different_pack_folders_do_not_collide() {
     let (ctx, tmp) = store_ctx();
     let one = b"first x".to_vec();
@@ -368,7 +366,6 @@ fn same_named_files_in_different_pack_folders_do_not_collide() {
 }
 
 #[test]
-#[ignore = "proves bug: an override with the same path as an index file now fails the import (TargetExists); before the store the override overwrote it"]
 fn an_override_replaces_an_index_file_of_the_same_name() {
     let (ctx, tmp) = store_ctx();
     let indexed = b"index version".to_vec();
@@ -390,7 +387,6 @@ fn an_override_replaces_an_index_file_of_the_same_name() {
 }
 
 #[test]
-#[ignore = "proves bug: a download that fails its published hash is still added to the shared store before the import stops"]
 fn a_hash_stopped_import_leaves_nothing_in_the_store() {
     let (ctx, tmp) = store_ctx();
     let good = b"good bytes".to_vec();

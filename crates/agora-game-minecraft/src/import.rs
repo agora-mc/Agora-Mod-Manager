@@ -903,6 +903,9 @@ pub fn import_mrpack_inner(
             .collect();
         let mut stored_content: BTreeMap<String, crate::content_bridge::StoredFile> =
             BTreeMap::new();
+        // Tracked files are written as ordinary files first; after every hash check of the pack
+        // has passed they are stored (so a hash-stopped import stores nothing).
+        let mut content_candidates: BTreeMap<String, Option<String>> = BTreeMap::new();
         for file_entry in &index.files {
             // Not fetched or written: the enabled twin is what Agora keeps.
             if superseded.contains(&manifest_path_key(&relative_archive_path(&file_entry.path))) {
@@ -980,27 +983,15 @@ pub fn import_mrpack_inner(
             };
             hash_problems.extend(mrpack_hash_problems(file_entry, &bytes));
             let key = manifest_path_key(&relative_path);
-            let stored = match ctx {
-                Some(ctx) => crate::content_bridge::store_and_place_bytes(
-                    ctx,
-                    target_dir,
-                    &key,
-                    &bytes,
-                    None,
-                    file_entry.downloads.first().map(String::as_str),
-                )?,
-                None => None,
-            };
-            match stored {
-                Some(stored) => {
-                    stored_content.insert(key, stored);
-                }
-                None => {
-                    fs::write(&dest, &bytes).map_err(|e| LauncherError::Generic {
-                        code: "ERR_IMPORT_WRITE".into(),
-                        message: format!("Cannot write {:?}: {e}", dest),
-                    })?;
-                }
+            fs::write(&dest, &bytes).map_err(|e| LauncherError::Generic {
+                code: "ERR_IMPORT_WRITE".into(),
+                message: format!("Cannot write {:?}: {e}", dest),
+            })?;
+            if crate::content_bridge::tracked_content_type(&key).is_some() {
+                content_candidates.insert(
+                    key,
+                    file_entry.downloads.first().cloned(),
+                );
             }
             completed_files += 1;
             if let (Some(sink), Some(operation_id)) = (&progress_sink, &operation_id) {
@@ -1067,21 +1058,31 @@ pub fn import_mrpack_inner(
             let buf =
                 read_zip_entry_bounded(&mut entry, MAX_MRPACK_FILE_BYTES as u64, &entry_name)?;
             let key = manifest_path_key(&relative_path);
-            let stored = match ctx {
-                Some(ctx) => crate::content_bridge::store_and_place_bytes(
-                    ctx, target_dir, &key, &buf, None, None,
-                )?,
-                None => None,
-            };
-            match stored {
-                Some(stored) => {
-                    stored_content.insert(key, stored);
-                }
-                None => {
-                    fs::write(&dest, &buf).map_err(|e| LauncherError::Generic {
-                        code: "ERR_IMPORT_WRITE".into(),
-                        message: format!("Cannot write {:?}: {e}", dest),
-                    })?;
+            // An override is applied after the index files and wins. Writing now (before any
+            // store placement) is what lets it replace an index file of the same path.
+            fs::write(&dest, &buf).map_err(|e| LauncherError::Generic {
+                code: "ERR_IMPORT_WRITE".into(),
+                message: format!("Cannot write {:?}: {e}", dest),
+            })?;
+            if crate::content_bridge::tracked_content_type(&key).is_some() {
+                content_candidates.insert(key, None);
+            }
+        }
+
+        // The pack passed its hash checks (or the user accepted them): now the tracked files
+        // become store items and links. Doing it here means a stopped import stores nothing.
+        if let Some(ctx) = ctx {
+            for (key, page_url) in &content_candidates {
+                let source = target_dir.join(key);
+                if let Some(stored) = crate::content_bridge::store_staged_content(
+                    ctx,
+                    target_dir,
+                    key,
+                    &source,
+                    None,
+                    page_url.as_deref(),
+                )? {
+                    stored_content.insert(key.clone(), stored);
                 }
             }
         }

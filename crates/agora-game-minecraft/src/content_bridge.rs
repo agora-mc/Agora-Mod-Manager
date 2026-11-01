@@ -102,6 +102,143 @@ fn write_error(action: &str, path: &Path, error: std::io::Error) -> LauncherErro
     }
 }
 
+/// A pack-relative content path must be a plain relative path under one tracked content folder:
+/// no absolute paths, drive prefixes, `..`, `.` or backslashes.
+fn validate_relative_path(relative_path: &str) -> LauncherResult<()> {
+    use std::path::Component;
+    let invalid = || LauncherError::Generic {
+        code: "ERR_CONTENT_PATH".into(),
+        message: format!("'{relative_path}' is not a safe content path."),
+    };
+    if relative_path.is_empty() || relative_path.contains('\\') {
+        return Err(invalid());
+    }
+    let mut parts = 0usize;
+    for component in Path::new(relative_path).components() {
+        match component {
+            Component::Normal(_) => parts += 1,
+            _ => return Err(invalid()),
+        }
+    }
+    if parts < 2 || tracked_content_type(relative_path).is_none() {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn store_details<'a>(
+    content_type: &'a str,
+    filename: &'a str,
+    version: Option<&'a str>,
+    page_url: Option<&'a str>,
+) -> StoreDetails<'a> {
+    StoreDetails {
+        content_type,
+        filename,
+        version,
+        page_url,
+        description: None,
+        catalog_id: None,
+        provider: None,
+        provider_id: None,
+        provider_origin: None,
+    }
+}
+
+/// Put a stored object at `instance_dir/<relative_path>`, keeping the pack's folder structure.
+fn place_at_relative(
+    ctx: &Ctx,
+    sha256: &str,
+    instance_dir: &Path,
+    relative_path: &str,
+) -> LauncherResult<store::PlacedAs> {
+    validate_relative_path(relative_path)?;
+    let target = instance_dir.join(relative_path);
+    let mode = store::placement_mode(ctx).map_err(content_error)?;
+    store::place_object_at(ctx, sha256, &target, mode).map_err(content_error)
+}
+
+/// Store a pack file already written at `instance_dir/<relative_path>` and replace that ordinary
+/// file with the store placement. Used once a whole import has passed its hash checks, so a
+/// stopped import never puts a failing file into the store.
+pub fn store_staged_content(
+    ctx: &Ctx,
+    instance_dir: &Path,
+    relative_path: &str,
+    source: &Path,
+    version: Option<&str>,
+    page_url: Option<&str>,
+) -> LauncherResult<Option<StoredFile>> {
+    let Some(content_type) = tracked_content_type(relative_path) else {
+        return Ok(None);
+    };
+    validate_relative_path(relative_path)?;
+    let stored = store_file_at(
+        ctx,
+        source,
+        &store_details(content_type, file_name_of(relative_path), version, page_url),
+        Some(relative_path),
+    )?;
+    let target = instance_dir.join(relative_path);
+    if target.exists() {
+        if let Some(folder) = target.parent() {
+            ensure_folder_can_delete_children(folder)?;
+        }
+        std::fs::remove_file(&target)
+            .map_err(|error| write_error("replace a staged pack file", &target, error))?;
+    }
+    place_at_relative(ctx, &stored.sha256, instance_dir, relative_path)?;
+    Ok(Some(stored))
+}
+
+/// Re-place every manifest entry that recorded a store object, using the current link/copy
+/// setting. A rollback restores bytes from a snapshot of copies; this puts the links back.
+/// Missing objects and files whose bytes no longer match the record are left alone.
+pub fn relink_recorded_content(ctx: &Ctx, instance_dir: &Path) -> LauncherResult<()> {
+    let manifest_path = instance_dir.join("instance_manifest.json");
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let manifest = helpers::read_manifest(&manifest_path)?;
+    let mode = store::placement_mode(ctx).map_err(content_error)?;
+    for entry in manifest
+        .mods
+        .iter()
+        .chain(manifest.resourcepacks.iter())
+        .chain(manifest.shaders.iter())
+        .chain(manifest.datapacks.iter())
+    {
+        let Some(object) = entry.object_sha256.as_deref() else {
+            continue;
+        };
+        if !ctx.paths.content_object_path(object).is_file() {
+            continue;
+        }
+        let subdir = subdir_for_content_type(&entry.content_type);
+        if subdir == "saves" {
+            continue;
+        }
+        let physical = if entry.enabled {
+            entry.filename.clone()
+        } else {
+            format!("{}.disabled", entry.filename)
+        };
+        let target = instance_dir.join(subdir).join(&physical);
+        if target.exists() {
+            if !file_matches_recorded(&target, &entry.sha256)? {
+                continue;
+            }
+            if let Some(folder) = target.parent() {
+                ensure_folder_can_delete_children(folder)?;
+            }
+            std::fs::remove_file(&target)
+                .map_err(|error| write_error("replace a restored file", &target, error))?;
+        }
+        store::place_object_at(ctx, object, &target, mode).map_err(content_error)?;
+    }
+    Ok(())
+}
+
 /// Store one file's bytes as a single-file item when `relative_path` is in a tracked content
 /// folder, without placing it anywhere yet. Returns `None` for any other path.
 pub fn store_bytes(
@@ -114,26 +251,22 @@ pub fn store_bytes(
     let Some(content_type) = tracked_content_type(relative_path) else {
         return Ok(None);
     };
-    let filename = file_name_of(relative_path);
+    validate_relative_path(relative_path)?;
     let incoming = ctx.paths.staging_root().join("pack-incoming");
     std::fs::create_dir_all(&incoming)
         .map_err(|error| write_error("create the store's incoming folder", &incoming, error))?;
     let temp = incoming.join(format!("{}.bin", uuid::Uuid::new_v4()));
     std::fs::write(&temp, bytes).map_err(|error| write_error("stage a pack file", &temp, error))?;
-    let stored = store_file(
+    let stored = store_file_at(
         ctx,
         &temp,
-        &StoreDetails {
+        &store_details(
             content_type,
-            filename,
+            file_name_of(relative_path),
             version,
             page_url,
-            description: None,
-            catalog_id: None,
-            provider: None,
-            provider_id: None,
-            provider_origin: None,
-        },
+        ),
+        Some(relative_path),
     );
     let _ = std::fs::remove_file(&temp);
     Ok(Some(stored?))
@@ -153,15 +286,7 @@ pub fn store_and_place_bytes(
     let Some(stored) = store_bytes(ctx, relative_path, bytes, version, page_url)? else {
         return Ok(None);
     };
-    let content_type =
-        tracked_content_type(relative_path).expect("a stored path is a tracked content path");
-    place_file(
-        ctx,
-        &stored.sha256,
-        instance_dir,
-        content_type,
-        file_name_of(relative_path),
-    )?;
+    place_at_relative(ctx, &stored.sha256, instance_dir, relative_path)?;
     Ok(Some(stored))
 }
 
@@ -178,23 +303,19 @@ pub fn store_and_place_file(
     let Some(content_type) = tracked_content_type(relative_path) else {
         return Ok(None);
     };
-    let filename = file_name_of(relative_path);
-    let stored = store_file(
+    validate_relative_path(relative_path)?;
+    let stored = store_file_at(
         ctx,
         source,
-        &StoreDetails {
+        &store_details(
             content_type,
-            filename,
+            file_name_of(relative_path),
             version,
             page_url,
-            description: None,
-            catalog_id: None,
-            provider: None,
-            provider_id: None,
-            provider_origin: None,
-        },
+        ),
+        Some(relative_path),
     )?;
-    place_file(ctx, &stored.sha256, instance_dir, content_type, filename)?;
+    place_at_relative(ctx, &stored.sha256, instance_dir, relative_path)?;
     Ok(Some(stored))
 }
 
@@ -217,11 +338,26 @@ pub fn store_file(
     file_path: &Path,
     details: &StoreDetails<'_>,
 ) -> LauncherResult<StoredFile> {
-    let rel = format!(
-        "{}/{}",
-        subdir_for_content_type(details.content_type),
-        details.filename
-    );
+    store_file_at(ctx, file_path, details, None)
+}
+
+fn store_file_at(
+    ctx: &Ctx,
+    file_path: &Path,
+    details: &StoreDetails<'_>,
+    relative_path: Option<&str>,
+) -> LauncherResult<StoredFile> {
+    let rel = match relative_path {
+        Some(path) => {
+            validate_relative_path(path)?;
+            path.to_string()
+        }
+        None => format!(
+            "{}/{}",
+            subdir_for_content_type(details.content_type),
+            details.filename
+        ),
+    };
     let name = Path::new(details.filename)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -529,6 +665,12 @@ pub fn init_local_state(ctx: &Ctx) {
 #[cfg(test)]
 pub fn store_item_count(ctx: &Ctx) -> usize {
     store::list_items(ctx).expect("list store items").len()
+}
+
+/// Whether a folder's own DACL grants the current user delete-child. Test support only.
+#[cfg(test)]
+pub fn folder_grants_delete_child(folder: &Path) -> bool {
+    store::protect::grants_delete_child(folder).expect("read the folder ACL")
 }
 
 /// Store one file with review metadata and return its item id. Test support only.

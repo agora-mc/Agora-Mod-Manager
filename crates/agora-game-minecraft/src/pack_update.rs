@@ -1587,16 +1587,28 @@ pub fn apply_merge(
     if let Err(error) = apply_result {
         let restore = snapshot::restore_snapshot(instance_dir, &snapshot.id);
         return match restore {
-            Ok(outcome) => Err(match outcome.coverage {
-                snapshot::RestoreCoverageKind::Exact => format!(
-                    "merge apply failed and the pre-merge snapshot was restored: {error}"
-                ),
-                snapshot::RestoreCoverageKind::LegacyPartial => format!(
-                    "merge apply failed and the pre-merge snapshot was restored, but it predates scoped \
-                     snapshots so roots outside {:?} were left as they are: {error}",
-                    outcome.restored_roots
-                ),
-            }),
+            Ok(outcome) => {
+                // The snapshot restores copies. Put back the store links for everything the
+                // update did not have to change, so a failed merge leaves the instance as it
+                // was (bytes, manifest and placement) in the user's current placement mode.
+                let relink_note = match ctx {
+                    Some(ctx) => crate::content_bridge::relink_recorded_content(ctx, instance_dir)
+                        .err()
+                        .map(|e| format!("; restoring store placements failed: {e}"))
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
+                Err(match outcome.coverage {
+                    snapshot::RestoreCoverageKind::Exact => format!(
+                        "merge apply failed and the pre-merge snapshot was restored: {error}{relink_note}"
+                    ),
+                    snapshot::RestoreCoverageKind::LegacyPartial => format!(
+                        "merge apply failed and the pre-merge snapshot was restored, but it predates scoped \
+                         snapshots so roots outside {:?} were left as they are: {error}{relink_note}",
+                        outcome.restored_roots
+                    ),
+                })
+            }
             Err(restore_error) => Err(format!(
                 "merge apply failed and automatic restore could not complete; original state is protected in recovery storage. apply: {error}; restore: {restore_error}"
             )),
@@ -1669,7 +1681,7 @@ fn apply_one_action(
             let dest = safe_join(instance_dir, &action.target_path)?;
             if dest.exists() {
                 refuse_if_changed(&dest, action.ours_sha.as_deref(), &action.target_path)?;
-                remove_instance_file(&dest)?;
+                remove_instance_file(instance_dir, &dest)?;
             }
             Ok(None)
         }
@@ -1692,7 +1704,7 @@ fn apply_one_action(
                 let prev = safe_join(instance_dir, previous)?;
                 if prev.exists() {
                     refuse_if_changed(&prev, action.ours_sha.as_deref(), previous)?;
-                    remove_instance_file(&prev)?;
+                    remove_instance_file(instance_dir, &prev)?;
                 }
             }
             let src = safe_join(staged_dir, &action.logical_path)?;
@@ -1730,7 +1742,7 @@ fn apply_theirs_for_conflict(
             let old = safe_join(instance_dir, ours_path)?;
             if old.exists() {
                 refuse_if_changed(&old, conflict.ours_sha.as_deref(), ours_path)?;
-                remove_instance_file(&old)?;
+                remove_instance_file(instance_dir, &old)?;
             }
         }
     }
@@ -1786,7 +1798,7 @@ fn replace_with_content(
             ));
         }
         refuse_if_changed(dest, recorded_sha256, target_path)?;
-        remove_instance_file(dest)?;
+        remove_instance_file(instance_dir, dest)?;
     }
     let stored = match ctx {
         Some(ctx) => crate::content_bridge::store_and_place_file(
@@ -1814,12 +1826,26 @@ fn replace_with_content(
     }
 }
 
-/// Remove one instance file. A file that is a link to a protected store object needs the
-/// folder's delete-child right, which the store grants on demand.
-fn remove_instance_file(path: &Path) -> Result<(), String> {
-    if let Some(folder) = path.parent() {
-        crate::content_bridge::ensure_folder_can_delete_children(folder)
-            .map_err(|error| error.to_string())?;
+/// Remove one instance file. Only a file in a content folder Agora places links in (or its own
+/// `.agora` staging/trash) can need the folder's delete-child right; a user folder such as
+/// `config/` must keep its ACL exactly as it was.
+fn remove_instance_file(instance_dir: &Path, path: &Path) -> Result<(), String> {
+    let agora_managed = path
+        .strip_prefix(instance_dir)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .and_then(|first| first.as_os_str().to_str())
+        .is_some_and(|first| {
+            matches!(
+                first,
+                "mods" | "resourcepacks" | "shaderpacks" | "datapacks" | ".agora"
+            )
+        });
+    if agora_managed {
+        if let Some(folder) = path.parent() {
+            crate::content_bridge::ensure_folder_can_delete_children(folder)
+                .map_err(|error| error.to_string())?;
+        }
     }
     remove_file(path)
 }
@@ -4798,7 +4824,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "proves bug: a failed pack update's rollback turns every untouched linked mod in mods/ into a plain copy while the manifest still records the store object"]
     fn a_failed_pack_update_leaves_untouched_linked_mods_linked() {
         let tmp = TempDir::new().unwrap();
         let inst = seed_instance(&tmp, "inst");
