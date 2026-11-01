@@ -1,11 +1,11 @@
 use crate::override_sanitizer::OverridePolicy;
-use agora_core::download::{sha1_hex, sha512_hex};
+use agora_core::download::{sha1_hex, sha256_hex, sha512_hex};
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::event_sink::{OperationId, ProgressEvent, ProgressPhase, ProgressSink};
 use agora_core::models::{
     InstalledMod, InstanceManifest, PackOrigin, PackPlatform, CURRENT_MANIFEST_VERSION,
 };
-use agora_core::paths;
+use agora_core::{ctx::Ctx, paths};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -265,6 +265,7 @@ fn inventory_pack_content(
     directory: &str,
     content_type: &str,
     modrinth_files: &BTreeMap<String, ImportedModrinthFile>,
+    stored: &BTreeMap<String, crate::content_bridge::StoredFile>,
 ) -> LauncherResult<Vec<InstalledMod>> {
     let root = instance_dir.join(directory);
     if !root.exists() {
@@ -309,6 +310,7 @@ fn inventory_pack_content(
             Some(logical) => (logical.to_string(), false),
             None => (physical_name.clone(), true),
         };
+        let stored_file = stored.get(&identity_key);
         installed.push(InstalledMod {
             provider: None,
             update_pinned: false,
@@ -321,7 +323,9 @@ fn inventory_pack_content(
             source: "modrinth-pack".into(),
             source_url: modrinth_file.map(|file| file.download_url.clone()),
             version: None,
-            sha256: agora_core::download::sha256_hex(&bytes),
+            sha256: stored_file
+                .map(|file| file.sha256.clone())
+                .unwrap_or_else(|| sha256_hex(&bytes)),
             hash_verified: true,
             installed_at: chrono::Utc::now().to_rfc3339(),
             java_packages: Vec::new(),
@@ -333,8 +337,8 @@ fn inventory_pack_content(
             optional_deps: Vec::new(),
             incompatible_deps: Vec::new(),
 
-            content_item_id: None,
-            object_sha256: None,
+            content_item_id: stored_file.map(|file| file.item_id.clone()),
+            object_sha256: stored_file.map(|file| file.sha256.clone()),
         });
     }
     installed.sort_by(|a, b| a.filename.cmp(&b.filename));
@@ -820,6 +824,7 @@ pub fn import_mrpack_with_progress(
         name_override,
         false,
         false,
+        None,
     )
 }
 
@@ -840,6 +845,7 @@ pub fn import_mrpack_inner(
     name_override: Option<&str>,
     skip_unfetchable: bool,
     install_anyway: bool,
+    ctx: Option<&Ctx>,
 ) -> LauncherResult<ImportResult> {
     let file = fs::File::open(mrpack_path).map_err(|e| LauncherError::Generic {
         code: "ERR_IMPORT_OPEN".into(),
@@ -895,6 +901,8 @@ pub fn import_mrpack_inner(
                 })
             })
             .collect();
+        let mut stored_content: BTreeMap<String, crate::content_bridge::StoredFile> =
+            BTreeMap::new();
         for file_entry in &index.files {
             // Not fetched or written: the enabled twin is what Agora keeps.
             if superseded.contains(&manifest_path_key(&relative_archive_path(&file_entry.path))) {
@@ -971,10 +979,29 @@ pub fn import_mrpack_inner(
                 read_embedded()?
             };
             hash_problems.extend(mrpack_hash_problems(file_entry, &bytes));
-            fs::write(&dest, &bytes).map_err(|e| LauncherError::Generic {
-                code: "ERR_IMPORT_WRITE".into(),
-                message: format!("Cannot write {:?}: {e}", dest),
-            })?;
+            let key = manifest_path_key(&relative_path);
+            let stored = match ctx {
+                Some(ctx) => crate::content_bridge::store_and_place_bytes(
+                    ctx,
+                    target_dir,
+                    &key,
+                    &bytes,
+                    None,
+                    file_entry.downloads.first().map(String::as_str),
+                )?,
+                None => None,
+            };
+            match stored {
+                Some(stored) => {
+                    stored_content.insert(key, stored);
+                }
+                None => {
+                    fs::write(&dest, &bytes).map_err(|e| LauncherError::Generic {
+                        code: "ERR_IMPORT_WRITE".into(),
+                        message: format!("Cannot write {:?}: {e}", dest),
+                    })?;
+                }
+            }
             completed_files += 1;
             if let (Some(sink), Some(operation_id)) = (&progress_sink, &operation_id) {
                 sink.report(
@@ -1039,13 +1066,28 @@ pub fn import_mrpack_inner(
             }
             let buf =
                 read_zip_entry_bounded(&mut entry, MAX_MRPACK_FILE_BYTES as u64, &entry_name)?;
-            fs::write(&dest, &buf).map_err(|e| LauncherError::Generic {
-                code: "ERR_IMPORT_WRITE".into(),
-                message: format!("Cannot write {:?}: {e}", dest),
-            })?;
+            let key = manifest_path_key(&relative_path);
+            let stored = match ctx {
+                Some(ctx) => crate::content_bridge::store_and_place_bytes(
+                    ctx, target_dir, &key, &buf, None, None,
+                )?,
+                None => None,
+            };
+            match stored {
+                Some(stored) => {
+                    stored_content.insert(key, stored);
+                }
+                None => {
+                    fs::write(&dest, &buf).map_err(|e| LauncherError::Generic {
+                        code: "ERR_IMPORT_WRITE".into(),
+                        message: format!("Cannot write {:?}: {e}", dest),
+                    })?;
+                }
+            }
         }
 
-        let mods = inventory_pack_content(target_dir, "mods", "mod", &modrinth_files)?;
+        let mods =
+            inventory_pack_content(target_dir, "mods", "mod", &modrinth_files, &stored_content)?;
         // The Modrinth format requires the loader as a dependency. A pack that
         // ships mod JARs without one would import as a vanilla instance that
         // silently ignores every mod, so refuse it instead.
@@ -1060,12 +1102,34 @@ pub fn import_mrpack_inner(
                 "This pack contains mods but its modrinth.index.json names no mod loader                  (expected a fabric-loader, quilt-loader, forge or neoforge dependency),                  so Agora cannot tell which loader the mods need.",
             ));
         }
-        let resourcepacks =
-            inventory_pack_content(target_dir, "resourcepacks", "resourcepack", &modrinth_files)?;
-        let shaders = inventory_pack_content(target_dir, "shaderpacks", "shader", &modrinth_files)?;
-        let datapacks =
-            inventory_pack_content(target_dir, "datapacks", "datapack", &modrinth_files)?;
-        let worlds = inventory_pack_content(target_dir, "saves", "world", &modrinth_files)?;
+        let resourcepacks = inventory_pack_content(
+            target_dir,
+            "resourcepacks",
+            "resourcepack",
+            &modrinth_files,
+            &stored_content,
+        )?;
+        let shaders = inventory_pack_content(
+            target_dir,
+            "shaderpacks",
+            "shader",
+            &modrinth_files,
+            &stored_content,
+        )?;
+        let datapacks = inventory_pack_content(
+            target_dir,
+            "datapacks",
+            "datapack",
+            &modrinth_files,
+            &stored_content,
+        )?;
+        let worlds = inventory_pack_content(
+            target_dir,
+            "saves",
+            "world",
+            &modrinth_files,
+            &stored_content,
+        )?;
         let imported_mods = mods.len();
         // Build PackOrigin for the Modrinth pack. `versionId` from the index is
         // treated as the opaque `version_id`; human `version_number` stays None.
@@ -1572,7 +1636,7 @@ pub fn import_prism_zip(
     instances_root: &Path,
     symlink_saves: bool,
 ) -> LauncherResult<ImportResult> {
-    import_prism_zip_named(zip_path, instances_root, symlink_saves, None)
+    import_prism_zip_named(zip_path, instances_root, symlink_saves, None, None)
 }
 
 /// [`import_prism_zip`] with an optional user-chosen instance name.
@@ -1581,6 +1645,7 @@ pub fn import_prism_zip_named(
     instances_root: &Path,
     symlink_saves: bool,
     name_override: Option<&str>,
+    ctx: Option<&Ctx>,
 ) -> LauncherResult<ImportResult> {
     let file = fs::File::open(zip_path).map_err(|e| LauncherError::Generic {
         code: "ERR_IMPORT_OPEN_ZIP".into(),
@@ -1651,6 +1716,8 @@ pub fn import_prism_zip_named(
     let import_result = (|| -> LauncherResult<usize> {
         let target_dir = &target.staging_dir;
         let mut imported_mods = 0;
+        let mut stored_content: BTreeMap<String, crate::content_bridge::StoredFile> =
+            BTreeMap::new();
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| LauncherError::Generic {
                 code: "ERR_IMPORT_READ_ZIP".into(),
@@ -1692,22 +1759,54 @@ pub fn import_prism_zip_named(
                     code: "ERR_IMPORT_READ".into(),
                     message: format!("Cannot read {entry_name}: {e}"),
                 })?;
-            fs::write(&dest, &buf).map_err(|e| LauncherError::Generic {
-                code: "ERR_IMPORT_WRITE".into(),
-                message: format!("Cannot write {:?}: {e}", dest),
-            })?;
+            let key = manifest_path_key(&relative_path);
+            let stored = match ctx {
+                Some(ctx) => crate::content_bridge::store_and_place_bytes(
+                    ctx, target_dir, &key, &buf, None, None,
+                )?,
+                None => None,
+            };
+            match stored {
+                Some(stored) => {
+                    stored_content.insert(key, stored);
+                }
+                None => {
+                    fs::write(&dest, &buf).map_err(|e| LauncherError::Generic {
+                        code: "ERR_IMPORT_WRITE".into(),
+                        message: format!("Cannot write {:?}: {e}", dest),
+                    })?;
+                }
+            }
             if relative_name.starts_with("mods/") {
                 imported_mods += 1;
             }
         }
 
         let identities = BTreeMap::new();
-        let mods = inventory_pack_content(target_dir, "mods", "mod", &identities)?;
-        let resourcepacks =
-            inventory_pack_content(target_dir, "resourcepacks", "resourcepack", &identities)?;
-        let shaders = inventory_pack_content(target_dir, "shaderpacks", "shader", &identities)?;
-        let datapacks = inventory_pack_content(target_dir, "datapacks", "datapack", &identities)?;
-        let worlds = inventory_pack_content(target_dir, "saves", "world", &identities)?;
+        let mods = inventory_pack_content(target_dir, "mods", "mod", &identities, &stored_content)?;
+        let resourcepacks = inventory_pack_content(
+            target_dir,
+            "resourcepacks",
+            "resourcepack",
+            &identities,
+            &stored_content,
+        )?;
+        let shaders = inventory_pack_content(
+            target_dir,
+            "shaderpacks",
+            "shader",
+            &identities,
+            &stored_content,
+        )?;
+        let datapacks = inventory_pack_content(
+            target_dir,
+            "datapacks",
+            "datapack",
+            &identities,
+            &stored_content,
+        )?;
+        let worlds =
+            inventory_pack_content(target_dir, "saves", "world", &identities, &stored_content)?;
         let pack_files =
             crate::pack_inventory::collect_pack_inventory(target_dir).unwrap_or_default();
         let pack_hash = if pack_files.is_empty() {
@@ -2174,6 +2273,7 @@ pub fn import_technic_solder_pack(
     pack: &TechnicSolderPack,
     instances_root: &Path,
     name_override: Option<&str>,
+    ctx: Option<&Ctx>,
 ) -> LauncherResult<ImportResult> {
     let instance_name = apply_name_override(pack.display_name.clone(), name_override);
     let target = prepare_import_target(instances_root, &instance_name)?;
@@ -2214,12 +2314,26 @@ pub fn import_technic_solder_pack(
                 }
             }
             let dest = mods_dir.join(&filename);
-            fs::write(&dest, &bytes).map_err(|e| {
-                import_error(
-                    "ERR_IMPORT_WRITE",
-                    format!("Cannot write mod {filename:?}: {e}"),
-                )
-            })?;
+            let key = format!("mods/{filename}");
+            let stored = match ctx {
+                Some(ctx) => crate::content_bridge::store_and_place_bytes(
+                    ctx,
+                    &target.staging_dir,
+                    &key,
+                    &bytes,
+                    None,
+                    Some(entry.url.as_str()),
+                )?,
+                None => None,
+            };
+            if stored.is_none() {
+                fs::write(&dest, &bytes).map_err(|e| {
+                    import_error(
+                        "ERR_IMPORT_WRITE",
+                        format!("Cannot write mod {filename:?}: {e}"),
+                    )
+                })?;
+            }
             imported_mods += 1;
         }
         // Stamp PackOrigin for Solder — slug + solder + build are the honest identity.
@@ -2332,6 +2446,7 @@ pub fn import_technic_zip_pack(
     instances_root: &Path,
     policy: OverridePolicy,
     name_override: Option<&str>,
+    ctx: Option<&Ctx>,
 ) -> LauncherResult<ImportResult> {
     let instance_name = apply_name_override(pack.display_name.clone(), name_override);
     let bytes = agora_core::download::download_consented_bytes_blocking(&pack.download_url)?;
@@ -2376,7 +2491,8 @@ pub fn import_technic_zip_pack(
     })?;
 
     let result = (|| -> LauncherResult<usize> {
-        let imported_mods = extract_technic_zip_entries(&mut archive, &mods_dir, policy)?;
+        let imported_mods =
+            extract_technic_zip_entries(&mut archive, &mods_dir, policy, ctx, &target.staging_dir)?;
         // Stamp PackOrigin for Technic Zip — download_url (stripped) is the honest identity.
         let origin_url = if pack.download_url.trim().is_empty() {
             None
@@ -2478,6 +2594,8 @@ fn extract_technic_zip_entries<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     mods_dir: &Path,
     policy: OverridePolicy,
+    ctx: Option<&Ctx>,
+    instance_dir: &Path,
 ) -> LauncherResult<usize> {
     // Checked up-front: the per-file cap below is only reached by `mods/`
     // entries, so an archive made entirely of other paths would otherwise walk
@@ -2552,12 +2670,26 @@ fn extract_technic_zip_entries<R: Read + Seek>(
         let dest = mods_dir.join(relative);
         assert_safe_path(mods_dir, Path::new(relative))?;
         let buf = read_zip_entry_bounded(&mut entry, MAX_TECHNIC_ENTRY_BYTES, &entry_name)?;
-        fs::write(&dest, &buf).map_err(|e| {
-            import_error(
-                "ERR_IMPORT_WRITE",
-                format!("Cannot write {relative:?}: {e}"),
-            )
-        })?;
+        let key = format!("mods/{relative}");
+        let stored = match ctx {
+            Some(ctx) => crate::content_bridge::store_and_place_bytes(
+                ctx,
+                instance_dir,
+                &key,
+                &buf,
+                None,
+                None,
+            )?,
+            None => None,
+        };
+        if stored.is_none() {
+            fs::write(&dest, &buf).map_err(|e| {
+                import_error(
+                    "ERR_IMPORT_WRITE",
+                    format!("Cannot write {relative:?}: {e}"),
+                )
+            })?;
+        }
         imported_mods += 1;
     }
     Ok(imported_mods)
@@ -3034,6 +3166,7 @@ mod tests {
             None,
             false,
             install_anyway,
+            None,
         )
     }
 
@@ -3231,7 +3364,9 @@ mod tests {
             },
         );
 
-        let installed = inventory_pack_content(tmp.path(), "mods", "mod", &modrinth_files).unwrap();
+        let installed =
+            inventory_pack_content(tmp.path(), "mods", "mod", &modrinth_files, &BTreeMap::new())
+                .unwrap();
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].modrinth_id.as_deref(), Some("AANobbMI"));
         assert_eq!(installed[0].source, "modrinth-pack");
@@ -3258,7 +3393,9 @@ mod tests {
             },
         );
 
-        let installed = inventory_pack_content(tmp.path(), "mods", "mod", &modrinth_files).unwrap();
+        let installed =
+            inventory_pack_content(tmp.path(), "mods", "mod", &modrinth_files, &BTreeMap::new())
+                .unwrap();
         let state: Vec<(&str, bool)> = installed
             .iter()
             .map(|m| (m.filename.as_str(), m.enabled))
@@ -3276,8 +3413,14 @@ mod tests {
             b"s",
         )
         .unwrap();
-        let shaders =
-            inventory_pack_content(tmp.path(), "shaderpacks", "shader", &BTreeMap::new()).unwrap();
+        let shaders = inventory_pack_content(
+            tmp.path(),
+            "shaderpacks",
+            "shader",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(shaders.len(), 1);
         assert_eq!(shaders[0].filename, "BSL.zip");
         assert!(!shaders[0].enabled);
@@ -3300,7 +3443,14 @@ mod tests {
         fs::create_dir_all(tmp.path().join("mods")).unwrap();
         fs::write(tmp.path().join("mods").join("x.jar"), b"a").unwrap();
         fs::write(tmp.path().join("mods").join("x.jar.disabled"), b"b").unwrap();
-        let err = inventory_pack_content(tmp.path(), "mods", "mod", &BTreeMap::new()).unwrap_err();
+        let err = inventory_pack_content(
+            tmp.path(),
+            "mods",
+            "mod",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "ERR_IMPORT_DUPLICATE");
     }
 
@@ -4019,8 +4169,14 @@ mod tests {
         let mods_dir = tmp.path().join("mods");
         fs::create_dir_all(&mods_dir).unwrap();
         let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).unwrap();
-        let imported =
-            extract_technic_zip_entries(&mut archive, &mods_dir, OverridePolicy::Standard).unwrap();
+        let imported = extract_technic_zip_entries(
+            &mut archive,
+            &mods_dir,
+            OverridePolicy::Standard,
+            None,
+            tmp.path(),
+        )
+        .unwrap();
         assert_eq!(imported, 1);
         assert!(mods_dir.join("good.jar").exists());
         assert!(!mods_dir.join("ignored.txt").exists());
@@ -4038,9 +4194,14 @@ mod tests {
         let mods_dir = tmp.path().join("mods");
         fs::create_dir_all(&mods_dir).unwrap();
         let mut archive = zip::ZipArchive::new(io::Cursor::new(bytes)).unwrap();
-        let imported =
-            extract_technic_zip_entries(&mut archive, &mods_dir, OverridePolicy::Permissive)
-                .unwrap();
+        let imported = extract_technic_zip_entries(
+            &mut archive,
+            &mods_dir,
+            OverridePolicy::Permissive,
+            None,
+            tmp.path(),
+        )
+        .unwrap();
         assert_eq!(imported, 1);
         assert!(tmp.path().join("config/kept.txt").exists());
         assert!(!tmp.path().join("bin").exists());
@@ -4048,10 +4209,14 @@ mod tests {
 
         let exe = zip_bytes(&[("tools/run.bat", b"x")]);
         let mut archive = zip::ZipArchive::new(io::Cursor::new(exe)).unwrap();
-        assert!(
-            extract_technic_zip_entries(&mut archive, &mods_dir, OverridePolicy::Permissive)
-                .is_err()
-        );
+        assert!(extract_technic_zip_entries(
+            &mut archive,
+            &mods_dir,
+            OverridePolicy::Permissive,
+            None,
+            tmp.path()
+        )
+        .is_err());
     }
 
     #[test]
@@ -4060,27 +4225,39 @@ mod tests {
         let evil = zip_bytes(&[("mods/../evil.jar", b"boom")]);
         let tmp = tempfile::tempdir().unwrap();
         let mut archive = zip::ZipArchive::new(io::Cursor::new(evil)).unwrap();
-        assert!(
-            extract_technic_zip_entries(&mut archive, tmp.path(), OverridePolicy::Standard)
-                .is_err()
-        );
+        assert!(extract_technic_zip_entries(
+            &mut archive,
+            tmp.path(),
+            OverridePolicy::Standard,
+            None,
+            tmp.path()
+        )
+        .is_err());
         assert!(!tmp.path().parent().unwrap().join("evil.jar").exists());
 
         // A top-level mods/ file that is not .jar/.zip must be rejected.
         let exe = zip_bytes(&[("mods/hack.exe", b"MZ")]);
         let mut archive = zip::ZipArchive::new(io::Cursor::new(exe)).unwrap();
-        assert!(
-            extract_technic_zip_entries(&mut archive, tmp.path(), OverridePolicy::Standard)
-                .is_err()
-        );
+        assert!(extract_technic_zip_entries(
+            &mut archive,
+            tmp.path(),
+            OverridePolicy::Standard,
+            None,
+            tmp.path()
+        )
+        .is_err());
 
         // A nested mods/config/... entry is not a top-level mod.
         let nested = zip_bytes(&[("mods/sub/evil.jar", b"x")]);
         let mut archive = zip::ZipArchive::new(io::Cursor::new(nested)).unwrap();
-        assert!(
-            extract_technic_zip_entries(&mut archive, tmp.path(), OverridePolicy::Standard)
-                .is_err()
-        );
+        assert!(extract_technic_zip_entries(
+            &mut archive,
+            tmp.path(),
+            OverridePolicy::Standard,
+            None,
+            tmp.path()
+        )
+        .is_err());
     }
 
     #[test]
@@ -4142,11 +4319,11 @@ mod tests {
             solder_url: "https://solder.example.com/api".into(),
             build: "1.2.3".into(),
         };
-        let first = import_technic_solder_pack(&pack, &instances_root, None).unwrap();
+        let first = import_technic_solder_pack(&pack, &instances_root, None, None).unwrap();
         assert_eq!(first.instance_id, "Solder-Test");
         std::fs::write(instances_root.join("Solder-Test").join("keep.txt"), b"mine").unwrap();
 
-        let collision = import_technic_solder_pack(&pack, &instances_root, None).unwrap_err();
+        let collision = import_technic_solder_pack(&pack, &instances_root, None, None).unwrap_err();
         assert!(
             collision.to_string().contains("already exists"),
             "{collision}"
@@ -4155,7 +4332,8 @@ mod tests {
         let suggested = suggest_unique_import_name(&instances_root, "Solder Test").unwrap();
         assert_eq!(suggested, "Solder Test (2)");
 
-        let second = import_technic_solder_pack(&pack, &instances_root, Some(&suggested)).unwrap();
+        let second =
+            import_technic_solder_pack(&pack, &instances_root, Some(&suggested), None).unwrap();
         assert_eq!(second.name, "Solder Test (2)");
         assert_ne!(second.instance_id, first.instance_id);
         assert_eq!(
@@ -4178,7 +4356,7 @@ mod tests {
             solder_url: "https://solder.example.com/api?token=secret#frag".into(),
             build: "1.2.3".into(),
         };
-        let result = import_technic_solder_pack(&pack, &instances_root, None).unwrap();
+        let result = import_technic_solder_pack(&pack, &instances_root, None, None).unwrap();
         assert_eq!(result.instance_id, "Solder-Test");
         let manifest: InstanceManifest = serde_json::from_str(
             // allow-raw-instance-manifest
@@ -4386,6 +4564,7 @@ pub fn import_provider_pack(
     pack: &ProviderPackImport,
     instances_root: &Path,
     name_override: Option<&str>,
+    ctx: Option<&Ctx>,
 ) -> LauncherResult<ImportResult> {
     let plan = &pack.plan;
     let instance_name = apply_name_override(plan.name.clone(), name_override);
@@ -4410,12 +4589,25 @@ pub fn import_provider_pack(
                     import_error("ERR_IMPORT_MKDIR", format!("Cannot create folder: {e}"))
                 })?;
             }
-            fs::write(&dest, &bytes).map_err(|e| {
-                import_error(
-                    "ERR_IMPORT_WRITE",
-                    format!("Cannot write {}: {e}", file.path),
-                )
-            })?;
+            let stored = match ctx {
+                Some(ctx) => crate::content_bridge::store_and_place_bytes(
+                    ctx,
+                    &target.staging_dir,
+                    &file.path,
+                    &bytes,
+                    plan.version_number.as_deref(),
+                    Some(file.download.url.as_str()),
+                )?,
+                None => None,
+            };
+            if stored.is_none() {
+                fs::write(&dest, &bytes).map_err(|e| {
+                    import_error(
+                        "ERR_IMPORT_WRITE",
+                        format!("Cannot write {}: {e}", file.path),
+                    )
+                })?;
+            }
             imported += usize::from(file.path.starts_with("mods/"));
         }
 
@@ -4507,3 +4699,6 @@ pub fn import_provider_pack(
         }
     }
 }
+
+#[cfg(test)]
+mod import_store_tests;

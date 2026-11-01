@@ -34,6 +34,7 @@ pub struct StoreDetails<'a> {
 }
 
 /// The store item a file was added as, and the object it was placed from.
+#[derive(Clone)]
 pub struct StoredFile {
     pub item_id: String,
     pub sha256: String,
@@ -71,6 +72,130 @@ pub fn content_type_for_subdir(name: &str) -> Option<&'static str> {
         "saves" => Some("world"),
         _ => None,
     }
+}
+
+/// The content type of an instance-relative path, for the folders the manifest tracks as
+/// content. `saves/` is deliberately absent: a world is a folder of ordinary per-instance
+/// files, never a single stored item.
+pub fn tracked_content_type(relative_path: &str) -> Option<&'static str> {
+    let folder = relative_path.split(['/', '\\']).next().unwrap_or_default();
+    match folder {
+        "mods" => Some("mod"),
+        "resourcepacks" => Some("resourcepack"),
+        "shaderpacks" => Some("shader"),
+        "datapacks" => Some("datapack"),
+        _ => None,
+    }
+}
+
+fn file_name_of(relative_path: &str) -> &str {
+    relative_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(relative_path)
+}
+
+fn write_error(action: &str, path: &Path, error: std::io::Error) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_CONTENT_STORE".into(),
+        message: format!("Could not {action} {}: {error}", path.display()),
+    }
+}
+
+/// Store one file's bytes as a single-file item when `relative_path` is in a tracked content
+/// folder, without placing it anywhere yet. Returns `None` for any other path.
+pub fn store_bytes(
+    ctx: &Ctx,
+    relative_path: &str,
+    bytes: &[u8],
+    version: Option<&str>,
+    page_url: Option<&str>,
+) -> LauncherResult<Option<StoredFile>> {
+    let Some(content_type) = tracked_content_type(relative_path) else {
+        return Ok(None);
+    };
+    let filename = file_name_of(relative_path);
+    let incoming = ctx.paths.staging_root().join("pack-incoming");
+    std::fs::create_dir_all(&incoming)
+        .map_err(|error| write_error("create the store's incoming folder", &incoming, error))?;
+    let temp = incoming.join(format!("{}.bin", uuid::Uuid::new_v4()));
+    std::fs::write(&temp, bytes).map_err(|error| write_error("stage a pack file", &temp, error))?;
+    let stored = store_file(
+        ctx,
+        &temp,
+        &StoreDetails {
+            content_type,
+            filename,
+            version,
+            page_url,
+            description: None,
+            catalog_id: None,
+            provider: None,
+            provider_id: None,
+            provider_origin: None,
+        },
+    );
+    let _ = std::fs::remove_file(&temp);
+    Ok(Some(stored?))
+}
+
+/// Store one file's bytes and place the object at `instance_dir/<relative_path>` when that path
+/// is in a tracked content folder. Returns `None` and writes nothing for any other path, which
+/// stays an ordinary per-instance file its owner writes itself.
+pub fn store_and_place_bytes(
+    ctx: &Ctx,
+    instance_dir: &Path,
+    relative_path: &str,
+    bytes: &[u8],
+    version: Option<&str>,
+    page_url: Option<&str>,
+) -> LauncherResult<Option<StoredFile>> {
+    let Some(stored) = store_bytes(ctx, relative_path, bytes, version, page_url)? else {
+        return Ok(None);
+    };
+    let content_type =
+        tracked_content_type(relative_path).expect("a stored path is a tracked content path");
+    place_file(
+        ctx,
+        &stored.sha256,
+        instance_dir,
+        content_type,
+        file_name_of(relative_path),
+    )?;
+    Ok(Some(stored))
+}
+
+/// Store an existing file and place the object at `instance_dir/<relative_path>` when that path
+/// is in a tracked content folder. Returns `None` (having written nothing) for any other path.
+pub fn store_and_place_file(
+    ctx: &Ctx,
+    instance_dir: &Path,
+    relative_path: &str,
+    source: &Path,
+    version: Option<&str>,
+    page_url: Option<&str>,
+) -> LauncherResult<Option<StoredFile>> {
+    let Some(content_type) = tracked_content_type(relative_path) else {
+        return Ok(None);
+    };
+    let filename = file_name_of(relative_path);
+    let stored = store_file(
+        ctx,
+        source,
+        &StoreDetails {
+            content_type,
+            filename,
+            version,
+            page_url,
+            description: None,
+            catalog_id: None,
+            provider: None,
+            provider_id: None,
+            provider_origin: None,
+        },
+    )?;
+    place_file(ctx, &stored.sha256, instance_dir, content_type, filename)?;
+    Ok(Some(stored))
 }
 
 /// The folder a content type is installed into.
@@ -398,6 +523,12 @@ pub fn set_artifact_enabled(
 #[cfg(test)]
 pub fn init_local_state(ctx: &Ctx) {
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).expect("test local state");
+}
+
+/// How many items the content store holds. Test support only.
+#[cfg(test)]
+pub fn store_item_count(ctx: &Ctx) -> usize {
+    store::list_items(ctx).expect("list store items").len()
 }
 
 /// Store one file with review metadata and return its item id. Test support only.
