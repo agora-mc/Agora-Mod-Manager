@@ -13,7 +13,7 @@ use agora_core::{
     error::{LauncherError, LauncherResult},
     helpers,
     lock_manager::LockResource,
-    models::InstalledMod,
+    models::{InstalledMod, ProviderOrigin},
     paths, snapshot,
 };
 
@@ -29,6 +29,8 @@ pub struct StoreDetails<'a> {
     /// Generic provenance kind (`catalog`, `modrinth`, `manual`, `provider`).
     pub provider: Option<&'a str>,
     pub provider_id: Option<&'a str>,
+    /// Opaque provider provenance (a JSON string built by [`provider_origin_blob`]).
+    pub provider_origin: Option<&'a str>,
 }
 
 /// The store item a file was added as, and the object it was placed from.
@@ -42,6 +44,21 @@ fn content_error(error: store::ContentError) -> LauncherError {
         code: "ERR_CONTENT_STORE".into(),
         message: error.to_string(),
     }
+}
+
+/// The opaque provenance blob a provider install records, so an offline add can rebuild the exact
+/// `ProviderOrigin` (provider, project and version ids).
+pub fn provider_origin_blob(provider_id: &str, project_id: &str, version_id: &str) -> String {
+    serde_json::to_string(&ProviderOrigin {
+        provider_id: provider_id.to_string(),
+        project_id: project_id.to_string(),
+        version_id: version_id.to_string(),
+    })
+    .expect("provider origin is serializable")
+}
+
+fn provider_origin_from_blob(blob: &str) -> Option<ProviderOrigin> {
+    serde_json::from_str(blob).ok()
 }
 
 /// The content type that owns one of the store's instance-side folders.
@@ -106,6 +123,7 @@ pub fn store_file(
             catalog_id: details.catalog_id.map(str::to_string),
             provider: details.provider.map(str::to_string),
             provider_id: details.provider_id.map(str::to_string),
+            provider_origin: details.provider_origin.map(str::to_string),
             icon_sha256: None,
         },
     )
@@ -179,6 +197,13 @@ pub fn stored_mod_fields(item: &store::ContentItem) -> LauncherResult<(String, S
             "'{path}' is not in a Minecraft content folder; this item cannot be added to an instance."
         ),
     })?;
+    if content_type == "world" {
+        return Err(LauncherError::Generic {
+            code: "ERR_CONTENT_ITEM_NOT_SINGLE".into(),
+            message: "Worlds are folders, not single files; a world cannot be added to an instance this way."
+                .into(),
+        });
+    }
     let filename = parts
         .next()
         .filter(|name| !name.is_empty())
@@ -221,6 +246,18 @@ pub fn add_item_to_instance(
     }
     let mut manifest = helpers::read_manifest(&manifest_path)?;
     let item = load_item(ctx, item_id)?;
+    if let Some(game) = item.game_id.as_deref() {
+        if game != "minecraft" {
+            return Err(LauncherError::Generic {
+                code: "ERR_CONTENT_ITEM_OTHER_GAME".into(),
+                message: format!("This item belongs to '{game}', not Minecraft."),
+            });
+        }
+    }
+    let (content_type, filename, sha256) = stored_mod_fields(&item)?;
+    // An item saved here before (or one whose game was not named) was the user's choice to add.
+    let untagged = item.game_id.is_none();
+
     if let Some(existing) = manifest
         .mods
         .iter()
@@ -229,34 +266,68 @@ pub fn add_item_to_instance(
         .chain(manifest.datapacks.iter())
         .chain(manifest.worlds.iter())
         .find(|entry| entry.content_item_id.as_deref() == Some(item.item_id.as_str()))
+        .cloned()
     {
-        return Ok(existing.clone());
+        let placed_name = if existing.enabled {
+            existing.filename.clone()
+        } else {
+            format!("{}.disabled", existing.filename)
+        };
+        let target = dir
+            .join(helpers::content_subdir(&existing.content_type))
+            .join(&placed_name);
+        if !target.is_file() {
+            place_file(ctx, &sha256, &dir, &existing.content_type, &placed_name)?;
+            let _ = snapshot::mark_instance_mutated(&dir);
+        }
+        return Ok(existing);
     }
-    let (content_type, filename, sha256) = stored_mod_fields(&item)?;
+
     place_file(ctx, &sha256, &dir, &content_type, &filename)?;
     let target = dir
         .join(helpers::content_subdir(&content_type))
         .join(&filename);
     let metadata = crate::jar_metadata::parse_jar_metadata_for_loader(&target, &manifest.loader);
-    // Restore the provenance the install recorded, so a catalog item comes back as a catalog item
-    // and a raw Modrinth item as a raw Modrinth item.
-    let (registry_id, modrinth_id, source) = match item.provider.as_deref() {
-        Some("catalog") => (item.provider_id.clone(), None, "registry"),
-        Some("modrinth") => (None, item.provider_id.clone(), "modrinth_raw"),
-        Some("provider") => (item.provider_id.clone(), None, "provider"),
-        Some("manual") => (None, None, "manual"),
-        _ => (item.catalog_id.clone(), None, "content_store"),
+    // Restore the provenance the install recorded. A provider's full origin is rebuilt from the
+    // opaque blob; without one, an item called "provider" becomes a manual mod rather than claiming
+    // an origin that was not recorded. An item with no game id was the user's own choice.
+    let origin = item
+        .provider_origin
+        .as_deref()
+        .and_then(provider_origin_from_blob);
+    let (provider, registry_id, modrinth_id, source) = if untagged {
+        (None, None, None, "manual".to_string())
+    } else if let Some(origin) = origin {
+        (Some(origin), None, None, "provider".to_string())
+    } else {
+        match item.provider.as_deref() {
+            Some("catalog") => (None, item.provider_id.clone(), None, "registry".to_string()),
+            Some("modrinth") => (
+                None,
+                None,
+                item.provider_id.clone(),
+                "modrinth_raw".to_string(),
+            ),
+            Some("provider") => (None, None, None, "manual".to_string()),
+            Some("manual") => (None, None, None, "manual".to_string()),
+            _ => (
+                None,
+                item.catalog_id.clone(),
+                None,
+                "content_store".to_string(),
+            ),
+        }
     };
     let installed = InstalledMod {
         hash_verified: false,
-        provider: None,
+        provider,
         update_pinned: false,
         pack_managed: false,
         installed_as_dependency: false,
         filename,
         registry_id,
         modrinth_id,
-        source: source.to_string(),
+        source,
         source_url: item.page_url.clone(),
         version: item.version.clone(),
         sha256: sha256.clone(),
@@ -277,7 +348,11 @@ pub fn add_item_to_instance(
         object_sha256: Some(sha256),
     };
     helpers::push_to_content_array(&mut manifest, &installed);
-    helpers::atomic_write_manifest(&manifest_path, &manifest)?;
+    if let Err(error) = helpers::atomic_write_manifest(&manifest_path, &manifest) {
+        // The placement is ours and has no manifest entry yet: take it back.
+        let _ = std::fs::remove_file(&target);
+        return Err(error);
+    }
     let _ = snapshot::mark_instance_mutated(&dir);
     Ok(installed)
 }
@@ -323,4 +398,29 @@ pub fn set_artifact_enabled(
 #[cfg(test)]
 pub fn init_local_state(ctx: &Ctx) {
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).expect("test local state");
+}
+
+/// Store one file with review metadata and return its item id. Test support only.
+#[cfg(test)]
+pub fn store_review_item(ctx: &Ctx, source: &Path, rel: &str, game_id: Option<&str>) -> String {
+    let outcome =
+        store::add_file(ctx, source, Some("review"), Some(rel)).expect("store review item");
+    let item = outcome.item().clone();
+    store::set_item_metadata(
+        ctx,
+        &item.item_id,
+        store::ItemMetadata {
+            description: None,
+            page_url: None,
+            version: Some("1.0.0".into()),
+            game_id: game_id.map(str::to_string),
+            catalog_id: None,
+            provider: None,
+            provider_id: None,
+            provider_origin: None,
+            icon_sha256: None,
+        },
+    )
+    .expect("set review metadata");
+    item.item_id
 }

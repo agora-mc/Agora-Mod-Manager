@@ -686,6 +686,7 @@ fn adding_a_stored_item_offline_needs_no_network() {
             catalog_id: None,
             provider: None,
             provider_id: None,
+            provider_origin: None,
         },
     )
     .unwrap();
@@ -712,32 +713,11 @@ fn adding_a_stored_item_offline_needs_no_network() {
 }
 
 // ---------------------------------------------------------------------------
-// Review tests (branch review/store-b). Each is `#[ignore]`d because it proves a bug; run with
-//   cargo nextest run -p agora-game-minecraft --lib --run-ignored only -E 'test(review_)'
+// Review tests (branch review/store-b), no longer ignored, plus the two follow-up cases.
 // ---------------------------------------------------------------------------
 
-fn review_store_item(
-    ctx: &Ctx,
-    source: &Path,
-    rel: &str,
-    game_id: Option<&str>,
-) -> agora_core::content_store::ContentItem {
-    use agora_core::content_store as store;
-    let outcome = store::add_file(ctx, source, Some("review"), Some(rel)).unwrap();
-    let item = outcome.item().clone();
-    store::set_item_metadata(
-        ctx,
-        &item.item_id,
-        store::ItemMetadata {
-            description: None,
-            page_url: None,
-            version: Some("1.0.0".into()),
-            game_id: game_id.map(str::to_string),
-            catalog_id: None,
-            icon_sha256: None,
-        },
-    )
-    .unwrap()
+fn review_store_item(ctx: &Ctx, source: &Path, rel: &str, game_id: Option<&str>) -> String {
+    crate::content_bridge::store_review_item(ctx, source, rel, game_id)
 }
 
 #[cfg(windows)]
@@ -749,15 +729,14 @@ fn review_set_readonly(path: &Path, readonly: bool) {
 }
 
 #[test]
-#[ignore = "proves bug: the offline add ignores the item's game_id and adds a Skyrim item to a Minecraft instance"]
 fn review_offline_add_refuses_an_item_of_another_game() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
     let source = write_mod_jar(tmp.path(), "other", "1.0.0");
-    let item = review_store_item(&ctx, &source, "mods/other.jar", Some("skyrim"));
+    let item_id = review_store_item(&ctx, &source, "mods/other.jar", Some("skyrim"));
 
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let result = service.install_stored_item("test", &item.item_id);
+    let result = service.install_stored_item("test", &item_id);
 
     assert!(
         result.is_err(),
@@ -768,17 +747,16 @@ fn review_offline_add_refuses_an_item_of_another_game() {
 }
 
 #[test]
-#[ignore = "proves bug: adding an item that is already in the manifest returns the entry without checking its file exists"]
 fn review_offline_add_restores_a_file_deleted_by_hand() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
     let source = write_mod_jar(tmp.path(), "offline", "1.0.0");
-    let item = review_store_item(&ctx, &source, "mods/offline.jar", Some("minecraft"));
+    let item_id = review_store_item(&ctx, &source, "mods/offline.jar", Some("minecraft"));
     let service = crate::install_service::InstallService::new(ctx.clone());
-    service.install_stored_item("test", &item.item_id).unwrap();
+    service.install_stored_item("test", &item_id).unwrap();
     std::fs::remove_file(dir.join("mods/offline.jar")).unwrap();
 
-    service.install_stored_item("test", &item.item_id).unwrap();
+    service.install_stored_item("test", &item_id).unwrap();
 
     assert!(
         dir.join("mods/offline.jar").is_file(),
@@ -788,17 +766,16 @@ fn review_offline_add_restores_a_file_deleted_by_hand() {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "proves bug: the offline add places the file before the manifest write, so a failed write leaves an unrecorded file"]
 fn review_offline_add_failing_manifest_write_leaves_no_file() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
     let source = write_mod_jar(tmp.path(), "offline", "1.0.0");
-    let item = review_store_item(&ctx, &source, "mods/offline.jar", Some("minecraft"));
+    let item_id = review_store_item(&ctx, &source, "mods/offline.jar", Some("minecraft"));
     let manifest_path = dir.join("instance_manifest.json");
     review_set_readonly(&manifest_path, true);
 
     let service = crate::install_service::InstallService::new(ctx.clone());
-    let result = service.install_stored_item("test", &item.item_id);
+    let result = service.install_stored_item("test", &item_id);
     review_set_readonly(&manifest_path, false);
 
     assert!(result.is_err(), "the manifest write was made to fail");
@@ -810,7 +787,6 @@ fn review_offline_add_failing_manifest_write_leaves_no_file() {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "proves bug: a manual reinstall removes the old file before the manifest write, so a failed write leaves new bytes under the old record"]
 fn review_failed_manual_reinstall_keeps_the_old_file() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
@@ -850,7 +826,6 @@ fn review_failed_manual_reinstall_keeps_the_old_file() {
 }
 
 #[test]
-#[ignore = "proves bug: a manual reinstall of a matching file appends a second manifest entry for the same filename"]
 fn review_manual_reinstall_leaves_one_manifest_entry() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
@@ -871,7 +846,6 @@ fn review_manual_reinstall_leaves_one_manifest_entry() {
 }
 
 #[test]
-#[ignore = "proves bug: remove_artifact falls back to deleting any same-named file in another content folder when the recorded file is gone"]
 fn review_remove_never_deletes_a_same_named_file_in_another_folder() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
@@ -915,7 +889,6 @@ fn review_remove_never_deletes_a_same_named_file_in_another_folder() {
 }
 
 #[test]
-#[ignore = "proves bug: remove_artifact deletes a file with no manifest entry (Agora never placed it)"]
 fn review_remove_never_deletes_an_untracked_file() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
@@ -932,7 +905,6 @@ fn review_remove_never_deletes_an_untracked_file() {
 }
 
 #[test]
-#[ignore = "proves bug: an update only checks the bytes of entries that carry object_sha256, so a user-replaced file of any other entry is deleted"]
 fn review_update_keeps_a_user_replaced_file_of_an_entry_without_object_hash() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (ctx, dir) = ctx_instance(&tmp, "test");
@@ -965,4 +937,92 @@ fn review_update_keeps_a_user_replaced_file_of_an_entry_without_object_hash() {
         Some(&b"the users new bytes"[..]),
         "the user's file was deleted instead of kept"
     );
+}
+
+#[test]
+fn review_offline_add_refuses_a_world_item() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "world", "1.0.0");
+    let item_id = review_store_item(&ctx, &source, "saves/World", Some("minecraft"));
+
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let result = service.install_stored_item("test", &item_id);
+
+    assert!(
+        result.is_err(),
+        "a world folder is not a single content file"
+    );
+    assert!(!dir.join("saves/World").exists());
+}
+
+#[test]
+fn review_offline_add_without_game_id_is_a_manual_mod() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, dir) = ctx_instance(&tmp, "test");
+    let source = write_mod_jar(tmp.path(), "untagged", "1.0.0");
+    let item_id = review_store_item(&ctx, &source, "mods/untagged.jar", None);
+
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let installed = service.install_stored_item("test", &item_id).unwrap();
+
+    assert_eq!(installed.source, "manual");
+    assert!(installed.registry_id.is_none());
+    assert!(installed.modrinth_id.is_none());
+    assert!(dir.join("mods/untagged.jar").is_file());
+}
+
+#[test]
+fn review_provider_origin_round_trips_offline() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (ctx, first) = ctx_instance(&tmp, "first");
+    let second = ctx.paths.instance_dir("second").unwrap();
+    std::fs::create_dir_all(second.join("mods")).unwrap();
+    let mut manifest = read_instance_manifest(&first);
+    manifest.instance_id = "second".into();
+    std::fs::write(
+        second.join("instance_manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let source = write_mod_jar(tmp.path(), "provider-mod", "1.0.0");
+    let mut plan = resolve_local_plan(&first, &source, "provider.jar", None);
+    if let ResolvedArtifact::Download(local) = &mut plan.files_to_add[0].artifact {
+        local.metadata.source_type = SourceType::Provider;
+        local.metadata.provider = Some(ProviderArtifact {
+            provider_id: "plugin-x".into(),
+            project_id: "proj".into(),
+            version_id: "v1".into(),
+            download_hosts: Vec::new(),
+            low_security: false,
+            security_notes: Vec::new(),
+        });
+    } else {
+        panic!("the local plan is a download artifact");
+    }
+    let staging = first.join(".agora").join("staging").join("provider-test");
+    std::fs::create_dir_all(staging.join("artifacts")).unwrap();
+    std::fs::copy(
+        &source,
+        staging
+            .join("artifacts")
+            .join(&plan.files_to_add[0].staging_filename),
+    )
+    .unwrap();
+    prepare_manifest(&plan, &first, &staging, Some(&ctx)).unwrap();
+    // allow-raw-instance-manifest
+    let prepared: InstanceManifest = serde_json::from_slice(
+        &std::fs::read(staging.join("instance_manifest.next.json")).unwrap(),
+    )
+    .unwrap();
+    let item_id = prepared.mods[0].content_item_id.clone().unwrap();
+
+    let service = crate::install_service::InstallService::new(ctx.clone());
+    let installed = service.install_stored_item("second", &item_id).unwrap();
+    let origin = installed.provider.expect("the provider origin is rebuilt");
+    assert_eq!(origin.provider_id, "plugin-x");
+    assert_eq!(origin.project_id, "proj");
+    assert_eq!(origin.version_id, "v1");
+    assert_eq!(installed.source, "provider");
 }

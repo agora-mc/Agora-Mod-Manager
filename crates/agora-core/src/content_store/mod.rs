@@ -147,6 +147,10 @@ pub struct ContentItem {
     /// The id that provider uses for the item.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Opaque provider provenance the installer recorded, so an offline add can restore it
+    /// exactly. Core stores and returns it without interpreting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_origin: Option<String>,
     /// The SHA-256 of a stored object holding the icon, never a URL alone: the bytes are in the
     /// store like any other content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,6 +175,8 @@ pub struct ItemMetadata {
     pub provider: Option<String>,
     #[serde(default)]
     pub provider_id: Option<String>,
+    #[serde(default)]
+    pub provider_origin: Option<String>,
     #[serde(default)]
     pub icon_sha256: Option<String>,
 }
@@ -1556,6 +1562,7 @@ fn commit_manifest(
             catalog_id: None,
             provider: None,
             provider_id: None,
+            provider_origin: None,
             icon_sha256: None,
         };
         write_manifest_atomic(&ctx.paths, &item)?;
@@ -1582,6 +1589,7 @@ pub fn set_item_metadata(
     item.catalog_id = metadata.catalog_id;
     item.provider = metadata.provider;
     item.provider_id = metadata.provider_id;
+    item.provider_origin = metadata.provider_origin;
     item.icon_sha256 = metadata.icon_sha256;
     write_manifest_atomic(&ctx.paths, &item)?;
     Ok(item)

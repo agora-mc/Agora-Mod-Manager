@@ -154,6 +154,7 @@ fn an_item_written_before_metadata_still_loads() {
     assert!(item.catalog_id.is_none());
     assert!(item.provider.is_none());
     assert!(item.provider_id.is_none());
+    assert!(item.provider_origin.is_none());
     assert!(item.icon_sha256.is_none());
 
     let serialized = serde_json::to_value(&item).unwrap();
@@ -165,6 +166,7 @@ fn an_item_written_before_metadata_still_loads() {
         "catalog_id",
         "provider",
         "provider_id",
+        "provider_origin",
         "icon_sha256",
     ] {
         assert!(
@@ -181,6 +183,7 @@ fn an_item_written_before_metadata_still_loads() {
         catalog_id: Some("example-mod".into()),
         provider: Some("catalog".into()),
         provider_id: Some("example-mod".into()),
+        provider_origin: None,
         icon_sha256: Some("cd".repeat(32)),
     };
     set_item_metadata(&ctx, &item_id, metadata.clone()).unwrap();

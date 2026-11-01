@@ -44,7 +44,10 @@ use agora_core::{
 };
 
 // Reuse types from dependency_ops to avoid duplication.
-pub use agora_core::dependency_ops::{DepSource, Requirement};
+pub use agora_core::{
+    dependency_ops::{DepSource, Requirement},
+    event_sink::CancellationToken,
+};
 
 /// Optional host-owned resources used while executing an install. Core-only
 /// callers can use the default; application hosts supply their bounded worker
@@ -920,9 +923,6 @@ pub enum ProgressPhase {
 // ---------------------------------------------------------------------------
 // 23. CancellationToken — re-exported from canonical event_sink module
 // ---------------------------------------------------------------------------
-
-/// Re-exported from `agora_core::event_sink` — the canonical cancellation type.
-pub use agora_core::event_sink::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // 24. ProgressReporter trait (Tauri-agnostic, uses legacy ProgressEvent)
@@ -3835,6 +3835,13 @@ fn prepare_manifest(
                         .or(metadata.modrinth_id.as_deref()),
                 ),
             };
+            let provider_origin = metadata.provider.as_ref().map(|origin| {
+                crate::content_bridge::provider_origin_blob(
+                    &origin.provider_id,
+                    &origin.project_id,
+                    &origin.version_id,
+                )
+            });
             let details = crate::content_bridge::StoreDetails {
                 content_type: &content_type,
                 filename: &installed_filename,
@@ -3848,6 +3855,7 @@ fn prepare_manifest(
                     .or(metadata.modrinth_id.as_deref()),
                 provider: Some(provider),
                 provider_id,
+                provider_origin: provider_origin.as_deref(),
             };
             let stored = crate::content_bridge::store_file(ctx, &staged, &details)
                 .map_err(|error| format!("could not store {}: {error}", add.target_filename))?;
@@ -3949,28 +3957,37 @@ fn apply_transaction(
                 if let Some(entry) =
                     manifest_entry_for(&manifest, &remove.filename, remove.content_type.as_deref())
                 {
-                    if let Some(recorded) = entry.object_sha256.as_deref() {
-                        match crate::content_bridge::file_matches_recorded(&live, recorded) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                let aside = moved_aside_path(instance_dir, relative);
-                                if let Some(parent) = aside.parent() {
-                                    std::fs::create_dir_all(parent).map_err(|e| {
-                                        format!("failed to create the moved-aside folder: {e}")
-                                    })?;
-                                }
-                                std::fs::rename(&live, &aside).map_err(|e| {
-                                    format!(
-                                        "failed to move your changed {} aside: {e}",
-                                        remove.filename
-                                    )
-                                })?;
-                                journal.moved_aside.push((aside.clone(), live));
-                                moved_aside.push(aside);
-                                continue;
-                            }
-                            Err(error) => return Err(error.to_string()),
+                    // Entries written before the store carry the object hash in `sha256`; with
+                    // neither hash there is no way to prove the file is Agora's, so it is the
+                    // user's.
+                    let recorded = entry
+                        .object_sha256
+                        .as_deref()
+                        .filter(|hash| !hash.is_empty())
+                        .or_else(|| {
+                            let hash = entry.sha256.as_str();
+                            (!hash.is_empty()).then_some(hash)
+                        });
+                    let users_file = match recorded {
+                        Some(recorded) => {
+                            !crate::content_bridge::file_matches_recorded(&live, recorded)
+                                .map_err(|error| error.to_string())?
                         }
+                        None => true,
+                    };
+                    if users_file {
+                        let aside = moved_aside_path(instance_dir, relative);
+                        if let Some(parent) = aside.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                format!("failed to create the moved-aside folder: {e}")
+                            })?;
+                        }
+                        std::fs::rename(&live, &aside).map_err(|e| {
+                            format!("failed to move your changed {} aside: {e}", remove.filename)
+                        })?;
+                        journal.moved_aside.push((aside.clone(), live));
+                        moved_aside.push(aside);
+                        continue;
                     }
                 }
             }
