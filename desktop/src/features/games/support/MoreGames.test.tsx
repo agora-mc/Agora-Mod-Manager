@@ -57,6 +57,9 @@ function answer(overrides: {
   unavailableReason?: string | null;
   dismissed?: boolean;
   install?: (args?: Record<string, unknown>) => unknown;
+  games?: unknown | (() => unknown);
+  picked?: string | null;
+  added?: { path: string; gameId: string; gameName: string };
 } = {}) {
   invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
     if (command === 'list_official_plugins') {
@@ -73,6 +76,17 @@ function answer(overrides: {
     if (command === 'install_official_plugin') {
       if (overrides.install) return overrides.install(args);
       return { outcome: 'installed', plugin: { id: 'agora.skyrim', name: 'Skyrim Special Edition' } };
+    }
+    if (command === 'games_list') {
+      return typeof overrides.games === 'function' ? overrides.games() : overrides.games ?? { games: [] };
+    }
+    if (command === 'pick_directory') return overrides.picked ?? null;
+    if (command === 'games_add_folder') {
+      return overrides.added ?? {
+        path: 'D:/Games/Skyrim',
+        gameId: 'skyrim-se',
+        gameName: 'Skyrim Special Edition',
+      };
     }
     if (command === 'restart_app') return null;
     throw new Error(`Unexpected command ${command}`);
@@ -110,13 +124,45 @@ describe('More games card', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Install' }));
 
-    expect(await screen.findByText('Restart Agora to add Skyrim Special Edition.')).toBeInTheDocument();
+    expect(await screen.findByText('Restart Agora to finish adding Skyrim Special Edition.')).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
       pluginId: 'agora.skyrim',
       acceptCapabilities: true,
       allowScripts: false,
     });
     expect(screen.queryByTestId('more-games')).not.toBeNull();
+  });
+
+  it('says the installed game was not found and offers to add its folder', async () => {
+    let hasInstall = false;
+    answer({
+      install: (args) => {
+        if (args?.acceptCapabilities === true) {
+          return { outcome: 'installed', plugin: { id: 'agora.skyrim', name: 'Skyrim Special Edition' } };
+        }
+        return { outcome: 'needsConsent', preview: consentPreview };
+      },
+      games: () => ({
+        games: hasInstall
+          ? [{ gameId: 'skyrim-se', name: 'Skyrim Special Edition', installs: [{}] }]
+          : [],
+      }),
+      picked: 'D:/Games/Skyrim',
+      added: { path: 'D:/Games/Skyrim', gameId: 'skyrim-se', gameName: 'Skyrim Special Edition' },
+    });
+    render(<MoreGamesCard surface="settings" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Install Skyrim Special Edition' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Install', exact: true }));
+
+    expect(await screen.findByText(MORE_GAMES_COPY.notFound('Skyrim Special Edition'))).toBeInTheDocument();
+
+    hasInstall = true;
+    fireEvent.click(screen.getByRole('button', { name: 'Add game folder for Skyrim Special Edition' }));
+
+    expect(await screen.findByText('Added D:/Games/Skyrim as Skyrim Special Edition.')).toBeInTheDocument();
+    expect(screen.queryByText(MORE_GAMES_COPY.notFound('Skyrim Special Edition'))).toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith('games_add_folder', { path: 'D:/Games/Skyrim' });
   });
 
   it('is hidden on Home when every official game plugin is installed or the list is empty', async () => {
@@ -198,7 +244,7 @@ describe('More games card', () => {
     expect(await screen.findByText('Skyrim Special Edition runs code. Allow it?')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Install and allow code' }));
 
-    expect(await screen.findByText('Restart Agora to add Skyrim Special Edition.')).toBeInTheDocument();
+    expect(await screen.findByText('Restart Agora to finish adding Skyrim Special Edition.')).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
       pluginId: 'agora.skyrim',
       acceptCapabilities: true,

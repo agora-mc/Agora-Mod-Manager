@@ -8,6 +8,8 @@ import {
 } from '@/features/plugins/api';
 import { InstallPrompt } from '@/features/plugins/InstallPrompt';
 import type { InstallPreview, OfficialPluginInfo } from '@/features/plugins/types';
+import { AddGameFolderButton } from '../discovery';
+import { listInstalledGames } from '../discovery/api';
 
 /**
  * The "More games" card: official plugins that add a game Agora does not have
@@ -23,14 +25,15 @@ import type { InstallPreview, OfficialPluginInfo } from '@/features/plugins/type
 /** The copy for the card, in one place so the wording can change without touching logic. */
 export const MORE_GAMES_COPY = {
   title: 'More games',
-  description: 'Agora can run other games too. Install one to add it to your game switcher.',
+  description: 'Agora can run other games too. Install one to add its game to Agora.',
   install: 'Install',
   installing: 'Installing…',
   dismiss: 'Dismiss',
   empty: 'Nothing else is available to install right now.',
   unavailable: 'Agora could not load the list of more games.',
   hashMismatch: 'The download did not match what Agora expected, so nothing was installed.',
-  restart: (name: string) => `Restart Agora to add ${name}.`,
+  restart: (name: string) => `Restart Agora to finish adding ${name}.`,
+  notFound: (name: string) => `Agora did not find ${name} on this computer. Add the folder it is in.`,
   restartNow: 'Restart now',
 } as const;
 
@@ -79,7 +82,9 @@ export function MoreGamesCard({ surface }: { surface: 'home' | 'settings' }) {
   const [dismissedRead, setDismissedRead] = useState(false);
   const [installingId, setInstallingId] = useState<string | null>(null);
   const [consent, setConsent] = useState<{ info: OfficialPluginInfo; preview: InstallPreview } | null>(null);
-  const [added, setAdded] = useState<string | null>(null);
+  const [added, setAdded] = useState<{ name: string; gameIds: string[]; found: boolean | null } | null>(null);
+  const [addNotice, setAddNotice] = useState<string | null>(null);
+  const [addError, setAddError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const reload = useCallback(() => {
@@ -128,12 +133,36 @@ export function MoreGamesCard({ surface }: { surface: 'home' | 'settings' }) {
     setConsent(null);
     setInstallingId(null);
     setError(null);
-    setAdded(info.name);
+    setAddNotice(null);
+    setAddError(null);
+    // `found` stays unknown while discovery is asked, and if it fails: a failed read is not
+    // "not found", so the card never sends a player looking for a folder that is already there.
+    setAdded({ name: info.name, gameIds: info.gameIds, found: null });
+    listInstalledGames()
+      .then((list) => {
+        const found = list.games.some(
+          (game) => info.gameIds.includes(game.gameId) && game.installs.length > 0,
+        );
+        setAdded((current) => (current && current.name === info.name ? { ...current, found } : current));
+      })
+      .catch(() => {
+        // Leave `found` unknown; the restart note is still all that can be said.
+      });
     setLoad((current) =>
       current.status === 'loaded'
         ? { ...current, plugins: current.plugins.filter((entry) => entry.id !== info.id) }
         : current,
     );
+  }, []);
+
+  const folderAdded = useCallback((folder: { path: string; gameId: string; gameName: string }) => {
+    setAddError(null);
+    setAddNotice(`Added ${folder.path} as ${folder.gameName}.`);
+    setAdded((current) => {
+      if (!current) return current;
+      if (!current.gameIds.includes(folder.gameId)) return current;
+      return { ...current, found: true };
+    });
   }, []);
 
   const startInstall = useCallback(async (info: OfficialPluginInfo) => {
@@ -210,9 +239,26 @@ export function MoreGamesCard({ surface }: { surface: 'home' | 'settings' }) {
       <p className="mt-1 text-sm text-muted-foreground">{MORE_GAMES_COPY.description}</p>
 
       {added ? (
-        <div className="mt-3 rounded-lg border border-border bg-muted/30 p-3" role="status">
-          <p className="text-sm">{MORE_GAMES_COPY.restart(added)}</p>
-          <Button size="sm" className="mt-2" onClick={() => void restartApp()}>
+        <div className="mt-3 space-y-2 rounded-lg border border-border bg-muted/30 p-3" role="status">
+          <p className="text-sm">{MORE_GAMES_COPY.restart(added.name)}</p>
+          {added.found === false ? (
+            <div className="space-y-2">
+              <p className="text-sm text-muted-foreground">{MORE_GAMES_COPY.notFound(added.name)}</p>
+              <AddGameFolderButton
+                label="Add game folder"
+                ariaLabel={`Add game folder for ${added.name}`}
+                size="sm"
+                onError={(message) => {
+                  setAddNotice(null);
+                  setAddError(message);
+                }}
+                onAdded={folderAdded}
+              />
+            </div>
+          ) : null}
+          {addNotice ? <p className="text-xs text-muted-foreground">{addNotice}</p> : null}
+          {addError ? <p role="alert" className="text-xs text-destructive">{addError}</p> : null}
+          <Button size="sm" onClick={() => void restartApp()}>
             {MORE_GAMES_COPY.restartNow}
           </Button>
         </div>

@@ -10,6 +10,7 @@ Ed25519 signature file registry.db.sig.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -2960,6 +2961,58 @@ OFFICIAL_PLUGIN_RELEASE_KEYS = {"version", "package_url", "sha256", "tree_sha256
 OFFICIAL_PLUGIN_KEYS = {
     "id", "name", "description", "game_ids", "min_agora_version", "current", "previous",
 }
+OFFICIAL_FETCH_TIMEOUT_SECONDS = 30
+
+
+def _fetch_official_package(url: str) -> bytes:
+    """Download an official plugin package, refusing anything larger than the size cap."""
+    response = requests.get(url, timeout=OFFICIAL_FETCH_TIMEOUT_SECONDS, stream=True)
+    try:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > OFFICIAL_PACKAGE_MAX_BYTES:
+                raise ValueError(
+                    f"the package is larger than the {OFFICIAL_PACKAGE_MAX_BYTES}-byte cap"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        response.close()
+
+
+def _verify_official_release(
+    path: Path,
+    label: str,
+    release: dict[str, Any],
+    fetch: Callable[[str], bytes],
+) -> None:
+    """Refuse an entry whose URL does not serve the bytes its size and sha256 pin.
+
+    A catalog that lists an official plugin is the app's only source for that
+    download, so an asset that is missing, private or was replaced must stop the
+    compile instead of shipping an entry that cannot install.
+    """
+    url = release["package_url"]
+    try:
+        data = fetch(url)
+    except Exception as exc:  # noqa: BLE001 - every fetch failure is the same refusal
+        raise SystemExit(
+            f"{path}: {label}.package_url does not resolve to a package: {url}: {exc}"
+        ) from exc
+    if len(data) != release["size"]:
+        raise SystemExit(
+            f"{path}: {label}.size is {release['size']} but {url} served {len(data)} bytes"
+        )
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != release["sha256"]:
+        raise SystemExit(
+            f"{path}: {label}.sha256 is {release['sha256']} but {url} served {actual}"
+        )
 
 
 def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
@@ -3018,13 +3071,19 @@ def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
     }
 
 
-def load_official_plugins() -> list[tuple[Path, dict[str, Any]]]:
+def load_official_plugins(
+    fetch: Callable[[str], bytes] | None = _fetch_official_package,
+) -> list[tuple[Path, dict[str, Any]]]:
     """Read ``registry/official-plugins/<id>.json``, one file per official plugin.
 
     The folder is flat and the file name must be the plugin id, so an id cannot
     be listed twice. Anything malformed refuses the whole compile: this table is
     what the app trusts to decide which downloads count as official, so a typo
     must not become a silently missing or silently different entry.
+
+    Each release's ``package_url`` must also serve the bytes its ``size`` and
+    ``sha256`` pin. Pass a fetcher in tests; ``None`` skips the download and is
+    only for tests that are not about the asset.
     """
     root = REGISTRY_DIR / "official-plugins"
     results: list[tuple[Path, dict[str, Any]]] = []
@@ -3088,6 +3147,10 @@ def load_official_plugins() -> list[tuple[Path, dict[str, Any]]]:
             previous = _official_release(path, "previous", data["previous"])
             if previous["version"] == current["version"]:
                 raise SystemExit(f"{path}: previous must be a different version from current")
+        if fetch is not None:
+            _verify_official_release(path, "current", current, fetch)
+            if previous is not None:
+                _verify_official_release(path, "previous", previous, fetch)
         results.append(
             (
                 path,
@@ -4487,8 +4550,14 @@ def compile_registry(
     registry_root: str | None = None,
     state_in_path: Path | None = None,
     state_out_path: Path | None = None,
+    official_fetcher: Callable[[str], bytes] | None = _fetch_official_package,
 ) -> None:
-    """Build the SQLite registry database at *output_path*."""
+    """Build the SQLite registry database at *output_path*.
+
+    ``official_fetcher`` downloads each official plugin package so its URL,
+    size and sha256 can be checked. Tests pass their own fetcher, or ``None``
+    when the test is not about the asset.
+    """
     global REGISTRY_DIR
     if registry_root:
         REGISTRY_DIR = Path(registry_root).resolve()
@@ -4527,7 +4596,7 @@ def compile_registry(
     game_items = load_game_manifests(game_declarations)
     # Official plugins (registry/official-plugins/): read up front so a malformed
     # entry stops the compile before any slow work, and written to their own table.
-    official_plugins = load_official_plugins()
+    official_plugins = load_official_plugins(official_fetcher)
 
     # Identity must be canonical before hydration and governance. Keep the
     # legacy alias readable for existing registries, but never let downstream
