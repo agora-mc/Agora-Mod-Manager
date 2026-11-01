@@ -1098,7 +1098,9 @@ pub async fn install_raw_modrinth(
             .collect(),
         enabled: true,
         content_type: "mod".to_string(),
-    };
+    
+        content_item_id: None,
+        object_sha256: None,};
 
     manifest.mods.push(installed_mod.clone());
 

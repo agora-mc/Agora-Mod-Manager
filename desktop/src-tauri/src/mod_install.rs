@@ -290,6 +290,25 @@ pub async fn add_manual_mod(
     })?
 }
 
+/// Add an item already in the shared content store to an instance, with no network.
+pub async fn add_stored_content(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+    item_id: &str,
+) -> LauncherResult<InstalledMod> {
+    let ctx = crate::core_context(app)?;
+    let (iid, item) = (instance_id.to_string(), item_id.to_string());
+    tokio::task::spawn_blocking(move || {
+        let svc = agora_game_minecraft::install_service::InstallService::new(ctx);
+        svc.install_stored_item(&iid, &item)
+    })
+    .await
+    .map_err(|_| LauncherError::Generic {
+        code: "ERR_MANIFEST_WRITE".into(),
+        message: "Add stored content task failed.".into(),
+    })?
+}
+
 /// Names of the mods an export in `format` would leave a friend unable to
 /// install. The logic lives in core, so the desktop and any other front end
 /// give the same answer.

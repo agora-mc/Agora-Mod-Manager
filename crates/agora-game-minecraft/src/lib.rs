@@ -6,6 +6,7 @@ pub mod agora_pack_import;
 pub mod bisect_service;
 pub mod browse_cache;
 pub mod clone;
+mod content_bridge;
 pub mod context;
 pub mod controller_service;
 pub mod curated_pack;

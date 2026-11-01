@@ -1392,7 +1392,9 @@ fn build_future_manifest(
                 .collect(),
             enabled: old.enabled,
             content_type: normalized_content_type(&swap.content_type).to_string(),
-        };
+        
+            content_item_id: None,
+            object_sha256: None,};
         // Drop every stale record of this identity across all buckets (the
         // pipeline applies the same rule at `prepare_manifest`).
         let identity = installed_identity(&installed);
@@ -1979,7 +1981,9 @@ mod tests {
                 provided_mod_ids: Vec::new(),
                 enabled: true,
                 content_type: seed.content_type.into(),
-            };
+            
+                content_item_id: None,
+                object_sha256: None,};
             match normalized_content_type(seed.content_type) {
                 "resourcepack" => manifest.resourcepacks.push(entry),
                 "shader" => manifest.shaders.push(entry),

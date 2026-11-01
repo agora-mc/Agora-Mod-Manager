@@ -36,9 +36,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use agora_core::artifact_hash::{all_unmet, ConfirmableHash, HashOrigin};
-use agora_core::error::HashConfirmation;
-use agora_core::task_scheduler::{BlockingPriority, TaskScheduler};
+use agora_core::{
+    artifact_hash::{all_unmet, ConfirmableHash, HashOrigin},
+    ctx::Ctx,
+    error::HashConfirmation,
+    task_scheduler::{BlockingPriority, TaskScheduler},
+};
 
 // Reuse types from dependency_ops to avoid duplication.
 pub use agora_core::dependency_ops::{DepSource, Requirement};
@@ -56,6 +59,9 @@ pub struct InstallExecutionResources<'a> {
     /// Verified downloads kept from plan time, so staging does not fetch the
     /// same file twice. `None` downloads everything, as before.
     pub download_cache: Option<&'a crate::download_cache::DownloadCache>,
+    /// The shared content store every installed file is added to and placed from. `None` keeps
+    /// the older plain-copy behaviour for callers without a context (unit tests).
+    pub content_store: Option<&'a agora_core::ctx::Ctx>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1522,8 @@ impl InstallPipeline {
         let registry_db_path = resources.registry_db_path;
         let loader_service = resources.loader_service;
         let download_cache = resources.download_cache;
+        // Owned so the blocking-phase closures can outlive this scope.
+        let content_store = resources.content_store.cloned();
         let fail = |error: String, snapshot_id: Option<String>, rollback_performed: bool| {
             InstallOutcome::Failed {
                 error,
@@ -1700,9 +1708,15 @@ impl InstallPipeline {
         let prepare_plan = plan.clone();
         let prepare_dir = instance_dir.to_path_buf();
         let prepare_staging = staging_dir.clone();
+        let prepare_store = content_store.clone();
         if let Err(error) =
             run_blocking_phase(scheduler, "install manifest preparation", move || {
-                prepare_manifest(&prepare_plan, &prepare_dir, &prepare_staging)
+                prepare_manifest(
+                    &prepare_plan,
+                    &prepare_dir,
+                    &prepare_staging,
+                    prepare_store.as_ref(),
+                )
             })
             .await
         {
@@ -1756,12 +1770,22 @@ impl InstallPipeline {
         let apply_plan = plan.clone();
         let apply_dir = instance_dir.to_path_buf();
         let apply_staging = staging_dir.clone();
-        if let Err(apply_error) =
+        let mut moved_aside = Vec::new();
+        let apply_store = content_store.clone();
+        let apply_result =
             run_blocking_phase(scheduler, "install transaction apply", move || {
-                apply_transaction(&apply_plan, &apply_dir, &apply_staging)
+                apply_transaction(
+                    &apply_plan,
+                    &apply_dir,
+                    &apply_staging,
+                    apply_store.as_ref(),
+                )
             })
             .await
-        {
+            .map(|moved| {
+                moved_aside = moved;
+            });
+        if let Err(apply_error) = apply_result {
             let fast_rollback_performed =
                 apply_error.contains("pre-commit file moves were reversed");
             let restore_dir = instance_dir.to_path_buf();
@@ -1872,6 +1896,7 @@ impl InstallPipeline {
                 // reverting to the pre-install snapshot.
                 cleanup_staging_dir(scheduler, &staging_dir).await;
                 let mut warnings = plan.warnings.clone();
+                warnings.extend(moved_aside_warnings(&moved_aside));
                 warnings.extend(sync_world_datapacks_after_install(scheduler, instance_dir).await);
                 reporter.report(ProgressEvent {
                     plan_id: plan.fingerprint.clone(),
@@ -1893,6 +1918,7 @@ impl InstallPipeline {
 
         cleanup_staging_dir(scheduler, &staging_dir).await;
         let mut warnings = plan.warnings.clone();
+        warnings.extend(moved_aside_warnings(&moved_aside));
         warnings.extend(sync_world_datapacks_after_install(scheduler, instance_dir).await);
         reporter.report(ProgressEvent {
             plan_id: plan.fingerprint.clone(),
@@ -3652,6 +3678,7 @@ fn prepare_manifest(
     plan: &ResolvedInstallPlan,
     instance_dir: &Path,
     staging_dir: &Path,
+    content_store: Option<&Ctx>,
 ) -> Result<(), String> {
     use std::io::Write;
 
@@ -3725,7 +3752,28 @@ fn prepare_manifest(
             agora_core::dependency_ops::JarDeps::default()
         };
         let sha256 = agora_core::download::sha256_hex(&contents);
-        let installed = agora_core::models::InstalledMod {
+        // The entry keeps the plain name; a `.disabled` target means `enabled: false`.
+        let installed_filename = add
+            .target_filename
+            .strip_suffix(".disabled")
+            .unwrap_or(&add.target_filename)
+            .to_string();
+        let content_type = normalized_content_type(&metadata.content_type).to_string();
+        let source_url = match &add.artifact {
+            ResolvedArtifact::Download(download) => match &download.source {
+                ArtifactSource::Download { url } => Some(url.clone()),
+                ArtifactSource::LocalFile { .. } => None,
+            },
+            ResolvedArtifact::LocalFile(_) => None,
+        };
+        let version_label = match &add.artifact {
+            ResolvedArtifact::Download(download) => metadata
+                .version
+                .clone()
+                .or_else(|| Some(download.version_id.clone())),
+            ResolvedArtifact::LocalFile(_) => None,
+        };
+        let mut installed = agora_core::models::InstalledMod {
             provider: metadata
                 .provider
                 .as_ref()
@@ -3739,13 +3787,7 @@ fn prepare_manifest(
             // installs stamp their own provenance; see PackOrigin.
             pack_managed: false,
             installed_as_dependency: add.installed_as_dependency,
-            // A `.disabled` target is a disabled entry: the record keeps the plain
-            // name and says so in `enabled`, as `effective_installed_filename` reads it.
-            filename: add
-                .target_filename
-                .strip_suffix(".disabled")
-                .unwrap_or(&add.target_filename)
-                .to_string(),
+            filename: installed_filename.clone(),
             registry_id: metadata.registry_id.clone(),
             modrinth_id: metadata.modrinth_id.clone(),
             source: match metadata.source_type {
@@ -3755,20 +3797,8 @@ fn prepare_manifest(
                 SourceType::Provider => "provider",
             }
             .into(),
-            source_url: match &add.artifact {
-                ResolvedArtifact::Download(download) => match &download.source {
-                    ArtifactSource::Download { url } => Some(url.clone()),
-                    ArtifactSource::LocalFile { .. } => None,
-                },
-                ResolvedArtifact::LocalFile(_) => None,
-            },
-            version: match &add.artifact {
-                ResolvedArtifact::Download(download) => metadata
-                    .version
-                    .clone()
-                    .or_else(|| Some(download.version_id.clone())),
-                ResolvedArtifact::LocalFile(_) => None,
-            },
+            source_url: source_url.clone(),
+            version: version_label.clone(),
             sha256,
             // Nothing the source published was checked, so the record says so.
             hash_verified: !add.hashes.values.is_empty(),
@@ -3781,7 +3811,7 @@ fn prepare_manifest(
                     .or_else(|| metadata.modrinth_id.clone())
             }),
             enabled: !add.target_filename.ends_with(".disabled"),
-            content_type: normalized_content_type(&metadata.content_type).into(),
+            content_type: content_type.clone(),
             depends_on: jar.depends_on,
             optional_deps: jar.optional_deps,
             incompatible_deps: jar.incompatible_deps,
@@ -3790,8 +3820,27 @@ fn prepare_manifest(
                 .iter()
                 .map(|pm| pm.mod_id.clone())
                 .collect(),
+            content_item_id: None,
+            object_sha256: None,
         };
-        let mut installed = installed;
+        if let Some(ctx) = content_store {
+            let details = crate::content_bridge::StoreDetails {
+                content_type: &content_type,
+                filename: &installed_filename,
+                version: version_label.as_deref(),
+                page_url: source_url.as_deref(),
+                // The pipeline has a release label and a page, never user-facing prose.
+                description: None,
+                catalog_id: metadata
+                    .registry_id
+                    .as_deref()
+                    .or(metadata.modrinth_id.as_deref()),
+            };
+            let stored = crate::content_bridge::store_file(ctx, &staged, &details)
+                .map_err(|error| format!("could not store {}: {error}", add.target_filename))?;
+            installed.content_item_id = Some(stored.item_id);
+            installed.object_sha256 = Some(stored.sha256);
+        }
         carry_forward_ownership(&previous_entries, &mut installed);
         remove_manifest_identity(&mut manifest, &installed);
         content_entries_mut(&mut manifest, &installed.content_type).push(installed);
@@ -3816,13 +3865,18 @@ struct ApplyJournal {
     disabled: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     enabled: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     added: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Files placed from a stored object; rollback deletes the name it created.
+    placed: Vec<std::path::PathBuf>,
+    /// Files the user changed, kept in Agora's moved-aside folder and put back on rollback.
+    moved_aside: Vec<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 fn apply_transaction(
     plan: &ResolvedInstallPlan,
     instance_dir: &Path,
     staging_dir: &Path,
-) -> Result<(), String> {
+    content_store: Option<&Ctx>,
+) -> Result<Vec<std::path::PathBuf>, String> {
     let manifest_path = instance_dir.join("instance_manifest.json");
     let original_text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("failed to read current manifest during apply: {e}"))?;
@@ -3835,6 +3889,33 @@ fn apply_transaction(
     std::fs::write(&manifest_backup, original_text.as_bytes())
         .map_err(|e| format!("failed to back up current manifest: {e}"))?;
 
+    // Which staged additions already have a stored object: the prepared manifest records the
+    // object each new entry was placed from.
+    let placed_targets = if content_store.is_some() {
+        let prepared =
+            agora_core::helpers::read_manifest(&staging_dir.join("instance_manifest.next.json"))
+                .map_err(|e| {
+                    format!("failed to read the prepared manifest during apply: {e}")
+                })?;
+        all_installed(&prepared)
+            .into_iter()
+            .filter_map(|entry| {
+                let sha = entry.object_sha256.as_ref()?;
+                Some((
+                    format!(
+                        "{}/{}",
+                        content_subdir(&entry.content_type),
+                        effective_installed_filename(entry)
+                    ),
+                    sha.clone(),
+                ))
+            })
+            .collect::<BTreeMap<String, String>>()
+    } else {
+        BTreeMap::new()
+    };
+
+    let mut moved_aside = Vec::new();
     let mut journal = ApplyJournal::default();
     let result = (|| -> Result<(), String> {
         let trash_dir = staging_dir.join("trash");
@@ -3851,6 +3932,37 @@ fn apply_transaction(
             let relative = live
                 .strip_prefix(instance_dir)
                 .map_err(|_| format!("removal path escaped instance: {}", live.display()))?;
+            // A file the user changed is theirs, not Agora's: keep it, out of the way, and say
+            // where. Only a file whose bytes still match the manifest is removed.
+            if content_store.is_some() {
+                if let Some(entry) =
+                    manifest_entry_for(&manifest, &remove.filename, remove.content_type.as_deref())
+                {
+                    if let Some(recorded) = entry.object_sha256.as_deref() {
+                        match crate::content_bridge::file_matches_recorded(&live, recorded) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                let aside = moved_aside_path(instance_dir, relative);
+                                if let Some(parent) = aside.parent() {
+                                    std::fs::create_dir_all(parent).map_err(|e| {
+                                        format!("failed to create the moved-aside folder: {e}")
+                                    })?;
+                                }
+                                std::fs::rename(&live, &aside).map_err(|e| {
+                                    format!(
+                                        "failed to move your changed {} aside: {e}",
+                                        remove.filename
+                                    )
+                                })?;
+                                journal.moved_aside.push((aside.clone(), live));
+                                moved_aside.push(aside);
+                                continue;
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                }
+            }
             let backup = trash_dir.join(relative);
             if let Some(parent) = backup.parent() {
                 std::fs::create_dir_all(parent)
@@ -3924,9 +4036,27 @@ fn apply_transaction(
                     .map_err(|e| format!("failed to create content directory: {e}"))?;
             }
             check_test_failpoint("artifact-rename")?;
-            std::fs::rename(&staged, &live)
-                .map_err(|e| format!("failed to promote {}: {e}", add.target_filename))?;
-            journal.added.push((live, staged));
+            let target_key = format!("{subdir}/{}", add.target_filename);
+            match (content_store, placed_targets.get(&target_key)) {
+                (Some(ctx), Some(sha256)) => {
+                    let content_type =
+                        normalized_content_type(&artifact_metadata(&add.artifact).content_type);
+                    crate::content_bridge::place_file(
+                        ctx,
+                        sha256,
+                        instance_dir,
+                        content_type,
+                        &add.target_filename,
+                    )
+                    .map_err(|e| format!("failed to place {}: {e}", add.target_filename))?;
+                    journal.placed.push(live);
+                }
+                _ => {
+                    std::fs::rename(&staged, &live)
+                        .map_err(|e| format!("failed to promote {}: {e}", add.target_filename))?;
+                    journal.added.push((live, staged));
+                }
+            }
         }
 
         let prepared = staging_dir.join("instance_manifest.next.json");
@@ -3950,7 +4080,55 @@ fn apply_transaction(
     // Tracked content changed; the next launch must not reuse a pre-install
     // recovery snapshot from before the apply.
     let _ = agora_core::snapshot::mark_instance_mutated(instance_dir);
-    Ok(())
+    Ok(moved_aside)
+}
+
+/// Where a changed file is kept when Agora must not delete it: an Agora-owned folder inside the
+/// instance, beside the staging area.
+fn moved_aside_path(instance_dir: &Path, relative: &Path) -> std::path::PathBuf {
+    let base = instance_dir.join(".agora").join("moved-aside");
+    let mut candidate = base.join(relative);
+    let mut counter = 1;
+    while candidate.exists() {
+        let name = format!(
+            "{}.{}",
+            relative
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file"),
+            counter
+        );
+        candidate = base.join(relative).with_file_name(name);
+        counter += 1;
+    }
+    candidate
+}
+
+/// The manifest entry a removal names, if there is one.
+fn manifest_entry_for<'a>(
+    manifest: &'a agora_core::models::InstanceManifest,
+    filename: &str,
+    content_type: Option<&str>,
+) -> Option<&'a agora_core::models::InstalledMod> {
+    all_installed(manifest).into_iter().find(|item| {
+        (item.filename == filename || effective_installed_filename(item) == filename)
+            && content_type.is_none_or(|ct| {
+                normalized_content_type(&item.content_type) == normalized_content_type(ct)
+            })
+    })
+}
+
+fn moved_aside_warnings(moved: &[std::path::PathBuf]) -> Vec<PlanWarning> {
+    moved
+        .iter()
+        .map(|path| PlanWarning {
+            code: "WARN_USER_FILE_MOVED_ASIDE".into(),
+            message: format!(
+                "A file Agora installed was changed outside Agora, so it was kept for you at {} instead of being deleted.",
+                path.display()
+            ),
+        })
+        .collect()
 }
 
 fn rollback_apply(
@@ -3959,6 +4137,23 @@ fn rollback_apply(
     manifest_backup: &Path,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
+    for live in journal.placed.iter().rev() {
+        if live.exists() {
+            if let Err(error) = std::fs::remove_file(live) {
+                errors.push(format!("placed {}: {error}", live.display()));
+            }
+        }
+    }
+    for (aside, original) in journal.moved_aside.iter().rev() {
+        if aside.exists() && !original.exists() {
+            if let Some(parent) = original.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(error) = std::fs::rename(aside, original) {
+                errors.push(format!("moved-aside {}: {error}", original.display()));
+            }
+        }
+    }
     for (live, staged) in journal.added.iter().rev() {
         if live.exists() {
             if let Some(parent) = staged.parent() {
@@ -4228,8 +4423,13 @@ impl crate::install_pipeline::ProgressReporter for agora_core::event_sink::Progr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_core::download::sha256_hex;
-    use agora_core::models::{InstalledMod, InstanceManifest};
+    use agora_core::{
+        download::sha256_hex,
+        models::{InstalledMod, InstanceManifest, CURRENT_MANIFEST_VERSION},
+    };
+
+    #[path = "store_install_tests.rs"]
+    mod store_install_tests;
 
     /// Minecraft version of the instance built by `make_instance`.
     /// Shared so the catalog lookup and the instance manifest cannot drift.
@@ -4672,8 +4872,8 @@ mod tests {
         std::fs::create_dir_all(staging.join("artifacts")).unwrap();
         let staged_name = &plan.files_to_add[0].staging_filename;
         std::fs::write(staging.join("artifacts").join(staged_name), bytes).unwrap();
-        prepare_manifest(plan, instance_dir, &staging).unwrap();
-        apply_transaction(plan, instance_dir, &staging).unwrap();
+        prepare_manifest(plan, instance_dir, &staging, None).unwrap();
+        apply_transaction(plan, instance_dir, &staging, None).unwrap();
     }
 
     #[test]
@@ -4835,8 +5035,8 @@ mod tests {
             )
             .unwrap();
         }
-        prepare_manifest(plan, instance_dir, &staging).unwrap();
-        apply_transaction(plan, instance_dir, &staging).unwrap();
+        prepare_manifest(plan, instance_dir, &staging, None).unwrap();
+        apply_transaction(plan, instance_dir, &staging, None).unwrap();
     }
 
     /// Applies a plan that only turns files on, the way the pipeline does:
@@ -4844,8 +5044,8 @@ mod tests {
     fn apply_planned_enable(instance_dir: &Path, plan: &ResolvedInstallPlan) {
         let staging = instance_dir.parent().unwrap().join("staging");
         std::fs::create_dir_all(staging.join("artifacts")).unwrap();
-        prepare_manifest(plan, instance_dir, &staging).unwrap();
-        apply_transaction(plan, instance_dir, &staging).unwrap();
+        prepare_manifest(plan, instance_dir, &staging, None).unwrap();
+        apply_transaction(plan, instance_dir, &staging, None).unwrap();
     }
 
     #[test]
@@ -4965,9 +5165,9 @@ mod tests {
             )
             .unwrap();
         }
-        prepare_manifest(&plan, &instance_dir, &staging).unwrap();
+        prepare_manifest(&plan, &instance_dir, &staging, None).unwrap();
         set_install_failpoint(Some("manifest-rename"));
-        let result = apply_transaction(&plan, &instance_dir, &staging);
+        let result = apply_transaction(&plan, &instance_dir, &staging, None);
         set_install_failpoint(None);
 
         assert!(result.is_err(), "the injected failure must surface");
@@ -7130,7 +7330,9 @@ mod tests {
             optional_deps: vec![],
             incompatible_deps: vec![],
             provided_mod_ids: vec![],
-        });
+        
+            content_item_id: None,
+            object_sha256: None,});
         std::fs::write(
             &manifest_path,
             serde_json::to_vec_pretty(&manifest).unwrap(),
@@ -8597,6 +8799,8 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 }

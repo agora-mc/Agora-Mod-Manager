@@ -260,6 +260,8 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 

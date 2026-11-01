@@ -666,7 +666,9 @@ mod tests {
                 provided_mod_ids: Vec::new(),
                 enabled: true,
                 content_type: "mod".to_string(),
-            })
+            
+                content_item_id: None,
+                object_sha256: None,})
             .collect();
         InstanceManifest {
             manifest_version: crate::models::CURRENT_MANIFEST_VERSION,
@@ -919,7 +921,9 @@ mod tests {
             provided_mod_ids: Vec::new(),
             enabled: true,
             content_type: "shader".to_string(),
-        });
+        
+            content_item_id: None,
+            object_sha256: None,});
         write_manifest(&dir, &manifest).unwrap();
 
         let profile = LoadoutProfile {

@@ -11872,7 +11872,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
-        };
+        
+            content_item_id: None,
+            object_sha256: None,};
 
         let dependent = InstalledMod {
             provider: None,
@@ -11896,7 +11898,9 @@ mod tests {
             depends_on: vec!["core-lib".into()],
             optional_deps: vec![],
             incompatible_deps: vec![],
-        };
+        
+            content_item_id: None,
+            object_sha256: None,};
 
         let installed = vec![target.clone(), dependent];
         let plan = dependency_ops::build_removal_plan(&installed, &target);
@@ -11932,7 +11936,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
-        };
+        
+            content_item_id: None,
+            object_sha256: None,};
 
         let other = InstalledMod {
             provider: None,
@@ -11956,7 +11962,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
-        };
+        
+            content_item_id: None,
+            object_sha256: None,};
 
         let installed = vec![target.clone(), other];
         let plan = dependency_ops::build_removal_plan(&installed, &target);
@@ -12570,7 +12578,9 @@ mod tests {
                 depends_on: vec![],
                 optional_deps: vec![],
                 incompatible_deps: vec![],
-            }],
+            
+                content_item_id: None,
+                object_sha256: None,}],
             resourcepacks: vec![],
             shaders: vec![],
             datapacks: vec![],

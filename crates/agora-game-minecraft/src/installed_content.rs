@@ -378,6 +378,8 @@ mod tests {
             depends_on: Vec::new(),
             optional_deps: Vec::new(),
             incompatible_deps: Vec::new(),
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 

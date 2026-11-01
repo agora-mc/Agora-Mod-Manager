@@ -649,7 +649,9 @@ fn inventory_directory(
             depends_on,
             optional_deps,
             incompatible_deps,
-        });
+        
+            content_item_id: None,
+            object_sha256: None,});
     }
 
     items.sort_by(|a, b| a.filename.cmp(&b.filename));

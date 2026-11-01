@@ -1269,6 +1269,8 @@ mod tests {
             enabled: true,
             content_type: "mod".to_string(),
             installed_as_dependency: false,
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 

@@ -145,6 +145,15 @@ pub struct InstalledMod {
     /// used in install/remove flow for v1.
     #[serde(default)]
     pub incompatible_deps: Vec<String>,
+    /// The shared content store item this file was placed from. Absent on
+    /// entries written before the store held Minecraft content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_item_id: Option<String>,
+    /// The SHA-256 of the stored object the file was placed from. The bytes
+    /// are the same as `sha256`; this records which object the link or copy
+    /// points at, so a later removal can tell Agora's file from the user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_sha256: Option<String>,
 }
 
 /// Heuristic: whether a version string denotes a pre-release (alpha/beta/rc/snapshot).
@@ -784,7 +793,9 @@ mod tests {
                 provided_mod_ids: vec!["nested_api".to_string(), "legacy_alias".to_string()],
                 enabled: true,
                 content_type: "mod".to_string(),
-            }],
+            
+                content_item_id: None,
+                object_sha256: None,}],
             resourcepacks: vec![],
             shaders: vec![],
             datapacks: vec![],
