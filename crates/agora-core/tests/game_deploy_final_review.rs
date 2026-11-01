@@ -213,7 +213,10 @@ fn interrupted_farm_removal_makes_the_next_harvest_delete_writable_files() {
     undeploy(&ctx, &inst.instance_id).unwrap();
     let inst_dir = ctx.paths.instance_dir(&inst.instance_id).unwrap();
     let kept = inst_dir.join("writable").join("new.txt");
-    assert!(kept.exists(), "setup: harvest should have created the writable copy");
+    assert!(
+        kept.exists(),
+        "setup: harvest should have created the writable copy"
+    );
 
     deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
     let game = deployment_dir(&ctx, &inst.instance_id).unwrap().unwrap();
@@ -227,8 +230,14 @@ fn interrupted_farm_removal_makes_the_next_harvest_delete_writable_files() {
         .unwrap();
     let first = undeploy(&ctx, &inst.instance_id);
     drop(held);
-    assert!(first.is_err(), "setup: the first undeploy should fail on the held file");
-    assert!(!game.join("new.txt").exists(), "setup: the farm should be half removed");
+    assert!(
+        first.is_err(),
+        "setup: the first undeploy should fail on the held file"
+    );
+    assert!(
+        !game.join("new.txt").exists(),
+        "setup: the farm should be half removed"
+    );
 
     // The user closes the scanner and undeploys / deploys again.
     let _ = undeploy(&ctx, &inst.instance_id);
@@ -277,4 +286,82 @@ fn farm_without_a_record_blocks_every_later_deploy() {
         "deploy is stuck behind the record-less farm: {:?}",
         again.err()
     );
+}
+
+#[test]
+#[ignore = "proves bug: when a second create with the same chosen id lands during the first's base build, the first's failed insert deletes the second's instance folder and leaves its row behind"]
+fn losing_a_same_id_create_race_deletes_the_winners_folder() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let tmp = TempDir::new().unwrap();
+    let def = make_test_definition();
+    let ctx = create_test_context(&tmp, &def);
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let install = make_test_install(&install_dir, true, true);
+
+    let fired = AtomicBool::new(false);
+    let inner_ok = AtomicBool::new(false);
+    let outer = create(
+        &ctx,
+        &install,
+        &def,
+        "Race",
+        Some("race-1".to_string()),
+        BaseMode::Linked,
+        &|_| {
+            // Another process creates the same id while this one is still building the base.
+            if !fired.swap(true, Ordering::SeqCst) {
+                let inner = create(
+                    &ctx,
+                    &install,
+                    &def,
+                    "Race",
+                    Some("race-1".to_string()),
+                    BaseMode::Linked,
+                    &|_| {},
+                );
+                inner_ok.store(inner.is_ok(), Ordering::SeqCst);
+            }
+        },
+    );
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "setup: the progress hook never ran"
+    );
+    assert!(
+        inner_ok.load(Ordering::SeqCst),
+        "setup: the second create should have won"
+    );
+    assert!(
+        outer.is_err(),
+        "setup: the first create should have lost on the unique id"
+    );
+
+    let dir = ctx.paths.instance_dir("race-1").unwrap();
+    let row = agora_core::game_instance::get(&ctx, "race-1")
+        .unwrap()
+        .is_some();
+    assert!(
+        !row || dir.join("instance_manifest.json").exists(),
+        "the instance 'race-1' is listed but its folder was deleted by the losing create"
+    );
+}
+
+/// Control for `interrupted_farm_removal_makes_the_next_harvest_delete_writable_files`: the same
+/// steps with nothing holding a file keep the game's save in the writable layer.
+#[test]
+fn control_clean_undeploy_keeps_the_writable_save() {
+    let tmp = TempDir::new().unwrap();
+    let (ctx, def, inst) = setup(&tmp);
+    let item = add_content_folder(&ctx, "M", &[("a.txt", b"a")]);
+    add_content(&ctx, &inst.instance_id, &item, None, None).unwrap();
+    deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    let game = deployment_dir(&ctx, &inst.instance_id).unwrap().unwrap();
+    std::fs::write(game.join("new.txt"), b"save").unwrap();
+    undeploy(&ctx, &inst.instance_id).unwrap();
+    deploy(&ctx, &inst.instance_id, &def, DeployMode::Links).unwrap();
+    undeploy(&ctx, &inst.instance_id).unwrap();
+    let inst_dir = ctx.paths.instance_dir(&inst.instance_id).unwrap();
+    assert!(inst_dir.join("writable").join("new.txt").exists());
 }

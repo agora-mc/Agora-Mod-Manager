@@ -144,7 +144,6 @@ fn test_skyrim_definition() -> GameDefinition {
     }
 }
 
-
 fn journal_path_of(h: &TestHarness, def: &GameDefinition) -> PathBuf {
     h.ctx
         .paths
@@ -158,7 +157,9 @@ fn backup_dir_of(h: &TestHarness, def: &GameDefinition) -> PathBuf {
 }
 
 fn plugins_real(h: &TestHarness) -> PathBuf {
-    h.local_dir().join("Skyrim Special Edition").join("Plugins.txt")
+    h.local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt")
 }
 
 fn ini_real(h: &TestHarness) -> PathBuf {
@@ -180,7 +181,10 @@ fn crash_between_overwrite_and_journal_update_loses_the_users_file() {
     let def = test_skyrim_definition();
     let real = plugins_real(&h);
     put(&real, "original\n");
-    put(&h.instance_dir("final-a").join("user").join("Plugins.txt"), "instance\n");
+    put(
+        &h.instance_dir("final-a").join("user").join("Plugins.txt"),
+        "instance\n",
+    );
     swap_in(&h.ctx, "final-a", &def, &StoreId::steam(), &h.running_from).unwrap();
     assert_eq!(std::fs::read_to_string(&real).unwrap(), "instance\n");
 
@@ -268,5 +272,25 @@ fn read_only_user_file_blocks_restore_and_every_later_launch() {
         "restore of an unchanged read-only file failed ({:?}) and the next launch is refused ({:?})",
         restored.err().map(|e| e.to_string()),
         next.err().map(|e| e.to_string())
+    );
+}
+
+/// Control for `rerun_of_an_interrupted_restore_overwrites_the_sessions_instance_copy`: an
+/// uninterrupted restore keeps the session's content in the instance copy.
+#[test]
+fn control_uninterrupted_restore_keeps_the_session_in_the_instance_copy() {
+    let h = TestHarness::new();
+    let def = test_skyrim_definition();
+    let plugins = plugins_real(&h);
+    put(&plugins, "orig-plugins\n");
+    let inst = h.instance_dir("final-d");
+    put(&inst.join("user").join("Plugins.txt"), "inst-plugins\n");
+    swap_in(&h.ctx, "final-d", &def, &StoreId::steam(), &h.running_from).unwrap();
+    std::fs::write(&plugins, "session-plugins\n").unwrap();
+    restore(&h.ctx, &def, &StoreId::steam()).unwrap();
+    assert_eq!(std::fs::read_to_string(&plugins).unwrap(), "orig-plugins\n");
+    assert_eq!(
+        std::fs::read_to_string(inst.join("user").join("Plugins.txt")).unwrap(),
+        "session-plugins\n"
     );
 }
