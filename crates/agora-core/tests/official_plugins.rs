@@ -1841,12 +1841,8 @@ async fn an_installed_official_plugin_wins_a_game_id_over_a_community_plugin() {
 #[tokio::test]
 async fn the_documented_development_install_of_skyrim_still_loads_the_game() {
     let world = World::new();
-    let folder =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
-    world
-        .service
-        .add_development_folder(&folder, true)
-        .unwrap();
+    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
+    world.service.add_development_folder(&folder, true).unwrap();
 
     let (ctx, warnings) = world.start();
     let game = GameId::new("skyrim-se").unwrap();
