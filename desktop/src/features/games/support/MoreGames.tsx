@@ -140,7 +140,8 @@ export function MoreGamesCard({ surface }: { surface: 'home' | 'settings' }) {
     setError(null);
     setInstallingId(info.id);
     try {
-      const result = await installOfficialPlugin(info.id, false);
+      // The first call only asks what the package wants; code is answered at the prompt.
+      const result = await installOfficialPlugin(info.id, false, false);
       if (isRecord(result) && result.outcome === 'needsConsent' && isRecord(result.preview)) {
         setConsent({ info, preview: result.preview as unknown as InstallPreview });
         return;
