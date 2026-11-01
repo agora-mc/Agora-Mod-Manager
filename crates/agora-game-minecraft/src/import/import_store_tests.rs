@@ -92,7 +92,12 @@ fn write_hashed_mrpack(dir: &Path, files: &[(&str, &[u8], String)]) -> PathBuf {
     path
 }
 
-fn assert_mod_is_linked(ctx: &Ctx, instance_dir: &Path, filename: &str) -> InstalledMod {
+fn assert_mod_is_stored(
+    ctx: &Ctx,
+    instance_dir: &Path,
+    filename: &str,
+    linked: bool,
+) -> InstalledMod {
     let id = instance_dir.file_name().unwrap().to_str().unwrap();
     let root = instance_dir.parent().unwrap();
     let manifest = read_test_manifest(root, id);
@@ -113,16 +118,23 @@ fn assert_mod_is_linked(ctx: &Ctx, instance_dir: &Path, filename: &str) -> Insta
     assert!(ctx.paths.content_object_path(&object).is_file());
     assert!(crate::content_bridge::load_item(ctx, &item).is_ok());
     assert_eq!(entry.sha256, object);
+    // Link counts are a Unix concept; Windows checks placement through the store instead.
+    #[cfg(not(unix))]
+    let _ = linked;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        assert!(
-            fs::metadata(instance_dir.join("mods").join(filename))
-                .unwrap()
-                .nlink()
-                >= 2,
-            "the instance file is a link to the stored object"
-        );
+        let links = fs::metadata(instance_dir.join("mods").join(filename))
+            .unwrap()
+            .nlink();
+        if linked {
+            assert!(
+                links >= 2,
+                "the instance file is a link to the stored object"
+            );
+        } else {
+            assert_eq!(links, 1, "sharing off places an ordinary copy");
+        }
     }
     entry
 }
@@ -137,7 +149,7 @@ fn an_mrpack_import_links_its_mods_from_the_store() {
     assert_eq!(imported.imported_mods, 1);
     let instance_dir = root.join(&imported.instance_id);
     assert_eq!(fs::read(instance_dir.join("mods/a.jar")).unwrap(), jar);
-    assert_mod_is_linked(&ctx, &instance_dir, "a.jar");
+    assert_mod_is_stored(&ctx, &instance_dir, "a.jar", true);
     assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
 }
 
@@ -150,18 +162,7 @@ fn an_mrpack_import_copies_when_sharing_is_off() {
     let root = ctx.paths.instances_root();
     let imported = import_mrpack_with(Some(&ctx), &path, &root, None, false).unwrap();
     let instance_dir = root.join(&imported.instance_id);
-    assert_mod_is_linked(&ctx, &instance_dir, "a.jar");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        assert_eq!(
-            fs::metadata(instance_dir.join("mods/a.jar"))
-                .unwrap()
-                .nlink(),
-            1,
-            "sharing off places an ordinary copy"
-        );
-    }
+    assert_mod_is_stored(&ctx, &instance_dir, "a.jar", false);
     assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
 }
 
@@ -200,8 +201,8 @@ fn two_instances_from_the_same_pack_share_objects() {
     let root = ctx.paths.instances_root();
     let first = import_mrpack_with(Some(&ctx), &path, &root, Some("pack-one"), false).unwrap();
     let second = import_mrpack_with(Some(&ctx), &path, &root, Some("pack-two"), false).unwrap();
-    let first_entry = assert_mod_is_linked(&ctx, &root.join(&first.instance_id), "a.jar");
-    let second_entry = assert_mod_is_linked(&ctx, &root.join(&second.instance_id), "a.jar");
+    let first_entry = assert_mod_is_stored(&ctx, &root.join(&first.instance_id), "a.jar", true);
+    let second_entry = assert_mod_is_stored(&ctx, &root.join(&second.instance_id), "a.jar", true);
     assert_eq!(first_entry.content_item_id, second_entry.content_item_id);
     assert_eq!(first_entry.object_sha256, second_entry.object_sha256);
     assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
@@ -233,7 +234,7 @@ fn a_prism_import_links_its_mods_from_the_store() {
         fs::read(instance_dir.join("mods/mod.jar")).unwrap(),
         b"prism mod"
     );
-    assert_mod_is_linked(&ctx, &instance_dir, "mod.jar");
+    assert_mod_is_stored(&ctx, &instance_dir, "mod.jar", true);
     assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
 }
 

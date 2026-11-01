@@ -658,7 +658,8 @@ pub fn store_item_count(ctx: &Ctx) -> usize {
 }
 
 /// Whether a folder's own DACL grants the current user delete-child. Test support only.
-#[cfg(test)]
+/// Only Windows has a folder ACL to ask about; on Unix the link's folder needs no extra right.
+#[cfg(all(test, windows))]
 pub fn folder_grants_delete_child(folder: &Path) -> bool {
     store::protect::grants_delete_child(folder).expect("read the folder ACL")
 }
