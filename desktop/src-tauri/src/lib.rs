@@ -203,7 +203,9 @@ pub fn run() {
             }
         }))
         .invoke_handler(tauri::generate_handler![
-            plugins::plugins_enabled,
+            plugins::plugins_emergency_stop,
+            plugins::set_plugins_emergency_stop,
+            plugins::set_plugin_scripts_allowed,
             plugins::start_plugins,
             plugins::list_plugins,
             plugins::list_plugin_contributions,
@@ -212,6 +214,10 @@ pub fn run() {
             plugins::install_plugin_package,
             plugins::plugin_check_update,
             plugins::plugin_apply_update,
+            plugins::list_official_plugins,
+            plugins::install_official_plugin,
+            plugins::update_official_plugin,
+            plugins::rollback_official_plugin,
             plugins::plugin_surfaces,
             plugins::plugin_set_surface,
             plugins::restore_plugin_data,

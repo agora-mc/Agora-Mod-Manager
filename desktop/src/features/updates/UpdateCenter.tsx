@@ -5,7 +5,7 @@ import {
   applyPluginUpdate,
   checkPluginUpdate,
   listPlugins,
-  pluginsEnabled,
+  pluginCodeAllowed,
 } from '../plugins/api';
 import { showToast } from '../../components/Toast';
 import { useConfirm } from '@/components/ui/confirm';
@@ -63,7 +63,7 @@ export function UpdateCenter() {
         (async () => {
           const rows: PluginRow[] = [];
           const errors: string[] = [];
-          if (!(await pluginsEnabled().catch(() => false))) return { rows, errors };
+          if (!(await pluginCodeAllowed().catch(() => false))) return { rows, errors };
           const installed = await listPlugins();
           await Promise.all(
             installed

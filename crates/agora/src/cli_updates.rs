@@ -28,7 +28,7 @@ use crate::{print_plan, print_table, report_unresolved_plan, SilentReporter};
 fn provider_registry(ctx: &Ctx) -> anyhow::Result<ProviderRegistry> {
     let service = crate::plugin_service(ctx);
     service.reload()?;
-    let plugins = service.is_enabled().then_some(&service);
+    let plugins = service.plugin_code_allowed().then_some(&service);
     Ok(ProviderRegistry::new(ctx, plugins))
 }
 

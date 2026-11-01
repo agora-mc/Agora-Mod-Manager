@@ -11,7 +11,7 @@
 //! take the launcher with it.
 
 use agora_core::ctx::Ctx;
-use agora_core::plugins::{PluginService, PLUGINS_ENABLED_SETTING};
+use agora_core::plugins::{PluginService, PLUGINS_EMERGENCY_STOP_SETTING};
 use agora_plugin_api::contributions::ReplaceableSurface;
 use agora_plugin_api::error::PluginErrorCode;
 use agora_plugin_api::host::ScriptHost;
@@ -39,7 +39,6 @@ fn world() -> World {
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).expect("db");
 
     let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-    agora_core::db::set_setting(&conn, PLUGINS_ENABLED_SETTING, &serde_json::json!(true)).unwrap();
     conn.execute(
         "INSERT INTO user_instances (
              instance_id, name, minecraft_version, loader, loader_version,
@@ -826,10 +825,15 @@ fn contributions_carry_the_plugin_namespace_so_the_ui_can_route_them_back() {
 }
 
 #[test]
-fn nothing_activates_while_the_plugin_system_is_switched_off() {
+fn nothing_activates_while_the_emergency_stop_is_engaged() {
     let world = world();
     let conn = agora_core::db::local_state_connection(&world.ctx.paths.local_state_db()).unwrap();
-    agora_core::db::set_setting(&conn, PLUGINS_ENABLED_SETTING, &serde_json::json!(false)).unwrap();
+    agora_core::db::set_setting(
+        &conn,
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::json!(true),
+    )
+    .unwrap();
 
     let folder = plugin_folder(
         world._dir.path(),
@@ -839,7 +843,7 @@ fn nothing_activates_while_the_plugin_system_is_switched_off() {
     );
     world.service.add_development_folder(&folder, true).unwrap();
 
-    assert!(!world.service.is_enabled());
+    assert!(world.service.emergency_stop_engaged());
     let failures = world.service.activate_all().unwrap();
     assert!(failures.is_empty());
     assert!(!world.service.list()[0].running);
@@ -1397,7 +1401,7 @@ async fn a_development_folder_is_never_updated() {
 }
 
 #[tokio::test]
-async fn nothing_checks_for_updates_while_the_plugin_system_is_switched_off() {
+async fn nothing_sweeps_for_updates_while_the_emergency_stop_is_engaged() {
     let world = world();
     let manifest = dashboard_manifest(serde_json::json!({ "required": ["instance:read"] }));
     let archive = world._dir.path().join("v1.zip");
@@ -1405,13 +1409,16 @@ async fn nothing_checks_for_updates_while_the_plugin_system_is_switched_off() {
     world.service.install_package(&archive, true).unwrap();
 
     let conn = agora_core::db::local_state_connection(&world.ctx.paths.local_state_db()).unwrap();
-    agora_core::db::set_setting(&conn, PLUGINS_ENABLED_SETTING, &serde_json::json!(false)).unwrap();
-    let error = world
-        .service
-        .check_update(&id("acme.dashboard"))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("switched off"), "{error}");
+    // The background sweep is allowed by its own setting, and still does nothing
+    // while the stop is engaged: nothing runs, and nothing reaches out for it.
+    agora_core::db::set_setting(&conn, "plugin_updates_enabled", &serde_json::json!(true)).unwrap();
+    agora_core::db::set_setting(
+        &conn,
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::json!(true),
+    )
+    .unwrap();
+    assert!(world.service.check_all_updates().await.is_empty());
 }
 
 /// Bytes that do not match the signed hash are refused, and refused *before*
@@ -2207,7 +2214,7 @@ fn opening_an_instance_starts_a_plugin_that_asked_for_it() {
 }
 
 #[test]
-fn nothing_is_woken_by_an_event_while_plugins_are_switched_off() {
+fn nothing_is_woken_by_an_event_while_the_emergency_stop_is_engaged() {
     use agora_plugin_api::protocol::PluginEvent;
 
     let world = world();
@@ -2219,7 +2226,12 @@ fn nothing_is_woken_by_an_event_while_plugins_are_switched_off() {
     world.service.add_development_folder(&folder, true).unwrap();
 
     let conn = agora_core::db::local_state_connection(&world.ctx.paths.local_state_db()).unwrap();
-    agora_core::db::set_setting(&conn, PLUGINS_ENABLED_SETTING, &serde_json::json!(false)).unwrap();
+    agora_core::db::set_setting(
+        &conn,
+        PLUGINS_EMERGENCY_STOP_SETTING,
+        &serde_json::json!(true),
+    )
+    .unwrap();
 
     assert_eq!(
         world.service.publish_event(

@@ -47,7 +47,7 @@ const BOOT_REPLIES = {
   check_all_instance_health: [],
   take_pending_cli_launch: null,
   get_governance_config: null,
-  plugins_enabled: false,
+  plugins_emergency_stop: true,
   list_plugins: [],
   list_plugin_contributions: [],
   get_connectivity_status: { state: 'unknown', last_outcome_at: null },

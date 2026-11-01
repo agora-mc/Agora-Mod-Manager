@@ -12,6 +12,7 @@ import type {
   InstallPreview,
   LaunchCheckOutcome,
   NamespacedContribution,
+  OfficialPluginList,
   PluginStartFailure,
   PluginSummary,
   RepairOutcome,
@@ -22,7 +23,24 @@ import type {
   ViewModel,
 } from './types';
 
-export const pluginsEnabled = () => invoke<boolean>('plugins_enabled');
+/**
+ * Whether the emergency stop ("Stop all plugin code") is engaged. While it is,
+ * no plugin script runs, official plugins included. Not engaged by default.
+ */
+export const pluginsEmergencyStop = () => invoke<boolean>('plugins_emergency_stop');
+
+/**
+ * Whether plugin code may run at all. Only an explicit "not stopped" counts: a
+ * rejection, or an answer that is not a boolean, reads as stopped.
+ */
+export const pluginCodeAllowed = async () => (await pluginsEmergencyStop()) === false;
+
+export const setPluginsEmergencyStop = (engaged: boolean) =>
+  invoke<void>('set_plugins_emergency_stop', { engaged });
+
+/** Allow or disallow one plugin's code. Independent per plugin; disallowing stops it now. */
+export const setPluginScriptsAllowed = (pluginId: string, allowed: boolean) =>
+  invoke<PluginSummary>('set_plugin_scripts_allowed', { pluginId, allowed });
 
 export const startPlugins = () => invoke<PluginStartFailure[]>('start_plugins');
 
@@ -37,8 +55,15 @@ export const previewPluginPackage = (path: string) =>
 export const previewPluginFolder = (path: string) =>
   invoke<InstallPreview>('preview_plugin_folder', { path });
 
-export const installPluginPackage = (path: string, acceptCapabilities: boolean) =>
-  invoke<PluginSummary>('install_plugin_package', { path, acceptCapabilities });
+/**
+ * `allowScripts` is the separate "<name> runs code. Allow it?" answer. Left out,
+ * the permission answer stands for both.
+ */
+export const installPluginPackage = (
+  path: string,
+  acceptCapabilities: boolean,
+  allowScripts?: boolean,
+) => invoke<PluginSummary>('install_plugin_package', { path, acceptCapabilities, allowScripts });
 
 export const checkPluginUpdate = (pluginId: string) =>
   invoke<UpdateVerdict | null>('plugin_check_update', { pluginId });
@@ -46,8 +71,36 @@ export const checkPluginUpdate = (pluginId: string) =>
 export const applyPluginUpdate = (pluginId: string, acceptCapabilities: boolean) =>
   invoke<UpdateOutcome | null>('plugin_apply_update', { pluginId, acceptCapabilities });
 
-export const addPluginDevelopmentFolder = (path: string, acceptCapabilities: boolean) =>
-  invoke<PluginSummary>('add_plugin_development_folder', { path, acceptCapabilities });
+/** The official plugins the signed catalog offers; empty with a reason when it cannot be verified. */
+export const listOfficialPlugins = () => invoke<OfficialPluginList>('list_official_plugins');
+
+export const installOfficialPlugin = (
+  pluginId: string,
+  acceptCapabilities: boolean,
+  allowScripts?: boolean,
+) =>
+  invoke<UpdateOutcome>('install_official_plugin', {
+    pluginId,
+    acceptCapabilities,
+    allowScripts,
+  });
+
+export const updateOfficialPlugin = (pluginId: string, acceptCapabilities: boolean) =>
+  invoke<UpdateOutcome>('update_official_plugin', { pluginId, acceptCapabilities });
+
+export const rollbackOfficialPlugin = (pluginId: string, acceptCapabilities: boolean) =>
+  invoke<UpdateOutcome>('rollback_official_plugin', { pluginId, acceptCapabilities });
+
+export const addPluginDevelopmentFolder = (
+  path: string,
+  acceptCapabilities: boolean,
+  allowScripts?: boolean,
+) =>
+  invoke<PluginSummary>('add_plugin_development_folder', {
+    path,
+    acceptCapabilities,
+    allowScripts,
+  });
 
 export const setPluginEnabled = (pluginId: string, enabled: boolean) =>
   invoke<void>('set_plugin_enabled', { pluginId, enabled });

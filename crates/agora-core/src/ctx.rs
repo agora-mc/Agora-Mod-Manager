@@ -132,7 +132,22 @@ impl CoreContext {
     /// observations that did not prevent initialization.
     pub fn initialize(
         paths: AppPaths,
+        game_builder: crate::game_registry::GameRegistryBuilder,
+    ) -> LauncherResult<(Self, Vec<String>)> {
+        Self::initialize_with_registry_trust(
+            paths,
+            game_builder,
+            crate::plugins::official::RegistryTrust::production(),
+        )
+    }
+
+    /// [`Self::initialize`] with an explicit registry key. Test support:
+    /// adapters call `initialize`, which trusts only the key compiled into the
+    /// app. The key decides which installed plugins count as official.
+    pub fn initialize_with_registry_trust(
+        paths: AppPaths,
         mut game_builder: crate::game_registry::GameRegistryBuilder,
+        registry_trust: crate::plugins::official::RegistryTrust,
     ) -> LauncherResult<(Self, Vec<String>)> {
         let mut warnings = Vec::new();
 
@@ -165,17 +180,44 @@ impl CoreContext {
         match crate::db::local_state_connection(&db_path) {
             Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
             Ok(conn) => {
-                let plugins_enabled =
-                    crate::db::get_setting(&conn, crate::plugins::PLUGINS_ENABLED_SETTING)
-                        .ok()
-                        .flatten()
-                        .and_then(|val| val.as_bool())
-                        .unwrap_or(false);
+                // A game package is data: it runs no code, so it loads whatever the
+                // emergency stop says and needs no script permission; installing the
+                // plugin (and granting `game:define`) was the opt-in. The one filter
+                // is official status. A plugin that was installed as official, or
+                // that uses an official plugin's id, and does not verify is blocked:
+                // not loaded, and named in the warnings with the reason. It is not
+                // demoted to a community plugin, which would let a revoked or
+                // tampered package keep loading.
+                let official = match crate::plugins::official::verify_installed(
+                    &conn,
+                    paths.root(),
+                    &registry_trust,
+                ) {
+                    Ok(statuses) => statuses,
+                    Err(e) => {
+                        warnings.push(format!(
+                            "Cannot verify official plugins, so none is treated as official: {e}"
+                        ));
+                        std::collections::BTreeMap::new()
+                    }
+                };
 
-                if plugins_enabled {
+                {
                     match crate::plugins::store::list(&conn) {
                         Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
-                        Ok(records) => {
+                        Ok(mut records) => {
+                            // Official plugins register first. A game id or a store
+                            // product id goes to whoever claims it first, and the
+                            // records come back in plugin-id order, so without this
+                            // a community plugin named `aaaa.x` could take
+                            // `skyrim-se` before the official plugin was read.
+                            // Stable, so each group stays in plugin-id order.
+                            records.sort_by_key(|record| {
+                                !matches!(
+                                    official.get(record.id().as_str()),
+                                    Some(crate::plugins::official::OfficialStatus::Official { .. })
+                                )
+                            });
                             for record in records {
                                 if !record.enabled
                                     || crate::plugins::store::is_tombstone(&record)
@@ -184,6 +226,25 @@ impl CoreContext {
                                         .contains(agora_plugin_api::Capability::GameDefine)
                                 {
                                     continue;
+                                }
+
+                                match official.get(record.id().as_str()) {
+                                    Some(crate::plugins::official::OfficialStatus::Official {
+                                        ..
+                                    }) => {}
+                                    Some(
+                                        crate::plugins::official::OfficialStatus::Unverified {
+                                            reason,
+                                        },
+                                    ) => {
+                                        warnings.push(format!(
+                                            "Plugin {} is blocked and its games are not loaded: {reason}.",
+                                            record.id()
+                                        ));
+                                        continue;
+                                    }
+                                    Some(crate::plugins::official::OfficialStatus::Community)
+                                    | None => {}
                                 }
 
                                 for pkg_contrib in &record.manifest.contributions.game_packages {
@@ -231,7 +292,9 @@ impl CoreContext {
                                         )),
                                     ) {
                                         warnings.push(format!(
-                                            "Plugin {}: rejected game package {}: {err}",
+                                            "Plugin {}: rejected game package {}: {err}. \
+                                             A game or store product already claimed (official \
+                                             plugins register first) cannot be claimed again.",
                                             record.id(),
                                             file_path.display()
                                         ));

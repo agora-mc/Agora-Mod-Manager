@@ -403,6 +403,14 @@ const NESTED_COMMANDS: &[&[&str]] = &[
     &["games", "import", "mo2", "scan"],
     &["plugin", "settings"],
     &["plugin", "set"],
+    &["plugin", "official"],
+    &["plugin", "scripts"],
+    &["plugin", "stop"],
+    &["plugin", "resume"],
+    &["plugin", "official", "list"],
+    &["plugin", "official", "install"],
+    &["plugin", "official", "update"],
+    &["plugin", "official", "rollback"],
     &["governance", "summary"],
     &["governance", "events"],
     &["governance", "config"],
@@ -3655,6 +3663,130 @@ fn removal_reports_whether_stored_data_was_kept() {
     );
 }
 
+/// A plugin with code runs it only if the user allowed that plugin, chosen once at install and
+/// changeable per plugin; the emergency stop is separate, and `plugin list` shows both.
+#[test]
+fn plugin_code_is_allowed_per_plugin_and_the_emergency_stop_is_separate() {
+    let data_dir = tempdir();
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/dashboard");
+    let example = example.to_string_lossy().to_string();
+
+    let installed = run_agora(
+        data_dir.path(),
+        &[
+            "plugin",
+            "install",
+            "--yes",
+            "--no-code",
+            "development",
+            example.as_str(),
+        ],
+    );
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let code_state = |data_dir: &std::path::Path| -> (bool, bool) {
+        let listed = run_agora_json(data_dir, &["plugin", "list"]);
+        assert!(listed.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("json");
+        let plugin = &json[0];
+        (
+            plugin["runsCode"].as_bool().unwrap(),
+            plugin["scriptsAllowed"].as_bool().unwrap(),
+        )
+    };
+    assert_eq!(
+        code_state(data_dir.path()),
+        (true, false),
+        "--no-code withholds it"
+    );
+
+    let allowed = run_agora(
+        data_dir.path(),
+        &["plugin", "scripts", "agora.dashboard", "allow"],
+    );
+    assert!(allowed.status.success());
+    assert_eq!(code_state(data_dir.path()), (true, true));
+
+    let denied = run_agora(
+        data_dir.path(),
+        &["plugin", "scripts", "agora.dashboard", "deny"],
+    );
+    assert!(denied.status.success());
+    assert_eq!(code_state(data_dir.path()), (true, false));
+
+    // The stop is its own switch and does not touch the per-plugin answer.
+    run_agora(
+        data_dir.path(),
+        &["plugin", "scripts", "agora.dashboard", "allow"],
+    );
+    let stop = run_agora(data_dir.path(), &["plugin", "stop"]);
+    assert!(stop.status.success());
+    assert_eq!(code_state(data_dir.path()), (true, true));
+    let resume = run_agora(data_dir.path(), &["plugin", "resume"]);
+    assert!(resume.status.success());
+
+    // Anything but allow or deny is refused.
+    let wrong = run_agora(
+        data_dir.path(),
+        &["plugin", "scripts", "agora.dashboard", "maybe"],
+    );
+    assert!(!wrong.status.success());
+    // A yes at the install prompt (`--yes`) allows the code too.
+    run_agora(data_dir.path(), &["plugin", "remove", "agora.dashboard"]);
+    let yes = run_agora(
+        data_dir.path(),
+        &[
+            "plugin",
+            "install",
+            "--yes",
+            "development",
+            example.as_str(),
+        ],
+    );
+    assert!(yes.status.success());
+    assert_eq!(code_state(data_dir.path()), (true, true));
+}
+
+/// With no verifiable catalog there are no official plugins: the list says why, and nothing can
+/// be installed. Ids that cannot be plugin ids are refused before core is asked.
+#[test]
+fn official_plugins_offer_nothing_without_a_verified_catalog() {
+    let data_dir = tempdir();
+
+    let listed = run_agora(data_dir.path(), &["plugin", "official", "list"]);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.status.success(), "{stdout}");
+    assert!(stdout.contains("No catalog"), "{stdout}");
+
+    let listed = run_agora_json(data_dir.path(), &["plugin", "official", "list"]);
+    assert!(listed.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("json");
+    assert_eq!(json["plugins"], serde_json::json!([]));
+    assert!(json["unavailableReason"].is_string(), "{json}");
+
+    for id in ["acme.fixture", "../x", "ACME.Fixture", ""] {
+        for verb in ["install", "update", "rollback"] {
+            let output = run_agora(data_dir.path(), &["plugin", "official", verb, id, "--yes"]);
+            assert!(
+                !output.status.success(),
+                "`plugin official {verb} {id:?}` must be refused"
+            );
+        }
+    }
+    assert!(
+        !data_dir.path().join("plugins").join("installed").exists()
+            || std::fs::read_dir(data_dir.path().join("plugins").join("installed"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "nothing may be installed"
+    );
+}
+
 #[test]
 fn games_base_cli_list_verify_remove() {
     let (_tmp, data_dir) = temp_data_dir();
@@ -4205,10 +4337,6 @@ fn games_user_files_cli_status_and_restore() {
 #[test]
 fn games_instance_content_add_thunderstore_and_fallback_to_suggest_placement() {
     let (_tmp, data_dir) = temp_data_dir();
-
-    // 0. Enable plugins
-    let out_set = run_agora(&data_dir, &["settings", "set", "plugins_enabled", "true"]);
-    assert!(out_set.status.success());
 
     // 1. Install Valheim tracer plugin so valheim game definition is available
     let valheim_pkg =

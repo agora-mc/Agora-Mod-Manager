@@ -43,7 +43,7 @@ const BOOT_REPLIES = {
   games_mod_inis_list: [],
   games_mod_ini_keep_game_version: [],
   games_mod_ini_restore_mine: [],
-  plugins_enabled: false,
+  plugins_emergency_stop: true,
   list_plugins: [],
   list_plugin_contributions: [],
   get_connectivity_status: { state: 'unknown', last_outcome_at: null },

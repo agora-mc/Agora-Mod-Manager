@@ -37,8 +37,52 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// Setting that turns the whole subsystem on. Off by default.
-pub const PLUGINS_ENABLED_SETTING: &str = "plugins_enabled";
+/// The emergency stop: while it is engaged, no plugin script runs, official or
+/// community. Default **not engaged**; a plugin's scripts then run if the user
+/// allowed that plugin's scripts (see [`PluginService::set_scripts_allowed`]).
+///
+/// Stored under a new key on purpose. The old `plugins_enabled` key meant the
+/// opposite ("community plugins on"), defaulted off, and was seeded as `false`
+/// in every database; reading it with the new meaning would have silently
+/// engaged the stop for everyone. It is ignored, treated as absent, and no longer
+/// written. Agora has no users yet, so there is nothing to migrate.
+///
+/// Data-only plugins (game packages) run no code and are not affected by it.
+pub const PLUGINS_EMERGENCY_STOP_SETTING: &str = "plugins_emergency_stop";
+
+/// What the user agreed to when installing a plugin.
+///
+/// Two separate answers, because they are separate questions: "may it have these
+/// permissions" and, for a plugin that has code, "may it run that code". A plain
+/// `bool` converts to both answers at once, which is what every caller that does
+/// not offer the second choice means by "yes".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Consent {
+    /// The capabilities and network hosts the preview listed.
+    pub capabilities: bool,
+    /// Running the plugin's scripts. Ignored for a plugin with no code, and for
+    /// an update of a plugin that already has an answer: that answer stands.
+    pub scripts: bool,
+}
+
+impl Consent {
+    /// Permissions granted, but the plugin's code is not allowed to run.
+    pub fn without_code() -> Self {
+        Self {
+            capabilities: true,
+            scripts: false,
+        }
+    }
+}
+
+impl From<bool> for Consent {
+    fn from(answer: bool) -> Self {
+        Self {
+            capabilities: answer,
+            scripts: answer,
+        }
+    }
+}
 
 /// Which plugin, if any, the user chose to render each replaceable surface.
 ///
@@ -105,6 +149,15 @@ pub struct PluginSummary {
     pub restorable_data: Option<store::CheckpointSummary>,
     /// Events this plugin missed because it could not keep up.
     pub dropped_events: u64,
+    /// Whether this plugin is currently verified as an official plugin, from
+    /// the signed registry. Never read from the manifest.
+    pub official: super::official::OfficialStatus,
+    /// The plugin has code (an entrypoint). A data-only plugin runs nothing.
+    pub runs_code: bool,
+    /// The user allowed this plugin's code to run. Always `false` for a
+    /// data-only plugin. Independent of every other plugin, and of the
+    /// emergency stop, which overrides it while engaged.
+    pub scripts_allowed: bool,
 }
 
 /// The outcome of the most recent update check, for display.
@@ -255,13 +308,20 @@ impl LaunchCheckOutcome {
 // Shared state
 // ---------------------------------------------------------------------------
 
-struct Inner {
-    ctx: Ctx,
+pub(super) struct Inner {
+    pub(super) ctx: Ctx,
     host: Arc<dyn ScriptHost>,
     ui: Arc<dyn PluginUiSink>,
     subscriptions: EventSubscriptions,
     resolution: RwLock<Resolution>,
     logs_root: PathBuf,
+    /// The key the registry must be signed with for a plugin to count as
+    /// official. The compiled-in key everywhere except tests.
+    pub(super) registry_trust: super::official::RegistryTrust,
+    /// Standing of the plugins that are official or use an official id, as of
+    /// the last `reload`. Read by `list`, so showing the manager does not
+    /// re-verify the registry on every render.
+    official: RwLock<BTreeMap<String, super::official::OfficialStatus>>,
 }
 
 impl Inner {
@@ -273,7 +333,7 @@ impl Inner {
             .map(|resolved| resolved.record.clone())
     }
 
-    fn conn(&self) -> LauncherResult<rusqlite::Connection> {
+    pub(super) fn conn(&self) -> LauncherResult<rusqlite::Connection> {
         crate::db::local_state_connection(&self.ctx.paths.local_state_db()).map_err(|e| {
             LauncherError::Generic {
                 code: "ERR_LOCAL_STATE_FAILED".into(),
@@ -346,12 +406,23 @@ pub struct PluginContentProvider {
 /// Core-owned plugin management and execution.
 #[derive(Clone)]
 pub struct PluginService {
-    inner: Arc<Inner>,
+    pub(super) inner: Arc<Inner>,
     bus: PluginEventBus,
 }
 
 impl PluginService {
     pub fn new(ctx: Ctx, host: Arc<dyn ScriptHost>, ui: Arc<dyn PluginUiSink>) -> Self {
+        Self::new_with_registry_trust(ctx, host, ui, super::official::RegistryTrust::production())
+    }
+
+    /// [`Self::new`] with an explicit registry key. Test support: production
+    /// adapters call `new`, which trusts only the key compiled into the app.
+    pub fn new_with_registry_trust(
+        ctx: Ctx,
+        host: Arc<dyn ScriptHost>,
+        ui: Arc<dyn PluginUiSink>,
+        registry_trust: super::official::RegistryTrust,
+    ) -> Self {
         let subscriptions = EventSubscriptions::new();
         let logs_root = ctx.paths.plugin_logs_root();
         let inner = Arc::new(Inner {
@@ -361,6 +432,8 @@ impl PluginService {
             subscriptions: subscriptions.clone(),
             resolution: RwLock::new(Resolution::default()),
             logs_root,
+            registry_trust,
+            official: RwLock::new(BTreeMap::new()),
         });
         Self {
             bus: PluginEventBus::new(subscriptions, host),
@@ -377,21 +450,116 @@ impl PluginService {
         &self.bus
     }
 
-    /// Whether the user has turned the plugin system on at all.
+    /// Whether the emergency stop is engaged: no plugin script runs, official
+    /// included.
     ///
-    /// Checked before anything is loaded. A user who never opts in never has a
-    /// plugin runtime in their process.
-    pub fn is_enabled(&self) -> bool {
+    /// Fails closed. An unreadable or malformed setting counts as engaged,
+    /// because the stop exists for the moment something is wrong and "I could
+    /// not tell" must not let code run. An absent setting is not engaged.
+    pub fn emergency_stop_engaged(&self) -> bool {
+        let Ok(conn) = self.inner.conn() else {
+            return true;
+        };
+        match crate::db::get_setting(&conn, PLUGINS_EMERGENCY_STOP_SETTING) {
+            Ok(None) => false,
+            Ok(Some(value)) => value.as_bool().unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+
+    /// The inverse, for callers that gate a whole feature on it: plugin code
+    /// may run for the plugins that are allowed to.
+    pub fn plugin_code_allowed(&self) -> bool {
+        !self.emergency_stop_engaged()
+    }
+
+    /// Engage or release the emergency stop. Engaging also stops every plugin
+    /// that is running now, rather than waiting for a restart.
+    pub fn set_emergency_stop(&self, engaged: bool) -> LauncherResult<()> {
+        let conn = self.inner.conn()?;
+        crate::db::set_setting(
+            &conn,
+            PLUGINS_EMERGENCY_STOP_SETTING,
+            &serde_json::Value::Bool(engaged),
+        )
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_LOCAL_STATE_FAILED".into(),
+            message: e.to_string(),
+        })?;
+        if engaged {
+            let ids: Vec<PluginId> = self
+                .inner
+                .resolution
+                .read()
+                .map(|resolution| {
+                    resolution
+                        .plugins
+                        .iter()
+                        .map(|resolved| resolved.id().clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for id in ids {
+                self.inner.host.cancel(&id);
+                let _ = self.deactivate(&id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this plugin's code may run right now: the emergency stop is not
+    /// engaged, and either the plugin has no code or the user allowed it.
+    ///
+    /// Data-only plugins return `true`: they run nothing, so there is nothing to
+    /// allow or stop. Used for every decision about starting or calling a script.
+    pub fn scripts_permitted(&self, plugin_id: &PluginId) -> bool {
+        if self.emergency_stop_engaged() {
+            return false;
+        }
+        let Some(record) = self.inner.record(plugin_id) else {
+            return false;
+        };
+        if record.manifest.is_declarative_only() {
+            return true;
+        }
         self.inner
             .conn()
-            .ok()
-            .and_then(|conn| {
-                crate::db::get_setting(&conn, PLUGINS_ENABLED_SETTING)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|value| value.as_bool())
+            .and_then(|conn| store::script_consent(&conn, plugin_id))
+            .map(|consent| consent == Some(true))
+            // Cannot read the choice: the user has not been shown to allow it.
             .unwrap_or(false)
+    }
+
+    /// Allow or disallow one plugin's scripts. Independent per plugin and
+    /// changeable at any time; disallowing stops it now.
+    pub fn set_scripts_allowed(
+        &self,
+        plugin_id: &PluginId,
+        allowed: bool,
+    ) -> LauncherResult<PluginSummary> {
+        // Read from the database, not the last resolution: this is a decision
+        // about what is installed now.
+        let conn = self.inner.conn()?;
+        let record = store::get(&conn, plugin_id)?
+            .filter(|record| !store::is_tombstone(record))
+            .ok_or_else(|| LauncherError::Generic {
+                code: "ERR_PLUGIN_NOT_FOUND".into(),
+                message: format!("`{plugin_id}` is not installed"),
+            })?;
+        if record.manifest.is_declarative_only() {
+            return Err(LauncherError::Generic {
+                code: "ERR_PLUGIN_NO_CODE".into(),
+                message: format!("`{plugin_id}` has no code to allow or stop"),
+            });
+        }
+        store::set_script_consent(&conn, plugin_id, allowed, &now(&self.inner.ctx))?;
+        drop(conn);
+        if !allowed {
+            self.inner.host.cancel(plugin_id);
+            let _ = self.deactivate(plugin_id);
+        }
+        self.reload()?;
+        self.summary(plugin_id)
     }
 
     // -- reading -----------------------------------------------------------
@@ -400,9 +568,41 @@ impl PluginService {
     pub fn reload(&self) -> LauncherResult<()> {
         let conn = self.inner.conn()?;
         let records = store::list(&conn)?;
-        let resolution = registry::resolve(records, &agora_plugin_api::HOST_API_VERSION);
+        // A plugin that is official, or borrows an official id, and does not
+        // verify is blocked outright: it is not runnable, and the status says
+        // why. An error reading the records is an error here, not "nothing is
+        // blocked".
+        let official = super::official::verify_installed(
+            &conn,
+            self.inner.ctx.paths.root(),
+            &self.inner.registry_trust,
+        )?;
+        let blocked: BTreeMap<String, String> = official
+            .iter()
+            .filter_map(|(id, status)| match status {
+                super::official::OfficialStatus::Unverified { reason } => {
+                    Some((id.clone(), reason.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // A plugin that has just become blocked (revoked by a newer registry,
+        // edited on disk) and is running stops now, not at the next launch.
+        for id in blocked.keys() {
+            if let Ok(plugin_id) = PluginId::parse(id) {
+                if self.inner.host.is_active(&plugin_id) {
+                    self.inner.host.cancel(&plugin_id);
+                    let _ = self.deactivate(&plugin_id);
+                }
+            }
+        }
+        let resolution =
+            registry::resolve_with_blocks(records, &agora_plugin_api::HOST_API_VERSION, &blocked);
         if let Ok(mut slot) = self.inner.resolution.write() {
             *slot = resolution;
+        }
+        if let Ok(mut slot) = self.inner.official.write() {
+            *slot = official;
         }
         Ok(())
     }
@@ -416,6 +616,13 @@ impl PluginService {
         // per row for information that changes only on install or check.
         let (trust, checks) = self.trust_for_display();
         let checkpoints = self.checkpoints_for_display();
+        let official = self
+            .inner
+            .official
+            .read()
+            .map(|statuses| statuses.clone())
+            .unwrap_or_default();
+        let consent = self.script_consent_for_display();
         resolution
             .plugins
             .iter()
@@ -454,9 +661,35 @@ impl PluginService {
                     last_update_check: checks.get(id.as_str()).cloned(),
                     restorable_data: checkpoints.get(id.as_str()).cloned(),
                     dropped_events: self.bus.dropped_count(&id),
+                    official: official
+                        .get(id.as_str())
+                        .cloned()
+                        .unwrap_or(super::official::OfficialStatus::Community),
+                    runs_code: !manifest.is_declarative_only(),
+                    scripts_allowed: !manifest.is_declarative_only()
+                        && consent.get(id.as_str()).copied() == Some(true),
                 }
             })
             .collect()
+    }
+
+    /// The recorded script choices, keyed by plugin id.
+    ///
+    /// Unreadable reads as "nobody allowed anything", which shows scripts as not
+    /// allowed: the safe direction for a display, and `scripts_permitted` does
+    /// its own read.
+    fn script_consent_for_display(&self) -> BTreeMap<String, bool> {
+        match self
+            .inner
+            .conn()
+            .and_then(|conn| store::list_script_consent(&conn))
+        {
+            Ok(consent) => consent,
+            Err(e) => {
+                eprintln!("[plugins] could not read script choices: {e}");
+                BTreeMap::new()
+            }
+        }
     }
 
     /// Pinned update sources and last check results, keyed by plugin id.
@@ -672,7 +905,7 @@ impl PluginService {
 
     /// Contributions from every plugin that is currently runnable.
     pub fn contributions(&self) -> Vec<NamespacedContribution> {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return Vec::new();
         }
         self.inner
@@ -680,6 +913,12 @@ impl PluginService {
             .read()
             .map(|resolution| resolution.contributions.clone())
             .unwrap_or_default()
+            .into_iter()
+            .filter(|contribution| {
+                PluginId::parse(&contribution.plugin_id)
+                    .is_ok_and(|plugin_id| self.scripts_permitted(&plugin_id))
+            })
+            .collect()
     }
 
     pub fn logs(&self, plugin_id: &PluginId, lines: usize) -> Vec<String> {
@@ -689,9 +928,14 @@ impl PluginService {
     // -- installing --------------------------------------------------------
 
     pub fn preview_package(&self, archive: &Path) -> LauncherResult<InstallPreview> {
-        let existing = self.existing_install(archive_id(archive).as_ref());
-        install::preview_package(
-            archive,
+        self.preview_package_bytes(&install::read_package_file(archive)?)
+    }
+
+    /// [`Self::preview_package`] over package bytes already in memory.
+    pub fn preview_package_bytes(&self, bytes: &[u8]) -> LauncherResult<InstallPreview> {
+        let existing = self.existing_install(archive_id(bytes).as_ref());
+        install::preview_package_bytes(
+            bytes,
             existing.as_ref().map(ExistingRecord::as_ref).as_ref(),
         )
     }
@@ -715,6 +959,7 @@ impl PluginService {
         let conn = self.inner.conn().ok()?;
         match store::get(&conn, plugin_id) {
             Ok(Some(record)) if !store::is_tombstone(&record) => Some(ExistingRecord {
+                runs_code: !record.manifest.is_declarative_only(),
                 version: record.manifest.version.clone(),
                 data_version: record.data_version,
                 hosts: record.manifest.network.hosts.clone(),
@@ -733,9 +978,25 @@ impl PluginService {
     pub fn install_package(
         &self,
         archive: &Path,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
-        let contents = install::read_package_manifest(archive)?;
+        // Read once; every step below works from these bytes, not the path.
+        let bytes = install::read_package_file(archive)?;
+        self.install_package_bytes(&bytes, consent)
+    }
+
+    /// [`Self::install_package`] from package bytes already in memory.
+    ///
+    /// The manifest is read from, and the files are unpacked from, the same
+    /// buffer, so nothing can swap the package between the check and the use.
+    pub fn install_package_bytes(
+        &self,
+        bytes: &[u8],
+        consent: impl Into<Consent>,
+    ) -> LauncherResult<PluginSummary> {
+        let consent = consent.into();
+        let accept_capabilities = consent.capabilities;
+        let contents = install::read_package_manifest_bytes(bytes)?;
         let manifest = contents.manifest;
 
         let destination =
@@ -778,7 +1039,7 @@ impl PluginService {
             install::stash_for_rollback(&destination, &rollback)?;
         }
 
-        if let Err(error) = install::extract_package(archive, &destination) {
+        if let Err(error) = install::extract_package(bytes, &destination) {
             if had_files {
                 // Best effort: if this also fails the user is told, rather
                 // than being left believing the old version is back.
@@ -826,6 +1087,15 @@ impl PluginService {
         match &contents.update_source {
             Some(source) => store::put_trust(&conn, &manifest.id, &source.url, &source.keys)?,
             None => store::clear_trust(&conn, &manifest.id)?,
+        }
+
+        // Whether its code may run is asked once, with the install, and kept in
+        // local state (not the manifest). A replacement keeps the answer already
+        // given; a version that newly has code, or a plugin never answered for,
+        // is denied until the user allows it.
+        let first_install = previous.as_ref().is_none_or(store::is_tombstone);
+        if !manifest.is_declarative_only() && first_install {
+            store::set_script_consent(&conn, &manifest.id, consent.scripts, &now(&self.inner.ctx))?;
         }
 
         self.reload()?;
@@ -940,8 +1210,8 @@ impl PluginService {
 
     /// Whether the user asked for update checks to happen on their own.
     ///
-    /// Separate from [`PLUGINS_ENABLED_SETTING`] because they are different
-    /// questions: one is whether plugins run at all, the other is whether
+    /// Separate from [`PLUGINS_EMERGENCY_STOP_SETTING`] because they are different
+    /// questions: one is whether plugin code may run at all, the other is whether
     /// Agora contacts a publisher without being asked. Off by default, like
     /// everything else here that reaches the network.
     pub fn automatic_updates_enabled(&self) -> bool {
@@ -968,7 +1238,7 @@ impl PluginService {
     /// failure, so the reason is recorded on the trust record for the manager
     /// to show and nothing is raised at the user.
     pub async fn check_all_updates(&self) -> Vec<(String, Result<UpdateVerdict, String>)> {
-        if !self.automatic_updates_enabled() || !self.is_enabled() {
+        if !self.automatic_updates_enabled() || !self.plugin_code_allowed() {
             return Vec::new();
         }
         let Ok(conn) = self.inner.conn() else {
@@ -1124,12 +1394,6 @@ impl PluginService {
         &self,
         plugin_id: &PluginId,
     ) -> LauncherResult<(store::PluginRecord, store::TrustRecord)> {
-        if !self.is_enabled() {
-            return Err(LauncherError::Generic {
-                code: "ERR_PLUGINS_DISABLED".into(),
-                message: "the plugin system is switched off".into(),
-            });
-        }
         let conn = self.inner.conn()?;
         let record = store::get(&conn, plugin_id)?
             .filter(|record| !store::is_tombstone(record))
@@ -1209,8 +1473,10 @@ impl PluginService {
     pub fn add_development_folder(
         &self,
         folder: &Path,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<PluginSummary> {
+        let consent = consent.into();
+        let accept_capabilities = consent.capabilities;
         let manifest = install::read_folder_manifest(folder)?;
 
         let conn = self.inner.conn()?;
@@ -1232,6 +1498,7 @@ impl PluginService {
 
         let _ = self.deactivate(&manifest.id);
         let granted = install::grant_for(&manifest)?;
+        let first_install = live.is_none();
         store::upsert(
             &conn,
             &manifest,
@@ -1243,6 +1510,9 @@ impl PluginService {
             true,
             &now(&self.inner.ctx),
         )?;
+        if !manifest.is_declarative_only() && first_install {
+            store::set_script_consent(&conn, &manifest.id, consent.scripts, &now(&self.inner.ctx))?;
+        }
         self.reload()?;
         self.summary(&manifest.id)
     }
@@ -1358,7 +1628,7 @@ impl PluginService {
     /// start. One broken plugin disabling the others would make the system
     /// exactly as fragile as having no isolation at all.
     pub fn activate_all(&self) -> LauncherResult<Vec<(PluginId, PluginError)>> {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return Ok(Vec::new());
         }
         self.reload()?;
@@ -1370,6 +1640,7 @@ impl PluginService {
                 resolution
                     .activation_order
                     .iter()
+                    .filter(|plugin_id| self.scripts_permitted(plugin_id))
                     .filter(|plugin_id| {
                         resolution
                             .get(plugin_id)
@@ -1403,7 +1674,7 @@ impl PluginService {
         event: agora_plugin_api::protocol::PluginEvent,
         operation_id: Option<String>,
     ) -> usize {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return 0;
         }
         self.activate_waiting_for_event(event.name());
@@ -1419,6 +1690,7 @@ impl PluginService {
             .map(|resolution| {
                 resolution
                     .runnable()
+                    .filter(|resolved| self.scripts_permitted(resolved.id()))
                     .filter(|resolved| {
                         resolved.record.manifest.activation.iter().any(|activation| {
                             matches!(activation, ActivationEvent::Event(name) if name == event_name)
@@ -1443,7 +1715,7 @@ impl PluginService {
     /// exists for a plugin that wants to react to an instance being opened
     /// without putting anything on screen.
     pub fn notify_instance_opened(&self) -> usize {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return 0;
         }
         let waiting: Vec<PluginId> = self
@@ -1453,6 +1725,7 @@ impl PluginService {
             .map(|resolution| {
                 resolution
                     .runnable()
+                    .filter(|resolved| self.scripts_permitted(resolved.id()))
                     .filter(|resolved| {
                         resolved
                             .record
@@ -1488,6 +1761,11 @@ impl PluginService {
         }
         if self.inner.host.is_active(plugin_id) {
             return Ok(());
+        }
+        // The one place a script runtime starts. A data-only plugin returned
+        // above and needs neither the user's permission nor the stop to be off.
+        if !self.scripts_permitted(plugin_id) {
+            return Err(self.scripts_refused());
         }
 
         let settings = self.settings_snapshot(plugin_id, &record);
@@ -1699,7 +1977,7 @@ impl PluginService {
     /// consent, never the manifest: a provider the user did not agree to never
     /// appears, even if an update added one.
     pub fn content_providers(&self) -> Vec<PluginContentProvider> {
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return Vec::new();
         }
         let Ok(resolution) = self.inner.resolution.read() else {
@@ -1708,6 +1986,7 @@ impl PluginService {
         resolution
             .plugins
             .iter()
+            .filter(|resolved| self.scripts_permitted(resolved.id()))
             .filter(|resolved| {
                 resolved
                     .record
@@ -1769,7 +2048,7 @@ impl PluginService {
     /// slow plugin nor a broken one can stop someone launching their game.
     pub fn run_launch_checks(&self, instance_id: &str) -> LaunchCheckOutcome {
         let mut outcome = LaunchCheckOutcome::default();
-        if !self.is_enabled() {
+        if !self.plugin_code_allowed() {
             return outcome;
         }
         let Ok(resolution) = self.inner.resolution.read() else {
@@ -1777,6 +2056,7 @@ impl PluginService {
         };
         let runnable: Vec<_> = resolution
             .runnable()
+            .filter(|resolved| self.scripts_permitted(resolved.id()))
             .map(|resolved| resolved.record.clone())
             .collect();
         drop(resolution);
@@ -1829,12 +2109,21 @@ impl PluginService {
         outcome
     }
 
+    /// Why a script was refused, in words for the person who has to fix it.
+    fn scripts_refused(&self) -> PluginError {
+        PluginError::new(
+            PluginErrorCode::NotActivated,
+            if self.emergency_stop_engaged() {
+                "All plugin code is stopped (emergency stop)"
+            } else {
+                "This plugin has not been allowed to run code"
+            },
+        )
+    }
+
     fn ensure_running(&self, plugin_id: &PluginId) -> Result<(), PluginError> {
-        if !self.is_enabled() {
-            return Err(PluginError::new(
-                PluginErrorCode::NotActivated,
-                "Plugins are turned off",
-            ));
+        if !self.scripts_permitted(plugin_id) {
+            return Err(self.scripts_refused());
         }
         if self.inner.host.is_active(plugin_id) {
             return Ok(());
@@ -1932,10 +2221,10 @@ impl PluginService {
                 code: "ERR_PLUGIN_DISABLED".into(),
                 message: "Plugin is unavailable or disabled".into(),
             })?;
-        if !self.is_enabled() {
+        if !self.scripts_permitted(plugin_id) {
             return Err(LauncherError::Generic {
                 code: "ERR_PLUGIN_DISABLED".into(),
-                message: "Plugins are turned off".into(),
+                message: self.scripts_refused().message,
             });
         }
         for action in &proposal.actions {
@@ -2118,7 +2407,7 @@ impl PluginService {
             })
     }
 
-    fn summary(&self, plugin_id: &PluginId) -> LauncherResult<PluginSummary> {
+    pub(super) fn summary(&self, plugin_id: &PluginId) -> LauncherResult<PluginSummary> {
         self.list()
             .into_iter()
             .find(|summary| summary.id == plugin_id.as_str())
@@ -2148,8 +2437,8 @@ fn now(ctx: &Ctx) -> String {
 }
 
 /// The plugin id an archive claims, when it can be read cheaply.
-fn archive_id(archive: &Path) -> Option<PluginId> {
-    install::read_package_manifest(archive)
+fn archive_id(bytes: &[u8]) -> Option<PluginId> {
+    install::read_package_manifest_bytes(bytes)
         .ok()
         .map(|contents| contents.manifest.id)
 }
@@ -2157,6 +2446,7 @@ fn archive_id(archive: &Path) -> Option<PluginId> {
 /// Capabilities a stored grant covers, for display.
 /// An install read out of the database, owned so the connection can be closed.
 struct ExistingRecord {
+    runs_code: bool,
     version: semver::Version,
     data_version: u32,
     hosts: Vec<String>,
@@ -2170,6 +2460,7 @@ impl ExistingRecord {
             data_version: self.data_version,
             granted: &self.granted,
             hosts: &self.hosts,
+            runs_code: self.runs_code,
         }
     }
 }

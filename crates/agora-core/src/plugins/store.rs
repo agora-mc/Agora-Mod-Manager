@@ -249,7 +249,152 @@ pub fn upsert(
         ],
     )
     .map_err(db_error)?;
+    // Whatever replaced the files, it was not the official installer, which
+    // records its provenance only after this call returns. Leaving the old row
+    // would let a different package inherit the previous one's standing.
+    clear_official(conn, &manifest.id)?;
     Ok(())
+}
+
+/// Record whether the user allowed this plugin's code to run. Per plugin; one
+/// plugin's answer never touches another's.
+pub fn set_script_consent(
+    conn: &Connection,
+    plugin_id: &PluginId,
+    allowed: bool,
+    now: &str,
+) -> LauncherResult<()> {
+    conn.execute(
+        "INSERT INTO plugin_script_consent (plugin_id, allowed, decided_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(plugin_id) DO UPDATE SET
+             allowed = excluded.allowed,
+             decided_at = excluded.decided_at",
+        params![plugin_id.as_str(), allowed as i64, now],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// The user's answer for this plugin, or `None` if it has never been given one
+/// (which is not permission).
+pub fn script_consent(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<Option<bool>> {
+    conn.query_row(
+        "SELECT allowed FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|answer| answer.map(|allowed| allowed != 0))
+    .map_err(db_error)
+}
+
+/// Every recorded answer, keyed by plugin id.
+pub fn list_script_consent(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, bool>> {
+    let mut stmt = conn
+        .prepare("SELECT plugin_id, allowed FROM plugin_script_consent")
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, allowed) = row.map_err(db_error)?;
+        out.insert(id, allowed);
+    }
+    Ok(out)
+}
+
+/// Where an installed plugin came from, when it came from a signed registry
+/// entry: the entry that was matched, the package hash that entry pinned, and a
+/// digest of the files as they were written, so a later edit is noticed.
+///
+/// This is a record of an installation, not a verdict. Whether the plugin is
+/// *still* official is decided against the signed registry each time it matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfficialProvenance {
+    pub entry_id: String,
+    pub entry_version: String,
+    /// SHA-256 of the package zip, as pinned by the signed entry.
+    pub entry_sha256: String,
+    /// Digest of the extracted files; see `official::tree_digest`.
+    pub tree_sha256: String,
+    pub recorded_at: String,
+}
+
+/// Record that this plugin's current files came from a signed registry entry.
+pub fn set_official(
+    conn: &Connection,
+    plugin_id: &PluginId,
+    provenance: &OfficialProvenance,
+) -> LauncherResult<()> {
+    conn.execute(
+        "INSERT INTO plugin_official
+             (plugin_id, entry_id, entry_version, entry_sha256, tree_sha256, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(plugin_id) DO UPDATE SET
+             entry_id = excluded.entry_id,
+             entry_version = excluded.entry_version,
+             entry_sha256 = excluded.entry_sha256,
+             tree_sha256 = excluded.tree_sha256,
+             recorded_at = excluded.recorded_at",
+        params![
+            plugin_id.as_str(),
+            provenance.entry_id,
+            provenance.entry_version,
+            provenance.entry_sha256,
+            provenance.tree_sha256,
+            provenance.recorded_at,
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Forget any official provenance for this plugin.
+pub fn clear_official(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<()> {
+    conn.execute(
+        "DELETE FROM plugin_official WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// Every recorded official provenance, keyed by plugin id.
+pub fn list_official(
+    conn: &Connection,
+) -> LauncherResult<std::collections::BTreeMap<String, OfficialProvenance>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT plugin_id, entry_id, entry_version, entry_sha256, tree_sha256, recorded_at
+             FROM plugin_official",
+        )
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                OfficialProvenance {
+                    entry_id: row.get(1)?,
+                    entry_version: row.get(2)?,
+                    entry_sha256: row.get(3)?,
+                    tree_sha256: row.get(4)?,
+                    recorded_at: row.get(5)?,
+                },
+            ))
+        })
+        .map_err(db_error)?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, provenance) = row.map_err(db_error)?;
+        out.insert(id, provenance);
+    }
+    Ok(out)
 }
 
 pub fn set_enabled(
@@ -392,6 +537,14 @@ pub fn remove(conn: &Connection, plugin_id: &PluginId, purge_data: bool) -> Laun
         "UPDATE plugin_installs
          SET enabled = 0, install_dir = '', last_error = 'uninstalled; data retained'
          WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+    )
+    .map_err(db_error)?;
+    // The files are gone, so whatever vouched for them no longer applies, and
+    // so does permission to run them: a reinstall asks again, like the grants.
+    clear_official(conn, plugin_id)?;
+    conn.execute(
+        "DELETE FROM plugin_script_consent WHERE plugin_id = ?1",
         params![plugin_id.as_str()],
     )
     .map_err(db_error)?;

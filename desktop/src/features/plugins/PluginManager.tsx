@@ -21,11 +21,14 @@ import {
   checkPluginUpdate,
   disableAllPlugins,
   installPluginPackage,
+  pluginsEmergencyStop,
   previewPluginFolder,
   previewPluginPackage,
   readPluginLog,
   restorePluginData,
   setPluginEnabled,
+  setPluginScriptsAllowed,
+  setPluginsEmergencyStop,
   uninstallPlugin,
 } from './api';
 import { usePlugins } from './PluginProvider';
@@ -53,7 +56,6 @@ import type {
  * without any plugin having to cooperate.
  */
 
-const PLUGINS_ENABLED = 'plugins_enabled';
 const NETWORK_PLUGINS_ENABLED = 'network_plugins_enabled';
 const PLUGIN_UPDATES_ENABLED = 'plugin_updates_enabled';
 
@@ -160,7 +162,8 @@ function isUpdateOutcome(value: unknown): value is UpdateOutcome {
 export function PluginManager() {
   const { plugins, refresh, ready } = usePlugins();
   const safePlugins = Array.isArray(plugins) ? plugins.filter(isPluginSummary) : [];
-  const [systemEnabled, setSystemEnabled] = useState(false);
+  // The emergency stop. Not engaged by default; while it is, no plugin code runs.
+  const [stopped, setStopped] = useState(false);
   const [networkEnabled, setNetworkEnabled] = useState(false);
   const [updatesEnabled, setUpdatesEnabled] = useState(false);
   const [preview, setPreview] = useState<{ preview: InstallPreview; path: string; development: boolean } | null>(null);
@@ -169,27 +172,24 @@ export function PluginManager() {
 
   useEffect(() => {
     void (async () => {
-      setSystemEnabled((await getSetting(PLUGINS_ENABLED)) === true);
+      // Anything but an explicit "not stopped" shows as stopped.
+      setStopped((await pluginsEmergencyStop().catch(() => true)) !== false);
       setNetworkEnabled((await getSetting(NETWORK_PLUGINS_ENABLED)) === true);
       setUpdatesEnabled((await getSetting(PLUGIN_UPDATES_ENABLED)) === true);
     })();
   }, []);
 
-  const toggleSystem = useCallback(
+  const toggleStop = useCallback(
     async (next: boolean) => {
       try {
-        await setSetting(PLUGINS_ENABLED, next);
-        setSystemEnabled(next);
-        if (!next) {
-          // Turning the system off should actually stop what is running, not
-          // just hide it until the next restart.
-          await disableAllPlugins();
-        }
+        // Engaging also stops what is running now, rather than at the next start.
+        await setPluginsEmergencyStop(next);
+        setStopped(next);
         await refresh();
         showToast(
           next
-            ? 'Plugins are on. Restart Agora to load anything already installed.'
-            : 'Plugins are off and everything installed has been stopped.',
+            ? 'All plugin code is stopped.'
+            : 'Plugin code can run again, for the plugins you allowed.',
         );
       } catch (e) {
         showToast(formatError(e), 'error');
@@ -251,13 +251,13 @@ export function PluginManager() {
     }
   }, []);
 
-  const confirmInstall = useCallback(async () => {
+  const confirmInstall = useCallback(async (allowCode: boolean) => {
     if (!preview) return;
     setBusy(true);
     try {
       const summary = preview.development
-        ? await addPluginDevelopmentFolder(preview.path, true)
-        : await installPluginPackage(preview.path, true);
+        ? await addPluginDevelopmentFolder(preview.path, true, allowCode)
+        : await installPluginPackage(preview.path, true, allowCode);
       if (!isRecord(summary) || typeof summary.name !== 'string' || typeof summary.version !== 'string') {
         showToast('Agora did not return a usable installed plugin.', 'error');
         return;
@@ -331,23 +331,33 @@ export function PluginManager() {
       <section className="space-y-3">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h3 className="text-base font-medium">Community plugins</h3>
+            <h3 className="text-base font-medium">Plugins</h3>
             <p className="text-sm text-muted-foreground">
-              Plugins add pages, panels, commands and checks to Agora. They are off by default,
-              run with only the permissions you grant, and can be turned off at any time. Agora
-              works the same with none installed. Permissions are the real boundary here — a
-              plugin runs inside Agora, so only install ones you trust.
+              Plugins add pages, panels, commands and checks to Agora. A plugin that has code
+              runs it only if you allow that plugin to, runs with only the permissions you grant,
+              and can be turned off at any time. Agora works the same with none installed.
+              Permissions are the real boundary here — a plugin runs inside Agora, so only allow
+              code you trust.
             </p>
           </div>
-          <Switch
-            checked={systemEnabled}
-            onCheckedChange={(checked) => void toggleSystem(checked)}
-            aria-label="Enable community plugins"
-          />
         </div>
 
-        {systemEnabled ? (
-          <div className="space-y-2">
+        <div className="space-y-2">
+          <div className="flex items-start justify-between gap-4 rounded-lg border border-border bg-muted/30 px-4 py-3">
+            <div>
+              <div className="text-sm font-medium">Stop all plugin code</div>
+              <p className="text-xs text-muted-foreground">
+                An emergency stop. While it is on, no plugin code runs, official plugins
+                included. Game support that is only data keeps working.
+              </p>
+            </div>
+            <Switch
+              checked={stopped}
+              onCheckedChange={(checked) => void toggleStop(checked)}
+              aria-label="Stop all plugin code"
+            />
+          </div>
+
             <div className="flex items-start justify-between gap-4 rounded-lg border border-border bg-muted/30 px-4 py-3">
               <div>
                 <div className="text-sm font-medium">Check for plugin updates automatically</div>
@@ -379,11 +389,9 @@ export function PluginManager() {
               />
             </div>
           </div>
-        ) : null}
       </section>
 
-      {systemEnabled ? (
-        <>
+      <>
           <PluginThemeSelect />
           <PluginSurfacePicker />
           <div className="flex flex-wrap gap-2">
@@ -409,7 +417,7 @@ export function PluginManager() {
               development={preview.development}
               busy={busy}
               onCancel={() => setPreview(null)}
-              onConfirm={() => void confirmInstall()}
+              onConfirm={(allowCode) => void confirmInstall(allowCode)}
             />
           ) : null}
 
@@ -451,8 +459,7 @@ export function PluginManager() {
               </pre>
             </div>
           ) : null}
-        </>
-      ) : null}
+      </>
     </div>
   );
 }
@@ -495,6 +502,22 @@ function PluginRow({
   const [restoreBusy, setRestoreBusy] = useState(false);
   const { confirm } = useConfirm();
   const hasSettings = contributions.some((contribution) => contribution?.kind === 'setting');
+  const setScripts = useCallback(
+    async (next: boolean) => {
+      try {
+        await setPluginScriptsAllowed(pluginId, next);
+        await onRefresh();
+        showToast(
+          next
+            ? `${pluginName} may run its code.`
+            : `${pluginName} will not run code, and has been stopped.`,
+        );
+      } catch (e) {
+        showToast(formatError(e), 'error');
+      }
+    },
+    [onRefresh, pluginId, pluginName],
+  );
   const statusState = isRecord(plugin.status) ? plugin.status.state : null;
   const broken = statusState !== 'ready' && statusState !== 'disabled';
   const droppedEvents = typeof plugin.droppedEvents === 'number' ? plugin.droppedEvents : 0;
@@ -657,6 +680,16 @@ function PluginRow({
             onCheckedChange={onToggle}
             aria-label={`Enable ${pluginName}`}
           />
+          {plugin.runsCode === true ? (
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              Allow code
+              <Switch
+                checked={plugin.scriptsAllowed === true}
+                onCheckedChange={(next) => void setScripts(next)}
+                aria-label={`Allow ${pluginName} to run code`}
+              />
+            </label>
+          ) : null}
           <div className="flex gap-1">
             <Button
               variant="ghost"
@@ -796,7 +829,8 @@ function InstallPrompt({
   confirmLabel?: string;
   busyLabel?: string;
   onCancel: () => void;
-  onConfirm: () => void;
+  /** `allowCode` is the answer to "<name> runs code. Allow it?"; `false` when not asked. */
+  onConfirm: (allowCode: boolean) => void;
 }) {
   const requiredCapabilities = Array.isArray(preview.requiredCapabilities)
     ? preview.requiredCapabilities.filter(isCapabilityDescription)
@@ -827,6 +861,8 @@ function InstallPrompt({
     ? stringArray(manifestNetworkValue.hosts)
     : [];
   const blocked = unsupportedCapabilities.length > 0;
+  // Asked once, at the first install. An update keeps the answer already given.
+  const asksAboutCode = preview.runsCode === true && !preview.replacesVersion;
 
   return (
     <div className="rounded-lg border border-border bg-muted/30 p-4">
@@ -935,10 +971,24 @@ function InstallPrompt({
         </p>
       ) : null}
 
+      {asksAboutCode ? (
+        <p className="mt-3 text-sm font-medium">{manifestName} runs code. Allow it?</p>
+      ) : null}
+
       <div className="mt-4 flex gap-2">
-        <Button size="sm" onClick={onConfirm} disabled={busy || blocked}>
-          {busy ? busyLabel : confirmLabel}
+        <Button size="sm" onClick={() => onConfirm(asksAboutCode)} disabled={busy || blocked}>
+          {busy ? busyLabel : asksAboutCode ? `${confirmLabel} and allow code` : confirmLabel}
         </Button>
+        {asksAboutCode ? (
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => onConfirm(false)}
+            disabled={busy || blocked}
+          >
+            {confirmLabel} without running code
+          </Button>
+        ) : null}
         <Button size="sm" variant="ghost" onClick={onCancel} disabled={busy}>
           Cancel
         </Button>

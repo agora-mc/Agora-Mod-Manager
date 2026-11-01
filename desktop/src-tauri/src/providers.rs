@@ -15,7 +15,7 @@ use tauri::AppHandle;
 /// without it — the official ones need no plugin runtime at all.
 fn plugin_service(app: &AppHandle) -> Option<agora_core::plugins::PluginService> {
     let service = crate::plugins::service(app).ok()?;
-    service.is_enabled().then_some(service)
+    service.plugin_code_allowed().then_some(service)
 }
 
 /// Every provider this session knows about: Agora's own and any a plugin

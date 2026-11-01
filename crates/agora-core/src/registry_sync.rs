@@ -173,12 +173,15 @@ pub async fn check_and_download_update(
     // valid forever, so an older release republished as "latest" (or promoted
     // by release pruning) would otherwise be installed over a newer registry,
     // reinstating entries that curation has since quarantined.
-    let update_available = match cached_tag.as_deref() {
-        Some(cached) if has_cached_db => tag_is_newer(cached, &latest.tag_name),
-        // No cached tag, or a tag with no database behind it: nothing to
-        // roll back from.
-        _ => true,
-    };
+    let latest_asset = latest.find_asset("registry.db");
+    let cached_asset = get_cached_asset_id(local_state_path)?;
+    let update_available = update_is_available(
+        cached_tag.as_deref(),
+        has_cached_db,
+        cached_asset,
+        &latest.tag_name,
+        latest_asset,
+    );
 
     if !update_available && has_cached_db {
         return Ok(RegistryStatus {
@@ -253,6 +256,7 @@ pub async fn check_and_download_update(
         paths::registry_sig_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     atomic_replace_db(&db_path, &sig_path, &db_bytes, &sig_bytes)?;
     set_cached_tag(local_state_path, &latest.tag_name)?;
+    set_cached_asset_id(local_state_path, Some(db_id))?;
 
     if let Some(op) = _op {
         op.complete();
@@ -553,15 +557,115 @@ async fn download_file(url: &str, token: Option<&str>) -> LauncherResult<Vec<u8>
 }
 
 // ---------------------------------------------------------------------------
+// Reading the cached registry as trusted data
+// ---------------------------------------------------------------------------
+
+/// The cached registry, read only after its signature was checked.
+///
+/// `verify_cached_registry` runs once at startup, but the cached file sits in a
+/// user-writable folder and can change afterwards. A caller that is about to
+/// act on what the registry says (download this URL, trust this hash) calls
+/// [`open_verified_registry`] instead: it verifies the bytes it is about to read,
+/// then opens a private copy of exactly those bytes, so the file cannot be
+/// swapped between the check and the read.
+pub struct VerifiedRegistry {
+    conn: Option<rusqlite::Connection>,
+    copy: std::path::PathBuf,
+}
+
+impl VerifiedRegistry {
+    pub fn connection(&self) -> &rusqlite::Connection {
+        self.conn
+            .as_ref()
+            .expect("the connection is only taken when the registry is dropped")
+    }
+}
+
+impl Drop for VerifiedRegistry {
+    fn drop(&mut self) {
+        // The connection must close before Windows lets the file go.
+        self.conn = None;
+        let _ = std::fs::remove_file(&self.copy);
+    }
+}
+
+/// Verify the cached `registry.db` against the compiled-in key and open it.
+///
+/// Fails closed: a missing registry, a missing or wrong signature, or an
+/// unreadable file is an error, never an empty registry.
+pub fn open_verified_registry(app_data_dir: &Path) -> LauncherResult<VerifiedRegistry> {
+    open_verified_registry_with_key(app_data_dir, REGISTRY_PUBKEY_HEX)
+}
+
+/// [`open_verified_registry`] against an explicit key.
+///
+/// Public so integration tests can sign a registry of their own. Production
+/// adapters call [`open_verified_registry`]; no setting or environment variable
+/// reaches this function.
+pub fn open_verified_registry_with_key(
+    app_data_dir: &Path,
+    pubkey_hex: &str,
+) -> LauncherResult<VerifiedRegistry> {
+    static COPY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // An empty key would reach the debug-build "skip verification" branch.
+    if pubkey_hex.trim().is_empty() {
+        return Err(LauncherError::RegistrySignatureInvalid);
+    }
+    let db_path =
+        paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    let sig_path =
+        paths::registry_sig_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    if !db_path.exists() {
+        return Err(LauncherError::RegistryMissing);
+    }
+    let db_bytes = std::fs::read(&db_path).map_err(|_| LauncherError::RegistryMissing)?;
+    // A registry with no signature sidecar is unsigned, which is not trusted.
+    let sig_bytes =
+        std::fs::read(&sig_path).map_err(|_| LauncherError::RegistrySignatureInvalid)?;
+    verify_signature_with_key(pubkey_hex, &db_bytes, &sig_bytes)?;
+
+    let copy = app_data_dir.join(format!(
+        "registry_verified-{}-{}.tmp",
+        std::process::id(),
+        COPY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&copy, &db_bytes).map_err(|_| LauncherError::RegistryMissing)?;
+    match db::registry_connection(&copy) {
+        Ok(conn) => Ok(VerifiedRegistry {
+            conn: Some(conn),
+            copy,
+        }),
+        Err(e) => {
+            let _ = std::fs::remove_file(&copy);
+            Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_UNREADABLE".into(),
+                message: format!("The verified catalog could not be opened: {e}"),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers â€” Ed25519 signature verification
 // ---------------------------------------------------------------------------
 
 fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
+    verify_signature_with_key(REGISTRY_PUBKEY_HEX, db_bytes, sig_bytes)
+}
+
+/// [`verify_signature`] against an explicit key, so a caller that is handed a
+/// different trust anchor (a test, never a user setting) shares the one check.
+fn verify_signature_with_key(
+    pubkey_hex: &str,
+    db_bytes: &[u8],
+    sig_bytes: &[u8],
+) -> LauncherResult<()> {
     // In debug builds only, allow skipping verification when no pubkey is set.
     // Release builds must have AGORA_REGISTRY_PUBKEY compiled in.
     #[cfg(not(debug_assertions))]
     {
-        if REGISTRY_PUBKEY_HEX.is_empty() {
+        if pubkey_hex.is_empty() {
             return Err(LauncherError::Generic {
                 code: "ERR_REGISTRY_PUBKEY_NOT_CONFIGURED".to_string(),
                 message: "Catalog public key not compiled in; refusing to verify. \
@@ -576,7 +680,7 @@ fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
 
     #[cfg(debug_assertions)]
     {
-        if REGISTRY_PUBKEY_HEX.is_empty() {
+        if pubkey_hex.is_empty() {
             eprintln!(
                 "WARNING: AGORA_REGISTRY_PUBKEY not set; skipping signature verification (debug build only).\n\
                  Set `$env:AGORA_REGISTRY_PUBKEY` (Ed25519 public key, hex) before `npm run tauri:dev` to enable verification.\n\
@@ -589,7 +693,7 @@ fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
         }
     }
 
-    let pubkey_bytes = hex::decode(REGISTRY_PUBKEY_HEX).map_err(|_| LauncherError::Generic {
+    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| LauncherError::Generic {
         code: "ERR_REGISTRY_PUBKEY".to_string(),
         message: "Invalid compiled-in registry public key.".to_string(),
     })?;
@@ -739,6 +843,46 @@ fn tag_is_newer(cached: &str, latest: &str) -> bool {
     }
 }
 
+/// Whether the latest release is worth downloading.
+///
+/// The tag is the date, so two releases published the same UTC day carry the
+/// same tag, and `deploy_release_assets.py` re-publishes into it by deleting and
+/// re-uploading the assets. A same-day re-publish is how a bad official plugin
+/// is revoked within the day, so a client that already synced today must still
+/// notice it. The tag cannot show it, but the `registry.db` asset's id does: a
+/// re-upload gets a new id. A client with no recorded id (one that synced before
+/// this was recorded) downloads once to learn it.
+///
+/// This is only a filter on unsigned API metadata. What decides whether a
+/// downloaded registry is installed is the signed `built_at` stamp
+/// ([`is_rollback`]); a forged id can at worst cost one wasted download per check.
+fn update_is_available(
+    cached_tag: Option<&str>,
+    has_cached_db: bool,
+    cached_asset: Option<u64>,
+    latest_tag: &str,
+    latest_asset: Option<u64>,
+) -> bool {
+    let Some(cached_tag) = cached_tag.filter(|_| has_cached_db) else {
+        // No cached tag, or a tag with no database behind it: nothing to
+        // roll back from.
+        return true;
+    };
+    if tag_is_newer(cached_tag, latest_tag) {
+        return true;
+    }
+    // Same release tag (same UTC day): newer only if its database was re-uploaded.
+    match (
+        parse_registry_tag(cached_tag),
+        parse_registry_tag(latest_tag),
+    ) {
+        (Some(cached), Some(latest)) if cached == latest => {
+            latest_asset.is_some() && latest_asset != cached_asset
+        }
+        _ => false,
+    }
+}
+
 /// Parse `registry-YYYY-MM-DD` into a comparable tuple.
 fn parse_registry_tag(tag: &str) -> Option<(u16, u8, u8)> {
     let mut parts = tag.strip_prefix("registry-")?.split('-');
@@ -848,6 +992,29 @@ fn set_cached_tag(local_state_path: &std::path::Path, tag: &str) -> LauncherResu
         &serde_json::Value::String(tag.to_string()),
     )
     .map_err(|_| LauncherError::LocalStateFailed)
+}
+
+/// The id of the `registry.db` release asset the cached registry came from.
+fn get_cached_asset_id(local_state_path: &std::path::Path) -> LauncherResult<Option<u64>> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::get_setting(&conn, "cached_registry_asset_id")
+        .map_err(|_| LauncherError::LocalStateFailed)
+        .map(|v| v.and_then(|v| v.as_u64()))
+}
+
+fn set_cached_asset_id(
+    local_state_path: &std::path::Path,
+    asset_id: Option<u64>,
+) -> LauncherResult<()> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    let value = match asset_id {
+        Some(id) => serde_json::Value::from(id),
+        None => serde_json::Value::Null,
+    };
+    db::set_setting(&conn, "cached_registry_asset_id", &value)
+        .map_err(|_| LauncherError::LocalStateFailed)
 }
 
 fn get_last_check_time(local_state_path: &std::path::Path) -> LauncherResult<Option<i64>> {
@@ -1091,6 +1258,71 @@ mod tests {
 
     /// The binding check: both stamps come from inside signature-verified
     /// bytes, so unlike the tag they cannot be forged without the signing key.
+    /// Same-day revocation: `deploy_release_assets.py` re-publishes into the day's
+    /// tag by deleting and re-uploading the assets, so the tag does not change but
+    /// the `registry.db` asset's id does.
+    #[test]
+    fn a_same_day_republish_is_noticed_by_its_new_asset_id() {
+        let today = "registry-2026-10-31";
+        // Re-uploaded: a new id.
+        assert!(update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            today,
+            Some(9)
+        ));
+        // Same bytes, same id: nothing to do.
+        assert!(!update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            today,
+            Some(7)
+        ));
+        // Synced before ids were recorded: download once to learn it.
+        assert!(update_is_available(Some(today), true, None, today, Some(9)));
+        // The release names no database asset: nothing to download.
+        assert!(!update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            today,
+            None
+        ));
+        // A different asset id never beats the date ordering.
+        assert!(!update_is_available(
+            Some("registry-2026-11-01"),
+            true,
+            Some(7),
+            today,
+            Some(9)
+        ));
+        assert!(!update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            "v0.9.0",
+            Some(9)
+        ));
+        // Newer day, or nothing cached, behaves as before.
+        assert!(update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            "registry-2026-11-01",
+            Some(7)
+        ));
+        assert!(update_is_available(None, false, None, today, Some(9)));
+        assert!(update_is_available(
+            Some(today),
+            false,
+            Some(7),
+            today,
+            Some(7)
+        ));
+    }
+
     #[test]
     fn is_rollback_compares_signed_build_stamps() {
         let older = "2026-08-26T03:19:02+00:00";

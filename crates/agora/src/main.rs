@@ -22,6 +22,7 @@ use agora_game_minecraft::runtime_service::RuntimeService;
 mod cli_discovery;
 mod cli_govniche;
 mod cli_network;
+mod cli_official;
 mod cli_tools;
 mod cli_updates;
 mod cli_worlds;
@@ -1083,9 +1084,15 @@ enum PluginCmd {
         #[arg(
             long,
             global = true,
-            help = "Accept requested plugin capabilities without prompting"
+            help = "Accept requested plugin capabilities, and let a plugin that has code run it, without prompting"
         )]
         yes: bool,
+        /// Install a plugin that has code without allowing that code to run.
+        ///
+        /// Its permissions are still granted (with --yes or at the prompt). Allow
+        /// it later with `plugin scripts <ID> allow`.
+        #[arg(long, global = true)]
+        no_code: bool,
     },
     /// Enable a previously disabled plugin.
     Enable { id: String },
@@ -1106,6 +1113,31 @@ enum PluginCmd {
     /// Disable every installed plugin as a recovery action.
     #[command(name = "disable-all")]
     DisableAll,
+    /// Allow or stop one plugin's code (scripts). Data-only plugins have none.
+    ///
+    /// Each plugin that has code runs it only if you allowed it, and one plugin's
+    /// answer never affects another's. `deny` also stops it now.
+    Scripts {
+        id: String,
+        #[arg(value_parser = ["allow", "deny"])]
+        choice: String,
+    },
+    /// Engage the emergency stop: no plugin code runs, official plugins included.
+    ///
+    /// Stops what is running now and until `resume`. Data-only plugins (game
+    /// packages) run no code and are not affected.
+    Stop,
+    /// Release the emergency stop. Plugins you allowed to run code run again.
+    Resume,
+    /// Official plugins: packages Agora's signed catalog vouches for.
+    ///
+    /// Downloaded from the URL the catalog names and checked against the size
+    /// and SHA-256 it pins before anything is unpacked. An official plugin
+    /// loads without the community-plugins switch while it still matches.
+    Official {
+        #[command(subcommand)]
+        action: cli_official::OfficialCmd,
+    },
     /// Show a plugin's declared settings and their current values.
     Settings {
         /// Plugin id.
@@ -2416,14 +2448,52 @@ fn preview_plugin_source(
 fn install_plugin_source(
     service: &PluginService,
     source: PluginSourceCmd,
-    accept_capabilities: bool,
+    consent: agora_core::plugins::Consent,
 ) -> anyhow::Result<PluginSummary> {
     Ok(match source {
-        PluginSourceCmd::Package { path } => service.install_package(&path, accept_capabilities)?,
-        PluginSourceCmd::Development { path } => {
-            service.add_development_folder(&path, accept_capabilities)?
-        }
+        PluginSourceCmd::Package { path } => service.install_package(&path, consent)?,
+        PluginSourceCmd::Development { path } => service.add_development_folder(&path, consent)?,
     })
+}
+
+/// Whether to let a plugin that has code run it: "<name> runs code. Allow it?"
+///
+/// Asked once, with the install, and only for a plugin that has code. Never
+/// assumed: without `--yes` or a person at a terminal the answer is no, and the
+/// plugin installs without running code.
+fn accept_plugin_code(
+    preview: &InstallPreview,
+    json: bool,
+    yes: bool,
+    no_code: bool,
+) -> anyhow::Result<bool> {
+    if !preview.runs_code || no_code {
+        return Ok(false);
+    }
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "{} runs code. It was installed without allowing that; rerun with --yes to allow it, or run `agora plugin scripts {} allow` once the person using this computer has agreed.",
+            preview.manifest.name, preview.manifest.id
+        );
+        return Ok(false);
+    }
+    let prompt = format!("{} runs code. Allow it? [y/N]: ", preview.manifest.name);
+    if json {
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+    } else {
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+    }
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn print_plugin_preview(
@@ -2464,6 +2534,11 @@ fn print_plugin_preview(
     }
     if let Some(version) = &preview.replaces_version {
         println!("Replaces installed version: {version}");
+    }
+    if preview.runs_code {
+        println!("Code: this plugin runs code (scripts)");
+    } else {
+        println!("Code: none (data only)");
     }
     if preview.migrates_data {
         println!("Data: the installed data shape would be migrated");
@@ -2667,6 +2742,14 @@ async fn run_plugin_command(
                             },
                             if plugin.enabled { "yes" } else { "no" }.into(),
                             if plugin.running { "yes" } else { "no" }.into(),
+                            if !plugin.runs_code {
+                                "none"
+                            } else if plugin.scripts_allowed {
+                                "allowed"
+                            } else {
+                                "not allowed"
+                            }
+                            .into(),
                             plugin.status_text.clone(),
                         ]
                     })
@@ -2679,6 +2762,7 @@ async fn run_plugin_command(
                         "Source",
                         "Enabled",
                         "Running",
+                        "Code",
                         "Status / reason",
                     ],
                     &rows,
@@ -2689,10 +2773,22 @@ async fn run_plugin_command(
             let preview = preview_plugin_source(service, &source)?;
             print_plugin_preview(&preview, json, false)?;
         }
-        PluginCmd::Install { source, yes } => {
+        PluginCmd::Install {
+            source,
+            yes,
+            no_code,
+        } => {
             let preview = preview_plugin_source(service, &source)?;
             let accepted = accept_plugin_capabilities(&preview, json, yes)?;
-            let summary = install_plugin_source(service, source, accepted)?;
+            let allow_code = accept_plugin_code(&preview, json, yes, no_code)?;
+            let summary = install_plugin_source(
+                service,
+                source,
+                agora_core::plugins::Consent {
+                    capabilities: accepted,
+                    scripts: allow_code,
+                },
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
@@ -2857,6 +2953,35 @@ async fn run_plugin_command(
         PluginCmd::Settings { id } => cli_govniche::plugin_settings(service, &id, json)?,
         PluginCmd::Set { id, key, value } => {
             cli_govniche::plugin_set(service, &id, &key, &value, json)?
+        }
+        PluginCmd::Official { action } => cli_official::run(service, action, json).await?,
+        PluginCmd::Scripts { id, choice } => {
+            let plugin_id = parse_plugin_id(&id)?;
+            let allowed = choice == "allow";
+            let summary = service.set_scripts_allowed(&plugin_id, allowed)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else if allowed {
+                println!("{id} may run its code.");
+            } else {
+                println!("{id} will not run code, and has been stopped.");
+            }
+        }
+        PluginCmd::Stop => {
+            service.set_emergency_stop(true)?;
+            if json {
+                println!("{}", serde_json::json!({"emergencyStop": true}));
+            } else {
+                println!("Emergency stop engaged: no plugin code runs. Release it with `agora plugin resume`.");
+            }
+        }
+        PluginCmd::Resume => {
+            service.set_emergency_stop(false)?;
+            if json {
+                println!("{}", serde_json::json!({"emergencyStop": false}));
+            } else {
+                println!("Emergency stop released. Plugins you allowed to run code run again.");
+            }
         }
         PluginCmd::DisableAll => {
             let disabled = service.disable_all()?;
@@ -5029,7 +5154,7 @@ async fn run_command(
         Commands::Provider { action } => {
             let service = plugin_service(ctx);
             let _ = service.reload();
-            let plugins = service.is_enabled().then_some(&service);
+            let plugins = service.plugin_code_allowed().then_some(&service);
             let registry = agora_core::providers::ProviderRegistry::new(ctx, plugins);
             match &action {
                 ProviderCmd::List => {

@@ -38,7 +38,9 @@ export type PluginStatus =
   | { state: 'incompatibleApi'; detail: { required: string; host: string } }
   | { state: 'unresolvedDependency'; detail: { dependency: string; reason: string } }
   | { state: 'dependencyCycle'; detail: { cycle: string[] } }
-  | { state: 'failed'; detail: { message: string } };
+  | { state: 'failed'; detail: { message: string } }
+  /** An official plugin, or one using an official id, that does not verify; never runs. */
+  | { state: 'blocked'; detail: { reason: string } };
 
 export interface ReplacementOffer {
   id: string;
@@ -116,6 +118,53 @@ export interface PluginSummary {
   /** A saved copy of this plugin's data that could be put back, if any. */
   restorableData: CheckpointSummary | null;
   droppedEvents: number;
+  /**
+   * Whether the signed registry currently vouches for this plugin. Decided by
+   * core, never read from the manifest; absent on builds that predate it.
+   */
+  official?: OfficialStatus;
+  /** The plugin has code (scripts). A data-only plugin, such as game support, runs none. */
+  runsCode?: boolean;
+  /** The user allowed this plugin's code to run. Per plugin; the emergency stop overrides it. */
+  scriptsAllowed?: boolean;
+}
+
+/** Standing of an installed plugin as an official one. */
+export type OfficialStatus =
+  | { state: 'official'; version: string }
+  | { state: 'community' }
+  /** Installed as official but no longer verifies; follows community rules. */
+  | { state: 'unverified'; reason: string };
+
+export type OfficialInstallState =
+  | 'notInstalled'
+  | 'upToDate'
+  | 'updateAvailable'
+  | 'notOfficial';
+
+export interface OfficialPluginInfo {
+  id: string;
+  name: string;
+  description: string | null;
+  /** Games this plugin adds, if any. */
+  gameIds: string[];
+  /** The version an install or update moves to. */
+  version: string;
+  previousVersion: string | null;
+  sizeBytes: number;
+  minAgoraVersion: string;
+  state: OfficialInstallState;
+  installedVersion: string | null;
+  canRollBack: boolean;
+  installedStatus: OfficialStatus | null;
+  /** Why it cannot be installed or updated right now, if it cannot. */
+  problem: string | null;
+}
+
+export interface OfficialPluginList {
+  plugins: OfficialPluginInfo[];
+  /** Set when the catalog could not be verified; the list is then empty on purpose. */
+  unavailableReason: string | null;
 }
 
 export interface CapabilityDescription {
@@ -144,6 +193,10 @@ export interface InstallPreview {
   needsReducedSecurity?: boolean;
   fileCount: number;
   uncompressedBytes: number;
+  /** The plugin has code: the prompt asks "<name> runs code. Allow it?". */
+  runsCode?: boolean;
+  /** The plugin has code and the installed version did not. */
+  addsCode?: boolean;
 }
 
 export type UpdateVerdict =
