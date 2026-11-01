@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Gamepad2 } from 'lucide-react';
 import { formatError } from '../../lib/tauri';
+import { MoreGamesCard } from '../../features/games/support/MoreGames';
 import { listGameSupport, setGameEnabled, type GameSupportRow } from '../../features/games/support/api';
+import { listOfficialPlugins } from '../../features/plugins/api';
+import { OfficialBadge, OfficialStatusNote } from '../../features/plugins/OfficialBadge';
+import type { OfficialPluginInfo } from '../../features/plugins/types';
 import { SettingsSection } from './SettingsSection';
 
 type Load =
@@ -22,6 +26,30 @@ export function GameSupportSettings() {
   const [saveError, setSaveError] = useState<string | null>(null);
   // One change at a time: the saved list is read, changed and written back as a whole.
   const [saving, setSaving] = useState<string | null>(null);
+  // Official catalog entries by plugin id, so a game added by a plugin can say
+  // whether that plugin is currently verified official. A failed read only
+  // means no badge; it never hides a game.
+  const [officialById, setOfficialById] = useState<Record<string, OfficialPluginInfo>>({});
+
+  const loadOfficial = useCallback(() => {
+    listOfficialPlugins()
+      .then((reply) => {
+        if (!reply || !Array.isArray(reply.plugins)) {
+          setOfficialById({});
+          return;
+        }
+        const byId: Record<string, OfficialPluginInfo> = {};
+        for (const info of reply.plugins) {
+          if (info && typeof info.id === 'string') byId[info.id] = info;
+        }
+        setOfficialById(byId);
+      })
+      .catch(() => setOfficialById({}));
+  }, []);
+
+  useEffect(() => {
+    loadOfficial();
+  }, [loadOfficial]);
 
   const reload = useCallback(() => {
     setLoad({ status: 'loading' });
@@ -59,6 +87,8 @@ export function GameSupportSettings() {
       title="Game support"
       description="Turn a game off to hide it from the game switcher. Its instances, bases and files stay where they are."
     >
+      <MoreGamesCard surface="settings" />
+
       {load.status === 'loading' && <p className="text-xs text-muted-foreground">Loading…</p>}
       {load.status === 'failed' && (
         <div className="space-y-2">
@@ -72,25 +102,33 @@ export function GameSupportSettings() {
       )}
       {load.status === 'loaded' && (
         <ul className="divide-y divide-border rounded-lg border border-border">
-          {load.rows.map((row) => (
-            <li key={row.gameId} className="flex items-center justify-between gap-3 px-3 py-2">
-              <div className="min-w-0">
-                <p className="truncate text-sm">{row.name}</p>
-                <p className="text-xs text-muted-foreground">
-                  {sourceLabel(row)}
-                  {!row.canDisable && ' · Always on: Agora falls back to Minecraft, so it cannot be turned off yet.'}
-                </p>
-              </div>
-              <input
-                type="checkbox"
-                aria-label={`Offer ${row.name}`}
-                checked={row.enabled}
-                disabled={!row.canDisable || saving !== null}
-                onChange={(event) => void toggle(row, event.currentTarget.checked)}
-                className="h-5 w-5 shrink-0 accent-primary disabled:opacity-50"
-              />
-            </li>
-          ))}
+          {load.rows.map((row) => {
+            const official = row.source.kind === 'plugin' ? officialById[row.source.pluginId] : null;
+            const status = official?.installedStatus ?? null;
+            return (
+              <li key={row.gameId} className="flex items-center justify-between gap-3 px-3 py-2">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <p className="truncate text-sm">{row.name}</p>
+                    <OfficialBadge status={status} />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {sourceLabel(row)}
+                    {!row.canDisable && ' · Always on: Agora falls back to Minecraft, so it cannot be turned off yet.'}
+                  </p>
+                  <OfficialStatusNote status={status} />
+                </div>
+                <input
+                  type="checkbox"
+                  aria-label={`Offer ${row.name}`}
+                  checked={row.enabled}
+                  disabled={!row.canDisable || saving !== null}
+                  onChange={(event) => void toggle(row, event.currentTarget.checked)}
+                  className="h-5 w-5 shrink-0 accent-primary disabled:opacity-50"
+                />
+              </li>
+            );
+          })}
         </ul>
       )}
       {saveError && <p role="alert" className="text-xs text-destructive">{saveError}</p>}

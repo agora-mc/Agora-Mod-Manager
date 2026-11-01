@@ -12,13 +12,30 @@ const rows = [
   { gameId: 'valheim', name: 'Valheim', source: { kind: 'plugin', pluginId: 'agora-tracer.valheim' }, enabled: false, canDisable: true },
 ];
 
+/** Answers by command. The card and the list load together, so call order is not a contract. */
+function answer(overrides: Record<string, unknown> = {}) {
+  invokeMock.mockImplementation(async (command: string) => {
+    if (Object.prototype.hasOwnProperty.call(overrides, command)) {
+      const reply = overrides[command];
+      if (typeof reply === 'function') return (reply as () => unknown)();
+      if (reply instanceof Error) throw reply;
+      return reply;
+    }
+    if (command === 'games_support_list') return rows;
+    if (command === 'list_official_plugins') return { plugins: [], unavailableReason: null };
+    if (command === 'games_support_set_enabled') return null;
+    if (command === 'get_setting') return null;
+    return null;
+  });
+}
+
 describe('GameSupportSettings', () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    answer();
   });
 
   it('lists every game with its source, and locks Minecraft on with the reason', async () => {
-    invokeMock.mockResolvedValueOnce(rows);
     render(<GameSupportSettings />);
 
     const minecraft = await screen.findByRole('checkbox', { name: 'Offer Minecraft: Java Edition' });
@@ -38,7 +55,7 @@ describe('GameSupportSettings', () => {
   });
 
   it('shows an error, not an empty list, when the list fails to load', async () => {
-    invokeMock.mockRejectedValueOnce(new Error('games_support_list did not return a list of games.'));
+    answer({ games_support_list: new Error('games_support_list did not return a list of games.') });
     render(<GameSupportSettings />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent('games_support_list did not return a list of games.');
@@ -47,16 +64,20 @@ describe('GameSupportSettings', () => {
   });
 
   it('retries a failed load when asked', async () => {
-    invokeMock.mockRejectedValueOnce(new Error('damaged'));
-    invokeMock.mockResolvedValueOnce(rows);
+    let attempts = 0;
+    answer({
+      games_support_list: () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('damaged');
+        return rows;
+      },
+    });
     render(<GameSupportSettings />);
     fireEvent.click(await screen.findByRole('button', { name: 'Try again' }));
     expect(await screen.findByRole('checkbox', { name: 'Offer Valheim' })).toBeInTheDocument();
   });
 
   it('turns a game on and records it, sending the id and state', async () => {
-    invokeMock.mockResolvedValueOnce(rows);
-    invokeMock.mockResolvedValueOnce(undefined);
     render(<GameSupportSettings />);
 
     const valheim = await screen.findByRole('checkbox', { name: 'Offer Valheim' });
@@ -68,8 +89,11 @@ describe('GameSupportSettings', () => {
   });
 
   it('keeps the old state and says why when a change is refused', async () => {
-    invokeMock.mockResolvedValueOnce(rows);
-    invokeMock.mockRejectedValueOnce({ code: 'core_failed', message: 'No game is known as \'x\'.' });
+    answer({
+      games_support_set_enabled: () => {
+        throw { code: 'core_failed', message: 'No game is known as \'x\'.' };
+      },
+    });
     render(<GameSupportSettings />);
 
     const skyrim = await screen.findByRole('checkbox', { name: 'Offer Skyrim Special Edition' });
@@ -77,5 +101,29 @@ describe('GameSupportSettings', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Skyrim Special Edition was not changed. No game is known as');
     expect(screen.getByRole('checkbox', { name: 'Offer Skyrim Special Edition' })).toBeChecked();
+  });
+
+  it('marks a game from a verified official plugin and explains an unverified one', async () => {
+    answer({
+      games_support_list: [
+        rows[0],
+        { gameId: 'skyrim-se', name: 'Skyrim Special Edition', source: { kind: 'plugin', pluginId: 'agora.skyrim' }, enabled: true, canDisable: true },
+        { gameId: 'fallout-4', name: 'Fallout 4', source: { kind: 'plugin', pluginId: 'agora.fallout' }, enabled: true, canDisable: true },
+      ],
+      list_official_plugins: {
+        plugins: [
+          { id: 'agora.skyrim', name: 'Skyrim Special Edition', gameIds: ['skyrim-se'], state: 'upToDate', installedStatus: { state: 'official', version: '1.0.0' } },
+          { id: 'agora.fallout', name: 'Fallout 4', gameIds: ['fallout-4'], state: 'notInstalled', installedStatus: { state: 'unverified', reason: 'files in the plugin folder changed after install' } },
+        ],
+        unavailableReason: null,
+      },
+    });
+    render(<GameSupportSettings />);
+
+    expect(await screen.findByText('Skyrim Special Edition')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByTestId('official-badge')).toHaveLength(1));
+    expect(screen.getByTestId('official-status-note')).toHaveTextContent(
+      'files in the plugin folder changed after install',
+    );
   });
 });
