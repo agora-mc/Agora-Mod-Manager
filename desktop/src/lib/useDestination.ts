@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-export type Tab = 'home' | 'browse' | 'instances' | 'governance' | 'ai' | 'guide' | 'field-guide' | 'living-background' | 'lab' | 'about' | 'settings'
+export type Tab = 'home' | 'browse' | 'library' | 'instances' | 'governance' | 'ai' | 'guide' | 'field-guide' | 'living-background' | 'lab' | 'about' | 'settings'
   // The four tabs of a non-Minecraft game (MASTER_SPEC §26.14). Sidebar ids only: a game tab
   // is opened as a `game-tab` destination, which carries the game it belongs to.
   | 'game-instances' | 'game-library' | 'game-import' | 'game-setup';

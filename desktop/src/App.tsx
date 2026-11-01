@@ -5,6 +5,7 @@ import { Sidebar } from './components/Sidebar';
 import { CommandPalette } from './components/command-palette';
 import { Home } from './pages/Home';
 import { Browse } from './pages/Browse';
+import { LibraryPage } from './pages/Library';
 import { requestBrowseSearch } from './lib/browseSearchRequest';
 import { Instances } from './pages/Instances';
 import { Governance } from './pages/Governance';
@@ -69,11 +70,12 @@ import { ControllerRootBindings, cycleTab } from './features/controller/Controll
 import { focusMemoryKey, useFocusMemory } from './features/controller/useFocusMemory';
 import { moveFocusForRoute, routeFocusTarget } from './lib/routeFocus';
 import { focusSkipTarget } from './lib/skipLink';
-import { BookOpen, Boxes, Compass, HomeIcon, Info, Landmark, Mountain, NotebookPen, SettingsIcon } from 'lucide-react';
+import { BookOpen, Boxes, Compass, HomeIcon, Info, Landmark, Library as LibraryIcon, Mountain, NotebookPen, SettingsIcon } from 'lucide-react';
 
 const BASE_TABS = [
   { id: 'home' as Tab, label: 'Home', icon: HomeIcon },
   { id: 'browse' as Tab, label: 'Browse', icon: Compass },
+  { id: 'library' as Tab, label: 'Library', icon: LibraryIcon },
   { id: 'instances' as Tab, label: 'My Instances', icon: Boxes },
   { id: 'governance' as Tab, label: 'Community Governance', icon: Landmark },
   { id: 'guide' as Tab, label: 'Help & Guide', icon: BookOpen },
@@ -596,10 +598,11 @@ function AppContent() {
   // Agora Lab is intentionally absent: it is the high-interaction entry point
   // for the guide's "New to modding" tier, reached from Help & Guide rather
   // than owning a permanent sidebar slot. `'lab'` remains a valid destination.
-  const [tabHome, tabBrowse, tabInstances, tabGovernance, tabGuide, tabFieldGuide, tabAbout, tabSettings] = BASE_TABS;
+  const [tabHome, tabBrowse, tabLibrary, tabInstances, tabGovernance, tabGuide, tabFieldGuide, tabAbout, tabSettings] = BASE_TABS;
   const minecraftTabs = [
     tabHome,
     tabBrowse,
+    tabLibrary,
     tabInstances,
     tabGovernance,
     tabGuide,
@@ -1153,6 +1156,7 @@ function AppContent() {
                     }
                   />
                 )}
+                {effectiveTab === 'library' && <LibraryPage />}
                 {effectiveTab === 'instances' && (
                   <Instances
                     onEditInstance={(id) => navigateToInstanceDetail(id)}
@@ -1217,6 +1221,7 @@ function AppContent() {
                 <Browse
                   onSelectMod={handleBrowseSelectMod}
                   onOpenInstance={navigateToInstanceDetail}
+                  onOpenLibrary={() => navigateToTab('library')}
                   initialInstanceId={browseInstanceId}
                   initialContentType={browseContentType}
                 />

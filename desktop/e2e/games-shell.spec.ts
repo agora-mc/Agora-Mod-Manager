@@ -11,6 +11,7 @@ import { expectNoUnmockedCommands, installGamesMock, storedSetting } from './sup
 const MINECRAFT_NAV = [
   'Home',
   'Browse',
+  'Library',
   'My Instances',
   'Community Governance',
   'Help & Guide',

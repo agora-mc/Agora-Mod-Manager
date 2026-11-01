@@ -15,6 +15,7 @@ pub mod icons;
 pub mod import;
 pub mod ini_saves;
 pub mod instances;
+pub mod library;
 pub mod plugins;
 pub mod support;
 pub mod tools;

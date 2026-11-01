@@ -1,4 +1,6 @@
+import { useEffect } from 'react';
 import { Check, ExternalLink } from 'lucide-react';
+import { cacheCatalogIcon } from '../../features/library/api';
 import { BrowseHeroMedia } from './BrowseHeroMedia';
 import { BrowseContextLabels, BrowseStats, BrowseVersions, CuratedBadge } from './BrowseContextLabels';
 import type { BrowseCardProps } from './types';
@@ -6,6 +8,14 @@ import { sourceLabel } from './sourceLabel';
 import { openExternalUrl } from '../../lib/tauri';
 
 export function BrowseTileCard({ item, context, onSelectMod, selected = false, onToggleSelect }: BrowseCardProps) {
+  // Keep a copy of a shown curated icon, so the Library can show it offline. A failed save is
+  // never an error for the page.
+  useEffect(() => {
+    if (item.source === 'curated') {
+      void cacheCatalogIcon(item.id, item.iconUrl);
+    }
+  }, [item.id, item.source, item.iconUrl]);
+
   return (
     <article
       className={[

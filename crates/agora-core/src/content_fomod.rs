@@ -2031,7 +2031,48 @@ pub fn install(
         &format!("{name} (FOMOD)"),
         source,
     )?;
+    let objects_new = outcome.objects_new();
+    let objects_restored = outcome.objects_restored();
+    let objects_present = outcome.objects_present();
+    let item = save_installer_metadata(ctx, outcome.item(), installer.info.as_ref())?;
+    let outcome = match outcome {
+        AddOutcome::Added { .. } => AddOutcome::Added { item, objects_new },
+        AddOutcome::Existing { .. } => AddOutcome::Existing {
+            item,
+            objects_new,
+            objects_restored,
+            objects_present,
+        },
+    };
     Ok((installer, plan, outcome))
+}
+
+/// Save what `fomod/info.xml` said about the item the installer produced, and return the item as
+/// now recorded. An absent info file changes nothing, and anything already recorded is kept.
+fn save_installer_metadata(
+    ctx: &Ctx,
+    item: &content_store::ContentItem,
+    info: Option<&FomodInfo>,
+) -> Result<content_store::ContentItem, FomodError> {
+    let Some(info) = info else {
+        return Ok(item.clone());
+    };
+    let metadata = content_store::ItemMetadata {
+        description: item
+            .description
+            .clone()
+            .or_else(|| info.description.clone()),
+        page_url: item.page_url.clone().or_else(|| info.website.clone()),
+        version: item.version.clone().or_else(|| info.version.clone()),
+        game_id: item.game_id.clone(),
+        catalog_id: item.catalog_id.clone(),
+        icon_sha256: item.icon_sha256.clone(),
+    };
+    Ok(content_store::set_item_metadata(
+        ctx,
+        &item.item_id,
+        metadata,
+    )?)
 }
 
 // ---------------------------------------------------------------------------

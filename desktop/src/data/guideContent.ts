@@ -260,7 +260,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Use the sidebar',
-          body: 'Home is the dashboard, Browse is the catalog, My Instances is your library, Community Governance shows curation activity, Help & Guide is this learning center, and Settings controls Agora itself.',
+          body: 'Home is the dashboard, Browse is the catalog, Library is everything you have installed or added (with descriptions saved on disk), My Instances holds your profiles, Community Governance shows curation activity, Help & Guide is this learning center, and Settings controls Agora itself.',
           steps: [
             'Select an item to move to that area.',
             'Use the arrow button at the sidebar edge to collapse or expand it.',

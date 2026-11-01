@@ -1714,3 +1714,45 @@ fn destinations_differing_only_in_case_keep_the_higher_priority_and_its_spelling
     let plan = fomod::evaluate(&fx.installer(&xml), &[], None).unwrap();
     assert_eq!(dests(&plan), ["Data/Patch.esp"]);
 }
+
+#[test]
+fn an_install_saves_the_info_description_and_version() {
+    let fx = Fx::new();
+    let info = br#"<?xml version="1.0" encoding="UTF-8"?>
+<fomod>
+  <Name>Cool Mod</Name>
+  <Version>4.5.6</Version>
+  <Website>https://example.invalid/cool-mod</Website>
+  <Description>Does cool things to the game.</Description>
+</fomod>"#;
+    let archive = store_archive(
+        &fx.ctx,
+        fx.work.path(),
+        utf16le_bom(&main_config()),
+        &[("fomod/info.xml", info)],
+    );
+
+    let (_, _, outcome) = fomod::install(
+        &fx.ctx,
+        &archive,
+        &[pick("Options", "Armor", &["Heavy"])],
+        None,
+    )
+    .unwrap();
+
+    let stored = get_item(&fx.ctx, outcome.item().item_id.as_str()).unwrap();
+    assert_eq!(
+        stored.description.as_deref(),
+        Some("Does cool things to the game.")
+    );
+    assert_eq!(stored.version.as_deref(), Some("4.5.6"));
+    assert_eq!(
+        stored.page_url.as_deref(),
+        Some("https://example.invalid/cool-mod")
+    );
+    assert_eq!(
+        outcome.item().description,
+        stored.description,
+        "the returned item reflects what was saved"
+    );
+}
