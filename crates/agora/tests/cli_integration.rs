@@ -356,6 +356,7 @@ const NESTED_COMMANDS: &[&[&str]] = &[
     &["games", "content", "show"],
     &["games", "content", "verify"],
     &["games", "content", "remove"],
+    &["games", "content", "share"],
     &["games", "content", "fomod"],
     &["games", "content", "fomod", "show"],
     &["games", "content", "fomod", "install"],

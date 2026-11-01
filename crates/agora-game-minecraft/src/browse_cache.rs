@@ -5,8 +5,10 @@ use tokio::sync::RwLock;
 
 use crate::modrinth::ModrinthSearchResult;
 use crate::technic::TechnicSearchResult;
-use agora_core::ranking::{self, RankingInput, RankingProfile, ScoreBreakdown};
-use agora_core::registry::RegistryItem;
+use agora_core::{
+    ranking::{self, RankingInput, RankingProfile, ScoreBreakdown},
+    registry::RegistryItem,
+};
 
 pub const PAGE_SIZE: usize = 20;
 

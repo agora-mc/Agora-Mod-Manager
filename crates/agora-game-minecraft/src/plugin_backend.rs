@@ -62,11 +62,13 @@ impl InstanceBackend for MinecraftInstances {
             return Ok(Some(Vec::new()));
         };
         let instance_dir = ctx.paths.instance_dir(instance_id)?;
+        let content_objects = ctx.paths.content_objects_dir();
         let rows = crate::installed_content::list_installed_content(
             &instance_dir,
             &manifest,
             content_type,
             None,
+            Some(&content_objects),
         );
         Ok(Some(
             rows.into_iter()

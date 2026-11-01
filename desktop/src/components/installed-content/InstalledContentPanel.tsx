@@ -475,6 +475,9 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
               <span className="mt-1 flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
                 {row.curation_status !== 'unknown' ? <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-primary">{curationLabel(row.curation_status)}</span> : null}
                 {!row.file_present ? <span className="rounded-full bg-destructive/10 px-1.5 py-0.5 text-destructive">Missing file</span> : null}
+                {row.file_state === 'modified' ? <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-amber-700 dark:text-amber-300" title="This file is not the one Agora installed. Agora left it alone.">Changed by hand</span> : null}
+                {row.file_state === 'unreadable' ? <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-amber-700 dark:text-amber-300" title="The file is on disk but Agora could not read it right now. It is not missing.">Can&apos;t read file</span> : null}
+                {row.file_state === 'untracked' ? <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground" title="Added to the content folder outside Agora, so it is not part of this instance's records.">Added by hand</span> : null}
                 {detailsPending(row) && row.metadata_status !== 'complete' ? <span className="animate-pulse text-muted-foreground" data-testid="row-details-loading">Loading details…</span> : null}{row.pack_managed ? <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground" title="Contributed by the modpack, not added by you">Pack</span> : null}{updateForRow(row) ? <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-amber-700 dark:text-amber-300">Update available</span> : null}
               </span>
             </button>
@@ -487,11 +490,16 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
       case 'installed': return <td key={column} className="px-3 py-2 text-sm whitespace-nowrap" title={row.installed_at}>{formatInstalledDate(row.installed_at)}</td>;
       case 'enabled': {
         const worldLabel = datapackWorldLabel(row.world_sync, row.enabled);
-        return <td key={column} className="px-3 py-2"><div className="flex items-center gap-2"><Switch checked={row.enabled} disabled={props.locked || pending[row.key]} onCheckedChange={() => void handleToggle(row)} aria-label={`${row.enabled ? 'Disable' : 'Enable'} ${row.display_name}`} /><span className="sr-only">{row.enabled ? 'Enabled' : 'Disabled'}</span>{!row.enabled ? <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">Disabled</span> : null}</div>
+        return <td key={column} className="px-3 py-2"><div className="flex items-center gap-2"><Switch checked={row.enabled} disabled={props.locked || pending[row.key] || row.file_state === 'untracked'} onCheckedChange={() => void handleToggle(row)} aria-label={`${row.enabled ? 'Disable' : 'Enable'} ${row.display_name}`} /><span className="sr-only">{row.enabled ? 'Enabled' : 'Disabled'}</span>{!row.enabled ? <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">Disabled</span> : null}</div>
           {worldLabel ? <div className="mt-1 flex max-w-[260px] flex-wrap items-center gap-x-2 text-xs text-muted-foreground"><span data-testid="datapack-world-status">{worldLabel}</span>{props.onChooseWorlds ? <button type="button" disabled={props.locked} onClick={() => props.onChooseWorlds?.(row)} className="font-medium text-primary hover:underline disabled:opacity-50" aria-label={`Choose worlds for ${row.display_name}`}>Worlds…</button> : null}</div> : null}
         </td>;
       }
       case 'actions': {
+      // A file Agora did not install has nothing to update, toggle or remove here: it is not in
+      // the instance's records, so the row only tells the user it is there.
+      if (row.file_state === 'untracked') {
+        return <td key={column} className="px-3 py-2 text-right text-xs text-muted-foreground">Not managed by Agora</td>;
+      }
       // An available update is the single most actionable thing about a row, so
       // it belongs in Actions — not only in the optional `update_status`
       // column, which is off by default and left updates effectively hidden.
@@ -579,7 +587,7 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
             </div>
           </td>
         </tr> : null}
-        {isCollapsed ? null : group.rows.map((row) => <tr key={row.key} className={`border-b border-border last:border-0 ${!row.enabled ? 'opacity-65' : ''}`}><td className="w-10 px-3 py-2"><input type="checkbox" checked={selectedKeys.has(row.key)} onChange={() => toggleSelected(row.key)} disabled={props.locked} aria-label={`Select ${row.display_name}`} /></td>{scrollColumns.map((column) => renderCell(row, column))}</tr>)}
+        {isCollapsed ? null : group.rows.map((row) => <tr key={row.key} className={`border-b border-border last:border-0 ${!row.enabled ? 'opacity-65' : ''}`}><td className="w-10 px-3 py-2"><input type="checkbox" checked={selectedKeys.has(row.key)} onChange={() => toggleSelected(row.key)} disabled={props.locked || row.file_state === 'untracked'} aria-label={`Select ${row.display_name}`} /></td>{scrollColumns.map((column) => renderCell(row, column))}</tr>)}
       </tbody>;
     })}</table></div>{showActions ? <div className="shrink-0 pl-2"><table ref={actionsTableRef} className="border-collapse text-left"><thead><tr className="border-b border-border"><th scope="col" className="bg-card px-3 py-2 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">{columnLabels.actions}</th></tr></thead>{groups.map((group) => {
       const isCollapsed = collapsedGroups.has(group.key);

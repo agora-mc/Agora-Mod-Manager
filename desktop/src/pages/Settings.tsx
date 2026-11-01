@@ -83,6 +83,7 @@ import {
 } from './settings/AppearanceSettings';
 import { TemplateSettings } from './settings/TemplateSettings';
 import { RuntimeReclaim } from './settings/RuntimeReclaim';
+import { ContentSharingSettings } from './settings/ContentSharingSettings';
 import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
 import { GameSupportSettings } from './settings/GameSupportSettings';
@@ -2396,7 +2397,17 @@ export function Settings({
         { id: 'walkthrough', label: 'Walkthrough', cards: ['walkthrough'], content: card('walkthrough', walkthroughCard) },
         { id: 'games', label: 'Game support', cards: ['game-support'], content: card('game-support', <GameSupportSettings />) },
         { id: 'templates', label: 'Templates', cards: ['template-settings'], content: card('template-settings', <TemplateSettings />) },
-        { id: 'storage', label: 'Storage', cards: ['runtime-reclaim'], content: card('runtime-reclaim', <RuntimeReclaim />) },
+        {
+          id: 'storage',
+          label: 'Storage',
+          cards: ['runtime-reclaim', 'content-sharing'],
+          content: (
+            <>
+              {card('content-sharing', <ContentSharingSettings />)}
+              {card('runtime-reclaim', <RuntimeReclaim />)}
+            </>
+          ),
+        },
         {
           id: 'updates',
           label: 'Updates',

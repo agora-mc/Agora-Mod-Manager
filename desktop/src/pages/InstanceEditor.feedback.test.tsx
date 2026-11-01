@@ -40,7 +40,7 @@ function contentRow(filename: string, overrides: Record<string, unknown> = {}) {
     content_type: 'mod', enabled: true, installed_at: '2026-07-01T00:00:00Z', source: 'modrinth',
     source_label: 'Modrinth', pack_managed: false, installed_as_dependency: false, update_pinned: false,
     source_url: null, registry_id: null, modrinth_id: 'proj', mod_jar_id: null, loader_mod_id: null,
-    size_bytes: 10, file_present: true, resolved_path: null, author: null, categories: ['Utility'],
+    size_bytes: 10, file_present: true, file_state: 'ok', resolved_path: null, author: null, categories: ['Utility'],
     icon_url: null, curation_status: 'unknown', agora_score: null, modrinth_downloads: null,
     metadata_status: 'partial', ...overrides,
   };

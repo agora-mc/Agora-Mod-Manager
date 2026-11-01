@@ -26,6 +26,7 @@ function row(overrides: Partial<InstalledContentRow> & { filename: string }): In
     loader_mod_id: null,
     size_bytes: 1024,
     file_present: true,
+    file_state: 'ok',
     resolved_path: `/mods/${overrides.filename}`,
     author: 'Author',
     categories: [],

@@ -154,6 +154,43 @@ fn copy_new(source: &Path, dest: &Path) -> std::io::Result<u64> {
     }
 }
 
+/// Whether two paths name the same file on disk. A hard link and its object are the same file;
+/// two copies are not, even when their bytes are equal.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    file_identity(a)
+        .zip(file_identity(b))
+        .is_some_and(|(left, right)| left == right)
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u32, u32, u32)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is valid, and the handle is open for the call.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    (ok != 0).then_some((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
+}
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino(), 0))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn file_identity(_path: &Path) -> Option<(u64, u64, u64)> {
+    None
+}
+
 fn ensure_absent(target: &Path) -> Result<(), ContentError> {
     // `symlink_metadata` sees a broken link too, which `exists` would call absent.
     if target.symlink_metadata().is_ok() {
@@ -172,7 +209,7 @@ fn is_sha256_hex(text: &str) -> bool {
 /// Make sure a file placed in `folder` can be deleted from it. The folder's own DACL is read
 /// first, so a folder that already grants `FILE_DELETE_CHILD` is left alone; a folder rebuilt at
 /// the same path is checked afresh rather than trusted from an older folder at that path.
-fn ensure_delete_child(folder: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn ensure_delete_child(folder: &Path) -> Result<(), std::io::Error> {
     if protect::grants_delete_child(folder)? {
         return Ok(());
     }

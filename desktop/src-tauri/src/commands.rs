@@ -3049,6 +3049,7 @@ pub async fn list_instance_content(
         let instance_dir = paths::instance_dir(&app, &sanitized)
             .map_err(|_| LauncherError::InstanceCreateFailed)?;
         let ctx = crate::core_context(&app)?;
+        let content_objects = ctx.paths.content_objects_dir();
         let registry = agora_core::registry::RegistryService::new(ctx);
         Ok(
             agora_game_minecraft::installed_content::list_installed_content(
@@ -3056,11 +3057,98 @@ pub async fn list_instance_content(
                 &manifest,
                 content_type.as_deref(),
                 Some(&registry),
+                Some(&content_objects),
             ),
         )
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
+}
+
+/// Map a content-store failure onto the command error the frontend understands, keeping a running
+/// or locked instance distinct from a damaged store.
+fn content_store_error(error: agora_core::content_store::ContentError) -> LauncherError {
+    use agora_core::content_store::ContentError;
+    let message = error.to_string();
+    let code = match &error {
+        ContentError::InstanceBusy(_) => "ERR_INSTANCE_BUSY",
+        ContentError::InvalidSetting(_) => "ERR_INVALID_SETTING",
+        ContentError::Io(_) => "ERR_CONTENT_STORE_IO",
+        _ => "ERR_CONTENT_STORE",
+    };
+    LauncherError::Generic {
+        code: code.into(),
+        message,
+    }
+}
+
+/// The "Share mod files between instances" setting. A malformed stored value is an error, never a
+/// default: the user must not silently get sharing they did not ask for, or lose it.
+#[tauri::command]
+pub async fn get_content_sharing(
+    app: tauri::AppHandle,
+) -> LauncherResult<agora_core::content_store::PlacementMode> {
+    let ctx = crate::core_context(&app)?;
+    tokio::task::spawn_blocking(move || {
+        agora_core::content_store::placement_mode(&ctx).map_err(content_store_error)
+    })
+    .await
+    .map_err(|_| LauncherError::Generic {
+        code: "ERR_CONTENT_SETTING_TASK".into(),
+        message: "Reading the sharing setting failed.".into(),
+    })?
+}
+
+/// What converting every instance to `share` would change, without changing anything.
+#[tauri::command]
+pub async fn preview_content_sharing_conversion(
+    app: tauri::AppHandle,
+    share: bool,
+) -> LauncherResult<agora_core::content_store::convert::BulkPreview> {
+    let ctx = crate::core_context(&app)?;
+    tokio::task::spawn_blocking(move || {
+        let mode = if share {
+            agora_core::content_store::PlacementMode::Link
+        } else {
+            agora_core::content_store::PlacementMode::Copy
+        };
+        agora_core::content_store::convert::preview_all(&ctx, mode).map_err(content_store_error)
+    })
+    .await
+    .map_err(|_| LauncherError::Generic {
+        code: "ERR_CONTENT_PREVIEW_TASK".into(),
+        message: "Previewing the conversion failed.".into(),
+    })?
+}
+
+/// Store the sharing choice and, when `convert` is set, also convert existing instances. The
+/// conversion is the user's explicit choice, never automatic.
+#[tauri::command]
+pub async fn set_content_sharing(
+    app: tauri::AppHandle,
+    share: bool,
+    convert: bool,
+) -> LauncherResult<Option<agora_core::content_store::convert::BulkConversion>> {
+    let ctx = crate::core_context(&app)?;
+    tokio::task::spawn_blocking(move || {
+        let mode = if share {
+            agora_core::content_store::PlacementMode::Link
+        } else {
+            agora_core::content_store::PlacementMode::Copy
+        };
+        agora_core::content_store::set_placement_mode(&ctx, mode).map_err(content_store_error)?;
+        if !convert {
+            return Ok(None);
+        }
+        agora_core::content_store::convert::convert_all(&ctx, mode)
+            .map(Some)
+            .map_err(content_store_error)
+    })
+    .await
+    .map_err(|_| LauncherError::Generic {
+        code: "ERR_CONTENT_CONVERT_TASK".into(),
+        message: "Changing the sharing setting failed.".into(),
+    })?
 }
 
 /// Enrich an already-loaded inventory with author metadata. This is a single
@@ -3079,6 +3167,7 @@ pub async fn enrich_instance_content(
         let instance_dir = paths::instance_dir(&inventory_app, &sanitized)
             .map_err(|_| LauncherError::InstanceCreateFailed)?;
         let ctx = crate::core_context(&inventory_app)?;
+        let content_objects = ctx.paths.content_objects_dir();
         let registry = agora_core::registry::RegistryService::new(ctx);
         Ok::<Vec<InstalledContentRow>, LauncherError>(
             agora_game_minecraft::installed_content::list_installed_content(
@@ -3086,6 +3175,7 @@ pub async fn enrich_instance_content(
                 &manifest,
                 None,
                 Some(&registry),
+                Some(&content_objects),
             ),
         )
     })
