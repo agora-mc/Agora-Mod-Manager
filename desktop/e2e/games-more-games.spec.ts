@@ -6,8 +6,9 @@ import { expectNoUnmockedCommands, installGamesMock } from './support/games-mock
  * and install it from Home, without opening the plugin manager. The install
  * asks for the same consent as any plugin, then explains the restart.
  *
- * The community-plugins switch is off here on purpose: official plugins are
- * exempt from it in core, and the card must not depend on it either.
+ * The emergency stop is engaged here on purpose: an official game package is
+ * data only, so core loads it regardless of the stop, and the card must not
+ * depend on the ability to run plugin code either.
  */
 
 const BOOT_REPLIES = {
@@ -21,7 +22,7 @@ const BOOT_REPLIES = {
   check_all_instance_health: [],
   take_pending_cli_launch: null,
   get_governance_config: null,
-  plugins_enabled: false,
+  plugins_emergency_stop: true,
   list_plugins: [],
   list_plugin_contributions: [],
   get_connectivity_status: { state: 'unknown', last_outcome_at: null },

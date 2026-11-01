@@ -3801,13 +3801,8 @@ fn games_list_shows_skyrim_only_after_the_plugin_is_installed() {
     assert!(before_text.contains("minecraft"), "{before_text}");
     assert!(!before_text.contains("skyrim-se"), "{before_text}");
 
-    let enable = run_agora(&data_dir, &["settings", "set", "plugins_enabled", "true"]);
-    assert!(
-        enable.status.success(),
-        "enabling plugins failed: {}",
-        String::from_utf8_lossy(&enable.stderr)
-    );
-
+    // Skyrim is data only, so it loads without any plugin switch: neither the
+    // emergency stop nor a code consent can hide a game package.
     let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
     let package = package.to_string_lossy().to_string();
     let install = run_agora(

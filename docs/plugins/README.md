@@ -19,11 +19,10 @@ pins them in `registry/official-plugins/<plugin-id>.json`. Skyrim Special Editio
 `packages/official/skyrim-se/` (plugin id `agora.creation-engine`, game id `skyrim-se`). The app does
 not compile Skyrim in, so `agora games list` shows it only when the plugin is installed.
 
-To use it while developing, install the folder as a development plugin and turn community plugins
-on:
+To use it while developing, install the folder as a development plugin. It is data only, so it
+loads with no plugin switch and no code consent:
 
 ```bash
-agora --data-dir ./tmp/agora-dev settings set plugins_enabled true
 agora --data-dir ./tmp/agora-dev plugin install --yes development packages/official/skyrim-se
 agora --data-dir ./tmp/agora-dev games list
 ```
