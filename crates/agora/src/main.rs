@@ -6124,7 +6124,7 @@ async fn run_command(
                     dry_run,
                 } => {
                     let svc = RegistryService::new(ctx.clone());
-                    let item = svc.get_game_item(&item_id)?.ok_or_else(|| {
+                    let item = svc.get_game_item_for_install(&item_id)?.ok_or_else(|| {
                         anyhow::anyhow!(
                             "No catalog entry '{item_id}'. 'agora games catalog list <game>' shows the entries for one game."
                         )

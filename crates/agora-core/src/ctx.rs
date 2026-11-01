@@ -316,17 +316,22 @@ impl CoreContext {
         //    download URL and expected hash the launcher trusts. A failing db is
         //    quarantined here, which also leaves no `registry.db` behind so the
         //    next sync re-downloads a good copy.
-        if let crate::registry_sync::CachedRegistryIntegrity::Quarantined(reason) =
-            crate::registry_sync::verify_cached_registry(paths.root())
-        {
-            warnings.push(reason);
-        }
+        let registry_trusted = match crate::registry_sync::verify_cached_registry(paths.root()) {
+            crate::registry_sync::CachedRegistryIntegrity::Verified => true,
+            crate::registry_sync::CachedRegistryIntegrity::Absent => false,
+            crate::registry_sync::CachedRegistryIntegrity::Quarantined(reason)
+            | crate::registry_sync::CachedRegistryIntegrity::Error(reason) => {
+                warnings.push(reason);
+                false
+            }
+        };
 
         //    Then validate the cached registry schema version (warning only —
-        //    the cached db may be absent or stale, which is recoverable).
+        //    the cached db may be absent or stale, which is recoverable). A db
+        //    that failed verification is not opened at all.
         let reg_path = paths.registry_db();
         let mut registry_conn = None;
-        if reg_path.exists() {
+        if registry_trusted && reg_path.exists() {
             match crate::db::registry_connection(&reg_path) {
                 Ok(conn) => {
                     let version: Result<i64, _> = conn.query_row(

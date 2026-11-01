@@ -254,7 +254,9 @@ pub async fn games_catalog_install(
         let ctx = crate::core_context(&app)?;
         let game = known_game(&ctx.games, &request.game_id)?;
         let svc = RegistryService::new(ctx.clone());
-        let item = svc.get_game_item(&request.entry_id)?.ok_or_else(|| {
+        let item = svc
+            .get_game_item_for_install(&request.entry_id)?
+            .ok_or_else(|| {
             GamesError::new(
                 NO_ENTRY,
                 format!(

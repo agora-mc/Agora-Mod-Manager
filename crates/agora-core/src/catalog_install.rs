@@ -21,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agora_game_api::{BaseReference, FrameworkId, GameDefinition, LayerSource, RuntimeIdentity};
 use async_trait::async_trait;
@@ -1052,11 +1053,19 @@ struct ScratchDir {
 
 impl ScratchDir {
     fn new(ctx: &Ctx) -> LauncherResult<Self> {
+        // The pid and the millisecond alone collide when two installs start together in one
+        // process; the counter makes every scratch folder distinct.
+        static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed);
         let path = ctx
             .paths
             .content_root()
             .join("catalog-downloads")
-            .join(format!("{}-{}", std::process::id(), now_unix_ms()));
+            .join(format!(
+                "{}-{}-{sequence}",
+                std::process::id(),
+                now_unix_ms()
+            ));
         std::fs::create_dir_all(&path).map_err(|e| generic("ERR_CATALOG_WRITE", e))?;
         Ok(Self { path })
     }
@@ -1102,5 +1111,16 @@ mod tests {
         assert_eq!(safe_file_name("../../evil.7z"), "download.._.._evil.7z");
         assert_eq!(safe_file_name(""), "download");
         assert!(!safe_file_name("a\\b:c").contains('\\'));
+    }
+
+    #[test]
+    fn two_scratch_dirs_at_once_do_not_share_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_testing(dir.path().to_path_buf());
+        let first = ScratchDir::new(&ctx).unwrap();
+        let second = ScratchDir::new(&ctx).unwrap();
+        assert_ne!(first.path, second.path);
+        assert!(first.path.exists());
+        assert!(second.path.exists());
     }
 }

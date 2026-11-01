@@ -283,6 +283,33 @@ pub enum CachedRegistryIntegrity {
     /// The cached db failed verification and was quarantined. The payload is a
     /// human-readable reason suitable for a startup warning.
     Quarantined(String),
+    /// The cached db failed verification and could not be moved aside, so it is
+    /// still on disk. The payload is a human-readable reason; nothing may open
+    /// the file in this run.
+    Error(String),
+}
+
+/// Move `path` to `<name>.untrusted`, or to a numbered variant when that name
+/// is already taken. Quarantine preserves the file for inspection; it never
+/// deletes something at the target.
+fn quarantine_aside(path: &Path, kind: &str) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut last_error = None;
+    for suffix in std::iter::once(kind.to_string()).chain((1..=100).map(|n| format!("{kind}-{n}")))
+    {
+        let target = path.with_extension(suffix);
+        match std::fs::rename(path, &target) {
+            Ok(()) => return Ok(()),
+            // Something else moved it; the untrusted file is no longer here.
+            Err(_) if !path.exists() => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free quarantine name")
+    }))
 }
 
 /// Verify the cached `registry.db` against the `registry.db.sig` sidecar that
@@ -311,8 +338,18 @@ pub fn verify_cached_registry(app_data_dir: &Path) -> CachedRegistryIntegrity {
     };
 
     let quarantine = |reason: String| -> CachedRegistryIntegrity {
-        let _ = std::fs::rename(&db_path, db_path.with_extension("db.untrusted"));
-        let _ = std::fs::rename(&sig_path, sig_path.with_extension("sig.untrusted"));
+        // A failed move is an error, not a quarantine: the unverified file is
+        // still where a later reader would find it.
+        if let Err(error) = quarantine_aside(&db_path, "db.untrusted") {
+            return CachedRegistryIntegrity::Error(format!(
+                "{reason} It could not be moved aside ({error}), so it will not be used this run."
+            ));
+        }
+        if let Err(error) = quarantine_aside(&sig_path, "sig.untrusted") {
+            return CachedRegistryIntegrity::Error(format!(
+                "{reason} The database was moved aside, but its signature could not be ({error})."
+            ));
+        }
         CachedRegistryIntegrity::Quarantined(reason)
     };
 
@@ -320,8 +357,9 @@ pub fn verify_cached_registry(app_data_dir: &Path) -> CachedRegistryIntegrity {
         Ok(bytes) => bytes,
         // Unreadable is not the same as untrusted — leave it in place and let
         // the caller fall back rather than destroying a file we cannot inspect.
+        // It still must not be opened: report a failure, not a quarantine.
         Err(error) => {
-            return CachedRegistryIntegrity::Quarantined(format!(
+            return CachedRegistryIntegrity::Error(format!(
                 "Cached registry could not be read ({error}); it will not be used."
             ))
         }
@@ -902,12 +940,15 @@ fn parse_registry_tag(tag: &str) -> Option<(u16, u8, u8)> {
 /// the release tag they cannot be forged without the signing key. ISO-8601 UTC
 /// timestamps from the compiler compare correctly as strings.
 ///
-/// Unknown is not treated as older: a cached database predating the stamp has
-/// no value to compare, and refusing every update in that state would strand
-/// clients on exactly the registry we want them to move off.
+/// An unstamped candidate over a stamped cache is a rollback: it predates the stamp, so it is
+/// older than anything stamped. Refusing it keeps the stamped registry. A *cached* database
+/// predating the stamp has no value to compare, and refusing every update in that state would
+/// strand clients on exactly the registry we want them to move off, so that direction still
+/// allows the update.
 fn is_rollback(cached_built_at: Option<&str>, candidate_built_at: Option<&str>) -> bool {
     match (cached_built_at, candidate_built_at) {
         (Some(cached), Some(candidate)) => candidate < cached,
+        (Some(_), None) => true,
         _ => false,
     }
 }
@@ -958,16 +999,76 @@ fn atomic_replace_db(
 ) -> LauncherResult<()> {
     let db_tmp = db_path.with_extension("db.tmp");
     let sig_tmp = sig_path.with_extension("sig.tmp");
+    let db_old = db_path.with_extension("db.old");
+    let sig_old = sig_path.with_extension("sig.old");
+
+    // A folder (or anything else that is not a file) at either path is not a
+    // registry pair we can replace safely. Fail before touching the signature:
+    // the old pair stays exactly as it was.
+    for path in [db_path, sig_path] {
+        if path.exists() && !path.is_file() {
+            return Err(LauncherError::RegistryDownloadFailed);
+        }
+    }
 
     std::fs::write(&db_tmp, db_bytes).map_err(|_| LauncherError::RegistryDownloadFailed)?;
     std::fs::write(&sig_tmp, sig_bytes).map_err(|_| LauncherError::RegistryDownloadFailed)?;
 
-    // Rename sig first, then db. If the sig rename fails, the old db is still
-    // intact. If the sig rename succeeds but db rename fails, old-db + new-sig
-    // still verifies against the old db and allows a clean retry on next check.
-    std::fs::rename(sig_tmp, sig_path).map_err(|_| LauncherError::RegistryDownloadFailed)?;
-    std::fs::rename(db_tmp, db_path).map_err(|_| LauncherError::RegistryDownloadFailed)?;
+    let cleanup_tmp = || {
+        let _ = std::fs::remove_file(&db_tmp);
+        let _ = std::fs::remove_file(&sig_tmp);
+    };
 
+    // Replace the database first, keeping the previous pair aside until the new
+    // signature is in place. A rename is atomic, so a reader never sees a half
+    // file, and a failure at any step puts the previous pair back: the sidecar
+    // always describes the database beside it.
+    let had_old_db = db_path.exists();
+    if had_old_db {
+        let _ = std::fs::remove_file(&db_old);
+        if std::fs::rename(db_path, &db_old).is_err() {
+            cleanup_tmp();
+            return Err(LauncherError::RegistryDownloadFailed);
+        }
+    }
+    if std::fs::rename(&db_tmp, db_path).is_err() {
+        if had_old_db {
+            let _ = std::fs::rename(&db_old, db_path);
+        }
+        cleanup_tmp();
+        return Err(LauncherError::RegistryDownloadFailed);
+    }
+
+    let had_old_sig = sig_path.exists();
+    if had_old_sig {
+        let _ = std::fs::remove_file(&sig_old);
+        if std::fs::rename(sig_path, &sig_old).is_err() {
+            let _ = std::fs::remove_file(db_path);
+            if had_old_db {
+                let _ = std::fs::rename(&db_old, db_path);
+            }
+            cleanup_tmp();
+            return Err(LauncherError::RegistryDownloadFailed);
+        }
+    }
+    if std::fs::rename(&sig_tmp, sig_path).is_err() {
+        let _ = std::fs::remove_file(db_path);
+        if had_old_db {
+            let _ = std::fs::rename(&db_old, db_path);
+        }
+        if had_old_sig {
+            let _ = std::fs::rename(&sig_old, sig_path);
+        }
+        cleanup_tmp();
+        return Err(LauncherError::RegistryDownloadFailed);
+    }
+
+    if had_old_db {
+        let _ = std::fs::remove_file(&db_old);
+    }
+    if had_old_sig {
+        let _ = std::fs::remove_file(&sig_old);
+    }
     Ok(())
 }
 
@@ -1330,10 +1431,10 @@ mod tests {
         assert!(is_rollback(Some(newer), Some(older)));
         assert!(!is_rollback(Some(older), Some(newer)));
         assert!(!is_rollback(Some(newer), Some(newer)));
-        // Absent stamps are not "older": a cached db predating the stamp must
-        // not block every future update.
+        // A cached db predating the stamp must not block every future update...
         assert!(!is_rollback(None, Some(newer)));
-        assert!(!is_rollback(Some(newer), None));
+        // ...but an unstamped candidate predates every stamped cache, so it is a rollback.
+        assert!(is_rollback(Some(newer), None));
         assert!(!is_rollback(None, None));
     }
 
@@ -1442,16 +1543,13 @@ mod tests {
     /// Treating "unknown" as "not older" lets a replayed old signed registry (the thing the stamp is
     /// for) replace a stamped one.
     #[test]
-    #[ignore = "proves bug: an old signed registry with no built_at stamp is not seen as a rollback over a stamped one"]
     fn an_unstamped_candidate_is_a_rollback_over_a_stamped_cache() {
         assert!(is_rollback(Some("2026-10-30T00:00:00+00:00"), None));
     }
 
-    /// `quarantine` ignores a failed rename (`let _ = std::fs::rename`) and still reports
-    /// `Quarantined`, yet the tampered `registry.db` stays where `RegistryService::connection` opens
-    /// it (that path never re-verifies). Here the rename target is a non-empty folder so it fails.
+    /// A quarantine whose documented target is occupied must still move the tampered
+    /// `registry.db` away: leaving it at `registry.db` lets later readers open it.
     #[test]
-    #[ignore = "proves bug: a failed quarantine rename is ignored and the unverified registry.db stays in use"]
     fn a_failed_quarantine_does_not_leave_the_unsigned_db_in_place() {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = paths::registry_db_path(dir.path()).unwrap();
@@ -1470,11 +1568,9 @@ mod tests {
         );
     }
 
-    /// atomic_replace_db renames the signature first. When the db rename then fails, the old db is
-    /// left beside a signature that does not belong to it, so the next startup quarantines a good
-    /// registry (the doc comment says "old-db + new-sig still verifies": it cannot).
+    /// A replace that cannot install the database must not install the signature either: the
+    /// sidecar must always describe the database beside it.
     #[test]
-    #[ignore = "proves bug: a failed db rename leaves the new signature beside the old db"]
     fn a_failed_replace_leaves_the_old_signature_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let sig_path = dir.path().join("registry.db.sig");
