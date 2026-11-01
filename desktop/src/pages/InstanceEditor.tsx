@@ -229,6 +229,7 @@ function fallbackContentRows(manifest: InstanceManifest | null): InstalledConten
       loader_mod_id: entry.mod_jar_id ?? null,
       size_bytes: null,
       file_present: false,
+      file_state: 'missing',
       resolved_path: null,
       author: null,
       categories: ['Uncategorized'],

@@ -1,6 +1,6 @@
 //! Inventory rows for installed instance content.
 
-use agora_core::helpers::content_subdir;
+use agora_core::helpers::{content_subdir, hash_file_sha256};
 use agora_core::models::{InstalledMod, InstanceManifest};
 use agora_core::registry::{RegistryItem, RegistryService};
 use serde::Serialize;
@@ -22,6 +22,21 @@ pub enum MetadataStatus {
     Complete,
     Partial,
     Unavailable,
+}
+
+/// What the file on disk looks like compared with the manifest entry, or a file Agora did not
+/// install. Nothing here changes a file; it only tells the user what it found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileState {
+    /// Present and still the bytes the manifest recorded.
+    Ok,
+    /// Listed in the manifest but not on disk (deleted by hand).
+    Missing,
+    /// Present, but its bytes are not the recorded ones (replaced or edited by hand).
+    Modified,
+    /// On disk in a content folder with no manifest entry (added by hand).
+    Untracked,
 }
 
 /// A manifest entry enriched with local filesystem and cached registry data.
@@ -52,6 +67,9 @@ pub struct InstalledContentRow {
     pub loader_mod_id: Option<String>,
     pub size_bytes: Option<u64>,
     pub file_present: bool,
+    /// How the file on disk compares with its manifest entry, or `untracked` for a file Agora
+    /// did not install. Detection never changes a file.
+    pub file_state: FileState,
     pub resolved_path: Option<String>,
     pub author: Option<String>,
     pub categories: Vec<String>,
@@ -128,7 +146,7 @@ pub fn list_installed_content(
         Vec::new()
     };
 
-    entries
+    let mut rows = entries
         .into_iter()
         .map(|entry| {
             let registry_item = entry
@@ -152,7 +170,111 @@ pub fn list_installed_content(
             }
             row
         })
-        .collect()
+        .collect::<Vec<_>>();
+    rows.extend(untracked_rows(instance_dir, manifest, content_type));
+    rows
+}
+
+/// Files sitting in a content folder with no manifest entry. Agora did not install them, so they
+/// are shown (and nothing else) rather than hidden or removed.
+fn untracked_rows(
+    instance_dir: &Path,
+    manifest: &InstanceManifest,
+    content_type: Option<&str>,
+) -> Vec<InstalledContentRow> {
+    use std::collections::HashSet;
+
+    let mut tracked = HashSet::new();
+    for entry in manifest
+        .mods
+        .iter()
+        .chain(manifest.resourcepacks.iter())
+        .chain(manifest.shaders.iter())
+        .chain(manifest.datapacks.iter())
+    {
+        let folder = content_subdir(&entry.content_type);
+        tracked.insert(format!("{folder}/{}", entry.filename));
+        tracked.insert(format!("{folder}/{}.disabled", entry.filename));
+    }
+
+    let mut rows = Vec::new();
+    for folder in ["mods", "resourcepacks", "shaderpacks", "datapacks"] {
+        let Some(kind) = content_type_for_folder(folder) else {
+            continue;
+        };
+        if !content_type_matches(kind, content_type) {
+            continue;
+        }
+        let dir = instance_dir.join(folder);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // A directory or a reparse point is not a content file Agora can reason about.
+            if !std::fs::symlink_metadata(&path)
+                .map(|meta| meta.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let rel = format!("{folder}/{name}");
+            if tracked.contains(&rel) {
+                continue;
+            }
+            let size = std::fs::metadata(&path).ok().map(|meta| meta.len());
+            rows.push(InstalledContentRow {
+                key: format!("untracked:{rel}"),
+                filename: name.to_string(),
+                display_name: filename_display_name(name),
+                version: None,
+                content_type: kind.to_string(),
+                enabled: !name.ends_with(".disabled"),
+                installed_at: String::new(),
+                source: "manual".to_string(),
+                source_label: "Added by hand".to_string(),
+                pack_managed: false,
+                installed_as_dependency: false,
+                update_pinned: false,
+                source_url: None,
+                registry_id: None,
+                modrinth_id: None,
+                mod_jar_id: None,
+                loader_mod_id: None,
+                size_bytes: size,
+                file_present: true,
+                file_state: FileState::Untracked,
+                resolved_path: Some(path.to_string_lossy().into_owned()),
+                author: None,
+                categories: vec!["Uncategorized".to_string()],
+                icon_url: None,
+                curation_status: CurationStatus::Unknown,
+                agora_score: None,
+                modrinth_downloads: None,
+                metadata_status: MetadataStatus::Unavailable,
+                world_sync: None,
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        left.content_type
+            .cmp(&right.content_type)
+            .then(left.filename.cmp(&right.filename))
+    });
+    rows
+}
+
+fn content_type_for_folder(folder: &str) -> Option<&'static str> {
+    match folder {
+        "mods" => Some("mod"),
+        "resourcepacks" => Some("resourcepack"),
+        "shaderpacks" => Some("shader"),
+        "datapacks" => Some("datapack"),
+        _ => None,
+    }
 }
 
 fn content_type_matches(value: &str, requested: Option<&str>) -> bool {
@@ -181,6 +303,7 @@ fn build_row(
 ) -> InstalledContentRow {
     let (resolved_path, size_bytes) = resolve_file(instance_dir, entry);
     let file_present = resolved_path.is_some();
+    let file_state = file_state(entry, resolved_path.as_deref());
     let source_label = match &entry.provider {
         Some(origin) => provider_source_label(&origin.provider_id),
         None => source_label(&entry.source),
@@ -222,6 +345,7 @@ fn build_row(
         loader_mod_id: entry.mod_jar_id.clone(),
         size_bytes,
         file_present,
+        file_state,
         resolved_path,
         author,
         categories: if categories.is_empty() {
@@ -263,6 +387,31 @@ fn resolve_file(instance_dir: &Path, entry: &InstalledMod) -> (Option<String>, O
         })
         .map(|(path, size)| (Some(path.to_string_lossy().into_owned()), Some(size)))
         .unwrap_or((None, None))
+}
+
+/// Compare a present file with the hash its manifest entry recorded. A world is a folder, so it is
+/// never hashed and never reported as changed.
+fn file_state(entry: &InstalledMod, resolved_path: Option<&str>) -> FileState {
+    let Some(path) = resolved_path else {
+        return FileState::Missing;
+    };
+    if normalize_content_type(&entry.content_type) == "world" {
+        return FileState::Ok;
+    }
+    let expected = entry
+        .object_sha256
+        .as_deref()
+        .or(Some(entry.sha256.as_str()))
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty());
+    let Some(expected) = expected else {
+        return FileState::Ok;
+    };
+    match hash_file_sha256(Path::new(path)) {
+        Ok(actual) if actual.eq_ignore_ascii_case(expected) => FileState::Ok,
+        Ok(_) => FileState::Modified,
+        Err(_) => FileState::Missing,
+    }
 }
 
 fn safe_filename(filename: &str) -> bool {
@@ -351,6 +500,7 @@ fn curation_status(status: &str) -> CurationStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agora_core::models::CURRENT_MANIFEST_VERSION;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -403,7 +553,7 @@ mod tests {
         fs::write(dir.join("resourcepacks/pack.zip"), b"x").unwrap();
 
         let mut manifest = InstanceManifest {
-            manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
+            manifest_version: CURRENT_MANIFEST_VERSION,
             game_data: Default::default(),
             pack_origin: None,
             instance_id: "test".to_string(),
@@ -436,6 +586,72 @@ mod tests {
         manifest.mods.clear();
         let filtered = list_installed_content(&dir, &manifest, Some("resourcepack"), None);
         assert_eq!(filtered.len(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_mod_deleted_by_hand_shows_as_missing() {
+        let dir = temp_dir();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+        let manifest = InstanceManifest {
+            manifest_version: CURRENT_MANIFEST_VERSION,
+            game_data: Default::default(),
+            pack_origin: None,
+            instance_id: "test".to_string(),
+            name: "Test".to_string(),
+            created_from_pack: None,
+            minecraft_version: "1.21".to_string(),
+            loader: "fabric".to_string(),
+            loader_version: "1".to_string(),
+            is_locked: false,
+            mods: vec![manifest_entry("deleted.jar", "mod", true)],
+            resourcepacks: Vec::new(),
+            shaders: Vec::new(),
+            datapacks: Vec::new(),
+            worlds: Vec::new(),
+            user_preferences: serde_json::Value::Object(Default::default()),
+        };
+
+        let rows = list_installed_content(&dir, &manifest, None, None);
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].file_present);
+        assert_eq!(rows[0].file_state, FileState::Missing);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_jar_added_by_hand_shows_as_untracked() {
+        let dir = temp_dir();
+        fs::create_dir_all(dir.join("mods")).unwrap();
+        let bytes = b"a jar Agora never installed";
+        fs::write(dir.join("mods/hand-added.jar"), bytes).unwrap();
+        let manifest = InstanceManifest {
+            manifest_version: CURRENT_MANIFEST_VERSION,
+            game_data: Default::default(),
+            pack_origin: None,
+            instance_id: "test".to_string(),
+            name: "Test".to_string(),
+            created_from_pack: None,
+            minecraft_version: "1.21".to_string(),
+            loader: "fabric".to_string(),
+            loader_version: "1".to_string(),
+            is_locked: false,
+            mods: Vec::new(),
+            resourcepacks: Vec::new(),
+            shaders: Vec::new(),
+            datapacks: Vec::new(),
+            worlds: Vec::new(),
+            user_preferences: serde_json::Value::Object(Default::default()),
+        };
+
+        let rows = list_installed_content(&dir, &manifest, Some("mod"), None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].filename, "hand-added.jar");
+        assert_eq!(rows[0].file_state, FileState::Untracked);
+        assert_eq!(rows[0].source_label, "Added by hand");
+        assert_eq!(rows[0].size_bytes, Some(bytes.len() as u64));
+        // The content type filter still applies to anything added by hand.
+        assert!(list_installed_content(&dir, &manifest, Some("shader"), None).is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 

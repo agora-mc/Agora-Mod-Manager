@@ -20,6 +20,7 @@ export const SETTINGS_CARD_AUDIENCE = {
   'game-support': 'all-games',
   'template-settings': 'minecraft',
   'runtime-reclaim': 'all-games',
+  'content-sharing': 'minecraft',
   updates: 'all-games',
   'instance-updates': 'minecraft',
 

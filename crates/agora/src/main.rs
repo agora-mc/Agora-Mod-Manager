@@ -893,6 +893,24 @@ enum ContentCmd {
         /// Item ID or unique prefix to remove.
         item: String,
     },
+    /// Show or change whether instances share mod files, and optionally convert existing ones.
+    Share {
+        /// Share file bytes between instances as hard links (saves space, files cannot be edited).
+        #[arg(long, conflicts_with = "off")]
+        on: bool,
+        /// Give each instance its own editable copy (uses more space).
+        #[arg(long, conflicts_with = "on")]
+        off: bool,
+        /// Also convert existing instances to the chosen mode. Never automatic.
+        #[arg(long)]
+        convert: bool,
+        /// Convert only this instance (repeatable). Omit to cover every instance.
+        #[arg(long = "instance", value_name = "ID")]
+        instances: Vec<String>,
+        /// Show what would change and stop.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show or run the FOMOD installer inside an archive item.
     Fomod {
         #[command(subcommand)]
@@ -6434,6 +6452,13 @@ async fn run_command(
                         }
                     }
                 }
+                ContentCmd::Share {
+                    on,
+                    off,
+                    convert,
+                    instances,
+                    dry_run,
+                } => run_content_share(ctx, json, on, off, convert, &instances, dry_run)?,
                 ContentCmd::Fomod { action } => run_fomod_command(ctx, action, json)?,
             },
             GamesCmd::Instance { action } => match action {
@@ -11775,6 +11800,222 @@ fn deploy_summary_json(
             })),
         }),
     }
+}
+
+fn run_content_share(
+    ctx: &agora_core::ctx::Ctx,
+    json: bool,
+    on: bool,
+    off: bool,
+    convert: bool,
+    instances: &[String],
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use agora_core::content_store::convert::{
+        self, BulkConversion, BulkPreview, ConversionSummary,
+    };
+    use agora_core::content_store::{placement_mode, set_placement_mode, PlacementMode};
+
+    fn merge(target: &mut ConversionSummary, source: ConversionSummary) {
+        target.files_converted += source.files_converted;
+        target.files_already += source.files_already;
+        target.bytes = target.bytes.saturating_add(source.bytes);
+        target.skipped.extend(source.skipped);
+    }
+
+    fn label(mode: PlacementMode) -> &'static str {
+        match mode {
+            PlacementMode::Link => "on (hard links)",
+            PlacementMode::Copy => "off (owned copies)",
+        }
+    }
+
+    fn human_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+        if bytes < 1024 {
+            return format!("{bytes} B");
+        }
+        let mut amount = bytes as f64;
+        let mut unit = 0;
+        while amount >= 1024.0 && unit + 1 < UNITS.len() {
+            amount /= 1024.0;
+            unit += 1;
+        }
+        format!("{amount:.1} {}", UNITS[unit - 1])
+    }
+
+    let requested = if on {
+        Some(PlacementMode::Link)
+    } else if off {
+        Some(PlacementMode::Copy)
+    } else {
+        None
+    };
+
+    let Some(mode) = requested else {
+        let current = match placement_mode(ctx) {
+            Ok(mode) => mode,
+            Err(error) => exit_with_error(json, &error.to_string()),
+        };
+        if convert || dry_run || !instances.is_empty() {
+            exit_with_error(
+                json,
+                "Choose --on or --off when previewing or converting instances.",
+            );
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "mode": current,
+                    "sharing": current == PlacementMode::Link,
+                }))?
+            );
+        } else {
+            println!("Sharing mod files is {}.", label(current));
+        }
+        return Ok(());
+    };
+
+    if !dry_run {
+        if let Err(error) = set_placement_mode(ctx, mode) {
+            exit_with_error(json, &error.to_string());
+        }
+    }
+
+    let mut preview = BulkPreview::default();
+    if instances.is_empty() {
+        preview = match convert::preview_all(ctx, mode) {
+            Ok(preview) => preview,
+            Err(error) => exit_with_error(json, &error.to_string()),
+        };
+    } else {
+        for id in instances {
+            match convert::preview_instance(ctx, id, mode) {
+                Ok(summary) => {
+                    preview.instances += 1;
+                    merge(&mut preview.summary, summary);
+                }
+                Err(error) => preview
+                    .warnings
+                    .push(format!("Instance '{id}' could not be previewed: {error}")),
+            }
+        }
+    }
+
+    if !convert || dry_run {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&preview)?);
+        } else {
+            println!("Sharing mod files is {}.", label(mode));
+            if preview.summary.files_converted == 0 {
+                println!("Nothing to convert.");
+            } else {
+                println!(
+                    "{} file{} in {} instance{} can be converted; this {} about {}.",
+                    preview.summary.files_converted,
+                    if preview.summary.files_converted == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    preview.instances,
+                    if preview.instances == 1 { "" } else { "s" },
+                    if mode == PlacementMode::Link {
+                        "frees"
+                    } else {
+                        "uses"
+                    },
+                    human_bytes(preview.summary.bytes),
+                );
+            }
+            if !preview.summary.skipped.is_empty() {
+                println!(
+                    "{} file{} will be left as they are.",
+                    preview.summary.skipped.len(),
+                    if preview.summary.skipped.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                );
+            }
+            for warning in &preview.warnings {
+                eprintln!("Warning: {warning}");
+            }
+            if dry_run {
+                println!("Nothing was changed (--dry-run).");
+            }
+        }
+        return Ok(());
+    }
+
+    let report: BulkConversion =
+        if instances.is_empty() {
+            match convert::convert_all(ctx, mode) {
+                Ok(report) => report,
+                Err(error) => exit_with_error(json, &error.to_string()),
+            }
+        } else {
+            let mut report = BulkConversion::default();
+            for id in instances {
+                match convert::convert_instance(ctx, id, mode) {
+                    Ok(summary) => {
+                        report.instances += 1;
+                        merge(&mut report.summary, summary);
+                    }
+                    Err(error) => report.failures.push(
+                        agora_core::content_store::convert::ConversionFailure {
+                            instance_id: id.clone(),
+                            message: error.to_string(),
+                        },
+                    ),
+                }
+            }
+            report
+        };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.failures.is_empty() {
+            std::process::exit(1);
+        }
+    } else {
+        println!("Sharing mod files is {}.", label(mode));
+        println!(
+            "Converted {} file{}.",
+            report.summary.files_converted,
+            if report.summary.files_converted == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
+        if !report.summary.skipped.is_empty() {
+            println!(
+                "{} file{} left as they are because they no longer match what Agora installed.",
+                report.summary.skipped.len(),
+                if report.summary.skipped.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            );
+        }
+        for failure in &report.failures {
+            eprintln!(
+                "Instance '{}' could not be converted: {}",
+                failure.instance_id, failure.message
+            );
+        }
+        for warning in &report.warnings {
+            eprintln!("Warning: {warning}");
+        }
+        if !report.failures.is_empty() {
+            std::process::exit(1);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

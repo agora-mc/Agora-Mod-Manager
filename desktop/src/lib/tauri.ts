@@ -460,6 +460,8 @@ export interface InstalledContentRow {
   loader_mod_id: string | null;
   size_bytes: number | null;
   file_present: boolean;
+  /** How the file compares with its manifest entry, or that Agora did not install it. */
+  file_state: 'ok' | 'missing' | 'modified' | 'untracked';
   resolved_path: string | null;
   author: string | null;
   categories: string[];
@@ -719,6 +721,47 @@ export const listInstanceContent = (instanceId: string, contentType?: string) =>
   });
 export const enrichInstanceContent = (instanceId: string) =>
   invoke<InstalledContentMetadata[]>('enrich_instance_content', { instanceId });
+
+/** How Minecraft content files are placed: shared hard links, or an owned copy per instance. */
+export type ContentPlacementMode = 'link' | 'copy';
+
+export interface ContentConversionSkip {
+  path: string;
+  reason: 'missing' | 'changed' | 'unsupported' | 'moved_aside';
+  movedTo?: string;
+}
+
+export interface ContentConversionSummary {
+  filesConverted: number;
+  filesAlready: number;
+  /** Space freed when turning sharing on, or additionally used when turning it off. */
+  bytes: number;
+  skipped: ContentConversionSkip[];
+}
+
+export interface ContentConversionPreview {
+  instances: number;
+  summary: ContentConversionSummary;
+  warnings: string[];
+}
+
+export interface ContentConversionFailure {
+  instanceId: string;
+  message: string;
+}
+
+export interface ContentConversionReport {
+  instances: number;
+  summary: ContentConversionSummary;
+  failures: ContentConversionFailure[];
+  warnings: string[];
+}
+
+export const getContentSharing = () => invoke<ContentPlacementMode>('get_content_sharing');
+export const previewContentSharingConversion = (share: boolean) =>
+  invoke<ContentConversionPreview>('preview_content_sharing_conversion', { share });
+export const setContentSharing = (share: boolean, convert: boolean) =>
+  invoke<ContentConversionReport | null>('set_content_sharing', { share, convert });
 export const createInstance = (request: CreateInstanceRequest) =>
   invoke<InstanceRow>('create_instance', { request });
 export const deleteInstance = (instanceId: string) =>

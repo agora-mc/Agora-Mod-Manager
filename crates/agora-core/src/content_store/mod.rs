@@ -3,6 +3,7 @@
 //! A mod's files are stored once, by content hash, protected from modification,
 //! and verifiable. Nothing deploys content to a game yet (slice 2).
 
+pub mod convert;
 #[cfg(test)]
 mod import_bench;
 pub mod place;
@@ -321,6 +322,8 @@ pub enum ContentError {
     DamagedObject(String),
     #[error("content placement setting is invalid: {0}")]
     InvalidSetting(String),
+    #[error("instance '{0}' is running; stop it before changing how its files are stored")]
+    InstanceBusy(String),
 }
 
 // ---------------------------------------------------------------------------
