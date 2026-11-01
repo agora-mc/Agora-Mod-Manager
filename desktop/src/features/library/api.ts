@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { addInstanceContent } from '@/features/games/content/api';
+import { addInstanceContent, removeStored } from '@/features/games/content/api';
 import { minecraftAddStoredContent } from '@/lib/tauri';
 
 /** One instance that has a library item. */
@@ -45,6 +45,21 @@ export interface LibraryIconCached {
   saved: boolean;
   matched: number;
   iconDataUrl: string | null;
+}
+
+/** One item no instance uses. */
+export interface UnusedItem {
+  itemId: string;
+  name: string;
+  totalSize: number;
+  gameId: string | null;
+}
+
+/** Items no instance uses, with their total size. Warnings mean the list may be incomplete. */
+export interface UnusedListing {
+  items: UnusedItem[];
+  totalSize: number;
+  warnings: string[];
 }
 
 function isLibraryInstance(value: unknown): value is LibraryInstance {
@@ -97,6 +112,39 @@ export async function listLibrary(): Promise<LibraryListing> {
     throw new Error('games_library_list did not return a library listing.');
   }
   return reply as LibraryListing;
+}
+
+function isUnusedItem(value: unknown): value is UnusedItem {
+  if (value === null || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.itemId === 'string'
+    && typeof row.name === 'string'
+    && typeof row.totalSize === 'number'
+    && (row.gameId === null || typeof row.gameId === 'string')
+  );
+}
+
+/** Every item no instance uses. Rejects a reply that is not an unused listing. */
+export async function listUnusedItems(): Promise<UnusedListing> {
+  const reply: unknown = await invoke<unknown>('games_library_unused');
+  if (
+    reply === null
+    || typeof reply !== 'object'
+    || !Array.isArray((reply as { items?: unknown }).items)
+    || !(reply as { items: unknown[] }).items.every(isUnusedItem)
+    || typeof (reply as { totalSize?: unknown }).totalSize !== 'number'
+    || !Array.isArray((reply as { warnings?: unknown }).warnings)
+    || !(reply as { warnings: unknown[] }).warnings.every((line) => typeof line === 'string')
+  ) {
+    throw new Error('games_library_unused did not return an unused-items listing.');
+  }
+  return reply as UnusedListing;
+}
+
+/** Remove one item from the store. Refused while an instance uses it, or when a manifest is unreadable. */
+export async function removeLibraryItem(itemId: string): Promise<void> {
+  await removeStored(itemId);
 }
 
 /** Every instance of every game, for the Add-to-instance picker. */

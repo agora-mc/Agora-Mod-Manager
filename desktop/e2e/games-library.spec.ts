@@ -38,6 +38,7 @@ const BOOT_REPLIES = {
   list_recent_play: [],
   games_instance_list: { instances: [] },
   games_library_list: { items: [item], damaged: [], warnings: [] },
+  games_library_unused: { items: [], totalSize: 0, warnings: [] },
   games_library_instances: {
     instances: [{ instanceId: 'mc1', name: 'My Minecraft', gameId: 'minecraft' }],
     warnings: [],

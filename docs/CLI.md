@@ -187,6 +187,7 @@ classified as a base game, add-on or tool (MASTER_SPEC §26.3), and manages pinn
 | `agora games base remove <base-id>` | Delete a pinned base and its manifest. A damaged record is removed with its folder in the bases folder, if there is one |
 | `agora games content add <path> [--name N]` | Add a zip, 7z or RAR archive (RAR is read through Windows' own tar) or a folder to the content store |
 | `agora games content list` | List all items in the content store |
+| `agora games content unused` | List items no instance uses, with their size. An unreadable instance manifest is a warning, and removal refuses while one exists |
 | `agora games content show <item>` | Show files in a content item |
 | `agora games content verify [<item>] [--full]` | Verify integrity of content items |
 | `agora games content remove <item>` | Delete an item from the content store |

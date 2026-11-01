@@ -174,6 +174,7 @@ export const OTHER_SLICES_REPLIES: Record<string, unknown> = {
   games_content_list: { items: [], damaged: [] },
   games_catalog_list: { entries: [], instances: [] },
   games_library_list: { items: [], damaged: [], warnings: [] },
+  games_library_unused: { items: [], totalSize: 0, warnings: [] },
   games_library_instances: { instances: [], warnings: [] },
   games_library_icon: null,
   games_library_cache_icon: { saved: false, matched: 0, iconDataUrl: null },

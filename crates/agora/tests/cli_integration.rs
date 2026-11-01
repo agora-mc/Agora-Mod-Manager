@@ -352,6 +352,7 @@ const NESTED_COMMANDS: &[&[&str]] = &[
     &["games", "content"],
     &["games", "content", "add"],
     &["games", "content", "list"],
+    &["games", "content", "unused"],
     &["games", "content", "show"],
     &["games", "content", "verify"],
     &["games", "content", "remove"],
@@ -3944,6 +3945,16 @@ fn games_content_cli_lifecycle() {
     let item_id = list_json[0]["item_id"].as_str().unwrap().to_string();
     let prefix = &item_id[..8];
 
+    // 3b. Unused: nothing uses the new item yet
+    let output_unused = run_agora(&data_dir, &["games", "content", "unused"]);
+    assert!(output_unused.status.success());
+    let unused_stdout = String::from_utf8_lossy(&output_unused.stdout);
+    assert!(unused_stdout.contains("test-mod"), "{unused_stdout}");
+    let unused_json = run_agora_json(&data_dir, &["games", "content", "unused"]);
+    let unused_val: serde_json::Value =
+        serde_json::from_slice(&unused_json.stdout).expect("valid unused json");
+    assert_eq!(unused_val["items"].as_array().unwrap().len(), 1);
+
     // 4. Show
     let output_show = run_agora(&data_dir, &["games", "content", "show", prefix]);
     assert!(output_show.status.success());
@@ -3961,6 +3972,13 @@ fn games_content_cli_lifecycle() {
     assert!(output_remove.status.success());
     let remove_stdout = String::from_utf8_lossy(&output_remove.stdout);
     assert!(remove_stdout.contains("removed"));
+
+    // 6b. Unused is empty again
+    let output_unused_empty = run_agora(&data_dir, &["games", "content", "unused"]);
+    assert!(output_unused_empty.status.success());
+    assert!(
+        String::from_utf8_lossy(&output_unused_empty.stdout).contains("No unused content items")
+    );
 
     // 7. Verify nonexistent fails
     let output_ver_err = run_agora(&data_dir, &["games", "content", "verify", prefix]);

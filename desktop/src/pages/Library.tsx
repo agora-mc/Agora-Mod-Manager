@@ -23,11 +23,15 @@ import {
   libraryGames,
   listLibrary,
   listLibraryInstances,
+  listUnusedItems,
   loadLibraryIcon,
+  removeLibraryItem,
   searchLibrary,
   type LibraryInstance,
   type LibraryItem,
   type LibraryListing,
+  type UnusedItem,
+  type UnusedListing,
 } from '@/features/library/api';
 
 type LoadState =
@@ -44,6 +48,16 @@ function errorMessage(error: unknown): string {
 function gameLabel(gameId: string): string {
   if (gameId === 'minecraft') return 'Minecraft';
   return gameId;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} bytes`;
+}
+
+function itemCount(count: number): string {
+  return count === 1 ? '1 item' : `${count} items`;
 }
 
 function LibraryIcon({ item }: { item: LibraryItem }) {
@@ -94,17 +108,25 @@ export function LibraryPage() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [unused, setUnused] = useState<UnusedListing | null>(null);
+  const [unusedOpen, setUnusedOpen] = useState(false);
+  const [unusedSelected, setUnusedSelected] = useState<Set<string>>(new Set());
+  const [unusedConfirming, setUnusedConfirming] = useState(false);
+  const [unusedBusy, setUnusedBusy] = useState(false);
+  const [unusedError, setUnusedError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setState({ status: 'loading' });
     try {
-      const [listing, options] = await Promise.all([
+      const [listing, options, unusedListing] = await Promise.all([
         listLibrary(),
         listLibraryInstances(),
+        listUnusedItems(),
       ]);
       setState({ status: 'loaded', listing });
       setInstances(options.instances);
       setInstanceWarnings(options.warnings);
+      setUnused(unusedListing);
     } catch (error) {
       setState({ status: 'error', message: errorMessage(error) });
     }
@@ -161,6 +183,59 @@ export function LibraryPage() {
 
   const candidates = addTarget ? instancesForItem(addTarget, instances) : [];
 
+  const openUnused = () => {
+    setUnusedOpen(true);
+    setUnusedSelected(new Set());
+    setUnusedConfirming(false);
+    setUnusedError(null);
+  };
+
+  const closeUnused = () => {
+    if (unusedBusy) return;
+    setUnusedOpen(false);
+    setUnusedSelected(new Set());
+    setUnusedConfirming(false);
+    setUnusedError(null);
+  };
+
+  const toggleUnused = (itemId: string) => {
+    setUnusedSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+    setUnusedConfirming(false);
+  };
+
+  const confirmRemoveUnused = async () => {
+    const chosen = unused?.items.filter((item) => unusedSelected.has(item.itemId)) ?? [];
+    if (chosen.length === 0) return;
+    setUnusedBusy(true);
+    setUnusedError(null);
+    const failures: string[] = [];
+    let removed = 0;
+    for (const item of chosen) {
+      try {
+        await removeLibraryItem(item.itemId);
+        removed += 1;
+      } catch (error) {
+        failures.push(`${item.name}: ${errorMessage(error)}`);
+      }
+    }
+    setUnusedBusy(false);
+    if (failures.length > 0) {
+      setUnusedError(failures.join(' '));
+      await load();
+      return;
+    }
+    setNotice(`Removed ${itemCount(removed)}.`);
+    closeUnused();
+    await load();
+  };
+
+  const selectedUnused = unusedSelected.size;
+
   return (
     <div className="space-y-6">
       <section className="agora-hero compact">
@@ -213,6 +288,26 @@ export function LibraryPage() {
           <ul className="mt-1 space-y-0.5 text-xs text-muted-foreground">
             {instanceWarnings.map((warning) => <li key={warning}>{warning}</li>)}
           </ul>
+        </div>
+      )}
+
+      {unused && unused.items.length > 0 && (
+        <div
+          className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4 sm:flex-row sm:items-center sm:justify-between"
+          data-testid="unused-summary"
+        >
+          <div>
+            <p className="text-sm font-medium">
+              Unused: {itemCount(unused.items.length)}, {formatSize(unused.totalSize)}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              No instance uses these. Removing one frees its space; instances keep the files they
+              already have.
+            </p>
+          </div>
+          <Button variant="outline" onClick={openUnused}>
+            Review unused items
+          </Button>
         </div>
       )}
 
@@ -368,6 +463,85 @@ export function LibraryPage() {
                 </Button>
               </div>
             </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={unusedOpen} onOpenChange={(open) => { if (!open) closeUnused(); }}>
+        <DialogContent className="w-[min(34rem,calc(100vw-2rem))]">
+          <DialogHeader>
+            <DialogTitle>Unused items</DialogTitle>
+            <DialogDescription>
+              No instance uses these. Removing one deletes it from your library and frees its
+              space. Instances keep the files they already have. Nothing is removed until you
+              confirm.
+            </DialogDescription>
+          </DialogHeader>
+
+          {unusedError && (
+            <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-2 text-sm">
+              {unusedError}
+            </p>
+          )}
+
+          {unused && unused.warnings.length > 0 && (
+            <div role="status" className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-2 text-xs">
+              <p className="font-medium">Some instances could not be read, so this list may be incomplete.</p>
+              <ul className="mt-1 space-y-0.5 text-muted-foreground">
+                {unused.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+              </ul>
+            </div>
+          )}
+
+          <ul className="max-h-80 space-y-2 overflow-auto" data-testid="unused-list">
+            {unused?.items.map((item: UnusedItem) => (
+              <li key={item.itemId}>
+                <label className="flex items-start gap-3 rounded-lg border border-border p-3">
+                  <input
+                    type="checkbox"
+                    checked={unusedSelected.has(item.itemId)}
+                    onChange={() => toggleUnused(item.itemId)}
+                    className="mt-1"
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium">{item.name}</span>
+                    <span className="block text-xs text-muted-foreground">
+                      {formatSize(item.totalSize)}
+                      {item.gameId ? ` · ${gameLabel(item.gameId)}` : ''}
+                    </span>
+                  </span>
+                </label>
+              </li>
+            ))}
+          </ul>
+
+          {unusedConfirming ? (
+            <div className="space-y-3">
+              <p className="text-sm">
+                Remove {itemCount(selectedUnused)}? This cannot be undone. Instances keep the files
+                they already have.
+              </p>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setUnusedConfirming(false)} disabled={unusedBusy}>
+                  Back
+                </Button>
+                <Button onClick={() => void confirmRemoveUnused()} disabled={unusedBusy}>
+                  {unusedBusy ? 'Removing…' : `Remove ${itemCount(selectedUnused)}`}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={closeUnused} disabled={unusedBusy}>
+                Cancel
+              </Button>
+              <Button
+                onClick={() => setUnusedConfirming(true)}
+                disabled={selectedUnused === 0}
+              >
+                Remove selected…
+              </Button>
+            </div>
           )}
         </DialogContent>
       </Dialog>

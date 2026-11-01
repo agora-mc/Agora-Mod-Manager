@@ -53,6 +53,8 @@ function route() {
           instances: [{ instanceId: 'mc1', name: 'Minecraft One', gameId: 'minecraft' }],
           warnings: [],
         };
+      case 'games_library_unused':
+        return { items: [], totalSize: 0, warnings: [] };
       case 'games_library_icon':
         return null;
       case 'minecraft_add_stored_content':
@@ -104,6 +106,9 @@ describe('LibraryPage', () => {
       if (command === 'games_library_instances') {
         return { instances: [], warnings: [] };
       }
+      if (command === 'games_library_unused') {
+        return { items: [], totalSize: 0, warnings: [] };
+      }
       if (command === 'games_library_icon') return iconDataUrl;
       throw new Error(`unmocked command in a library test: ${command}`);
     });
@@ -151,5 +156,57 @@ describe('LibraryPage', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Add to instance' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('The store item is missing.');
+  });
+
+  it('removes only the unused items the user selects and confirms', async () => {
+    const unusedItem = {
+      itemId: 'e'.repeat(64),
+      name: 'Old Mod',
+      totalSize: 2 * 1024 * 1024,
+      gameId: 'minecraft',
+    };
+    let removed = false;
+    invokeMock.mockImplementation(async (command: string) => {
+      switch (command) {
+        case 'games_library_list':
+          return { items: [first], damaged: [], warnings: [] };
+        case 'games_library_instances':
+          return { instances: [], warnings: [] };
+        case 'games_library_unused':
+          return removed
+            ? { items: [], totalSize: 0, warnings: [] }
+            : { items: [unusedItem], totalSize: unusedItem.totalSize, warnings: [] };
+        case 'games_content_remove':
+          removed = true;
+          return null;
+        default:
+          throw new Error(`unmocked command in a library test: ${command}`);
+      }
+    });
+
+    render(<LibraryPage />);
+    expect(await screen.findByTestId('unused-summary')).toHaveTextContent(
+      'Unused: 1 item, 2.0 MB',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review unused items' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('checkbox'));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove selected…' }));
+
+    expect(invokeMock).not.toHaveBeenCalledWith('games_content_remove', expect.anything());
+    expect(within(dialog).getByText(/Remove 1 item\?/)).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove 1 item' }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('games_content_remove', {
+        itemId: unusedItem.itemId,
+      });
+    });
+    expect(await screen.findByRole('status')).toHaveTextContent('Removed 1 item.');
+    await waitFor(() => {
+      expect(screen.queryByTestId('unused-summary')).not.toBeInTheDocument();
+    });
   });
 });
