@@ -4448,4 +4448,23 @@ mod game_catalog_tests {
             other => panic!("expected a named error, got {other:?}"),
         }
     }
+
+    /// `has_game_catalog` turns any SQL failure into `false`, so a database that cannot be read
+    /// reads as "this registry has no other games" instead of an error.
+    #[test]
+    #[ignore = "proves bug: a registry that cannot be queried reads as an empty other-games catalog (has_game_catalog unwrap_or(false))"]
+    fn an_unreadable_registry_is_an_error_not_an_empty_game_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.db");
+        std::fs::write(&path, vec![0x5Au8; 8192]).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert!(
+            list_game_items(&conn, "skyrim-se").is_err(),
+            "listing must fail on a file that is not a database"
+        );
+        assert!(
+            get_game_item(&conn, "any").is_err(),
+            "a lookup must fail, not answer 'no such entry'"
+        );
+    }
 }

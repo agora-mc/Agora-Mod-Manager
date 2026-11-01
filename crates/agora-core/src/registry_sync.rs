@@ -1437,4 +1437,59 @@ mod tests {
         // Sanity check: the expected schema version should be >= 1.
         const { assert!(APP_REGISTRY_SCHEMA_VERSION >= 1) };
     }
+
+    /// A candidate with no `built_at` predates the stamp, so it is older than any stamped registry.
+    /// Treating "unknown" as "not older" lets a replayed old signed registry (the thing the stamp is
+    /// for) replace a stamped one.
+    #[test]
+    #[ignore = "proves bug: an old signed registry with no built_at stamp is not seen as a rollback over a stamped one"]
+    fn an_unstamped_candidate_is_a_rollback_over_a_stamped_cache() {
+        assert!(is_rollback(Some("2026-10-30T00:00:00+00:00"), None));
+    }
+
+    /// `quarantine` ignores a failed rename (`let _ = std::fs::rename`) and still reports
+    /// `Quarantined`, yet the tampered `registry.db` stays where `RegistryService::connection` opens
+    /// it (that path never re-verifies). Here the rename target is a non-empty folder so it fails.
+    #[test]
+    #[ignore = "proves bug: a failed quarantine rename is ignored and the unverified registry.db stays in use"]
+    fn a_failed_quarantine_does_not_leave_the_unsigned_db_in_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = paths::registry_db_path(dir.path()).unwrap();
+        let sig_path = paths::registry_sig_path(dir.path()).unwrap();
+        std::fs::write(&db_path, b"tampered registry contents").unwrap();
+        std::fs::write(&sig_path, [0u8; SIGNATURE_LENGTH]).unwrap();
+        let blocker = db_path.with_extension("db.untrusted");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), b"x").unwrap();
+
+        let result = verify_cached_registry(dir.path());
+        assert!(matches!(result, CachedRegistryIntegrity::Quarantined(_)));
+        assert!(
+            !db_path.exists(),
+            "reported as quarantined, but the tampered db is still at registry.db"
+        );
+    }
+
+    /// atomic_replace_db renames the signature first. When the db rename then fails, the old db is
+    /// left beside a signature that does not belong to it, so the next startup quarantines a good
+    /// registry (the doc comment says "old-db + new-sig still verifies": it cannot).
+    #[test]
+    #[ignore = "proves bug: a failed db rename leaves the new signature beside the old db"]
+    fn a_failed_replace_leaves_the_old_signature_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let sig_path = dir.path().join("registry.db.sig");
+        // A directory where the db should be makes the final rename fail on every platform.
+        let db_path = dir.path().join("registry.db");
+        std::fs::create_dir(&db_path).unwrap();
+        std::fs::write(db_path.join("keep"), b"x").unwrap();
+        std::fs::write(&sig_path, b"old signature").unwrap();
+
+        let result = atomic_replace_db(&db_path, &sig_path, b"new db", b"new signature");
+        assert!(result.is_err(), "the db rename must fail in this setup");
+        assert_eq!(
+            std::fs::read(&sig_path).unwrap(),
+            b"old signature",
+            "a failed replace must leave the signature that matches the surviving db"
+        );
+    }
 }

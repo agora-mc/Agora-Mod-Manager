@@ -1182,4 +1182,52 @@ mod tests {
         let definition = test_definition();
         assert!(cached(&ctx, &definition).unwrap().is_none());
     }
+
+    /// GitHub's contents API wraps `content` at 60 base64 characters with `\n` and ends it with a
+    /// newline. `base64::STANDARD.decode` rejects those newlines, so any file small enough to come
+    /// inline (the prelude is) makes every update fail with "not valid base64".
+    #[test]
+    #[ignore = "proves bug: loot contents answers with newline-wrapped base64 are rejected (fetch_file decodes without stripping whitespace)"]
+    fn a_newline_wrapped_base64_contents_answer_is_accepted() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        fn wrapped(bytes: &[u8]) -> String {
+            let encoded = STANDARD.encode(bytes);
+            let mut out = String::new();
+            for chunk in encoded.as_bytes().chunks(60) {
+                out.push_str(std::str::from_utf8(chunk).unwrap());
+                out.push('\n');
+            }
+            out
+        }
+        fn inline_json(bytes: &[u8]) -> Vec<u8> {
+            serde_json::json!({
+                "sha": git_blob_sha1(bytes),
+                "download_url": null,
+                "content": wrapped(bytes),
+                "encoding": "base64"
+            })
+            .to_string()
+            .into_bytes()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(dir.path().to_path_buf());
+        let definition = test_definition();
+        let main =
+            b"plugins: []\n# padding so the encoded form is longer than one 60 character line\n";
+        let fake = FakeFetcher::new()
+            .with(
+                &contents_url("loot/skyrimse", "masterlist.yaml", "v0.29"),
+                inline_json(main),
+            )
+            .with(
+                &contents_url("loot/prelude", "prelude.yaml", "v0.29"),
+                inline_json(main),
+            )
+            .with(
+                &commits_url("loot/skyrimse", "v0.29"),
+                commit_json("deadbeef"),
+            );
+        update_with(&ctx, &definition, &fake)
+            .expect("a normal GitHub inline (newline-wrapped base64) answer is accepted");
+    }
 }
