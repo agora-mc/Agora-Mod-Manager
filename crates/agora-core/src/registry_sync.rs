@@ -553,15 +553,115 @@ async fn download_file(url: &str, token: Option<&str>) -> LauncherResult<Vec<u8>
 }
 
 // ---------------------------------------------------------------------------
+// Reading the cached registry as trusted data
+// ---------------------------------------------------------------------------
+
+/// The cached registry, read only after its signature was checked.
+///
+/// `verify_cached_registry` runs once at startup, but the cached file sits in a
+/// user-writable folder and can change afterwards. A caller that is about to
+/// act on what the registry says (download this URL, trust this hash) calls
+/// [`open_verified_registry`] instead: it verifies the bytes it is about to read,
+/// then opens a private copy of exactly those bytes, so the file cannot be
+/// swapped between the check and the read.
+pub struct VerifiedRegistry {
+    conn: Option<rusqlite::Connection>,
+    copy: std::path::PathBuf,
+}
+
+impl VerifiedRegistry {
+    pub fn connection(&self) -> &rusqlite::Connection {
+        self.conn
+            .as_ref()
+            .expect("the connection is only taken when the registry is dropped")
+    }
+}
+
+impl Drop for VerifiedRegistry {
+    fn drop(&mut self) {
+        // The connection must close before Windows lets the file go.
+        self.conn = None;
+        let _ = std::fs::remove_file(&self.copy);
+    }
+}
+
+/// Verify the cached `registry.db` against the compiled-in key and open it.
+///
+/// Fails closed: a missing registry, a missing or wrong signature, or an
+/// unreadable file is an error, never an empty registry.
+pub fn open_verified_registry(app_data_dir: &Path) -> LauncherResult<VerifiedRegistry> {
+    open_verified_registry_with_key(app_data_dir, REGISTRY_PUBKEY_HEX)
+}
+
+/// [`open_verified_registry`] against an explicit key.
+///
+/// Public so integration tests can sign a registry of their own. Production
+/// adapters call [`open_verified_registry`]; no setting or environment variable
+/// reaches this function.
+pub fn open_verified_registry_with_key(
+    app_data_dir: &Path,
+    pubkey_hex: &str,
+) -> LauncherResult<VerifiedRegistry> {
+    static COPY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // An empty key would reach the debug-build "skip verification" branch.
+    if pubkey_hex.trim().is_empty() {
+        return Err(LauncherError::RegistrySignatureInvalid);
+    }
+    let db_path =
+        paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    let sig_path =
+        paths::registry_sig_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    if !db_path.exists() {
+        return Err(LauncherError::RegistryMissing);
+    }
+    let db_bytes = std::fs::read(&db_path).map_err(|_| LauncherError::RegistryMissing)?;
+    // A registry with no signature sidecar is unsigned, which is not trusted.
+    let sig_bytes =
+        std::fs::read(&sig_path).map_err(|_| LauncherError::RegistrySignatureInvalid)?;
+    verify_signature_with_key(pubkey_hex, &db_bytes, &sig_bytes)?;
+
+    let copy = app_data_dir.join(format!(
+        "registry_verified-{}-{}.tmp",
+        std::process::id(),
+        COPY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&copy, &db_bytes).map_err(|_| LauncherError::RegistryMissing)?;
+    match db::registry_connection(&copy) {
+        Ok(conn) => Ok(VerifiedRegistry {
+            conn: Some(conn),
+            copy,
+        }),
+        Err(e) => {
+            let _ = std::fs::remove_file(&copy);
+            Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_UNREADABLE".into(),
+                message: format!("The verified catalog could not be opened: {e}"),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers â€” Ed25519 signature verification
 // ---------------------------------------------------------------------------
 
 fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
+    verify_signature_with_key(REGISTRY_PUBKEY_HEX, db_bytes, sig_bytes)
+}
+
+/// [`verify_signature`] against an explicit key, so a caller that is handed a
+/// different trust anchor (a test, never a user setting) shares the one check.
+fn verify_signature_with_key(
+    pubkey_hex: &str,
+    db_bytes: &[u8],
+    sig_bytes: &[u8],
+) -> LauncherResult<()> {
     // In debug builds only, allow skipping verification when no pubkey is set.
     // Release builds must have AGORA_REGISTRY_PUBKEY compiled in.
     #[cfg(not(debug_assertions))]
     {
-        if REGISTRY_PUBKEY_HEX.is_empty() {
+        if pubkey_hex.is_empty() {
             return Err(LauncherError::Generic {
                 code: "ERR_REGISTRY_PUBKEY_NOT_CONFIGURED".to_string(),
                 message: "Catalog public key not compiled in; refusing to verify. \
@@ -576,7 +676,7 @@ fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
 
     #[cfg(debug_assertions)]
     {
-        if REGISTRY_PUBKEY_HEX.is_empty() {
+        if pubkey_hex.is_empty() {
             eprintln!(
                 "WARNING: AGORA_REGISTRY_PUBKEY not set; skipping signature verification (debug build only).\n\
                  Set `$env:AGORA_REGISTRY_PUBKEY` (Ed25519 public key, hex) before `npm run tauri:dev` to enable verification.\n\
@@ -589,7 +689,7 @@ fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
         }
     }
 
-    let pubkey_bytes = hex::decode(REGISTRY_PUBKEY_HEX).map_err(|_| LauncherError::Generic {
+    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| LauncherError::Generic {
         code: "ERR_REGISTRY_PUBKEY".to_string(),
         message: "Invalid compiled-in registry public key.".to_string(),
     })?;

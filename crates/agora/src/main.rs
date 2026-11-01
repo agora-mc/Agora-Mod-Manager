@@ -22,6 +22,7 @@ use agora_game_minecraft::runtime_service::RuntimeService;
 mod cli_discovery;
 mod cli_govniche;
 mod cli_network;
+mod cli_official;
 mod cli_tools;
 mod cli_updates;
 mod cli_worlds;
@@ -1106,6 +1107,15 @@ enum PluginCmd {
     /// Disable every installed plugin as a recovery action.
     #[command(name = "disable-all")]
     DisableAll,
+    /// Official plugins: packages Agora's signed catalog vouches for.
+    ///
+    /// Downloaded from the URL the catalog names and checked against the size
+    /// and SHA-256 it pins before anything is unpacked. An official plugin
+    /// loads without the community-plugins switch while it still matches.
+    Official {
+        #[command(subcommand)]
+        action: cli_official::OfficialCmd,
+    },
     /// Show a plugin's declared settings and their current values.
     Settings {
         /// Plugin id.
@@ -2858,6 +2868,7 @@ async fn run_plugin_command(
         PluginCmd::Set { id, key, value } => {
             cli_govniche::plugin_set(service, &id, &key, &value, json)?
         }
+        PluginCmd::Official { action } => cli_official::run(service, action, json).await?,
         PluginCmd::DisableAll => {
             let disabled = service.disable_all()?;
             if json {

@@ -9,8 +9,8 @@
 
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::plugins::{
-    InstallPreview, LaunchCheckOutcome, PluginService, PluginSummary, PluginUiSink, RepairOutcome,
-    UpdateOutcome, UpdateVerdict,
+    InstallPreview, LaunchCheckOutcome, OfficialPluginList, PluginService, PluginSummary,
+    PluginUiSink, RepairOutcome, UpdateOutcome, UpdateVerdict,
 };
 use agora_plugin_api::diagnostics::{DiagnosticReport, RepairProposal};
 use agora_plugin_api::dto::{Tone, ViewModel};
@@ -233,6 +233,55 @@ pub async fn plugin_apply_update(
 ) -> LauncherResult<UpdateOutcome> {
     service(&app)?
         .apply_update(&parse_id(&plugin_id)?, accept_capabilities)
+        .await
+}
+
+/// The official plugins the signed catalog offers, and where each stands.
+///
+/// An unverifiable catalog is an empty list with `unavailableReason`, never an
+/// error the page has to guess about.
+#[tauri::command]
+pub async fn list_official_plugins(app: AppHandle) -> LauncherResult<OfficialPluginList> {
+    service(&app)?.official_plugins()
+}
+
+/// Install an official plugin that is not installed yet. Core downloads it from
+/// the signed catalog's URL and checks size and SHA-256 before unpacking.
+#[tauri::command]
+pub async fn install_official_plugin(
+    app: AppHandle,
+    plugin_id: String,
+    accept_capabilities: bool,
+) -> LauncherResult<UpdateOutcome> {
+    let service = service(&app)?;
+    service
+        .install_official(&plugin_id, accept_capabilities, &service.http_fetcher())
+        .await
+}
+
+/// Move an installed plugin to the catalog's current official version.
+#[tauri::command]
+pub async fn update_official_plugin(
+    app: AppHandle,
+    plugin_id: String,
+    accept_capabilities: bool,
+) -> LauncherResult<UpdateOutcome> {
+    let service = service(&app)?;
+    service
+        .update_official(&plugin_id, accept_capabilities, &service.http_fetcher())
+        .await
+}
+
+/// Return an official plugin to the previous version the catalog keeps.
+#[tauri::command]
+pub async fn rollback_official_plugin(
+    app: AppHandle,
+    plugin_id: String,
+    accept_capabilities: bool,
+) -> LauncherResult<UpdateOutcome> {
+    let service = service(&app)?;
+    service
+        .rollback_official(&plugin_id, accept_capabilities, &service.http_fetcher())
         .await
 }
 

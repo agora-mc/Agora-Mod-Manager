@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 18;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 19;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -732,6 +732,29 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (18)",
+            [],
+        )?;
+    }
+
+    if current < 19 {
+        // Which installed plugins were installed from a signed registry entry
+        // (official plugins). A table beside `plugin_installs` rather than
+        // columns on it, so the manifest-derived record stays exactly what the
+        // package said and "official" is only ever what the installer wrote
+        // here. A plain install replaces the plugin's row and clears this one.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plugin_official (
+                 plugin_id TEXT PRIMARY KEY,
+                 entry_id TEXT NOT NULL,
+                 entry_version TEXT NOT NULL,
+                 entry_sha256 TEXT NOT NULL,
+                 tree_sha256 TEXT NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+             );",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (19)",
             [],
         )?;
     }

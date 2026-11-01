@@ -615,6 +615,21 @@ agora plugin install development ./example-plugin --yes
 
 Without `--yes`, a non-interactive invocation cannot grant capabilities. The CLI shows the preview and passes a negative consent answer to core, so `PluginService` refuses the install. This keeps scripting fail-closed; do not use `--yes` unless the package's preview is trusted. In JSON mode, a pending interactive preview and prompt are written to standard error; the completed plugin summary is the single JSON value on standard output.
 
+### Official plugins
+
+```text
+agora plugin official list
+agora plugin official install <PLUGIN_ID> [--yes]
+agora plugin official update <PLUGIN_ID> [--yes]
+agora plugin official rollback <PLUGIN_ID> [--yes]
+```
+
+An official plugin is an ordinary plugin package whose id, version and package SHA-256 are listed in the `official_plugins` table of Agora's Ed25519-signed catalog (`registry.db`). Nothing in the plugin's own manifest can make it official; the `publisher` part of its id is only a namespace. `list` shows what the catalog offers and where each one stands (not installed, installed, update available, or an installed copy that is not the official package). If the catalog is missing, unsigned or fails its signature check, `list` says so and offers nothing, and `install` / `update` / `rollback` refuse.
+
+`install`, `update` and `rollback` download the package from the URL the catalog names (HTTPS only, pinned to that host), refuse it unless its size and SHA-256 match the catalog entry **before anything is unpacked**, and then use the same installer as `plugin install package`, so the same capability consent applies: without `--yes` the command prints what the package asks for and stops. `install` is for a plugin that is not installed, `update` moves an installed one to the catalog's current version (and replaces a same-id community copy with the official package), and `rollback` returns an official install to the previous version the catalog keeps. An id is matched exactly: an empty id, a path, or a different capitalisation matches nothing.
+
+An installed plugin counts as official only while its id, version and installed package hash still match a signed catalog entry and its files are unchanged since they were installed. While it does, it loads at startup even when the community-plugins switch (`plugins_enabled`) is off. If it stops matching (the files were edited, the catalog no longer lists that version or pins a different package, the catalog cannot be verified), it follows the community rules again, and the reason appears in `plugin list --json` (`official.reason`) and in the startup warnings. Installing a package through `plugin install package`, even one with the same id and version, makes it a community plugin.
+
 ### Content providers
 
 ```text

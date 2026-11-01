@@ -850,3 +850,72 @@ compile error.
 The Skyrim SE package declares `skse` (Skyrim Script Extender, version 2.2.6). Its
 `supported_runtimes` is empty, because the game's `runtime_files` already enforce which SKSE build
 matches which Skyrim runtime. The example above compiles against the real package.
+
+---
+
+## Official plugins
+
+An official plugin is an ordinary plugin package (`agora-plugin.json` plus its files in a zip) that
+this signed registry vouches for. Being listed here, with the package's SHA-256, is the **only**
+thing that makes a plugin official; nothing in the plugin's own manifest counts, and the
+`publisher` half of its id is just a namespace. The app shows the Official badge only for an
+installed plugin whose id, version and package hash still match an entry, and an official plugin
+loads without the community-plugins switch. Installing one still asks for the same capability
+consent as any package.
+
+### Where the entries are stored
+
+One file per plugin, `registry/official-plugins/<plugin-id>.json`; the file name must be the plugin
+id. The folder is flat, `archived/` is skipped like everywhere else, and any other file in it
+fails the compile. A complete example, with placeholder URLs and hashes that is never compiled, is
+`examples/official-plugins/acme.fixture.json`.
+
+```json
+{
+  "id": "acme.fixture",
+  "name": "Acme Fixture",
+  "description": "What it adds, in a sentence.",
+  "game_ids": ["fixture-game"],
+  "min_agora_version": "0.1.0",
+  "current": {
+    "version": "1.1.0",
+    "package_url": "https://plugins.example.org/acme.fixture-1.1.0.zip",
+    "sha256": "<64 lowercase hex characters: the SHA-256 of the zip>",
+    "size": 4096
+  },
+  "previous": {
+    "version": "1.0.0",
+    "package_url": "https://plugins.example.org/acme.fixture-1.0.0.zip",
+    "sha256": "<64 lowercase hex characters>",
+    "size": 4000
+  }
+}
+```
+
+| Field | Rule |
+|---|---|
+| `id` | `publisher.plugin`, lowercase letters, digits and inner hyphens, at most 96 characters; equals the file name and the `id` in the package's manifest (the app refuses a package that names itself otherwise) |
+| `name`, `description` | Shown in the plugin list; `name` is required |
+| `game_ids` | Games the plugin adds, if any; lowercase ids, no repeats |
+| `min_agora_version` | Semantic version; an older Agora lists the plugin but will not install it |
+| `current` | What a new install or an update moves to |
+| `previous` | Optional. Keep the version before `current` here so a bad update can be rolled back; it must be a different version |
+| `*.version` | Semantic version; must equal the `version` in the package's manifest |
+| `*.package_url` | `https://` and a plain host: no user info, no port, no spaces. The download is pinned to that host |
+| `*.sha256` | The SHA-256 of the zip, 64 **lowercase** hex characters. The app checks size and hash before it unpacks anything |
+| `*.size` | The zip's size in bytes, 1 to 67,108,864 |
+
+Unknown fields, a missing field, or a malformed value stop the compile with a message naming the
+file and the field: the table decides which downloads count as official, so a typo must not become
+a silently missing or different entry.
+
+### How older clients are affected
+
+Entries are written to their own table, `official_plugins`, with one row per listed version
+(`plugin_id`, `version`, `channel` = `current` or `previous`, `name`, `description`,
+`game_ids_json`, `package_url`, `package_sha256`, `package_size`, `min_agora_version`). The
+registry schema version stays 9 and no existing table changes, so a client that predates the table
+keeps downloading and reading the registry and simply never selects it (the same arrangement as
+`game_catalog_items`). A client that has the feature, reading a registry without the table, lists
+no official plugins and treats that as normal.
+

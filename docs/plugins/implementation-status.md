@@ -82,11 +82,23 @@ corrupt migration from a partial one; the person using it can.
 **Signatures prove continuity, not identity, and there is no revocation.** A verified update came
 from whoever published the version you already have — nothing more. Whoever hands you the *first*
 package chooses the key and the update URL, so a package from a bad source is bad forever and
-every subsequent "update" will verify perfectly. There is no catalog, no publisher verification,
-and no way to revoke a stolen key: an author whose key is taken has no channel to say so, and an
+every subsequent "update" will verify perfectly. For community plugins there is no catalog, no
+publisher verification, and no way to revoke a stolen key (official plugins are the exception;
+see the next paragraph): an author whose key is taken has no channel to say so, and an
 author who loses theirs cannot ship to existing installs again. `docs/plugins/publishing.md` says
 this to authors in the same words. Replay is handled — a document carries a monotonic sequence and
 an older one is refused — but that is a narrower guarantee than it sounds.
+
+**Official plugins are the one exception, and the trust root is the signed registry, not the
+plugin.** A plugin is official only while its id, version and package SHA-256 are listed in the
+`official_plugins` table of the Ed25519-signed `registry.db` and its installed files are
+unchanged since the official installer wrote them (`agora plugin official list`,
+`crates/agora-core/src/plugins/official.rs`). Nothing in the manifest can claim it. Official
+plugins load at startup without `plugins_enabled`; if one stops verifying it falls back to the
+community rules and the reason is shown. This covers game-package contributions loaded at
+startup. A script-backed (QuickJS) plugin still runs only while `plugins_enabled` is on. The
+catalog can keep a previous version per plugin, so an official update can be rolled back; community
+plugins still cannot.
 
 **The update path has now run against a real host, and doing it found a bug no test could.**
 Every real call panicked — `Cannot drop a runtime in a context where blocking is not allowed` —

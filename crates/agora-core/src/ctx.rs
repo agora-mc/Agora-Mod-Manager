@@ -132,7 +132,22 @@ impl CoreContext {
     /// observations that did not prevent initialization.
     pub fn initialize(
         paths: AppPaths,
+        game_builder: crate::game_registry::GameRegistryBuilder,
+    ) -> LauncherResult<(Self, Vec<String>)> {
+        Self::initialize_with_registry_trust(
+            paths,
+            game_builder,
+            crate::plugins::official::RegistryTrust::production(),
+        )
+    }
+
+    /// [`Self::initialize`] with an explicit registry key. Test support:
+    /// adapters call `initialize`, which trusts only the key compiled into the
+    /// app. The key decides which installed plugins count as official.
+    pub fn initialize_with_registry_trust(
+        paths: AppPaths,
         mut game_builder: crate::game_registry::GameRegistryBuilder,
+        registry_trust: crate::plugins::official::RegistryTrust,
     ) -> LauncherResult<(Self, Vec<String>)> {
         let mut warnings = Vec::new();
 
@@ -172,7 +187,26 @@ impl CoreContext {
                         .and_then(|val| val.as_bool())
                         .unwrap_or(false);
 
-                if plugins_enabled {
+                // A plugin installed from a signed registry entry and still matching
+                // it is official, and official plugins do not need the community
+                // switch. Everything else follows the switch, as before. One that was
+                // installed as official and no longer verifies is not silently
+                // demoted: it is named in the warnings with the reason.
+                let official = match crate::plugins::official::verify_installed(
+                    &conn,
+                    paths.root(),
+                    &registry_trust,
+                ) {
+                    Ok(statuses) => statuses,
+                    Err(e) => {
+                        warnings.push(format!(
+                            "Cannot verify official plugins, so none is treated as official: {e}"
+                        ));
+                        Default::default()
+                    }
+                };
+
+                {
                     match crate::plugins::store::list(&conn) {
                         Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
                         Ok(records) => {
@@ -184,6 +218,36 @@ impl CoreContext {
                                         .contains(agora_plugin_api::Capability::GameDefine)
                                 {
                                     continue;
+                                }
+
+                                match official.get(record.id().as_str()) {
+                                    Some(crate::plugins::official::OfficialStatus::Official {
+                                        ..
+                                    }) => {}
+                                    Some(
+                                        crate::plugins::official::OfficialStatus::Unverified {
+                                            reason,
+                                        },
+                                    ) => {
+                                        let consequence = if plugins_enabled {
+                                            "it is treated as a community plugin"
+                                        } else {
+                                            "it is treated as a community plugin and is not loaded while community plugins are switched off"
+                                        };
+                                        warnings.push(format!(
+                                            "Plugin {} was installed as an official plugin but no longer verifies ({reason}); {consequence}.",
+                                            record.id()
+                                        ));
+                                        if !plugins_enabled {
+                                            continue;
+                                        }
+                                    }
+                                    Some(crate::plugins::official::OfficialStatus::Community)
+                                    | None => {
+                                        if !plugins_enabled {
+                                            continue;
+                                        }
+                                    }
                                 }
 
                                 for pkg_contrib in &record.manifest.contributions.game_packages {
