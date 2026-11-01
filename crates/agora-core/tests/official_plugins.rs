@@ -1854,3 +1854,100 @@ async fn the_documented_development_install_of_skyrim_still_loads_the_game() {
         })
     );
 }
+
+// ---------------------------------------------------------------------------
+// Final review (plugins): proven bugs, ignored so the suite stays green
+// ---------------------------------------------------------------------------
+
+/// The doc comment on `install_package_bytes` says "a version that newly has code ... is denied
+/// until the user allows it". The answer is only cleared by an uninstall, so a version with no
+/// code in between does not end it: v1 (code, allowed) -> v2 (no code) -> v3 (new code) runs v3
+/// with the permission given for v1.
+#[tokio::test]
+#[ignore = "proves bug: script consent given for a plugin's v1 code survives a code-less v2 and is applied to v3's new code (service.rs:1096 only writes consent on a first install with code, never clears it)"]
+async fn script_consent_does_not_survive_a_version_with_no_code() {
+    let world = World::new();
+    let v1 = world
+        .service
+        .install_package_bytes(&script_zip(COMMUNITY_SCRIPT, "1.0.0"), true)
+        .unwrap();
+    assert!(v1.scripts_allowed, "the user allowed v1's code");
+
+    // v2 ships no code at all (a data-only game package under the same id).
+    let v2 = world
+        .service
+        .install_package_bytes(
+            &package_zip(COMMUNITY_SCRIPT, "2.0.0", "some-game", "game:define", ""),
+            Consent::without_code(),
+        )
+        .unwrap();
+    assert!(!v2.runs_code);
+
+    // v3 brings code back. The user was never asked about this code.
+    let v3 = world
+        .service
+        .install_package_bytes(
+            &script_zip(COMMUNITY_SCRIPT, "3.0.0"),
+            Consent::without_code(),
+        )
+        .unwrap();
+    assert!(v3.runs_code);
+    assert!(
+        !v3.scripts_allowed,
+        "v3's code is new: it must not run on the answer given for v1"
+    );
+    world.stop_everything();
+    world.service.activate_all().unwrap();
+    assert!(
+        !world.running(COMMUNITY_SCRIPT),
+        "v3 ran without being allowed"
+    );
+}
+
+/// A tampered or revoked official plugin is Blocked and its games are not loaded; the game id it
+/// held is then free, and any community plugin that declares the same game id takes it over.
+#[tokio::test]
+#[ignore = "proves bug: a community plugin gets the game id of a blocked (demoted) official plugin (ctx.rs:235-245 skips the blocked plugin, so game_builder.add accepts the community claim)"]
+async fn a_blocked_official_plugin_does_not_hand_its_game_id_to_a_community_plugin() {
+    let world = World::new();
+    let signed = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &signed), signed)]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    // Someone edits the installed official files: it is demoted and Blocked.
+    std::fs::write(world.installed_dir().join("extra.txt"), b"edited").unwrap();
+    world.service.reload().unwrap();
+    assert!(matches!(world.status(), OfficialStatus::Unverified { .. }));
+
+    // A community plugin declares the official plugin's game.
+    let mut package = game_package(GAME);
+    package.id = "test.pkg.community".into();
+    world
+        .service
+        .install_package_bytes(
+            &package_zip_with("aaa.community", "1.0.0", package, "game:define", ""),
+            true,
+        )
+        .unwrap();
+
+    let (ctx, warnings) = world.start();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains(PLUGIN) && w.contains("blocked")),
+        "the official plugin is reported blocked: {warnings:?}"
+    );
+    let source = ctx.games.source_for(&GameId::new(GAME).unwrap());
+    assert_ne!(
+        source,
+        Some(&PackageSource::Plugin {
+            plugin_id: "aaa.community".into()
+        }),
+        "the community plugin must not take over the game of a blocked official plugin"
+    );
+}
