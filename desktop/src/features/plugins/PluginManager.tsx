@@ -21,13 +21,18 @@ import {
   checkPluginUpdate,
   disableAllPlugins,
   installPluginPackage,
+  listOfficialPlugins,
   previewPluginFolder,
   previewPluginPackage,
   readPluginLog,
   restorePluginData,
+  rollbackOfficialPlugin,
   setPluginEnabled,
   uninstallPlugin,
+  updateOfficialPlugin,
 } from './api';
+import { InstallPrompt } from './InstallPrompt';
+import { OfficialBadge, OfficialStatusNote } from './OfficialBadge';
 import { usePlugins } from './PluginProvider';
 import { PluginSettingsForm } from './PluginSettingsForm';
 import { PluginThemeSelect } from './PluginTheme';
@@ -37,6 +42,7 @@ import type {
   CheckpointSummary,
   InstallPreview,
   KeyFingerprint,
+  OfficialPluginInfo,
   PluginSummary,
   UpdateCheckRecord,
   UpdateOutcome,
@@ -166,6 +172,29 @@ export function PluginManager() {
   const [preview, setPreview] = useState<{ preview: InstallPreview; path: string; development: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   const [logFor, setLogFor] = useState<{ id: string; lines: string[] } | null>(null);
+  // Official offers, by plugin id. Absent while the catalog is unreadable; the
+  // row then keeps its community behaviour and the badge comes from the
+  // summary's `official` field alone.
+  const [officialById, setOfficialById] = useState<Record<string, OfficialPluginInfo>>({});
+
+  const refreshOfficial = useCallback(async () => {
+    try {
+      const list = await listOfficialPlugins();
+      const byId: Record<string, OfficialPluginInfo> = {};
+      for (const info of Array.isArray(list.plugins) ? list.plugins : []) {
+        if (info && typeof info.id === 'string') byId[info.id] = info;
+      }
+      setOfficialById(byId);
+    } catch {
+      // The catalog is optional for this page; a missing one must not hide or
+      // break the community list.
+      setOfficialById({});
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshOfficial();
+  }, [refreshOfficial]);
 
   useEffect(() => {
     void (async () => {
@@ -426,6 +455,8 @@ export function PluginManager() {
                 <PluginRow
                   key={plugin.id}
                   plugin={plugin}
+                  official={officialById[plugin.id] ?? null}
+                  onOfficialChanged={refreshOfficial}
                   onRefresh={refresh}
                   onToggle={(next) => void toggle(plugin, next)}
                   onRemove={() => void remove(plugin)}
@@ -459,12 +490,16 @@ export function PluginManager() {
 
 function PluginRow({
   plugin,
+  official,
+  onOfficialChanged,
   onRefresh,
   onToggle,
   onRemove,
   onShowLog,
 }: {
   plugin: PluginSummary;
+  official: OfficialPluginInfo | null;
+  onOfficialChanged: () => Promise<void>;
   onRefresh: () => Promise<void>;
   onToggle: (next: boolean) => void;
   onRemove: () => void;
@@ -474,6 +509,9 @@ function PluginRow({
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateVerdict, setUpdateVerdict] = useState<UpdateVerdict | null>(null);
   const [updatePreview, setUpdatePreview] = useState<InstallPreview | null>(null);
+  const [officialBusy, setOfficialBusy] = useState(false);
+  const [officialPreview, setOfficialPreview] = useState<InstallPreview | null>(null);
+  const [officialRollback, setOfficialRollback] = useState(false);
   const pluginId = typeof plugin.id === 'string' ? plugin.id : 'unknown-plugin';
   const pluginName = typeof plugin.name === 'string' ? plugin.name : 'Unnamed plugin';
   const pluginVersion = typeof plugin.version === 'string' ? plugin.version : 'unknown version';
@@ -577,6 +615,39 @@ function PluginRow({
     [onRefresh, pluginId],
   );
 
+  const applyOfficial = useCallback(
+    async (acceptCapabilities: boolean, rollback: boolean) => {
+      setOfficialBusy(true);
+      try {
+        const result = rollback
+          ? await rollbackOfficialPlugin(pluginId, acceptCapabilities)
+          : await updateOfficialPlugin(pluginId, acceptCapabilities);
+        if (!isUpdateOutcome(result)) {
+          showToast('Agora did not return a usable update outcome.', 'error');
+          return;
+        }
+        if (result.outcome === 'needsConsent') {
+          setOfficialRollback(rollback);
+          setOfficialPreview(result.preview);
+          return;
+        }
+        setOfficialPreview(null);
+        await onRefresh();
+        await onOfficialChanged();
+        showToast(
+          rollback
+            ? `${result.plugin.name} rolled back. Restart Agora to use the previous version.`
+            : `${result.plugin.name} updated. Restart Agora to use the new version.`,
+        );
+      } catch (e) {
+        showToast(formatError(e), 'error');
+      } finally {
+        setOfficialBusy(false);
+      }
+    },
+    [onOfficialChanged, onRefresh, pluginId],
+  );
+
   return (
     <li className="rounded-lg border border-border bg-card p-4">
       <div className="flex items-start justify-between gap-4">
@@ -586,10 +657,12 @@ function PluginRow({
             <span className="text-xs text-muted-foreground">{pluginVersion}</span>
             {plugin.development === true ? <Badge variant="outline">Development</Badge> : null}
             {plugin.running === true ? <Badge variant="secondary">Running</Badge> : null}
+            <OfficialBadge status={plugin.official} />
           </div>
           {pluginDescription ? (
             <p className="text-sm text-muted-foreground">{pluginDescription}</p>
           ) : null}
+          <OfficialStatusNote status={plugin.official} />
           <p
             className={
               broken
@@ -658,6 +731,26 @@ function PluginRow({
             aria-label={`Enable ${pluginName}`}
           />
           <div className="flex gap-1">
+            {official?.state === 'updateAvailable' ? (
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={officialBusy || officialPreview !== null}
+                onClick={() => void applyOfficial(false, false)}
+              >
+                {officialBusy ? 'Updating…' : `Update to ${official.version}`}
+              </Button>
+            ) : null}
+            {official?.canRollBack ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={officialBusy || officialPreview !== null}
+                onClick={() => void applyOfficial(false, true)}
+              >
+                Roll back to {official.previousVersion}
+              </Button>
+            ) : null}
             <Button
               variant="ghost"
               size="sm"
@@ -730,6 +823,20 @@ function PluginRow({
           />
         </div>
       ) : null}
+
+      {officialPreview ? (
+        <div className="mt-4 border-t border-border pt-4">
+          <InstallPrompt
+            preview={officialPreview}
+            development={false}
+            busy={officialBusy}
+            confirmLabel={officialRollback ? 'Roll back' : 'Update'}
+            busyLabel={officialRollback ? 'Rolling back…' : 'Updating…'}
+            onCancel={() => setOfficialPreview(null)}
+            onConfirm={() => void applyOfficial(true, officialRollback)}
+          />
+        </div>
+      ) : null}
     </li>
   );
 }
@@ -781,168 +888,4 @@ function UpdateResult({
   return null;
 }
 
-function InstallPrompt({
-  preview,
-  development,
-  busy,
-  confirmLabel = 'Install',
-  busyLabel = 'Installing…',
-  onCancel,
-  onConfirm,
-}: {
-  preview: InstallPreview;
-  development: boolean;
-  busy: boolean;
-  confirmLabel?: string;
-  busyLabel?: string;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  const requiredCapabilities = Array.isArray(preview.requiredCapabilities)
-    ? preview.requiredCapabilities.filter(isCapabilityDescription)
-    : [];
-  const optionalCapabilities = Array.isArray(preview.optionalCapabilities)
-    ? preview.optionalCapabilities.filter(isCapabilityDescription)
-    : [];
-  const unsupportedCapabilities = stringArray(preview.unsupportedCapabilities);
-  // Coerced: an older backend that predates this field would otherwise put
-  // `undefined` where a list is expected, in a component whose whole job is
-  // telling the user what they are agreeing to.
-  const newlyRequested = Array.isArray(preview.addedCapabilities)
-    ? stringArray(preview.addedCapabilities)
-    : [];
-  const newHosts = Array.isArray(preview.addedHosts) ? stringArray(preview.addedHosts) : [];
-  const manifestName = typeof preview.manifest?.name === 'string' ? preview.manifest.name : 'Plugin';
-  const manifestVersion =
-    typeof preview.manifest?.version === 'string' ? preview.manifest.version : 'unknown version';
-  const manifestDescription =
-    typeof preview.manifest?.description === 'string'
-      ? preview.manifest.description
-      : 'No description given.';
-  const manifestLicense =
-    typeof preview.manifest?.license === 'string' ? preview.manifest.license : 'Unknown license';
-  const manifestSource = typeof preview.manifest?.source === 'string' ? preview.manifest.source : null;
-  const manifestNetworkValue: unknown = preview.manifest?.network;
-  const manifestNetwork = isRecord(manifestNetworkValue)
-    ? stringArray(manifestNetworkValue.hosts)
-    : [];
-  const blocked = unsupportedCapabilities.length > 0;
 
-  return (
-    <div className="rounded-lg border border-border bg-muted/30 p-4">
-      <div className="space-y-1">
-        <div className="font-medium">
-          {manifestName} {manifestVersion}
-        </div>
-        <p className="text-sm text-muted-foreground">
-          {manifestDescription}
-        </p>
-        <p className="text-xs text-muted-foreground">
-          {manifestLicense}
-          {manifestSource ? ` · ${manifestSource}` : ' · no source link given'}
-          {development ? ' · loaded from a folder you are editing' : ''}
-        </p>
-      </div>
-
-      {preview.replacesVersion ? (
-        <p className="mt-3 text-sm">
-          This replaces version {preview.replacesVersion}.
-          {preview.migratesData
-            ? ' It changes how it stores data — Agora will keep a copy of the old data first.'
-            : ''}
-        </p>
-      ) : null}
-
-      {/*
-        On an update the full permission list is not the decision — the user
-        already agreed to most of it. Naming only what is new is what makes a
-        release that starts asking for more impossible to skim past.
-      */}
-      {preview.replacesVersion && (newlyRequested.length > 0 || newHosts.length > 0) ? (
-        <p className="mt-2 flex items-start gap-2 text-sm text-amber-700 dark:text-amber-400">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-          This version asks for something it did not have before:{' '}
-          {[...newlyRequested, ...newHosts.map((host) => `contact ${host}`)].join(', ')}.
-        </p>
-      ) : null}
-
-      {requiredCapabilities.length > 0 ? (
-        <div className="mt-3">
-          <div className="text-sm font-medium">It needs permission to:</div>
-          <ul className="mt-1 space-y-1 text-sm text-muted-foreground">
-            {requiredCapabilities.map((capability) => (
-              <li key={capability.name}>
-                {capability.summary}
-                {capability.isMutating ? (
-                  <span className="ml-1 text-amber-600 dark:text-amber-400">(makes changes)</span>
-                ) : null}
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      {/*
-        Optional capabilities are granted too — the plugin simply copes if they
-        are missing in some future build. Listing only the required ones told
-        the user "it asks for no permissions" while handing over the optional
-        ones, which is the one sentence this dialog must never get wrong.
-      */}
-      {optionalCapabilities.length > 0 ? (
-        <div className="mt-3">
-          <div className="text-sm font-medium">It will also use, if allowed:</div>
-          <ul className="mt-1 space-y-1 text-sm text-muted-foreground">
-            {optionalCapabilities.map((capability) => (
-              <li key={capability.name}>
-                {capability.summary}
-                {capability.isMutating ? (
-                  <span className="ml-1 text-amber-600 dark:text-amber-400">(makes changes)</span>
-                ) : null}
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      {requiredCapabilities.length === 0 && optionalCapabilities.length === 0 ? (
-        <p className="mt-3 text-sm text-muted-foreground">It asks for no permissions.</p>
-      ) : null}
-
-      {manifestNetwork.length > 0 ? (
-        <p className="mt-2 text-sm text-muted-foreground">
-          It may contact:{' '}
-          {manifestNetwork.includes('*')
-            ? 'any website'
-            : manifestNetwork.join(', ')}
-        </p>
-      ) : null}
-
-      {preview.needsReducedSecurity === true ? (
-        <p className="mt-3 flex items-start gap-2 text-sm text-amber-700 dark:text-amber-400">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-          This plugin can reach{' '}
-          {manifestNetwork.includes('*') ? 'any website' : `${manifestNetwork.length} websites`}, so
-          Agora cannot tell you in advance where your data goes. It installs only with Reduced
-          security mode turned on in Settings.
-        </p>
-      ) : null}
-
-      {blocked ? (
-        <p className="mt-3 flex items-start gap-2 text-sm text-destructive">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-          This plugin needs something this version of Agora does not provide:{' '}
-          {unsupportedCapabilities.join(', ')}. Check for an Agora update.
-        </p>
-      ) : null}
-
-      <div className="mt-4 flex gap-2">
-        <Button size="sm" onClick={onConfirm} disabled={busy || blocked}>
-          {busy ? busyLabel : confirmLabel}
-        </Button>
-        <Button size="sm" variant="ghost" onClick={onCancel} disabled={busy}>
-          Cancel
-        </Button>
-      </div>
-    </div>
-  );
-}

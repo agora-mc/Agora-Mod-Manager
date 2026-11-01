@@ -20,6 +20,12 @@ import { expect } from '@playwright/test';
 /** Replies by command name. Values are plain data: they cross into the page as JSON. */
 export interface GamesMockTable {
   replies: Record<string, unknown>;
+  /**
+   * Replies handed out in order for one command, then `replies` takes over.
+   * Used where the real command answers differently per call, such as an
+   * install that first asks for consent and then installs.
+   */
+  sequences?: Record<string, unknown[]>;
   /** Settings the app starts with. Values written later by `set_setting` take precedence. */
   settings?: Record<string, unknown>;
 }
@@ -34,7 +40,18 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
       // The shell asks which games are turned off on every start. A null answer is a failed list,
       // which hides nothing (specs that need rows pass their own). The game switcher asks for each
       // game's exe icon; null means "this game has none".
-      const replies: Record<string, unknown> = { games_support_list: null, games_icon: null, ...table.replies };
+      const replies: Record<string, unknown> = {
+        games_support_list: null,
+        games_icon: null,
+        // A verified registry that lists no official plugins. Specs that need a
+        // card pass their own entry; an unanswered command would fail the test.
+        list_official_plugins: { plugins: [], unavailableReason: null },
+        ...table.replies,
+      };
+      const sequences: Record<string, unknown[]> = {};
+      for (const [command, queue] of Object.entries(table.sequences ?? {})) {
+        sequences[command] = [...queue];
+      }
       const seeded: Record<string, unknown> = { onboarding_complete: true, ...table.settings };
       const stored = JSON.parse(localStorage.getItem(settingsKey) ?? '{}') as Record<string, unknown>;
       const settings: Record<string, unknown> = { ...seeded, ...stored };
@@ -73,6 +90,11 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
                 }
               }
               return Promise.resolve(null);
+            }
+            const queued = sequences[command];
+            if (Array.isArray(queued) && queued.length > 0) {
+              const next = queued.shift();
+              return Promise.resolve(Array.isArray(next) ? structuredClone(next) : next);
             }
             if (Object.prototype.hasOwnProperty.call(replies, command)) {
               const reply = replies[command];

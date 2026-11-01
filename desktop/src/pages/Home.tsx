@@ -28,6 +28,7 @@ import { useConfirm } from '@/components/ui/confirm';
 import { GUIDE_OVERVIEW, GUIDE_TOPICS } from '../data/guideContent';
 import { healthCounts } from '@/lib/healthSummary';
 import { HealthNotice, ReviewBeforeLaunchButtons } from '../components/HealthLaunchControls';
+import { MoreGamesCard } from '../features/games/support/MoreGames';
 
 // ---------------------------------------------------------------------------
 // D1: Action-oriented Home
@@ -292,6 +293,8 @@ export function Home({
       </section>
 
       <OverviewCard />
+
+      <MoreGamesCard surface="home" />
 
       {/* Zone A: Alerts — compact warnings */}
       {lastCrash && (
