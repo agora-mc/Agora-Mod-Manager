@@ -1,10 +1,10 @@
 # Community plugins: experimental author guide
 
-The plugin host is opt-in and uses API **0.1.1** (0.1.1 added content providers; every 0.1.0 plugin still loads). It adds behavior to the existing Minecraft launcher without rebuilding Agora. This is a development feature; the public release acceptance gates are recorded in `implementation-status.md`.
+The plugin host uses API **0.1.1** (0.1.1 added content providers; every 0.1.0 plugin still loads). It adds behavior to the existing Minecraft launcher without rebuilding Agora. This is a development feature; the public release acceptance gates are recorded in `implementation-status.md`.
 
 ## Try the examples
 
-Build the desktop application, open **Settings → Services → Plugins**, and enable community plugins. Choose **Load a folder** and select one of the directories in `examples/plugins`. Review the requested permissions. Restart Agora to run startup activation. Pages and commands also activate their scripts when first invoked.
+Build the desktop application, open **Settings → Services → Plugins**. Choose **Load a folder** and select one of the directories in `examples/plugins`. Review the requested permissions, and allow the plugin to run its code when asked (see "Who may run code" below). Restart Agora to run startup activation. Pages and commands also activate their scripts when first invoked.
 
 - `dashboard`: reads real instances, renders a host-owned table, and saves a count to plugin storage from a button.
 - `diagnostics`: lists disabled mods in an instance and proposes enabling one. The instance's integration area shows findings and a repair review; no repair runs until the user approves it. Its launch reminder feeds into the normal launch flow.

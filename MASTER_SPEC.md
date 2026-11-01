@@ -2649,10 +2649,13 @@ protect the user's own network. A declared host always covered its subdomains, s
 more than 10 hosts is allowed only under Reduced security mode (§21.3). `network_plugins_enabled` defaults to **off**, and Lockdown Mode overrides
 everything regardless.
 
-**Both switches are opt-in.** `plugins_enabled` defaults to off. A user who never opts in
-never has a plugin runtime in their process. This is the whitelist-over-denylist rule from
-`AGENTS.md` applied to the extension system itself: a default-on extension surface is a
-default-on attack surface.
+**Code is opt-in per plugin, and network is opt-in.** A plugin's scripts run only if the user
+allowed that plugin to run them (asked at install, changeable later; §26.11), and
+`network_plugins_enabled` defaults to off. A user who never allows a plugin's code never has a
+plugin runtime in their process. This is the whitelist-over-denylist rule from `AGENTS.md`
+applied to the extension system itself: a default-on extension surface is a default-on attack
+surface. (Until 2026-10-31 a single global `plugins_enabled` switch, off by default, was the
+gate; §26.11 describes what replaced it.)
 
 **Activation events gate activation, and are not decorative.** `activate_all` starts only the
 plugins that asked for startup — `onStartup`, or a manifest declaring no activation at all,
@@ -4063,14 +4066,74 @@ as the Creation Engine sorter). A script package reaches the same services throu
 of core, a script package can ask by the same name: community parity is structural, not promised.
 
 **Heavy algorithms are host services, not private code.** Creation Engine load order (the LOOT
-crates) lives in core as a host service any package may use. Only Minecraft and Creation Engine are
-compiled packages, and they get nothing a plugin cannot also call, as the Modrinth and Technic
-providers stayed compiled-in without privilege (§21.2).
+crates) lives in core as a host service any package may use. Only Minecraft is a compiled package
+(Skyrim ships as an official plugin, below), and it gets nothing a plugin cannot also call, as the
+Modrinth and Technic providers stayed compiled-in without privilege (§21.2).
 
 **Community packages from the start, not the end.** The tracer games (§26.13) are external packages
 loaded through the plugin path from Phase 2, so the route a community author takes is exercised as
 each interface lands. What waits for Phase 5 is publishing the SDK and the spec, not proving they
 work.
+
+**Official plugins** (decided with the user, 2026-10-31; as built). Skyrim is the first game to
+reach users this way: not compiled in, but an *official plugin*. An official plugin is a normal
+plugin, not a second kind. It is official only because Agora's Ed25519-signed registry lists it:
+the `official_plugins` table pins its id, version, `package_sha256` and `package_tree_sha256` (a
+digest of the files the package unpacks to), and the app shows an Official badge. Nothing in the
+manifest can claim it, and nothing remembered in `local_state.db` can either, since that file is
+not signed. Each time it matters the installed folder is re-hashed against the pinned tree digest.
+A plugin that was installed as official and stops matching (edited, re-pinned, dropped from the
+catalog, catalog unverifiable) is **Blocked**, not demoted to a community plugin, which would let a
+revoked or tampered package keep loading; so is a non-official plugin that uses an official id. A
+blocked plugin loads neither its game package nor its scripts, and the reason is shown. Official
+plugins register before community ones, so a community plugin cannot take an official game id or
+store product id by sorting earlier. An official plugin needs no community-plugins switch: that
+switch no longer exists (below), and a data-only plugin runs nothing that a switch could gate. For
+now they live in this repository, one folder per plugin in `packages/official/<id>/`, built
+reproducibly by `scripts/build_official_plugin.py` and attached to a release tagged
+`official-<folder>-v<version>` (the folder is named for the game, `skyrim-se`, so
+`official-skyrim-se-v0.1.0`); `scripts/official_plugin_digest.py` computes the pinned values and
+must agree byte for byte with the Rust digest. Code: `crates/agora-core/src/plugins/official.rs`,
+the registry compiler in `compiler/compile.py`, and `packages/official/skyrim-se/`.
+
+**Official plugins stay data-only.** Official status buys verification and registration order, not
+privilege. If a game needs something a definition cannot express, the capability is added to
+`agora-core` as a `GameHost` service that any plugin may call, not written as an official script.
+This is a rule the review process holds, not one the installer enforces (`install_official` does
+not refuse an `entrypoint`); an official plugin that did ship scripts would still be asked about
+and stoppable like any other, as below.
+
+**Who may run code: one consent per plugin, and an emergency stop** (final decision, 2026-10-31;
+as built). The earlier single global switch (`plugins_enabled`, "community plugins on", off by
+default) is gone. It gated the wrong thing: it said nothing about *which* plugin, treated official
+and community alike, and a data-only game package needed it for no reason. In its place:
+
+- **Script consent is per plugin.** A plugin's scripts (anything with an `entrypoint`), official or
+  community, run only if the user allowed that plugin. It is asked once with the install, as
+  "runs code. Allow it?", stored in `plugin_script_consent` (migration 20, one row per plugin with
+  code, no row meaning never allowed), and changeable later in Settings or with
+  `agora plugin scripts <id> allow|deny`. Updating keeps the answer; a version that newly has code
+  starts not allowed. A data-only plugin runs no code and needs no consent.
+- **The emergency stop** (`plugins_emergency_stop`) is *not engaged* by default. While engaged, no
+  plugin script runs at all, official included, whatever each plugin was allowed; engaging it also
+  stops what is running. Data-only plugins keep loading, since they run nothing. An unreadable
+  value counts as engaged. The old key is ignored whatever it holds: its meaning was the opposite,
+  and every database had it seeded `false`, so reading it as the stop would have engaged the stop
+  for everyone.
+
+**Accepted residuals** (from a red-team review, accepted rather than fixed):
+
+- A plugin revoked by a newer registry stops *running* in the same session (the update re-verifies
+  installed plugins), but its game package, loaded once at startup, stops loading one launch late.
+- Verification hashes the plugin's files and the loader reads them later, so a swap between the two
+  is possible. It needs a local attacker able to write to the plugins folder.
+- Community plugin updates still write the downloaded zip to a staging folder under Agora's data
+  directory and install from that path. An official install checks the bytes against the signed
+  entry and installs from memory, with no file re-opened by path in between.
+- Noted in the code rather than the review: a plugin never installed as official cannot be told
+  from a community one without a verified catalog, so a community plugin squatting an official id
+  is Blocked only while the catalog can be read. A plugin installed as official is Blocked
+  whenever the catalog cannot be verified.
 
 **The script runtime, examined rather than inherited.** QuickJS was introduced in one commit whose
 message states a measurement (a 15 s MSVC build, a 2 MB binary) with no spike or benchmark anywhere in
@@ -4085,7 +4148,9 @@ is added when the first package needs one, which the `ScriptHost` seam was desig
 **Shape.** A new contract crate `agora-game-api` (like `agora-plugin-api`) defines games, installs,
 runtime identity, layers, deployment strategies, frameworks, tools, load order, `GamePackage` and
 `GameHost`. `agora-core` becomes game-agnostic and holds a registry of game packages. Minecraft moves
-to `agora-game-minecraft`; Creation Engine support is `agora-game-creation`.
+to `agora-game-minecraft`. Creation Engine support is not a compiled package: Skyrim ships as an
+official plugin (§26.11), and `agora-game-creation` survives only as a test helper that loads that
+plugin's definition file.
 
 **Dependency direction.** Contracts at the bottom, no cycles, no side door:
 
@@ -4429,7 +4494,7 @@ least one tracer from another family use it.**
 | **2. Discovery, bases, launch** | Store adapters with classification; runtime identity; Linked and Copied bases with verification; generic launch recipe and process tracking | Agora lists the machine's games correctly, builds bases for Steam and GOG Skyrim, and launches vanilla Skyrim from them with the store install unchanged afterwards. A base archive changed in place is detected and the instance refuses to launch on it, naming the files. Tracers, **as external packages through the plugin path**: every reference game is discovered and launches vanilla, including CK3 from the Microsoft Store. The generic halves of the instance and launch services exist and serve both Minecraft and Skyrim. The Minecraft package's `agora-core` budget has fallen with every generic service built (it reaches zero in Phase 5). |
 | **3. Deployment** | Content store, archives, FOMOD, the layer stack, Redirect, VFS (Windows) with the isolation Spike 2 chose, per-user files (done 2026-10-06; §26.12, as built) | A Skyrim instance with SKSE and twenty mods runs; switching instances needs no redeploy. **Failure gates:** an unexpected write by a game or tool never changes a content or base file; two launches of one game contend on `GameUserFiles` and the second is told why; a failed launch restores per-user files; Agora killed while the game runs, then restarted, restores nothing under the running game; a file edited externally before recovery is kept, not overwritten. Tracer: a Valheim instance with BepInEx mods runs through Redirect. |
 | **4. Creation Engine (Skyrim complete)** | Load order (LOOT crates as a host service); framework and Address Library checks; per-profile INIs; save choice; tools with staging and generated layers; MO2 import including `overwrite` and both orders; the catalog for Skyrim (§26.8) | The 214,592-file salvage pack imports with its bytes, both orders and its Nemesis output (inputs unknown), and plays; changing a mod marks Nemesis output stale; rebuilding and rolling back both change the bytes the game reads; curated Skyrim mods install from a `github_release` and a `direct_hash` entry with verified hashes. |
-| **5. Plugin API 0.2** | Game packages, family parents, new capabilities, `GameTarget` providers, `nxm://` routing, published game-definition spec; the Minecraft package reaches core only through `GameHost` | The tracers become finished support written as plugins: Valheim (BepInEx) and Satisfactory (Unreal), then CK3 (Paradox, Microsoft Store) and Cyberpunk (REDengine). The Minecraft package's `agora-core` budget is zero, so nothing a compiled package does is beyond a community one. |
+| **5. Plugin API 0.2** | Game packages, family parents, new capabilities, `GameTarget` providers, `nxm://` routing, published game-definition spec; the Minecraft package reaches core only through `GameHost`. Done 2026-10-31 (§26.11, as built): official plugins (signed `official_plugins` pins, Blocked on mismatch, registered first; Skyrim ships as `packages/official/skyrim-se/`), script consent per plugin (`plugin_script_consent`, migration 20), and the emergency stop replacing the global `plugins_enabled` switch. Accepted residuals are listed there. Not yet: the rest of this row | The tracers become finished support written as plugins: Valheim (BepInEx) and Satisfactory (Unreal), then CK3 (Paradox, Microsoft Store) and Cyberpunk (REDengine). The Minecraft package's `agora-core` budget is zero, so nothing a compiled package does is beyond a community one. |
 | **6. Breadth** | Linux overlayfs backend and Proton; Vortex import; Wabbajack recognition; companion-process scripts when a package needs them | Each backed by a real run, like everything above. |
 
 **When the Minecraft package stops using core directly** (decided with the user, 2026-10-04). The
