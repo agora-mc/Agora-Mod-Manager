@@ -143,6 +143,32 @@ Microsoft online identity, missing artifacts, updates, and uncached downloads ca
 
 Lockdown Mode in **Settings > Privacy** is a global backend network block: while it is on, every endpoint permission is disabled and Agora sends no feature requests. Use it to force offline behavior, and turn individual endpoints back on when you need finer-grained access than an all-or-nothing block.
 
+### "Access denied" when changing a mod file outside Agora
+
+Agora keeps one copy of each mod and shares it between the instances that use it, so ten instances
+with the same mod use the disk space of one. The files in an instance's `mods`, `resourcepacks`,
+`shaderpacks` and `datapacks` folders are links to that shared copy, and the copy is protected so a
+change made through one instance cannot quietly break another.
+
+You may see this when you work in those folders with File Explorer or another tool:
+
+- replacing a mod with a newer file of the same name says "Access denied" or "You need permission";
+- a tool that edits mod files in place fails to save;
+- File Explorer reports each instance at its full size, even though the mods are only stored once.
+
+What to do:
+
+- Add, update and remove content in Agora (the Instance Editor or Browse) where you can.
+- Deleting or renaming a mod file in File Explorer works. To replace one by hand, delete the old file
+  first, then add the new one.
+- If a tool needs to edit mod files, turn off **Share mod files between instances** in Settings.
+  New installs then get their own copy in each instance.
+- Configs, saves, screenshots and everything else in the instance are ordinary files you can edit
+  freely.
+
+If deleting a mod file also says "Access denied", report it with the instance's folder path and the
+drive it is on.
+
 ## Snapshots and world safety
 
 Agora uses different recovery scopes:
