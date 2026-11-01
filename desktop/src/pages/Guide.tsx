@@ -65,6 +65,7 @@ const TOPIC_DESTINATIONS: Record<string, TopicDestination> = {
   'version-migration': { label: 'Open My Instances', tab: 'instances' },
   'controller-handheld': { label: 'Open My Instances', tab: 'instances' },
   'disk-and-desktop': { label: 'Open Settings', tab: 'settings' },
+  'other-games': { label: 'Open Settings', tab: 'settings' },
   governance: { label: 'Open Governance', tab: 'governance' },
   'crash-report-sharing': { label: 'Open My Instances', tab: 'instances' },
   'ai-assistant': { label: 'Open My Instances', tab: 'instances' },

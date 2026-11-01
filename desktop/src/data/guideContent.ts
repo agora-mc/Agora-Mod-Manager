@@ -809,6 +809,118 @@ export const GUIDE_TOPICS: GuideTopic[] = [
     },
   },
   {
+    id: 'other-games',
+    title: 'Playing other games',
+    shortTitle: 'Other games',
+    category: 'Play',
+    description: 'Add support for a game like Skyrim Special Edition, make an instance, add mods, sort the load order, and know where to look when something goes wrong.',
+    keywords: ['skyrim', 'other games', 'game support', 'more games', 'base', 'load order', 'loot', 'plugins', 'fomod', 'dyndolod', 'pgpatcher', 'tools', 'mod organizer'],
+    basic: {
+      summary: 'Agora can also look after mods for games other than Minecraft. Skyrim Special Edition is the first. Each game has its own instances, so one setup never disturbs another.',
+      outcomes: [
+        'Add a game and make sure Agora has found it.',
+        'Make an instance and put mods in it.',
+        'Sort the load order and launch.',
+      ],
+      sections: [
+        {
+          title: 'Add a game',
+          body: 'Other games arrive as small add-ons that you install once. Your Minecraft instances are not affected.',
+          steps: [
+            'On Home, find the More games card and press Install next to the game. The same card is in Settings > Game support, which helps if you dismissed it on Home.',
+            'If Agora shows what the add-on wants to do, read it first, and approve it only if you are happy with it.',
+            'Restart Agora when it asks (Restart now).',
+            'Once Agora has found a copy of the game on this computer (Steam, GOG, Epic Games Store or Microsoft Store), a game switcher appears at the top of the sidebar. Choose the game there to open its Instances, Library, Import and Setup pages.',
+          ],
+          callout: {
+            tone: 'tip',
+            title: 'If Agora did not find your game',
+            text: 'Use Add game folder in Settings > Game support and pick the folder the game is installed in. After you install or move the game later, Rescan on the game\'s Setup page looks again.',
+          },
+        },
+        {
+          title: 'Instances and bases',
+          body: 'An instance is a separate setup of the game, with its own mods and load order, so a heavily modded game can sit beside a lightly modded one. Instances of the same game share a base: a pinned copy of the game\'s files that Agora builds the first time you need it and reuses after that.',
+          steps: [
+            'Open the game and choose Instances > New instance.',
+            'Name it, and pick the install to build from if you have more than one, such as a Steam copy and a GOG copy.',
+            'Choose a base. A Linked base shares most files with your install, so it takes little extra space, but a change to a linked file also changes the install. A Copied base takes about the size of the game again, and changes to it never reach the install. If you have the space, we suggest Copied base.',
+            'Leave How it will run on Automatic unless you have a reason. You can change it later on the instance\'s Overview.',
+            'Choose Create instance and wait while the base is built.',
+          ],
+          callout: {
+            tone: 'note',
+            title: 'Your game install',
+            text: 'Agora starts the game from the instance\'s own folder and does not write into your game\'s files. The exceptions are the Linked base above and the full-copy swap some tools can use, which renames the game\'s Data folder for the length of a run and puts it back. Agora shows that option\'s cost before you agree to it.',
+          },
+        },
+        {
+          title: 'Add mods',
+          body: 'Mods go into your library first and then into an instance, so the same mod can be used by several instances.',
+          steps: [
+            'On Library, Curated items lists mods Agora has checked for this game. Choose the instance under Install into, then Preview or Install. The list can be empty for a game until the catalog has entries for it.',
+            'For your own downloads, use Add an archive… (zip, 7z or RAR) or Add a folder… under Your stored mods.',
+            'Open an instance, go to its Content tab, choose an item under Add from your library, and press Add to instance.',
+            'If an archive has an installer (a FOMOD), Agora asks the installer\'s questions first and adds what you chose.',
+          ],
+          bullets: [
+            'Turn off, Turn on and Remove change one item without touching the others.',
+            'When two items change the same file, the one that loads later wins. Move up and Move down change that, and each button says whether it makes the item load later or earlier.',
+          ],
+        },
+        {
+          title: 'Load order and launching',
+          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order. Sort… puts them in the order LOOT, the community\'s sorting tool, recommends.',
+          steps: [
+            'Open the instance\'s Plugins tab and press Sort….',
+            'Agora asks whether to download LOOT\'s masterlist. Download and sort uses it. Sort by masters only just puts each plugin below its masters.',
+            'Read the preview. Nothing is written until you choose Apply, and locked or always-loaded plugins stay where they are.',
+            'On Overview, read the Launch checks, then press Launch. Each finding says what is wrong, why it matters and what to do.',
+          ],
+        },
+      ],
+    },
+    advanced: {
+      summary: 'Tools that build files for the game, importing a Mod Organizer 2 setup, and where to look when a launch or a tool run goes wrong.',
+      outcomes: [
+        'Run a tool such as DynDOLOD or PGPatcher and keep its output manageable.',
+        'Bring a Mod Organizer 2 setup into Agora.',
+        'Find the page that explains a problem.',
+      ],
+      sections: [
+        {
+          title: 'Tools that build files for the game',
+          body: 'Some mods need a tool run after you change your setup, such as DynDOLOD or PGPatcher. The instance\'s Tools tab lists them. Each card shows a badge (Up to date, Out of date, Rebuild to be sure or Not built yet) and a button that reads Build, Rebuild or Run again.',
+          bullets: [
+            'How to capture the output decides how the tool\'s files are collected while it runs. We recommend Let Agora choose: it asks before using anything slower.',
+            'For tools whose result is a mod, including DynDOLOD, PGPatcher and tools you add yourself with an output folder, Agora keeps the output as a mod in the instance. Use an earlier output switches back to an older run.',
+            'Where a tool offers them, Show changes, Roll back and Remove output let you compare, undo or remove the last run.',
+            'Find tools looks through the instance\'s mods for tools to add, and Add a tool of your own lets you point at an .exe.',
+          ],
+          callout: {
+            tone: 'tip',
+            title: 'Rebuild after changing mods',
+            text: 'When a mod, the load order or a setting changes, a tool\'s badge turns to Out of date. Rebuild it so the game reads output that matches your setup.',
+          },
+        },
+        {
+          title: 'Bring a Mod Organizer 2 setup',
+          body: 'The game\'s Import page lists Mod Organizer 2 setups on this computer. Choose a profile, use Preview the import to see what will happen, then confirm with Import profile. It becomes a new instance, and your Mod Organizer 2 setup is only read, not changed.',
+        },
+        {
+          title: 'When something goes wrong',
+          body: 'Start with the page closest to the problem.',
+          bullets: [
+            'Overview > Launch checks says what stopped a launch, and Check again re-runs them. Launch anyway under Advanced options skips them, but the game may then crash, so we suggest it only when you know why a check is wrong.',
+            'The Plugins tab lists Problems with the load order.',
+            'If Agora was closed while a tool ran, the Tools tab says A tool swap was interrupted and offers Put the Data folder back. Do that before you launch.',
+            'Setup > Recovery lists game files that are still swapped and offers Put the files back.',
+          ],
+        },
+      ],
+    },
+  },
+  {
     id: 'crash-recovery',
     title: 'Crash diagnosis and recovery',
     shortTitle: 'Crashes & recovery',

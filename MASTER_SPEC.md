@@ -3322,9 +3322,12 @@ not controller support.
 
 ## 26. MULTI-GAME SUPPORT
 
-**Status: planned, not built.** A post-v1 initiative. It replaces the `BACKLOG.md` line that put
-"MO2 integration, Steam discovery, generic game adapters" out of scope for v1: they stay out of v1,
-and this section is the plan for after it. Every measured claim below cites
+**Status: partly built (2026-11-01); see §26.13 for each phase.** A post-v1 initiative. It replaces
+the `BACKLOG.md` line that put "MO2 integration, Steam discovery, generic game adapters" out of scope
+for v1: they stay out of v1, and this section is the plan for after it. Phases 0 to 3 are done,
+Phase 4 is partly done and is not complete, Phase 5 has its official-plugin, script-consent and
+emergency-stop parts, and Phase 6 has not started. The sections below were written as the plan and
+are kept as the record of its reasons; the "as built" paragraphs say where reality differed. Every measured claim below cites
 `scripts/spikes/game-support/FINDINGS.md` (F1–F8), which cites the raw reports next to it.
 
 ### 26.1 What This Is, and What It Is Not
@@ -3346,8 +3349,9 @@ Three requirements from the user shaped the rest of this section:
 2. **Community support is mandatory.** A game that ships in Agora must be one a community author
    could have added. First-party code is allowed to be faster to write, never more privileged.
 3. **Correct over inherited.** Existing Agora structure is kept where it is right and changed where
-   it is not, including the plugin system. Minecraft-only users see no change and download nothing
-   new.
+   it is not, including the plugin system. A Minecraft-only user's instances keep working and
+   launching unchanged and no game component is downloaded for them; how Minecraft mod files are
+   stored did change (§26.12, *Minecraft content in the shared store*).
 
 ### 26.2 Evidence and the Decisions It Forced
 
@@ -3796,8 +3800,12 @@ interface (§21.2), and community plugins supply providers for other games.
 
 **The provider API loses its Minecraft vocabulary.** Today's request and plan types carry
 `minecraft_version` and `loader` fields. They become a `GameTarget`: game id, runtime identity, and the
-frameworks installed. This is a breaking change in plugin API 0.2, acceptable because 0.1 is
-unreleased, experimental and off by default; the 0.1 fixtures keep pinning what 0.1 accepted.
+frameworks installed. This is a breaking change in plugin API 0.2. 0.1 did ship, in the v0.9.x releases
+(`HOST_API_VERSION` is 0.1.1 in v0.9.3, and `docs/plugins/README.md` there calls it an experimental,
+opt-in author guide), so the change does break any community plugin written against it, and such a
+plugin has to be updated. It is accepted because 0.1 was documented as experimental and was opt-in
+(behind the global `plugins_enabled` switch, which §26.11 has since replaced with per-plugin
+consent). 0.2 itself has not shipped: `HOST_API_VERSION` is still 0.1.1. The 0.1 fixtures keep pinning what 0.1 accepted.
 
 **`nxm://` is routed by core, owned by nobody by default.** Windows gives one application a URL
 scheme; the spike found Vortex holding it (F8). Agora registers for `nxm://` only when the user turns
@@ -4203,6 +4211,24 @@ ordinary per-instance files and are not content items. Relinking an existing ins
 separate, explicit user action, so the migration promise above still holds: automatic migration
 leaves an instance's contents byte-for-byte unchanged.
 
+**This changed what a Minecraft-only player gets, on purpose.** §26.1 and the Phase 1 done-when
+once promised that a Minecraft user would see no change. That does not hold and is not claimed any
+more. It was decided with the user on 2026-11-01: links by default, copies one toggle away, and the
+default may flip later if links prove confusing. What holds is narrower: a Minecraft user's
+instances keep working and launching unchanged, and no game component is downloaded for them. What
+they do now get:
+
+- **Protected hard links by default.** Settings > General > Storage, "Share mod files between
+  instances"; off makes new placements plain copies. A protected object can be deleted only by
+  Agora, so replacing or deleting a mod file in File Explorer can say "Access denied"
+  (`docs/TROUBLESHOOTING.md`, "Access denied" when changing a mod file outside Agora). Mods that
+  rewrite their own jar in place are **untested** under links: nobody has run one to see whether
+  the protection refuses the write or how the mod reacts.
+- **A Library page** (sidebar), with an Unused listing of stored items no instance uses.
+- **A More games card on Home** (also in Settings > General > Game support) that installs official
+  game plugins; it can be dismissed.
+- **Per-plugin script consent** (§26.11) in place of the old global `plugins_enabled` switch.
+
 **Enforced by script.** `scripts/check_architecture.py` gains three rules:
 - `agora-core` does not reference the Minecraft package.
 - `agora-game-api` depends only on `serde`, `semver` and `thiserror`. (The spec once said "like
@@ -4248,7 +4274,7 @@ out of `agora-core`. It differs from the table above in three ways.
    (`Mojang*`), and the host classification the launch planner trusts stays the package's own
    function, not a hook another package could answer.
 3. **The package still depends on `agora-core`,** within the budget above: 1,162 references at
-   the end of Phase 1. Removing them means designing core's generic data model: the instance
+   the end of Phase 1 (its later history is under *Phase 2, the registry as built*). Removing them means designing core's generic data model: the instance
    table and manifest with an opaque per-game section, an error envelope, and a game-scoped
    catalog. Each budget family moves onto a `GameHost` service when Phase 2 builds the generic
    version of what it uses. That includes the 51 parameterized SQL statements that moved with
@@ -4291,6 +4317,27 @@ against core while Minecraft still lived there, and moved into the package with 
 The merge of master's ~173 commits on 2026-10-28 (pack import, worlds, recently deleted, bisect and
 loadout services, skins, log sharing, the download cache) raised it again, to 1,530; Phase 5 still
 takes it to zero.
+
+**The budget, honestly** (`git log -- scripts/game_package_core_budget.json`). The recorded values
+are 1,162 (2026-10-02), 1,160 (2026-10-03), 1,206 (the master merge, 2026-10-04), 1,191, 1,188 and
+1,187 (later Phase 3 and 4 slices, 2026-10-08 and 09), 1,530 (the 2026-10-28 merge) and, with the
+shared content store, 1,477, 1,475 and the current 1,476 (2026-11-01). Two things the number does
+not say:
+
+- **It counts `agora_core` tokens, not coupling.** `scripts/check_architecture.py` counts the word
+  `agora_core` outside comments. Replacing many path-qualified uses (`agora_core::models::X`) with
+  one `use agora_core::{...}` lowers it without removing a single dependency. The 1,530 to 1,475 fall
+  is largely that: `pack_update.rs` went from 111 references to 59 when the pack work consolidated
+  its imports. The ratchet therefore reports progress that is partly cosmetic.
+- **Real coupling to the shared store grew, deliberately.** Storing Minecraft content in the shared
+  content store (*Minecraft content in the shared store*, above) makes the package depend on core's
+  `content_store`, placement, locking and snapshot code. `content_bridge.rs` is the one door to it,
+  written so the package gains a single `use agora_core::{...}` rather than many references; the
+  count barely moved (a test calling `agora_core::library` added one: 1,475 to 1,476) while the
+  dependency is real. That runs against Phase 5's goal and is accepted because the store is the
+  generic service the Minecraft package should use. It moves onto `GameHost` with the rest.
+
+Treat the budget as a ceiling that stops silent growth, not as a measure of how far Phase 5 is.
 Per-store user paths (Steam's `Skyrim Special Edition` and GOG's `Skyrim Special Edition GOG`
 under Documents and AppData) cannot be expressed by `GamePath` yet; Phase 3 needs them.
 
@@ -4358,7 +4405,12 @@ is not installed there; its definition waits for Phase 3. What the tracers taugh
   rebuilt).
 
 **Phase 2 status.** Its done-when is met on the spike machine except Valheim, which is not installed
-there, and the Minecraft budget, which moved to Phase 5. Phase 2 is closed.
+there, and the Minecraft budget, which moved to Phase 5. Phase 2 is closed, with one correction to
+what "the generic halves serve both games" means: the generic instance (`game_instance`) and launch
+halves serve the other games, Skyrim and the tracers. Minecraft is registered in the same registry
+but keeps its own instance table, its own v3 manifest with a Minecraft section, and its own launch
+path (`launch: None`, command line from version metadata through `prepare_launch`). It moves onto
+the generic halves in Phase 5, with its budget.
 
 **Deployment, as built (Phase 3, slices 1-8, 2026-10-05/06).** Shown by `agora games content …` and
 `agora games instance content|deploy|undeploy|plugins|set-deployment|launch`:
@@ -4490,12 +4542,47 @@ least one tracer from another family use it.**
 |---|---|---|
 | **0. Spike** | `scripts/spikes/game-support/` | Done (F1–F8). |
 | **0b. Spike 2: write isolation** | usvfs against content and base files: write an existing file, replace by rename, delete, create, and each from a child process; an archive in a Linked base changed in place | Done (2026-10-04): usvfs has no copy-on-write; Agora builds its own copy-on-write VFS, with ACLs on what it owns and link deployment as the fallback (§26.5). |
-| **1. Game interface** | `agora-game-api` with `GamePackage` and `GameHost`; the dependency direction above; Minecraft behind it; manifest migration; architecture rules | Every existing test passes; a Minecraft user sees no change; the new rules pass; migration tests cover interruption, re-running, and a manifest from a newer Agora. `agora-core` contains no Minecraft; `agora-game-minecraft` may still use core within its shrinking budget (§26.12, *as built*). |
-| **2. Discovery, bases, launch** | Store adapters with classification; runtime identity; Linked and Copied bases with verification; generic launch recipe and process tracking | Agora lists the machine's games correctly, builds bases for Steam and GOG Skyrim, and launches vanilla Skyrim from them with the store install unchanged afterwards. A base archive changed in place is detected and the instance refuses to launch on it, naming the files. Tracers, **as external packages through the plugin path**: every reference game is discovered and launches vanilla, including CK3 from the Microsoft Store. The generic halves of the instance and launch services exist and serve both Minecraft and Skyrim. The Minecraft package's `agora-core` budget has fallen with every generic service built (it reaches zero in Phase 5). |
+| **1. Game interface** | `agora-game-api` with `GamePackage` and `GameHost`; the dependency direction above; Minecraft behind it; manifest migration; architecture rules | Every existing test passes; a Minecraft user's instances keep working and launching unchanged (how mod files are stored changed later, §26.12); the new rules pass; migration tests cover interruption, re-running, and a manifest from a newer Agora. `agora-core` contains no Minecraft; `agora-game-minecraft` may still use core within its shrinking budget (§26.12, *as built*). |
+| **2. Discovery, bases, launch** | Store adapters with classification; runtime identity; Linked and Copied bases with verification; generic launch recipe and process tracking | Agora lists the machine's games correctly, builds bases for Steam and GOG Skyrim, and launches vanilla Skyrim from them with the store install unchanged afterwards. A base archive changed in place is detected and the instance refuses to launch on it, naming the files. Tracers, **as external packages through the plugin path**: every reference game is discovered and launches vanilla, including CK3 from the Microsoft Store. The generic halves of the instance and launch services exist and serve the other games (Skyrim and the tracers); Minecraft keeps its own instance table, manifest and launch path until Phase 5 (§26.12, *Phase 2 status*). The Minecraft package's `agora-core` budget has fallen with every generic service built (it reaches zero in Phase 5). |
 | **3. Deployment** | Content store, archives, FOMOD, the layer stack, Redirect, VFS (Windows) with the isolation Spike 2 chose, per-user files (done 2026-10-06; §26.12, as built) | A Skyrim instance with SKSE and twenty mods runs; switching instances needs no redeploy. **Failure gates:** an unexpected write by a game or tool never changes a content or base file; two launches of one game contend on `GameUserFiles` and the second is told why; a failed launch restores per-user files; Agora killed while the game runs, then restarted, restores nothing under the running game; a file edited externally before recovery is kept, not overwritten. Tracer: a Valheim instance with BepInEx mods runs through Redirect. |
-| **4. Creation Engine (Skyrim complete)** | Load order (LOOT crates as a host service); framework and Address Library checks; per-profile INIs; save choice; tools with staging and generated layers; MO2 import including `overwrite` and both orders; the catalog for Skyrim (§26.8) | The 214,592-file salvage pack imports with its bytes, both orders and its Nemesis output (inputs unknown), and plays; changing a mod marks Nemesis output stale; rebuilding and rolling back both change the bytes the game reads; curated Skyrim mods install from a `github_release` and a `direct_hash` entry with verified hashes. |
+| **4. Creation Engine (Skyrim complete)** | **Partly done, not complete (2026-11-01); see *Phase 4 status* below.** Load order (LOOT crates as a host service); framework and Address Library checks; per-profile INIs; save choice; tools with staging and generated layers; MO2 import including `overwrite` and both orders; the catalog for Skyrim (§26.8) | The 214,592-file salvage pack imports with its bytes, both orders and its Nemesis output (inputs unknown), and plays; changing a mod marks Nemesis output stale; rebuilding and rolling back both change the bytes the game reads; curated Skyrim mods install from a `github_release` and a `direct_hash` entry with verified hashes. |
 | **5. Plugin API 0.2** | Game packages, family parents, new capabilities, `GameTarget` providers, `nxm://` routing, published game-definition spec; the Minecraft package reaches core only through `GameHost`. Done 2026-10-31 (§26.11, as built): official plugins (signed `official_plugins` pins, Blocked on mismatch, registered first; Skyrim ships as `packages/official/skyrim-se/`), script consent per plugin (`plugin_script_consent`, migration 20), and the emergency stop replacing the global `plugins_enabled` switch. Accepted residuals are listed there. Not yet: the rest of this row | The tracers become finished support written as plugins: Valheim (BepInEx) and Satisfactory (Unreal), then CK3 (Paradox, Microsoft Store) and Cyberpunk (REDengine). The Minecraft package's `agora-core` budget is zero, so nothing a compiled package does is beyond a community one. |
 | **6. Breadth** | Linux overlayfs backend and Proton; Vortex import; Wabbajack recognition; companion-process scripts when a package needs them | Each backed by a real run, like everything above. |
+
+**Phase 4 status (2026-11-01): not done.** Most of its machinery is built and was exercised on the
+spike machine; the Skyrim catalog does not exist, and several of its done-when clauses have no real
+run behind them yet.
+
+*Done:*
+- **Tools on the real path** (§26.9): the real-path view, 32-bit programs, the full-copy swap and the
+  fallback chain, built 2026-10-09. Under the VFS the real install folder is an alias for the
+  instance's files, so Nemesis and BodySlide see the mods at their own path.
+- **FOMOD version conditions** (§26.12, *Deployment, as built*): `gameDependency` and
+  `skseDependency` evaluated when the instance is known.
+- **The VFS DLLs ship:** `agora_vfs.dll` and its 32-bit twin are staged and bundled
+  (`scripts/stage_vfs_files.py`, `desktop/src-tauri/tauri.bundle-vfs.conf.json`).
+- **LOOT sorting through libloot** (`libloot` 0.29.7 in `agora-core`): the Plugins tab sorts, previews
+  the moves, and writes nothing until applied; the masterlist is downloaded only when asked.
+- **User tools whose output is captured as a mod:** DynDOLOD, TexGen and PGPatcher are declared with a
+  mod output in `packages/official/skyrim-se/games/package.json`, and a player can add a tool of
+  their own with an output folder (`game_user_tools.rs`). The output is imported as a content item
+  and kept as generations.
+- **MO2 import** (the Import tab) and the catalog install path (`LibraryCatalogSection`,
+  `github_release` and `direct_hash` into a game instance).
+
+*Not done:*
+- **There is no curated Skyrim catalog.** The compiler reads `registry/games/<game>/<kind>/`, but
+  that folder does not exist, so the catalog tab has nothing to install. §26.8 says Skyrim support
+  "is not complete until curated Skyrim mods install from the catalog", so by the spec's own words
+  Skyrim support is not complete, and the last clause of this phase's done-when is unmet.
+- **Pandora Behaviour Engine has never been run for real** (§26.9, *Still to confirm on a real run*):
+  it is not on the spike machine, and downloading or running it needs the user's permission.
+- **The 84 GB import has not been re-timed** since the speed work, and **a real LOOT sort has not
+  been timed on a large setup.**
+- **The rollback-bytes test is `#[ignore]`.** `real_injection_rollback_changes_the_bytes_the_game_reads`
+  (`crates/agora-core/tests/game_tools.rs`) needs `agora_vfs.dll` and `AGORA_VFS_DLL`, so a default
+  test run does not check that rolling back changes the bytes the game reads. That clause of the
+  done-when is covered only when someone runs the ignored tests.
 
 **When the Minecraft package stops using core directly** (decided with the user, 2026-10-04). The
 goal stands: Minecraft reaches core's universal services through `GameHost`, the door a community
@@ -4509,8 +4596,12 @@ publishes the plugin API, is when parity has to be true rather than trending.
 
 ### 26.14 What the User Sees
 
-Nothing changes for someone who only plays Minecraft: the game picker does not appear until a second
-game is enabled, and no component is downloaded. Enabling another game starts from discovery ("Agora
+Someone who only plays Minecraft keeps their instances and launches unchanged: the game picker does
+not appear until discovery has found a game other than Minecraft, and no game component is
+downloaded. Four things are new for them, all recorded in §26.12: mod files are shared as protected
+hard links by default (one setting turns that off), a Library page lists stored and unused items,
+Home can show a More games card, and plugin scripts are allowed per plugin instead of by one global
+switch. Adding another game starts from discovery ("Agora
 found Skyrim on Steam, 1.6.1170, and on GOG, 1.6.1179"). A Skyrim instance's page shows its runtime
 (store, version, pinned or not, whether its frameworks match), its content in load order with
 per-layer origin, its plugins list, and its tools with a stale badge when their output is out of date.
@@ -4525,7 +4616,7 @@ that the slices build on:
 - **Where the switcher lives.** The app has no header bar, so the switcher sits at the top of the
   sidebar, under the brand mark. It lists Minecraft, then each non-Minecraft game that discovery
   found, grouped by game. It is not rendered until at least one such game is found, so a
-  Minecraft-only user sees the app exactly as before.
+  Minecraft-only user never sees the switcher (the other changes for them are in §26.12).
 - **What is remembered.** The chosen game is stored under the `active_game` setting. A launch
   opens that game's Instances tab, not Minecraft's Home. If discovery no longer finds the game, or
   fails, the app shows Minecraft and leaves the stored choice alone.
@@ -4533,8 +4624,9 @@ that the slices build on:
   and the shared Settings. Minecraft-only entries are hidden. An instance page has Overview,
   Content, Plugins, INI & saves and Tools.
 - **Command layer.** Commands live in `desktop/src-tauri/src/games/`, one file per slice, and are
-  registered in `lib.rs` now. A command its slice has not built returns `not_implemented` and names
-  itself, so nothing answers with a fake `null` or an empty list. `games_list` is the one real command.
+  registered in `lib.rs`. The scaffold's rule survives in `games/error.rs`: a command whose body does
+  not exist fails with `not_implemented` and names itself, so nothing answers with a fake `null` or
+  an empty list. Every slice has since built its commands, and none of them returns it now.
 - **Frontend folders.** Each slice owns `desktop/src/features/games/<slice>/` (`api.ts` for its IPC
   wrappers, `index.tsx` for the components the shell renders). The shell itself lives in
   `features/games/shell/`, and the shared types and the active-game hook in `features/games/shared/`.
@@ -4553,8 +4645,9 @@ that the slices build on:
 | Instance INI & saves | iniSaves | `InstanceIniSavesTab` |
 | Instance Tools | tools | `InstanceToolsTab` |
 
-Each slot currently renders a placeholder. A slice replaces its own component and never edits the
-shell.
+Every slot renders its slice's own component (`GameTabPage`, `GameInstancePage`). The scaffold's
+`features/games/shared/SlotPlaceholder.tsx` is still in the tree and nothing uses it. A slice
+replaces its own component and never edits the shell.
 
 ### 26.15 Open Questions
 
