@@ -496,21 +496,38 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
                 item_ids.insert(content.clone());
             }
         }
-        let typed_hashes: HashSet<String> = manifest
+        let mut hashes = HashSet::new();
+        for installed in manifest
             .mods
             .iter()
             .chain(manifest.resourcepacks.iter())
             .chain(manifest.shaders.iter())
             .chain(manifest.datapacks.iter())
             .chain(manifest.worlds.iter())
-            .filter(|installed| !installed.sha256.is_empty())
-            .map(|installed| installed.sha256.to_ascii_lowercase())
-            .collect();
-        // TODO(integrator): use typed `InstalledMod.content_item_id`/`object_sha256` once the
-        // parallel Minecraft slice lands; this raw read matches those field names today.
-        let recorded = read_recorded_join_keys(&manifest_path);
-        let hashes = recorded.hashes.unwrap_or(typed_hashes);
-        item_ids.extend(recorded.item_ids);
+        {
+            if let Some(id) = installed
+                .content_item_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                item_ids.insert(id.to_string());
+            }
+            // The store object hash is the file's real identity; `sha256` is the download's.
+            if let Some(hash) = installed
+                .object_sha256
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .or_else(|| {
+                    Some(installed.sha256.as_str())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                })
+            {
+                hashes.insert(hash.to_ascii_lowercase());
+            }
+        }
 
         scan.instances.push(ScannedInstance {
             reference: LibraryInstanceRef {
@@ -523,49 +540,4 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
         });
     }
     scan
-}
-
-/// What an instance manifest records for the store, read from its text because the typed model
-/// does not carry these fields yet. `hashes` is `None` when the manifest cannot be read, so the
-/// caller can fall back to the typed `sha256` values.
-struct RecordedJoinKeys {
-    hashes: Option<HashSet<String>>,
-    item_ids: HashSet<String>,
-}
-
-fn read_recorded_join_keys(manifest_path: &Path) -> RecordedJoinKeys {
-    let mut keys = RecordedJoinKeys {
-        hashes: None,
-        item_ids: HashSet::new(),
-    };
-    let Ok(text) = std::fs::read_to_string(manifest_path) else {
-        return keys;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return keys;
-    };
-    let mut hashes = HashSet::new();
-    for key in ["mods", "resourcepacks", "shaders", "datapacks", "worlds"] {
-        let Some(entries) = value.get(key).and_then(|entries| entries.as_array()) else {
-            continue;
-        };
-        for entry in entries {
-            let text_field = |name: &str| {
-                entry
-                    .get(name)
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-            };
-            // The store object hash is the file's real identity; `sha256` is the download's.
-            if let Some(hash) = text_field("object_sha256").or_else(|| text_field("sha256")) {
-                hashes.insert(hash.to_ascii_lowercase());
-            }
-            if let Some(id) = text_field("content_item_id") {
-                keys.item_ids.insert(id.to_string());
-            }
-        }
-    }
-    keys.hashes = Some(hashes);
-    keys
 }
