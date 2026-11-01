@@ -1571,6 +1571,70 @@ pub fn set_item_metadata(
     Ok(item)
 }
 
+/// Whether `text` is a lowercase SHA-256 hex digest, the only form an object path accepts.
+fn is_sha256_hex(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Store raw bytes as a protected content object and return the object's SHA-256. Used for bytes
+/// that are not an item file, such as a saved icon. The bytes are never unpacked, and identical
+/// bytes share one object.
+pub fn store_object_bytes(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentError> {
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    let size = bytes.len() as u64;
+    let obj_path = ctx.paths.content_object_path(&sha256);
+    if let Some(parent) = obj_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if obj_path.exists() && object_is_trustworthy(&obj_path, size, &sha256)? {
+        if protect::protection(&obj_path)? != Protection::Protected {
+            protect::protect(&obj_path)?;
+        }
+        return Ok(sha256);
+    }
+
+    let staging_root = ctx.paths.content_staging_dir();
+    std::fs::create_dir_all(&staging_root)?;
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let staging_dir = staging_root.join(unique);
+    std::fs::create_dir_all(&staging_dir)?;
+    let mut guard = StagingGuard::new(&staging_dir);
+    let staged_path = staging_dir.join("object");
+    std::fs::write(&staged_path, bytes)?;
+    let entry = StagedEntry {
+        rel_path: validate_entry_path("object")?,
+        staged_path,
+        size,
+        sha256: sha256.clone(),
+    };
+    place_object(&ctx.paths, &entry, false)?;
+    guard.active = false;
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    Ok(sha256)
+}
+
+/// Read a stored object's bytes, refusing a hash that is not an object name and an object that no
+/// longer holds what its name says. Icons are read through this rather than straight off disk.
+pub fn read_object_bytes(ctx: &Ctx, sha256: &str) -> Result<Vec<u8>, ContentError> {
+    if !is_sha256_hex(sha256) {
+        return Err(ContentError::InvalidHash(sha256.to_string()));
+    }
+    let path = ctx.paths.content_object_path(sha256);
+    if !path.exists() {
+        return Err(ContentError::MissingObject(sha256.to_string()));
+    }
+    let size = std::fs::metadata(&path)?.len();
+    if !object_is_trustworthy(&path, size, sha256)? {
+        return Err(ContentError::DamagedObject(format!(
+            "the object named {sha256} no longer holds those bytes"
+        )));
+    }
+    Ok(std::fs::read(&path)?)
+}
+
 /// Create an item from some of another item's files, under new paths, without extracting
 /// anything again: the new manifest points at the objects `from_item` already holds. A FOMOD
 /// install is the first user. `files` pairs each new path with the sha256 of an object `from_item`

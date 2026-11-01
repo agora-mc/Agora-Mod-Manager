@@ -35,6 +35,7 @@ interface CommandPaletteProps {
 const SETTINGS_ITEMS: { label: string; tab: Tab; icon: string }[] = [
   { label: 'Home', tab: 'home', icon: '🏠' },
   { label: 'Browse', tab: 'browse', icon: '🔍' },
+  { label: 'Library', tab: 'library', icon: '📚' },
   { label: 'My Instances', tab: 'instances', icon: '📦' },
   { label: 'Community Governance', tab: 'governance', icon: '🗳️' },
   { label: 'Help & Guide', tab: 'guide', icon: '' },

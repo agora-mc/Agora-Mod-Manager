@@ -176,6 +176,10 @@ pub fn install_thunderstore(
         }
     }
 
+    // Build human-readable summary of mappings. It is saved as the derived item's description:
+    // it is what this importer already knows about the package, and nothing is fetched.
+    let summary = build_mapping_summary(&file_paths, &mappings, &package_id);
+
     // Derive item in content store
     let derived_name = format!("{package_id} {}", manifest.version_number);
     let source = ContentSource::Thunderstore {
@@ -185,7 +189,7 @@ pub fn install_thunderstore(
         added_at_unix_ms: content_store::now_unix_ms(),
     };
     let outcome = content_store::derive_item(ctx, item_id, derived_files, &derived_name, source)?;
-    let derived = outcome.item().clone();
+    let derived = save_import_metadata(ctx, outcome.item(), &summary, &manifest.version_number)?;
 
     // Add derived item to instance with mount_path "" and source_path ""
     let layer = game_deploy::add_content(ctx, instance_id, &derived.item_id, Some(""), Some(""))?;
@@ -238,9 +242,6 @@ pub fn install_thunderstore(
         }
     }
 
-    // Build human-readable summary of mappings
-    let summary = build_mapping_summary(&file_paths, &mappings, &package_id);
-
     Ok(ThunderstoreInstallOutcome {
         derived_item: derived,
         layer,
@@ -249,6 +250,28 @@ pub fn install_thunderstore(
         summary,
         missing_dependencies,
     })
+}
+
+/// Save what the importer knew when it created the item: its mapping summary and version. Anything
+/// the item already recorded is kept, so a reinstall does not erase a description from elsewhere.
+fn save_import_metadata(
+    ctx: &Ctx,
+    item: &ContentItem,
+    summary: &str,
+    version: &str,
+) -> Result<ContentItem, ContentError> {
+    let metadata = content_store::ItemMetadata {
+        description: item
+            .description
+            .clone()
+            .or_else(|| Some(summary.to_string())),
+        page_url: item.page_url.clone(),
+        version: item.version.clone().or_else(|| Some(version.to_string())),
+        game_id: item.game_id.clone(),
+        catalog_id: item.catalog_id.clone(),
+        icon_sha256: item.icon_sha256.clone(),
+    };
+    content_store::set_item_metadata(ctx, &item.item_id, metadata)
 }
 
 fn build_mapping_summary(

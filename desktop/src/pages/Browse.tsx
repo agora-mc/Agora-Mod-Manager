@@ -390,7 +390,7 @@ function RegistryRecoveryShell({
   );
 }
 
-export function Browse({ onSelectMod, onOpenInstance, initialInstanceId, initialContentType }: { onSelectMod?: (id: string, instanceId?: string, contentType?: string) => void; onOpenInstance?: (instanceId: string) => void; initialInstanceId?: string; initialContentType?: string }) {
+export function Browse({ onSelectMod, onOpenInstance, onOpenLibrary, initialInstanceId, initialContentType }: { onSelectMod?: (id: string, instanceId?: string, contentType?: string) => void; onOpenInstance?: (instanceId: string) => void; onOpenLibrary?: () => void; initialInstanceId?: string; initialContentType?: string }) {
   // Catalog availability — show the recovery panel when there is nothing left
   // to browse. These are the ONLY hook calls in this component, and both are
   // unconditional, so the hook count is stable.
@@ -433,12 +433,13 @@ export function Browse({ onSelectMod, onOpenInstance, initialInstanceId, initial
 
   // Remount when catalog availability flips (e.g. the first download lands) so
   // every value derived from it — sort options, category metadata — is rebuilt.
-  return <BrowseContent key={catalogAvailable ? 'with-catalog' : 'live-only'} onSelectMod={onSelectMod} onOpenInstance={onOpenInstance} initialInstanceId={initialInstanceId} initialContentType={initialContentType} catalogAvailable={catalogAvailable} registryState={registry.state} registryStatus={registry.status} registryError={registry.error} registryActions={registry.actions} />;
+  return <BrowseContent key={catalogAvailable ? 'with-catalog' : 'live-only'} onSelectMod={onSelectMod} onOpenInstance={onOpenInstance} onOpenLibrary={onOpenLibrary} initialInstanceId={initialInstanceId} initialContentType={initialContentType} catalogAvailable={catalogAvailable} registryState={registry.state} registryStatus={registry.status} registryError={registry.error} registryActions={registry.actions} />;
 }
 
 function BrowseContent({
   onSelectMod,
   onOpenInstance,
+  onOpenLibrary,
   initialInstanceId,
   initialContentType,
   catalogAvailable,
@@ -449,6 +450,7 @@ function BrowseContent({
 }: {
   onSelectMod?: (id: string, instanceId?: string, contentType?: string) => void;
   onOpenInstance?: (instanceId: string) => void;
+  onOpenLibrary?: () => void;
   initialInstanceId?: string;
   initialContentType?: string;
   /** False when the curated catalog is not on disk; live sources carry the page. */
@@ -1450,6 +1452,16 @@ function BrowseContent({
       <section className="agora-hero compact">
         <div className="flex items-center gap-3 mb-2">
           <h2 className="text-2xl font-bold">Browse</h2>
+          {onOpenLibrary && (
+            <button
+              type="button"
+              onClick={onOpenLibrary}
+              className={`${simpleBrowse ? 'ml-auto ' : ''}rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-accent`}
+              data-testid="open-library"
+            >
+              Your Library
+            </button>
+          )}
           {/* Simple mode has exactly one Browse. Offering a door to the Bazaar
               from it would put the thing the mode exists to avoid one click
               away — the interaction mode is changed in Settings, not here. */}
