@@ -38,6 +38,9 @@ pub enum FileState {
     Missing,
     /// Present, but its bytes are not the recorded ones (replaced or edited by hand).
     Modified,
+    /// On disk but cannot be read right now (another program holds it, or the read failed). It is
+    /// not missing: the file is there.
+    Unreadable,
     /// On disk in a content folder with no manifest entry (added by hand).
     Untracked,
 }
@@ -496,7 +499,7 @@ impl<'a> FileStateInspector<'a> {
 
         let actual = match hash_file_for_state(path) {
             Ok(actual) => actual,
-            Err(_) => return FileState::Missing,
+            Err(_) => return FileState::Unreadable,
         };
         if let Some(modified) = modified {
             let verified = CachedFileState {

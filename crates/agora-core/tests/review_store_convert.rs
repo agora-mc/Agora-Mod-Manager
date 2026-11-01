@@ -1,5 +1,4 @@
-//! Review tests for the store-convert slice. Each `#[ignore]`d test proves one bug; run them with
-//! `cargo test -p agora-core --test review_store_convert -- --ignored`.
+//! Review tests for the store-convert slice, one per bug found in review.
 
 use std::path::{Path, PathBuf};
 
@@ -99,7 +98,6 @@ fn store_bytes(ctx: &Ctx, name: &str, bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "proves bug: manifest is read before the instance lock, so a change made while waiting for it is overwritten (convert.rs:125-136 reads, :280 locks, :299 writes)"]
 fn a_change_made_while_the_conversion_waits_for_the_lock_is_not_overwritten() {
     let (_tmp, ctx) = test_ctx();
     let bytes = b"a mod that will be linked".repeat(8);
@@ -144,7 +142,6 @@ fn a_change_made_while_the_conversion_waits_for_the_lock_is_not_overwritten() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "proves bug: a failure part-way drops the manifest record (item id, object hash) of files already linked, and a re-run never records it (convert.rs:294 `?` before :299, and :380-382)"]
 fn files_linked_before_a_failure_still_get_their_manifest_record_after_a_rerun() {
     let (_tmp, ctx) = test_ctx();
     let first = b"first mod bytes".repeat(16);
@@ -192,7 +189,6 @@ fn files_linked_before_a_failure_still_get_their_manifest_record_after_a_rerun()
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "proves bug: a newer-version (read-only) manifest is not refused up front, so files are replaced and then the manifest write fails (convert.rs:134 read_manifest accepts it, :299 write refuses)"]
 fn a_read_only_manifest_is_refused_before_any_file_is_replaced() {
     let (_tmp, ctx) = test_ctx();
     let bytes = b"a mod in a newer instance".repeat(8);
@@ -223,7 +219,6 @@ fn a_read_only_manifest_is_refused_before_any_file_is_replaced() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "proves bug: a half-written target left by a crashed copy is kept and the intact journaled original is shoved into moved-aside, so a re-run leaves a truncated mod (convert.rs:572-603 recover_journal; place.rs:copy_new writes in place, not via temp+rename)"]
 fn a_half_copied_target_does_not_replace_the_journaled_original_on_rerun() {
     let (_tmp, ctx) = test_ctx();
     let original = b"the complete original jar".repeat(64);
@@ -268,7 +263,6 @@ fn restrict_folder_to_modify(dir: &Path) {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "proves bug: the journal folder is created without FILE_DELETE_CHILD, so the link moved into it cannot be deleted; the error is swallowed (convert.rs:514 `let _ = remove_file`) and every later run fails at :591 `remove_file(..)?`"]
 fn converting_to_separate_cleans_up_its_journal_on_a_default_acl_folder() {
     let (_tmp, ctx) = test_ctx();
     let bytes = b"a shared mod jar".repeat(32);
@@ -299,7 +293,6 @@ fn converting_to_separate_cleans_up_its_journal_on_a_default_acl_folder() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "proves bug (racy): bytes the user wrote after the hash check are moved to the journal and then deleted unverified (convert.rs:367 hash, :394 replace_with, :514 remove_file of the journaled copy)"]
 fn an_edit_between_the_hash_check_and_the_replacement_is_not_lost() {
     // Many bytes make the add_file step (store the object) long; the editing thread waits for the
     // object to appear (hash and store are already done) and then appends to the file.

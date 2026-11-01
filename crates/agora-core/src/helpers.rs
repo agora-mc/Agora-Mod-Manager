@@ -139,7 +139,7 @@ pub fn safe_zip_entry_name(filename: &str) -> Option<String> {
     Some(format!("mods/{}", filename))
 }
 
-fn manifest_read_only_error() -> LauncherError {
+pub(crate) fn manifest_read_only_error() -> LauncherError {
     LauncherError::Generic {
         code: "ERR_MANIFEST_READ_ONLY".into(),
         message: "This instance manifest was written by a newer Agora. Open it with that version to make changes.".into(),

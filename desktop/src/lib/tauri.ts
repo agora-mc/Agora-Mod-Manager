@@ -461,7 +461,7 @@ export interface InstalledContentRow {
   size_bytes: number | null;
   file_present: boolean;
   /** How the file compares with its manifest entry, or that Agora did not install it. */
-  file_state: 'ok' | 'missing' | 'modified' | 'untracked';
+  file_state: 'ok' | 'missing' | 'modified' | 'unreadable' | 'untracked';
   resolved_path: string | null;
   author: string | null;
   categories: string[];

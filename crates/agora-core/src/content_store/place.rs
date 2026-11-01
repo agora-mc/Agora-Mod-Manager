@@ -209,7 +209,7 @@ fn is_sha256_hex(text: &str) -> bool {
 /// Make sure a file placed in `folder` can be deleted from it. The folder's own DACL is read
 /// first, so a folder that already grants `FILE_DELETE_CHILD` is left alone; a folder rebuilt at
 /// the same path is checked afresh rather than trusted from an older folder at that path.
-fn ensure_delete_child(folder: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn ensure_delete_child(folder: &Path) -> Result<(), std::io::Error> {
     if protect::grants_delete_child(folder)? {
         return Ok(());
     }

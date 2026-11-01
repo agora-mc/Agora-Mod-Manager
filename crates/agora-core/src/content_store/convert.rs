@@ -131,9 +131,7 @@ pub fn convert_instance(
         .paths
         .instance_manifest(&sanitized)
         .map_err(|error| crate::content_store::ContentError::Other(error.to_string()))?;
-    let manifest = read_manifest(&manifest_path)
-        .map_err(|error| crate::content_store::ContentError::Other(error.to_string()))?;
-    convert_instance_dir(ctx, &sanitized, &dir, &manifest_path, manifest, mode)
+    convert_instance_dir(ctx, &sanitized, &dir, &manifest_path, mode)
 }
 
 fn load_instance(
@@ -162,12 +160,18 @@ pub fn preview_all(
     let mut report = BulkPreview::default();
     for found in scan_instances(ctx) {
         match found {
-            Ok(found) => {
-                report.instances += 1;
-                report
-                    .summary
-                    .merge(preview_manifest(ctx, &found.dir, &found.manifest, mode));
-            }
+            Ok(found) => match read_manifest(&found.manifest_path) {
+                Ok(manifest) => {
+                    report.instances += 1;
+                    report
+                        .summary
+                        .merge(preview_manifest(ctx, &found.dir, &manifest, mode));
+                }
+                Err(error) => report.warnings.push(format!(
+                    "Instance '{}' could not be read, so it was not previewed: {error}",
+                    found.name
+                )),
+            },
             Err(warning) => report.warnings.push(warning),
         }
     }
@@ -185,25 +189,13 @@ pub fn convert_all(
         match found {
             Ok(found) => {
                 report.instances += 1;
-                let id = found.manifest.instance_id.clone();
-                // The lock names the folder that is actually written, never a folder from a
-                // manifest field that could point somewhere else.
-                let lock_id = found
-                    .dir
-                    .file_name()
-                    .map(|name| sanitize_id(&name.to_string_lossy()))
-                    .unwrap_or_else(|| sanitize_id(&id));
-                match convert_instance_dir(
-                    ctx,
-                    &lock_id,
-                    &found.dir,
-                    &found.manifest_path,
-                    found.manifest,
-                    mode,
-                ) {
+                // The lock names the folder that is actually written, never a value from a
+                // manifest that could point somewhere else.
+                let lock_id = sanitize_id(&found.name);
+                match convert_instance_dir(ctx, &lock_id, &found.dir, &found.manifest_path, mode) {
                     Ok(summary) => report.summary.merge(summary),
                     Err(error) => report.failures.push(ConversionFailure {
-                        instance_id: id,
+                        instance_id: found.name,
                         message: error.to_string(),
                     }),
                 }
@@ -215,12 +207,14 @@ pub fn convert_all(
 }
 
 struct FoundInstance {
+    /// The folder name, which is the instance id other commands use.
+    name: String,
     dir: PathBuf,
     manifest_path: PathBuf,
-    manifest: InstanceManifest,
 }
 
-/// Every instance folder with a readable manifest, sorted by folder name so runs are repeatable.
+/// Every instance folder with a manifest, sorted by folder name so runs are repeatable. The
+/// manifest is read by the caller, under the instance lock where it will be written.
 fn scan_instances(ctx: &Ctx) -> Vec<Result<FoundInstance, String>> {
     let root = ctx.paths.instances_root();
     let mut found = Vec::new();
@@ -244,16 +238,11 @@ fn scan_instances(ctx: &Ctx) -> Vec<Result<FoundInstance, String>> {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match read_manifest(&manifest_path) {
-            Ok(manifest) => found.push(Ok(FoundInstance {
-                dir,
-                manifest_path,
-                manifest,
-            })),
-            Err(error) => found.push(Err(format!(
-                "Instance '{name}' could not be read, so it was not converted: {error}"
-            ))),
-        }
+        found.push(Ok(FoundInstance {
+            name,
+            dir,
+            manifest_path,
+        }));
     }
     found
 }
@@ -263,7 +252,6 @@ fn convert_instance_dir(
     lock_id: &str,
     instance_dir: &Path,
     manifest_path: &Path,
-    mut manifest: InstanceManifest,
     mode: PlacementMode,
 ) -> Result<ConversionSummary, crate::content_store::ContentError> {
     // A running game has the files open; replacing them under it is neither safe nor useful.
@@ -282,26 +270,82 @@ fn convert_instance_dir(
         "content-convert",
     )?;
 
+    // Read the manifest under the lock: anything installed while we waited is in this copy and
+    // will be written back, never overwritten by a stale one.
+    let mut manifest = read_manifest(manifest_path)
+        .map_err(|error| crate::content_store::ContentError::Other(error.to_string()))?;
+    // Refuse a manifest we may not write before any file is replaced. A newer Agora owns its
+    // shape, and a locked instance belongs to whatever has it open.
+    if manifest.is_read_only() {
+        return Err(crate::content_store::ContentError::Lock(
+            crate::helpers::manifest_read_only_error(),
+        ));
+    }
+    if manifest.is_locked {
+        return Err(crate::content_store::ContentError::Lock(
+            crate::error::LauncherError::InstanceLocked,
+        ));
+    }
+
     let journal_root = instance_dir.join(JOURNAL_DIR);
+    let expected = expected_hashes(&manifest);
     let mut summary = ConversionSummary::default();
     // Finish whatever an earlier run left half-done before touching anything new.
     summary
         .skipped
-        .extend(recover_journal(instance_dir, &journal_root)?);
+        .extend(recover_journal(instance_dir, &journal_root, &expected)?);
 
     let mut dirty = false;
+    let mut failure = None;
     for entry in content_entries_mut(&mut manifest) {
-        let changed = convert_entry(ctx, instance_dir, &journal_root, entry, mode, &mut summary)?;
-        dirty |= changed;
+        match convert_entry(ctx, instance_dir, &journal_root, entry, mode, &mut summary) {
+            Ok(changed) => dirty |= changed,
+            Err(error) => {
+                // A later file's failure must not discard the records of files already converted.
+                failure = Some(error);
+                break;
+            }
+        }
     }
 
     if dirty {
-        atomic_write_manifest(manifest_path, &manifest)
-            .map_err(|error| crate::content_store::ContentError::Other(error.to_string()))?;
+        if let Err(write_error) = atomic_write_manifest(manifest_path, &manifest) {
+            return Err(match failure {
+                Some(error) => crate::content_store::ContentError::Other(format!(
+                    "{error}; the records of the files already converted could not be saved: {write_error}"
+                )),
+                None => crate::content_store::ContentError::Other(write_error.to_string()),
+            });
+        }
     }
     prune_empty_dirs(&journal_root, &journal_root);
     let _ = std::fs::remove_dir(&journal_root);
-    Ok(summary)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(summary),
+    }
+}
+
+/// The recorded hash of every manifest file under its instance-relative name, including the
+/// enabled and `.disabled` names, so recovery can tell a complete target from a truncated one.
+fn expected_hashes(manifest: &InstanceManifest) -> std::collections::BTreeMap<String, String> {
+    let mut expected = std::collections::BTreeMap::new();
+    for entry in manifest
+        .mods
+        .iter()
+        .chain(manifest.resourcepacks.iter())
+        .chain(manifest.shaders.iter())
+        .chain(manifest.datapacks.iter())
+        .chain(manifest.worlds.iter())
+    {
+        let Some(hash) = recorded_hash(entry) else {
+            continue;
+        };
+        let folder = content_subdir(&entry.content_type);
+        expected.insert(format!("{folder}/{}", entry.filename), hash.clone());
+        expected.insert(format!("{folder}/{}.disabled", entry.filename), hash);
+    }
+    expected
 }
 
 fn content_entries_mut(manifest: &mut InstanceManifest) -> Vec<&mut InstalledMod> {
@@ -379,38 +423,85 @@ fn convert_entry(
         PlacementMode::Link => {
             if object.is_file() && same_file(&target, &object) {
                 summary.files_already += 1;
-                return Ok(false);
-            }
-            let mut dirty = false;
-            if !object.is_file() {
+                // A file linked by an earlier run whose record was lost still needs its record:
+                // otherwise a future run sees "already" and never writes one.
+                if entry.content_item_id.is_some() && entry.object_sha256.is_some() {
+                    return Ok(false);
+                }
                 let (item_id, stored_hash) = store_from_file(ctx, &target, entry)?;
-                entry.content_item_id = Some(item_id);
-                entry.object_sha256 = Some(stored_hash);
-                dirty = true;
-            } else if entry.object_sha256.as_deref() != Some(actual.as_str()) {
-                entry.object_sha256 = Some(actual.clone());
-                dirty = true;
+                return Ok(update_record(entry, item_id, stored_hash));
             }
-            let placed = replace_with(ctx, instance_dir, journal_root, &target, &actual, mode)?;
-            if placed == super::PlacedAs::Link {
-                summary.files_converted += 1;
-                summary.bytes = summary.bytes.saturating_add(metadata.len());
+            // Store the object first so the replacement has something to point at.
+            let stored = if object.is_file() {
+                None
             } else {
-                // The file system refused a link, so this is still an owned copy: no space freed.
-                summary.files_already += 1;
+                Some(store_from_file(ctx, &target, entry)?)
+            };
+            match replace_with(ctx, instance_dir, journal_root, &target, &actual, mode)? {
+                Replacement::Changed => {
+                    summary.skipped.push(ConvertSkip {
+                        path: rel,
+                        reason: ConvertSkipReason::Changed,
+                        moved_to: None,
+                    });
+                    Ok(false)
+                }
+                Replacement::Replaced(placed) => {
+                    let dirty = match stored {
+                        Some((item_id, stored_hash)) => update_record(entry, item_id, stored_hash),
+                        None => update_object_hash(entry, &actual),
+                    };
+                    if placed == super::PlacedAs::Link {
+                        summary.files_converted += 1;
+                        summary.bytes = summary.bytes.saturating_add(metadata.len());
+                    } else {
+                        // The file system refused a link, so this is still an owned copy.
+                        summary.files_already += 1;
+                    }
+                    Ok(dirty)
+                }
             }
-            Ok(dirty)
         }
         PlacementMode::Copy => {
             if !object.is_file() || !same_file(&target, &object) {
                 summary.files_already += 1;
                 return Ok(false);
             }
-            replace_with(ctx, instance_dir, journal_root, &target, &actual, mode)?;
-            summary.files_converted += 1;
-            summary.bytes = summary.bytes.saturating_add(metadata.len());
-            Ok(false)
+            match replace_with(ctx, instance_dir, journal_root, &target, &actual, mode)? {
+                Replacement::Changed => {
+                    summary.skipped.push(ConvertSkip {
+                        path: rel,
+                        reason: ConvertSkipReason::Changed,
+                        moved_to: None,
+                    });
+                    Ok(false)
+                }
+                Replacement::Replaced(_) => {
+                    summary.files_converted += 1;
+                    summary.bytes = summary.bytes.saturating_add(metadata.len());
+                    Ok(false)
+                }
+            }
         }
+    }
+}
+
+fn update_record(entry: &mut InstalledMod, item_id: String, stored_hash: String) -> bool {
+    let mut dirty = false;
+    if entry.content_item_id.as_deref() != Some(item_id.as_str()) {
+        entry.content_item_id = Some(item_id);
+        dirty = true;
+    }
+    dirty |= update_object_hash(entry, &stored_hash);
+    dirty
+}
+
+fn update_object_hash(entry: &mut InstalledMod, sha256: &str) -> bool {
+    if entry.object_sha256.as_deref() != Some(sha256) {
+        entry.object_sha256 = Some(sha256.to_string());
+        true
+    } else {
+        false
     }
 }
 
@@ -498,8 +589,16 @@ fn store_from_file(
     Ok((item.item_id.clone(), stored.sha256.clone()))
 }
 
-/// Move the current file into the journal, place the store object at the original path, and only
-/// then drop the journal copy. A failure puts the moved file back.
+enum Replacement {
+    Replaced(super::PlacedAs),
+    /// The file no longer hashed to the recorded value after it was moved aside. It was put back
+    /// with the change intact, and the conversion left it alone.
+    Changed,
+}
+
+/// Move the current file into the journal, verify the moved file still has the bytes that were
+/// checked, and only then place the replacement. An edit that lands after the first hash is
+/// therefore put back, not deleted. A failure puts the moved file back.
 fn replace_with(
     ctx: &Ctx,
     instance_dir: &Path,
@@ -507,27 +606,55 @@ fn replace_with(
     target: &Path,
     sha256: &str,
     mode: PlacementMode,
-) -> Result<super::PlacedAs, crate::content_store::ContentError> {
+) -> Result<Replacement, crate::content_store::ContentError> {
     let journaled = move_to_journal(instance_dir, journal_root, target)?;
+    let still_matches = match hash_file_sha256(&journaled) {
+        Ok(actual) => actual.eq_ignore_ascii_case(sha256),
+        Err(error) => {
+            return Err(restore_journaled(
+                &journaled,
+                target,
+                crate::content_store::ContentError::Io(error),
+            ));
+        }
+    };
+    if !still_matches {
+        return match std::fs::rename(&journaled, target) {
+            Ok(()) => Ok(Replacement::Changed),
+            Err(restore) => Err(crate::content_store::ContentError::Other(format!(
+                "the file changed while it was being converted and could not be put back: {restore}; \
+                 the changed file is kept at {}",
+                journaled.display()
+            ))),
+        };
+    }
     match place_object_at(ctx, sha256, target, mode) {
         Ok(placed) => {
-            let _ = std::fs::remove_file(&journaled);
+            // The moved original is now verified and no longer needed.
+            std::fs::remove_file(&journaled)?;
             prune_empty_dirs(journaled.parent().unwrap_or(journal_root), journal_root);
-            Ok(placed)
+            Ok(Replacement::Replaced(placed))
         }
-        Err(error) => {
-            // The original must come back before the error reaches the user.
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::rename(&journaled, target) {
-                Ok(()) => Err(error),
-                Err(restore) => Err(crate::content_store::ContentError::Other(format!(
-                    "{error}; the original file is kept at {} because it could not be put back: {restore}",
-                    journaled.display()
-                ))),
-            }
-        }
+        Err(error) => Err(restore_journaled(&journaled, target, error)),
+    }
+}
+
+/// Put a journaled file back at its target, returning `error` when it succeeds and a combined
+/// error (naming the journal path, so the file is still findable) when it cannot.
+fn restore_journaled(
+    journaled: &Path,
+    target: &Path,
+    error: crate::content_store::ContentError,
+) -> crate::content_store::ContentError {
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::rename(journaled, target) {
+        Ok(()) => error,
+        Err(restore) => crate::content_store::ContentError::Other(format!(
+            "{error}; the original file is kept at {} because it could not be put back: {restore}",
+            journaled.display()
+        )),
     }
 }
 
@@ -545,6 +672,10 @@ fn move_to_journal(
     let journaled = journal_root.join(relative);
     if let Some(parent) = journaled.parent() {
         std::fs::create_dir_all(parent)?;
+        // A link to a protected object cannot be deleted from a folder that lacks
+        // FILE_DELETE_CHILD. Grant it here, before the link is moved in, and never ignore a
+        // refusal: the journal could not be cleaned up later otherwise.
+        super::place::ensure_delete_child(parent)?;
     }
     if journaled.symlink_metadata().is_ok() {
         return Err(crate::content_store::ContentError::Other(format!(
@@ -557,18 +688,27 @@ fn move_to_journal(
 }
 
 /// Restore or tidy every file an interrupted run left in the journal.
+///
+/// A target that does not match the hash the manifest recorded is a half-written replacement, not
+/// the file: it is moved aside (never deleted) and the intact original is put back.
 fn recover_journal(
     instance_dir: &Path,
     journal_root: &Path,
+    expected: &std::collections::BTreeMap<String, String>,
 ) -> Result<Vec<ConvertSkip>, crate::content_store::ContentError> {
     let mut skipped = Vec::new();
     if !journal_root.is_dir() {
         return Ok(skipped);
     }
+    // A journal left by an older build may hold links in a folder that lacks delete-child.
+    super::place::ensure_delete_child(journal_root)?;
     let files = super::collect_folder_files(journal_root)?;
     for (relative, journaled) in files {
         let rel = relative.as_str().to_string();
-        let target = instance_dir.join(rel.as_str());
+        if let Some(parent) = journaled.parent() {
+            super::place::ensure_delete_child(parent)?;
+        }
+        let target = instance_dir.join(&rel);
         if target.symlink_metadata().is_err() {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -576,7 +716,39 @@ fn recover_journal(
             std::fs::rename(&journaled, &target)?;
             continue;
         }
-        // The replacement is already in place (or the file came back some other way). When the
+        if let Some(expected_hash) = expected.get(&rel) {
+            let target_ok = hash_file_sha256(&target)
+                .map(|actual| actual.eq_ignore_ascii_case(expected_hash))
+                .unwrap_or(false);
+            if target_ok {
+                // The replacement completed; the journal copy is the original. Remove it only
+                // when it is still the recorded file; anything else is preserved.
+                let journal_ok = hash_file_sha256(&journaled)
+                    .map(|actual| actual.eq_ignore_ascii_case(expected_hash))
+                    .unwrap_or(false);
+                if journal_ok {
+                    std::fs::remove_file(&journaled)?;
+                } else {
+                    skipped.push(move_aside(instance_dir, &rel, &journaled)?);
+                }
+                continue;
+            }
+            // A truncated or otherwise wrong target is not the file. Keep it (it may hold
+            // something a person wrote) and restore the original from the journal.
+            let moved_to = unique_moved_aside(instance_dir, &rel);
+            if let Some(parent) = moved_to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&target, &moved_to)?;
+            std::fs::rename(&journaled, &target)?;
+            skipped.push(ConvertSkip {
+                path: rel,
+                reason: ConvertSkipReason::MovedAside,
+                moved_to: Some(moved_to.display().to_string()),
+            });
+            continue;
+        }
+        // No manifest record (for example, a file removed from the manifest since). When the
         // bytes agree the journal copy is a leftover from before the final cleanup.
         let same_bytes = match (
             hash_file_sha256(&journaled),
@@ -589,20 +761,28 @@ fn recover_journal(
         };
         if same_bytes {
             std::fs::remove_file(&journaled)?;
-            continue;
+        } else {
+            skipped.push(move_aside(instance_dir, &rel, &journaled)?);
         }
-        let moved_to = unique_moved_aside(instance_dir, &rel);
-        if let Some(parent) = moved_to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::rename(&journaled, &moved_to)?;
-        skipped.push(ConvertSkip {
-            path: rel,
-            reason: ConvertSkipReason::MovedAside,
-            moved_to: Some(moved_to.display().to_string()),
-        });
     }
     Ok(skipped)
+}
+
+fn move_aside(
+    instance_dir: &Path,
+    rel: &str,
+    file: &Path,
+) -> Result<ConvertSkip, crate::content_store::ContentError> {
+    let moved_to = unique_moved_aside(instance_dir, rel);
+    if let Some(parent) = moved_to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(file, &moved_to)?;
+    Ok(ConvertSkip {
+        path: rel.to_string(),
+        reason: ConvertSkipReason::MovedAside,
+        moved_to: Some(moved_to.display().to_string()),
+    })
 }
 
 fn unique_moved_aside(instance_dir: &Path, relative: &str) -> PathBuf {

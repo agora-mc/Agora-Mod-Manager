@@ -254,7 +254,10 @@ fn a_conversion_interrupted_mid_way_finishes_on_rerun_and_loses_nothing() {
         same_file(&kept_target, &object),
         "the rerun finished the link"
     );
-    assert_eq!(summary.files_converted, 1, "kept was recovered and linked");
+    assert_eq!(
+        summary.files_converted, 2,
+        "kept and conflict were both recovered and linked"
+    );
 
     let placed_target = dir.join("mods/placed.jar");
     assert!(same_file(&placed_target, &object_path(&ctx, &placed_hash)));
@@ -263,21 +266,22 @@ fn a_conversion_interrupted_mid_way_finishes_on_rerun_and_loses_nothing() {
         "the leftover was cleaned up"
     );
 
-    // The conflicting journal copy is preserved, not deleted, and the user's target is untouched.
+    // The target did not match the recorded hash, so it was not the file: it is preserved aside
+    // and the intact original is restored, then linked.
     assert_eq!(
         std::fs::read(dir.join("mods/conflict.jar")).unwrap(),
-        conflict_target
+        conflict_original
     );
     let moved = summary
         .skipped
         .iter()
         .find(|skip| skip.reason == ConvertSkipReason::MovedAside)
-        .expect("the unmatched journal copy is reported");
+        .expect("the rejected target is reported");
     let moved_to = moved
         .moved_to
         .as_deref()
         .expect("the file says where it went");
-    assert_eq!(std::fs::read(moved_to).unwrap(), conflict_original);
+    assert_eq!(std::fs::read(moved_to).unwrap(), conflict_target);
     assert!(!journal.join("conflict.jar").exists());
 }
 

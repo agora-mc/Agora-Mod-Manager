@@ -1,12 +1,13 @@
-//! Review tests for the store-convert slice. Run the `#[ignore]`d ones with
-//! `cargo test -p agora-game-minecraft --test review_store_convert -- --ignored`.
+//! Review tests for the store-convert slice.
 
 #[cfg(windows)]
-use agora_core::models::{InstalledMod, InstanceManifest, CURRENT_MANIFEST_VERSION};
+use agora_core::{
+    helpers::hash_file_sha256,
+    models::{InstalledMod, InstanceManifest, CURRENT_MANIFEST_VERSION},
+};
 
 #[cfg(windows)]
 #[test]
-#[ignore = "proves bug: a present file that cannot be read (held open by the game or a scanner) is reported as Missing, not as unreadable (installed_content.rs file_state `Err(_) => FileState::Missing`)"]
 fn a_present_file_that_is_locked_is_not_reported_missing() {
     use agora_game_minecraft::installed_content::{list_installed_content, FileState};
     use std::os::windows::fs::OpenOptionsExt;
@@ -15,7 +16,7 @@ fn a_present_file_that_is_locked_is_not_reported_missing() {
     std::fs::create_dir_all(dir.path().join("mods")).unwrap();
     let jar = dir.path().join("mods/held.jar");
     std::fs::write(&jar, b"bytes the manifest recorded").unwrap();
-    let hash = agora_core::helpers::hash_file_sha256(&jar).unwrap();
+    let hash = hash_file_sha256(&jar).unwrap();
 
     let entry = InstalledMod {
         provider: None,
@@ -67,7 +68,7 @@ fn a_present_file_that_is_locked_is_not_reported_missing() {
         .share_mode(0)
         .open(&jar)
         .unwrap();
-    let rows = list_installed_content(dir.path(), &manifest, None, None);
+    let rows = list_installed_content(dir.path(), &manifest, None, None, None);
     assert_eq!(rows.len(), 1);
     assert!(rows[0].file_present);
     assert_ne!(
