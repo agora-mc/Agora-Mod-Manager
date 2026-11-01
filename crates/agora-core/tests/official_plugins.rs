@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use agora_core::app_paths::AppPaths;
 use agora_core::ctx::CoreContext;
 use agora_core::error::LauncherResult;
-use agora_core::game_registry::GameRegistry;
+use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_core::plugins::official::{tree_digest, zip_tree_digest};
 use agora_core::plugins::{
     Consent, NoopUiSink, OfficialCatalog, OfficialInstallState, OfficialStatus, PackageFetcher,
@@ -1786,4 +1786,75 @@ async fn a_revocation_stops_a_running_official_script_plugin_at_the_next_reload(
     world.service.activate_all().unwrap();
     assert!(!world.running(PLUGIN));
     world.stop_everything();
+}
+
+// ---------------------------------------------------------------------------
+// Registration order
+// ---------------------------------------------------------------------------
+
+/// Official plugins register their games before community ones, even when the community
+/// plugin's id sorts first. Otherwise a package named `aaa.community` could claim a game id
+/// the signed registry gives to the official plugin.
+#[tokio::test]
+async fn an_installed_official_plugin_wins_a_game_id_over_a_community_plugin() {
+    let world = World::new();
+    let official = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &official), official)]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    // A different package id (so the packages themselves do not collide) that claims the
+    // same game, under an id that sorts before `acme.fixture`.
+    let mut package = game_package(GAME);
+    package.id = "test.pkg.community".into();
+    let community = package_zip_with("aaa.community", "1.0.0", package, "game:define", "");
+    world
+        .service
+        .install_package_bytes(&community, true)
+        .unwrap();
+
+    let (ctx, warnings) = world.start();
+    let game = GameId::new(GAME).unwrap();
+    assert!(ctx.games.game(&game).is_some(), "{warnings:?}");
+    assert_eq!(
+        ctx.games.source_for(&game),
+        Some(&PackageSource::Plugin {
+            plugin_id: PLUGIN.into()
+        }),
+        "the official package must have registered first; warnings: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("rejected game package")),
+        "the community claim must be named, not silently dropped: {warnings:?}"
+    );
+}
+
+/// The documented development path: install `packages/official/skyrim-se` as a folder, with no
+/// signed entry and no plugin switch, and the game still appears.
+#[tokio::test]
+async fn the_documented_development_install_of_skyrim_still_loads_the_game() {
+    let world = World::new();
+    let folder =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
+    world
+        .service
+        .add_development_folder(&folder, true)
+        .unwrap();
+
+    let (ctx, warnings) = world.start();
+    let game = GameId::new("skyrim-se").unwrap();
+    assert!(ctx.games.game(&game).is_some(), "{warnings:?}");
+    assert_eq!(
+        ctx.games.source_for(&game),
+        Some(&PackageSource::Plugin {
+            plugin_id: "agora.creation-engine".into()
+        })
+    );
 }
