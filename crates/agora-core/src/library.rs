@@ -234,6 +234,9 @@ fn metadata_of(item: &ContentItem) -> ItemMetadata {
         version: item.version.clone(),
         game_id: item.game_id.clone(),
         catalog_id: item.catalog_id.clone(),
+        provider: item.provider.clone(),
+        provider_id: item.provider_id.clone(),
+        provider_origin: item.provider_origin.clone(),
         icon_sha256: item.icon_sha256.clone(),
     }
 }
@@ -520,9 +523,8 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .or_else(|| {
-                    Some(installed.sha256.as_str())
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
+                    let hash = installed.sha256.trim();
+                    (!hash.is_empty()).then_some(hash)
                 })
             {
                 hashes.insert(hash.to_ascii_lowercase());

@@ -2066,6 +2066,9 @@ fn save_installer_metadata(
         version: item.version.clone().or_else(|| info.version.clone()),
         game_id: item.game_id.clone(),
         catalog_id: item.catalog_id.clone(),
+        provider: item.provider.clone(),
+        provider_id: item.provider_id.clone(),
+        provider_origin: item.provider_origin.clone(),
         icon_sha256: item.icon_sha256.clone(),
     };
     Ok(content_store::set_item_metadata(

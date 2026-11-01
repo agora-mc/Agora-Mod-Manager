@@ -173,6 +173,9 @@ fn the_library_lists_items_with_their_saved_metadata() {
             version: Some("2.4.0".into()),
             game_id: Some("skyrim-se".into()),
             catalog_id: Some("catalog-thing".into()),
+            provider: None,
+            provider_id: None,
+            provider_origin: None,
             icon_sha256: None,
         },
     )
@@ -335,6 +338,9 @@ fn a_catalog_item_without_its_own_description_uses_the_cached_catalog() {
             version: None,
             game_id: Some("skyrim-se".into()),
             catalog_id: Some("catalog-thing".into()),
+            provider: None,
+            provider_id: None,
+            provider_origin: None,
             icon_sha256: None,
         },
     )

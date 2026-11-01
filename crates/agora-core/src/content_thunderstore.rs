@@ -275,6 +275,9 @@ fn save_import_metadata(
             .or_else(|| Some(manifest.version_number.clone())),
         game_id: item.game_id.clone(),
         catalog_id: item.catalog_id.clone(),
+        provider: item.provider.clone(),
+        provider_id: item.provider_id.clone(),
+        provider_origin: item.provider_origin.clone(),
         icon_sha256: item.icon_sha256.clone(),
     };
     content_store::set_item_metadata(ctx, &item.item_id, metadata)
