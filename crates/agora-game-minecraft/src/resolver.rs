@@ -4632,6 +4632,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         assert!(!manifest_has_shader_loader(&manifest));
         manifest
@@ -5008,6 +5011,9 @@ mod tests {
                 depends_on: vec![],
                 optional_deps: vec![],
                 incompatible_deps: vec![],
+
+                content_item_id: None,
+                object_sha256: None,
             }],
             resourcepacks: vec![InstalledMod {
                 provider: None,
@@ -5031,6 +5037,9 @@ mod tests {
                 depends_on: vec![],
                 optional_deps: vec![],
                 incompatible_deps: vec![],
+
+                content_item_id: None,
+                object_sha256: None,
             }],
             shaders: vec![],
             datapacks: vec![],
@@ -6001,6 +6010,8 @@ modId=\"xaerominimap\"
             content_type: "mod".to_string(),
             installed_as_dependency: false,
             hash_verified: true,
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 
@@ -6163,6 +6174,8 @@ modId=\"xaerominimap\"
             enabled,
             content_type: "mod".into(),
             hash_verified: true,
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 

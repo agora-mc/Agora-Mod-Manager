@@ -400,6 +400,7 @@ pub fn run() {
             commands::enable_mod_for_test,
             commands::disable_instance_mod,
             commands::enable_instance_mod,
+            commands::minecraft_add_stored_content,
             commands::set_datapack_worlds,
             commands::sync_instance_datapacks,
             commands::list_instance_worlds,

@@ -433,6 +433,8 @@ mod tests {
             depends_on: deps.iter().map(|d| d.to_string()).collect(),
             optional_deps: Vec::new(),
             incompatible_deps: Vec::new(),
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 

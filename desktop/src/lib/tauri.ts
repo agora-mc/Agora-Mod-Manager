@@ -1400,6 +1400,9 @@ export const disableInstanceMod = (instanceId: string, filename: string) =>
   invoke<void>('disable_instance_mod', { instanceId, filename });
 export const enableInstanceMod = (instanceId: string, filename: string) =>
   invoke<void>('enable_instance_mod', { instanceId, filename });
+/** Add an item already in the shared content store to an instance, with no network. */
+export const minecraftAddStoredContent = (instanceId: string, itemId: string) =>
+  invoke<InstalledMod>('minecraft_add_stored_content', { instanceId, itemId });
 
 /** Choose which worlds a data pack goes to (`null` = all worlds) and sync now. */
 export const setDatapackWorlds = (instanceId: string, filename: string, worlds: string[] | null) =>

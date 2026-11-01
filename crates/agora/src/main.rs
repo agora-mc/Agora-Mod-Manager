@@ -11872,6 +11872,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
 
         let dependent = InstalledMod {
@@ -11896,6 +11899,9 @@ mod tests {
             depends_on: vec!["core-lib".into()],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
 
         let installed = vec![target.clone(), dependent];
@@ -11932,6 +11938,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
 
         let other = InstalledMod {
@@ -11956,6 +11965,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
 
         let installed = vec![target.clone(), other];
@@ -12570,6 +12582,9 @@ mod tests {
                 depends_on: vec![],
                 optional_deps: vec![],
                 incompatible_deps: vec![],
+
+                content_item_id: None,
+                object_sha256: None,
             }],
             resourcepacks: vec![],
             shaders: vec![],

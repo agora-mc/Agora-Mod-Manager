@@ -2473,6 +2473,16 @@ pub async fn enable_instance_mod(
     .map_err(|_| LauncherError::LocalStateFailed)?
 }
 
+/// Add a stored content item to a Minecraft instance, with no network access.
+#[tauri::command]
+pub async fn minecraft_add_stored_content(
+    app: tauri::AppHandle,
+    instance_id: String,
+    item_id: String,
+) -> LauncherResult<crate::models::InstalledMod> {
+    mod_install::add_stored_content(&app, &instance_id, &item_id).await
+}
+
 /// Choose which worlds a data pack is synced into (`worlds: None` = all worlds)
 /// and sync now. Allowed on locked instances: it is a preference, not content.
 #[tauri::command]
@@ -8273,6 +8283,8 @@ mod command_helper_tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 }

@@ -666,6 +666,9 @@ mod tests {
                 provided_mod_ids: Vec::new(),
                 enabled: true,
                 content_type: "mod".to_string(),
+
+                content_item_id: None,
+                object_sha256: None,
             })
             .collect();
         InstanceManifest {
@@ -919,6 +922,9 @@ mod tests {
             provided_mod_ids: Vec::new(),
             enabled: true,
             content_type: "shader".to_string(),
+
+            content_item_id: None,
+            object_sha256: None,
         });
         write_manifest(&dir, &manifest).unwrap();
 

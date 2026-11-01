@@ -1118,6 +1118,9 @@ fn build_pack_entry(
         depends_on: jar.depends_on,
         optional_deps: jar.optional_deps,
         incompatible_deps: jar.incompatible_deps,
+
+        content_item_id: None,
+        object_sha256: None,
     })
 }
 
@@ -1388,6 +1391,9 @@ pub fn reconcile_manifest(
                         depends_on: jar.depends_on,
                         optional_deps: jar.optional_deps,
                         incompatible_deps: jar.incompatible_deps,
+
+                        content_item_id: None,
+                        object_sha256: None,
                     };
                     let arr: &mut Vec<agora_core::models::InstalledMod> = match ct {
                         "resourcepack" => &mut new.resourcepacks,
@@ -3344,6 +3350,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let inst = seed_instance(&tmp, "inst");
         write_manifest_with_mods(&inst, "inst", vec![sodium]);
@@ -3476,6 +3485,9 @@ mod tests {
             depends_on: vec!["dep".into()],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let pack_mod = agora_core::models::InstalledMod {
             provider: None,
@@ -3499,6 +3511,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let old = agora_core::models::InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
@@ -3632,6 +3647,9 @@ mod tests {
             depends_on: vec!["dep-a".into()],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let old = agora_core::models::InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
@@ -3730,6 +3748,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let old = agora_core::models::InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
@@ -3965,6 +3986,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let old = bare_manifest(vec![user_mod]);
         let plan = PackMergePlan {
@@ -4087,6 +4111,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let remove = agora_core::models::InstalledMod {
             provider: None,
@@ -4110,6 +4137,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let old = agora_core::models::InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
@@ -4281,6 +4311,9 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+
+            content_item_id: None,
+            object_sha256: None,
         };
         let old = agora_core::models::InstanceManifest {
             manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
