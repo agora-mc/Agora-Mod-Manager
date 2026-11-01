@@ -4712,6 +4712,24 @@ mod tests {
         assert_ne!(new_object, old_stored.sha256);
         assert!(ctx.paths.content_object_path(&new_object).is_file());
 
+        // The file the update just placed is not reported as changed by hand.
+        let rows = crate::installed_content::list_installed_content(
+            &inst,
+            &manifest,
+            None,
+            None,
+            Some(&ctx.paths.content_objects_dir()),
+        );
+        let row = rows
+            .iter()
+            .find(|row| row.filename == "packmod.jar")
+            .expect("the updated mod is listed");
+        assert_eq!(
+            row.file_state,
+            crate::installed_content::FileState::Ok,
+            "a file the update just placed is unchanged"
+        );
+
         // A failure after the replacement rolls back to the previous file and its entry.
         let staged = staged_update(b"packC");
         let (plan, reconciled, _dbtmp, conn) =

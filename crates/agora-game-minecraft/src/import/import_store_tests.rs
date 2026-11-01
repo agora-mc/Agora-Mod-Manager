@@ -409,3 +409,42 @@ fn a_hash_stopped_import_leaves_nothing_in_the_store() {
         "the mismatching download was stored as a trusted object before the import stopped"
     );
 }
+
+#[test]
+fn a_pack_import_records_files_as_unchanged_and_items_as_used() {
+    let (ctx, tmp) = store_ctx();
+    let jar = b"pack mod bytes".to_vec();
+    let path = write_hashed_mrpack(tmp.path(), &[("mods/a.jar", &jar, both_hashes(&jar))]);
+    let root = ctx.paths.instances_root();
+    let imported = import_mrpack_with(Some(&ctx), &path, &root, None, false).unwrap();
+    let instance_dir = root.join(&imported.instance_id);
+    let manifest = read_test_manifest(&root, &imported.instance_id);
+
+    // Hand-edit detection must not flag a file the import just placed.
+    let rows = crate::installed_content::list_installed_content(
+        &instance_dir,
+        &manifest,
+        None,
+        None,
+        Some(&ctx.paths.content_objects_dir()),
+    );
+    let row = rows
+        .iter()
+        .find(|row| row.filename == "a.jar")
+        .expect("the imported mod is listed");
+    assert_eq!(
+        row.file_state,
+        crate::installed_content::FileState::Ok,
+        "a file the import just placed is unchanged"
+    );
+
+    // The item the import created belongs to this instance, so it is not unused. The store holds
+    // it and the instance scanned cleanly, so an empty listing means "in use", not "unreadable".
+    assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
+    let listing = agora_core::library::list_unused(&ctx).unwrap();
+    assert!(listing.warnings.is_empty(), "{:?}", listing.warnings);
+    assert!(
+        listing.items.is_empty(),
+        "a pack's own item is not unused: {listing:?}"
+    );
+}
