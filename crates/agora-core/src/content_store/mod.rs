@@ -299,6 +299,8 @@ pub enum ContentError {
     TargetExists(String),
     #[error("stored object is missing: {0}")]
     MissingObject(String),
+    #[error("stored object is damaged or not what its hash says: {0}")]
+    DamagedObject(String),
     #[error("content placement setting is invalid: {0}")]
     InvalidSetting(String),
 }
@@ -504,7 +506,11 @@ fn disk_free_space(path: &Path) -> Option<u64> {
 /// Whether an existing object can be kept as is. A protected object of the right size is trusted
 /// (the quick check, as `VerifyDepth::Quick`); one that was unprotected or has the wrong size may
 /// have been changed, so its bytes are re-hashed.
-fn object_is_trustworthy(path: &Path, size: u64, sha256: &str) -> Result<bool, ContentError> {
+pub(crate) fn object_is_trustworthy(
+    path: &Path,
+    size: u64,
+    sha256: &str,
+) -> Result<bool, ContentError> {
     if std::fs::metadata(path)?.len() != size {
         return Ok(false);
     }

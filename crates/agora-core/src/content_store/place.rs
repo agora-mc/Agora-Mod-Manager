@@ -2,13 +2,11 @@
 //!
 //! A link to a protected object can only be deleted when the folder holding it grants the user
 //! `FILE_DELETE_CHILD`; a folder with only the usual `Modify` right does not. So link placements
-//! make sure that grant exists (once per folder in this process) and fall back to an owned copy
-//! when they cannot: another volume, a file system without links, the NTFS link limit, or a folder
-//! whose ACL cannot be changed.
+//! read the target folder's own DACL and grant that right when it is missing, then fall back to an
+//! owned copy when they cannot: another volume, a file system without links, the NTFS link limit,
+//! or a folder whose ACL cannot be changed.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -93,6 +91,13 @@ pub fn place_object_at(
     if !object.is_file() {
         return Err(ContentError::MissingObject(sha256.to_string()));
     }
+    // The same rule `place_object` applies when an object already exists: a protected object is
+    // trusted, an unprotected one is only trusted when its bytes still hash to its name. A damaged
+    // object is never linked or copied into an instance.
+    let object_size = std::fs::metadata(&object)?.len();
+    if !super::object_is_trustworthy(&object, object_size, sha256)? {
+        return Err(ContentError::DamagedObject(sha256.to_string()));
+    }
     ensure_absent(target)?;
 
     let folder = target
@@ -102,16 +107,10 @@ pub fn place_object_at(
     std::fs::create_dir_all(folder)?;
 
     match mode {
-        PlacementMode::Copy => {
-            ensure_absent(target)?;
-            copy_owned(&object, target)?;
-            Ok(PlacedAs::Copy)
-        }
+        PlacementMode::Copy => place_copy(&object, target),
         PlacementMode::Link => {
             if at_link_limit(&object) || ensure_delete_child(folder).is_err() {
-                ensure_absent(target)?;
-                copy_owned(&object, target)?;
-                return Ok(PlacedAs::Copy);
+                return place_copy(&object, target);
             }
             match std::fs::hard_link(&object, target) {
                 Ok(()) => Ok(PlacedAs::Link),
@@ -119,12 +118,38 @@ pub fn place_object_at(
                     Err(ContentError::TargetExists(target.display().to_string()))
                 }
                 // A link that cannot be made is a copy, and the result says so.
-                Err(_) => {
-                    ensure_absent(target)?;
-                    copy_owned(&object, target)?;
-                    Ok(PlacedAs::Copy)
-                }
+                Err(_) => place_copy(&object, target),
             }
+        }
+    }
+}
+
+/// Copy the object into a brand-new file at `target`. `create_new` refuses any existing entry,
+/// symlinks included, so a file that appears after the earlier check is never overwritten. If
+/// writing fails part-way, only the file this call created is removed.
+fn place_copy(object: &Path, target: &Path) -> Result<PlacedAs, ContentError> {
+    match copy_new(object, target) {
+        Ok(_) => Ok(PlacedAs::Copy),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(ContentError::TargetExists(target.display().to_string()))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn copy_new(source: &Path, dest: &Path) -> std::io::Result<u64> {
+    let mut input = std::fs::File::open(source)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    match std::io::copy(&mut input, &mut output) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => {
+            // `create_new` proved this file is ours; remove it rather than leave a partial copy.
+            drop(output);
+            let _ = std::fs::remove_file(dest);
+            Err(e)
         }
     }
 }
@@ -144,29 +169,14 @@ fn is_sha256_hex(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn delete_child_folders() -> &'static Mutex<HashSet<PathBuf>> {
-    static FOLDERS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    FOLDERS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Make sure a file placed in `folder` can be deleted from it. The grant is written once per
-/// folder in this process; a folder whose ACL cannot be changed is an error, and the caller places
-/// a copy instead.
+/// Make sure a file placed in `folder` can be deleted from it. The folder's own DACL is read
+/// first, so a folder that already grants `FILE_DELETE_CHILD` is left alone; a folder rebuilt at
+/// the same path is checked afresh rather than trusted from an older folder at that path.
 fn ensure_delete_child(folder: &Path) -> Result<(), std::io::Error> {
-    let key = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
-    if delete_child_folders()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(&key)
-    {
+    if protect::grants_delete_child(folder)? {
         return Ok(());
     }
-    protect::grant_delete_child(folder)?;
-    delete_child_folders()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key);
-    Ok(())
+    protect::grant_delete_child(folder)
 }
 
 /// Copy a file the game may then write. `fs::copy` carries the source's permissions, and on Unix
@@ -211,4 +221,38 @@ fn link_count(path: &Path) -> Option<u32> {
 #[cfg(not(any(windows, unix)))]
 fn link_count(_path: &Path) -> Option<u32> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copy_refuses_an_existing_target_and_leaves_it_alone() {
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, b"the new bytes").unwrap();
+        let target = work.path().join("target");
+        std::fs::write(&target, b"the other file").unwrap();
+
+        let error = copy_new(&source, &target).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"the other file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_does_not_write_through_a_symlink_at_the_target() {
+        let work = tempfile::tempdir().unwrap();
+        let source = work.path().join("source");
+        std::fs::write(&source, b"the new bytes").unwrap();
+        let victim = work.path().join("victim");
+        std::fs::write(&victim, b"must not change").unwrap();
+        let target = work.path().join("target");
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+
+        let error = copy_new(&source, &target).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must not change");
+    }
 }

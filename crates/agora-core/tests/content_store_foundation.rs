@@ -226,6 +226,23 @@ fn restore_inherited_acl(dir: &Path) {
         .status();
 }
 
+#[cfg(windows)]
+fn grant_full_control(dir: &Path) {
+    let user = std::env::var("USERNAME").expect("USERNAME");
+    let out = std::process::Command::new("icacls")
+        .arg(dir)
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .output()
+        .expect("run icacls");
+    assert!(
+        out.status.success(),
+        "icacls could not grant Full Control on {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 #[cfg(windows)]
 fn a_placed_link_can_be_deleted_from_a_folder_without_full_control() {
@@ -248,6 +265,48 @@ fn a_placed_link_can_be_deleted_from_a_folder_without_full_control() {
 
     std::fs::remove_file(&target).expect("a placed link must be deletable from its folder");
     assert!(!target.exists());
+    restore_inherited_acl(&folder);
+}
+
+#[test]
+#[cfg(windows)]
+fn a_deleted_and_recreated_folder_gets_the_grant_again() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("mod.jar");
+    let bytes = b"stored object bytes".repeat(32);
+    std::fs::write(&source, &bytes).unwrap();
+    let item = add_file(&ctx, &source, None, None).unwrap();
+    let hash = item.item().files[0].sha256.clone();
+
+    // A parent that grants only Modify, so a folder recreated under it inherits no
+    // FILE_DELETE_CHILD, exactly like an instance folder on a drive with the default ACL.
+    let parent = work.path().join("parent");
+    std::fs::create_dir_all(&parent).unwrap();
+    restrict_folder_to_modify(&parent);
+
+    let folder = parent.join("mods");
+    std::fs::create_dir_all(&folder).unwrap();
+    let first = folder.join("mod.jar");
+    assert_eq!(
+        place_object_at(&ctx, &hash, &first, PlacementMode::Link).unwrap(),
+        PlacedAs::Link
+    );
+    std::fs::remove_file(&first).unwrap();
+
+    // Delete the folder and rebuild it at the same path, as a recreated instance would be.
+    grant_full_control(&folder);
+    std::fs::remove_dir(&folder).unwrap();
+    std::fs::create_dir_all(&folder).unwrap();
+
+    let second = folder.join("mod.jar");
+    assert_eq!(
+        place_object_at(&ctx, &hash, &second, PlacementMode::Link).unwrap(),
+        PlacedAs::Link
+    );
+    std::fs::remove_file(&second).expect("a recreated folder must be granted again");
+
+    restore_inherited_acl(&parent);
     restore_inherited_acl(&folder);
 }
 
@@ -305,6 +364,42 @@ fn copy_mode_places_a_writable_copy() {
         bytes,
         "writing the copy must not change the stored object"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5b. A damaged (unprotected) object is never placed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tampered_unprotected_object_is_not_placed() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let source = work.path().join("mod.jar");
+    let bytes = b"the stored bytes".repeat(32);
+    std::fs::write(&source, &bytes).unwrap();
+    let item = add_file(&ctx, &source, None, None).unwrap();
+    let hash = item.item().files[0].sha256.clone();
+    let object = ctx.paths.content_object_path(&hash);
+
+    agora_core::content_store::protect::unprotect(&object).unwrap();
+    let mut tampered = std::fs::read(&object).unwrap();
+    tampered[0] ^= 0xff;
+    std::fs::write(&object, &tampered).unwrap();
+
+    let folder = work.path().join("mods");
+    std::fs::create_dir_all(&folder).unwrap();
+    let target = folder.join("mod.jar");
+    for mode in [PlacementMode::Link, PlacementMode::Copy] {
+        let result = place_object_at(&ctx, &hash, &target, mode);
+        assert!(
+            result.is_err(),
+            "a tampered object must not be placed ({mode:?})"
+        );
+        assert!(
+            !target.exists(),
+            "a refused placement must leave nothing at the target"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
