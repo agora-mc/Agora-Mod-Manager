@@ -18,7 +18,7 @@ export function gameErrorMessage(error: unknown): string {
   return 'Something went wrong. Try again.';
 }
 
-interface AddGameFolderButtonProps extends Omit<ButtonProps, 'onClick' | 'children'> {
+interface AddGameFolderButtonProps extends Omit<ButtonProps, 'onClick' | 'children' | 'onError'> {
   /** The visible label. The default is Setup's. */
   label?: string;
   /** A label for a screen reader when several buttons share the visible label. */

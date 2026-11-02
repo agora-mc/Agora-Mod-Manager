@@ -5182,6 +5182,12 @@ def main() -> None:
         help="Root directory for registry manifests (default: registry/)",
     )
     parser.add_argument(
+        "--skip-official-asset-check",
+        action="store_true",
+        help="Do not download official plugin packages to check their URL, size and sha256 "
+             "(local development and tests only; the catalog release must not use it)",
+    )
+    parser.add_argument(
         "--governance-repo",
         type=str,
         default=None,
@@ -5237,6 +5243,7 @@ def main() -> None:
         registry_root=args.registry_root,
         state_in_path=Path(args.governance_state_in) if args.governance_state_in else None,
         state_out_path=Path(args.governance_state_out) if args.governance_state_out else None,
+        official_fetcher=None if args.skip_official_asset_check else _fetch_official_package,
     )
 
 

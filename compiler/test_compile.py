@@ -12,6 +12,7 @@ Covers: validate_sha256, _get_registry_repo, _load_poll_blacklist,
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import logging
 import os
@@ -2195,9 +2196,15 @@ class OfficialPluginTests(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
 
-    def compile(self):
+    def compile(self, official_fetcher=None):
         out = self.tmp / "out" / "registry.db"
-        _compile.compile_registry(out, skip_sign=True, no_governance_write=True, governance_mode_str="off")
+        _compile.compile_registry(
+            out,
+            skip_sign=True,
+            no_governance_write=True,
+            governance_mode_str="off",
+            official_fetcher=official_fetcher,
+        )
         return out
 
     def rows(self, out):
@@ -2232,6 +2239,36 @@ class OfficialPluginTests(unittest.TestCase):
         self.assertEqual(by_version["1.0.0"]["package_tree_sha256"], "4" * 64)
         self.assertEqual(current["package_size"], 4096)
         self.assertEqual(current["min_agora_version"], "0.1.0")
+
+    def test_an_official_package_must_match_its_pinned_bytes(self):
+        payload = b"acme fixture package"
+        digest = hashlib.sha256(payload).hexdigest()
+        data = self.entry()
+        del data["previous"]
+        data["current"]["sha256"] = digest
+        data["current"]["size"] = len(payload)
+        self.write(data)
+
+        # A fetcher that serves the pinned bytes lets the entry through.
+        rows = self.rows(self.compile(official_fetcher=lambda url: payload))
+        self.assertEqual(rows[0]["package_sha256"], digest)
+
+        with self.assertRaises(SystemExit) as caught:
+            self.compile(official_fetcher=lambda url: payload.upper())
+        self.assertIn("current.sha256", str(caught.exception.code))
+
+        def missing(url):
+            raise OSError("404")
+
+        with self.assertRaises(SystemExit) as caught:
+            self.compile(official_fetcher=missing)
+        self.assertIn("does not resolve", str(caught.exception.code))
+
+        data["current"]["size"] = len(payload) + 1
+        self.write(data)
+        with self.assertRaises(SystemExit) as caught:
+            self.compile(official_fetcher=lambda url: payload)
+        self.assertIn("current.size", str(caught.exception.code))
 
     def test_the_schema_version_is_unchanged_so_older_clients_still_read_the_registry(self):
         self.write(self.entry())

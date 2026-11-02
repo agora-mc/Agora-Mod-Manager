@@ -45,6 +45,8 @@ class _CompileFixtures(unittest.TestCase):
                 "--governance-mode",
                 "off",
                 "--no-governance-write",
+                # This suite checks DB structure, not release assets, and must not use the network.
+                "--skip-official-asset-check",
             ],
             cwd=repo_root,
             capture_output=True,
@@ -415,6 +417,8 @@ def compile_registry_rows(compile_module, registry_root: pathlib.Path, out_dir: 
             no_governance_write=True,
             governance_mode_str="off",
             registry_root=str(registry_root),
+            # This test compares catalog rows, not release assets, so it never downloads.
+            official_fetcher=None,
         )
     return dump_table_rows(out_dir / "registry.db")
 

@@ -153,7 +153,7 @@ describe('More games card', () => {
     render(<MoreGamesCard surface="settings" />);
 
     fireEvent.click(await screen.findByRole('button', { name: 'Install Skyrim Special Edition' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Install', exact: true }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Install$/ }));
 
     expect(await screen.findByText(MORE_GAMES_COPY.notFound('Skyrim Special Edition'))).toBeInTheDocument();
 

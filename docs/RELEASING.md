@@ -18,7 +18,11 @@ Skyrim SE is an official plugin (`packages/official/skyrim-se/`, plugin id
 `packages/official/**` or `registry/official-plugins/**` changes. It builds each package zip
 reproducibly, verifies that `registry/official-plugins/<plugin-id>.json` pins those exact bytes, and
 attaches the zip to the `official-<name>-v<version>` release. That release URL is the one the signed
-registry names, so the asset must be published before a catalog that lists it.
+registry names, so the asset must be published before a catalog that lists it. The catalog compile
+now enforces this: it downloads every `package_url` in `registry/official-plugins/` and refuses the
+whole compile when the URL does not resolve, or when the bytes do not match the pinned `size` and
+`sha256`. A missing, private or replaced asset therefore fails the catalog release instead of
+shipping an entry the app cannot install.
 
 To release a new plugin version:
 

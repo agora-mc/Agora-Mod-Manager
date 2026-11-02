@@ -2485,7 +2485,7 @@ fn real_injection_a_32_bit_tool_is_captured_from_links_under_auto_when_the_x86_d
     assert_eq!(out.capture, CaptureMethod::Links, "{out:?}");
     let reason = out.capture_reason.clone().unwrap_or_default();
     assert!(
-        reason.contains("32-bit program and the 32-bit VFS files were not found at")
+        reason.contains("32-bit program and the 32-bit VFS files were not found:")
             && reason.contains(r"agora-missing"),
         "{reason}"
     );
