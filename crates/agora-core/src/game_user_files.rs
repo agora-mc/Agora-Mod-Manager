@@ -268,6 +268,12 @@ fn is_torn_prefix(real: &[u8], complete: &[u8]) -> bool {
 /// Write a user file atomically: a temp file beside it, synced, renamed over the target, then the
 /// directory synced where the platform supports it. A stop leaves the old bytes or the complete new
 /// bytes, never a torn file. The target is named when the write is refused.
+///
+/// A file the player marked read-only is theirs: it is refused, and left exactly as it was. On
+/// Windows a rename over it would fail anyway, but on Unix a rename only needs the folder to be
+/// writable, so without this check the file would be silently replaced and lose its mode. A file
+/// that is replaced keeps its permissions, so another attribute Agora has no business changing is
+/// not lost on either platform.
 fn write_user_file(path: &Path, bytes: &[u8]) -> Result<(), UserFilesError> {
     let Some(parent) = path.parent() else {
         return Err(UserFilesError::Other(format!(
@@ -276,6 +282,28 @@ fn write_user_file(path: &Path, bytes: &[u8]) -> Result<(), UserFilesError> {
         )));
     };
     std::fs::create_dir_all(parent)?;
+    let existing_permissions = match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let permissions = metadata.permissions();
+            if permissions.readonly() {
+                return Err(UserFilesError::Write {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "the file is read-only",
+                    ),
+                });
+            }
+            Some(permissions)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(UserFilesError::Write {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -297,6 +325,15 @@ fn write_user_file(path: &Path, bytes: &[u8]) -> Result<(), UserFilesError> {
             path: path.to_path_buf(),
             source,
         });
+    }
+    if let Some(permissions) = existing_permissions {
+        if let Err(source) = std::fs::set_permissions(&tmp, permissions) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(UserFilesError::Write {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
     }
     if let Err(source) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
@@ -1104,4 +1141,72 @@ pub fn list_statuses(
 
     results.sort_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(b.0.as_str(), b.1.as_str())));
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_user_file;
+
+    fn make_read_writable(path: &std::path::Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_target_is_refused_and_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Plugins.txt");
+        std::fs::write(&path, b"the player's list").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let error = write_user_file(&path, b"the instance's list").unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("Plugins.txt") && text.contains("read-only"),
+            "the error names the file and says why: {text}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the player's list",
+            "a refused write left different bytes"
+        );
+        assert!(
+            std::fs::metadata(&path).unwrap().permissions().readonly(),
+            "a refused write removed the read-only mode"
+        );
+
+        make_read_writable(&path);
+    }
+
+    #[test]
+    fn a_replace_keeps_the_targets_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Skyrim.ini");
+        std::fs::write(&path, b"the player's ini").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().permissions();
+
+        write_user_file(&path, b"the instance's ini").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"the instance's ini");
+        let after = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(after.readonly(), before.readonly());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                after.mode() & 0o777,
+                before.mode() & 0o777,
+                "the replaced file did not keep its mode"
+            );
+        }
+    }
 }
