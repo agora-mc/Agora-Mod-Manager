@@ -338,6 +338,81 @@ fn a_refused_restore_clears_this_processes_starting_mark() {
 }
 
 #[test]
+fn a_hash_mismatch_names_the_real_file_and_its_backup() {
+    use sha2::{Digest, Sha256};
+
+    let h = TestHarness::new();
+    let def = test_skyrim_definition();
+    let real = h
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    let copy = h
+        .instance_dir("mismatch-a")
+        .join("user")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(
+        &real,
+        "the session's bytes
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &copy,
+        "the saved session
+",
+    )
+    .unwrap();
+    let backup_dir = h
+        .ctx
+        .paths
+        .user_files_backup_dir(def.id.as_str(), StoreId::steam().as_str());
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backup = backup_dir.join("0");
+    std::fs::write(&backup, "torn").unwrap();
+    let sha = |b: &[u8]| format!("{:x}", Sha256::digest(b));
+    let journal = Journal {
+        game: def.id.clone(),
+        store: StoreId::steam(),
+        instance_id: "mismatch-a".to_string(),
+        created_at: "2026-11-01T00:00:00Z".to_string(),
+        running_from: h.running_from.clone(),
+        processes: Vec::new(),
+        starting_launcher: None,
+        files: vec![JournaledFile {
+            real_path: real.clone(),
+            instance_path: RelPath::new("user/Plugins.txt").unwrap(),
+            instance_copy_path: copy.clone(),
+            existed: true,
+            backup_path: Some(backup.clone()),
+            original_sha256: Some(sha(b"the player's original
+")),
+            written_sha256: sha(b"the instance's bytes
+"),
+            swapped: true,
+            state: Some(agora_core::game_user_files::FileState::Swapped),
+            restored: false,
+        }],
+    };
+    let journal_path = journal_path_of(&h, &def);
+    std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+    let error = restore(&h.ctx, &def, &StoreId::steam())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Plugins.txt"),
+        "the error does not name the real file: {error}"
+    );
+    assert!(
+        error.contains(&backup.display().to_string()),
+        "the error does not name the backup: {error}"
+    );
+}
+
+#[test]
 fn probe_restore_without_a_session_is_harmless() {
     let h = TestHarness::new();
     let def = test_skyrim_definition();

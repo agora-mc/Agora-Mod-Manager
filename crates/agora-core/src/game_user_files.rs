@@ -37,9 +37,12 @@ pub enum UserFilesError {
     NoSession { game: GameId, store: StoreId },
     #[error("user data location '{0:?}' could not be resolved")]
     UserDataNotFound(UserDataLocation),
-    #[error("hash mismatch on file '{path}': expected {expected}, got {actual}")]
+    #[error(
+        "the backup '{path}' of the user file '{real_path}' does not match the recorded original: expected {expected}, got {actual}"
+    )]
     HashMismatch {
         path: PathBuf,
+        real_path: PathBuf,
         expected: String,
         actual: String,
     },
@@ -255,13 +258,67 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Write a user file, naming it when the write is refused (a read-only file the game changed).
-fn write_user_file(path: &Path, bytes: &[u8]) -> Result<(), UserFilesError> {
-    std::fs::write(path, bytes).map_err(|source| UserFilesError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
+/// True when `real` is a strict prefix of `complete`: the shape a write that stopped part way
+/// leaves. Agora's own writes are atomic now; this recognises a state an older build or a torn
+/// external write left, so recovery does not take it for the game's output.
+fn is_torn_prefix(real: &[u8], complete: &[u8]) -> bool {
+    real.len() < complete.len() && complete.starts_with(real)
 }
+
+/// Write a user file atomically: a temp file beside it, synced, renamed over the target, then the
+/// directory synced where the platform supports it. A stop leaves the old bytes or the complete new
+/// bytes, never a torn file. The target is named when the write is refused.
+fn write_user_file(path: &Path, bytes: &[u8]) -> Result<(), UserFilesError> {
+    let Some(parent) = path.parent() else {
+        return Err(UserFilesError::Other(format!(
+            "cannot write '{}': it has no folder",
+            path.display()
+        )));
+    };
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let tmp = parent.join(format!(
+        ".{name}.agora-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(source) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(UserFilesError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    if let Err(source) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(UserFilesError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    sync_directory(parent);
+    Ok(())
+}
+
+/// Flush a directory entry where the platform supports it, so a rename is durable.
+#[cfg(unix)]
+fn sync_directory(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) {}
 
 fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFilesError> {
     if let Some(parent) = journal_path.parent() {
@@ -489,6 +546,7 @@ pub fn swap_in(
                     let _ = std::fs::remove_file(&temp_backup);
                     return Err(UserFilesError::HashMismatch {
                         path: temp_backup,
+                        real_path: real_path.clone(),
                         expected: orig_hash,
                         actual: b_hash,
                     });
@@ -552,9 +610,14 @@ pub fn swap_in(
     })();
 
     if let Err(e) = swap_result {
-        // Any error restores what was swapped so far and returns the error.
-        let _ = restore_journal_internal(ctx, definition, &journal);
-        return Err(e);
+        // Any error puts back what was swapped so far. A restore that also fails is reported, and
+        // its journal is left for the next launch or a restore to finish.
+        return Err(match restore_journal_internal(ctx, definition, &journal) {
+            Ok(_) => e,
+            Err(restore_error) => UserFilesError::Other(format!(
+                "{e}; putting the player's files back also failed: {restore_error}. The journal was kept so recovery can finish it."
+            )),
+        });
     }
 
     Ok(SwapOutcome {
@@ -784,6 +847,8 @@ fn restore_journal_internal(
         let real_matches_backup =
             real_hash.is_some() && backup_hash.is_some() && real_hash == backup_hash;
 
+        // By design: a session that ends on exactly the player's original bytes has no changed
+        // bytes to save, so the instance copy is left as it was.
         if real_is_original || real_matches_backup {
             if entry.derived_backup_path.exists() {
                 let _ = std::fs::remove_file(&entry.derived_backup_path);
@@ -818,6 +883,15 @@ fn restore_journal_internal(
             continue;
         }
 
+        let real_is_torn = real_bytes.as_deref().is_some_and(|current| {
+            backup_bytes
+                .as_deref()
+                .is_some_and(|backup| is_torn_prefix(current, backup))
+                || std::fs::read(&entry.derived_instance_copy)
+                    .ok()
+                    .is_some_and(|instance| is_torn_prefix(current, &instance))
+        });
+
         if entry.existed {
             let Some(original) = entry.original_sha256.as_deref() else {
                 return Err(UserFilesError::Other(format!(
@@ -836,6 +910,7 @@ fn restore_journal_internal(
             if backup_hash != original {
                 return Err(UserFilesError::HashMismatch {
                     path: entry.derived_backup_path.clone(),
+                    real_path: entry.derived_real_path.clone(),
                     expected: original.to_string(),
                     actual: backup_hash.to_string(),
                 });
@@ -844,7 +919,8 @@ fn restore_journal_internal(
             // The session's saved copy is the game's changed file, and only when the game changed
             // it from what Agora wrote.
             if let Some(current) = &real_bytes {
-                if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
+                if !real_is_torn && real_hash.as_deref() != Some(entry.file.written_sha256.as_str())
+                {
                     if let Some(parent) = entry.derived_instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -861,7 +937,8 @@ fn restore_journal_internal(
             // Agora created this file during the session; the session's copy goes back and the real
             // file goes.
             if let Some(current) = &real_bytes {
-                if real_hash.as_deref() != Some(entry.file.written_sha256.as_str()) {
+                if !real_is_torn && real_hash.as_deref() != Some(entry.file.written_sha256.as_str())
+                {
                     if let Some(parent) = entry.derived_instance_copy.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
