@@ -411,6 +411,15 @@ pub fn add_system_forms(cfg: &mut RuntimeConfig) {
             prefix.device = Some(device);
         }
         let mut tails = vec![tail];
+        // A configured path can itself be an 8.3 name (TEMP on a CI runner is, for example), and
+        // Windows names a handle's path in its long form. Both forms must match.
+        if let Some(long) = unsafe { long_path(&prefix.original) } {
+            let differs = agora_game_api::fold_path_case(&long)
+                != agora_game_api::fold_path_case(&prefix.original);
+            if differs && long.len() >= 2 && long.as_bytes()[1] == b':' {
+                tails.push(long[2..].to_string());
+            }
+        }
         if let Some(short) = unsafe { short_path(&prefix.original) } {
             let differs = agora_game_api::fold_path_case(&short)
                 != agora_game_api::fold_path_case(&prefix.original);
@@ -459,6 +468,19 @@ unsafe fn dos_device(drive: &str) -> Option<String> {
     // The answer is a list of NUL-terminated names; the first is the volume's device.
     let first = wide_str(&buf);
     first.starts_with(r"\Device\").then_some(first)
+}
+
+/// The long form of a path, from GetLongPathNameW. `None` when it has none (or does not exist).
+#[cfg(windows)]
+unsafe fn long_path(path: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let n = GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32);
+    if n == 0 || n as usize >= buf.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..n as usize]))
 }
 
 /// The 8.3 form of a path, from GetShortPathNameW. `None` when it has none.
@@ -620,5 +642,44 @@ mod tests {
             view_path(Via::Alias(0), "x", &cfg).as_deref(),
             Some(r"\S\x")
         );
+    }
+
+    /// A runner's `TEMP` can be the 8.3 form of the folder (`C:\Users\RUNNER~1\...`), while a
+    /// handle reports its long path. The configuration's forms must cover both, or relative names
+    /// (which go through the current-directory handle) are not located at all.
+    #[test]
+    fn a_short_configured_path_also_matches_its_long_form() {
+        let root = std::env::temp_dir().join(format!(
+            "agora-vfs-long-form-{}-a-long-name",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let long = root.to_string_lossy().to_string();
+        let short = unsafe { short_path(&long) }.expect("this path has a form");
+        let Some(short_long) = (unsafe { long_path(&short) }) else {
+            eprintln!("skipped: this volume gave no long form for {short}");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        if agora_game_api::fold_path_case(&short) == agora_game_api::fold_path_case(&short_long) {
+            eprintln!("skipped: this volume has no 8.3 form for {long}");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let json = serde_json::json!({
+            "version": 1,
+            "mount": short,
+            "upper": std::env::temp_dir().join(format!("agora-vfs-form-upper-{}", std::process::id())),
+            "lowers": [],
+            "dll": "C:\\d.dll",
+        });
+        let mut cfg = VfsConfig::from_json_str(&json.to_string()).unwrap();
+        add_system_forms(&mut cfg);
+        assert_eq!(
+            rel_of(&format!(r"{short_long}\Data\mod.esp"), &cfg),
+            Some(r"Data\mod.esp".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

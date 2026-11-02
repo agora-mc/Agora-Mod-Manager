@@ -6,8 +6,8 @@ use crate::config::{RuntimeConfig, VfsConfig};
 use crate::hooks::{plan_open, Plan};
 use crate::nt::*;
 use crate::paths::{
-    add_whiteout, normalize_rel, note_close, rel_of_handle, resolve, upper_for_write, whited_out,
-    Resolved, Via,
+    add_system_forms, add_whiteout, normalize_rel, note_close, rel_of_handle, resolve,
+    upper_for_write, whited_out, Resolved, Via,
 };
 use crate::Tracked;
 use std::path::{Path, PathBuf};
@@ -234,6 +234,11 @@ fn bug_a_panic_inside_guarded_leaves_the_thread_unprotected() {
 /// passed through to the real file system unredirected. The lookup now grows the buffer (and a
 /// write whose path still cannot be read is refused, not passed through; the hook is the only way
 /// to prove that part, see the hand-back).
+///
+/// `add_system_forms` is what the DLL does at start-up. Without it, a `TEMP` that Windows reports in
+/// its 8.3 form (a CI runner's does) does not match the long path a handle reports, which is a
+/// different failure: the handle would be located on a machine with a long `TEMP` and not on one
+/// with a short one.
 #[test]
 fn a_handle_path_over_1023_characters_is_still_located() {
     use std::os::windows::fs::OpenOptionsExt;
@@ -245,7 +250,8 @@ fn a_handle_path_over_1023_characters_is_still_located() {
     }
     std::fs::create_dir_all(&deep).unwrap();
     assert!(deep.as_os_str().len() > 1023);
-    let c = config(&root, &temp_root("longpath-upper"), &[&root]);
+    let mut c = config(&root, &temp_root("longpath-upper"), &[&root]);
+    add_system_forms(&mut c);
     let dir = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
