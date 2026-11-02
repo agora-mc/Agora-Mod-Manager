@@ -321,6 +321,30 @@ fn adding_to_the_library_leaves_the_download_untouched() {
 }
 
 #[test]
+fn a_changed_file_with_the_same_name_is_offered_again() {
+    let (_tmp, ctx) = test_ctx();
+    let downloads = tempfile::tempdir().unwrap();
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+    let path = downloads.path().join("Cool.zip");
+    create_zip(&path, &[("Cool.esp", b"esp")]);
+    let first = scan_until_stable(&mut state, &ctx);
+    assert_eq!(first.len(), 1);
+
+    // Re-downloading replaces the bytes under the same name. It is new content, not the file
+    // already seen, so it is offered again with a new hash.
+    create_zip(&path, &[("Cool.esp", b"a different, longer payload")]);
+    assert!(
+        state.scan(&ctx).unwrap().is_empty(),
+        "the new size is recorded first"
+    );
+    let again = state.scan(&ctx).unwrap();
+    assert_eq!(again.len(), 1);
+    assert_ne!(again[0].sha256, first[0].sha256);
+}
+
+#[test]
 fn a_fomod_download_asks_the_existing_wizard_to_finish_it() {
     let (_tmp, ctx) = test_ctx();
     let downloads = tempfile::tempdir().unwrap();

@@ -212,12 +212,20 @@ impl WatchState {
             if !looks_like_archive(&entry.name) || is_partial(&entry.name) {
                 continue;
             }
-            if self.baseline.contains(&entry.name) || self.published.contains(&entry.name) {
+            if self.baseline.contains(&entry.name) {
                 continue;
             }
             let Some(marker) = entry.marker else {
                 continue;
             };
+            if self.published.contains(&entry.name) {
+                if self.previous.get(&entry.name) == Some(&marker) {
+                    continue;
+                }
+                // The file changed after it was offered (a fresh download under the same name):
+                // it is new content again, not the file already seen.
+                self.published.remove(&entry.name);
+            }
             if self.previous.get(&entry.name) != Some(&marker) {
                 self.previous.insert(entry.name.clone(), marker);
                 continue;
