@@ -21,6 +21,7 @@ use crate::content_store::{
 };
 use crate::ctx::Ctx;
 use crate::helpers::read_manifest;
+use crate::lock_manager::LockResource;
 use crate::registry::RegistryService;
 
 /// One instance that uses a library item.
@@ -210,11 +211,16 @@ pub fn save_icon(ctx: &Ctx, item_id_or_prefix: &str, bytes: &[u8]) -> Result<boo
     if community_image::sniff_image(bytes).is_none() {
         return Ok(false);
     }
+    // Store the object and record it under one lock: a sweep must not see the icon object as
+    // unreferenced between the write and the item that names it.
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::ContentStore, "content-icon")?;
     let item = content_store::get_item(ctx, item_id_or_prefix)?;
-    let sha256 = content_store::store_object_bytes(ctx, bytes)?;
+    let sha256 = content_store::store_object_bytes_locked(ctx, bytes)?;
     let mut metadata = metadata_of(&item);
     metadata.icon_sha256 = Some(sha256);
-    content_store::set_item_metadata(ctx, &item.item_id, metadata)?;
+    content_store::set_item_metadata_locked(ctx, &item.item_id, metadata)?;
     Ok(true)
 }
 
@@ -252,12 +258,17 @@ pub async fn fetch_icon_for_catalog(
         Ok(image) => image,
         Err(_) => return Ok(0),
     };
-    let sha256 = content_store::store_object_bytes(ctx, &image.bytes)?;
+    // The same one-lock rule as `save_icon`: the object and the records that name it land
+    // together, so a sweep cannot delete the icon in between.
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::ContentStore, "content-icons")?;
+    let sha256 = content_store::store_object_bytes_locked(ctx, &image.bytes)?;
     let mut saved = 0;
     for item in matches {
         let mut metadata = metadata_of(&item);
         metadata.icon_sha256 = Some(sha256.clone());
-        content_store::set_item_metadata(ctx, &item.item_id, metadata)?;
+        content_store::set_item_metadata_locked(ctx, &item.item_id, metadata)?;
         saved += 1;
     }
     Ok(saved)
@@ -499,6 +510,17 @@ pub fn instances_using(ctx: &Ctx, item_id: &str, object_hashes: &[String]) -> In
         instances: scan.using(item_id, &hashes),
         unreadable: scan.unreadable,
     }
+}
+
+/// Whether any readable instance manifest records a stored object hash. Only a Minecraft-style
+/// manifest does; a generic instance names items by id. Removal uses this when an item's own
+/// record cannot be read: its object hashes are unknown, so it cannot prove that none of those
+/// hashes is in use.
+pub fn any_instance_records_objects(ctx: &Ctx) -> bool {
+    scan_instances(ctx)
+        .instances
+        .iter()
+        .any(|instance| !instance.hashes.is_empty())
 }
 
 /// Every item no instance uses, with its size. When an instance manifest cannot be read, nothing

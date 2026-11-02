@@ -363,22 +363,43 @@ fn store_file_at(
         item_id: item.item_id.clone(),
         sha256: file.sha256.clone(),
     };
-    store::set_item_metadata(
-        ctx,
-        &stored.item_id,
-        store::ItemMetadata {
-            description: details.description.map(str::to_string),
-            page_url: details.page_url.map(str::to_string),
-            version: details.version.map(str::to_string),
-            game_id: Some("minecraft".to_string()),
-            catalog_id: details.catalog_id.map(str::to_string),
-            provider: details.provider.map(str::to_string),
-            provider_id: details.provider_id.map(str::to_string),
-            provider_origin: details.provider_origin.map(str::to_string),
-            icon_sha256: None,
-        },
-    )
-    .map_err(content_error)?;
+    // The item may already be in the store (the same bytes, or the same path). Merge rather than
+    // replace: a field this install does not know keeps the value the item already carries, so a
+    // reinstall never erases a saved icon, description or provider provenance.
+    let metadata = store::ItemMetadata {
+        description: details
+            .description
+            .map(str::to_string)
+            .or_else(|| item.description.clone()),
+        page_url: details
+            .page_url
+            .map(str::to_string)
+            .or_else(|| item.page_url.clone()),
+        version: details
+            .version
+            .map(str::to_string)
+            .or_else(|| item.version.clone()),
+        game_id: Some("minecraft".to_string()),
+        catalog_id: details
+            .catalog_id
+            .map(str::to_string)
+            .or_else(|| item.catalog_id.clone()),
+        provider: details
+            .provider
+            .map(str::to_string)
+            .or_else(|| item.provider.clone()),
+        provider_id: details
+            .provider_id
+            .map(str::to_string)
+            .or_else(|| item.provider_id.clone()),
+        provider_origin: details
+            .provider_origin
+            .map(str::to_string)
+            .or_else(|| item.provider_origin.clone()),
+        // The install never knows the icon; only a saved one does.
+        icon_sha256: item.icon_sha256.clone(),
+    };
+    store::set_item_metadata(ctx, &stored.item_id, metadata).map_err(content_error)?;
     Ok(stored)
 }
 
@@ -687,4 +708,68 @@ pub fn store_review_item(ctx: &Ctx, source: &Path, rel: &str, game_id: Option<&s
     )
     .expect("set review metadata");
     item.item_id
+}
+
+#[cfg(test)]
+mod review_store_metadata {
+    use super::*;
+
+    /// A PNG signature plus filler: enough for the library's image sniffing.
+    fn png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[3u8; 32]);
+        bytes
+    }
+
+    #[test]
+    fn storing_the_same_file_again_keeps_the_saved_icon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_testing(tmp.path().to_path_buf());
+        let work = tempfile::tempdir().unwrap();
+        let jar = work.path().join("cool.jar");
+        std::fs::write(&jar, b"jar bytes for the review").unwrap();
+
+        let details = StoreDetails {
+            content_type: "mod",
+            filename: "cool.jar",
+            version: Some("1.0.0"),
+            page_url: None,
+            description: Some("Adds cool things"),
+            catalog_id: None,
+            provider: None,
+            provider_id: None,
+            provider_origin: None,
+        };
+        let first = store_file(&ctx, &jar, &details).unwrap();
+        let icon = store::store_object_bytes(&ctx, &png()).unwrap();
+        store::set_item_metadata(
+            &ctx,
+            &first.item_id,
+            store::ItemMetadata {
+                icon_sha256: Some(icon),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = store::get_item(&ctx, &first.item_id).unwrap();
+        assert!(before.icon_sha256.is_some());
+
+        // The same file installed again (second instance, or a reinstall) from a source that
+        // does not know the icon.
+        let again = StoreDetails {
+            description: None,
+            ..details
+        };
+        let second = store_file(&ctx, &jar, &again).unwrap();
+        assert_eq!(
+            first.item_id, second.item_id,
+            "identical bytes are one item"
+        );
+
+        let after = store::get_item(&ctx, &first.item_id).unwrap();
+        assert_eq!(
+            after.icon_sha256, before.icon_sha256,
+            "the saved icon was erased by re-storing the same file"
+        );
+    }
 }

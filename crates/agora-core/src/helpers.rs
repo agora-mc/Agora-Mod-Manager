@@ -421,8 +421,22 @@ pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn available_disk_space_bytes(_path: &Path) -> Option<u64> {
-    None
+pub fn available_disk_space_bytes(path: &Path) -> Option<u64> {
+    // `Disk::available_space` is the space a non-privileged process may use, the same number
+    // Windows reports through `GetDiskFreeSpaceExW`.
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut best: Option<(usize, u64)> = None;
+    for disk in disks.list() {
+        let mount = disk.mount_point();
+        if absolute.starts_with(mount) {
+            let mount_len = mount.as_os_str().len();
+            if best.is_none_or(|(best_len, _)| mount_len > best_len) {
+                best = Some((mount_len, disk.available_space()));
+            }
+        }
+    }
+    best.map(|(_, available)| available)
 }
 
 pub fn check_disk_space_for(path: &Path, required_bytes: u64) -> LauncherResult<()> {
