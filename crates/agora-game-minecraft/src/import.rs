@@ -1,3 +1,4 @@
+use crate::content_bridge::{EnrichOptions, EnrichTarget, MetadataSource};
 use crate::override_sanitizer::OverridePolicy;
 use agora_core::download::{sha1_hex, sha256_hex, sha512_hex};
 use agora_core::error::{LauncherError, LauncherResult};
@@ -877,7 +878,7 @@ pub fn import_mrpack_inner(
     skip_unfetchable: bool,
     install_anyway: bool,
     ctx: Option<&Ctx>,
-    metadata_source: Option<&dyn agora_core::library::MetadataSource>,
+    metadata_source: Option<&dyn MetadataSource>,
 ) -> LauncherResult<ImportResult> {
     let file = fs::File::open(mrpack_path).map_err(|e| LauncherError::Generic {
         code: "ERR_IMPORT_OPEN".into(),
@@ -916,7 +917,7 @@ pub fn import_mrpack_inner(
     let superseded = superseded_disabled_keys(&pack_supplied_keys(&archive, &index));
     let target = prepare_import_target(instances_root, &name)?;
 
-    let import_result = (|| -> LauncherResult<(usize, Vec<agora_core::library::EnrichTarget>)> {
+    let import_result = (|| -> LauncherResult<(usize, Vec<EnrichTarget>)> {
         let target_dir = &target.staging_dir;
         let total_files = index.files.len() as u32;
         let mut completed_files = 0u32;
@@ -1109,7 +1110,7 @@ pub fn import_mrpack_inner(
         // become store items and links. Doing it here means a stopped import stores nothing.
         // A Modrinth CDN URL names the project and version, so those are recorded without any
         // request; the description and icon are filled in afterwards when networking allows.
-        let mut enrich_targets: Vec<agora_core::library::EnrichTarget> = Vec::new();
+        let mut enrich_targets: Vec<EnrichTarget> = Vec::new();
         if let Some(ctx) = ctx {
             for (key, identity) in &content_candidates {
                 let Some(content_type) = crate::content_bridge::tracked_content_type(key) else {
@@ -1117,9 +1118,9 @@ pub fn import_mrpack_inner(
                 };
                 let source = target_dir.join(key);
                 let filename = key.rsplit('/').next().unwrap_or(key);
-                let version = identity
-                    .as_ref()
-                    .and_then(|identity| identity.version_id.as_deref());
+                // The CDN URL's version id is not a label players should read. It stays in
+                // provider_origin for the lookup; `version` is filled by the hash lookup.
+                let version = None;
                 let page_url = identity
                     .as_ref()
                     .map(|identity| modrinth_page_url(&identity.project_id, content_type));
@@ -1147,10 +1148,10 @@ pub fn import_mrpack_inner(
                     ctx, target_dir, key, &source, &details,
                 )? {
                     if let Some(identity) = identity {
-                        enrich_targets.push(agora_core::library::EnrichTarget {
+                        enrich_targets.push(EnrichTarget {
                             item_id: stored.item_id.clone(),
                             project_id: Some(identity.project_id.clone()),
-                            version: identity.version_id.clone(),
+                            version: None,
                         });
                     }
                     stored_content.insert(key.clone(), stored);
@@ -1299,20 +1300,19 @@ pub fn import_mrpack_inner(
 
     let warnings = match ctx {
         Some(ctx) if !enrich_targets.is_empty() => {
-            let options = agora_core::library::EnrichOptions {
+            let options = EnrichOptions {
                 provider: "modrinth",
                 game_id: Some("minecraft"),
                 prefer_title: true,
                 replace_page_url: true,
             };
-            let run = |source: &dyn agora_core::library::MetadataSource,
-                       warnings: &mut Vec<String>| {
+            let run = |source: &dyn MetadataSource, warnings: &mut Vec<String>| {
                 // Offline or Modrinth turned off: the ids are already recorded and the import
                 // is complete. Nothing is attempted, so there is nothing to warn about.
                 if source.available().is_err() {
                     return;
                 }
-                match agora_core::library::enrich_items(
+                match crate::content_bridge::enrich_store_items(
                     ctx,
                     source,
                     &enrich_targets,

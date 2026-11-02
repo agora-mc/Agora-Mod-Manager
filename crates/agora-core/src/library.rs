@@ -490,15 +490,24 @@ pub fn enrich_items(
         let Some(item) = items.get(&target.item_id) else {
             continue;
         };
-        if let Some(project_id) = target.project_id.clone().or_else(|| {
+        let known_project = target.project_id.clone().or_else(|| {
             item_provider(item)
                 .filter(|provider| *provider == options.provider)
                 .and(item.provider_id.clone())
-        }) {
-            if !project_id.trim().is_empty() {
-                project_of.insert(target.item_id.clone(), project_id);
-                continue;
-            }
+        });
+        let has_known_project = known_project
+            .as_deref()
+            .is_some_and(|project_id| !project_id.trim().is_empty());
+        if let Some(project_id) = known_project.filter(|_| has_known_project) {
+            project_of.insert(target.item_id.clone(), project_id);
+        }
+        // A provider id explains what the item is, but not which version the file is. The
+        // version label comes from the hash lookup, so an item still lacking one is hashed even
+        // when its project is known.
+        let needs_version = non_empty(item.version.clone()).is_none()
+            && non_empty(target.version.clone()).is_none();
+        if has_known_project && !needs_version {
+            continue;
         }
         let Some(file) = item.files.first() else {
             continue;
@@ -525,7 +534,9 @@ pub fn enrich_items(
                         continue;
                     };
                     for item_id in item_ids {
-                        project_of.insert(item_id.clone(), version.project_id.clone());
+                        project_of
+                            .entry(item_id.clone())
+                            .or_insert_with(|| version.project_id.clone());
                         if let Some(label) = version.version_number.clone() {
                             version_of.insert(item_id.clone(), label);
                         }

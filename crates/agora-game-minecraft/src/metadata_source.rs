@@ -12,11 +12,18 @@
 
 use std::collections::HashMap;
 
-use agora_core::ctx::Ctx;
-use agora_core::error::{LauncherError, LauncherResult};
-use agora_core::http_client::{self, ClientCategory};
-use agora_core::library::{MetadataSource, ProjectDetails, ProjectVersion};
+use agora_core::{
+    community_image,
+    ctx::Ctx,
+    error::{LauncherError, LauncherResult},
+    http_client::{self, ClientCategory},
+    library::{MetadataSource, ProjectDetails, ProjectVersion},
+    network_gate,
+};
 use serde::Deserialize;
+
+#[cfg(test)]
+use agora_core::db;
 
 const PROJECTS_URL: &str = "https://api.modrinth.com/v2/projects";
 const VERSIONS_FROM_HASHES_URL: &str = "https://api.modrinth.com/v2/version_files";
@@ -60,7 +67,7 @@ impl MetadataSource for ModrinthMetadataSource {
         // The Privacy switch first (a plain settings read, no network), then the process gate,
         // which is where Lockdown Mode is enforced.
         crate::modrinth::ModrinthService::new(self.ctx.clone()).check_network_enabled()?;
-        agora_core::network_gate::authorize(ClientCategory::Modrinth)
+        network_gate::authorize(ClientCategory::Modrinth)
     }
 
     fn projects(&self, project_ids: &[String]) -> LauncherResult<Vec<ProjectDetails>> {
@@ -153,7 +160,7 @@ impl MetadataSource for ModrinthMetadataSource {
             url,
             http_client::HostPolicy::AnyPublicHost,
         )?;
-        if agora_core::community_image::sniff_image(&bytes).is_none() {
+        if community_image::sniff_image(&bytes).is_none() {
             return Err(LauncherError::Generic {
                 code: "ERR_NOT_AN_IMAGE".into(),
                 message: "The project icon was not an image.".into(),
@@ -170,7 +177,7 @@ mod tests {
 
     struct PanicGate;
 
-    impl agora_core::network_gate::NetworkGate for PanicGate {
+    impl network_gate::NetworkGate for PanicGate {
         fn check(&self, _category: ClientCategory) -> LauncherResult<()> {
             panic!("the metadata source reached the network gate while the switch was off");
         }
@@ -182,14 +189,13 @@ mod tests {
         let ctx = crate::testing_context(tmp.path().join("data"));
         ctx.paths.create_required_dirs().unwrap();
         crate::content_bridge::init_local_state(&ctx);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::set_setting(&conn, "network_modrinth_enabled", &serde_json::json!(false))
-            .unwrap();
+        let conn = db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        db::set_setting(&conn, "network_modrinth_enabled", &serde_json::json!(false)).unwrap();
         drop(conn);
 
         // A local state with the Modrinth network switch off must answer first, without the
         // process gate or an HTTP client ever being consulted.
-        agora_core::network_gate::install(Arc::new(PanicGate));
+        network_gate::install(Arc::new(PanicGate));
         let source = ModrinthMetadataSource::new(ctx);
         let error = source.available().unwrap_err();
         assert_eq!(error.code(), "ERR_NETWORK_DISABLED");

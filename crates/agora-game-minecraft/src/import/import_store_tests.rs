@@ -3,6 +3,7 @@
 //! own.
 
 use super::*;
+use crate::content_bridge::{MetadataSource, ProjectDetails, ProjectVersion};
 use std::io::Write;
 
 fn store_ctx() -> (Ctx, tempfile::TempDir) {
@@ -443,7 +444,7 @@ fn a_pack_import_records_files_as_unchanged_and_items_as_used() {
     // The item the import created belongs to this instance, so it is not unused. The store holds
     // it and the instance scanned cleanly, so an empty listing means "in use", not "unreadable".
     assert_eq!(crate::content_bridge::store_item_count(&ctx), 1);
-    let listing = agora_core::library::list_unused(&ctx).unwrap();
+    let listing = crate::content_bridge::list_unused(&ctx).unwrap();
     assert!(listing.warnings.is_empty(), "{:?}", listing.warnings);
     assert!(
         listing.items.is_empty(),
@@ -475,7 +476,7 @@ struct SilentMetadataSource {
     calls: std::sync::atomic::AtomicUsize,
 }
 
-impl agora_core::library::MetadataSource for SilentMetadataSource {
+impl MetadataSource for SilentMetadataSource {
     fn available(&self) -> Result<(), LauncherError> {
         Err(LauncherError::Generic {
             code: "ERR_TEST_NETWORK_OFF".into(),
@@ -483,10 +484,7 @@ impl agora_core::library::MetadataSource for SilentMetadataSource {
         })
     }
 
-    fn projects(
-        &self,
-        _project_ids: &[String],
-    ) -> Result<Vec<agora_core::library::ProjectDetails>, LauncherError> {
+    fn projects(&self, _project_ids: &[String]) -> Result<Vec<ProjectDetails>, LauncherError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         panic!("a metadata request was made while the network was off");
     }
@@ -494,7 +492,7 @@ impl agora_core::library::MetadataSource for SilentMetadataSource {
     fn versions_from_hashes(
         &self,
         _hashes: &[String],
-    ) -> Result<Vec<agora_core::library::ProjectVersion>, LauncherError> {
+    ) -> Result<Vec<ProjectVersion>, LauncherError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         panic!("a metadata request was made while the network was off");
     }
@@ -510,11 +508,8 @@ struct AnsweringMetadataSource {
     project_calls: std::sync::atomic::AtomicUsize,
 }
 
-impl agora_core::library::MetadataSource for AnsweringMetadataSource {
-    fn projects(
-        &self,
-        project_ids: &[String],
-    ) -> Result<Vec<agora_core::library::ProjectDetails>, LauncherError> {
+impl MetadataSource for AnsweringMetadataSource {
+    fn projects(&self, project_ids: &[String]) -> Result<Vec<ProjectDetails>, LauncherError> {
         self.project_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail_projects {
@@ -525,7 +520,7 @@ impl agora_core::library::MetadataSource for AnsweringMetadataSource {
         }
         Ok(project_ids
             .iter()
-            .map(|id| agora_core::library::ProjectDetails {
+            .map(|id| ProjectDetails {
                 project_id: id.clone(),
                 title: Some("Sodium".into()),
                 description: Some("A modern rendering engine for Minecraft.".into()),
@@ -537,9 +532,16 @@ impl agora_core::library::MetadataSource for AnsweringMetadataSource {
 
     fn versions_from_hashes(
         &self,
-        _hashes: &[String],
-    ) -> Result<Vec<agora_core::library::ProjectVersion>, LauncherError> {
-        Ok(Vec::new())
+        hashes: &[String],
+    ) -> Result<Vec<ProjectVersion>, LauncherError> {
+        Ok(hashes
+            .iter()
+            .map(|hash| ProjectVersion {
+                hash: hash.clone(),
+                project_id: "PROJ".into(),
+                version_number: Some("1.3.9".into()),
+            })
+            .collect())
     }
 
     fn icon_bytes(&self, _url: &str) -> Result<Option<Vec<u8>>, LauncherError> {
@@ -549,11 +551,7 @@ impl agora_core::library::MetadataSource for AnsweringMetadataSource {
     }
 }
 
-fn imported_item(
-    ctx: &Ctx,
-    root: &Path,
-    instance_id: &str,
-) -> agora_core::content_store::ContentItem {
+fn imported_item(ctx: &Ctx, root: &Path, instance_id: &str) -> crate::content_bridge::ContentItem {
     let manifest = read_test_manifest(root, instance_id);
     let entry = manifest.mods.first().expect("the mod entry");
     crate::content_bridge::load_item(
@@ -597,7 +595,16 @@ fn an_offline_pack_import_records_project_ids_and_page_urls() {
     let item = imported_item(&ctx, &root, &imported.instance_id);
     assert_eq!(item.provider.as_deref(), Some("modrinth"));
     assert_eq!(item.provider_id.as_deref(), Some("PROJ"));
-    assert_eq!(item.version.as_deref(), Some("VER"));
+    assert!(
+        item.version.is_none(),
+        "an offline import leaves the human version absent; the CDN id is provenance, not a label"
+    );
+    assert!(
+        item.provider_origin
+            .as_deref()
+            .is_some_and(|origin| origin.contains("VER")),
+        "the version id stays in the provider fields for the lookup"
+    );
     assert_eq!(
         item.page_url.as_deref(),
         Some("https://modrinth.com/mod/PROJ")
@@ -661,6 +668,11 @@ fn a_pack_import_saves_descriptions_titles_and_icons_when_modrinth_answers() {
     assert_eq!(
         item.name, "Sodium",
         "the project title replaces the file name"
+    );
+    assert_eq!(
+        item.version.as_deref(),
+        Some("1.3.9"),
+        "the hash lookup supplies the human version label"
     );
     assert_eq!(
         item.page_url.as_deref(),

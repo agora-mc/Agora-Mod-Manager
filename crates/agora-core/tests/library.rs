@@ -699,6 +699,7 @@ fn set_provider(ctx: &Ctx, item_id: &str, provider_id: &str) {
         ctx,
         item_id,
         ItemMetadata {
+            version: Some("1.0.0".into()),
             provider: Some("modrinth".into()),
             provider_id: Some(provider_id.into()),
             ..Default::default()
@@ -725,6 +726,7 @@ fn filling_missing_details_fills_only_what_is_missing_and_batches_the_lookup() {
         ItemMetadata {
             description: Some("Keep this.".into()),
             page_url: Some("https://keep.invalid/page".into()),
+            version: Some("1.0.0".into()),
             provider: Some("modrinth".into()),
             provider_id: Some("project0".into()),
             ..Default::default()
