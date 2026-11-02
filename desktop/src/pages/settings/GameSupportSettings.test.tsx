@@ -39,18 +39,18 @@ describe('GameSupportSettings', () => {
   it('lists every game with its source, and locks Minecraft on with the reason', async () => {
     render(<GameSupportSettings />);
 
-    const minecraft = await screen.findByRole('checkbox', { name: 'Offer Minecraft: Java Edition' });
+    const minecraft = await screen.findByRole('switch', { name: 'Offer Minecraft: Java Edition' });
     expect(minecraft).toBeChecked();
     expect(minecraft).toBeDisabled();
     expect(screen.getByText(/Always on: Agora falls back to Minecraft/)).toBeInTheDocument();
 
-    const skyrim = screen.getByRole('checkbox', { name: 'Offer Skyrim Special Edition' });
+    const skyrim = screen.getByRole('switch', { name: 'Offer Skyrim Special Edition' });
     expect(skyrim).toBeChecked();
     expect(skyrim).toBeEnabled();
     // Minecraft and Skyrim are both built in; only Valheim comes from a plugin.
     expect(screen.getAllByText(/^Built in/)).toHaveLength(2);
 
-    const valheim = screen.getByRole('checkbox', { name: 'Offer Valheim' });
+    const valheim = screen.getByRole('switch', { name: 'Offer Valheim' });
     expect(valheim).not.toBeChecked();
     expect(screen.getByText('From plugin agora-tracer.valheim')).toBeInTheDocument();
   });
@@ -60,7 +60,7 @@ describe('GameSupportSettings', () => {
     render(<GameSupportSettings />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent('games_support_list did not return a list of games.');
-    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(screen.queryByRole('switch')).toBeNull();
     expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
   });
 
@@ -75,7 +75,7 @@ describe('GameSupportSettings', () => {
     });
     render(<GameSupportSettings />);
     fireEvent.click(await screen.findByRole('button', { name: 'Try again' }));
-    expect(await screen.findByRole('checkbox', { name: 'Offer Valheim' })).toBeInTheDocument();
+    expect(await screen.findByRole('switch', { name: 'Offer Valheim' })).toBeInTheDocument();
   });
 
   it('offers Add game folder for a game discovery did not find, and marks it found after the add', async () => {
@@ -114,10 +114,10 @@ describe('GameSupportSettings', () => {
   it('turns a game on and records it, sending the id and state', async () => {
     render(<GameSupportSettings />);
 
-    const valheim = await screen.findByRole('checkbox', { name: 'Offer Valheim' });
+    const valheim = await screen.findByRole('switch', { name: 'Offer Valheim' });
     fireEvent.click(valheim);
 
-    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Offer Valheim' })).toBeChecked());
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Offer Valheim' })).toBeChecked());
     expect(invokeMock).toHaveBeenCalledWith('games_support_set_enabled', { gameId: 'valheim', enabled: true });
     expect(screen.queryByRole('alert')).toBeNull();
   });
@@ -130,11 +130,11 @@ describe('GameSupportSettings', () => {
     });
     render(<GameSupportSettings />);
 
-    const skyrim = await screen.findByRole('checkbox', { name: 'Offer Skyrim Special Edition' });
+    const skyrim = await screen.findByRole('switch', { name: 'Offer Skyrim Special Edition' });
     fireEvent.click(skyrim);
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Skyrim Special Edition was not changed. No game is known as');
-    expect(screen.getByRole('checkbox', { name: 'Offer Skyrim Special Edition' })).toBeChecked();
+    expect(screen.getByRole('switch', { name: 'Offer Skyrim Special Edition' })).toBeChecked();
   });
 
   it('marks a game from a verified official plugin and explains an unverified one', async () => {

@@ -328,7 +328,7 @@ test('the Library shows the mods for this game and those that name none; a switc
   await expect(page.getByText('Skyrim Lighting')).toBeVisible();
   await expect(page.getByText('Fallout Texture Pack')).toHaveCount(0);
 
-  await page.getByLabel('Show mods for every game').check();
+  await page.getByLabel('Show mods for every game').click();
   await expect(rows).toHaveCount(3);
   await expect(page.getByText('Fallout Texture Pack')).toBeVisible();
 });

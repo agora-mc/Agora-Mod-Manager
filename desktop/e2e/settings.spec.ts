@@ -191,13 +191,13 @@ test('boolean settings are sent to Tauri as JSON booleans', async ({ page }) => 
   // General > Basics is the landing section, so the install toggles are here.
   await expect(page.getByLabel('Always auto-confirm installs', { exact: true })).toBeDisabled();
 
-  await page.getByLabel('Auto-confirm clean installs', { exact: true }).check();
+  await page.getByLabel('Auto-confirm clean installs', { exact: true }).click();
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'install_auto_confirm_clean',
     value: true,
   });
 
-  await page.getByLabel('Always auto-confirm installs', { exact: true }).check();
+  await page.getByLabel('Always auto-confirm installs', { exact: true }).click();
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'install_always_auto_confirm',
     value: true,
@@ -206,7 +206,7 @@ test('boolean settings are sent to Tauri as JSON booleans', async ({ page }) => 
   await page.getByRole('navigation', { name: 'Settings sections' })
     .getByRole('tab', { name: 'Services' }).click();
   await expect(page.getByText('Modrinth Integration', { exact: true })).toBeVisible();
-  await page.locator('#settings-services input[type="checkbox"]').first().check();
+  await page.locator('#settings-services').getByRole('switch').first().click();
 
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'modrinth_enabled',

@@ -125,7 +125,7 @@ describe('InstanceEditor reload after mutations', () => {
     await openEditor();
     fireEvent.click(screen.getByRole('button', { name: 'Java & Args' }));
     const before = await screen.findByLabelText('Pre-touch allocated memory');
-    expect((before as HTMLInputElement).checked).toBe(true);
+    expect(before).toHaveAttribute('aria-checked', 'true');
 
     fireEvent.click(screen.getByRole('button', { name: 'Templates' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }));
@@ -133,7 +133,7 @@ describe('InstanceEditor reload after mutations', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Java & Args' }));
     const after = await screen.findByLabelText('Pre-touch allocated memory');
-    await waitFor(() => expect((after as HTMLInputElement).checked).toBe(false));
+    await waitFor(() => expect(after).toHaveAttribute('aria-checked', 'false'));
   });
 
   it('shows the restored state after a snapshot restore', async () => {
