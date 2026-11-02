@@ -1310,6 +1310,7 @@ impl agora_core::game_launch::Launcher for FakeLauncher {
                 expected_exe: None,
             },
             program: prepared.resolved.program.clone(),
+            output: None,
         })
     }
 }
@@ -1939,12 +1940,26 @@ fn cmd_game(cmd_args: &[&str]) -> GameDefinition {
 
 #[cfg(windows)]
 fn cmd_fixture(def: &GameDefinition) -> (TempDir, CoreContext, GameInstanceRecord, String) {
+    fixture_with_program(def, Path::new(r"C:\Windows\System32\cmd.exe"))
+}
+
+/// The same fixture with this workspace's file-operation helper as the "game".
+#[cfg(windows)]
+fn tool_fixture(def: &GameDefinition) -> (TempDir, CoreContext, GameInstanceRecord, String) {
+    fixture_with_program(def, Path::new(env!("CARGO_BIN_EXE_agora-tool-test-helper")))
+}
+
+#[cfg(windows)]
+fn fixture_with_program(
+    def: &GameDefinition,
+    program: &Path,
+) -> (TempDir, CoreContext, GameInstanceRecord, String) {
     let tmp = TempDir::new().unwrap();
     let ctx = create_test_context(&tmp, def);
     let install_dir = tmp.path().join("install");
     std::fs::create_dir_all(&install_dir).unwrap();
     setup_fake_install(&install_dir);
-    std::fs::copy(r"C:\Windows\System32\cmd.exe", install_dir.join("Game.exe")).unwrap();
+    std::fs::copy(program, install_dir.join("Game.exe")).unwrap();
     let install = make_test_install(&install_dir, true, true);
     let inst = create_pinned_instance(&ctx, &install, def, "Injected");
     let item = add_content_folder(&ctx, "Mod", &[("Data/mod.txt", b"original")]);
@@ -1961,8 +1976,8 @@ fn cmd_fixture(def: &GameDefinition) -> (TempDir, CoreContext, GameInstanceRecor
 #[test]
 #[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
 fn real_injection_a_write_to_a_deployed_file_lands_in_the_writable_layer() {
-    let def = cmd_game(&["/c", "echo", "changed>", r"Data\mod.txt"]);
-    let (_tmp, ctx, inst, sha) = cmd_fixture(&def);
+    let def = cmd_game(&["--write", "Data/mod.txt", "--content", "changed"]);
+    let (_tmp, ctx, inst, sha) = tool_fixture(&def);
     let id = &inst.instance_id;
     let launcher = RealDllLauncher(built_dll());
 
@@ -1979,7 +1994,7 @@ fn real_injection_a_write_to_a_deployed_file_lands_in_the_writable_layer() {
         launched.prepared.notice
     );
     let status = launched.launched.child.wait().unwrap();
-    assert!(status.success(), "cmd exited with {status}");
+    assert!(status.success(), "the game exited with {status}");
 
     let object = ctx.paths.content_object_path(&sha);
     assert_eq!(

@@ -58,6 +58,16 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
         ...table.replies,
       };
       const sequences: Record<string, unknown[]> = {};
+      // An exhausted sequence keeps answering its last reply. A page may ask again for the same
+      // command (React StrictMode runs effects twice in the dev config), and the scripted answer
+      // that was true for the second call stays the true one until the test changes it.
+      const sequenceLast: Record<string, unknown> = {};
+      // A command may be asked twice in the same task (React StrictMode runs an effect twice in
+      // the dev config). Both calls must see the same scripted answer, or the second step of a
+      // sequence would be used before the thing it answers for has happened. Calls in later tasks
+      // advance the sequence.
+      const turnReplies: Record<string, unknown> = {};
+      const turnPending: Record<string, boolean> = {};
       for (const [command, queue] of Object.entries(table.sequences ?? {})) {
         sequences[command] = [...queue];
       }
@@ -101,8 +111,26 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
               return Promise.resolve(null);
             }
             const queued = sequences[command];
-            if (Array.isArray(queued) && queued.length > 0) {
-              const next = queued.shift();
+            const scripted =
+              Array.isArray(queued) || Object.prototype.hasOwnProperty.call(sequenceLast, command);
+            if (scripted) {
+              if (turnPending[command]) {
+                const held = turnReplies[command];
+                return Promise.resolve(Array.isArray(held) ? structuredClone(held) : held);
+              }
+              let next: unknown;
+              if (Array.isArray(queued) && queued.length > 0) {
+                next = queued.shift();
+                sequenceLast[command] = next;
+              } else {
+                next = sequenceLast[command];
+              }
+              turnReplies[command] = next;
+              turnPending[command] = true;
+              setTimeout(() => {
+                delete turnPending[command];
+                delete turnReplies[command];
+              }, 0);
               return Promise.resolve(Array.isArray(next) ? structuredClone(next) : next);
             }
             if (Object.prototype.hasOwnProperty.call(replies, command)) {

@@ -289,6 +289,12 @@ pub struct RunOutcome {
     /// file or text that failed it (MASTER_SPEC §26.9). `None` for a promoted run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// The last of what the tool wrote to stdout and stderr, kept so a failed run can say why.
+    /// `CAPTURED_OUTPUT_LIMIT` bytes at most per stream.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stdout_tail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr_tail: String,
     /// The content layer whose files were copied for this run, because it provides the tool's
     /// executable: the tool may then rewrite its own files (MASTER_SPEC §26.9). `None` when no
     /// content layer was copied, as under the virtual file system.
@@ -1407,6 +1413,53 @@ fn release_session(
 struct TreeExit {
     code: Option<i32>,
     cancelled: bool,
+    output: crate::game_launch::CapturedOutput,
+}
+
+impl TreeExit {
+    /// Why a run was discarded because the tool did not exit cleanly, with the last of what it
+    /// said so the player is not left with only the code.
+    fn failed_with_code(&self, code: Option<i32>) -> String {
+        let base = match code {
+            Some(code) => format!("the tool exited with code {code}"),
+            None => "the tool exited with no exit code".to_string(),
+        };
+        self.with_output(base)
+    }
+
+    /// Add the last of the tool's output to a failure reason, when it said anything.
+    fn with_output(&self, base: String) -> String {
+        let mut said = String::new();
+        for (name, text) in [
+            ("stdout", &self.output.stdout),
+            ("stderr", &self.output.stderr),
+        ] {
+            let tail = failure_tail(text);
+            if !tail.is_empty() {
+                if !said.is_empty() {
+                    said.push('\n');
+                }
+                said.push_str(&format!("{name}:\n{tail}"));
+            }
+        }
+        if said.is_empty() {
+            base
+        } else {
+            format!("{base}. It said:\n{said}")
+        }
+    }
+}
+
+/// The last of a stream that belongs in a failure message: a few lines, not the whole capture.
+fn failure_tail(text: &str) -> &str {
+    const CHARS: usize = 2000;
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    text[start..].trim()
 }
 
 /// Wait for the tool and every process it started from `dir` to end. A cancel ends them all.
@@ -1436,7 +1489,12 @@ fn wait_for_tree(dir: &Path, launched: &mut LaunchedGame, cancel: &CancellationT
         }
         std::thread::sleep(POLL);
     }
-    TreeExit { code, cancelled }
+    let output = launched.finish_output();
+    TreeExit {
+        code,
+        cancelled,
+        output,
+    }
 }
 
 fn kill_from(dir: &Path) {
@@ -1603,10 +1661,23 @@ fn promote(
     Ok((next_name, current.map(|g| g.generation), deletions))
 }
 
-/// Keep a discarded run's folder as `failed-<run>`, and the newest few of those.
-fn discard(dir: &Path, staging: &Path, run: &str) -> Result<PathBuf, ToolError> {
+/// Keep a discarded run's folder as `failed-<run>`, and the newest few of those. The tool's last
+/// output goes beside the run's files, so the player can see why it failed.
+fn discard(dir: &Path, staging: &Path, run: &str, exit: &TreeExit) -> Result<PathBuf, ToolError> {
     let failed = dir.join(format!("failed-{run}"));
     std::fs::rename(staging, &failed)?;
+    if !exit.output.stdout.is_empty() {
+        std::fs::write(
+            failed.join("tool-stdout.txt"),
+            exit.output.stdout.as_bytes(),
+        )?;
+    }
+    if !exit.output.stderr.is_empty() {
+        std::fs::write(
+            failed.join("tool-stderr.txt"),
+            exit.output.stderr.as_bytes(),
+        )?;
+    }
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -2317,7 +2388,7 @@ fn run_under_vfs(
     let log_from = game_launch::log_len(&log);
     // The real install is watched from just before the tool starts until it exits (MASTER_SPEC §26.9).
     let watch = InstallWatch::start(&base.source_location);
-    let mut launched = match launcher.launch(&prepared) {
+    let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
             release_session(ctx, definition, &store)?;
@@ -2461,7 +2532,7 @@ fn run_from_links(
 
     // The real install is watched from just before the tool starts until it exits (MASTER_SPEC §26.9).
     let watch = InstallWatch::start(&base.source_location);
-    let mut launched = match launcher.launch(&prepared) {
+    let mut launched = match launcher.launch_capturing(&prepared) {
         Ok(launched) => launched,
         Err(e) => {
             release_session(ctx, definition, &store)?;
@@ -2611,7 +2682,7 @@ fn run_by_swap(
     prepared_launch.deployment = Some(DeployMode::Copies);
 
     let watch = InstallWatch::start(&install);
-    let mut launched = match launcher.launch(&prepared_launch) {
+    let mut launched = match launcher.launch_capturing(&prepared_launch) {
         Ok(launched) => launched,
         Err(e) => {
             let _ = watch.finish();
@@ -2849,6 +2920,8 @@ fn outcome(
         cancelled: exit.cancelled,
         failed_folder: settled.failed_folder,
         failure: settled.failure,
+        stdout_tail: exit.output.stdout.clone(),
+        stderr_tail: exit.output.stderr.clone(),
         copied_layer: None,
         install_changes: InstallChanges::default(),
         swap: None,
@@ -2893,7 +2966,7 @@ fn capture_from_links(
         })
         .collect();
     if !linked.is_empty() {
-        let failed = discard(dir, staging, run)?;
+        let failed = discard(dir, staging, run, exit)?;
         // A refused run is a discarded run too, though it returns no outcome to carry an offer.
         note_discard(dir, false, false);
         return Err(ToolError::LinkedFileChanged {
@@ -3158,28 +3231,25 @@ fn settle_mod_output(
 ) -> Result<Settled, ToolError> {
     let written = written_files(staging)?;
     let failure = if exit.cancelled {
-        Some("the run was cancelled".to_string())
+        Some(exit.with_output("the run was cancelled".to_string()))
     } else if exit.code != Some(0) {
-        Some(match exit.code {
-            Some(code) => format!("the tool exited with code {code}"),
-            None => "the tool exited with no exit code".to_string(),
-        })
+        Some(exit.failed_with_code(exit.code))
     } else {
         match crate::content_store::collect_folder_files(folder) {
             Ok(files) if !files.is_empty() => None,
-            Ok(_) => Some(format!(
+            Ok(_) => Some(exit.with_output(format!(
                 "the tool exited with code 0 but its output folder '{}' has no files, so nothing was imported",
                 folder.display()
-            )),
-            Err(e) => Some(format!(
+            ))),
+            Err(e) => Some(exit.with_output(format!(
                 "the tool exited with code 0 but its output folder '{}' could not be read: {e}",
                 folder.display()
-            )),
+            ))),
         }
     };
     let current = current_mod_output(ctx, instance_id, &tool.id)?;
     if let Some(failure) = failure {
-        let failed = discard(dir, staging, run)?;
+        let failed = discard(dir, staging, run, exit)?;
         if tool.output_arg.is_some() {
             let _ = std::fs::remove_dir_all(folder);
         }
@@ -3251,14 +3321,12 @@ fn settle_run(
     }
     let written = written_files(staging)?;
     let failure = if exit.cancelled {
-        Some("the run was cancelled".to_string())
+        Some(exit.with_output("the run was cancelled".to_string()))
     } else if exit.code != Some(0) {
-        Some(match exit.code {
-            Some(code) => format!("the tool exited with code {code}"),
-            None => "the tool exited with no exit code".to_string(),
-        })
+        Some(exit.failed_with_code(exit.code))
     } else {
         output_check(ctx, instance_id, definition, tool, staging, &written)?
+            .map(|failure| exit.with_output(failure))
     };
     let promoted = failure.is_none();
     if promoted {
@@ -3281,7 +3349,7 @@ fn settle_run(
             failure: None,
         });
     }
-    let failed = discard(dir, staging, run)?;
+    let failed = discard(dir, staging, run, exit)?;
     Ok(Settled {
         written,
         promoted,

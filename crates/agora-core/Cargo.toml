@@ -10,6 +10,12 @@ description = "Agora launcher core — shared business logic for the Tauri GUI, 
 name = "agora_core"
 path = "src/lib.rs"
 
+# A test tool that does the file operations some tests need, instead of a copy of the machine's
+# `cmd.exe`. Integration tests reach it through `CARGO_BIN_EXE_agora-tool-test-helper`.
+[[bin]]
+name = "agora-tool-test-helper"
+path = "src/bin/agora-tool-test-helper.rs"
+
 [features]
 test-support = []
 

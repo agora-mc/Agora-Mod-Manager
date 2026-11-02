@@ -408,6 +408,18 @@ pub enum ProxySetting {
 }
 
 impl ProxySetting {
+    /// The setting as it may be printed: a manual proxy URL keeps its host and user name but
+    /// never its password (CodeQL rust/cleartext-logging).
+    pub fn redacted(&self) -> ProxySetting {
+        match self {
+            ProxySetting::Manual { url, username } => ProxySetting::Manual {
+                url: redact_proxy_url(url),
+                username: username.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// Refuse a manual proxy reqwest could not use, before it is saved.
     pub fn validate(&self) -> LauncherResult<()> {
         if let ProxySetting::Manual { url, .. } = self {
@@ -427,6 +439,42 @@ impl ProxySetting {
         }
         Ok(())
     }
+}
+
+/// A proxy URL with its password replaced, for showing to the player. A URL without credentials
+/// is returned as it was. An unparseable one is still stripped of anything before an `@`, so a
+/// typo cannot print a secret either.
+pub fn redact_proxy_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Ok(mut parsed) = reqwest::Url::parse(trimmed) else {
+        return redact_raw_userinfo(trimmed);
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return url.to_string();
+    }
+    if parsed.username().is_empty() {
+        let _ = parsed.set_password(None);
+        let _ = parsed.set_username("***");
+    } else {
+        let _ = parsed.set_password(Some("***"));
+    }
+    parsed.to_string()
+}
+
+fn redact_raw_userinfo(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_string();
+    };
+    let Some((userinfo, host)) = rest.rsplit_once('@') else {
+        return raw.to_string();
+    };
+    let user = userinfo.split(':').next().unwrap_or_default();
+    let shown = if user.is_empty() {
+        "***".to_string()
+    } else {
+        format!("{user}:***")
+    };
+    format!("{scheme}://{shown}@{host}")
 }
 
 static PROXY: std::sync::RwLock<Option<ProxySetting>> = std::sync::RwLock::new(None);
@@ -2253,6 +2301,28 @@ mod tests {
         assert!(!category_allowlist(ClientCategory::Loader).is_empty());
         assert!(!category_allowlist(ClientCategory::MojangContent).is_empty());
         assert!(!category_allowlist(ClientCategory::Registry).is_empty());
+    }
+
+    #[test]
+    fn a_proxy_url_is_shown_without_its_password() {
+        let shown = redact_proxy_url("http://alice:s3cret@proxy.example:8080");
+        assert!(shown.contains("alice:***@proxy.example:8080"), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+
+        let shown = redact_proxy_url("socks5h://proxy.example:1080");
+        assert_eq!(shown, "socks5h://proxy.example:1080");
+
+        let shown = redact_proxy_url("http://:s3cret@proxy.example:8080");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("***@proxy.example:8080"), "{shown}");
+
+        let setting = ProxySetting::Manual {
+            url: "http://alice:s3cret@proxy.example:8080".into(),
+            username: Some("alice".into()),
+        };
+        let shown = serde_json::to_string(&setting.redacted()).unwrap();
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("alice:***@proxy.example:8080"), "{shown}");
     }
 }
 
