@@ -151,6 +151,64 @@ pub fn start_path(located: &Located, cfg: &RuntimeConfig) -> Start {
     }
 }
 
+/// The rel with `.` components dropped and `..` resolved. `None` when it would leave the view
+/// (a `..` above the root, or a leading separator that would make `Path::join` replace the upper),
+/// contains an alternate data stream (`:`), or names a Windows device. Every rel that becomes a
+/// path on disk must pass this first.
+pub fn normalize_rel(rel: &str) -> Option<String> {
+    if rel.is_empty() {
+        return Some(String::new());
+    }
+    if rel.contains(':') || rel.starts_with(['\\', '/']) {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rel.split(['\\', '/']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ if is_device_name(part) => return None,
+            _ => parts.push(part),
+        }
+    }
+    Some(parts.join("\\"))
+}
+
+/// A Win32 device name (`CON`, `NUL`, `COM1`, ...) in any case and with or without an extension:
+/// such a name opens the device, not a file in the upper layer.
+fn is_device_name(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
+    matches!(
+        agora_game_api::fold_path_case(stem).as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+            | "conin$"
+            | "conout$"
+    )
+}
+
 /// `<upper>\.agvfs-wh\<rel>.wh`, a marker file. The suffix keeps the marker for a folder distinct
 /// from the folder that holds the markers of its children.
 pub fn whiteout_path(rel: &str, upper: &Path) -> PathBuf {
@@ -188,28 +246,57 @@ pub enum Resolved {
 }
 
 pub fn resolve(rel: &str, cfg: &RuntimeConfig) -> Resolved {
+    let Some(rel) = normalize_rel(rel) else {
+        return Resolved::Missing;
+    };
     if rel.is_empty() {
         return Resolved::Missing; // the mount folder itself: the real one
     }
-    if whited_out(rel, &cfg.upper) {
+    if whited_out_tree(&rel, &cfg.upper) {
         return Resolved::WhitedOut;
     }
-    let upper = cfg.upper.join(rel);
+    let upper = cfg.upper.join(&rel);
     if upper.exists() {
         return Resolved::Upper(upper);
     }
-    match in_any_lower(rel, &cfg.lowers) {
+    match in_any_lower(&rel, &cfg.lowers) {
         Some(p) => Resolved::Lower(p),
         None => Resolved::Missing,
     }
 }
 
+/// `rel`, or a folder above it, has a whiteout marker: deleting a folder hides everything below it,
+/// as it would on a real disk.
+fn whited_out_tree(rel: &str, upper: &Path) -> bool {
+    if whited_out(rel, upper) {
+        return true;
+    }
+    let mut end = 0;
+    while let Some(sep) = rel[end..].find('\\') {
+        if whited_out(&rel[..end + sep], upper) {
+            return true;
+        }
+        end += sep + 1;
+    }
+    false
+}
+
+/// `rel` must already be normalized (see [`normalize_rel`]).
 pub fn upper_for_write(rel: &str, upper_root: &Path) -> PathBuf {
     let p = upper_root.join(rel);
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     p
+}
+
+/// A delete-on-close handle that closes: if a lower layer holds the same path, the lower file would
+/// reappear once the handle (and the upper copy, when it was copied up) is gone, so record a
+/// whiteout. The caller still closes the real handle.
+pub fn note_close(t: &crate::Tracked, cfg: &RuntimeConfig) {
+    if t.delete_on_close && in_any_lower(&t.rel, &cfg.lowers).is_some() {
+        add_whiteout(&t.rel, &cfg.upper);
+    }
 }
 
 #[cfg(windows)]
@@ -224,53 +311,84 @@ pub fn roots() -> &'static Mutex<HashMap<usize, Option<Located>>> {
 /// as a name relative to the current-directory handle, which the process opened before our hooks
 /// existed, so untracked handles are asked for their path.
 #[cfg(windows)]
-pub unsafe fn rel_of_handle(handle: HANDLE, cfg: &RuntimeConfig) -> Option<Located> {
+pub unsafe fn rel_of_handle(
+    handle: HANDLE,
+    cfg: &RuntimeConfig,
+) -> Result<Option<Located>, Unresolved> {
     if let Some(t) = handles().lock().unwrap().get(&(handle as usize)) {
-        return Some(Located {
+        return Ok(Some(Located {
             rel: t.rel.clone(),
             via: t.via,
-        });
+        }));
     }
     if let Some(cached) = roots().lock().unwrap().get(&(handle as usize)) {
-        return cached.clone();
+        return Ok(cached.clone());
     }
+    // A name can be longer than MAX_PATH; grow the buffer to the length Windows asks for. A path
+    // beyond what NT can name means the handle is not a plain file handle, which the caller may
+    // not pass a write through.
+    const MAX_NAME_UNITS: usize = 32_768;
     let mut buf = vec![0u16; 1024];
-    let n = windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(
-        handle,
-        buf.as_mut_ptr(),
-        buf.len() as u32,
-        0,
-    );
-    let located = if n == 0 || n as usize >= buf.len() {
+    let n = loop {
+        let n = windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(
+            handle,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            0,
+        ) as usize;
+        if n == 0 {
+            break 0;
+        }
+        if n < buf.len() {
+            break n;
+        }
+        if n + 1 > MAX_NAME_UNITS {
+            return Err(Unresolved);
+        }
+        buf.resize(n + 1, 0);
+    };
+    let located = if n == 0 {
         None
     } else {
-        let path = String::from_utf16_lossy(&buf[..n as usize]);
+        let path = String::from_utf16_lossy(&buf[..n]);
         locate(path.strip_prefix(r"\\?\").unwrap_or(&path), cfg)
     };
     roots()
         .lock()
         .unwrap()
         .insert(handle as usize, located.clone());
-    located
+    Ok(located)
 }
 
+/// A handle's path could not be read, so a name relative to it cannot be mapped to the view.
 #[cfg(windows)]
-pub unsafe fn rel_of_attrs(oa: *const ObjectAttributes, cfg: &RuntimeConfig) -> Option<Located> {
+#[derive(Debug, Clone, Copy)]
+pub struct Unresolved;
+
+#[cfg(windows)]
+pub unsafe fn rel_of_attrs(
+    oa: *const ObjectAttributes,
+    cfg: &RuntimeConfig,
+) -> Result<Option<Located>, Unresolved> {
     if oa.is_null() {
-        return None;
+        return Ok(None);
     }
-    let name = unicode((*oa).object_name)?;
+    let Some(name) = unicode((*oa).object_name) else {
+        return Ok(None);
+    };
     if (*oa).root_directory.is_null() || name.starts_with('\\') {
-        return locate(&name, cfg);
+        return Ok(locate(&name, cfg));
     }
-    let root = rel_of_handle((*oa).root_directory, cfg)?;
+    let Some(root) = rel_of_handle((*oa).root_directory, cfg)? else {
+        return Ok(None);
+    };
     let name = name.trim_end_matches('\\');
     let rel = match (root.rel.is_empty(), name.is_empty()) {
         (_, true) => root.rel,
         (true, false) => name.to_string(),
         (false, false) => format!("{}\\{name}", root.rel),
     };
-    Some(Located { rel, via: root.via })
+    Ok(Some(Located { rel, via: root.via }))
 }
 
 /// Work out the NT names of the mount and of each alias that the DLL recognises: every form that

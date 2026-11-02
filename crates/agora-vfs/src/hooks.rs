@@ -172,14 +172,52 @@ pub enum Plan {
     },
 }
 
+/// `path:stream`, for an NTFS alternate data stream.
+fn with_stream(path: PathBuf, stream: Option<&str>) -> PathBuf {
+    match stream {
+        Some(s) => {
+            let mut os = path.into_os_string();
+            os.push(":");
+            os.push(s);
+            PathBuf::from(os)
+        }
+        None => path,
+    }
+}
+
+/// Splits a rel into a normalized base path and its alternate data stream, if any. A `:` is only a
+/// stream separator in the final component; anywhere else, or an empty base, is not a plain path.
+fn split_stream(rel: &str) -> Option<(String, Option<&str>)> {
+    let Some(colon) = rel.find(':') else {
+        return normalize_rel(rel).map(|base| (base, None));
+    };
+    let (base, rest) = rel.split_at(colon);
+    let stream = &rest[1..];
+    if base.is_empty() || stream.is_empty() || stream.contains(['\\', '/']) {
+        return None;
+    }
+    normalize_rel(base).map(|base| (base, Some(stream)))
+}
+
 pub fn plan_open(
     rel: String,
     via: Via,
-    access: u32,
+    mut access: u32,
     disposition: u32,
     options: u32,
     cfg: &RuntimeConfig,
 ) -> Plan {
+    let (base, stream) = match split_stream(&rel) {
+        Some(parts) => parts,
+        None => {
+            log(format!("refused a name outside the view: {rel:?}"));
+            return Plan::Fail(STATUS_OBJECT_PATH_INVALID);
+        }
+    };
+    let rel = match stream {
+        Some(s) => format!("{base}:{s}"),
+        None => base.clone(),
+    };
     let wants_write = access & WRITE_RIGHTS != 0;
     let truncates = matches!(
         disposition,
@@ -197,9 +235,16 @@ pub fn plan_open(
         delete_on_close: false,
         dir,
     };
-    match resolve(&rel, cfg) {
-        Resolved::Missing if rel.is_empty() => {
-            // The mount folder itself: open the real one, list it merged.
+    match resolve(&base, cfg) {
+        Resolved::Missing if base.is_empty() => {
+            // The mount folder itself: open the real one, list it merged. It is a lower-layer
+            // folder, so the handle must not carry rights to delete or change it: set_info only
+            // intercepts handles tracked as lower, and a rename or delete through this one would
+            // reach the real folder.
+            access = (access & !(WRITE_RIGHTS | DELETE_ACCESS | MAXIMUM_ALLOWED))
+                | GENERIC_READ
+                | GENERIC_EXECUTE
+                | SYNCHRONIZE;
             let path = PathBuf::from(&cfg.mount_original);
             Plan::Open {
                 path,
@@ -212,7 +257,7 @@ pub fn plan_open(
         Resolved::Upper(path) => {
             let dir = path.is_dir();
             Plan::Open {
-                path,
+                path: with_stream(path, stream),
                 access,
                 disposition,
                 options,
@@ -221,7 +266,11 @@ pub fn plan_open(
         }
         Resolved::Lower(lower) => {
             if lower.is_dir() {
-                if disposition == FILE_CREATE {
+                if stream.is_some() && (wants_write || truncates) {
+                    // A folder cannot be copied up, so writing its stream would change the lower.
+                    return Plan::Fail(STATUS_ACCESS_DENIED);
+                }
+                if disposition == FILE_CREATE && stream.is_none() {
                     return Plan::Fail(STATUS_OBJECT_NAME_COLLISION);
                 }
                 // Directories are only ever read from a lower layer.
@@ -236,20 +285,21 @@ pub fn plan_open(
                     dir: true,
                 };
                 return Plan::Open {
-                    path: lower,
+                    path: with_stream(lower, stream),
                     access,
                     disposition: FILE_OPEN,
                     options: options & !FILE_DELETE_ON_CLOSE,
                     track,
                 };
             }
-            if disposition == FILE_CREATE {
+            if disposition == FILE_CREATE && stream.is_none() {
                 return Plan::Fail(STATUS_OBJECT_NAME_COLLISION);
             }
             if wants_write || truncates {
-                // Copy up. A whole-file rewrite needs no copy of the old bytes.
-                let upper = upper_for_write(&rel, &cfg.upper);
-                if !truncates {
+                // Copy up. A whole-file rewrite needs no copy of the old bytes, but a stream write
+                // always does: the file's data must survive while the stream is written beside it.
+                let upper = upper_for_write(&base, &cfg.upper);
+                if !truncates || stream.is_some() {
                     if let Err(e) = std::fs::copy(&lower, &upper) {
                         log(format!("copy-up {rel} failed: {e}"));
                         return Plan::Fail(STATUS_ACCESS_DENIED);
@@ -261,7 +311,11 @@ pub fn plan_open(
                 } else {
                     log(format!("redirect rewrite {rel}"));
                 }
-                let disposition = if disposition == FILE_OVERWRITE {
+                let disposition = if disposition == FILE_CREATE {
+                    // Whether this stream already exists in the lower file is not visible here, so
+                    // let the upper copy take it either way.
+                    FILE_OPEN_IF
+                } else if disposition == FILE_OVERWRITE {
                     FILE_OVERWRITE_IF
                 } else {
                     disposition
@@ -274,7 +328,7 @@ pub fn plan_open(
                     dir: false,
                 };
                 return Plan::Open {
-                    path: upper,
+                    path: with_stream(upper, stream),
                     access,
                     disposition,
                     options,
@@ -294,7 +348,7 @@ pub fn plan_open(
                 dir: false,
             };
             Plan::Open {
-                path: lower,
+                path: with_stream(lower, stream),
                 access,
                 disposition: FILE_OPEN,
                 options: options & !FILE_DELETE_ON_CLOSE,
@@ -305,8 +359,8 @@ pub fn plan_open(
             if !creates {
                 return Plan::Fail(STATUS_OBJECT_NAME_NOT_FOUND);
             }
-            clear_whiteout(&rel, &cfg.upper);
-            let path = upper_for_write(&rel, &cfg.upper);
+            clear_whiteout(&base, &cfg.upper);
+            let path = with_stream(upper_for_write(&base, &cfg.upper), stream);
             Plan::Open {
                 path,
                 access,
@@ -374,8 +428,14 @@ unsafe extern "system" fn nt_create_file(
         }
 
         let plan = guarded(|| match rel_of_attrs(oa, c) {
-            Some(loc) => plan_open(loc.rel, loc.via, access, disposition, options, c),
-            None => Plan::Passthrough,
+            Ok(Some(loc)) => plan_open(loc.rel, loc.via, access, disposition, options, c),
+            Ok(None) => Plan::Passthrough,
+            Err(Unresolved) if (access & (WRITE_RIGHTS | DELETE_ACCESS)) == 0 => Plan::Passthrough,
+            Err(Unresolved) => {
+                // The name is relative to a handle whose path could not be read (for example a
+                // path longer than NT can name). A read may pass; a write must not.
+                Plan::Fail(STATUS_ACCESS_DENIED)
+            }
         });
         if let Some(Plan::Fail(status)) = &plan {
             let name = guarded(|| unicode((*oa).object_name)).flatten();
@@ -438,8 +498,10 @@ unsafe extern "system" fn nt_open_file(
         }
 
         let plan = guarded(|| match rel_of_attrs(oa, c) {
-            Some(loc) => plan_open(loc.rel, loc.via, access, FILE_OPEN, options, c),
-            None => Plan::Passthrough,
+            Ok(Some(loc)) => plan_open(loc.rel, loc.via, access, FILE_OPEN, options, c),
+            Ok(None) => Plan::Passthrough,
+            Err(Unresolved) if (access & (WRITE_RIGHTS | DELETE_ACCESS)) == 0 => Plan::Passthrough,
+            Err(Unresolved) => Plan::Fail(STATUS_ACCESS_DENIED),
         });
         if let Some(Plan::Fail(status)) = &plan {
             let name = guarded(|| unicode((*oa).object_name)).flatten();
@@ -559,6 +621,10 @@ unsafe extern "system" fn nt_set_information_file(
                     }
                     return hooks().set_info.call(handle, iosb, info, len, class);
                 };
+                let Some(target_rel) = normalize_rel(&target_rel) else {
+                    // A target with `..`, a stream or a device name would land outside the view.
+                    return STATUS_ACCESS_DENIED;
+                };
                 let outcome = guarded(|| -> Result<Option<PathBuf>, NTSTATUS> {
                     let exists = !matches!(
                         resolve(&target_rel, c),
@@ -649,8 +715,12 @@ unsafe fn query_attributes(oa: *mut ObjectAttributes, out: *mut c_void, full: bo
         }
     };
     let c = cfg();
-    let resolved =
-        guarded(|| rel_of_attrs(oa, c).map(|loc| (loc.rel.is_empty(), resolve(&loc.rel, c))));
+    let resolved = guarded(|| {
+        rel_of_attrs(oa, c)
+            .ok()
+            .flatten()
+            .map(|loc| (loc.rel.is_empty(), resolve(&loc.rel, c)))
+    });
     match resolved {
         Some(Some((_, Resolved::Upper(p)))) | Some(Some((_, Resolved::Lower(p)))) => {
             let r = redirect(oa, &p);
@@ -693,8 +763,12 @@ unsafe extern "system" fn nt_query_information_by_name(
     catch_hook_panic("NtQueryInformationByName", || {
         let call = |o| hooks().query_by_name.call(o, iosb, out, len, class);
         let c = cfg();
-        let resolved =
-            guarded(|| rel_of_attrs(oa, c).map(|loc| (loc.rel.is_empty(), resolve(&loc.rel, c))));
+        let resolved = guarded(|| {
+            rel_of_attrs(oa, c)
+                .ok()
+                .flatten()
+                .map(|loc| (loc.rel.is_empty(), resolve(&loc.rel, c)))
+        });
         match resolved {
             Some(Some((_, Resolved::Upper(p)))) | Some(Some((_, Resolved::Lower(p)))) => {
                 let r = redirect(oa, &p);
@@ -731,9 +805,12 @@ unsafe extern "system" fn nt_close(handle: HANDLE) -> NTSTATUS {
             .ok()
             .and_then(|mut m| m.remove(&(handle as usize)));
         if let Some(t) = removed {
-            if t.lower && t.delete_on_close {
+            if t.delete_on_close {
+                // A copied-up file is really deleted from the upper layer; without a marker the
+                // lower original would reappear. A lower handle is never really deleted, so this
+                // is its delete.
                 let c = cfg();
-                guarded(|| add_whiteout(&t.rel, &c.upper));
+                guarded(|| note_close(&t, c));
             }
         }
         hooks().close.call(handle)

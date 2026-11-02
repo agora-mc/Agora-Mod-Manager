@@ -18,6 +18,9 @@
 pub mod config;
 pub mod paths;
 
+#[cfg(all(test, windows))]
+mod review_final_tests;
+
 #[cfg(windows)]
 pub mod child;
 #[cfg(windows)]
