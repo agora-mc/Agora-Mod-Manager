@@ -64,7 +64,7 @@ Generate the root `registry-web.json` through the local compiler procedure below
 ```powershell
 cd web
 npm install
-$env:NEXT_PUBLIC_GITHUB_REPOSITORY = "agora-mc/Agora-Launcher"
+$env:NEXT_PUBLIC_GITHUB_REPOSITORY = "agora-mc/Agora-Mod-Manager"
 npm run build
 ```
 

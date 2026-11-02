@@ -96,7 +96,7 @@ uses issuer `https://token.actions.githubusercontent.com`, audience
 `api://AzureADTokenExchange`, and this immutable GitHub subject:
 
 ```text
-repo:agora-mc@309633368/Agora-Launcher@1272711399:environment:windows-signing
+repo:agora-mc@309633368/Agora-Mod-Manager@1272711399:environment:windows-signing
 ```
 
 Enable immutable subjects in the repository's GitHub Actions OIDC settings so the
@@ -285,7 +285,7 @@ The workflow leaves the release as a draft after all build jobs succeed. The des
 After the packaged smoke test passes, publish the draft:
 
 - click **Publish release** on the draft's GitHub page, or
-- run `gh release edit "$TAG" --draft=false --repo agora-mc/Agora-Launcher`.
+- run `gh release edit "$TAG" --draft=false --repo agora-mc/Agora-Mod-Manager`.
 
 After publishing:
 

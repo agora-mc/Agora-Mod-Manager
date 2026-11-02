@@ -3216,7 +3216,7 @@ $env:DISCORD_WEBHOOK_URL = "YOUR_PRODUCTION_WEBHOOK"
 python compiler/compile.py `
   --governance-mode monitor `
   --governance-policy production `
-  --governance-repo agora-mc/Agora-Launcher `
+  --governance-repo agora-mc/Agora-Mod-Manager `
   --governance-state-in D:/Agora/registry/governance/governance-state.json `
   --governance-state-out D:/Agora/registry/governance/governance-state.json `
   --no-governance-write `
@@ -3231,7 +3231,7 @@ $env:GITHUB_TOKEN = (gh auth token)
 python compiler/compile.py `
   --governance-mode read-only `
   --governance-policy production `
-  --governance-repo agora-mc/Agora-Launcher `
+  --governance-repo agora-mc/Agora-Mod-Manager `
   --governance-state-in D:/Agora/registry/governance/governance-state.json `
   --skip-sign `
   --out D:/Agora/registry.db

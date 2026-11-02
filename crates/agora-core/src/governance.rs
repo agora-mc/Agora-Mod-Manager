@@ -292,7 +292,7 @@ pub fn resolve_governance_environment() -> GovernanceEnvironment {
 /// Priority (production / non-debug):
 /// 1. Compile-time `AGORA_GOVERNANCE_REPO` (via `option_env!`)
 /// 2. Compile-time `AGORA_REGISTRY_REPO` (via `option_env!`)
-/// 3. Built-in default `"agora-mc/Agora-Launcher"`
+/// 3. Built-in default `"agora-mc/Agora-Mod-Manager"`
 ///
 /// In debug builds, runtime env vars `AGORA_GOVERNANCE_REPO` and
 /// `AGORA_REGISTRY_REPO` take priority before compile-time values.
@@ -318,7 +318,7 @@ pub fn resolve_governance_repo() -> String {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "agora-mc/Agora-Launcher".into())
+        .unwrap_or_else(|| "agora-mc/Agora-Mod-Manager".into())
 }
 
 /// Resolve the GitHub App slug.
@@ -1870,7 +1870,7 @@ mod tests {
         .unwrap();
 
         let config = GovernanceConfig {
-            repository: "agora-mc/Agora-Launcher".into(),
+            repository: "agora-mc/Agora-Mod-Manager".into(),
             environment: GovernanceEnvironment::Production,
             github_app_slug: None,
             development_registry: false,
@@ -1917,7 +1917,7 @@ mod tests {
 
         // governance JSON files not created — checks should report Warning
         let config = GovernanceConfig {
-            repository: "agora-mc/Agora-Launcher".into(),
+            repository: "agora-mc/Agora-Mod-Manager".into(),
             environment: GovernanceEnvironment::Production,
             github_app_slug: None,
             development_registry: false,

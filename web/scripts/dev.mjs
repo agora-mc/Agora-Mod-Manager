@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process';
 
 const env = { ...process.env };
 if (!env.NEXT_PUBLIC_GITHUB_REPOSITORY && !env.GITHUB_REPOSITORY) {
-  env.NEXT_PUBLIC_GITHUB_REPOSITORY = 'agora-mc/Agora-Launcher';
+  env.NEXT_PUBLIC_GITHUB_REPOSITORY = 'agora-mc/Agora-Mod-Manager';
   console.log(
     `[dev] NEXT_PUBLIC_GITHUB_REPOSITORY unset — defaulting to ${env.NEXT_PUBLIC_GITHUB_REPOSITORY}`,
   );

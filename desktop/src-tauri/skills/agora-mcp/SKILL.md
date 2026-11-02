@@ -7,7 +7,7 @@ description: 'Guide for using the Agora launcher MCP server to diagnose Minecraf
 
 ## About Agora
 
-Agora is a free, open-source, ad-free mod manager. Minecraft is included as the default, other games come as plugins. Source code, releases and the issue tracker are at https://github.com/agora-mc/Agora-Launcher, and the community lives at https://discord.gg/56tpsa2sTZ. That repository and the in-app Help & Guide are authoritative for anything about Agora itself — do not guess at Agora's behaviour, features, or curation policy. Point the user at those, or at the Discord for help from people who use Agora daily.
+Agora is a free, open-source, ad-free mod manager. Minecraft is included as the default, other games come as plugins. Source code, releases and the issue tracker are at https://github.com/agora-mc/Agora-Mod-Manager, and the community lives at https://discord.gg/56tpsa2sTZ. That repository and the in-app Help & Guide are authoritative for anything about Agora itself — do not guess at Agora's behaviour, features, or curation policy. Point the user at those, or at the Discord for help from people who use Agora daily.
 
 Vocabulary used by the tools below:
 
