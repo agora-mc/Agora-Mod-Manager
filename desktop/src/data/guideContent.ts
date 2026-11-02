@@ -867,6 +867,11 @@ export const GUIDE_TOPICS: GuideTopic[] = [
             'Turn off, Turn on and Remove change one item without touching the others.',
             'When two items change the same file, the one that loads later wins. Move up and Move down change that, and each button says whether it makes the item load later or earlier.',
           ],
+          callout: {
+            tone: 'note',
+            title: 'Mods from Nexus Mods',
+            text: 'Most Skyrim mods are on Nexus Mods. Download them in your browser with the "Manual download" button, then use Add an archive…. Agora does not sign in to Nexus Mods or CurseForge: it does not register with platforms whose terms would bind how Agora works, so their "Mod Manager Download" buttons do not open in Agora.',
+          },
         },
         {
           title: 'Load order and launching',

@@ -3815,11 +3815,36 @@ Nexus's download model (API keys, premium-only direct downloads) sits badly with
 no-forced-sign-in position, the same reason CurseForge was declined, and a community plugin can go
 as deep as its author wants.
 
+**Decision (owner, 2026-11-02): Agora does not register with the APIs of platforms whose terms would
+bind how Agora works.** That covers Nexus Mods and CurseForge today. It is not a contract question
+(Nexus's registration is an email, not an agreement) but a principle: Agora stays decentralized and
+community-run, and does not make itself answerable to a commercial platform's API terms. Reconsider if
+players ask for it in numbers.
+What follows from it, measured on 2026-11-01 (research in `NEXUS-RESEARCH-2026-11-01.md`):
+- An `nxm://` link is a hand-off, not a download URL. Turning it into a file needs an API call with a
+  credential, and Nexus's API Acceptable Use Policy lists "using personal API keys for a public-facing
+  application" as unacceptable (https://help.nexusmods.com/article/114-api-acceptable-use-policy).
+  Without a registered application there is therefore no built-in `nxm://` download, no Nexus file
+  lookup and no Nexus update check. The routing above stays, for a community plugin used by its own
+  author under that policy's personal-use allowance.
+- Players bring Nexus files in themselves: they download in their browser with Nexus's manual
+  download, and Agora takes the archive from there (Add an archive…, and an opt-in Downloads-folder
+  watch that recognises mod archives by their contents, not their file names).
+- The game itself is never the reason: none of this depends on which game the mods are for.
+
 ### 26.8 The Curated Catalog for Other Games
 
-**Skyrim support is not complete until curated Skyrim mods install from the catalog** through the
-same two strategies self-hosted Minecraft mods use: `github_release` and `direct_hash`. Curation is
-Agora's core idea; a game without it is a mod manager, not Agora.
+**Decision (owner, 2026-11-02): Skyrim ships without curated catalog entries for now.** The design
+below stays: both strategies, `github_release` and `direct_hash`, are game-agnostic and the compiler
+already handles `game` entries. But almost every Skyrim mod is hosted on Nexus Mods, and even SKSE's
+current Steam build is Nexus-only (its own site hosts only the GOG and 1.5.97 builds), so a Skyrim
+catalog would hold a handful of tools and miss the mods players need. The effort goes into making
+Nexus downloads painless without an API instead (§26.7). Entries can still be added when a project
+self-hosts its releases (Community Shaders, PGPatcher and Pandora publish GitHub releases with SHA-256
+digests, measured 2026-11-01).
+
+The original position, kept for the record: "Skyrim support is not complete until curated Skyrim mods
+install from the catalog"; curation is Agora's core idea.
 
 What already fits: both strategies are game-agnostic. A GitHub release or a pinned HTTPS URL with a
 SHA-256 identifies a file regardless of what it is for, and the compiler, signature and
