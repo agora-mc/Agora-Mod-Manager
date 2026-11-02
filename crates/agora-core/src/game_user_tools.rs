@@ -132,12 +132,20 @@ pub fn list(ctx: &Ctx, instance_id: &str) -> Result<Vec<UserTool>, UserToolError
 /// The same executable twice is refused.
 pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, UserToolError> {
     // The list is an instance file, so it is edited under the instance lock like every other one.
+    // A tool run holds that lock for its whole run; fail fast rather than wait out the timeout.
+    let resource = LockResource::Instance(instance_id.to_string());
+    if ctx
+        .lock_manager
+        .current_operation(&resource)
+        .is_some_and(|operation| operation.starts_with("tool-"))
+    {
+        return Err(UserToolError::Other(format!(
+            "a tool is running for instance '{instance_id}'; wait for it to finish, then try again"
+        )));
+    }
     let _lock = ctx
         .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "user-tool-add",
-        )
+        .acquire(resource, "user-tool-add")
         .map_err(|e| UserToolError::Other(e.to_string()))?;
     let definition = definition_of(ctx, instance_id)?;
     let instance_dir = instance_dir(ctx, instance_id)?;
@@ -205,12 +213,19 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
 
 /// Remove a tool from the instance's list. Only the list is edited; no file is deleted.
 pub fn remove(ctx: &Ctx, instance_id: &str, id: &str) -> Result<Vec<UserTool>, UserToolError> {
+    let resource = LockResource::Instance(instance_id.to_string());
+    if ctx
+        .lock_manager
+        .current_operation(&resource)
+        .is_some_and(|operation| operation.starts_with("tool-"))
+    {
+        return Err(UserToolError::Other(format!(
+            "a tool is running for instance '{instance_id}'; wait for it to finish, then try again"
+        )));
+    }
     let _lock = ctx
         .lock_manager
-        .acquire(
-            LockResource::Instance(instance_id.to_string()),
-            "user-tool-remove",
-        )
+        .acquire(resource, "user-tool-remove")
         .map_err(|e| UserToolError::Other(e.to_string()))?;
     let instance_dir = instance_dir(ctx, instance_id)?;
     let path = instance_dir.join(USER_TOOLS_FILE);

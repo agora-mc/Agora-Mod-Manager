@@ -1183,14 +1183,14 @@ fn is_windows_device_name(stem: &str) -> bool {
 /// file means none. A file that cannot be read is an error: removal must not treat it as "no
 /// roots", and must not guess one.
 /// The folders Agora has put bases in: the data folder's own, plus every root a build registered.
-pub fn known_base_roots(paths: &AppPaths) -> Vec<PathBuf> {
+/// An unreadable list of roots is an error: a caller that cannot see every root must not decide
+/// that a folder elsewhere does not exist.
+pub fn known_base_roots(paths: &AppPaths) -> Result<Vec<PathBuf>, BaseError> {
     let mut roots = vec![paths.bases_dir()];
-    if let Ok(registered) = read_base_roots(paths) {
-        roots.extend(registered);
-    }
+    roots.extend(read_base_roots(paths)?);
     roots.sort();
     roots.dedup();
-    roots
+    Ok(roots)
 }
 
 fn read_base_roots(paths: &AppPaths) -> Result<Vec<PathBuf>, BaseError> {

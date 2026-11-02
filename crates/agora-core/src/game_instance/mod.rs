@@ -1,6 +1,6 @@
 //! Generic game instances for non-Minecraft games (MASTER_SPEC §26.3, §26.4, §26.12, §26.13).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
 
@@ -555,13 +555,21 @@ pub fn delete_with_options(
     options: DeleteOptions,
 ) -> Result<DeleteOutcome, InstanceError> {
     // A delete changes the instance's records and folders, so it takes the same lock as every other
-    // writer. While it is held nothing can deploy or launch the instance out from under it.
+    // writer. While it is held nothing can deploy or launch the instance out from under it. A tool
+    // run holds it for its whole run, so that case fails fast instead of waiting out the timeout.
+    let resource = crate::lock_manager::LockResource::Instance(id.to_string());
+    if ctx
+        .lock_manager
+        .current_operation(&resource)
+        .is_some_and(|operation| operation.starts_with("tool-"))
+    {
+        return Err(InstanceError::Other(format!(
+            "a tool is running for instance '{id}'; wait for it to finish, then try again"
+        )));
+    }
     let _lock = ctx
         .lock_manager
-        .acquire(
-            crate::lock_manager::LockResource::Instance(id.to_string()),
-            "delete",
-        )
+        .acquire(resource, "delete")
         .map_err(|e| InstanceError::Other(e.to_string()))?;
 
     let db_path = ctx.paths.local_state_db();
@@ -637,7 +645,10 @@ pub fn delete_with_options(
     };
     // Without the record the farm cannot be checked or harvested. It is left alone, and named.
     let left_in_place = if base_unreadable {
-        find_instance_deployment_folder(&ctx.paths, id)
+        match find_instance_deployment_folder(&ctx.paths, id)? {
+            Some(folder) => Some(move_orphaned_deployment(&folder, id)?),
+            None => None,
+        }
     } else {
         None
     };
@@ -686,11 +697,41 @@ pub fn delete_with_options(
 
 /// The deployment folder Agora would have made for `id`, searched across the base roots it knows,
 /// when the instance's own record cannot say where its base is.
-fn find_instance_deployment_folder(paths: &AppPaths, id: &str) -> Option<PathBuf> {
-    crate::game_base::known_base_roots(paths)
+fn find_instance_deployment_folder(
+    paths: &AppPaths,
+    id: &str,
+) -> Result<Option<PathBuf>, InstanceError> {
+    Ok(crate::game_base::known_base_roots(paths)?
         .into_iter()
         .map(|root| root.join("deployments").join(id))
-        .find(|folder| folder.is_dir())
+        .find(|folder| folder.is_dir()))
+}
+
+/// Move a deployment folder Agora cannot prove is the instance's out of the instance-id space, so
+/// a later instance created with the same id cannot inherit it. The folder is kept under the base
+/// root's `orphaned-deployments`, named with the time it was set aside.
+fn move_orphaned_deployment(folder: &Path, id: &str) -> Result<PathBuf, InstanceError> {
+    let bases_root = folder
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| {
+            InstanceError::Other(format!(
+                "cannot tell where to keep the deployed folder '{}'",
+                folder.display()
+            ))
+        })?;
+    let orphaned = bases_root.join("orphaned-deployments");
+    std::fs::create_dir_all(&orphaned)?;
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let unique = uuid::Uuid::new_v4().simple();
+    let destination = orphaned.join(format!("{id}-{stamp}-{unique}"));
+    std::fs::rename(folder, &destination).map_err(|error| {
+        InstanceError::Other(format!(
+            "the deployed folder '{}' could not be moved aside, so the instance was kept: {error}",
+            folder.display()
+        ))
+    })?;
+    Ok(destination)
 }
 
 /// Update `last_launched_at` timestamp for a game instance.

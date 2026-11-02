@@ -375,8 +375,8 @@ fn deleting_an_instance_with_an_unreadable_base_record_needs_the_force_answer() 
         panic!("the instance is pinned");
     };
     let base_manifest_path = ctx.paths.base_manifest_path(base_id);
-    let base: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&base_manifest_path).unwrap()).unwrap();
+    let base_record = std::fs::read(&base_manifest_path).unwrap();
+    let base: serde_json::Value = serde_json::from_slice(&base_record).unwrap();
     let base_folder = PathBuf::from(base["location"].as_str().unwrap());
     // The farm the instance deployed, which the unreadable record can no longer locate.
     let deployment = base_folder
@@ -411,18 +411,45 @@ fn deleting_an_instance_with_an_unreadable_base_record_needs_the_force_answer() 
     )
     .unwrap();
 
+    let left = outcome
+        .left_in_place
+        .expect("the folder it left in place is not named");
+    assert!(
+        !deployment.exists(),
+        "the farm is still reachable by the old id"
+    );
     assert_eq!(
-        outcome.left_in_place.as_deref(),
-        Some(deployment.as_path()),
-        "the folder it left in place is not named"
+        left.parent().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("orphaned-deployments")),
+        "the kept farm is not in an Agora-owned orphaned folder: {}",
+        left.display()
+    );
+    assert!(
+        left.join("game").join("save.txt").exists(),
+        "a farm Agora could not prove was its own was deleted"
     );
     assert!(!ctx.paths.instance_dir(&rec.instance_id).unwrap().exists());
     assert!(get(&ctx, &rec.instance_id).unwrap().is_none());
-    assert!(
-        deployment.join("game").join("save.txt").exists(),
-        "a farm Agora could not prove was its own was deleted"
-    );
     assert!(base_folder.exists(), "the base folder was deleted");
+
+    // A new instance with the same id must not inherit the farm that was left behind.
+    std::fs::write(&base_manifest_path, &base_record).unwrap();
+    create(
+        &ctx,
+        &install,
+        &def,
+        "Again",
+        Some(rec.instance_id.clone()),
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("the id is free again");
+    assert!(
+        agora_core::game_deploy::deployment_dir(&ctx, &rec.instance_id)
+            .unwrap()
+            .is_none(),
+        "the new instance inherited the old farm"
+    );
 }
 
 #[test]
@@ -483,6 +510,105 @@ fn delete_refuses_while_the_instances_session_is_starting_or_running() {
         "a recorded live process was not running: {running:?}"
     );
     assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+}
+
+#[test]
+fn delete_fails_fast_while_a_tool_run_holds_the_instance_lock() {
+    use std::time::{Duration, Instant};
+
+    use agora_core::lock_manager::LockResource;
+
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Busy tool",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let held = ctx
+        .lock_manager
+        .acquire(LockResource::Instance(rec.instance_id.clone()), "tool-run")
+        .unwrap();
+    let start = Instant::now();
+    let refused = delete(&ctx, &rec.instance_id).unwrap_err();
+    let waited = start.elapsed();
+    drop(held);
+
+    assert!(
+        refused.to_string().contains("a tool is running"),
+        "the delete did not say a tool is running: {refused}"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "the delete waited for the tool run's lock: {waited:?}"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+}
+
+#[test]
+fn a_forced_delete_fails_closed_when_the_base_roots_cannot_be_read() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Unreadable roots",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let BaseReference::Pinned { id: base_id, .. } = &rec.base else {
+        panic!("the instance is pinned");
+    };
+    let base_manifest_path = ctx.paths.base_manifest_path(base_id);
+    let base: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&base_manifest_path).unwrap()).unwrap();
+    let base_folder = PathBuf::from(base["location"].as_str().unwrap());
+    let deployment = base_folder
+        .parent()
+        .unwrap()
+        .join("deployments")
+        .join(&rec.instance_id);
+    std::fs::create_dir_all(deployment.join("game")).unwrap();
+    std::fs::write(deployment.join("game").join("save.txt"), b"the game's save").unwrap();
+    std::fs::write(&base_manifest_path, b"not a base record").unwrap();
+    std::fs::write(ctx.paths.base_roots_file(), b"{ not a list").unwrap();
+
+    let refused = delete_with_options(
+        &ctx,
+        &rec.instance_id,
+        DeleteOptions {
+            force_unreadable_base: true,
+        },
+    );
+
+    assert!(
+        refused.is_err(),
+        "a forced delete guessed where the base roots were"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+    assert!(deployment.join("game").join("save.txt").exists());
 }
 
 #[test]

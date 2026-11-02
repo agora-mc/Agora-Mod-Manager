@@ -282,6 +282,62 @@ fn probe_garbage_journal_is_an_error_not_none() {
 }
 
 #[test]
+fn a_refused_restore_clears_this_processes_starting_mark() {
+    let h = TestHarness::new();
+    let def = test_skyrim_definition();
+    let real = h
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(
+        &real,
+        "original
+",
+    )
+    .unwrap();
+    let copy = h.instance_dir("mark-a").join("user").join("Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(
+        &copy,
+        "instance
+",
+    )
+    .unwrap();
+    swap_in(&h.ctx, "mark-a", &def, &StoreId::steam(), &h.running_from).unwrap();
+
+    // A helper process is still running from the session, so restore refuses.
+    let journal_path = journal_path_of(&h, &def);
+    let mut journal: Journal =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    journal.processes = vec![process_identity::capture_self().unwrap()];
+    journal.starting_launcher = process_identity::capture_self();
+    std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+    assert!(restore(&h.ctx, &def, &StoreId::steam()).is_err());
+    assert!(
+        status(&h.ctx, &def.id, &StoreId::steam())
+            .unwrap()
+            .unwrap()
+            .running
+    );
+
+    // When the helper is gone, another Agora sees a session that can be recovered: the refused
+    // restore cleared this process's starting mark instead of leaving it for the process's life.
+    let mut after: Journal =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    after.processes.clear();
+    std::fs::write(&journal_path, serde_json::to_vec(&after).unwrap()).unwrap();
+    assert!(
+        !status(&h.ctx, &def.id, &StoreId::steam())
+            .unwrap()
+            .unwrap()
+            .running,
+        "the failed restore left this process's starting mark set"
+    );
+}
+
+#[test]
 fn probe_restore_without_a_session_is_harmless() {
     let h = TestHarness::new();
     let def = test_skyrim_definition();

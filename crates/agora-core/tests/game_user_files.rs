@@ -565,6 +565,7 @@ fn interrupted_swap_restores_correctly() {
                 original_sha256: Some(sha256_hex("Original Plugins\n".as_bytes())),
                 written_sha256: sha256_hex("Swapped Plugins Content\n".as_bytes()),
                 swapped: true,
+                state: None,
                 restored: false,
             },
             JournaledFile {
@@ -576,6 +577,7 @@ fn interrupted_swap_restores_correctly() {
                 original_sha256: None,
                 written_sha256: String::new(),
                 swapped: false,
+                state: None,
                 restored: false,
             },
         ],

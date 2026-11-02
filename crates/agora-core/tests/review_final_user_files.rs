@@ -222,6 +222,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 original_sha256: None,
                 written_sha256: String::new(),
                 swapped: false,
+                state: None,
                 restored: false,
             },
             JournaledFile {
@@ -233,6 +234,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 original_sha256: None,
                 written_sha256: String::new(),
                 swapped: false,
+                state: None,
                 restored: false,
             },
         ],
@@ -296,12 +298,19 @@ fn bug_two_mappings_for_one_real_file_do_not_restore_the_original() {
         "A Second\n",
     );
 
-    swap_in(&h.ctx, "inst-a", &def, &StoreId::steam(), &h.running_from).unwrap();
-    restore(&h.ctx, &def, &StoreId::steam()).unwrap();
+    let refused = swap_in(&h.ctx, "inst-a", &def, &StoreId::steam(), &h.running_from);
 
+    assert!(
+        refused.is_err(),
+        "two mappings for one real file were swapped in: {refused:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(h.plugins()).unwrap(),
         "Original Plugins\n",
-        "the player's own Plugins.txt was not put back"
+        "the player's own Plugins.txt was touched by a refused duplicate mapping"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.instance_file("inst-a", "Plugins.txt")).unwrap(),
+        "A Plugins\n"
     );
 }

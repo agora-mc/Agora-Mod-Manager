@@ -295,6 +295,18 @@ impl LockManager {
         &self.locks_root
     }
 
+    /// The operation of the live holder of `resource`, when one holds it. A stale lock is not a
+    /// holder. Used to fail fast when the holder is a long tool run instead of waiting out the
+    /// acquire timeout.
+    pub fn current_operation(&self, resource: &LockResource) -> Option<String> {
+        let name = resource.lock_name().ok()?;
+        let meta = read_lock_metadata(&self.locks_root.join(format!("{name}.lock"))).ok()?;
+        if is_stale_lock(&meta) {
+            return None;
+        }
+        Some(meta.operation)
+    }
+
     /// Record a change to an instance for other Agora programs, for an edit that takes no
     /// instance lock (releasing one records it already). Best-effort, as the change feed is.
     pub fn record_instance_change(&self, instance_id: &str, operation: &str) {

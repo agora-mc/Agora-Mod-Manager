@@ -338,6 +338,13 @@ fn recover_stale_session(
     {
         return Ok(());
     }
+    // A session that is running (or still starting) is not a stale one: leave it alone, or a
+    // plugin edit during a launch would put back the files the launch just swapped in.
+    if let Some(session) = crate::game_user_files::status(ctx, &definition.id, store)? {
+        if session.running {
+            return Ok(());
+        }
+    }
     match crate::game_user_files::restore(ctx, definition, store) {
         Ok(_)
         | Err(UserFilesError::CannotRestoreRunning { .. })
