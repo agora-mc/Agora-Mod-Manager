@@ -59,7 +59,7 @@ pub struct MasterlistStatus {
     pub fetched_at: String,
     /// The contents API URL the masterlist came from.
     pub source_url: String,
-    /// The commit the branch pointed at when it was fetched.
+    /// The commit the masterlist bytes came from.
     pub commit_sha: String,
     /// The git blob SHA-1 the bytes were checked against.
     pub blob_sha: String,
@@ -240,8 +240,17 @@ fn fetch_file(
     let content = match (response.encoding.as_deref(), response.content.as_deref()) {
         (Some("base64"), Some(content)) => {
             use base64::{engine::general_purpose::STANDARD, Engine};
+            // GitHub's contents endpoint returns `content` as base64
+            // (https://docs.github.com/en/rest/repos/contents#get-repository-content).
+            // The service wraps that base64 at 60 characters with ASCII newlines, and the
+            // standard decoder rejects them. The wrapping itself is not stated in the docs
+            // (unverified), but stripping ASCII whitespace is harmless for base64 either way.
+            let compact: String = content
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
             STANDARD
-                .decode(content)
+                .decode(compact)
                 .map_err(|error| LoadOrderError::Masterlist {
                     reason: format!(
                         "GitHub's contents for {repo}/{path} is not valid base64: {error}"
@@ -422,17 +431,21 @@ pub fn update_with(
     fetcher: &dyn Fetcher,
 ) -> Result<MasterlistStatus, LoadOrderError> {
     let rule = loot_rule(definition)?.clone();
+    // Read the branch once, then fetch the file *at that commit*. Fetching the commit and the
+    // file separately can straddle a branch update, which would record a commit the bytes did
+    // not come from. GitHub's contents endpoint takes any commit/branch/tag as `ref`
+    // (https://docs.github.com/en/rest/repos/contents#get-repository-content).
+    let commit_sha = fetch_commit(fetcher, &rule.masterlist_repo, &rule.branch)?;
     let masterlist = fetch_file(
         fetcher,
         &rule.masterlist_repo,
-        &rule.branch,
+        &commit_sha,
         "masterlist.yaml",
     )?;
     let prelude = match &rule.prelude_repo {
         Some(repo) => Some(fetch_file(fetcher, repo, &rule.branch, "prelude.yaml")?),
         None => None,
     };
-    let commit_sha = fetch_commit(fetcher, &rule.masterlist_repo, &rule.branch)?;
     validate_download(
         &rule,
         &masterlist.bytes,
@@ -870,11 +883,13 @@ mod tests {
         )
         .unwrap();
 
-        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "v0.29");
+        let commit_api = commits_url("loot/skyrimse", "v0.29");
+        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "deadbeef");
         let main_download = "https://raw.githubusercontent.com/loot/skyrimse/v0.29/masterlist.yaml";
         let prelude_api = contents_url("loot/prelude", "prelude.yaml", "v0.29");
         let prelude_download = "https://raw.githubusercontent.com/loot/prelude/v0.29/prelude.yaml";
         let fake = FakeFetcher::new()
+            .with(&commit_api, commit_json("deadbeef"))
             .with(&main_api, contents_json("0000", main_download))
             .with(main_download, b"bad masterlist\n".to_vec())
             .with(&prelude_api, contents_json("1111", prelude_download))
@@ -902,7 +917,7 @@ mod tests {
         let definition = test_definition();
         let main = b"plugins: []\n";
         let prelude = b"plugins: []\n";
-        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "v0.29");
+        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "deadbeef");
         let main_download = "https://raw.githubusercontent.com/loot/skyrimse/v0.29/masterlist.yaml";
         let prelude_api = contents_url("loot/prelude", "prelude.yaml", "v0.29");
         let prelude_download = "https://raw.githubusercontent.com/loot/prelude/v0.29/prelude.yaml";
@@ -935,6 +950,54 @@ mod tests {
         let saved = cached(&ctx, &definition).unwrap().unwrap();
         assert_eq!(saved.status, status);
     }
+
+    /// The recorded commit must be the commit the bytes came from. If the branch moves between
+    /// the commit lookup and the file fetch, asking for the branch records a commit that does
+    /// not describe the saved file.
+    #[test]
+    fn the_recorded_commit_is_the_one_the_masterlist_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(dir.path().to_path_buf());
+        let definition = test_definition();
+        let from_commit = b"plugins: []\n";
+        let from_branch = b"plugins:\n  - name: 'Moved.esp'\n";
+        let prelude = b"plugins: []\n";
+        let commit_api = commits_url("loot/skyrimse", "v0.29");
+        let branch_api = contents_url("loot/skyrimse", "masterlist.yaml", "v0.29");
+        let branch_download =
+            "https://raw.githubusercontent.com/loot/skyrimse/v0.29/masterlist.yaml";
+        let commit_file_api = contents_url("loot/skyrimse", "masterlist.yaml", "deadbeef");
+        let commit_download =
+            "https://raw.githubusercontent.com/loot/skyrimse/deadbeef/masterlist.yaml";
+        let prelude_api = contents_url("loot/prelude", "prelude.yaml", "v0.29");
+        let prelude_download = "https://raw.githubusercontent.com/loot/prelude/v0.29/prelude.yaml";
+        let fake = FakeFetcher::new()
+            .with(&commit_api, commit_json("deadbeef"))
+            .with(
+                &branch_api,
+                contents_json(&git_blob_sha1(from_branch), branch_download),
+            )
+            .with(branch_download, from_branch.to_vec())
+            .with(
+                &commit_file_api,
+                contents_json(&git_blob_sha1(from_commit), commit_download),
+            )
+            .with(commit_download, from_commit.to_vec())
+            .with(
+                &prelude_api,
+                contents_json(&git_blob_sha1(prelude), prelude_download),
+            )
+            .with(prelude_download, prelude.to_vec());
+
+        let status = update_with(&ctx, &definition, &fake).unwrap();
+        assert_eq!(status.commit_sha, "deadbeef");
+        assert_eq!(
+            std::fs::read(game_dir(&ctx, &definition).join("masterlist.yaml")).unwrap(),
+            from_commit,
+            "the saved file must be the one fetched at the recorded commit"
+        );
+    }
+
     fn seed_cache(ctx: &Ctx, definition: &GameDefinition, bytes: &[u8]) -> MasterlistStatus {
         let status = MasterlistStatus {
             fetched_at: "2026-01-01T00:00:00Z".into(),
@@ -962,7 +1025,7 @@ mod tests {
         let old_status = seed_cache(&ctx, &definition, old);
         let garbage = b"plugins: [unclosed\n  - name: 'A.esp'\n";
 
-        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "v0.29");
+        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "deadbeef");
         let main_download = "https://raw.githubusercontent.com/loot/skyrimse/v0.29/masterlist.yaml";
         let prelude_api = contents_url("loot/prelude", "prelude.yaml", "v0.29");
         let prelude_download = "https://raw.githubusercontent.com/loot/prelude/v0.29/prelude.yaml";
@@ -1040,11 +1103,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = crate::ctx::CoreContext::for_testing(dir.path().to_path_buf());
         let definition = test_definition();
-        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "v0.29");
-        let fake = FakeFetcher::new().with(
-            &main_api,
-            contents_json("0000", "https://evil.example/masterlist.yaml"),
-        );
+        let commit_api = commits_url("loot/skyrimse", "v0.29");
+        let main_api = contents_url("loot/skyrimse", "masterlist.yaml", "deadbeef");
+        let fake = FakeFetcher::new()
+            .with(&commit_api, commit_json("deadbeef"))
+            .with(
+                &main_api,
+                contents_json("0000", "https://evil.example/masterlist.yaml"),
+            );
 
         let error = update_with(&ctx, &definition, &fake).unwrap_err();
         assert!(
@@ -1181,5 +1247,52 @@ mod tests {
         let ctx = crate::ctx::CoreContext::for_testing(dir.path().to_path_buf());
         let definition = test_definition();
         assert!(cached(&ctx, &definition).unwrap().is_none());
+    }
+
+    /// GitHub's contents API wraps `content` at 60 base64 characters with `\n` and ends it with a
+    /// newline. `base64::STANDARD.decode` rejects those newlines, so any file small enough to come
+    /// inline (the prelude is) makes every update fail with "not valid base64".
+    #[test]
+    fn a_newline_wrapped_base64_contents_answer_is_accepted() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        fn wrapped(bytes: &[u8]) -> String {
+            let encoded = STANDARD.encode(bytes);
+            let mut out = String::new();
+            for chunk in encoded.as_bytes().chunks(60) {
+                out.push_str(std::str::from_utf8(chunk).unwrap());
+                out.push('\n');
+            }
+            out
+        }
+        fn inline_json(bytes: &[u8]) -> Vec<u8> {
+            serde_json::json!({
+                "sha": git_blob_sha1(bytes),
+                "download_url": null,
+                "content": wrapped(bytes),
+                "encoding": "base64"
+            })
+            .to_string()
+            .into_bytes()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(dir.path().to_path_buf());
+        let definition = test_definition();
+        let main =
+            b"plugins: []\n# padding so the encoded form is longer than one 60 character line\n";
+        let fake = FakeFetcher::new()
+            .with(
+                &contents_url("loot/skyrimse", "masterlist.yaml", "deadbeef"),
+                inline_json(main),
+            )
+            .with(
+                &contents_url("loot/prelude", "prelude.yaml", "v0.29"),
+                inline_json(main),
+            )
+            .with(
+                &commits_url("loot/skyrimse", "v0.29"),
+                commit_json("deadbeef"),
+            );
+        update_with(&ctx, &definition, &fake)
+            .expect("a normal GitHub inline (newline-wrapped base64) answer is accepted");
     }
 }

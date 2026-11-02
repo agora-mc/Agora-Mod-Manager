@@ -247,6 +247,41 @@ impl RegistryService {
         get_game_item(&conn, item_id)
     }
 
+    /// One catalog entry an install is about to act on.
+    ///
+    /// The entry names a download URL and the hash to expect, so the database it came from is
+    /// verified in this call rather than trusted from startup. A file changed after the startup
+    /// check therefore cannot choose what an install downloads.
+    pub fn get_game_item_for_install(
+        &self,
+        item_id: &str,
+    ) -> LauncherResult<Option<GameCatalogItem>> {
+        // A debug-only dev registry is an explicit developer choice and is not signed.
+        #[cfg(debug_assertions)]
+        if self.development_registry_active() {
+            return get_game_item(&self.connection()?, item_id);
+        }
+        let registry = crate::registry_sync::open_verified_registry(self.ctx.paths.root())?;
+        get_game_item(registry.connection(), item_id)
+    }
+
+    /// [`get_game_item_for_install`] against an explicit key.
+    ///
+    /// Test support only: production adapters call the no-key method, which uses the
+    /// compiled-in key.
+    #[doc(hidden)]
+    pub fn get_game_item_for_install_with_key(
+        &self,
+        item_id: &str,
+        pubkey_hex: &str,
+    ) -> LauncherResult<Option<GameCatalogItem>> {
+        let registry = crate::registry_sync::open_verified_registry_with_key(
+            self.ctx.paths.root(),
+            pubkey_hex,
+        )?;
+        get_game_item(registry.connection(), item_id)
+    }
+
     /// Fetch a single registry item by ID.
     pub fn get_item_by_id(&self, item_id: &str) -> LauncherResult<Option<RegistryItem>> {
         let conn = self.connection()?;
@@ -745,22 +780,26 @@ pub struct GameCatalogItem {
 }
 
 /// Whether the registry has the `game_catalog_items` table. A registry without
-/// it, which every registry before this table was, has no other games.
-fn has_game_catalog(conn: &Connection) -> bool {
+/// it, which every registry before this table was, has no other games. A
+/// registry that cannot be queried is an error, not an empty catalog.
+fn has_game_catalog(conn: &Connection) -> LauncherResult<bool> {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'game_catalog_items'",
         [],
         |row| row.get::<_, i64>(0),
     )
     .map(|count| count > 0)
-    .unwrap_or(false)
+    .map_err(|error| LauncherError::Generic {
+        code: "ERR_INVALID_QUERY".to_string(),
+        message: format!("The catalog could not be read: {error}"),
+    })
 }
 
 /// The catalog entries for `game`, by name. `"minecraft"` yields nothing here,
 /// because Minecraft has its own browse path, and so does a registry without
 /// the table.
 pub fn list_game_items(conn: &Connection, game: &str) -> LauncherResult<Vec<GameCatalogItem>> {
-    if game == "minecraft" || !has_game_catalog(conn) {
+    if game == "minecraft" || !has_game_catalog(conn)? {
         return Ok(Vec::new());
     }
     query_game_items(conn, "game = ?1", game)
@@ -768,7 +807,7 @@ pub fn list_game_items(conn: &Connection, game: &str) -> LauncherResult<Vec<Game
 
 /// The catalog entry `item_id`, whatever game it is for, or `None` when there is no such entry.
 pub fn get_game_item(conn: &Connection, item_id: &str) -> LauncherResult<Option<GameCatalogItem>> {
-    if !has_game_catalog(conn) {
+    if !has_game_catalog(conn)? {
         return Ok(None);
     }
     Ok(query_game_items(conn, "id = ?1", item_id)?
@@ -4447,5 +4486,79 @@ mod game_catalog_tests {
             }
             other => panic!("expected a named error, got {other:?}"),
         }
+    }
+
+    /// `has_game_catalog` turns any SQL failure into `false`, so a database that cannot be read
+    /// reads as "this registry has no other games" instead of an error.
+    #[test]
+    fn an_unreadable_registry_is_an_error_not_an_empty_game_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.db");
+        std::fs::write(&path, vec![0x5Au8; 8192]).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert!(
+            list_game_items(&conn, "skyrim-se").is_err(),
+            "listing must fail on a file that is not a database"
+        );
+        assert!(
+            get_game_item(&conn, "any").is_err(),
+            "a lookup must fail, not answer 'no such entry'"
+        );
+    }
+
+    /// An install takes the URL and hash from the entry, so it must read a registry whose
+    /// signature is checked in that call, not one that merely verified at startup. A file
+    /// swapped after the startup check must be refused.
+    #[test]
+    fn a_catalog_install_refuses_a_registry_tampered_after_verification() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Ctx::for_testing(dir.path().to_owned());
+        let db_path = ctx.paths.registry_db();
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE game_catalog_items (
+                    id TEXT PRIMARY KEY, game TEXT NOT NULL, name TEXT NOT NULL,
+                    author TEXT, content_type TEXT NOT NULL, download_strategy TEXT NOT NULL,
+                    source_identifier TEXT NOT NULL, sha256 TEXT NOT NULL,
+                    download_sources_json TEXT NOT NULL DEFAULT '[]',
+                    game_compatibility_json TEXT NOT NULL, description TEXT,
+                    license_id TEXT, page_url TEXT, icon_url TEXT,
+                    status TEXT NOT NULL DEFAULT 'active', date_added TEXT
+                );",
+            )
+            .unwrap();
+            insert_other(&conn, "crash-logger", "skyrim-se", SKYRIM_COMPAT);
+        }
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let public = hex::encode(key.verifying_key().to_bytes());
+        let signature = key.sign(&std::fs::read(&db_path).unwrap()).to_bytes();
+        std::fs::write(ctx.paths.registry_signature(), signature).unwrap();
+
+        let svc = RegistryService::new(ctx.clone());
+        let item = svc
+            .get_game_item_for_install_with_key("crash-logger", &public)
+            .unwrap()
+            .expect("the signed registry has the entry");
+        assert_eq!(item.source_identifier, "owner/repo");
+
+        // The startup check saw the good bytes. Now swap the entry a later reader would see.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE game_catalog_items
+                SET source_identifier = 'attacker/repo', name = 'Swapped'
+              WHERE id = 'crash-logger'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            svc.get_game_item_for_install_with_key("crash-logger", &public)
+                .is_err(),
+            "an install must not read a registry whose signature no longer matches"
+        );
     }
 }
