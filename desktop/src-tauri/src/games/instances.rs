@@ -31,6 +31,8 @@ use super::error::{GamesError, CORE_FAILED, TASK_FAILED};
 pub const INSTANCE_NOT_FOUND: &str = "instance_not_found";
 /// The instance is running, so the change or the launch has to wait until the game closes.
 pub const INSTANCE_RUNNING: &str = "instance_running";
+/// The instance's base record cannot be read; deleting it needs the user's answer.
+pub const INSTANCE_BASE_UNREADABLE: &str = "instance_base_unreadable";
 /// The request names something that cannot exist: a blank name, an unknown mode, a bad game id.
 pub const INVALID_REQUEST: &str = "invalid_request";
 /// The id belongs to a Minecraft instance, which the Minecraft pages manage.
@@ -165,6 +167,8 @@ pub struct DeletedInstance {
     pub instance_id: String,
     /// The base the deleted instance pinned, when nothing else pins it any more.
     pub orphaned_base: Option<String>,
+    /// A deployed game folder Agora could not prove was the instance's, left where it was.
+    pub left_in_place: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -236,8 +240,9 @@ pub async fn games_instance_create(
 pub async fn games_instance_delete(
     app: tauri::AppHandle,
     instance_id: String,
+    delete_anyway: bool,
 ) -> Result<DeletedInstance, GamesError> {
-    blocking(move || delete_instance(&app, &instance_id)).await
+    blocking(move || delete_instance(&app, &instance_id, delete_anyway)).await
 }
 
 /// The launch checks for an instance, without starting anything.
@@ -435,6 +440,7 @@ fn create_instance(
 fn delete_instance(
     app: &tauri::AppHandle,
     instance_id: &str,
+    delete_anyway: bool,
 ) -> Result<DeletedInstance, GamesError> {
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
@@ -442,10 +448,20 @@ fn delete_instance(
     if is_running(&ctx, &record, &manifest)? {
         return Err(running_error(instance_id));
     }
-    let outcome = game_instance::delete(&ctx, instance_id).map_err(map_error)?;
+    let outcome = game_instance::delete_with_options(
+        &ctx,
+        instance_id,
+        game_instance::DeleteOptions {
+            force_unreadable_base: delete_anyway,
+        },
+    )
+    .map_err(map_error)?;
     Ok(DeletedInstance {
         instance_id: outcome.instance_id,
         orphaned_base: outcome.orphaned_base,
+        left_in_place: outcome
+            .left_in_place
+            .map(|folder| folder.display().to_string()),
     })
 }
 
@@ -904,6 +920,13 @@ pub fn clean_name(name: &str) -> Result<String, GamesError> {
 pub fn map_error(error: InstanceError) -> GamesError {
     match error {
         InstanceError::NotFound(id) => not_found(&id),
+        InstanceError::Running(id) => running_error(&id),
+        InstanceError::Deploy(agora_core::game_deploy::DeployError::UnreadableBaseManifest(
+            detail,
+        )) => GamesError::new(
+            INSTANCE_BASE_UNREADABLE,
+            format!("Agora cannot read this instance's base record: {detail}"),
+        ),
         InstanceError::MinecraftInstance(id) => GamesError::new(
             MINECRAFT_INSTANCE,
             format!("'{id}' is a Minecraft instance. Manage it under My Instances."),

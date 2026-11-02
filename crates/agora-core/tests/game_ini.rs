@@ -288,6 +288,29 @@ fn an_edit_is_refused_while_an_earlier_session_is_not_put_back() {
     h.write_real(REAL.as_bytes());
     h.start_session("inst-g", &def);
 
+    // The launch that swapped these files in is still going, so editing is refused as running.
+    let err = game_ini::set_value(
+        &h.ctx,
+        "inst-g",
+        &def,
+        "user/Skyrim.ini",
+        "Display",
+        "fGamma",
+        "2",
+    )
+    .unwrap_err();
+    assert!(matches!(err, IniError::SessionRunning { .. }), "{err:?}");
+
+    // An Agora that died after swapping leaves no launcher either: the session needs restoring.
+    let journal_path = h
+        .ctx
+        .paths
+        .user_files_journal_path(def.id.as_str(), StoreId::steam().as_str());
+    let mut journal: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    journal["starting_launcher"] = serde_json::Value::Null;
+    std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
     let err = game_ini::set_value(
         &h.ctx,
         "inst-g",

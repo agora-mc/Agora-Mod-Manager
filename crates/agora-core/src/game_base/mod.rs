@@ -1182,6 +1182,17 @@ fn is_windows_device_name(stem: &str) -> bool {
 /// The bases roots outside the data folder that builds here created, from `bases/roots.json`. No
 /// file means none. A file that cannot be read is an error: removal must not treat it as "no
 /// roots", and must not guess one.
+/// The folders Agora has put bases in: the data folder's own, plus every root a build registered.
+pub fn known_base_roots(paths: &AppPaths) -> Vec<PathBuf> {
+    let mut roots = vec![paths.bases_dir()];
+    if let Ok(registered) = read_base_roots(paths) {
+        roots.extend(registered);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn read_base_roots(paths: &AppPaths) -> Result<Vec<PathBuf>, BaseError> {
     let file = paths.base_roots_file();
     let text = match std::fs::read_to_string(&file) {

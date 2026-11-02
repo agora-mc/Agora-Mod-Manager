@@ -554,6 +554,7 @@ fn interrupted_swap_restores_correctly() {
         created_at: "2026-10-05T00:00:00Z".to_string(),
         running_from: harness.running_from.clone(),
         processes: vec![],
+        starting_launcher: None,
         files: vec![
             JournaledFile {
                 real_path: real_plugin_file.clone(),

@@ -94,10 +94,15 @@ fn capture_once(pid: u32) -> LauncherResult<ProcessIdentity> {
     })
 }
 
+/// The identity of the process calling this, for a journal that must say a launch is starting.
+/// One read of the process table, not the settling loop [`capture`] uses after a spawn.
+pub fn capture_self() -> Option<ProcessIdentity> {
+    capture_once(std::process::id()).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Verify
 // ---------------------------------------------------------------------------
-
 /// Verify that the OS process identified by `identity` is still alive and
 /// matches the captured identity on every available attribute.
 ///

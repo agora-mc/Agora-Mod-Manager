@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_base::{
@@ -6,11 +6,13 @@ use agora_core::game_base::{
 };
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{
-    create, delete, get, get_manifest, prepare_launch_with_discovery, record_launch,
-    GameInstanceManifest, InstanceError,
+    create, delete, delete_with_options, get, get_manifest, prepare_launch_with_discovery,
+    record_launch, DeleteOptions, GameInstanceManifest, InstanceError,
 };
 use agora_core::game_launch::LaunchError;
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
+use agora_core::game_user_files::Journal;
+use agora_core::process_identity;
 use agora_game_api::{
     BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePath, InstallId, InstallKind,
     LaunchRecipe, LaunchValue, RelPath, RuntimeIdentity, StoreId, StoreIdentifier,
@@ -345,6 +347,142 @@ fn delete_refuses_id_that_only_exists_in_user_instances_and_leaves_folder_alone(
     // Folder and marker file remain intact
     assert!(mc_dir.exists());
     assert!(marker_file.exists());
+}
+
+#[test]
+fn deleting_an_instance_with_an_unreadable_base_record_needs_the_force_answer() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Broken base",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let BaseReference::Pinned { id: base_id, .. } = &rec.base else {
+        panic!("the instance is pinned");
+    };
+    let base_manifest_path = ctx.paths.base_manifest_path(base_id);
+    let base: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&base_manifest_path).unwrap()).unwrap();
+    let base_folder = PathBuf::from(base["location"].as_str().unwrap());
+    // The farm the instance deployed, which the unreadable record can no longer locate.
+    let deployment = base_folder
+        .parent()
+        .unwrap()
+        .join("deployments")
+        .join(&rec.instance_id);
+    std::fs::create_dir_all(deployment.join("game")).unwrap();
+    std::fs::write(deployment.join("game").join("save.txt"), b"the game's save").unwrap();
+    std::fs::write(deployment.join("deployment.json"), b"{}").unwrap();
+    std::fs::write(&base_manifest_path, b"not a base record").unwrap();
+
+    // Without the answer, the unreadable record blocks the delete and nothing moves.
+    let refused = delete(&ctx, &rec.instance_id).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            InstanceError::Deploy(agora_core::game_deploy::DeployError::UnreadableBaseManifest(_))
+        ),
+        "unexpected delete error: {refused:?}"
+    );
+    assert!(ctx.paths.instance_dir(&rec.instance_id).unwrap().exists());
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+    assert!(deployment.join("game").join("save.txt").exists());
+
+    let outcome = delete_with_options(
+        &ctx,
+        &rec.instance_id,
+        DeleteOptions {
+            force_unreadable_base: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.left_in_place.as_deref(),
+        Some(deployment.as_path()),
+        "the folder it left in place is not named"
+    );
+    assert!(!ctx.paths.instance_dir(&rec.instance_id).unwrap().exists());
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_none());
+    assert!(
+        deployment.join("game").join("save.txt").exists(),
+        "a farm Agora could not prove was its own was deleted"
+    );
+    assert!(base_folder.exists(), "the base folder was deleted");
+}
+
+#[test]
+fn delete_refuses_while_the_instances_session_is_starting_or_running() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Busy",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let journal_path = ctx.paths.user_files_journal_path("skyrim-se", "steam");
+    std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+    let journal = |starting: bool| Journal {
+        game: GameId::new("skyrim-se").unwrap(),
+        store: StoreId::new("steam").unwrap(),
+        instance_id: rec.instance_id.clone(),
+        created_at: "2026-11-01T00:00:00Z".to_string(),
+        running_from: tmp.path().join("nothing-runs-here"),
+        processes: if starting {
+            Vec::new()
+        } else {
+            vec![process_identity::capture_self().unwrap()]
+        },
+        starting_launcher: if starting {
+            process_identity::capture_self()
+        } else {
+            None
+        },
+        files: Vec::new(),
+    };
+
+    std::fs::write(&journal_path, serde_json::to_vec(&journal(true)).unwrap()).unwrap();
+    let starting = delete(&ctx, &rec.instance_id).unwrap_err();
+    assert!(
+        matches!(starting, InstanceError::Running(_)),
+        "a launch that had swapped its files in was not running: {starting:?}"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+
+    std::fs::write(&journal_path, serde_json::to_vec(&journal(false)).unwrap()).unwrap();
+    let running = delete(&ctx, &rec.instance_id).unwrap_err();
+    assert!(
+        matches!(running, InstanceError::Running(_)),
+        "a recorded live process was not running: {running:?}"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
 }
 
 #[test]

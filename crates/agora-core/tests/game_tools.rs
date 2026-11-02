@@ -4255,6 +4255,48 @@ fn add_user_tool(
 }
 
 #[test]
+fn user_tool_edits_wait_for_the_instance_lock() {
+    use std::time::{Duration, Instant};
+
+    use agora_core::lock_manager::LockResource;
+
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let id = f.id().to_string();
+    let hold = |duration: Duration| {
+        let guard = f
+            .ctx
+            .lock_manager
+            .acquire(LockResource::Instance(id.clone()), "test")
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            drop(guard);
+        })
+    };
+
+    let released = hold(Duration::from_millis(700));
+    let start = Instant::now();
+    let tool = add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let add_wait = start.elapsed();
+    released.join().unwrap();
+    assert!(
+        add_wait >= Duration::from_millis(500),
+        "adding a user tool did not wait for the instance lock: {add_wait:?}"
+    );
+
+    let released = hold(Duration::from_millis(700));
+    let start = Instant::now();
+    game_user_tools::remove(&f.ctx, &id, &tool.id).unwrap();
+    let remove_wait = start.elapsed();
+    released.join().unwrap();
+    assert!(
+        remove_wait >= Duration::from_millis(500),
+        "removing a user tool did not wait for the instance lock: {remove_wait:?}"
+    );
+}
+
+#[test]
 fn a_missing_user_tools_file_is_an_empty_list() {
     let f = fixture(Vec::new());
     assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());

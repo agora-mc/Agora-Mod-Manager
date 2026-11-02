@@ -119,6 +119,18 @@ pub struct InstanceSummary {
 pub struct DeleteOutcome {
     pub instance_id: String,
     pub orphaned_base: Option<String>,
+    /// A deployed game folder Agora could not prove was this instance's, left where it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_in_place: Option<PathBuf>,
+}
+
+/// Options for [`delete`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeleteOptions {
+    /// Delete the instance even when its base record cannot be read. The instance's own folder goes;
+    /// a deployed game folder Agora cannot prove is the instance's stays, and is named in the
+    /// outcome.
+    pub force_unreadable_base: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +141,8 @@ pub enum InstanceError {
     AlreadyExists(String),
     #[error("instance '{0}' not found")]
     NotFound(String),
+    #[error("instance '{0}' is running; close the game first")]
+    Running(String),
     #[error("instance '{0}' is a Minecraft instance; use 'agora launch {0}' to launch or 'agora instance delete {0}' to delete")]
     MinecraftInstance(String),
     #[error("invalid instance ID '{0}': {1}")]
@@ -531,6 +545,15 @@ pub fn is_minecraft_instance(ctx: &Ctx, id: &str) -> bool {
 /// Delete a generic game instance and its folder. Refuses Minecraft instances and folders
 /// outside `<instances_root>`.
 pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
+    delete_with_options(ctx, id, DeleteOptions::default())
+}
+
+/// [`delete`] with the caller's answer for a base record that cannot be read.
+pub fn delete_with_options(
+    ctx: &Ctx,
+    id: &str,
+    options: DeleteOptions,
+) -> Result<DeleteOutcome, InstanceError> {
     // A delete changes the instance's records and folders, so it takes the same lock as every other
     // writer. While it is held nothing can deploy or launch the instance out from under it.
     let _lock = ctx
@@ -580,12 +603,45 @@ pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
         return Err(InstanceError::InvalidInstanceDir(instance_dir));
     }
 
+    // A launch that is swapping or spawning has no game process yet, but it is running: the
+    // journal says so. An unreadable journal is not "not running"; it refuses.
+    if let Ok(manifest) = get_manifest(ctx, id) {
+        if let Some(runtime) = &manifest.runtime_identity {
+            match crate::game_user_files::status(ctx, &manifest.game, &runtime.store) {
+                Ok(Some(session)) if session.running && session.instance == id => {
+                    return Err(InstanceError::Running(id.to_string()));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(InstanceError::Other(format!(
+                        "the user-files session for instance '{id}' cannot be read, so it may be running: {error}"
+                    )))
+                }
+            }
+        }
+    }
+
     // The instance's deployed folder is Agora's and is rebuilt on demand, but the game may have
     // written into it. Take it down as a launch end does: harvest those changes first, and refuse
     // (changing nothing) when that cannot run. A game still running from it is refused there.
-    let deployment_folder = crate::game_deploy::deployment_dir(ctx, id)?
-        .and_then(|game| game.parent().map(std::path::Path::to_path_buf));
-    if instance_dir.join("instance_manifest.json").exists() {
+    let mut base_unreadable = false;
+    let deployment_folder = match crate::game_deploy::deployment_dir(ctx, id) {
+        Ok(deployed) => deployed.and_then(|game| game.parent().map(std::path::Path::to_path_buf)),
+        Err(crate::game_deploy::DeployError::UnreadableBaseManifest(_))
+            if options.force_unreadable_base =>
+        {
+            base_unreadable = true;
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // Without the record the farm cannot be checked or harvested. It is left alone, and named.
+    let left_in_place = if base_unreadable {
+        find_instance_deployment_folder(&ctx.paths, id)
+    } else {
+        None
+    };
+    if instance_dir.join("instance_manifest.json").exists() && !base_unreadable {
         crate::game_deploy::undeploy_locked(ctx, id)?;
     }
     // What is left is the empty folder Agora made for the farm; the instance is going, so it does.
@@ -624,7 +680,17 @@ pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
     Ok(DeleteOutcome {
         instance_id: id.to_string(),
         orphaned_base,
+        left_in_place,
     })
+}
+
+/// The deployment folder Agora would have made for `id`, searched across the base roots it knows,
+/// when the instance's own record cannot say where its base is.
+fn find_instance_deployment_folder(paths: &AppPaths, id: &str) -> Option<PathBuf> {
+    crate::game_base::known_base_roots(paths)
+        .into_iter()
+        .map(|root| root.join("deployments").join(id))
+        .find(|folder| folder.is_dir())
 }
 
 /// Update `last_launched_at` timestamp for a game instance.
@@ -1418,15 +1484,24 @@ pub fn launch_with(
     crate::game_user_files::swap_in(ctx, id, definition, &store, &running_from)?;
 
     // 4. Spawn game process
-    let (launched, prepared) =
-        match spawn_prepared(ctx, id, definition, prepared, options, launcher) {
-            Ok(l) => l,
-            Err(e) => {
-                // "If spawning fails, restore immediately."
-                let _ = crate::game_user_files::restore(ctx, definition, &store);
-                return Err(e);
-            }
-        };
+    let (launched, prepared) = match spawn_prepared(
+        ctx, id, definition, prepared, options, launcher,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            // "If spawning fails, restore immediately." The launch never reported a game, so
+            // its starting mark is cleared first. A restore that also fails is reported rather
+            // than swallowed: the journal stays, and the next launch or a restore finishes it.
+            let put_back = crate::game_user_files::finish_starting(ctx, &definition.id, &store)
+                .and_then(|()| crate::game_user_files::restore(ctx, definition, &store));
+            return Err(match put_back {
+                Ok(_) | Err(crate::game_user_files::UserFilesError::NoSession { .. }) => e,
+                Err(restore_error) => InstanceError::Other(format!(
+                    "{e}; putting the player's files back also failed: {restore_error}. The journal was kept, and the next launch will finish restoring it."
+                )),
+            });
+        }
+    };
 
     // 5. Record spawned process identity in journal
     let _ = crate::game_user_files::record_process(

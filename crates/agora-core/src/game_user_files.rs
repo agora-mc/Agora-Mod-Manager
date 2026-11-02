@@ -72,6 +72,11 @@ pub struct Journal {
     pub created_at: String,
     pub running_from: PathBuf,
     pub processes: Vec<ProcessIdentity>,
+    /// The Agora process that swapped these files in and has not yet recorded the game's process.
+    /// While it is alive the session counts as running: a launch between the swap and the spawn is
+    /// still a launch. A crash leaves a dead identity, so recovery is not blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_launcher: Option<ProcessIdentity>,
     pub files: Vec<JournaledFile>,
 }
 
@@ -252,6 +257,18 @@ fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFiles
 /// (`process_identity::verify`) or any process runs from the recorded folder
 /// (`processes_running_from`).
 pub fn is_session_running(journal: &Journal) -> bool {
+    if session_running_apart_from_starting(journal) {
+        return true;
+    }
+    journal
+        .starting_launcher
+        .as_ref()
+        .is_some_and(|launcher| process_identity::verify(launcher).is_ok())
+}
+
+/// The session's own processes, and any process running from its game folder. A launch that has
+/// swapped in but has not recorded its game yet is not counted here.
+fn session_running_apart_from_starting(journal: &Journal) -> bool {
     for proc in &journal.processes {
         if process_identity::verify(proc).is_ok() {
             return true;
@@ -336,10 +353,17 @@ pub fn swap_in(
         .user_files_backup_dir(definition.id.as_str(), store.as_str());
     std::fs::create_dir_all(&backup_dir)?;
 
-    // 3. Build initial journal record before touching any real file
+    // 3. Build initial journal record before touching any real file. A definition that names the
+    // same real file twice is refused as a duplicate mapping: swapping both would back up what the
+    // first wrote, so restore could never put the player's original back.
     let mut journal_files = Vec::new();
+    let mut seen_real_paths = std::collections::HashSet::new();
     for m in &applicable_mappings {
         let real_path = resolve_user_file_source(&m.source)?;
+        let real_key = fold_path_case(&real_path.to_string_lossy());
+        if !seen_real_paths.insert(real_key) {
+            continue;
+        }
         let instance_copy_path = instance_dir.join(m.instance_path.as_str());
         journal_files.push(JournaledFile {
             real_path,
@@ -361,6 +385,7 @@ pub fn swap_in(
         created_at: chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339(),
         running_from: running_from.to_path_buf(),
         processes: Vec::new(),
+        starting_launcher: process_identity::capture_self(),
         files: journal_files,
     };
 
@@ -479,15 +504,55 @@ pub fn restore(
     }
 
     let text = std::fs::read_to_string(&journal_path)?;
-    let journal: Journal = serde_json::from_str(&text)?;
+    let mut journal: Journal = serde_json::from_str(&text)?;
 
-    if is_session_running(&journal) {
+    if session_running_apart_from_starting(&journal) {
         return Err(UserFilesError::CannotRestoreRunning {
             instance: journal.instance_id.clone(),
         });
     }
+    match journal.starting_launcher.as_ref() {
+        Some(launcher) if process_identity::verify(launcher).is_ok() => {
+            // The process that started the launch is the one restoring: this is a launch that never
+            // reported a game, not a second launch. Any other process restoring must wait for it.
+            if launcher.pid != std::process::id() {
+                return Err(UserFilesError::CannotRestoreRunning {
+                    instance: journal.instance_id.clone(),
+                });
+            }
+            journal.starting_launcher = None;
+            write_journal(&journal_path, &journal)?;
+        }
+        _ => {}
+    }
 
     restore_journal_internal(ctx, definition, &journal)
+}
+
+/// Clear the "starting" mark of a launch that will never spawn. The caller then restores its
+/// files; a launch that failed must not leave the session counting as running.
+pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), UserFilesError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(game.clone(), store.clone()),
+        "finish-starting",
+    )?;
+    let journal_path = ctx
+        .paths
+        .user_files_journal_path(game.as_str(), store.as_str());
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&journal_path)?;
+    let mut journal: Journal = serde_json::from_str(&text)?;
+    let ours = journal
+        .starting_launcher
+        .as_ref()
+        .is_some_and(|launcher| launcher.pid == std::process::id());
+    if ours {
+        journal.starting_launcher = None;
+        write_journal(&journal_path, &journal)?;
+    }
+    Ok(())
 }
 
 fn restore_journal_internal(
@@ -740,6 +805,8 @@ pub fn record_process(
     let text = std::fs::read_to_string(&journal_path)?;
     let mut journal: Journal = serde_json::from_str(&text)?;
     journal.processes.push(identity);
+    // The game now has an identity that says whether it is alive; the launcher mark is done.
+    journal.starting_launcher = None;
     write_journal(&journal_path, &journal)?;
     Ok(())
 }
