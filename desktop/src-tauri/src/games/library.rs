@@ -98,8 +98,56 @@ pub struct LibraryIconCached {
     pub icon_data_url: Option<String>,
 }
 
+/// What "Fill in missing details" did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryFillReport {
+    pub considered: usize,
+    pub updated: usize,
+    pub skipped: Vec<LibraryFillSkip>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryFillSkip {
+    pub item_id: String,
+    pub name: String,
+    pub reason: String,
+}
+
 fn library_error(error: ContentError) -> GamesError {
     GamesError::new(CORE_FAILED, error.to_string())
+}
+
+/// Fill missing descriptions, names, versions, page links and icons from the provider. Uses the
+/// same batched lookup as a pack import; Modrinth's Privacy switch and Lockdown Mode still apply.
+#[tauri::command]
+pub async fn games_library_fill_details(
+    app: tauri::AppHandle,
+) -> Result<LibraryFillReport, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<LibraryFillReport, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let source =
+            agora_game_minecraft::metadata_source::ModrinthMetadataSource::new(ctx.clone());
+        let report = core_library::fill_missing_details(&ctx, &source).map_err(library_error)?;
+        Ok(LibraryFillReport {
+            considered: report.considered,
+            updated: report.updated,
+            skipped: report
+                .skipped
+                .into_iter()
+                .map(|skip| LibraryFillSkip {
+                    item_id: skip.item_id,
+                    name: skip.name,
+                    reason: skip.reason,
+                })
+                .collect(),
+            warnings: report.warnings,
+        })
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Filling in details did not finish."))?
 }
 
 /// Every item in the content store with its saved metadata and the instances that use it. Makes no

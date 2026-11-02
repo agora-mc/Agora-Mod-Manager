@@ -551,6 +551,7 @@ impl ImportService {
                 skip_unfetchable,
                 install_anyway,
                 Some(&blocking_ctx),
+                None,
             ),
             ImportSource::PrismZip(path) => crate::import::import_prism_zip_named(
                 &path,

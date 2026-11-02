@@ -525,6 +525,7 @@ pub fn run() {
             games::content::games_instance_content_set_enabled,
             games::content::games_instance_content_move,
             games::library::games_library_list,
+            games::library::games_library_fill_details,
             games::library::games_library_unused,
             games::library::games_library_instances,
             games::library::games_library_icon,

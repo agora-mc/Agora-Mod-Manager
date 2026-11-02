@@ -188,6 +188,7 @@ classified as a base game, add-on or tool (MASTER_SPEC §26.3), and manages pinn
 | `agora games content add <path> [--name N]` | Add a zip, 7z or RAR archive (RAR is read through Windows' own tar) or a folder to the content store |
 | `agora games content list` | List all items in the content store |
 | `agora games content unused` | List items no instance uses, with their size. An unreadable instance manifest is a warning, and removal refuses while one exists |
+| `agora games content fill-details` | Fill missing descriptions, names, versions, page links and icons from Modrinth, in batched lookups. Fields an item already has are never overwritten; Modrinth's Privacy switch and Lockdown Mode apply |
 | `agora games content show <item>` | Show files in a content item |
 | `agora games content verify [<item>] [--full]` | Verify integrity of content items |
 | `agora games content remove <item>` | Delete an item from the content store |

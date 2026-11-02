@@ -45,6 +45,7 @@ pub mod log_share;
 pub mod maintenance;
 pub mod mcp_dispatcher;
 pub mod memory_recommendation;
+pub mod metadata_source;
 pub mod migration_report;
 pub mod minecraft_metadata;
 pub mod minecraft_runtime;

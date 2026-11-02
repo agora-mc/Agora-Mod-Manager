@@ -18,6 +18,7 @@ use agora_core::{
 };
 
 /// What an install path already knows about the file it is storing.
+#[derive(Clone, Copy)]
 pub struct StoreDetails<'a> {
     pub content_type: &'a str,
     /// The file's name inside the instance, without a `.disabled` suffix.
@@ -166,19 +167,18 @@ pub fn store_staged_content(
     instance_dir: &Path,
     relative_path: &str,
     source: &Path,
-    version: Option<&str>,
-    page_url: Option<&str>,
+    details: &StoreDetails<'_>,
 ) -> LauncherResult<Option<StoredFile>> {
     let Some(content_type) = tracked_content_type(relative_path) else {
         return Ok(None);
     };
     validate_relative_path(relative_path)?;
-    let stored = store_file_at(
-        ctx,
-        source,
-        &store_details(content_type, file_name_of(relative_path), version, page_url),
-        Some(relative_path),
-    )?;
+    let details = StoreDetails {
+        content_type,
+        filename: file_name_of(relative_path),
+        ..*details
+    };
+    let stored = store_file_at(ctx, source, &details, Some(relative_path))?;
     let target = instance_dir.join(relative_path);
     if target.exists() {
         if let Some(folder) = target.parent() {

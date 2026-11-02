@@ -38,6 +38,7 @@ fn import_mrpack_with(
         false,
         install_anyway,
         ctx,
+        None,
     )
 }
 
@@ -448,4 +449,265 @@ fn a_pack_import_records_files_as_unchanged_and_items_as_used() {
         listing.items.is_empty(),
         "a pack's own item is not unused: {listing:?}"
     );
+}
+
+/// A pack whose one listed file carries a Modrinth download URL while its bytes are embedded, so
+/// the import identifies the project without any request.
+fn write_downloaded_mrpack(dir: &Path, rel: &str, bytes: &[u8], url: &str) -> PathBuf {
+    let path = dir.join("downloaded.mrpack");
+    let hashes = both_hashes(bytes);
+    let index = format!(
+        r#"{{"formatVersion":1,"game":"minecraft","versionId":"1.0.0","name":"Downloaded Pack","summary":"","files":[{{"path":"{rel}","hashes":{hashes},"env":{{"client":"required","server":"required"}},"downloads":["{url}"],"fileSize":{}}}],
+            "dependencies":{{"minecraft":"1.20.4","fabric-loader":"0.15.0"}}}}"#,
+        bytes.len()
+    );
+    let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let opts = zip::write::SimpleFileOptions::default();
+    writer.start_file("modrinth.index.json", opts).unwrap();
+    writer.write_all(index.as_bytes()).unwrap();
+    writer.start_file(rel, opts).unwrap();
+    writer.write_all(bytes).unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+struct SilentMetadataSource {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl agora_core::library::MetadataSource for SilentMetadataSource {
+    fn available(&self) -> Result<(), LauncherError> {
+        Err(LauncherError::Generic {
+            code: "ERR_TEST_NETWORK_OFF".into(),
+            message: "network off".into(),
+        })
+    }
+
+    fn projects(
+        &self,
+        _project_ids: &[String],
+    ) -> Result<Vec<agora_core::library::ProjectDetails>, LauncherError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("a metadata request was made while the network was off");
+    }
+
+    fn versions_from_hashes(
+        &self,
+        _hashes: &[String],
+    ) -> Result<Vec<agora_core::library::ProjectVersion>, LauncherError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("a metadata request was made while the network was off");
+    }
+
+    fn icon_bytes(&self, _url: &str) -> Result<Option<Vec<u8>>, LauncherError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("a metadata request was made while the network was off");
+    }
+}
+
+struct AnsweringMetadataSource {
+    fail_projects: bool,
+    project_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl agora_core::library::MetadataSource for AnsweringMetadataSource {
+    fn projects(
+        &self,
+        project_ids: &[String],
+    ) -> Result<Vec<agora_core::library::ProjectDetails>, LauncherError> {
+        self.project_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_projects {
+            return Err(LauncherError::Generic {
+                code: "ERR_TEST_BATCH".into(),
+                message: "the batch could not be fetched".into(),
+            });
+        }
+        Ok(project_ids
+            .iter()
+            .map(|id| agora_core::library::ProjectDetails {
+                project_id: id.clone(),
+                title: Some("Sodium".into()),
+                description: Some("A modern rendering engine for Minecraft.".into()),
+                page_url: Some("https://modrinth.com/mod/sodium".into()),
+                icon_url: Some("https://cdn.modrinth.com/data/PROJ/icon.png".into()),
+            })
+            .collect())
+    }
+
+    fn versions_from_hashes(
+        &self,
+        _hashes: &[String],
+    ) -> Result<Vec<agora_core::library::ProjectVersion>, LauncherError> {
+        Ok(Vec::new())
+    }
+
+    fn icon_bytes(&self, _url: &str) -> Result<Option<Vec<u8>>, LauncherError> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[9u8; 16]);
+        Ok(Some(bytes))
+    }
+}
+
+fn imported_item(
+    ctx: &Ctx,
+    root: &Path,
+    instance_id: &str,
+) -> agora_core::content_store::ContentItem {
+    let manifest = read_test_manifest(root, instance_id);
+    let entry = manifest.mods.first().expect("the mod entry");
+    crate::content_bridge::load_item(
+        ctx,
+        entry.content_item_id.as_deref().expect("the store item id"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_offline_pack_import_records_project_ids_and_page_urls() {
+    let (ctx, tmp) = store_ctx();
+    let bytes = b"offline mod bytes".to_vec();
+    let path = write_downloaded_mrpack(
+        tmp.path(),
+        "mods/a.jar",
+        &bytes,
+        "https://cdn.modrinth.com/data/PROJ/versions/VER/a.jar",
+    );
+    let root = ctx.paths.instances_root();
+    let source = SilentMetadataSource {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let imported = import_mrpack_inner(
+        &path,
+        &root,
+        false,
+        None,
+        None,
+        None,
+        OverridePolicy::Standard,
+        None,
+        false,
+        false,
+        Some(&ctx),
+        Some(&source),
+    )
+    .unwrap();
+
+    assert!(imported.warnings.is_empty());
+    let item = imported_item(&ctx, &root, &imported.instance_id);
+    assert_eq!(item.provider.as_deref(), Some("modrinth"));
+    assert_eq!(item.provider_id.as_deref(), Some("PROJ"));
+    assert_eq!(item.version.as_deref(), Some("VER"));
+    assert_eq!(
+        item.page_url.as_deref(),
+        Some("https://modrinth.com/mod/PROJ")
+    );
+    assert!(
+        item.description.is_none(),
+        "an offline import records no description and invents none"
+    );
+    assert!(item.icon_sha256.is_none());
+    assert_eq!(
+        source.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an offline import makes no metadata request"
+    );
+}
+
+#[test]
+fn a_pack_import_saves_descriptions_titles_and_icons_when_modrinth_answers() {
+    let (ctx, tmp) = store_ctx();
+    let bytes = b"online mod bytes".to_vec();
+    let path = write_downloaded_mrpack(
+        tmp.path(),
+        "mods/bbe-fabric-1.3.9+mc26.2-mod.jar",
+        &bytes,
+        "https://cdn.modrinth.com/data/PROJ/versions/VER/bbe.jar",
+    );
+    let root = ctx.paths.instances_root();
+    let source = AnsweringMetadataSource {
+        fail_projects: false,
+        project_calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let imported = import_mrpack_inner(
+        &path,
+        &root,
+        false,
+        None,
+        None,
+        None,
+        OverridePolicy::Standard,
+        None,
+        false,
+        false,
+        Some(&ctx),
+        Some(&source),
+    )
+    .unwrap();
+
+    assert!(imported.warnings.is_empty(), "{:?}", imported.warnings);
+    assert_eq!(
+        source
+            .project_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one batched request answers the whole pack"
+    );
+    let item = imported_item(&ctx, &root, &imported.instance_id);
+    assert_eq!(
+        item.description.as_deref(),
+        Some("A modern rendering engine for Minecraft.")
+    );
+    assert_eq!(
+        item.name, "Sodium",
+        "the project title replaces the file name"
+    );
+    assert_eq!(
+        item.page_url.as_deref(),
+        Some("https://modrinth.com/mod/sodium")
+    );
+    assert!(item.icon_sha256.is_some(), "the icon bytes were saved");
+}
+
+#[test]
+fn a_failed_metadata_batch_warns_and_the_import_still_succeeds() {
+    let (ctx, tmp) = store_ctx();
+    let bytes = b"mod bytes with a failing batch".to_vec();
+    let path = write_downloaded_mrpack(
+        tmp.path(),
+        "mods/failing.jar",
+        &bytes,
+        "https://cdn.modrinth.com/data/PROJ/versions/VER/failing.jar",
+    );
+    let root = ctx.paths.instances_root();
+    let source = AnsweringMetadataSource {
+        fail_projects: true,
+        project_calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let imported = import_mrpack_inner(
+        &path,
+        &root,
+        false,
+        None,
+        None,
+        None,
+        OverridePolicy::Standard,
+        None,
+        false,
+        false,
+        Some(&ctx),
+        Some(&source),
+    )
+    .unwrap();
+
+    assert_eq!(imported.imported_mods, 1, "the import itself succeeded");
+    assert_eq!(imported.warnings.len(), 1, "{:?}", imported.warnings);
+    assert!(
+        imported.warnings[0].contains("the batch could not be fetched"),
+        "{:?}",
+        imported.warnings
+    );
+    let item = imported_item(&ctx, &root, &imported.instance_id);
+    assert!(item.description.is_none());
+    assert_eq!(item.provider_id.as_deref(), Some("PROJ"));
 }
