@@ -14,13 +14,23 @@ describe('Switch', () => {
   it('is off with a neutral track and on with the theme accent', () => {
     const { rerender } = render(<Switch aria-label="Music" checked={false} />);
     const off = screen.getByRole('switch', { name: 'Music' });
+    expect(off).toHaveClass('agora-switch');
     expect(off).toHaveAttribute('aria-checked', 'false');
-    expect(off).toHaveClass('data-[state=unchecked]:bg-[hsl(var(--switch-off))]');
 
     rerender(<Switch aria-label="Music" checked />);
     const on = screen.getByRole('switch', { name: 'Music' });
     expect(on).toHaveAttribute('aria-checked', 'true');
-    expect(on).toHaveClass('data-[state=checked]:bg-primary');
+
+    // The off track is the neutral muted foreground; only the on state uses
+    // the accent, which is what makes "off" read as off in every theme.
+    const css = cssFile();
+    expect(css).toMatch(/\.agora-switch\s*\{[^}]*background:\s*hsl\(var\(--muted-foreground\) \/ 0\.22\)/);
+    expect(css).toMatch(/\.agora-switch\[data-state="checked"\]\s*\{[^}]*background:\s*hsl\(var\(--primary\)\)/);
+  });
+
+  it('offers a small size for dense tables', () => {
+    render(<Switch aria-label="Music" size="sm" checked={false} />);
+    expect(screen.getByRole('switch', { name: 'Music' })).toHaveClass('agora-switch--sm');
   });
 
   it('reports the new state when clicked', async () => {
@@ -64,22 +74,23 @@ describe('Switch', () => {
     const control = screen.getByRole('switch', { name: 'Music' });
 
     expect(control).toBeDisabled();
-    expect(control).toHaveClass('disabled:opacity-50');
     await user.click(control);
     expect(onCheckedChange).not.toHaveBeenCalled();
+    expect(cssFile()).toMatch(/\.agora-switch:disabled\s*\{[^}]*opacity:\s*0\.55/);
   });
 
   it('animates the track and knob, and the app-wide reduced-motion rules stop it', () => {
     render(<Switch aria-label="Music" checked={false} />);
     const control = screen.getByRole('switch', { name: 'Music' });
     const thumb = control.firstElementChild;
+    const css = cssFile();
 
-    expect(control).toHaveClass('transition-colors');
-    expect(thumb).toHaveClass('transition-transform');
+    expect(thumb).toHaveClass('agora-switch__thumb');
+    expect(css).toMatch(/\.agora-switch__thumb\s*\{[^}]*transition:/);
+    expect(css).toMatch(/\.agora-switch\s*\{[^}]*transition:/);
 
     // The app honours reduced motion globally (the user's motion setting and
     // the OS preference); this is the same mechanism every other animation uses.
-    const css = cssFile();
     expect(css).toContain(':root[data-motion="reduced"] *');
     expect(css).toContain('transition-duration: 0.01ms !important');
     expect(css).toContain('@media (prefers-reduced-motion: reduce)');
