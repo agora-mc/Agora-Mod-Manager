@@ -186,6 +186,7 @@ export function GameSupportSettings() {
                 </div>
                 <Switch
                   aria-label={`Offer ${row.name}`}
+                  size="sm"
                   checked={row.enabled}
                   disabled={!row.canDisable || saving !== null}
                   onCheckedChange={(checked) => void toggle(row, checked)}

@@ -84,6 +84,7 @@ export function ContentProvidersList() {
                 </div>
                 <Switch
                   aria-label={`${provider.title} content source`}
+                  size="sm"
                   checked={provider.enabled}
                   disabled={busy === provider.id}
                   onCheckedChange={(checked) => toggle(provider, checked)}

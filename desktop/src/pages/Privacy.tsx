@@ -285,6 +285,7 @@ export function Privacy() {
             </p>
           </div>
           <Switch
+            aria-label="Lockdown Mode"
             checked={lockdown}
             onCheckedChange={handleLockdown}
             className={cn(
@@ -328,6 +329,8 @@ export function Privacy() {
                     )}
                   </div>
                   <Switch
+                    aria-label={ep.name}
+                    size="sm"
                     checked={endpointStates[ep.key] ?? ep.default}
                     onCheckedChange={(value) => handleToggle(ep.key, value)}
                     disabled={lockdown}

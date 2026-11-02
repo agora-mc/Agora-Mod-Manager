@@ -1868,6 +1868,7 @@ export function Settings({
           <span className="text-sm">Modrinth-sourced catalog entries</span>
           <Switch
             aria-label="Modrinth-sourced catalog entries"
+            size="sm"
             checked={curatedSources['modrinth_id'] ?? true}
             onCheckedChange={(checked) => toggleCuratedSource('modrinth_id', checked)}
           />
@@ -1876,6 +1877,7 @@ export function Settings({
           <span className="text-sm">GitHub-sourced catalog entries</span>
           <Switch
             aria-label="GitHub-sourced catalog entries"
+            size="sm"
             checked={curatedSources['github_release'] ?? true}
             onCheckedChange={(checked) => toggleCuratedSource('github_release', checked)}
           />
@@ -1884,6 +1886,7 @@ export function Settings({
           <span className="text-sm">Direct-hash catalog entries</span>
           <Switch
             aria-label="Direct-hash catalog entries"
+            size="sm"
             checked={curatedSources['direct_hash'] ?? true}
             onCheckedChange={(checked) => toggleCuratedSource('direct_hash', checked)}
           />
@@ -1892,6 +1895,7 @@ export function Settings({
           <span className="text-sm">Curated pack entries</span>
           <Switch
             aria-label="Curated pack entries"
+            size="sm"
             checked={curatedSources['curated_pack'] ?? true}
             onCheckedChange={(checked) => toggleCuratedSource('curated_pack', checked)}
           />
@@ -1900,6 +1904,7 @@ export function Settings({
           <span className="text-sm">Technic-sourced pack entries</span>
           <Switch
             aria-label="Technic-sourced pack entries"
+            size="sm"
             checked={curatedSources['technic_pack'] ?? true}
             onCheckedChange={(checked) => toggleCuratedSource('technic_pack', checked)}
           />
@@ -1908,6 +1913,7 @@ export function Settings({
           <span className="text-sm">Packs curated from content sources</span>
           <Switch
             aria-label="Packs curated from content sources"
+            size="sm"
             checked={curatedSources['provider_pack'] ?? true}
             onCheckedChange={(checked) => toggleCuratedSource('provider_pack', checked)}
           />
