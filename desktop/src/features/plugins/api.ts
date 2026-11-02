@@ -68,8 +68,16 @@ export const installPluginPackage = (
 export const checkPluginUpdate = (pluginId: string) =>
   invoke<UpdateVerdict | null>('plugin_check_update', { pluginId });
 
-export const applyPluginUpdate = (pluginId: string, acceptCapabilities: boolean) =>
-  invoke<UpdateOutcome | null>('plugin_apply_update', { pluginId, acceptCapabilities });
+export const applyPluginUpdate = (
+  pluginId: string,
+  acceptCapabilities: boolean,
+  allowScripts?: boolean,
+) =>
+  invoke<UpdateOutcome | null>('plugin_apply_update', {
+    pluginId,
+    acceptCapabilities,
+    allowScripts,
+  });
 
 /** The official plugins the signed catalog offers; empty with a reason when it cannot be verified. */
 export const listOfficialPlugins = () => invoke<OfficialPluginList>('list_official_plugins');

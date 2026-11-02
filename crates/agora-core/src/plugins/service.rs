@@ -1368,7 +1368,7 @@ impl PluginService {
     pub async fn apply_update(
         &self,
         plugin_id: &PluginId,
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
         let verdict = self.check_update(plugin_id).await?;
         let UpdateVerdict::Available {
@@ -1389,7 +1389,7 @@ impl PluginService {
         };
 
         let bytes = self.fetch_update_package(url, *size).await?;
-        self.install_downloaded_update(plugin_id, to, sha256, *size, &bytes, accept_capabilities)
+        self.install_downloaded_update(plugin_id, to, sha256, *size, &bytes, consent)
     }
 
     /// Check downloaded bytes against the signed release and install them.
@@ -1411,8 +1411,9 @@ impl PluginService {
         sha256: &str,
         size: u64,
         bytes: &[u8],
-        accept_capabilities: bool,
+        consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
+        let consent = consent.into();
         // The signed document said what these bytes must be. The host that
         // served them is trusted for nothing else: it may refuse, and it may
         // serve something different, but something different fails here.
@@ -1459,7 +1460,7 @@ impl PluginService {
             .as_ref()
             .map(|preview| preview.requires_capability_consent())
             .unwrap_or(false);
-        if needs_consent && !accept_capabilities {
+        if needs_consent && !consent.capabilities {
             let _ = std::fs::remove_dir_all(&staging);
             return Ok(UpdateOutcome::NeedsConsent {
                 preview: Box::new(preview.expect("checked above")),
@@ -1470,7 +1471,7 @@ impl PluginService {
         // a privileged path: it gets the same capability comparison, the same
         // data checkpoint, the same staging and rollback, and the same refusal
         // when it asks for more than was granted.
-        let result = self.install_package(&archive, accept_capabilities);
+        let result = self.install_package(&archive, consent);
         let _ = std::fs::remove_file(&archive);
 
         // The downloaded bytes are not kept. Retaining them would be a second

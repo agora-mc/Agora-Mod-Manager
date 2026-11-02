@@ -830,9 +830,34 @@ mod tests {
         let exactly = std::io::Cursor::new(vec![b'x'; 16]);
         assert_eq!(read_capped(exactly, 16).unwrap().len(), 16);
 
-        let too_large = std::io::Cursor::new(vec![b'x'; 17]);
-        let error = read_capped(too_large, 16).unwrap_err();
+        /// An endless body that counts how many bytes were pulled from it, so
+        /// the test can tell "stopped at the cap" from "read it all".
+        struct Endless {
+            served: usize,
+            max: usize,
+        }
+        impl std::io::Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.served >= self.max {
+                    return Ok(0);
+                }
+                self.served += 1;
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let too_large = Endless {
+            served: 0,
+            max: 10_000,
+        };
+        let mut too_large = too_large;
+        let error = read_capped(&mut too_large, 16).unwrap_err();
         assert_eq!(error.code, PluginErrorCode::ResourceExhausted);
+        assert_eq!(
+            too_large.served, 17,
+            "it reads at most one byte past the limit, not the whole body"
+        );
     }
 
     #[test]
