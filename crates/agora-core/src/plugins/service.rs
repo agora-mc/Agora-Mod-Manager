@@ -526,6 +526,24 @@ impl PluginService {
         if record.manifest.is_declarative_only() {
             return true;
         }
+        // An official plugin whose catalog standing could not be checked (or
+        // whose version is no longer listed) keeps loading its data, but its
+        // scripts wait until a verified catalog says it is official again.
+        // Consent alone is not enough without a verifiable source.
+        let status_forbids_scripts = self
+            .inner
+            .official
+            .read()
+            .map(|statuses| {
+                statuses
+                    .get(plugin_id.as_str())
+                    .is_some_and(|status| !status.scripts_allowed_by_status())
+            })
+            // Cannot read the standings: do not run code on a guess.
+            .unwrap_or(true);
+        if status_forbids_scripts {
+            return false;
+        }
         self.inner
             .conn()
             .and_then(|conn| store::script_consent(&conn, plugin_id))
@@ -598,8 +616,12 @@ impl PluginService {
             })
             .collect();
         // A plugin that has just become blocked (revoked by a newer registry,
-        // edited on disk) and is running stops now, not at the next launch.
-        for id in blocked.keys() {
+        // edited on disk), or whose catalog standing can no longer allow its
+        // scripts, stops now rather than at the next launch.
+        for (id, status) in &official {
+            if status.scripts_allowed_by_status() {
+                continue;
+            }
             if let Ok(plugin_id) = PluginId::parse(id) {
                 if self.inner.host.is_active(&plugin_id) {
                     self.inner.host.cancel(&plugin_id);
@@ -980,6 +1002,11 @@ impl PluginService {
                     .flatten()
                     .map(|trust| trust.keys)
                     .unwrap_or_default(),
+                // Failing to read it reads as "changed", which asks again
+                // rather than reusing an answer we cannot see.
+                code_hash: store::script_consent_code_hash(&conn, plugin_id)
+                    .ok()
+                    .flatten(),
             }),
             _ => None,
         }
@@ -1151,9 +1178,8 @@ impl PluginService {
             } else {
                 store::script_consent_code_hash(&conn, &manifest.id)?
             };
-            let code_is_new = first_install
-                || !previous_runs_code
-                || previous_digest != new_code_digest;
+            let code_is_new =
+                first_install || !previous_runs_code || previous_digest != new_code_digest;
             if code_is_new || publisher_changed {
                 store::set_script_consent(
                     &conn,
@@ -2552,6 +2578,7 @@ struct ExistingRecord {
     hosts: Vec<String>,
     granted: CapabilitySet,
     trusted_keys: Vec<agora_plugin_api::distribution::PublicKey>,
+    code_hash: Option<String>,
 }
 
 impl ExistingRecord {
@@ -2563,6 +2590,7 @@ impl ExistingRecord {
             hosts: &self.hosts,
             runs_code: self.runs_code,
             trusted_keys: Some(&self.trusted_keys),
+            code_hash: self.code_hash.as_deref(),
         }
     }
 }

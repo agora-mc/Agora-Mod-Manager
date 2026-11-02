@@ -783,10 +783,20 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         // in between would let a later version inherit an answer given for
         // different code. A digest of the manifest's entrypoint is enough to
         // tell "the code the user allowed" from "new code".
-        conn.execute(
-            "ALTER TABLE plugin_script_consent ADD COLUMN code_hash TEXT",
+        // The table may already carry the column when an older schema_version
+        // row was lost (the migration tests delete rows to replay history), so
+        // add it only when it is missing.
+        let has_code_hash: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plugin_script_consent') WHERE name = 'code_hash'",
             [],
+            |row| row.get(0),
         )?;
+        if has_code_hash == 0 {
+            conn.execute(
+                "ALTER TABLE plugin_script_consent ADD COLUMN code_hash TEXT",
+                [],
+            )?;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (21)",
             [],

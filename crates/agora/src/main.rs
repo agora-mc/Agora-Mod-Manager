@@ -2548,6 +2548,12 @@ fn print_plugin_preview(
     if let Some(version) = &preview.replaces_version {
         println!("Replaces installed version: {version}");
     }
+    if preview.publisher_changed {
+        println!(
+            "Publisher: CHANGED — this update is signed by a different publisher than the one \
+             installed. Only continue if you trust where it came from."
+        );
+    }
     if preview.runs_code {
         println!("Code: this plugin runs code (scripts)");
     } else {

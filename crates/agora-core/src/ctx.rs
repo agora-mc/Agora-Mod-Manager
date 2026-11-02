@@ -185,9 +185,9 @@ impl CoreContext {
                 // Finish or undo it before anything reads the records.
                 match crate::plugins::install::recover_interrupted_installs(&conn, &paths) {
                     Ok(recovered) => warnings.extend(recovered),
-                    Err(e) => warnings.push(format!(
-                        "Cannot recover interrupted plugin installs: {e}"
-                    )),
+                    Err(e) => {
+                        warnings.push(format!("Cannot recover interrupted plugin installs: {e}"))
+                    }
                 }
 
                 // A game package is data: it runs no code, so it loads whatever the
@@ -227,14 +227,11 @@ impl CoreContext {
                             // not load, so the reservation must happen before
                             // any community package is read.
                             records.sort_by_key(|record| {
-                                !matches!(
+                                matches!(
                                     official.get(record.id().as_str()),
-                                    Some(crate::plugins::official::OfficialStatus::Official { .. })
-                                        | Some(
-                                            crate::plugins::official::OfficialStatus::Unverified {
-                                                ..
-                                            }
-                                        )
+                                    None | Some(
+                                        crate::plugins::official::OfficialStatus::Community
+                                    )
                                 )
                             });
                             for record in records {
@@ -288,6 +285,24 @@ impl CoreContext {
                                             game_builder.reserve_blocked(&package_def);
                                         }
                                         continue;
+                                    }
+                                    Some(
+                                        crate::plugins::official::OfficialStatus::CatalogUnavailable {
+                                            reason,
+                                        },
+                                    )
+                                    | Some(
+                                        crate::plugins::official::OfficialStatus::NotListed {
+                                            reason,
+                                        },
+                                    ) => {
+                                        // It still loads from its installed files;
+                                        // say (once, on the plugin and here) that
+                                        // it could not be checked this time.
+                                        warnings.push(format!(
+                                            "Plugin {} is loaded from its installed files: {reason}",
+                                            record.id()
+                                        ));
                                     }
                                     Some(crate::plugins::official::OfficialStatus::Community)
                                     | None => {}

@@ -150,6 +150,7 @@ struct Release {
     tree_sha256: String,
     size: i64,
     min_agora: &'static str,
+    revoked: bool,
 }
 
 impl Release {
@@ -162,6 +163,7 @@ impl Release {
             tree_sha256: zip_tree_digest(zip).unwrap(),
             size: zip.len() as i64,
             min_agora: "0.1.0",
+            revoked: false,
         }
     }
 }
@@ -186,13 +188,14 @@ fn write_registry(root: &Path, releases: &[Release], key: &SigningKey, sign: boo
             package_tree_sha256 TEXT NOT NULL,
             package_size INTEGER NOT NULL,
             min_agora_version TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (plugin_id, version)
          );",
     )
     .unwrap();
     for release in releases {
         conn.execute(
-            "INSERT INTO official_plugins VALUES (?1, ?2, ?3, 'Fixture', 'A test plugin', ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO official_plugins VALUES (?1, ?2, ?3, 'Fixture', 'A test plugin', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 PLUGIN,
                 release.version,
@@ -203,6 +206,7 @@ fn write_registry(root: &Path, releases: &[Release], key: &SigningKey, sign: boo
                 release.tree_sha256,
                 release.size,
                 release.min_agora,
+                release.revoked as i64,
             ],
         )
         .unwrap();
@@ -685,7 +689,7 @@ async fn editing_an_installed_official_plugins_files_removes_official_status_wit
 }
 
 #[tokio::test]
-async fn an_entry_the_registry_no_longer_lists_stops_being_official() {
+async fn an_entry_the_registry_no_longer_lists_keeps_loading_with_a_warning() {
     let world = World::new();
     let zip = fixture_zip("1.0.0");
     world.publish(vec![(Release::of("1.0.0", "current", &zip), zip)]);
@@ -701,24 +705,25 @@ async fn an_entry_the_registry_no_longer_lists_stops_being_official() {
     let newer = fixture_zip("2.0.0");
     world.publish(vec![(Release::of("2.0.0", "current", &newer), newer)]);
 
-    let OfficialStatus::Unverified { reason } = world.status() else {
+    let OfficialStatus::NotListed { reason } = world.status() else {
         panic!("a removed entry must not stay official");
     };
-    assert!(reason.contains("no longer lists"), "reason: {reason}");
+    assert!(reason.contains("no longer listed"), "reason: {reason}");
     world.set_emergency_stop(true);
     let (ctx, warnings) = world.start();
-    assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_none());
-    assert!(warnings.iter().any(|w| w.contains("no longer lists")));
-
-    // A revoked version stays blocked with the switch on, too.
-    world.set_emergency_stop(false);
-    let (ctx, _) = world.start();
-    assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_none());
-    world.service.reload().unwrap();
-    assert!(matches!(
-        world.service.list().remove(0).status,
-        PluginStatus::Blocked { .. }
-    ));
+    assert!(
+        ctx.games.game(&GameId::new(GAME).unwrap()).is_some(),
+        "an old version that is no longer listed still loads its game"
+    );
+    assert!(warnings.iter().any(|w| w.contains("no longer listed")));
+    assert!(
+        !world
+            .service
+            .list()
+            .iter()
+            .any(|plugin| matches!(plugin.status, PluginStatus::Blocked { .. })),
+        "it is not blocked"
+    );
 }
 
 #[tokio::test]
@@ -825,7 +830,7 @@ async fn an_unsigned_or_tampered_registry_offers_no_official_plugins() {
 }
 
 #[tokio::test]
-async fn an_installed_official_plugin_loses_standing_when_the_registry_stops_verifying() {
+async fn an_installed_official_plugin_keeps_loading_when_the_registry_stops_verifying() {
     let world = World::new();
     let zip = fixture_zip("1.0.0");
     world.publish(vec![(Release::of("1.0.0", "current", &zip), zip)]);
@@ -840,14 +845,17 @@ async fn an_installed_official_plugin_loses_standing_when_the_registry_stops_ver
     // Corrupt the signature.
     std::fs::write(world.root().join("registry.db.sig"), [0u8; 64]).unwrap();
 
-    let OfficialStatus::Unverified { reason } = world.status() else {
-        panic!("without a verifiable registry nothing is official");
+    let OfficialStatus::CatalogUnavailable { reason } = world.status() else {
+        panic!("without a verifiable registry it is not official");
     };
     assert!(reason.contains("signature"), "reason: {reason}");
     world.set_emergency_stop(true);
     let (ctx, warnings) = world.start();
-    assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_none());
-    assert!(warnings.iter().any(|w| w.contains("blocked")));
+    assert!(
+        ctx.games.game(&GameId::new(GAME).unwrap()).is_some(),
+        "the game stays while the catalog cannot be checked"
+    );
+    assert!(warnings.iter().any(|w| w.contains("could not check")));
 }
 
 #[tokio::test]
@@ -1255,6 +1263,13 @@ async fn local_state_cannot_vouch_for_a_tampered_folder_or_a_rewritten_record() 
     // 1. Edit a file and rewrite the remembered digest to match it.
     let target = world.installed_dir().join("games/package.json");
     let original = std::fs::read(&target).unwrap();
+    let original_digest: String = conn
+        .query_row(
+            "SELECT tree_sha256 FROM plugin_official WHERE plugin_id = ?1",
+            [PLUGIN],
+            |row| row.get(0),
+        )
+        .unwrap();
     std::fs::write(&target, b"{\"hijacked\": true}").unwrap();
     let forged = tree_digest(&world.installed_dir()).unwrap();
     conn.execute(
@@ -1265,8 +1280,13 @@ async fn local_state_cannot_vouch_for_a_tampered_folder_or_a_rewritten_record() 
     let OfficialStatus::Unverified { reason } = world.status() else {
         panic!("a digest remembered in local state must not vouch for edited files");
     };
-    assert!(reason.contains("changed"), "{reason}");
+    assert!(reason.contains("different files"), "{reason}");
     std::fs::write(&target, &original).unwrap();
+    conn.execute(
+        "UPDATE plugin_official SET tree_sha256 = ?1 WHERE plugin_id = ?2",
+        rusqlite::params![original_digest, PLUGIN],
+    )
+    .unwrap();
     assert!(world.status().is_official(), "restored files verify again");
 
     // 2. Rewrite the stored manifest (contributions are read from it) without touching a file.
@@ -1677,7 +1697,10 @@ async fn the_emergency_stop_stops_every_script_and_data_only_plugins_still_load(
     world.service.activate_all().unwrap();
     assert!(!world.running(COMMUNITY_SCRIPT));
     assert!(!world.running(SCRIPTED_B));
-    assert!(world.service.activate(&plugin_id(COMMUNITY_SCRIPT)).is_err());
+    assert!(world
+        .service
+        .activate(&plugin_id(COMMUNITY_SCRIPT))
+        .is_err());
     assert!(world.service.contributions().is_empty());
 
     // Data-only plugins run no code, so the stop does not take their games away.
@@ -2077,11 +2100,7 @@ async fn a_differently_signed_update_is_flagged_and_asks_about_its_code_again() 
 
     let preview = world
         .service
-        .preview_package_bytes(&script_zip_with_source(
-            COMMUNITY_SCRIPT,
-            "2.0.0",
-            &second,
-        ))
+        .preview_package_bytes(&script_zip_with_source(COMMUNITY_SCRIPT, "2.0.0", &second))
         .unwrap();
     assert!(
         preview.publisher_changed,
@@ -2203,4 +2222,134 @@ async fn a_finished_install_left_in_the_rollback_folder_is_just_cleaned_up() {
         "2.0.0",
         "the finished install is kept"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Catalog standing: load what was verified, warn when it cannot be checked
+// ---------------------------------------------------------------------------
+
+/// A missing or corrupt catalog must not make an installed game vanish.
+#[tokio::test]
+async fn an_unverifiable_catalog_keeps_a_data_only_official_plugin_loading() {
+    let world = World::new();
+    let signed = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &signed), signed)]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    std::fs::write(world.root().join("registry.db.sig"), [0u8; 64]).unwrap();
+    assert!(matches!(
+        world.status(),
+        OfficialStatus::CatalogUnavailable { .. }
+    ));
+
+    let (ctx, warnings) = world.start();
+    assert!(
+        ctx.games.game(&GameId::new(GAME).unwrap()).is_some(),
+        "the game still loads from the installed files"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("could not check")),
+        "and the warning says why: {warnings:?}"
+    );
+}
+
+/// Being two releases behind hides the game today; it must keep loading with a warning instead.
+#[tokio::test]
+async fn a_version_no_longer_listed_keeps_a_data_only_official_plugin_loading() {
+    let world = World::new();
+    let signed = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &signed), signed)]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    let newer = fixture_zip("2.0.0");
+    world.publish(vec![(Release::of("2.0.0", "current", &newer), newer)]);
+    assert!(matches!(world.status(), OfficialStatus::NotListed { .. }));
+
+    let (ctx, warnings) = world.start();
+    assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_some());
+    assert!(
+        warnings.iter().any(|w| w.contains("no longer listed")),
+        "the warning says why: {warnings:?}"
+    );
+}
+
+/// An explicit revocation is different from simply not listing an old version.
+#[tokio::test]
+async fn an_explicitly_revoked_official_version_is_blocked() {
+    let world = World::new();
+    let signed = fixture_zip("1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &signed), signed)]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    let signed = fixture_zip("1.0.0");
+    let mut revoked = Release::of("1.0.0", "current", &signed);
+    revoked.revoked = true;
+    world.publish(vec![(revoked, signed)]);
+
+    assert!(matches!(world.status(), OfficialStatus::Unverified { .. }));
+    let (ctx, warnings) = world.start();
+    assert!(ctx.games.game(&GameId::new(GAME).unwrap()).is_none());
+    assert!(warnings.iter().any(|w| w.contains("revokes")));
+}
+
+/// In the "catalog could not be checked" state a plugin that would otherwise have scripts keeps
+/// loading its data but runs no script: consent alone is not a verifiable source.
+#[tokio::test]
+async fn an_unverified_official_plugin_with_scripts_does_not_run_them() {
+    let world = World::new();
+    let scripted = script_zip(PLUGIN, "1.0.0");
+    world
+        .service
+        .install_package_bytes(&scripted, true)
+        .unwrap();
+
+    // A legacy install (before official packages were required to be data-only)
+    // that the catalog vouched for. Record that standing by hand: the test is
+    // about what happens when the catalog can no longer be read.
+    let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
+    agora_core::plugins::store::set_official(
+        &conn,
+        &World::id(),
+        &agora_core::plugins::store::OfficialProvenance {
+            entry_id: PLUGIN.into(),
+            entry_version: "1.0.0".into(),
+            entry_sha256: "0".repeat(64),
+            tree_sha256: tree_digest(&world.installed_dir()).unwrap(),
+            recorded_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    std::fs::write(world.root().join("registry.db.sig"), [0u8; 64]).unwrap();
+    world.service.reload().unwrap();
+    assert!(matches!(
+        world.status(),
+        OfficialStatus::CatalogUnavailable { .. }
+    ));
+    assert!(
+        !world.service.scripts_permitted(&World::id()),
+        "no script without a verifiable catalog"
+    );
+
+    world.service.activate_all().unwrap();
+    assert!(!world.running(PLUGIN));
 }

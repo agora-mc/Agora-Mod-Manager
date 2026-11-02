@@ -143,6 +143,8 @@ pub struct ExistingInstall<'a> {
     /// The publisher keys pinned when this plugin was installed, if it had an
     /// update source. A package naming different keys is a publisher change.
     pub trusted_keys: Option<&'a [PublicKey]>,
+    /// The code digest the script consent was given for, if the user answered.
+    pub code_hash: Option<&'a str>,
 }
 
 /// What the user is agreeing to when they install something.
@@ -198,6 +200,10 @@ pub struct InstallPreview {
     /// The plugin has code and the installed version did not, or nothing is
     /// installed. An update that adds code does not inherit permission to run it.
     pub adds_code: bool,
+    /// This package's code is not the code the user's answer was given for
+    /// (new, changed, or a changed publisher). The code prompt is asked again,
+    /// and until it is answered the scripts do not run.
+    pub code_changed: bool,
 }
 
 impl InstallPreview {
@@ -431,22 +437,38 @@ pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageConten
     };
     let manifest = PluginManifest::parse(&text).map_err(|e| invalid_package(e.message))?;
 
-    if let Some(entrypoint) = &manifest.entrypoint {
-        let present = (0..zip.len()).any(|index| {
-            zip.by_index(index)
-                .map(|entry| {
-                    entry
-                        .name()
-                        .is_ok_and(|name| name.replace('\\', "/") == *entrypoint)
-                })
-                .unwrap_or(false)
-        });
-        if !present {
-            return Err(invalid_package(format!(
-                "the manifest names `{entrypoint}` as the entrypoint, but the package does not contain it"
-            )));
+    // The digest of the entrypoint identifies the code in this package, so a
+    // preview can tell whether it is code the user already answered for.
+    let code_digest = if let Some(entrypoint) = &manifest.entrypoint {
+        use sha2::{Digest, Sha256};
+        let mut digest = None;
+        for index in 0..zip.len() {
+            let mut entry = zip
+                .by_index(index)
+                .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?;
+            let name = entry
+                .name()
+                .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?
+                .into_owned();
+            if name.replace('\\', "/") == *entrypoint {
+                let mut hasher = Sha256::new();
+                std::io::copy(&mut entry, &mut hasher)
+                    .map_err(|e| invalid_package(format!("could not read `{entrypoint}`: {e}")))?;
+                digest = Some(hex::encode(hasher.finalize()));
+                break;
+            }
         }
-    }
+        match digest {
+            Some(digest) => Some(digest),
+            None => {
+                return Err(invalid_package(format!(
+                    "the manifest names `{entrypoint}` as the entrypoint, but the package does not contain it"
+                )))
+            }
+        }
+    } else {
+        None
+    };
 
     // A malformed distribution block fails the install rather than being
     // ignored. Silently dropping it would leave a plugin that looks like it
@@ -459,6 +481,7 @@ pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageConten
     Ok(PackageContents {
         manifest,
         update_source,
+        code_digest,
         file_count: zip.len(),
         uncompressed_bytes: total,
     })
@@ -481,6 +504,7 @@ pub fn preview_package_bytes(
     Ok(build_preview(
         contents.manifest,
         contents.update_source,
+        contents.code_digest,
         existing,
         contents.file_count,
         contents.uncompressed_bytes,
@@ -493,30 +517,42 @@ pub fn preview_folder(
     existing: Option<&ExistingInstall<'_>>,
 ) -> LauncherResult<InstallPreview> {
     let manifest = read_folder_manifest(folder)?;
+    let code_digest = script_digest(&manifest, folder)?;
     // A development folder is never enrolled for updates: the author is the
     // one editing it, and an update that overwrote their working copy would be
     // the opposite of helpful.
-    Ok(build_preview(manifest, None, existing, 0, 0))
+    Ok(build_preview(manifest, None, code_digest, existing, 0, 0))
 }
 
 fn build_preview(
     manifest: PluginManifest,
     update_source: Option<UpdateSource>,
+    new_code_digest: Option<String>,
     existing: Option<&ExistingInstall<'_>>,
     file_count: usize,
     uncompressed_bytes: u64,
 ) -> InstallPreview {
     let (required, optional, unsupported) = describe(&manifest.capabilities);
+    let runs_code = !manifest.is_declarative_only();
+    let publisher_changed = publisher_changed(
+        existing.and_then(|current| current.trusted_keys),
+        update_source.as_ref(),
+    );
+    // New code, changed code, or code whose publisher changed: the answer the
+    // user gave (if any) does not cover it, so the prompt asks again.
+    let code_changed = runs_code
+        && (publisher_changed
+            || existing.is_none_or(|current| {
+                !current.runs_code || current.code_hash != new_code_digest.as_deref()
+            }));
     InstallPreview {
-        runs_code: !manifest.is_declarative_only(),
-        adds_code: !manifest.is_declarative_only() && !existing.is_some_and(|e| e.runs_code),
+        runs_code,
+        code_changed,
+        adds_code: runs_code && !existing.is_some_and(|e| e.runs_code),
         replaces_version: existing.map(|current| current.version.to_string()),
         added_capabilities: added_capabilities(existing.map(|current| current.granted), &manifest),
         added_hosts: added_hosts(existing.map(|current| current.hosts), &manifest),
-        publisher_changed: publisher_changed(
-            existing.and_then(|current| current.trusted_keys),
-            update_source.as_ref(),
-        ),
+        publisher_changed,
         update_source: update_source.as_ref().map(UpdateSourceSummary::of),
         // Only a *change* is a migration. A first install has nothing to
         // migrate, and a reinstall of the same data version does not either.
@@ -716,12 +752,8 @@ pub fn recover_interrupted_installs(
         }
     };
     for item in read {
-        let item = item.map_err(|e| {
-            io_error(format!(
-                "could not read {}: {e}",
-                rollback_root.display()
-            ))
-        })?;
+        let item =
+            item.map_err(|e| io_error(format!("could not read {}: {e}", rollback_root.display())))?;
         if !item.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             continue;
         }
@@ -740,9 +772,8 @@ pub fn recover_interrupted_installs(
         if finished {
             // The new version was recorded; the stashed copy did not need to
             // come back.
-            std::fs::remove_dir_all(&rollback).map_err(|e| {
-                io_error(format!("could not clear {}: {e}", rollback.display()))
-            })?;
+            std::fs::remove_dir_all(&rollback)
+                .map_err(|e| io_error(format!("could not clear {}: {e}", rollback.display())))?;
             continue;
         }
         let restoring = installed_version(&rollback);
@@ -801,7 +832,10 @@ pub fn publisher_changed(
 /// The entrypoint is the file Agora starts, so it identifies the code the user
 /// allowed. A version that brings a different entrypoint file is new code and
 /// must be asked about again.
-pub fn script_digest(manifest: &PluginManifest, plugin_dir: &Path) -> LauncherResult<Option<String>> {
+pub fn script_digest(
+    manifest: &PluginManifest,
+    plugin_dir: &Path,
+) -> LauncherResult<Option<String>> {
     let Some(entrypoint) = &manifest.entrypoint else {
         return Ok(None);
     };
@@ -1099,7 +1133,7 @@ mod tests {
     #[test]
     fn a_first_install_is_not_a_data_migration() {
         let manifest: PluginManifest = serde_json::from_str(&manifest_json("acme.one")).unwrap();
-        let preview = build_preview(manifest, None, None, 2, 100);
+        let preview = build_preview(manifest, None, None, None, 2, 100);
         assert!(!preview.migrates_data);
         assert!(preview.replaces_version.is_none());
     }
@@ -1115,6 +1149,7 @@ mod tests {
         let preview = build_preview(
             manifest,
             None,
+            None,
             Some(&ExistingInstall {
                 version: &installed,
                 data_version: 1,
@@ -1122,6 +1157,7 @@ mod tests {
                 hosts: &[],
                 runs_code: false,
                 trusted_keys: None,
+                code_hash: None,
             }),
             2,
             100,
@@ -1148,6 +1184,7 @@ mod tests {
             hosts: &[],
             runs_code: false,
             trusted_keys: None,
+            code_hash: None,
         };
 
         let same: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -1161,7 +1198,7 @@ mod tests {
             "capabilities": { "required": ["instance:read"] }
         }))
         .unwrap();
-        let preview = build_preview(same, None, Some(&existing), 2, 100);
+        let preview = build_preview(same, None, None, Some(&existing), 2, 100);
         assert!(
             !preview.requires_capability_consent(),
             "re-granting what is already granted is not a new decision"
@@ -1178,7 +1215,7 @@ mod tests {
             "capabilities": { "required": ["instance:read", "content:write"] }
         }))
         .unwrap();
-        let preview = build_preview(wider, None, Some(&existing), 2, 100);
+        let preview = build_preview(wider, None, None, Some(&existing), 2, 100);
         assert_eq!(
             preview.added_capabilities,
             vec!["content:write".to_string()]
@@ -1201,7 +1238,7 @@ mod tests {
             "capabilities": { "required": ["instance:read"], "optional": ["content:read"] }
         }))
         .unwrap();
-        let preview = build_preview(manifest, None, None, 2, 100);
+        let preview = build_preview(manifest, None, None, None, 2, 100);
         assert_eq!(
             preview.added_capabilities,
             vec!["instance:read".to_string(), "content:read".to_string()]
