@@ -30,11 +30,11 @@ export default async function HomePage() {
         />
         <p className="eyebrow">Community-curated &middot; Ad-free &middot; Open source</p>
         <h1 className="mt-3 bg-gold-sheen bg-clip-text text-4xl font-extrabold tracking-tight text-transparent md:text-5xl">
-          Agora Minecraft Mod Launcher
+          Agora Mod Manager
         </h1>
         <p className="mx-auto mt-4 max-w-2xl text-lg leading-8 text-ink-muted">
-          A bespoke, boutique, community-curated Minecraft mod platform. Curated, not warehoused &mdash;
-          every entry hand-picked and community reviewed.
+          A bespoke, boutique, community-curated mod manager. Minecraft is built in; other games come as
+          plugins. Curated, not warehoused &mdash; every entry hand-picked and community reviewed.
         </p>
 
         <HeroTrailer />
@@ -68,7 +68,8 @@ export default async function HomePage() {
             <p className="mt-4 leading-8 text-ink-muted">
               Agora keeps Minecraft instances isolated, resolves dependency-aware install plans,
               checks health before launch, recommends compatible loader versions, and creates
-              recovery points before risky changes.
+              recovery points before risky changes. Other games, starting with Skyrim Special
+              Edition, come as plugins you install when you want them.
             </p>
             <Link href="/about" className="ui-text mt-3 inline-flex text-sm font-semibold text-gold hover:underline">
               What makes Agora special →

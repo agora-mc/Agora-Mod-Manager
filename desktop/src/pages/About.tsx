@@ -14,10 +14,16 @@ import {
   Gamepad2,
   Bot,
   Bug,
+  Layers,
 } from 'lucide-react';
 import { agoraRepositoryUrl, agoraDiscordUrl, agoraSponsorsUrl } from '../lib/brandConfig';
 
 const PILLARS = [
+  {
+    icon: Layers,
+    title: 'Built for more than one game',
+    body: 'Minecraft is built in and is the default. Other games come as plugins: Skyrim Special Edition is the first, an official plugin you can install from the More games card on Home or in Settings > Game support. The curated catalog is mostly Minecraft today.',
+  },
   {
     icon: SlidersHorizontal,
     title: 'Customizable to you',
@@ -87,7 +93,7 @@ export function About() {
           <p className="max-w-2xl text-sm leading-6 text-white/80 sm:text-base">
             Agora is a bespoke boutique, not a warehouse. Every entry in the catalog is curated,
             tailored, and made accessible for you — a hand-picked selection of the best Minecraft
-            has to offer, free of ads, tracking, and bloat.
+            mods today, free of ads, tracking, and bloat.
           </p>
         </div>
       </section>
@@ -100,7 +106,7 @@ export function About() {
         <p className="text-sm leading-6 text-muted-foreground">
           The name &ldquo;Agora&rdquo; comes from the ancient Greek word for a public gathering
           place. Just as the agora was the heart of social and political life in ancient Athens,
-          Agora is designed to be a central hub for the Minecraft modding community.
+          Agora is designed to be a central hub for the modding community.
         </p>
       </section>
 
@@ -175,7 +181,7 @@ export function About() {
         <div className="mb-4 rounded-lg border border-pink-500/30 bg-pink-500/10 p-5">
           <h4 className="font-semibold text-pink-800 dark:text-pink-200">Support Agora’s future</h4>
           <p className="mt-1 text-sm leading-6 text-pink-700 dark:text-pink-300">
-            Agora is built and maintained by a solo developer who cares deeply about the Minecraft community. If Agora saves you time, helps you discover great mods, or just makes modding more fun — please consider sponsoring. Your donation keeps Agora free, ad-free, and improving, and it helps fund awesome new projects down the road. Every contribution, big or small, means a lot — thank you!
+            Agora is built and maintained by a solo developer who cares deeply about the modding community. If Agora saves you time, helps you discover great mods, or just makes modding more fun — please consider sponsoring. Your donation keeps Agora free, ad-free, and improving, and it helps fund awesome new projects down the road. Every contribution, big or small, means a lot — thank you!
           </p>
           <a
             href={agoraSponsorsUrl}

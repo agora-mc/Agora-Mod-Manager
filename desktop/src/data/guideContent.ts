@@ -41,7 +41,7 @@ export interface GuideOverview {
 /** Orientation shown at the top of the app's Home page and the website's docs home. */
 export const GUIDE_OVERVIEW: GuideOverview = {
   title: 'What Agora manages',
-  body: 'Agora looks after the files and settings around modded Minecraft: instances, mods, packs, Java runtimes, snapshots, compatibility checks, and recovery. By default, the official Minecraft launcher still runs the game and handles your Microsoft account.',
+  body: 'Agora looks after the files and settings around your modded games: instances, mods, packs, Java runtimes, snapshots, compatibility checks, and recovery. Minecraft is built in and is the default. Other games come as plugins, starting with Skyrim Special Edition. For Minecraft, the official launcher still runs the game by default and handles your Microsoft account.',
   terms: [
     {
       term: 'Instance',

@@ -4,11 +4,11 @@ import { Shell } from '@/components/Shell';
 
 export const metadata: Metadata = {
   title: {
-    default: 'Agora Minecraft Mod Launcher',
+    default: 'Agora Mod Manager',
     template: '%s · Agora',
   },
   description:
-    'A community-curated Minecraft launcher with dependency-aware installs, recovery tools, direct or delegated launch, and an ad-free public catalog.',
+    'A community-curated, multi-game mod manager. Minecraft is built in, and other games come as plugins. Dependency-aware installs, recovery tools, and an ad-free public catalog.',
 };
 
 /*

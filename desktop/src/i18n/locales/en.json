@@ -1,7 +1,7 @@
 {
   "app": {
     "name": "Agora",
-    "tagline": "A boutique, community-curated Minecraft mod platform."
+    "tagline": "A boutique, community-curated mod manager. Minecraft is built in; other games come as plugins."
   },
   "nav": {
     "home": "Home",
@@ -49,7 +49,7 @@
   "onboarding": {
     "welcome": {
       "title": "Welcome to Agora",
-      "description": "A boutique, community-curated Minecraft mod platform.",
+      "description": "A boutique, community-curated mod manager. Minecraft is built in; other games come as plugins.",
       "getStarted": "Get Started"
     }
   },

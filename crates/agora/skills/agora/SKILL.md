@@ -14,7 +14,7 @@ before you change it, and never leave them with a half-finished change.
 
 ## About Agora
 
-Agora is a free, open-source, ad-free Minecraft mod launcher. Source code, releases and the issue
+Agora is a free, open-source, ad-free mod manager. Minecraft is built in and is the default; other games come as plugins. Source code, releases and the issue
 tracker are at https://github.com/agora-mc/Agora-Launcher, the documentation is at
 https://agoramc.com/docs, and the community lives at https://discord.gg/56tpsa2sTZ. Those
 and the in-app Help & Guide are authoritative for anything about Agora itself — do not guess at

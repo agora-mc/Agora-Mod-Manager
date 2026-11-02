@@ -45,7 +45,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
               <span className="flex flex-col leading-none">
                 <span className="font-display text-2xl font-bold tracking-tight text-ink">Agora</span>
                 <span className="ui-text mt-1 text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-gold">
-                  Mod Launcher
+                  Mod Manager
                 </span>
               </span>
             </Link>
@@ -73,7 +73,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
                   className="h-8 w-8 rounded-md opacity-90 ring-1 ring-gold/20"
                 />
                 <p className="max-w-sm leading-6">
-                  Agora — a bespoke, boutique, community-curated Minecraft mod launcher.
+                  Agora — a bespoke, boutique, community-curated mod manager for Minecraft and, through plugins, other games.
                 </p>
               </div>
               <div className="ui-text flex flex-wrap gap-x-5 gap-y-2">
