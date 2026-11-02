@@ -51,6 +51,7 @@ import { LaunchFailedBanner } from '../components/LaunchFailedBanner';
 import { HealthNotice, ReviewBeforeLaunchButtons } from '../components/HealthLaunchControls';
 import { PackInstallProgressBar, usePackInstall, type PackInstallTask } from '../components/PackInstallProgress';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { formatPlayTime } from '@/lib/utils';
 import {
   Dialog,
@@ -1413,12 +1414,10 @@ function CreateInstanceDialog({
               </select>
               {loader === 'vanilla' && (
                 <span className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-                  <input
-                    type="checkbox"
+                  <Switch
                     aria-label="Show snapshots"
                     checked={showSnapshots}
-                    onChange={async (e) => {
-                      const on = e.target.checked;
+                    onCheckedChange={async (on) => {
                       setShowSnapshots(on);
                       setSnapshotError(null);
                       if (on && snapshotVersions.length === 0) {
@@ -1431,7 +1430,6 @@ function CreateInstanceDialog({
                       }
                       if (!on && !mcVersions.includes(mcVersion) && mcVersions[0]) setMcVersion(mcVersions[0]);
                     }}
-                    className="h-3.5 w-3.5 accent-primary"
                   />
                   Show snapshots (test builds; back up worlds first)
                 </span>
@@ -1494,20 +1492,21 @@ function CreateInstanceDialog({
             </label>
           )}
 
-          <label className="block">
-            <span className="flex items-center justify-between text-sm font-medium">
+          <div className="block">
+            <div className="flex items-center justify-between text-sm font-medium">
               <span>JVM memory: {memoryMode === 'auto' ? 'Auto' : `${memoryMb} MB`}</span>
               <span className="flex items-center gap-2 text-xs text-muted-foreground">
                 Automatic
-                <input
-                  type="checkbox"
+                <Switch
+                  aria-label="Automatic memory allocation"
                   checked={memoryMode === 'auto'}
-                  onChange={(event) => setMemoryMode(event.target.checked ? 'auto' : 'manual')}
+                  onCheckedChange={(checked) => setMemoryMode(checked ? 'auto' : 'manual')}
                 />
               </span>
-            </span>
+            </div>
             <input
               type="range"
+              aria-label="JVM memory"
               min={1024}
               max={16384}
               step={512}
@@ -1521,7 +1520,7 @@ function CreateInstanceDialog({
                 Agora will estimate memory from enabled pack content and system headroom.
               </span>
             )}
-          </label>
+          </div>
         </div>
 
         {progressMessage && (

@@ -20,6 +20,7 @@ import {
   type UserToolRow,
 } from './api';
 import { ToolCard } from './ToolCard';
+import { Switch } from '@/components/ui/switch';
 import { conflictLine, messageOf } from './toolCopy';
 
 export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: string }) {
@@ -398,14 +399,14 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
                 className="rounded-lg border border-border bg-background px-2 py-1"
               />
             </label>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
+            <div className="flex items-center gap-2 text-sm">
+              <Switch
+                aria-label="Its output is a mod"
                 checked={newIsMod}
-                onChange={(event) => setNewIsMod(event.target.checked)}
+                onCheckedChange={setNewIsMod}
               />
               Its output is a mod
-            </label>
+            </div>
             {newIsMod && (
               <label className="flex flex-col gap-1 text-sm sm:col-span-2">
                 <span className="text-muted-foreground">Output folder (relative to the executable, or absolute)</span>

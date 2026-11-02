@@ -10,6 +10,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event';
 import { Download, FolderOpen, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { formatBytes } from '@/components/installed-content/contentTableState';
 import { formatError, pickDirectory } from '@/lib/tauri';
 import {
@@ -287,13 +288,7 @@ export function GameImportPage({ gameId }: { gameId: string }) {
                 />
               </label>
 
-              <label className="flex items-start gap-3 text-sm">
-                <input
-                  type="checkbox"
-                  className="mt-1"
-                  checked={copySaves}
-                  onChange={(event) => setCopySaves(event.target.checked)}
-                />
+              <div className="flex items-start justify-between gap-3 text-sm">
                 <span>
                   <span className="font-medium">Copy this profile’s saves into the new instance</span>
                   <span className="block text-muted-foreground">
@@ -301,7 +296,12 @@ export function GameImportPage({ gameId }: { gameId: string }) {
                     there are left alone. Off: the saves stay where they are, and you can copy them by hand.
                   </span>
                 </span>
-              </label>
+                <Switch
+                  aria-label="Copy this profile’s saves into the new instance"
+                  checked={copySaves}
+                  onCheckedChange={setCopySaves}
+                />
+              </div>
 
               <div>
                 <Button
