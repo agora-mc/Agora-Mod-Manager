@@ -881,6 +881,8 @@ enum ContentCmd {
     List,
     /// List items no instance uses, with their size.
     Unused,
+    /// Fill missing descriptions, titles, versions, pages and icons from Modrinth.
+    FillDetails,
     /// Show files in a content item.
     Show {
         /// Item ID or unique prefix.
@@ -6361,6 +6363,45 @@ async fn run_command(
                         std::process::exit(1);
                     }
                 },
+                ContentCmd::FillDetails => {
+                    let source = agora_game_minecraft::metadata_source::ModrinthMetadataSource::new(
+                        ctx.clone(),
+                    );
+                    match agora_core::library::fill_missing_details(ctx, &source) {
+                        Ok(report) => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&report)?);
+                            } else {
+                                if report.considered == 0 {
+                                    println!("Every item already has its details.");
+                                } else {
+                                    println!(
+                                        "Filled in {} of {} item(s).",
+                                        report.updated, report.considered
+                                    );
+                                }
+                                for skip in &report.skipped {
+                                    eprintln!("Skipped {}: {}", skip.name, skip.reason);
+                                }
+                                for warning in &report.warnings {
+                                    eprintln!("Warning: {warning}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if json {
+                                let out = serde_json::json!({
+                                    "error": e.to_string(),
+                                    "exitCode": 1,
+                                });
+                                eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                            } else {
+                                eprintln!("Error: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 ContentCmd::Show { item } => {
                     match agora_core::content_store::get_item(ctx, &item) {
                         Ok(it) => {

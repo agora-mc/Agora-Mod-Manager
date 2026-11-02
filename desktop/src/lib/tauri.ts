@@ -1775,6 +1775,8 @@ export interface PackImportReport {
 export interface PackImportOutcome {
   instance_id: string;
   report: PackImportReport | null;
+  /** Non-fatal notes from the import itself. The import still succeeded. */
+  warnings: string[];
 }
 
 /** The instance block of an Agora pack file. */

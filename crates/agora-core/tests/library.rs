@@ -594,3 +594,258 @@ fn a_thunderstore_import_without_a_description_saves_none() {
     );
     assert_eq!(derived.version.as_deref(), Some("1.2.3"));
 }
+
+// ---------------------------------------------------------------------------
+// Filling missing details from a provider
+// ---------------------------------------------------------------------------
+
+struct FakeMetadataSource {
+    available: bool,
+    fail_projects: bool,
+    project_calls: std::sync::Mutex<Vec<Vec<String>>>,
+    hash_calls: std::sync::Mutex<Vec<Vec<String>>>,
+    icon_calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl FakeMetadataSource {
+    fn answering() -> Self {
+        Self {
+            available: true,
+            fail_projects: false,
+            project_calls: std::sync::Mutex::new(Vec::new()),
+            hash_calls: std::sync::Mutex::new(Vec::new()),
+            icon_calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+fn png() -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(&[7u8; 16]);
+    bytes
+}
+
+impl library::MetadataSource for FakeMetadataSource {
+    fn available(&self) -> Result<(), LauncherError> {
+        if self.available {
+            Ok(())
+        } else {
+            Err(LauncherError::Generic {
+                code: "ERR_TEST_NETWORK_OFF".into(),
+                message: "network off".into(),
+            })
+        }
+    }
+
+    fn projects(
+        &self,
+        project_ids: &[String],
+    ) -> Result<Vec<library::ProjectDetails>, LauncherError> {
+        self.project_calls
+            .lock()
+            .unwrap()
+            .push(project_ids.to_vec());
+        if self.fail_projects {
+            return Err(LauncherError::Generic {
+                code: "ERR_TEST_BATCH".into(),
+                message: "batch unavailable".into(),
+            });
+        }
+        Ok(project_ids
+            .iter()
+            .map(|id| library::ProjectDetails {
+                project_id: id.clone(),
+                title: Some(format!("Title {id}")),
+                description: Some(format!("Description {id}")),
+                page_url: Some(format!("https://modrinth.com/mod/{id}")),
+                icon_url: Some(format!("https://cdn.modrinth.com/{id}.png")),
+            })
+            .collect())
+    }
+
+    fn versions_from_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<library::ProjectVersion>, LauncherError> {
+        self.hash_calls.lock().unwrap().push(hashes.to_vec());
+        Ok(hashes
+            .iter()
+            .map(|hash| library::ProjectVersion {
+                hash: hash.clone(),
+                project_id: "project-by-hash".into(),
+                version_number: Some("9.9.9".into()),
+            })
+            .collect())
+    }
+
+    fn icon_bytes(&self, url: &str) -> Result<Option<Vec<u8>>, LauncherError> {
+        self.icon_calls.lock().unwrap().push(url.to_string());
+        Ok(Some(png()))
+    }
+}
+
+fn add_named_item(ctx: &Ctx, directory: &TempDir, name: &str) -> String {
+    let file = directory.path().join(format!("{name}.jar"));
+    std::fs::write(&file, format!("bytes of {name}")).unwrap();
+    add_file(ctx, &file, None, None)
+        .unwrap()
+        .item()
+        .item_id
+        .clone()
+}
+
+fn set_provider(ctx: &Ctx, item_id: &str, provider_id: &str) {
+    set_item_metadata(
+        ctx,
+        item_id,
+        ItemMetadata {
+            version: Some("1.0.0".into()),
+            provider: Some("modrinth".into()),
+            provider_id: Some(provider_id.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn filling_missing_details_fills_only_what_is_missing_and_batches_the_lookup() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let mut items = Vec::new();
+    for index in 0..101 {
+        let item_id = add_named_item(&ctx, &work, &format!("raw{index}"));
+        set_provider(&ctx, &item_id, &format!("project{index}"));
+        items.push(item_id);
+    }
+    // One item already has a description, page and a name a person chose.
+    let kept = &items[0];
+    set_item_metadata(
+        &ctx,
+        kept,
+        ItemMetadata {
+            description: Some("Keep this.".into()),
+            page_url: Some("https://keep.invalid/page".into()),
+            version: Some("1.0.0".into()),
+            provider: Some("modrinth".into()),
+            provider_id: Some("project0".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    agora_core::content_store::set_item_name(&ctx, kept, "Chosen Name").unwrap();
+
+    let source = FakeMetadataSource::answering();
+    let report = library::fill_missing_details(&ctx, &source).unwrap();
+
+    assert_eq!(report.considered, 101);
+    assert_eq!(report.updated, 101, "every item gained an icon and a title");
+    let calls = source.project_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2, "101 items are two batched requests");
+    assert!(calls.iter().all(|ids| ids.len() <= library::METADATA_BATCH));
+    assert_eq!(calls[0].len(), 100);
+    assert_eq!(calls[1].len(), 1);
+    assert!(
+        source.hash_calls.lock().unwrap().is_empty(),
+        "items with a provider id are not looked up by hash"
+    );
+
+    let first = get_item(&ctx, &items[1]).unwrap();
+    assert_eq!(first.description.as_deref(), Some("Description project1"));
+    assert_eq!(
+        first.page_url.as_deref(),
+        Some("https://modrinth.com/mod/project1")
+    );
+    assert_eq!(first.name, "Title project1");
+    assert!(first.icon_sha256.is_some());
+
+    let kept = get_item(&ctx, kept).unwrap();
+    assert_eq!(
+        kept.description.as_deref(),
+        Some("Keep this."),
+        "a saved description is never overwritten"
+    );
+    assert_eq!(kept.page_url.as_deref(), Some("https://keep.invalid/page"));
+    assert_eq!(
+        kept.name, "Chosen Name",
+        "a name a person chose is never replaced"
+    );
+    assert!(kept.icon_sha256.is_some(), "the missing icon is filled");
+}
+
+#[test]
+fn filling_missing_details_identifies_an_item_by_its_file_hash() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let item_id = add_named_item(&ctx, &work, "hashed");
+    let item = get_item(&ctx, &item_id).unwrap();
+    let object = item.files.first().unwrap().sha256.clone();
+    let bytes = agora_core::content_store::read_object_bytes(&ctx, &object).unwrap();
+    let expected = agora_core::download::sha512_hex(&bytes);
+
+    let source = FakeMetadataSource::answering();
+    let report = library::fill_missing_details(&ctx, &source).unwrap();
+    assert_eq!(report.updated, 1);
+
+    let calls = source.hash_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0], vec![expected.clone()]);
+    drop(calls);
+    assert_eq!(source.project_calls.lock().unwrap().len(), 1);
+
+    let item = get_item(&ctx, &item_id).unwrap();
+    assert_eq!(item.provider.as_deref(), Some("modrinth"));
+    assert_eq!(item.provider_id.as_deref(), Some("project-by-hash"));
+    assert_eq!(item.version.as_deref(), Some("9.9.9"));
+    assert_eq!(
+        item.description.as_deref(),
+        Some("Description project-by-hash")
+    );
+}
+
+#[test]
+fn filling_missing_details_makes_no_request_when_the_source_is_off() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let item_id = add_named_item(&ctx, &work, "offline");
+    set_provider(&ctx, &item_id, "project-offline");
+
+    let mut source = FakeMetadataSource::answering();
+    source.available = false;
+    let report = library::fill_missing_details(&ctx, &source).unwrap();
+
+    assert_eq!(
+        source.project_calls.lock().unwrap().len(),
+        0,
+        "no request is made when the source is unavailable"
+    );
+    assert_eq!(source.hash_calls.lock().unwrap().len(), 0);
+    assert_eq!(source.icon_calls.lock().unwrap().len(), 0);
+    assert_eq!(report.updated, 0);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+
+    let item = get_item(&ctx, &item_id).unwrap();
+    assert!(item.description.is_none());
+}
+
+#[test]
+fn a_failed_batch_fetch_is_a_warning_not_a_failure() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    for index in 0..2 {
+        let item_id = add_named_item(&ctx, &work, &format!("failing{index}"));
+        set_provider(&ctx, &item_id, &format!("project{index}"));
+    }
+
+    let mut source = FakeMetadataSource::answering();
+    source.fail_projects = true;
+    let report = library::fill_missing_details(&ctx, &source).unwrap();
+
+    assert_eq!(report.updated, 0);
+    assert_eq!(report.warnings.len(), 1);
+    assert!(
+        report.warnings[0].contains("batch unavailable"),
+        "{:?}",
+        report.warnings
+    );
+}

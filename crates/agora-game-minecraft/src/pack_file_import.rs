@@ -23,6 +23,10 @@ pub type CreateProgressFactory<'a> =
 pub struct PackImportOutcome {
     pub instance_id: String,
     pub report: Option<PackImportReport>,
+    /// Non-fatal notes from the import itself: a metadata lookup that could not
+    /// finish, say. The import still succeeded.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// What importing a pack file would do. Reads the file and this install's
@@ -78,16 +82,12 @@ pub async fn import_pack_file(
 ) -> LauncherResult<PackImportOutcome> {
     let lower = source_path.to_ascii_lowercase();
     if lower.ends_with(".mrpack") {
+        let (instance_id, warnings) =
+            import_mrpack(ctx, reviewed_sha256, name, skip_unfetchable, install_anyway).await?;
         Ok(PackImportOutcome {
-            instance_id: import_mrpack(
-                ctx,
-                reviewed_sha256,
-                name,
-                skip_unfetchable,
-                install_anyway,
-            )
-            .await?,
+            instance_id,
             report: None,
+            warnings,
         })
     } else if lower.ends_with(".json") || lower.ends_with(".agora-pack.json") {
         import_agora_json(
@@ -115,7 +115,7 @@ async fn import_mrpack(
     name: Option<&str>,
     skip_unfetchable: bool,
     install_anyway: bool,
-) -> LauncherResult<String> {
+) -> LauncherResult<(String, Vec<String>)> {
     let svc = ImportService::new(ctx.clone());
     let staged = svc.take_reviewed_copy(reviewed_sha256)?;
     let request = ImportRequest {
@@ -145,7 +145,8 @@ async fn import_mrpack(
             svc.discard_reviewed_copy(sha);
         }
     }
-    Ok(result?.instance_id)
+    let result = result?;
+    Ok((result.instance_id, result.warnings))
 }
 
 /// Import an Agora plain-JSON pack (`.agora-pack.json`): create the instance,
@@ -230,6 +231,7 @@ async fn import_agora_json(
     Ok(PackImportOutcome {
         instance_id,
         report: Some(report),
+        warnings: Vec::new(),
     })
 }
 

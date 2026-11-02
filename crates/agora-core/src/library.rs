@@ -9,7 +9,7 @@
 //! directly (`LayerSource::Content`); a Minecraft instance records the installed file's SHA-256,
 //! so an item is joined to it by object hash (and by a recorded item id when one is present).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use agora_game_api::LayerSource;
@@ -20,6 +20,7 @@ use crate::content_store::{
     self, ContentError, ContentItem, ContentSource, ItemEntry, ItemMetadata,
 };
 use crate::ctx::Ctx;
+use crate::error::LauncherResult;
 use crate::helpers::read_manifest;
 use crate::lock_manager::LockResource;
 use crate::registry::RegistryService;
@@ -272,6 +273,387 @@ pub async fn fetch_icon_for_catalog(
         saved += 1;
     }
     Ok(saved)
+}
+
+/// How many project ids or hashes one metadata request may carry. Modrinth's batch endpoints
+/// document a per-request id/hash list (see the URLs in the Minecraft metadata source); Agora
+/// sends this many at most so a large library becomes a few requests, never one per item.
+pub const METADATA_BATCH: usize = 100;
+
+/// What a provider knows about one project, without any install-time details.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectDetails {
+    pub project_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub page_url: Option<String>,
+    pub icon_url: Option<String>,
+}
+
+/// The version a file hash belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectVersion {
+    pub hash: String,
+    pub project_id: String,
+    /// The human version label (`1.3.9`), when the source publishes one.
+    pub version_number: Option<String>,
+}
+
+/// A provider that can explain store items: batch project details, the version behind a file
+/// hash, and an icon's bytes. Implemented by the game package that owns the provider; core keeps
+/// the batching and merging so every caller behaves the same.
+pub trait MetadataSource: Send + Sync {
+    /// Whether the source may be used at all (network permission, endpoint switch). Checked once
+    /// before any request, so a caller that is not allowed does not touch the network.
+    fn available(&self) -> LauncherResult<()> {
+        Ok(())
+    }
+
+    /// Details for at most [`METADATA_BATCH`] project ids.
+    fn projects(&self, project_ids: &[String]) -> LauncherResult<Vec<ProjectDetails>>;
+
+    /// The version each SHA-512 hash belongs to. Hashes the source does not know are omitted.
+    fn versions_from_hashes(&self, hashes: &[String]) -> LauncherResult<Vec<ProjectVersion>>;
+
+    /// An icon's bytes. Returning `None` means the source had nothing usable, not a failure.
+    fn icon_bytes(&self, url: &str) -> LauncherResult<Option<Vec<u8>>>;
+}
+
+/// What one enrichment pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillReport {
+    /// Items that were missing at least one detail and were considered.
+    pub considered: usize,
+    /// Items that gained at least one field, a title or an icon.
+    pub updated: usize,
+    /// Items that could not be identified, with the reason.
+    pub skipped: Vec<FillSkip>,
+    /// A failed batch or icon is reported here and never stops the rest.
+    pub warnings: Vec<String>,
+}
+
+/// One item a fill pass could not identify.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillSkip {
+    pub item_id: String,
+    pub name: String,
+    pub reason: String,
+}
+
+/// One item to enrich, and what the caller already knows about its project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichTarget {
+    pub item_id: String,
+    pub project_id: Option<String>,
+    /// A version label the caller already knows (a pack pins one before any lookup).
+    pub version: Option<String>,
+}
+
+/// How to fill an item's missing fields.
+#[derive(Debug, Clone)]
+pub struct EnrichOptions<'a> {
+    /// `provider` value to record, e.g. `modrinth`.
+    pub provider: &'a str,
+    /// `game_id` to record when the item has none.
+    pub game_id: Option<&'a str>,
+    /// Replace a name that is still the stored file's stem with the project's title.
+    pub prefer_title: bool,
+    /// Replace a page URL the caller recorded as a guess (a pack's id-only URL) with the
+    /// project's canonical page. Off for the fill action, which never overwrites a saved field.
+    pub replace_page_url: bool,
+}
+
+impl Default for EnrichOptions<'_> {
+    fn default() -> Self {
+        Self {
+            provider: "modrinth",
+            game_id: Some("minecraft"),
+            prefer_title: true,
+            replace_page_url: false,
+        }
+    }
+}
+
+/// Fill missing details on every item the source can identify. Reads and writes the content
+/// store only; the source decides whether it may reach the network.
+pub fn fill_missing_details(
+    ctx: &Ctx,
+    source: &dyn MetadataSource,
+) -> Result<FillReport, ContentError> {
+    let targets: Vec<EnrichTarget> = content_store::list_items(ctx)?
+        .into_iter()
+        .filter_map(|entry| entry.readable().cloned())
+        .filter(needs_details)
+        .map(|item| EnrichTarget {
+            item_id: item.item_id,
+            project_id: item.provider_id.clone(),
+            version: item.version.clone(),
+        })
+        .collect();
+    enrich_items(ctx, source, &targets, EnrichOptions::default())
+}
+
+fn needs_details(item: &ContentItem) -> bool {
+    non_empty(item.description.clone()).is_none()
+        || non_empty(item.page_url.clone()).is_none()
+        || non_empty(item.version.clone()).is_none()
+        || item.icon_sha256.is_none()
+}
+
+fn item_provider(item: &ContentItem) -> Option<&str> {
+    item.provider.as_deref()
+}
+
+/// The file stem an item was named after, when its name still is that stem.
+fn name_is_file_stem(item: &ContentItem) -> bool {
+    let Some(file) = item.files.first() else {
+        return false;
+    };
+    let stem = Path::new(file.path.as_str())
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned());
+    stem.as_deref() == Some(item.name.trim())
+}
+
+/// SHA-512 of a stored object, read in chunks so a large file is never loaded whole. Modrinth's
+/// hash lookup accepts SHA-1 and SHA-512 (not the store's SHA-256), so this is the value it needs.
+fn object_sha512(ctx: &Ctx, sha256: &str) -> Result<String, ContentError> {
+    use sha2::{Digest, Sha512};
+    use std::io::Read;
+    if !sha256
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || sha256.len() != 64
+    {
+        return Err(ContentError::InvalidHash(sha256.to_string()));
+    }
+    let path = ctx.paths.content_object_path(sha256);
+    let mut file = std::fs::File::open(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ContentError::MissingObject(sha256.to_string())
+        } else {
+            ContentError::Io(error)
+        }
+    })?;
+    let mut hasher = Sha512::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Apply project details to `targets`, filling only fields that are absent. A failed batch or
+/// icon is a warning: the rest of the items are still filled.
+pub fn enrich_items(
+    ctx: &Ctx,
+    source: &dyn MetadataSource,
+    targets: &[EnrichTarget],
+    options: EnrichOptions<'_>,
+) -> Result<FillReport, ContentError> {
+    let mut report = FillReport {
+        considered: targets.len(),
+        ..Default::default()
+    };
+    if targets.is_empty() {
+        return Ok(report);
+    }
+    if let Err(error) = source.available() {
+        report.warnings.push(error.to_string());
+        return Ok(report);
+    }
+
+    let mut items: BTreeMap<String, ContentItem> = BTreeMap::new();
+    for target in targets {
+        match content_store::get_item(ctx, &target.item_id) {
+            Ok(item) => {
+                items.insert(target.item_id.clone(), item);
+            }
+            Err(error) => report.warnings.push(format!(
+                "Could not read the item {} to fill in its details: {error}",
+                target.item_id
+            )),
+        }
+    }
+
+    // Identify by the provider's own id first, else by the file's SHA-512.
+    let mut project_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut version_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut hash_targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for target in targets {
+        let Some(item) = items.get(&target.item_id) else {
+            continue;
+        };
+        let known_project = target.project_id.clone().or_else(|| {
+            item_provider(item)
+                .filter(|provider| *provider == options.provider)
+                .and(item.provider_id.clone())
+        });
+        let has_known_project = known_project
+            .as_deref()
+            .is_some_and(|project_id| !project_id.trim().is_empty());
+        if let Some(project_id) = known_project.filter(|_| has_known_project) {
+            project_of.insert(target.item_id.clone(), project_id);
+        }
+        // A provider id explains what the item is, but not which version the file is. The
+        // version label comes from the hash lookup, so an item still lacking one is hashed even
+        // when its project is known.
+        let needs_version = non_empty(item.version.clone()).is_none()
+            && non_empty(target.version.clone()).is_none();
+        if has_known_project && !needs_version {
+            continue;
+        }
+        let Some(file) = item.files.first() else {
+            continue;
+        };
+        match object_sha512(ctx, &file.sha256) {
+            Ok(hash) => hash_targets
+                .entry(hash)
+                .or_default()
+                .push(target.item_id.clone()),
+            Err(error) => report.skipped.push(FillSkip {
+                item_id: item.item_id.clone(),
+                name: item.name.clone(),
+                reason: format!("its stored file could not be hashed: {error}"),
+            }),
+        }
+    }
+
+    let hashes: Vec<String> = hash_targets.keys().cloned().collect();
+    for chunk in hashes.chunks(METADATA_BATCH) {
+        match source.versions_from_hashes(chunk) {
+            Ok(found) => {
+                for version in found {
+                    let Some(item_ids) = hash_targets.get(&version.hash) else {
+                        continue;
+                    };
+                    for item_id in item_ids {
+                        project_of
+                            .entry(item_id.clone())
+                            .or_insert_with(|| version.project_id.clone());
+                        if let Some(label) = version.version_number.clone() {
+                            version_of.insert(item_id.clone(), label);
+                        }
+                    }
+                }
+            }
+            Err(error) => report
+                .warnings
+                .push(format!("Could not look up file versions: {error}")),
+        }
+    }
+
+    let mut by_project: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (item_id, project_id) in &project_of {
+        by_project
+            .entry(project_id.clone())
+            .or_default()
+            .push(item_id.clone());
+    }
+    let project_ids: Vec<String> = by_project.keys().cloned().collect();
+    let mut details: BTreeMap<String, ProjectDetails> = BTreeMap::new();
+    for chunk in project_ids.chunks(METADATA_BATCH) {
+        match source.projects(chunk) {
+            Ok(found) => {
+                for project in found {
+                    details.insert(project.project_id.clone(), project);
+                }
+            }
+            Err(error) => report
+                .warnings
+                .push(format!("Could not look up project details: {error}")),
+        }
+    }
+
+    for (item_id, project_id) in &project_of {
+        let Some(mut item) = items.remove(item_id) else {
+            continue;
+        };
+        let Some(project) = details.get(project_id) else {
+            report.skipped.push(FillSkip {
+                item_id: item.item_id.clone(),
+                name: item.name.clone(),
+                reason: "its project was not returned by the lookup".into(),
+            });
+            continue;
+        };
+        let mut metadata = metadata_of(&item);
+        let mut changed = false;
+        if metadata.description.is_none() {
+            metadata.description = non_empty(project.description.clone());
+            changed |= metadata.description.is_some();
+        }
+        if options.replace_page_url {
+            let canonical = non_empty(project.page_url.clone());
+            if canonical.is_some() && metadata.page_url != canonical {
+                metadata.page_url = canonical;
+                changed = true;
+            }
+        } else if metadata.page_url.is_none() {
+            metadata.page_url = non_empty(project.page_url.clone());
+            changed |= metadata.page_url.is_some();
+        }
+        if metadata.version.is_none() {
+            let label = version_of.get(item_id).cloned().or_else(|| {
+                targets
+                    .iter()
+                    .find(|t| &t.item_id == item_id)?
+                    .version
+                    .clone()
+            });
+            metadata.version = non_empty(label);
+            changed |= metadata.version.is_some();
+        }
+        if metadata.provider.is_none() {
+            metadata.provider = Some(options.provider.to_string());
+            changed = true;
+        }
+        if metadata.provider_id.is_none() {
+            metadata.provider_id = Some(project_id.clone());
+            changed = true;
+        }
+        if metadata.game_id.is_none() {
+            metadata.game_id = options.game_id.map(str::to_string);
+            changed |= metadata.game_id.is_some();
+        }
+        if changed {
+            content_store::set_item_metadata(ctx, &item.item_id, metadata.clone())?;
+            item = content_store::get_item(ctx, &item.item_id)?;
+        }
+        if metadata.icon_sha256.is_none() {
+            if let Some(url) = project.icon_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                match source.icon_bytes(url) {
+                    Ok(Some(bytes)) => {
+                        if save_icon(ctx, &item.item_id, &bytes)? {
+                            changed = true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => report.warnings.push(format!(
+                        "Could not save the icon for {}: {error}",
+                        item.name
+                    )),
+                }
+            }
+        }
+        if options.prefer_title && name_is_file_stem(&item) {
+            if let Some(title) = non_empty(project.title.clone()) {
+                content_store::set_item_name(ctx, &item.item_id, &title)?;
+                changed = true;
+            }
+        }
+        if changed {
+            report.updated += 1;
+        }
+    }
+
+    Ok(report)
 }
 
 /// Keep every metadata field the item already has, so setting an icon never erases a description.

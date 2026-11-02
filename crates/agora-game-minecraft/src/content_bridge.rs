@@ -12,12 +12,34 @@ use agora_core::{
     ctx::Ctx,
     error::{LauncherError, LauncherResult},
     helpers,
+    library::{self as core_library},
     lock_manager::LockResource,
     models::{InstalledMod, ProviderOrigin},
     paths, snapshot,
 };
 
+#[cfg(test)]
+pub use core_library::{list_unused, ProjectDetails, ProjectVersion};
+pub use core_library::{EnrichOptions, EnrichTarget, FillReport, MetadataSource};
+#[cfg(test)]
+pub use store::ContentItem;
+
+#[cfg(test)]
+use agora_core::{db, http_client};
+
+/// The core richness pass used by pack imports and the Library action, so both go through one
+/// narrow door and the game package's core references stay in this module.
+pub fn enrich_store_items(
+    ctx: &Ctx,
+    source: &dyn MetadataSource,
+    targets: &[EnrichTarget],
+    options: EnrichOptions<'_>,
+) -> LauncherResult<FillReport> {
+    core_library::enrich_items(ctx, source, targets, options).map_err(content_error)
+}
+
 /// What an install path already knows about the file it is storing.
+#[derive(Clone, Copy)]
 pub struct StoreDetails<'a> {
     pub content_type: &'a str,
     /// The file's name inside the instance, without a `.disabled` suffix.
@@ -166,19 +188,18 @@ pub fn store_staged_content(
     instance_dir: &Path,
     relative_path: &str,
     source: &Path,
-    version: Option<&str>,
-    page_url: Option<&str>,
+    details: &StoreDetails<'_>,
 ) -> LauncherResult<Option<StoredFile>> {
     let Some(content_type) = tracked_content_type(relative_path) else {
         return Ok(None);
     };
     validate_relative_path(relative_path)?;
-    let stored = store_file_at(
-        ctx,
-        source,
-        &store_details(content_type, file_name_of(relative_path), version, page_url),
-        Some(relative_path),
-    )?;
+    let details = StoreDetails {
+        content_type,
+        filename: file_name_of(relative_path),
+        ..*details
+    };
+    let stored = store_file_at(ctx, source, &details, Some(relative_path))?;
     let target = instance_dir.join(relative_path);
     if target.exists() {
         if let Some(folder) = target.parent() {
@@ -638,7 +659,7 @@ pub fn forbid_network(ctx: &mut Ctx) {
         .timeout(std::time::Duration::from_millis(250))
         .build()
         .expect("test HTTP client");
-    ctx.http_clients = agora_core::http_client::HttpClients::for_testing(client);
+    ctx.http_clients = http_client::HttpClients::for_testing(client);
 }
 
 /// Turn file sharing on (`true`) or off (`false`) for this context's placements.
@@ -669,7 +690,7 @@ pub fn set_artifact_enabled(
 /// Create the local state database a test context needs for settings.
 #[cfg(test)]
 pub fn init_local_state(ctx: &Ctx) {
-    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).expect("test local state");
+    db::init_local_state_db(&ctx.paths.local_state_db()).expect("test local state");
 }
 
 /// How many items the content store holds. Test support only.

@@ -1,3 +1,4 @@
+use crate::content_bridge::{EnrichOptions, EnrichTarget, MetadataSource};
 use crate::override_sanitizer::OverridePolicy;
 use agora_core::download::{sha1_hex, sha256_hex, sha512_hex};
 use agora_core::error::{LauncherError, LauncherResult};
@@ -23,6 +24,10 @@ pub struct ImportResult {
     pub loader_version: String,
     pub imported_mods: usize,
     pub linked_saves: bool,
+    /// Things the import did not fail on: a metadata lookup that could not complete, a file that
+    /// could not be switched off. Never a reason to stop the import.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -61,6 +66,7 @@ struct MrpackFile {
 #[derive(Debug, Clone)]
 struct ImportedModrinthFile {
     project_id: String,
+    version_id: Option<String>,
     download_url: String,
 }
 
@@ -182,7 +188,7 @@ fn mrpack_hash_stop(problems: &[String]) -> LauncherError {
 /// Extract a Modrinth project ID only from the canonical Modrinth CDN path.
 /// Pack entries may also point at GitHub or contain no download URL, so those
 /// entries remain pack-managed without claiming a Modrinth project identity.
-fn modrinth_project_id_from_download_url(raw_url: &str) -> Option<String> {
+fn modrinth_identity_from_download_url(raw_url: &str) -> Option<(String, Option<String>)> {
     let url = reqwest::Url::parse(raw_url).ok()?;
     if url.scheme() != "https"
         || url.host_str() != Some("cdn.modrinth.com")
@@ -202,16 +208,41 @@ fn modrinth_project_id_from_download_url(raw_url: &str) -> Option<String> {
     {
         return None;
     }
-    Some(project_id.to_string())
+    let version_id = segments[3];
+    let version_id = (!version_id.is_empty()
+        && version_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then(|| version_id.to_string());
+    Some((project_id.to_string(), version_id))
+}
+
+#[cfg(test)]
+fn modrinth_project_id_from_download_url(raw_url: &str) -> Option<String> {
+    modrinth_identity_from_download_url(raw_url).map(|(project_id, _)| project_id)
 }
 
 fn modrinth_file_identity(file: &MrpackFile) -> Option<ImportedModrinthFile> {
     file.downloads.iter().find_map(|download_url| {
-        modrinth_project_id_from_download_url(download_url).map(|project_id| ImportedModrinthFile {
-            project_id,
-            download_url: download_url.clone(),
+        modrinth_identity_from_download_url(download_url).map(|(project_id, version_id)| {
+            ImportedModrinthFile {
+                project_id,
+                version_id,
+                download_url: download_url.clone(),
+            }
         })
     })
+}
+
+/// The page a Modrinth project is shown at, known from the id and the content folder alone.
+fn modrinth_page_url(project_id: &str, content_type: &str) -> String {
+    let kind = match content_type {
+        "resourcepack" => "resourcepack",
+        "shader" => "shader",
+        "datapack" => "datapack",
+        _ => "mod",
+    };
+    format!("https://modrinth.com/{kind}/{project_id}")
 }
 
 fn manifest_path_key(path: &Path) -> String {
@@ -825,6 +856,7 @@ pub fn import_mrpack_with_progress(
         false,
         false,
         None,
+        None,
     )
 }
 
@@ -846,6 +878,7 @@ pub fn import_mrpack_inner(
     skip_unfetchable: bool,
     install_anyway: bool,
     ctx: Option<&Ctx>,
+    metadata_source: Option<&dyn MetadataSource>,
 ) -> LauncherResult<ImportResult> {
     let file = fs::File::open(mrpack_path).map_err(|e| LauncherError::Generic {
         code: "ERR_IMPORT_OPEN".into(),
@@ -884,7 +917,7 @@ pub fn import_mrpack_inner(
     let superseded = superseded_disabled_keys(&pack_supplied_keys(&archive, &index));
     let target = prepare_import_target(instances_root, &name)?;
 
-    let import_result = (|| -> LauncherResult<usize> {
+    let import_result = (|| -> LauncherResult<(usize, Vec<EnrichTarget>)> {
         let target_dir = &target.staging_dir;
         let total_files = index.files.len() as u32;
         let mut completed_files = 0u32;
@@ -905,7 +938,8 @@ pub fn import_mrpack_inner(
             BTreeMap::new();
         // Tracked files are written as ordinary files first; after every hash check of the pack
         // has passed they are stored (so a hash-stopped import stores nothing).
-        let mut content_candidates: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut content_candidates: BTreeMap<String, Option<ImportedModrinthFile>> =
+            BTreeMap::new();
         for file_entry in &index.files {
             // Not fetched or written: the enabled twin is what Agora keeps.
             if superseded.contains(&manifest_path_key(&relative_archive_path(&file_entry.path))) {
@@ -947,9 +981,10 @@ pub fn import_mrpack_inner(
                     message: format!("Cannot create dir {parent:?}: {e}"),
                 })?;
             }
+            let embedded_path = file_entry.path.replace('\\', "/");
+            let has_embedded = archive.by_name(&embedded_path).is_ok();
             let mut read_embedded = || -> LauncherResult<Vec<u8>> {
-                let idx_path = file_entry.path.replace('\\', "/");
-                let mut entry = archive.by_name(&idx_path).map_err(|_| {
+                let mut entry = archive.by_name(&embedded_path).map_err(|_| {
                     import_error(
                         "ERR_IMPORT_MISSING_FILE",
                         format!(
@@ -975,7 +1010,12 @@ pub fn import_mrpack_inner(
                 Ok(bytes)
             };
 
-            let bytes = if let Some(url) = file_entry.downloads.first() {
+            // A file bundled inside the pack is read from there first: the pack already
+            // carries the bytes, so importing it needs no request (and no download the user did
+            // not expect). A download is the fallback, and its hash is checked the same way.
+            let bytes = if has_embedded {
+                read_embedded()?
+            } else if let Some(url) = file_entry.downloads.first() {
                 download_bytes(url)
                     .or_else(|download_error| read_embedded().map_err(|_| download_error))?
             } else {
@@ -988,7 +1028,7 @@ pub fn import_mrpack_inner(
                 message: format!("Cannot write {:?}: {e}", dest),
             })?;
             if crate::content_bridge::tracked_content_type(&key).is_some() {
-                content_candidates.insert(key, file_entry.downloads.first().cloned());
+                content_candidates.insert(key.clone(), modrinth_files.get(&key).cloned());
             }
             completed_files += 1;
             if let (Some(sink), Some(operation_id)) = (&progress_sink, &operation_id) {
@@ -1068,17 +1108,52 @@ pub fn import_mrpack_inner(
 
         // The pack passed its hash checks (or the user accepted them): now the tracked files
         // become store items and links. Doing it here means a stopped import stores nothing.
+        // A Modrinth CDN URL names the project and version, so those are recorded without any
+        // request; the description and icon are filled in afterwards when networking allows.
+        let mut enrich_targets: Vec<EnrichTarget> = Vec::new();
         if let Some(ctx) = ctx {
-            for (key, page_url) in &content_candidates {
+            for (key, identity) in &content_candidates {
+                let Some(content_type) = crate::content_bridge::tracked_content_type(key) else {
+                    continue;
+                };
                 let source = target_dir.join(key);
+                let filename = key.rsplit('/').next().unwrap_or(key);
+                // The CDN URL's version id is not a label players should read. It stays in
+                // provider_origin for the lookup; `version` is filled by the hash lookup.
+                let version = None;
+                let page_url = identity
+                    .as_ref()
+                    .map(|identity| modrinth_page_url(&identity.project_id, content_type));
+                let provider_origin = identity.as_ref().map(|identity| {
+                    crate::content_bridge::provider_origin_blob(
+                        "modrinth",
+                        &identity.project_id,
+                        identity.version_id.as_deref().unwrap_or(""),
+                    )
+                });
+                let details = crate::content_bridge::StoreDetails {
+                    content_type,
+                    filename,
+                    version,
+                    page_url: page_url.as_deref(),
+                    description: None,
+                    catalog_id: None,
+                    provider: identity.as_ref().map(|_| "modrinth"),
+                    provider_id: identity
+                        .as_ref()
+                        .map(|identity| identity.project_id.as_str()),
+                    provider_origin: provider_origin.as_deref(),
+                };
                 if let Some(stored) = crate::content_bridge::store_staged_content(
-                    ctx,
-                    target_dir,
-                    key,
-                    &source,
-                    None,
-                    page_url.as_deref(),
+                    ctx, target_dir, key, &source, &details,
                 )? {
+                    if let Some(identity) = identity {
+                        enrich_targets.push(EnrichTarget {
+                            item_id: stored.item_id.clone(),
+                            project_id: Some(identity.project_id.clone()),
+                            version: None,
+                        });
+                    }
                     stored_content.insert(key.clone(), stored);
                 }
             }
@@ -1208,11 +1283,11 @@ pub fn import_mrpack_inner(
                 message: format!("Cannot write manifest: {e}"),
             }
         })?;
-        Ok(imported_mods)
+        Ok((imported_mods, enrich_targets))
     })();
 
-    let imported_mods = match import_result {
-        Ok(count) => count,
+    let (imported_mods, enrich_targets) = match import_result {
+        Ok(done) => done,
         Err(error) => {
             cleanup_staging(&target);
             return Err(error);
@@ -1223,6 +1298,44 @@ pub fn import_mrpack_inner(
         return Err(error);
     }
 
+    let warnings = match ctx {
+        Some(ctx) if !enrich_targets.is_empty() => {
+            let options = EnrichOptions {
+                provider: "modrinth",
+                game_id: Some("minecraft"),
+                prefer_title: true,
+                replace_page_url: true,
+            };
+            let run = |source: &dyn MetadataSource, warnings: &mut Vec<String>| {
+                // Offline or Modrinth turned off: the ids are already recorded and the import
+                // is complete. Nothing is attempted, so there is nothing to warn about.
+                if source.available().is_err() {
+                    return;
+                }
+                match crate::content_bridge::enrich_store_items(
+                    ctx,
+                    source,
+                    &enrich_targets,
+                    options.clone(),
+                ) {
+                    Ok(report) => warnings.extend(report.warnings),
+                    Err(error) => warnings.push(format!(
+                        "The pack was imported, but filling in its mod details failed: {error}"
+                    )),
+                }
+            };
+            let mut warnings = Vec::new();
+            if let Some(source) = metadata_source {
+                run(source, &mut warnings);
+            } else {
+                let source = crate::metadata_source::ModrinthMetadataSource::new(ctx.clone());
+                run(&source, &mut warnings);
+            }
+            warnings
+        }
+        _ => Vec::new(),
+    };
+
     Ok(ImportResult {
         instance_id: target.instance_id,
         name,
@@ -1231,6 +1344,7 @@ pub fn import_mrpack_inner(
         loader_version,
         imported_mods,
         linked_saves: false,
+        warnings,
     })
 }
 
@@ -1889,6 +2003,7 @@ pub fn import_prism_zip_named(
         loader_version,
         imported_mods,
         linked_saves: symlink_saves,
+        warnings: Vec::new(),
     })
 }
 
@@ -2154,6 +2269,7 @@ pub fn import_directory_named(
         loader_version,
         imported_mods: mod_count,
         linked_saves,
+        warnings: Vec::new(),
     })
 }
 
@@ -2425,6 +2541,7 @@ pub fn import_technic_solder_pack(
             loader_version: pack.loader_version.clone(),
             imported_mods,
             linked_saves: false,
+            warnings: Vec::new(),
         }),
         Err(error) => {
             cleanup_staging(&target);
@@ -2572,6 +2689,7 @@ pub fn import_technic_zip_pack(
             loader_version: pack.loader_version.clone(),
             imported_mods,
             linked_saves: false,
+            warnings: Vec::new(),
         }),
         Err(error) => {
             cleanup_staging(&target);
@@ -3165,6 +3283,7 @@ mod tests {
             false,
             install_anyway,
             None,
+            None,
         )
     }
 
@@ -3357,6 +3476,7 @@ mod tests {
             "mods/sodium.jar".to_string(),
             ImportedModrinthFile {
                 project_id: "AANobbMI".to_string(),
+                version_id: Some("abc123".to_string()),
                 download_url: "https://cdn.modrinth.com/data/AANobbMI/versions/abc123/sodium.jar"
                     .to_string(),
             },
@@ -3387,6 +3507,7 @@ mod tests {
             "mods/off.jar.disabled".to_string(),
             ImportedModrinthFile {
                 project_id: "PROJ".to_string(),
+                version_id: Some("v".to_string()),
                 download_url: "https://cdn.modrinth.com/data/PROJ/versions/v/off.jar".to_string(),
             },
         );
@@ -4690,6 +4811,7 @@ pub fn import_provider_pack(
             loader_version: plan.loader_version.clone(),
             imported_mods,
             linked_saves: false,
+            warnings: Vec::new(),
         }),
         Err(error) => {
             cleanup_staging(&target);

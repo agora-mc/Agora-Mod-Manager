@@ -287,3 +287,32 @@ export function cacheCatalogIcon(catalogId: string, url: string | null): Promise
   if (!url) return Promise.resolve(null);
   return saveIcon(`catalog:${catalogId}:${url}`, { itemId: null, catalogId, url });
 }
+
+export interface LibraryFillSkip {
+  itemId: string;
+  name: string;
+  reason: string;
+}
+
+export interface LibraryFillReport {
+  considered: number;
+  updated: number;
+  skipped: LibraryFillSkip[];
+  warnings: string[];
+}
+
+/** Fill missing descriptions, titles, versions, pages and icons from Modrinth. */
+export async function fillMissingLibraryDetails(): Promise<LibraryFillReport> {
+  const reply = await invoke<LibraryFillReport>('games_library_fill_details');
+  if (
+    reply === null
+    || typeof reply !== 'object'
+    || typeof reply.considered !== 'number'
+    || typeof reply.updated !== 'number'
+    || !Array.isArray(reply.skipped)
+    || !Array.isArray(reply.warnings)
+  ) {
+    throw new Error('games_library_fill_details did not return a report.');
+  }
+  return reply;
+}

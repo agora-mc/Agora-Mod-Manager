@@ -18,6 +18,7 @@ import {
 import { isGamesError } from '@/features/games/shared/types';
 import {
   addLibraryItem,
+  fillMissingLibraryDetails,
   filterLibraryByGame,
   instancesForItem,
   libraryGames,
@@ -114,6 +115,8 @@ export function LibraryPage() {
   const [unusedConfirming, setUnusedConfirming] = useState(false);
   const [unusedBusy, setUnusedBusy] = useState(false);
   const [unusedError, setUnusedError] = useState<string | null>(null);
+  const [fillBusy, setFillBusy] = useState(false);
+  const [fillWarnings, setFillWarnings] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     setState({ status: 'loading' });
@@ -182,6 +185,30 @@ export function LibraryPage() {
   };
 
   const candidates = addTarget ? instancesForItem(addTarget, instances) : [];
+
+  const fillDetails = async () => {
+    setFillBusy(true);
+    setActionError(null);
+    setFillWarnings([]);
+    setNotice(null);
+    try {
+      const report = await fillMissingLibraryDetails();
+      setNotice(
+        report.considered === 0
+          ? 'Every item already has its details.'
+          : `Filled in ${report.updated} of ${report.considered} item(s).`,
+      );
+      setFillWarnings([
+        ...report.warnings,
+        ...report.skipped.map((skip) => `${skip.name}: ${skip.reason}`),
+      ]);
+      await load();
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setFillBusy(false);
+    }
+  };
 
   const openUnused = () => {
     setUnusedOpen(true);
@@ -274,7 +301,23 @@ export function LibraryPage() {
         <Button variant="outline" onClick={() => void load()}>
           Refresh
         </Button>
+        <Button
+          variant="outline"
+          onClick={() => void fillDetails()}
+          disabled={fillBusy}
+        >
+          {fillBusy ? 'Filling in…' : 'Fill in missing details'}
+        </Button>
       </div>
+
+      {fillWarnings.length > 0 && (
+        <div role="status" className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+          <p className="font-medium">Some details could not be filled in.</p>
+          <ul className="mt-1 space-y-0.5 text-xs text-muted-foreground">
+            {fillWarnings.map((warning) => <li key={warning}>{warning}</li>)}
+          </ul>
+        </div>
+      )}
 
       {notice && <p role="status" className="text-sm text-muted-foreground">{notice}</p>}
       {actionError && (

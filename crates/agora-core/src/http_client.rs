@@ -1517,6 +1517,77 @@ pub fn blocking_checked_get_bytes_with_policy(
     Ok(bytes.to_vec())
 }
 
+/// Blocking JSON POST through the same policy path as [`blocking_checked_request`], returning the
+/// response bytes under the category's size cap. Used by synchronous metadata lookups.
+///
+/// A redirect is refused rather than followed: the caller posted a body to a specific endpoint,
+/// and silently replaying it elsewhere is exactly what the async path only does for 307/308.
+pub fn blocking_checked_post_json(
+    _clients: &HttpClients,
+    category: ClientCategory,
+    url: &str,
+    body: &serde_json::Value,
+) -> LauncherResult<Vec<u8>> {
+    crate::network_gate::authorize(category)?;
+    check_request_url(category, url)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(category.timeout())
+        .user_agent(category.user_agent())
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(4)
+        .build()
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_HTTP_CLIENT_BUILD".into(),
+            message: format!("Failed to build blocking HTTP client: {e}"),
+        })?;
+
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .map_err(transport_failure_from)?;
+    crate::connectivity::record_reachable();
+
+    if response.status().is_redirection() {
+        return Err(LauncherError::Generic {
+            code: "ERR_UNEXPECTED_REDIRECT".into(),
+            message: format!(
+                "Refusing a redirect from {} for a posted lookup",
+                network::sanitized_url_for_log(url)
+            ),
+        });
+    }
+    if !response.status().is_success() {
+        return Err(LauncherError::Generic {
+            code: "ERR_HTTP_STATUS".into(),
+            message: format!(
+                "HTTP {} for {}",
+                response.status(),
+                network::sanitized_url_for_log(url)
+            ),
+        });
+    }
+
+    let max = category.max_response_bytes().unwrap_or(10 * 1024 * 1024);
+    let mut limited = response.take(max.saturating_add(1));
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|_| transport_failure())?;
+    if bytes.len() as u64 > max {
+        return Err(LauncherError::Generic {
+            code: "ERR_RESPONSE_TOO_LARGE".into(),
+            message: format!(
+                "Response exceeds {} bytes (downloaded {})",
+                max,
+                bytes.len()
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
 /// Log a sanitized summary of an HTTP response for diagnostics.
 pub fn log_response_error(response: &reqwest::Response, context: &str) {
     let status = response.status();

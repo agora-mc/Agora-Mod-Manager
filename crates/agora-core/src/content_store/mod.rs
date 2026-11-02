@@ -1601,6 +1601,26 @@ fn commit_manifest(
     }
 }
 
+/// Replace an item's display name, leaving its identity, files and metadata alone. Used when a
+/// source's own title is learned after the file was stored under its file name.
+pub fn set_item_name(
+    ctx: &Ctx,
+    item_id_or_prefix: &str,
+    name: &str,
+) -> Result<ContentItem, ContentError> {
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::ContentStore, "content-name")?;
+    let mut item = get_item(ctx, item_id_or_prefix)?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ContentError::Other("an item name cannot be empty".into()));
+    }
+    item.name = name.to_string();
+    write_manifest_atomic(&ctx.paths, &item)?;
+    Ok(item)
+}
+
 /// Replace an item's optional metadata. The item's identity and files do not change, and a field
 /// passed as `None` is removed rather than kept. Returns the item as written.
 pub fn set_item_metadata(
