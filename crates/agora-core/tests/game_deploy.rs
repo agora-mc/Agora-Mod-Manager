@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;
@@ -20,7 +20,7 @@ use agora_core::game_registry::{
 use agora_game_api::{
     BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
     InstallKind, LaunchRecipe, LaunchValue, PackageDefinition, RelPath, RuntimeIdentity, StoreId,
-    StoreIdentifier,
+    StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -1361,6 +1361,30 @@ fn launch_with_fake_policy(
     )
 }
 
+/// A launcher whose spawn fails, after making the player's file read-only so the restore that
+/// follows also fails. Nothing real runs.
+struct FailSpawn {
+    real: PathBuf,
+}
+
+impl agora_core::game_launch::Launcher for FailSpawn {
+    fn locate_vfs_dll(&self) -> Result<PathBuf, String> {
+        Err("no virtual file system in this test".into())
+    }
+
+    fn launch(
+        &self,
+        _prepared: &agora_core::game_launch::PreparedLaunch,
+    ) -> Result<agora_core::game_launch::LaunchedGame, agora_core::game_launch::LaunchError> {
+        let mut perms = std::fs::metadata(&self.real).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&self.real, perms).unwrap();
+        Err(agora_core::game_launch::LaunchError::ProgramMissing {
+            path: self.real.clone(),
+        })
+    }
+}
+
 fn recorded_mode(ctx: &CoreContext, id: &str) -> DeployMode {
     let game_dir = deployment_dir(ctx, id).unwrap().unwrap();
     let record: agora_core::game_deploy::DeploymentRecord = serde_json::from_str(
@@ -1368,6 +1392,81 @@ fn recorded_mode(ctx: &CoreContext, id: &str) -> DeployMode {
     )
     .unwrap();
     record.mode
+}
+
+#[test]
+fn a_failed_spawn_whose_restore_also_fails_is_reported_and_keeps_the_journal() {
+    let user_root = TempDir::new().unwrap();
+    std::env::set_var("AGORA_TEST_USER_DATA_ROOT", user_root.path());
+    let real = user_root
+        .path()
+        .join("local")
+        .join("TestGame")
+        .join("config.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, b"the player's original").unwrap();
+
+    let mut def = make_test_definition();
+    def.user_files = vec![UserFileMapping {
+        source: GamePath::UserData {
+            location: UserDataLocation::LocalAppData,
+            path: RelPath::new("TestGame/config.txt").unwrap(),
+        },
+        instance_path: RelPath::new("user/config.txt").unwrap(),
+        strategy: UserFileStrategy::JournaledSwap,
+        stores: vec![StoreId::new("steam").unwrap()],
+    }];
+    let (tmp, ctx, inst) = rung_fixture("SpawnFails", &def);
+    let instance_copy = ctx
+        .paths
+        .instance_dir(&inst.instance_id)
+        .unwrap()
+        .join("user")
+        .join("config.txt");
+    std::fs::create_dir_all(instance_copy.parent().unwrap()).unwrap();
+    std::fs::write(&instance_copy, b"the instance's copy").unwrap();
+
+    let launcher = FailSpawn { real: real.clone() };
+    let error = agora_core::game_instance::launch_with(
+        &ctx,
+        &inst.instance_id,
+        &def,
+        agora_core::game_instance::LaunchOptions {
+            launch_anyway: true,
+            plain: false,
+            deployment: Some(DeployMode::Links),
+            on_vfs_failure: VfsFailure::FallBack,
+        },
+        &DiscoveryReport::default,
+        &launcher,
+    )
+    .err()
+    .expect("the spawn fails");
+
+    let text = error.to_string();
+    assert!(
+        text.contains("putting the player's files back also failed"),
+        "the failed restore was swallowed: {text}"
+    );
+    assert!(
+        ctx.paths
+            .user_files_journal_path(def.id.as_str(), "steam")
+            .exists(),
+        "the journal was removed, so a later restore cannot finish the job"
+    );
+    assert_eq!(
+        std::fs::read(&real).unwrap(),
+        b"the instance's copy",
+        "the player's file was not left as the session left it"
+    );
+
+    let mut perms = std::fs::metadata(&real).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&real, perms).unwrap();
+    std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
+    drop(tmp);
+    drop(user_root);
 }
 
 #[test]

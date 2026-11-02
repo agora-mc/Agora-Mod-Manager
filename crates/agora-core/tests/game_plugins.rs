@@ -626,6 +626,15 @@ fn a_session_left_behind_is_recovered_before_the_real_file_is_read() {
         std::fs::read_to_string(&real).unwrap(),
         "*OtherInstance.esp\r\n"
     );
+    // The process that swapped it in is gone too (the test process is not it).
+    let journal_path = h
+        .ctx
+        .paths
+        .user_files_journal_path(h.def.id.as_str(), StoreId::steam().as_str());
+    let mut journal: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&journal_path).unwrap()).unwrap();
+    journal["starting_launcher"] = serde_json::Value::Null;
+    std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
 
     let inst = h.instance("recovering");
     let item = h.item("mod", &[("Data/A.esp", b"a")]);
@@ -634,6 +643,41 @@ fn a_session_left_behind_is_recovered_before_the_real_file_is_read() {
 
     assert_eq!(h.lines(&inst), ["*UserOnly.esp", "*A.esp"]);
     assert_eq!(std::fs::read_to_string(&real).unwrap(), original);
+}
+
+#[test]
+fn a_plugin_edit_during_a_launch_start_does_not_restore_the_session() {
+    let h = Harness::new();
+    let real = h.real_path();
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "*UserOnly.esp\r\n").unwrap();
+
+    let inst = h.instance("starting");
+    let copy = h.copy_path(&inst);
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(&copy, "*Instance.esp\r\n").unwrap();
+    let nowhere = h.tmp.path().join("no-such-running-from");
+    agora_core::game_user_files::swap_in(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        &StoreId::steam(),
+        &nowhere,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&real).unwrap(), "*Instance.esp\r\n");
+
+    // The launch that swapped these in is this process and is still starting. A deploy (and the
+    // plugin sync inside it) must not take it for a stale session and put the files back.
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "*Instance.esp\r\n",
+        "a launch's own starting session was restored under it"
+    );
 }
 
 #[test]

@@ -367,7 +367,9 @@ fn failed_launch_restores_cleanly() {
         std::fs::read_to_string(&real_plugin_file).unwrap(),
         "Original Plugins\n"
     );
-    assert!(status(&harness.ctx, &def.id, &StoreId::steam()).is_none());
+    assert!(status(&harness.ctx, &def.id, &StoreId::steam())
+        .unwrap()
+        .is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +440,9 @@ fn agora_killed_while_running_then_restarted() {
         std::fs::read_to_string(&real_plugin_file).unwrap(),
         "Original Plugins\n"
     );
-    assert!(status(&harness.ctx, &def.id, &StoreId::steam()).is_none());
+    assert!(status(&harness.ctx, &def.id, &StoreId::steam())
+        .unwrap()
+        .is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +554,7 @@ fn interrupted_swap_restores_correctly() {
         created_at: "2026-10-05T00:00:00Z".to_string(),
         running_from: harness.running_from.clone(),
         processes: vec![],
+        starting_launcher: None,
         files: vec![
             JournaledFile {
                 real_path: real_plugin_file.clone(),
@@ -560,6 +565,8 @@ fn interrupted_swap_restores_correctly() {
                 original_sha256: Some(sha256_hex("Original Plugins\n".as_bytes())),
                 written_sha256: sha256_hex("Swapped Plugins Content\n".as_bytes()),
                 swapped: true,
+                state: None,
+                restored: false,
             },
             JournaledFile {
                 real_path: real_ini_file.clone(),
@@ -570,6 +577,8 @@ fn interrupted_swap_restores_correctly() {
                 original_sha256: None,
                 written_sha256: String::new(),
                 swapped: false,
+                state: None,
+                restored: false,
             },
         ],
     };

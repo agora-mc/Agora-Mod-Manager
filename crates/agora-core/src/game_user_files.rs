@@ -37,9 +37,12 @@ pub enum UserFilesError {
     NoSession { game: GameId, store: StoreId },
     #[error("user data location '{0:?}' could not be resolved")]
     UserDataNotFound(UserDataLocation),
-    #[error("hash mismatch on file '{path}': expected {expected}, got {actual}")]
+    #[error(
+        "the backup '{path}' of the user file '{real_path}' does not match the recorded original: expected {expected}, got {actual}"
+    )]
     HashMismatch {
         path: PathBuf,
+        real_path: PathBuf,
         expected: String,
         actual: String,
     },
@@ -47,6 +50,12 @@ pub enum UserFilesError {
     Lock(#[from] crate::error::LauncherError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("cannot write '{path}': {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("{0}")]
@@ -66,7 +75,35 @@ pub struct Journal {
     pub created_at: String,
     pub running_from: PathBuf,
     pub processes: Vec<ProcessIdentity>,
+    /// The Agora process that swapped these files in and has not yet recorded the game's process.
+    /// While it is alive the session counts as running: a launch between the swap and the spawn is
+    /// still a launch. A crash leaves a dead identity, so recovery is not blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_launcher: Option<ProcessIdentity>,
     pub files: Vec<JournaledFile>,
+}
+
+/// How far the write-ahead record of one file has got. A stop leaves the last state written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileState {
+    /// The player's file is hashed and recorded; no backup is complete yet.
+    BackingUp,
+    /// A verified backup exists; the real file is untouched.
+    BackedUp,
+    /// The instance's file has been (or is about to be) written over the real file.
+    Swapped,
+}
+
+/// The state a journal entry records. Old journals have no `state`; their `swapped` flag and
+/// recorded hashes say how far they got.
+fn file_state(file: &JournaledFile) -> FileState {
+    match file.state {
+        Some(state) => state,
+        None if file.swapped => FileState::Swapped,
+        None if file.backup_path.is_some() || file.original_sha256.is_some() => FileState::BackedUp,
+        None => FileState::BackingUp,
+    }
 }
 
 /// A specific file tracked in the session journal.
@@ -83,6 +120,13 @@ pub struct JournaledFile {
     pub written_sha256: String,
     #[serde(default)]
     pub swapped: bool,
+    /// The write-ahead state, when this journal was written by the hash-first protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<FileState>,
+    /// Set once this entry's original is back on disk, so a re-run of an interrupted restore does
+    /// not put the user's file over the session's saved copy again.
+    #[serde(default)]
+    pub restored: bool,
 }
 
 /// Status of an active or recoverable user-file session.
@@ -214,13 +258,80 @@ fn hash_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// True when `real` is a strict prefix of `complete`: the shape a write that stopped part way
+/// leaves. Agora's own writes are atomic now; this recognises a state an older build or a torn
+/// external write left, so recovery does not take it for the game's output.
+fn is_torn_prefix(real: &[u8], complete: &[u8]) -> bool {
+    real.len() < complete.len() && complete.starts_with(real)
+}
+
+/// Write a user file atomically: a temp file beside it, synced, renamed over the target, then the
+/// directory synced where the platform supports it. A stop leaves the old bytes or the complete new
+/// bytes, never a torn file. The target is named when the write is refused.
+fn write_user_file(path: &Path, bytes: &[u8]) -> Result<(), UserFilesError> {
+    let Some(parent) = path.parent() else {
+        return Err(UserFilesError::Other(format!(
+            "cannot write '{}': it has no folder",
+            path.display()
+        )));
+    };
+    std::fs::create_dir_all(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let tmp = parent.join(format!(
+        ".{name}.agora-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(source) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(UserFilesError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    if let Err(source) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(UserFilesError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    sync_directory(parent);
+    Ok(())
+}
+
+/// Flush a directory entry where the platform supports it, so a rename is durable.
+#[cfg(unix)]
+fn sync_directory(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_dir: &Path) {}
+
 fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFilesError> {
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(journal)?;
     let tmp_path = journal_path.with_extension("tmp");
-    std::fs::write(&tmp_path, data.as_bytes())?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(data.as_bytes())?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp_path, journal_path)?;
     Ok(())
 }
@@ -234,6 +345,18 @@ fn write_journal(journal_path: &Path, journal: &Journal) -> Result<(), UserFiles
 /// (`process_identity::verify`) or any process runs from the recorded folder
 /// (`processes_running_from`).
 pub fn is_session_running(journal: &Journal) -> bool {
+    if session_running_apart_from_starting(journal) {
+        return true;
+    }
+    journal
+        .starting_launcher
+        .as_ref()
+        .is_some_and(|launcher| process_identity::verify(launcher).is_ok())
+}
+
+/// The session's own processes, and any process running from its game folder. A launch that has
+/// swapped in but has not recorded its game yet is not counted here.
+fn session_running_apart_from_starting(journal: &Journal) -> bool {
     for proc in &journal.processes {
         if process_identity::verify(proc).is_ok() {
             return true;
@@ -318,22 +441,56 @@ pub fn swap_in(
         .user_files_backup_dir(definition.id.as_str(), store.as_str());
     std::fs::create_dir_all(&backup_dir)?;
 
-    // 3. Build initial journal record before touching any real file
-    let mut journal_files = Vec::new();
+    // 3. Settle the mappings before anything else. Two mappings for one real file, or two that
+    // share one instance path, cannot be swapped and restored unambiguously: the journal is looked
+    // up by instance path, and two entries for one real file would back up each other's writes.
+    // Refuse and name both, touching nothing.
+    let mut chosen: Vec<(&UserFileMapping, PathBuf)> = Vec::new();
+    let mut real_to_instance: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut instance_to_real: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for m in &applicable_mappings {
         let real_path = resolve_user_file_source(&m.source)?;
-        let instance_copy_path = instance_dir.join(m.instance_path.as_str());
-        journal_files.push(JournaledFile {
+        let real_key = fold_path_case(&real_path.to_string_lossy());
+        let instance_key = fold_path_case(m.instance_path.as_str());
+        if let Some(other) = real_to_instance.get(&real_key) {
+            return Err(UserFilesError::Other(format!(
+                "two user-file mappings name the same real file '{}' (instance paths '{}' and '{}'); fix the game definition",
+                real_path.display(),
+                other,
+                m.instance_path
+            )));
+        }
+        if let Some(other) = instance_to_real.get(&instance_key) {
+            return Err(UserFilesError::Other(format!(
+                "two user-file mappings share instance path '{}' (real files '{}' and '{}'); fix the game definition",
+                m.instance_path,
+                other,
+                real_path.display()
+            )));
+        }
+        real_to_instance.insert(real_key, m.instance_path.as_str().to_string());
+        instance_to_real.insert(instance_key, real_path.display().to_string());
+        chosen.push((m, real_path));
+    }
+
+    // 4. Initial journal record, before touching any real file.
+    let journal_files: Vec<JournaledFile> = chosen
+        .into_iter()
+        .map(|(m, real_path)| JournaledFile {
             real_path,
             instance_path: m.instance_path.clone(),
-            instance_copy_path,
+            instance_copy_path: instance_dir.join(m.instance_path.as_str()),
             existed: false,
             backup_path: None,
             original_sha256: None,
             written_sha256: String::new(),
             swapped: false,
-        });
-    }
+            state: Some(FileState::BackingUp),
+            restored: false,
+        })
+        .collect();
 
     let mut journal = Journal {
         game: definition.id.clone(),
@@ -342,79 +499,125 @@ pub fn swap_in(
         created_at: chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339(),
         running_from: running_from.to_path_buf(),
         processes: Vec::new(),
+        starting_launcher: process_identity::capture_self(),
         files: journal_files,
     };
 
     write_journal(&journal_path, &journal)?;
 
-    // 4. Perform the swap file-by-file, updating the journal after each file.
+    // 5. Hash first, then back up, then journal, then swap. Every journal write is fsynced, so a
+    // stop leaves a record of exactly what the disk may hold: a complete backup is never mistaken
+    // for the player's file until its hash matches the hash recorded before the copy.
     let swap_result: Result<(), UserFilesError> = (|| {
         for i in 0..journal.files.len() {
             let real_path = journal.files[i].real_path.clone();
             let instance_copy_path = journal.files[i].instance_copy_path.clone();
-            let backup_path = backup_dir.join(format!("{i}"));
+            let final_backup = backup_dir.join(format!("{i}"));
+            let temp_backup = backup_dir.join(format!("{i}.tmp"));
 
             if real_path.exists() {
                 let original_bytes = std::fs::read(&real_path)?;
                 let orig_hash = hash_bytes(&original_bytes);
 
-                // Back up real file and verify backup hash
-                std::fs::copy(&real_path, &backup_path)?;
-                let backup_bytes = std::fs::read(&backup_path)?;
+                // The player's hash is durable before any copy exists.
+                journal.files[i].existed = true;
+                journal.files[i].backup_path = None;
+                journal.files[i].original_sha256 = Some(orig_hash.clone());
+                journal.files[i].written_sha256 = String::new();
+                journal.files[i].swapped = false;
+                journal.files[i].state = Some(FileState::BackingUp);
+                journal.files[i].restored = false;
+                write_journal(&journal_path, &journal)?;
+
+                // Copy to a temp name, make it durable, verify it, and only then give it the final
+                // name. A torn copy never becomes the backup restore trusts.
+                let _ = std::fs::remove_file(&temp_backup);
+                {
+                    // A fresh file, not a permission-preserving copy: a read-only player file must
+                    // not make its backup read-only, because the backup is verified and then used.
+                    let mut source = std::fs::File::open(&real_path)?;
+                    let mut copy = std::fs::File::create(&temp_backup)?;
+                    std::io::copy(&mut source, &mut copy)?;
+                    copy.sync_all()?;
+                }
+                let backup_bytes = std::fs::read(&temp_backup)?;
                 let b_hash = hash_bytes(&backup_bytes);
                 if b_hash != orig_hash {
+                    let _ = std::fs::remove_file(&temp_backup);
                     return Err(UserFilesError::HashMismatch {
-                        path: backup_path,
+                        path: temp_backup,
+                        real_path: real_path.clone(),
                         expected: orig_hash,
                         actual: b_hash,
                     });
                 }
+                let _ = std::fs::remove_file(&final_backup);
+                std::fs::rename(&temp_backup, &final_backup)?;
 
-                let written_hash;
-                if instance_copy_path.exists() {
-                    let instance_bytes = std::fs::read(&instance_copy_path)?;
-                    written_hash = hash_bytes(&instance_bytes);
-                    std::fs::write(&real_path, &instance_bytes)?;
+                journal.files[i].backup_path = Some(final_backup);
+                journal.files[i].state = Some(FileState::BackedUp);
+                write_journal(&journal_path, &journal)?;
+
+                let instance_bytes = if instance_copy_path.exists() {
+                    Some(std::fs::read(&instance_copy_path)?)
                 } else {
+                    None
+                };
+                let written_hash = match &instance_bytes {
+                    Some(bytes) => hash_bytes(bytes),
                     // First launch keeps the user's settings: write nothing and
                     // record original hash as what Agora "wrote".
-                    written_hash = orig_hash.clone();
-                }
+                    None => orig_hash.clone(),
+                };
 
-                journal.files[i].existed = true;
-                journal.files[i].backup_path = Some(backup_path);
-                journal.files[i].original_sha256 = Some(orig_hash);
                 journal.files[i].written_sha256 = written_hash;
                 journal.files[i].swapped = true;
-            } else {
-                let written_hash;
-                if instance_copy_path.exists() {
-                    let instance_bytes = std::fs::read(&instance_copy_path)?;
-                    written_hash = hash_bytes(&instance_bytes);
-                    if let Some(parent) = real_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&real_path, &instance_bytes)?;
-                } else {
-                    written_hash = String::new();
+                journal.files[i].state = Some(FileState::Swapped);
+                write_journal(&journal_path, &journal)?;
+
+                if let Some(instance_bytes) = instance_bytes {
+                    write_user_file(&real_path, &instance_bytes)?;
                 }
+            } else {
+                let instance_bytes = if instance_copy_path.exists() {
+                    Some(std::fs::read(&instance_copy_path)?)
+                } else {
+                    None
+                };
+                let written_hash = match &instance_bytes {
+                    Some(bytes) => hash_bytes(bytes),
+                    None => String::new(),
+                };
 
                 journal.files[i].existed = false;
                 journal.files[i].backup_path = None;
                 journal.files[i].original_sha256 = None;
                 journal.files[i].written_sha256 = written_hash;
                 journal.files[i].swapped = true;
-            }
+                journal.files[i].state = Some(FileState::Swapped);
+                journal.files[i].restored = false;
+                write_journal(&journal_path, &journal)?;
 
-            write_journal(&journal_path, &journal)?;
+                if let Some(instance_bytes) = instance_bytes {
+                    if let Some(parent) = real_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    write_user_file(&real_path, &instance_bytes)?;
+                }
+            }
         }
         Ok(())
     })();
 
     if let Err(e) = swap_result {
-        // Any error restores what was swapped so far and returns the error.
-        let _ = restore_journal_internal(ctx, definition, &journal);
-        return Err(e);
+        // Any error puts back what was swapped so far. A restore that also fails is reported, and
+        // its journal is left for the next launch or a restore to finish.
+        return Err(match restore_journal_internal(ctx, definition, &journal) {
+            Ok(_) => e,
+            Err(restore_error) => UserFilesError::Other(format!(
+                "{e}; putting the player's files back also failed: {restore_error}. The journal was kept so recovery can finish it."
+            )),
+        });
     }
 
     Ok(SwapOutcome {
@@ -444,15 +647,66 @@ pub fn restore(
     }
 
     let text = std::fs::read_to_string(&journal_path)?;
-    let journal: Journal = serde_json::from_str(&text)?;
+    let mut journal: Journal = serde_json::from_str(&text)?;
 
-    if is_session_running(&journal) {
+    if session_running_apart_from_starting(&journal) {
+        // The restore outcome is known now. If this process is the one that swapped the files in,
+        // its "starting" mark has done its job: keeping it would make another Agora refuse until
+        // this process exits, even after the game and its helpers are gone.
+        if journal
+            .starting_launcher
+            .as_ref()
+            .is_some_and(|launcher| launcher.pid == std::process::id())
+        {
+            journal.starting_launcher = None;
+            write_journal(&journal_path, &journal)?;
+        }
         return Err(UserFilesError::CannotRestoreRunning {
             instance: journal.instance_id.clone(),
         });
     }
+    match journal.starting_launcher.as_ref() {
+        Some(launcher) if process_identity::verify(launcher).is_ok() => {
+            // The process that started the launch is the one restoring: this is a launch that never
+            // reported a game, not a second launch. Any other process restoring must wait for it.
+            if launcher.pid != std::process::id() {
+                return Err(UserFilesError::CannotRestoreRunning {
+                    instance: journal.instance_id.clone(),
+                });
+            }
+            journal.starting_launcher = None;
+            write_journal(&journal_path, &journal)?;
+        }
+        _ => {}
+    }
 
     restore_journal_internal(ctx, definition, &journal)
+}
+
+/// Clear the "starting" mark of a launch that will never spawn. The caller then restores its
+/// files; a launch that failed must not leave the session counting as running.
+pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), UserFilesError> {
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::GameUserFiles(game.clone(), store.clone()),
+        "finish-starting",
+    )?;
+    let journal_path = ctx
+        .paths
+        .user_files_journal_path(game.as_str(), store.as_str());
+    if !journal_path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&journal_path)?;
+    let mut journal: Journal = serde_json::from_str(&text)?;
+    let ours = journal
+        .starting_launcher
+        .as_ref()
+        .is_some_and(|launcher| launcher.pid == std::process::id());
+    if ours {
+        journal.starting_launcher = None;
+        write_journal(&journal_path, &journal)?;
+    }
+    Ok(())
 }
 
 fn restore_journal_internal(
@@ -496,14 +750,19 @@ fn restore_journal_internal(
     // "A journal entry whose instance_path matches no mapping for that store,
     // or whose recorded real_path differs from the derived one (case-insensitive),
     // makes restore refuse, keep the journal and change nothing."
-    struct ValidatedEntry<'a> {
-        file: &'a JournaledFile,
+    struct ValidatedEntry {
+        index: usize,
+        file: JournaledFile,
+        instance_path: RelPath,
+        original_sha256: Option<String>,
         derived_real_path: PathBuf,
         derived_instance_copy: PathBuf,
         derived_backup_path: PathBuf,
-        mapping: &'a UserFileMapping,
+        state: FileState,
+        existed: bool,
     }
 
+    let mut journal = journal.clone();
     let mut validated_entries = Vec::with_capacity(journal.files.len());
 
     for (i, file) in journal.files.iter().enumerate() {
@@ -529,33 +788,7 @@ fn restore_journal_internal(
         let derived_instance_copy = instance_dir.join(mapping.instance_path.as_str());
         let derived_backup_path = backup_dir.join(format!("{i}"));
 
-        if file.swapped {
-            if file.existed {
-                let Some(ref bp) = file.backup_path else {
-                    return Err(UserFilesError::Other(format!(
-                        "missing backup path in journal for existed file: {:?}",
-                        file.real_path
-                    )));
-                };
-                if !paths_eq_case_insensitive(bp, &derived_backup_path) {
-                    return Err(UserFilesError::Other(format!(
-                        "journal backup path '{:?}' does not match expected backup index path '{:?}'",
-                        bp, derived_backup_path
-                    )));
-                }
-                if !derived_backup_path.exists() {
-                    return Err(UserFilesError::Other(format!(
-                        "backup file does not exist: {:?}",
-                        derived_backup_path
-                    )));
-                }
-            } else if file.backup_path.is_some() {
-                return Err(UserFilesError::Other(format!(
-                    "journal has backup path for non-existed file: {:?}",
-                    file.real_path
-                )));
-            }
-        } else if let Some(ref bp) = file.backup_path {
+        if let Some(ref bp) = file.backup_path {
             if !paths_eq_case_insensitive(bp, &derived_backup_path) {
                 return Err(UserFilesError::Other(format!(
                     "journal backup path '{:?}' does not match expected backup index path '{:?}'",
@@ -564,57 +797,157 @@ fn restore_journal_internal(
             }
         }
 
+        // A backup on disk proves the real file was there, even when a stop happened before the
+        // journal said so. It is only usable when its hash matches the recorded original.
+        let has_backup = derived_backup_path.exists();
+        let existed = file.existed || has_backup || file.original_sha256.is_some();
+
         validated_entries.push(ValidatedEntry {
-            file,
+            index: i,
+            file: file.clone(),
+            instance_path: mapping.instance_path.clone(),
+            original_sha256: file.original_sha256.clone(),
             derived_real_path,
             derived_instance_copy,
             derived_backup_path,
-            mapping,
+            state: file_state(file),
+            existed,
         });
     }
 
-    // 4. Perform restore using derived paths
+    // 4. Restore trusts only what it can prove. A backup is written only when its hash equals the
+    // journal's recorded original. A real file that still holds that original never changed (or was
+    // already put back): it and the instance copy are left alone. A torn or unverifiable backup is
+    // never written over anything; the entry is reported with both paths and everything is kept.
     let mut restored_files = Vec::new();
 
     for entry in &validated_entries {
-        if !entry.file.swapped {
+        if entry.file.restored {
             continue;
         }
 
-        let changed = if entry.derived_real_path.exists() {
-            let current_bytes = std::fs::read(&entry.derived_real_path)?;
-            let current_hash = hash_bytes(&current_bytes);
-            let ch = current_hash != entry.file.written_sha256;
-
-            // Current file contents always go to the instance copy
-            if let Some(parent) = entry.derived_instance_copy.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&entry.derived_instance_copy, &current_bytes)?;
-            ch
+        let real_bytes = if entry.derived_real_path.exists() {
+            Some(std::fs::read(&entry.derived_real_path)?)
         } else {
-            !entry.file.written_sha256.is_empty()
+            None
         };
+        let real_hash = real_bytes.as_ref().map(|bytes| hash_bytes(bytes));
+        let backup_bytes = if entry.derived_backup_path.exists() {
+            Some(std::fs::read(&entry.derived_backup_path)?)
+        } else {
+            None
+        };
+        let backup_hash = backup_bytes.as_ref().map(|bytes| hash_bytes(bytes));
 
-        // Put the original backup back, or delete real file if it did not exist before
-        if entry.file.existed {
-            let backup_bytes = std::fs::read(&entry.derived_backup_path)?;
-            let b_hash = hash_bytes(&backup_bytes);
-            if let Some(ref orig_hash) = entry.file.original_sha256 {
-                if &b_hash != orig_hash {
-                    return Err(UserFilesError::HashMismatch {
-                        path: entry.derived_backup_path.clone(),
-                        expected: orig_hash.clone(),
-                        actual: b_hash,
-                    });
+        // The real file still holding the recorded original means the swap never changed it (or an
+        // earlier run already restored it). With no recorded hash, a backup byte-identical to the
+        // real file proves the same thing.
+        let real_is_original = entry.original_sha256.is_some()
+            && real_hash.as_deref() == entry.original_sha256.as_deref();
+        let real_matches_backup =
+            real_hash.is_some() && backup_hash.is_some() && real_hash == backup_hash;
+
+        // By design: a session that ends on exactly the player's original bytes has no changed
+        // bytes to save, so the instance copy is left as it was.
+        if real_is_original || real_matches_backup {
+            if entry.derived_backup_path.exists() {
+                let _ = std::fs::remove_file(&entry.derived_backup_path);
+            }
+            let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+            journal.files[entry.index].restored = true;
+            write_journal(&journal_path, &journal)?;
+            restored_files.push(RestoredFile {
+                real_path: entry.derived_real_path.clone(),
+                instance_path: entry.instance_path.clone(),
+                changed: false,
+                original_sha256: entry.original_sha256.clone(),
+                final_sha256: real_hash,
+            });
+            continue;
+        }
+
+        if entry.state != FileState::Swapped {
+            // The journal records that no write reached the real file. A backup that matches it was
+            // already handled; one that does not may be the only copy of the player's file, so it
+            // is kept and reported instead of removed.
+            if entry.derived_backup_path.exists() {
+                return Err(UserFilesError::Other(format!(
+                    "the user file '{}' does not match its backup '{}', and the journal records no swap; both were left in place",
+                    entry.derived_real_path.display(),
+                    entry.derived_backup_path.display()
+                )));
+            }
+            let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+            journal.files[entry.index].restored = true;
+            write_journal(&journal_path, &journal)?;
+            continue;
+        }
+
+        let real_is_torn = real_bytes.as_deref().is_some_and(|current| {
+            backup_bytes
+                .as_deref()
+                .is_some_and(|backup| is_torn_prefix(current, backup))
+                || std::fs::read(&entry.derived_instance_copy)
+                    .ok()
+                    .is_some_and(|instance| is_torn_prefix(current, &instance))
+        });
+
+        if entry.existed {
+            let Some(original) = entry.original_sha256.as_deref() else {
+                return Err(UserFilesError::Other(format!(
+                    "the backup '{}' of the user file '{}' cannot be verified: the journal has no original hash; both were left in place",
+                    entry.derived_backup_path.display(),
+                    entry.derived_real_path.display()
+                )));
+            };
+            let Some(backup_hash) = backup_hash.as_deref() else {
+                return Err(UserFilesError::Other(format!(
+                    "the backup '{}' of the user file '{}' is missing; the file and the journal were left in place",
+                    entry.derived_backup_path.display(),
+                    entry.derived_real_path.display()
+                )));
+            };
+            if backup_hash != original {
+                return Err(UserFilesError::HashMismatch {
+                    path: entry.derived_backup_path.clone(),
+                    real_path: entry.derived_real_path.clone(),
+                    expected: original.to_string(),
+                    actual: backup_hash.to_string(),
+                });
+            }
+
+            // The session's saved copy is the game's changed file, and only when the game changed
+            // it from what Agora wrote.
+            if let Some(current) = &real_bytes {
+                if !real_is_torn && real_hash.as_deref() != Some(entry.file.written_sha256.as_str())
+                {
+                    if let Some(parent) = entry.derived_instance_copy.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    write_user_file(&entry.derived_instance_copy, current)?;
                 }
             }
+
+            let backup_bytes = backup_bytes.expect("checked above");
             if let Some(parent) = entry.derived_real_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&entry.derived_real_path, &backup_bytes)?;
-        } else if entry.derived_real_path.exists() {
-            std::fs::remove_file(&entry.derived_real_path)?;
+            write_user_file(&entry.derived_real_path, &backup_bytes)?;
+        } else {
+            // Agora created this file during the session; the session's copy goes back and the real
+            // file goes.
+            if let Some(current) = &real_bytes {
+                if !real_is_torn && real_hash.as_deref() != Some(entry.file.written_sha256.as_str())
+                {
+                    if let Some(parent) = entry.derived_instance_copy.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    write_user_file(&entry.derived_instance_copy, current)?;
+                }
+            }
+            if entry.derived_real_path.exists() {
+                std::fs::remove_file(&entry.derived_real_path)?;
+            }
         }
 
         let final_sha256 = if entry.derived_real_path.exists() {
@@ -624,11 +957,18 @@ fn restore_journal_internal(
             None
         };
 
+        // Record the entry before its backup can go, so a stop from here on does not restore it a
+        // second time.
+        journal.files[entry.index].restored = true;
+        write_journal(&journal_path, &journal)?;
+        let _ = std::fs::remove_file(&entry.derived_backup_path);
+        let _ = std::fs::remove_file(entry.derived_backup_path.with_extension("tmp"));
+
         restored_files.push(RestoredFile {
             real_path: entry.derived_real_path.clone(),
-            instance_path: entry.mapping.instance_path.clone(),
-            changed,
-            original_sha256: entry.file.original_sha256.clone(),
+            instance_path: entry.instance_path.clone(),
+            changed: real_hash != entry.original_sha256,
+            original_sha256: entry.original_sha256.clone(),
             final_sha256,
         });
     }
@@ -674,26 +1014,43 @@ pub fn record_process(
     let text = std::fs::read_to_string(&journal_path)?;
     let mut journal: Journal = serde_json::from_str(&text)?;
     journal.processes.push(identity);
+    // The game now has an identity that says whether it is alive; the launcher mark is done.
+    journal.starting_launcher = None;
     write_journal(&journal_path, &journal)?;
     Ok(())
 }
 
-/// Inspect the status of a user-file session for a game and store.
-pub fn status(ctx: &Ctx, game: &GameId, store: &StoreId) -> Option<SessionStatus> {
+/// Inspect the status of a user-file session for a game and store. An unreadable journal is an
+/// error, never "no session": launching over it would have to guess what it holds.
+pub fn status(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+) -> Result<Option<SessionStatus>, UserFilesError> {
     let journal_path = ctx
         .paths
         .user_files_journal_path(game.as_str(), store.as_str());
     if !journal_path.exists() {
-        return None;
+        return Ok(None);
     }
-    let text = std::fs::read_to_string(&journal_path).ok()?;
-    let journal: Journal = serde_json::from_str(&text).ok()?;
+    let text = std::fs::read_to_string(&journal_path).map_err(|e| {
+        UserFilesError::Other(format!(
+            "the user-files journal {} cannot be read: {e}",
+            journal_path.display()
+        ))
+    })?;
+    let journal: Journal = serde_json::from_str(&text).map_err(|e| {
+        UserFilesError::Other(format!(
+            "the user-files journal {} cannot be read: {e}",
+            journal_path.display()
+        ))
+    })?;
     let running = is_session_running(&journal);
-    Some(SessionStatus {
+    Ok(Some(SessionStatus {
         instance: journal.instance_id,
         running,
         files: journal.files,
-    })
+    }))
 }
 
 /// List active/recoverable user-file sessions across all games, optionally filtered.

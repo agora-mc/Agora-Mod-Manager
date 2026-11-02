@@ -31,6 +31,8 @@ use super::error::{GamesError, CORE_FAILED, TASK_FAILED};
 pub const INSTANCE_NOT_FOUND: &str = "instance_not_found";
 /// The instance is running, so the change or the launch has to wait until the game closes.
 pub const INSTANCE_RUNNING: &str = "instance_running";
+/// The instance's base record cannot be read; deleting it needs the user's answer.
+pub const INSTANCE_BASE_UNREADABLE: &str = "instance_base_unreadable";
 /// The request names something that cannot exist: a blank name, an unknown mode, a bad game id.
 pub const INVALID_REQUEST: &str = "invalid_request";
 /// The id belongs to a Minecraft instance, which the Minecraft pages manage.
@@ -165,6 +167,8 @@ pub struct DeletedInstance {
     pub instance_id: String,
     /// The base the deleted instance pinned, when nothing else pins it any more.
     pub orphaned_base: Option<String>,
+    /// A deployed game folder Agora could not prove was the instance's, left where it was.
+    pub left_in_place: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -236,8 +240,9 @@ pub async fn games_instance_create(
 pub async fn games_instance_delete(
     app: tauri::AppHandle,
     instance_id: String,
+    delete_anyway: bool,
 ) -> Result<DeletedInstance, GamesError> {
-    blocking(move || delete_instance(&app, &instance_id)).await
+    blocking(move || delete_instance(&app, &instance_id, delete_anyway)).await
 }
 
 /// The launch checks for an instance, without starting anything.
@@ -299,7 +304,7 @@ fn list_instances(app: &tauri::AppHandle, game_id: &str) -> Result<InstanceList,
         .filter(|record| record.game.as_str() == game.as_str())
     {
         let manifest = game_instance::get_manifest(&ctx, &record.instance_id).map_err(map_error)?;
-        let running = is_running(&ctx, record, &manifest);
+        let running = is_running(&ctx, record, &manifest)?;
         instances.push(card_for(record, &manifest, running));
     }
     Ok(InstanceList { instances })
@@ -316,7 +321,7 @@ fn instance_detail(
         .games
         .game(&record.game)
         .ok_or_else(|| game_missing(record.game.as_str()))?;
-    let running = is_running(&ctx, &record, &manifest);
+    let running = is_running(&ctx, &record, &manifest)?;
     let runtime = runtime_of(&record, &manifest);
     Ok(InstanceDetail {
         instance_id: record.instance_id.clone(),
@@ -435,17 +440,28 @@ fn create_instance(
 fn delete_instance(
     app: &tauri::AppHandle,
     instance_id: &str,
+    delete_anyway: bool,
 ) -> Result<DeletedInstance, GamesError> {
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
     let manifest = game_instance::get_manifest(&ctx, instance_id).map_err(map_error)?;
-    if is_running(&ctx, &record, &manifest) {
+    if is_running(&ctx, &record, &manifest)? {
         return Err(running_error(instance_id));
     }
-    let outcome = game_instance::delete(&ctx, instance_id).map_err(map_error)?;
+    let outcome = game_instance::delete_with_options(
+        &ctx,
+        instance_id,
+        game_instance::DeleteOptions {
+            force_unreadable_base: delete_anyway,
+        },
+    )
+    .map_err(map_error)?;
     Ok(DeletedInstance {
         instance_id: outcome.instance_id,
         orphaned_base: outcome.orphaned_base,
+        left_in_place: outcome
+            .left_in_place
+            .map(|folder| folder.display().to_string()),
     })
 }
 
@@ -492,7 +508,7 @@ fn set_deployment(
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
     let manifest = game_instance::get_manifest(&ctx, instance_id).map_err(map_error)?;
-    if is_running(&ctx, &record, &manifest) {
+    if is_running(&ctx, &record, &manifest)? {
         return Err(running_error(instance_id));
     }
     agora_core::game_deploy::set_deployment(&ctx, instance_id, chosen).map_err(core_failed)?;
@@ -511,7 +527,7 @@ fn launch_instance(
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
     let manifest = game_instance::get_manifest(&ctx, instance_id).map_err(map_error)?;
-    if is_running(&ctx, &record, &manifest) {
+    if is_running(&ctx, &record, &manifest)? {
         return Err(running_error(instance_id));
     }
     let definition = ctx
@@ -651,20 +667,21 @@ fn runtime_of(
     }
 }
 
-/// Whether the game is running from this instance right now, from the user-file session.
+/// Whether the game is running from this instance right now, from the user-file session. An
+/// unreadable session is an error, not "not running": the page shows it instead of guessing.
 fn is_running(
     ctx: &agora_core::ctx::Ctx,
     record: &GameInstanceRecord,
     manifest: &GameInstanceManifest,
-) -> bool {
+) -> Result<bool, GamesError> {
     match runtime_of(record, manifest) {
-        Some(runtime) => running_from_session(
-            game_user_files::status(ctx, &record.game, &runtime.store),
+        Some(runtime) => Ok(running_from_session(
+            game_user_files::status(ctx, &record.game, &runtime.store).map_err(core_failed)?,
             &record.instance_id,
-        ),
+        )),
         // An instance with no recorded runtime has no store to look a session up under. It has
         // never been launched through a store this build can name, so no session can be ours.
-        None => false,
+        None => Ok(false),
     }
 }
 
@@ -903,6 +920,13 @@ pub fn clean_name(name: &str) -> Result<String, GamesError> {
 pub fn map_error(error: InstanceError) -> GamesError {
     match error {
         InstanceError::NotFound(id) => not_found(&id),
+        InstanceError::Running(id) => running_error(&id),
+        InstanceError::Deploy(agora_core::game_deploy::DeployError::UnreadableBaseManifest(
+            detail,
+        )) => GamesError::new(
+            INSTANCE_BASE_UNREADABLE,
+            format!("Agora cannot read this instance's base record: {detail}"),
+        ),
         InstanceError::MinecraftInstance(id) => GamesError::new(
             MINECRAFT_INSTANCE,
             format!("'{id}' is a Minecraft instance. Manage it under My Instances."),

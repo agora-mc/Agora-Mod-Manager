@@ -896,6 +896,73 @@ fn an_interrupted_build_does_not_brick_its_base_id() {
 }
 
 #[test]
+fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
+    use std::time::Duration;
+
+    use agora_core::lock_manager::{LockManager, LockResource};
+
+    let tmp = TempDir::new().unwrap();
+    let (paths, _install_dir, install) = built(&tmp, Some("9"));
+    let root = tmp.path().join("AgoraBases");
+    let RuntimeResolution::Identified { runtime, .. } = &install.runtime else {
+        panic!("the fixture install is identified");
+    };
+    let base_id = make_base_id(runtime);
+
+    agora_core::game_base::set_base_build_pause_after_rename(true);
+    let build_paths = paths.clone();
+    let build_install = install.clone();
+    let build_root = root.clone();
+    let handle = std::thread::spawn(move || {
+        build_base(
+            &build_paths,
+            &build_install,
+            &test_definition(),
+            BaseMode::Linked,
+            Some(&build_root),
+            BuildOptions::default(),
+            &|_| {},
+        )
+    });
+
+    // Wait for the build to reach the rename, where it holds the base lock.
+    let mut reached = false;
+    for _ in 0..600 {
+        if agora_core::game_base::base_build_pause_reached() {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let manager = LockManager::new(paths.locks_root());
+    std::fs::create_dir_all(paths.locks_root()).unwrap();
+    let probe = manager.acquire_with_timeout(
+        LockResource::Base(base_id.clone()),
+        "probe",
+        Duration::from_millis(100),
+        None,
+    );
+    agora_core::game_base::set_base_build_pause_after_rename(false);
+    let outcome = handle.join().unwrap().expect("the base build succeeds");
+
+    assert!(reached, "the base build never reached its rename");
+    assert!(
+        probe.is_err(),
+        "the base lock was free between the rename and the record write"
+    );
+    assert!(matches!(outcome, BuildOutcome::Built { .. }));
+    // Once the build is done its lock is free again.
+    manager
+        .acquire_with_timeout(
+            LockResource::Base(base_id),
+            "after",
+            Duration::from_secs(1),
+            None,
+        )
+        .expect("the base lock is released when the build finishes");
+}
+
+#[test]
 fn base_id_parts_never_start_or_end_with_a_dot() {
     for odd in ["1.", ".1", ".", "..", "...", "a..b."] {
         let part = sanitize_base_id_part(odd);

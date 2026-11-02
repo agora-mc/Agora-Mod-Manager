@@ -5,8 +5,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use agora_game_api::{fold_path_case, GameDefinition, InstallId, RuntimeIdentity, VolumeInfo};
 use serde::{Deserialize, Serialize};
@@ -499,6 +500,37 @@ pub fn install_size(
     Ok(entries.iter().map(|e| e.size).sum())
 }
 
+/// Test seam for the crash window between the base folder's rename into place and the write of its
+/// record. While paused, the build holds its base lock, so a test can check that another build of
+/// the same id cannot take it.
+static PAUSE_AFTER_BASE_RENAME: AtomicBool = AtomicBool::new(false);
+static BASE_RENAME_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Test seam: make the next `build_base` on this process stop right after it renames its folder
+/// into place, until `pause` is false again. Off by default.
+#[doc(hidden)]
+pub fn set_base_build_pause_after_rename(pause: bool) {
+    PAUSE_AFTER_BASE_RENAME.store(pause, Ordering::SeqCst);
+    BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
+}
+
+/// Whether a paused build has reached its rename and is waiting.
+#[doc(hidden)]
+pub fn base_build_pause_reached() -> bool {
+    BASE_RENAME_PAUSED.load(Ordering::SeqCst)
+}
+
+fn pause_after_rename_if_asked() {
+    if !PAUSE_AFTER_BASE_RENAME.load(Ordering::SeqCst) {
+        return;
+    }
+    BASE_RENAME_PAUSED.store(true, Ordering::SeqCst);
+    while PAUSE_AFTER_BASE_RENAME.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
+}
+
 pub fn build_base(
     paths: &AppPaths,
     install: &IdentifiedInstall,
@@ -688,6 +720,27 @@ pub fn build_base(
     base_files.sort_by(|a, b| a.path.cmp(&b.path));
     skipped.sort();
 
+    // From here the base folder is put in place and its record written. Another build of the same
+    // id must not see the folder without its record and take it for an interrupted build: that
+    // would delete the base this one is finishing. The lock covers the rename and the record, and
+    // the re-check under it answers a build that finished while this one was hashing.
+    let locks_root = paths.locks_root();
+    std::fs::create_dir_all(&locks_root)?;
+    let _base_lock = crate::lock_manager::LockManager::new(locks_root)
+        .acquire(
+            crate::lock_manager::LockResource::Base(base_id.clone()),
+            "build-base",
+        )
+        .map_err(|e| BaseError::Other(e.to_string()))?;
+    if manifest_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<BaseManifest>(&content) {
+                // The staging folder goes with the guard when this returns.
+                return Ok(BuildOutcome::Existing(manifest));
+            }
+        }
+    }
+
     let final_base_dir = base_root.join(&base_id);
 
     // A folder under our own name with no readable manifest is what an
@@ -716,6 +769,7 @@ pub fn build_base(
     }
 
     guard.active = false;
+    pause_after_rename_if_asked();
 
     let created_unix_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
@@ -1128,6 +1182,17 @@ fn is_windows_device_name(stem: &str) -> bool {
 /// The bases roots outside the data folder that builds here created, from `bases/roots.json`. No
 /// file means none. A file that cannot be read is an error: removal must not treat it as "no
 /// roots", and must not guess one.
+/// The folders Agora has put bases in: the data folder's own, plus every root a build registered.
+/// An unreadable list of roots is an error: a caller that cannot see every root must not decide
+/// that a folder elsewhere does not exist.
+pub fn known_base_roots(paths: &AppPaths) -> Result<Vec<PathBuf>, BaseError> {
+    let mut roots = vec![paths.bases_dir()];
+    roots.extend(read_base_roots(paths)?);
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
 fn read_base_roots(paths: &AppPaths) -> Result<Vec<PathBuf>, BaseError> {
     let file = paths.base_roots_file();
     let text = match std::fs::read_to_string(&file) {

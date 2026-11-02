@@ -226,6 +226,8 @@ pub enum LockResource {
     ContentStore,
     /// Exclusive access for per-user game files journaled swap.
     GameUserFiles(GameId, StoreId),
+    /// Exclusive access to building a base by id (the rename into place through its record).
+    Base(String),
 }
 
 impl LockResource {
@@ -262,6 +264,10 @@ impl LockResource {
                     store.as_str()
                 ))
             }
+            LockResource::Base(id) => {
+                app_paths::validate_path_component(id)?;
+                Ok(format!("base-{id}"))
+            }
         }
     }
 }
@@ -287,6 +293,18 @@ impl LockManager {
     /// The root directory for lock files.
     pub fn locks_root(&self) -> &Path {
         &self.locks_root
+    }
+
+    /// The operation of the live holder of `resource`, when one holds it. A stale lock is not a
+    /// holder. Used to fail fast when the holder is a long tool run instead of waiting out the
+    /// acquire timeout.
+    pub fn current_operation(&self, resource: &LockResource) -> Option<String> {
+        let name = resource.lock_name().ok()?;
+        let meta = read_lock_metadata(&self.locks_root.join(format!("{name}.lock"))).ok()?;
+        if is_stale_lock(&meta) {
+            return None;
+        }
+        Some(meta.operation)
     }
 
     /// Record a change to an instance for other Agora programs, for an edit that takes no

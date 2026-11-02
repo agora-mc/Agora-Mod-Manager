@@ -1,7 +1,4 @@
 //! Final-review probes of the per-user file journal (MASTER_SPEC §26.5).
-//!
-//! Tests named `bug_*` prove a bug and are `#[ignore]`d so the suite stays green; run them with
-//! `cargo test -p agora-core --test review_final_user_files -- --ignored`.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -140,7 +137,6 @@ fn definition() -> GameDefinition {
 /// the first file's now-restored real content as "what the game left" and writes it over the
 /// instance copy that the first attempt saved, so the game's changes to that file are lost.
 #[test]
-#[ignore = "proves bug: re-running a half-done restore overwrites the saved instance copy with the original file"]
 fn bug_a_second_restore_overwrites_the_instance_copy_the_first_one_saved() {
     let h = Harness::new();
     let def = definition();
@@ -192,7 +188,6 @@ fn bug_a_second_restore_overwrites_the_instance_copy_the_first_one_saved() {
 ///
 /// The state is built by hand: the window between the two statements cannot be hit from a test.
 #[test]
-#[ignore = "proves bug: a crash between overwriting the real file and journaling it loses the original"]
 fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
     let h = Harness::new();
     let def = definition();
@@ -216,6 +211,7 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
         created_at: "2026-11-01T00:00:00Z".to_string(),
         running_from: h.running_from.clone(),
         processes: vec![],
+        starting_launcher: None,
         files: vec![
             JournaledFile {
                 real_path: h.plugins(),
@@ -226,6 +222,8 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 original_sha256: None,
                 written_sha256: String::new(),
                 swapped: false,
+                state: None,
+                restored: false,
             },
             JournaledFile {
                 real_path: h.ini(),
@@ -236,6 +234,8 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
                 original_sha256: None,
                 written_sha256: String::new(),
                 swapped: false,
+                state: None,
+                restored: false,
             },
         ],
     };
@@ -263,7 +263,6 @@ fn bug_crash_between_overwrite_and_journal_loses_the_original_file() {
 /// restore`) then restores the first launch's files and starts its own, instead of being told the
 /// game is starting.
 #[test]
-#[ignore = "proves bug: a launch that has swapped files in but not yet spawned is not a running session"]
 fn bug_a_second_launch_during_the_first_ones_spawn_restores_its_files() {
     let h = Harness::new();
     let def = definition();
@@ -286,7 +285,6 @@ fn bug_a_second_launch_during_the_first_ones_spawn_restores_its_files() {
 /// does not check for it) are swapped one after the other: the second backs up what the first just
 /// wrote, so restoring in order puts the first mapping's instance content back as the "original".
 #[test]
-#[ignore = "proves bug: two mappings for one real file leave the player's file holding an instance copy after restore"]
 fn bug_two_mappings_for_one_real_file_do_not_restore_the_original() {
     let h = Harness::new();
     let mut def = definition();
@@ -300,12 +298,19 @@ fn bug_two_mappings_for_one_real_file_do_not_restore_the_original() {
         "A Second\n",
     );
 
-    swap_in(&h.ctx, "inst-a", &def, &StoreId::steam(), &h.running_from).unwrap();
-    restore(&h.ctx, &def, &StoreId::steam()).unwrap();
+    let refused = swap_in(&h.ctx, "inst-a", &def, &StoreId::steam(), &h.running_from);
 
+    assert!(
+        refused.is_err(),
+        "two mappings for one real file were swapped in: {refused:?}"
+    );
     assert_eq!(
         std::fs::read_to_string(h.plugins()).unwrap(),
         "Original Plugins\n",
-        "the player's own Plugins.txt was not put back"
+        "the player's own Plugins.txt was touched by a refused duplicate mapping"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.instance_file("inst-a", "Plugins.txt")).unwrap(),
+        "A Plugins\n"
     );
 }

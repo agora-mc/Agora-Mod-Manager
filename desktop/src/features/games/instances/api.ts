@@ -99,6 +99,8 @@ export interface CreatedInstance {
 export interface DeletedInstance {
   instanceId: string;
   orphanedBase: string | null;
+  /** A deployed game folder Agora could not prove was the instance's, left where it was. */
+  leftInPlace: string | null;
 }
 
 export interface InstanceDeployment {
@@ -244,9 +246,14 @@ export async function createGameInstance(
   return reply as unknown as CreatedInstance;
 }
 
-export async function deleteGameInstance(instanceId: string): Promise<DeletedInstance> {
-  const reply: unknown = await invoke<unknown>('games_instance_delete', { instanceId });
-  if (!isRecord(reply) || typeof reply.instanceId !== 'string' || !isOptionalString(reply.orphanedBase)) {
+export async function deleteGameInstance(instanceId: string, deleteAnyway = false): Promise<DeletedInstance> {
+  const reply: unknown = await invoke<unknown>('games_instance_delete', { instanceId, deleteAnyway });
+  if (
+    !isRecord(reply)
+    || typeof reply.instanceId !== 'string'
+    || !isOptionalString(reply.orphanedBase)
+    || !isOptionalString(reply.leftInPlace)
+  ) {
     throw shapeError('games_instance_delete');
   }
   return reply as unknown as DeletedInstance;

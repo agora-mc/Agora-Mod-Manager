@@ -6,8 +6,10 @@ import { useConfirm } from '@/components/ui/confirm';
 import { CreateInstanceDialog } from './CreateInstanceDialog';
 import {
   deleteGameInstance,
+  gamesErrorCode,
   gamesErrorMessage,
   listGameInstances,
+  type DeletedInstance,
   type InstanceCard,
 } from './api';
 import { deploymentLabel, formatWhen } from './instanceText';
@@ -62,11 +64,27 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
     setActionError(null);
     setNotice(null);
     try {
-      const deleted = await deleteGameInstance(card.instanceId);
+      let deleted: DeletedInstance;
+      try {
+        deleted = await deleteGameInstance(card.instanceId);
+      } catch (error) {
+        if (gamesErrorCode(error) !== 'instance_base_unreadable') throw error;
+        const forced = await confirm({
+          title: `Delete ${card.name} anyway?`,
+          body: `Agora cannot read this instance's base record, so it cannot check the game folder it deployed. The instance and its own folder will be deleted. A deployed game folder Agora cannot prove is this instance's will be left where it is, and Agora will say where.`,
+          confirmLabel: 'Delete instance anyway',
+          tone: 'danger',
+        });
+        if (!forced) return;
+        deleted = await deleteGameInstance(card.instanceId, true);
+      }
+      const left = deleted.leftInPlace === null
+        ? ''
+        : ` A deployed game folder Agora could not check was left at ${deleted.leftInPlace}.`;
       setNotice(
         deleted.orphanedBase === null
-          ? `${card.name} was deleted.`
-          : `${card.name} was deleted. The base ${deleted.orphanedBase} is no longer used by any instance. Remove it under Setup, pinned bases, if you want the disk space back.`,
+          ? `${card.name} was deleted.${left}`
+          : `${card.name} was deleted. The base ${deleted.orphanedBase} is no longer used by any instance. Remove it under Setup, pinned bases, if you want the disk space back.${left}`,
       );
       load();
     } catch (error) {

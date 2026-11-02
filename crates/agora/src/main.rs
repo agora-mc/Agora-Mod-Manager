@@ -549,6 +549,10 @@ enum GameInstanceCmd {
     Delete {
         /// Instance ID to delete.
         instance_id: String,
+        /// Delete even when the instance's base record cannot be read. The instance folder goes;
+        /// a deployed game folder Agora cannot prove is the instance's is left in place, and named.
+        #[arg(long)]
+        force: bool,
     },
     /// Manage content layers in a game instance.
     Content {
@@ -7308,20 +7312,31 @@ async fn run_command(
                         break 'launch;
                     }
                 }
-                GameInstanceCmd::Delete { instance_id } => {
-                    match agora_core::game_instance::delete(ctx, &instance_id) {
+                GameInstanceCmd::Delete { instance_id, force } => {
+                    let options = agora_core::game_instance::DeleteOptions {
+                        force_unreadable_base: force,
+                    };
+                    match agora_core::game_instance::delete_with_options(ctx, &instance_id, options)
+                    {
                         Ok(outcome) => {
                             if json {
                                 let out = serde_json::json!({
                                     "status": "deleted",
                                     "instance_id": instance_id,
                                     "orphaned_base": outcome.orphaned_base,
+                                    "left_in_place": outcome.left_in_place,
                                 });
                                 println!("{}", serde_json::to_string_pretty(&out)?);
                             } else {
                                 println!("Instance '{instance_id}' deleted.");
                                 if let Some(base_id) = outcome.orphaned_base {
                                     println!("Base '{base_id}' is no longer used by any instance; run 'agora games base remove {base_id}' to remove it.");
+                                }
+                                if let Some(folder) = outcome.left_in_place {
+                                    println!(
+                                        "A deployed game folder Agora could not check was left at: {}",
+                                        folder.display()
+                                    );
                                 }
                             }
                         }
