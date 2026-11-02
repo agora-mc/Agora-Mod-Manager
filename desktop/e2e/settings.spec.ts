@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { setSwitch } from './support/switches';
 
 /**
  * Verify that one failed setting read does not prevent others from loading,
@@ -191,13 +192,13 @@ test('boolean settings are sent to Tauri as JSON booleans', async ({ page }) => 
   // General > Basics is the landing section, so the install toggles are here.
   await expect(page.getByLabel('Always auto-confirm installs', { exact: true })).toBeDisabled();
 
-  await page.getByLabel('Auto-confirm clean installs', { exact: true }).check();
+  await setSwitch(page.getByLabel('Auto-confirm clean installs', { exact: true }), true);
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'install_auto_confirm_clean',
     value: true,
   });
 
-  await page.getByLabel('Always auto-confirm installs', { exact: true }).check();
+  await setSwitch(page.getByLabel('Always auto-confirm installs', { exact: true }), true);
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'install_always_auto_confirm',
     value: true,
@@ -206,7 +207,7 @@ test('boolean settings are sent to Tauri as JSON booleans', async ({ page }) => 
   await page.getByRole('navigation', { name: 'Settings sections' })
     .getByRole('tab', { name: 'Services' }).click();
   await expect(page.getByText('Modrinth Integration', { exact: true })).toBeVisible();
-  await page.locator('#settings-services input[type="checkbox"]').first().check();
+  await page.locator('#settings-services').getByRole('switch').first().click();
 
   await expect.poll(async () => page.evaluate(() => (window as any).__settingWrites)).toContainEqual({
     key: 'modrinth_enabled',

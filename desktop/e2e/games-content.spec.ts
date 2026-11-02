@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { setSwitch } from './support/switches';
 import { expectNoUnmockedCommands, instanceHeaderReplies, installGamesMock } from './support/games-mock';
 
 /**
@@ -328,7 +329,7 @@ test('the Library shows the mods for this game and those that name none; a switc
   await expect(page.getByText('Skyrim Lighting')).toBeVisible();
   await expect(page.getByText('Fallout Texture Pack')).toHaveCount(0);
 
-  await page.getByLabel('Show mods for every game').check();
+  await setSwitch(page.getByLabel('Show mods for every game'), true);
   await expect(rows).toHaveCount(3);
   await expect(page.getByText('Fallout Texture Pack')).toBeVisible();
 });

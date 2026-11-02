@@ -1,7 +1,8 @@
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import { act, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { GamepadIntent } from '../../lib/useGamepad';
+import { Switch } from '../../components/ui/switch';
 import { ControllerProvider } from './ControllerProvider';
 import { useControllerLayer } from './useControllerLayer';
 
@@ -98,6 +99,18 @@ function ButtonLayer({
   );
 }
 
+function SwitchLayer() {
+  const rootRef = useRef<HTMLDivElement>(null);
+  useControllerLayer({ rootRef });
+  const [on, setOn] = useState(false);
+  return (
+    <div ref={rootRef}>
+      <button type="button">first</button>
+      <Switch aria-label="Music" checked={on} onCheckedChange={setOn} />
+    </div>
+  );
+}
+
 describe('controller navigation geometry', () => {
   it('uses the aligned geometric candidate instead of document order', () => {
     render(<ControllerProvider><ButtonLayer /></ControllerProvider>);
@@ -153,6 +166,26 @@ describe('controller navigation geometry', () => {
 
     expect(scrollBy).toHaveBeenCalledWith({ behavior: 'auto', left: 0, top: 100 });
     expect(document.activeElement).toBe(second);
+  });
+});
+
+describe('default controller activation', () => {
+  it('reaches a switch and flips it with Accept', () => {
+    render(<ControllerProvider><SwitchLayer /></ControllerProvider>);
+    const first = screen.getByText('first');
+    const music = screen.getByRole('switch', { name: 'Music' });
+    setRect(first, rect(0, 0, 40, 40));
+    setRect(music, rect(0, 60, 40, 100));
+
+    move('down');
+    move('down');
+    expect(document.activeElement).toBe(music);
+
+    send({ type: 'button', button: 'south' });
+    expect(music).toHaveAttribute('aria-checked', 'true');
+
+    send({ type: 'button', button: 'south' });
+    expect(music).toHaveAttribute('aria-checked', 'false');
   });
 });
 

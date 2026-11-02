@@ -10,6 +10,7 @@ import {
   type InstanceTemplate,
   type TemplateJvm,
 } from '../lib/tauri';
+import { Switch } from './ui/switch';
 
 const CATEGORY_LABELS: Record<string, string> = {
   options: 'Game options',
@@ -200,15 +201,15 @@ export function InstanceTemplatePanel({
         </label>
       </div>
 
-      <label className="flex items-center gap-2 text-sm">
-        <input
-          type="checkbox"
+      <div className="flex items-center justify-between gap-3 text-sm">
+        <span>Include this instance&apos;s Java and memory settings</span>
+        <Switch
+          aria-label="Include this instance's Java and memory settings"
           checked={includeJvm}
           disabled={disabled || busy}
-          onChange={(e) => setIncludeJvm(e.target.checked)}
+          onCheckedChange={setIncludeJvm}
         />
-        Include this instance&apos;s Java and memory settings
-      </label>
+      </div>
 
       {capturable.length === 0 ? (
         <p className="text-sm text-muted-foreground">

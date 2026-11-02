@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { setSwitch } from './support/switches';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -290,18 +291,18 @@ test('JVM preview follows GC and pre-touch controls', async ({ page }) => {
 
   await page.getByRole('button', { name: 'Java & Args' }).click();
   await expect(page.getByText(/^Generational ZGC ·/)).toBeVisible();
-  await expect(page.getByRole('checkbox', { name: 'Automatic GC selection' })).toBeChecked();
+  await expect(page.getByRole('switch', { name: 'Automatic GC selection' })).toBeChecked();
 
-  await page.getByRole('checkbox', { name: 'Automatic GC selection' }).uncheck();
+  await setSwitch(page.getByRole('switch', { name: 'Automatic GC selection' }), false);
   await expect(page.getByText(/^Tuned G1GC ·/)).toBeVisible();
-  await page.getByRole('checkbox', { name: 'Pre-touch allocated memory' }).uncheck();
+  await setSwitch(page.getByRole('switch', { name: 'Pre-touch allocated memory' }), false);
   await expect.poll(async () => page.evaluate(() => (
     (window as unknown as { __commandArgs: Record<string, Record<string, unknown>> }).__commandArgs
       .compute_gc_args?.alwaysPreTouch
   ))).toBe(false);
   await expect(page.getByText('NoPreTouch')).toBeVisible();
 
-  await page.getByRole('checkbox', { name: 'Automatic GC selection' }).uncheck();
+  await setSwitch(page.getByRole('switch', { name: 'Automatic GC selection' }), false);
   await page.getByRole('combobox', { name: 'Garbage collector' }).selectOption('manual');
   await page.getByLabel('Additional JVM flags').fill('-Xss1M');
   await expect(page.getByText(/^Manual JVM flags ·/)).toBeVisible();

@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { setSwitch } from './support/switches';
 import { expectNoUnmockedCommands, installGamesMock, storedSetting } from './support/games-mock';
 
 /**
@@ -211,8 +212,8 @@ test('turning off the game being viewed remembers Minecraft and says so once', a
   await sidebarNav(page).getByRole('button', { name: 'Settings' }).click();
 
   await page.getByRole('tablist', { name: / pages$/ }).getByRole('tab', { name: 'Game support' }).click();
-  await page.getByRole('checkbox', { name: 'Offer Skyrim Special Edition' }).uncheck();
-  await expect(page.getByRole('checkbox', { name: 'Offer Skyrim Special Edition' })).not.toBeChecked();
+  await setSwitch(page.getByRole('switch', { name: 'Offer Skyrim Special Edition' }), false);
+  await expect(page.getByRole('switch', { name: 'Offer Skyrim Special Edition' })).not.toBeChecked();
 
   await expect.poll(() => navLabels(page)).toEqual(MINECRAFT_NAV);
   await expect(page.getByRole('alert').filter({ hasText: 'Skyrim Special Edition is turned off, so Agora switched to Minecraft.' }))

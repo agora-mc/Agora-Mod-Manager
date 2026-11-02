@@ -1489,3 +1489,146 @@ main [data-skip-landing][tabindex="-1"]:focus {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 4px;
 }
+
+/* ── Switch ──────────────────────────────────────────────────────────────
+   Off is neutral in every theme; on takes the accent (--primary) with a soft glow.
+   Sizes come from custom properties so the small variant is one override. */
+.agora-switch {
+  --sw-w: 2.75rem;
+  --sw-h: 1.5rem;
+  --sw-pad: 0.1875rem;
+  --sw-knob: calc(var(--sw-h) - 2 * var(--sw-pad));
+  --sw-travel: calc(var(--sw-w) - var(--sw-knob) - 2 * var(--sw-pad));
+  --sw-spring: cubic-bezier(0.34, 1.45, 0.64, 1);
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  width: var(--sw-w);
+  height: var(--sw-h);
+  padding: var(--sw-pad);
+  border-radius: 9999px;
+  cursor: pointer;
+  background: hsl(var(--muted-foreground) / 0.22);
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--foreground) / 0.14),
+    inset 0 1px 2px hsl(0 0% 0% / 0.25);
+  transition:
+    background-color 220ms ease,
+    box-shadow 260ms ease,
+    filter 200ms ease,
+    opacity 200ms ease;
+}
+.agora-switch--sm {
+  --sw-w: 2.125rem;
+  --sw-h: 1.125rem;
+  --sw-pad: 0.125rem;
+}
+/* Hover darkens a touch, whatever the state, and never changes the state's colour. */
+.agora-switch:hover:not(:disabled) {
+  filter: brightness(0.92);
+}
+.agora-switch[data-state="checked"] {
+  background: hsl(var(--primary));
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--primary) / 0.65),
+    inset 0 1px 1px hsl(0 0% 100% / 0.18),
+    0 0 0.75rem -0.125rem hsl(var(--primary) / 0.55);
+}
+.agora-switch[data-state="checked"]:hover:not(:disabled) {
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--primary) / 0.65),
+    inset 0 1px 1px hsl(0 0% 100% / 0.22),
+    0 0 1rem 0 hsl(var(--primary) / 0.6);
+}
+/* Danger tone: the on state is a warning (Lockdown Mode), so it glows red instead of the accent. */
+.agora-switch--danger[data-state="checked"] {
+  background: hsl(var(--destructive));
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--destructive) / 0.65),
+    inset 0 1px 1px hsl(0 0% 100% / 0.18),
+    0 0 0.75rem -0.125rem hsl(var(--destructive) / 0.6);
+}
+.agora-switch--danger[data-state="checked"]:hover:not(:disabled) {
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--destructive) / 0.65),
+    inset 0 1px 1px hsl(0 0% 100% / 0.22),
+    0 0 1rem 0 hsl(var(--destructive) / 0.65);
+}
+.agora-switch--danger .agora-switch__check {
+  stroke: hsl(var(--destructive));
+}
+.agora-switch:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 3px;
+}
+.agora-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  filter: saturate(0.15);
+}
+.agora-switch:disabled[data-state="unchecked"] {
+  background: hsl(var(--muted-foreground) / 0.32);
+}
+.agora-switch:disabled[data-state="checked"] {
+  box-shadow: inset 0 0 0 1px hsl(var(--foreground) / 0.2);
+}
+.agora-switch:disabled .agora-switch__check {
+  stroke: hsl(var(--muted-foreground));
+}
+
+.agora-switch__thumb {
+  pointer-events: none;
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: var(--sw-knob);
+  height: var(--sw-knob);
+  border-radius: 9999px;
+  background: hsl(0 0% 99%);
+  box-shadow:
+    0 0 0 0.5px hsl(0 0% 0% / 0.12),
+    0 1px 2px hsl(0 0% 0% / 0.3),
+    0 2px 5px -1px hsl(0 0% 0% / 0.2);
+  transform: translateX(0);
+  transition:
+    transform 320ms var(--sw-spring),
+    width 180ms ease,
+    background-color 220ms ease;
+}
+.agora-switch[data-state="checked"] .agora-switch__thumb {
+  transform: translateX(var(--sw-travel));
+}
+.agora-switch:disabled .agora-switch__thumb {
+  box-shadow: 0 0 0 0.5px hsl(0 0% 0% / 0.15);
+}
+/* Pressing stretches the knob toward where it will go, like a finger squashing it. */
+.agora-switch:active:not(:disabled) .agora-switch__thumb {
+  width: calc(var(--sw-knob) * 1.3);
+}
+.agora-switch[data-state="checked"]:active:not(:disabled) .agora-switch__thumb {
+  transform: translateX(calc(var(--sw-travel) - var(--sw-knob) * 0.3));
+}
+
+.agora-switch__check {
+  width: 62%;
+  height: 62%;
+  fill: none;
+  stroke: hsl(var(--primary));
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 12;
+  stroke-dashoffset: 12;
+  opacity: 0;
+  transition:
+    stroke-dashoffset 260ms ease 90ms,
+    opacity 120ms ease 60ms;
+}
+.agora-switch[data-state="checked"] .agora-switch__check {
+  stroke-dashoffset: 0;
+  opacity: 1;
+}
+.agora-switch--sm .agora-switch__check {
+  stroke-width: 2.2;
+}

@@ -10,6 +10,7 @@ import { listOfficialPlugins } from '../../features/plugins/api';
 import { OfficialBadge, OfficialStatusNote } from '../../features/plugins/OfficialBadge';
 import type { OfficialPluginInfo } from '../../features/plugins/types';
 import { SettingsSection } from './SettingsSection';
+import { Switch } from '../../components/ui/switch';
 
 type Load =
   | { status: 'loading' }
@@ -183,13 +184,12 @@ export function GameSupportSettings() {
                     </div>
                   )}
                 </div>
-                <input
-                  type="checkbox"
+                <Switch
                   aria-label={`Offer ${row.name}`}
+                  size="sm"
                   checked={row.enabled}
                   disabled={!row.canDisable || saving !== null}
-                  onChange={(event) => void toggle(row, event.currentTarget.checked)}
-                  className="h-5 w-5 shrink-0 accent-primary disabled:opacity-50"
+                  onCheckedChange={(checked) => void toggle(row, checked)}
                 />
               </li>
             );

@@ -204,7 +204,7 @@ test('sharing switches send both choices', async ({ page }) => {
   await installWorldsMock(page);
   await openWorldsTab(page);
   // The mock never reports the change back, so assert what was sent, not the box.
-  await page.getByRole('checkbox', { name: /Server list/ }).click();
+  await page.getByRole('switch', { name: 'Server list' }).click();
   await expect.poll(() => argsOf(page, 'set_instance_sharing')).toEqual({
     instanceId: 'test-instance', options: false, servers: true,
   });

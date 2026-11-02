@@ -105,6 +105,7 @@ import {
   takePendingSettingsSection,
 } from '../lib/settingsSection';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { ContentProvidersList } from '../components/ContentProvidersList';
 import { UpdateCenter } from '../features/updates/UpdateCenter';
 
@@ -1104,16 +1105,14 @@ export function Settings({
       card="advanced-mode"
       title="Advanced mode"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Show advanced settings</span>
-        <input
-          type="checkbox"
+        <Switch
           aria-label="Show advanced settings"
           checked={advancedMode}
-          onChange={toggleAdvanced}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={() => toggleAdvanced()}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Reveal JVM arguments, garbage collector settings, custom commands, and other power-user options.
       </p>
@@ -1128,16 +1127,14 @@ export function Settings({
       title="Installation"
       description="How much of the install review Agora may skip for you."
     >
-      <label className="flex items-center justify-between gap-4">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Auto-confirm clean installs</span>
-        <input
-          type="checkbox"
+        <Switch
           aria-label="Auto-confirm clean installs"
           checked={autoConfirmCleanInstalls}
-          onChange={(e) => toggleAutoConfirmCleanInstalls(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleAutoConfirmCleanInstalls(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Skip the review screen only when the plan has no errors, warnings, conflicts, new dependencies, or existing files to change. Plans that need decisions always open for review.
       </p>
@@ -1145,17 +1142,15 @@ export function Settings({
         <p className="text-xs text-destructive">{ts.statuses['install_auto_confirm_clean']?.error}</p>
       )}
       <div className="rounded-lg border border-border bg-muted/20 p-3 space-y-2">
-        <label className="flex items-center justify-between gap-4">
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Always auto-confirm installs</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Always auto-confirm installs"
             checked={alwaysAutoConfirmInstalls}
             disabled={!autoConfirmCleanInstalls}
-            onChange={(e) => toggleAlwaysAutoConfirmInstalls(e.target.checked)}
-            className="h-5 w-5 accent-primary disabled:cursor-not-allowed disabled:opacity-40"
+            onCheckedChange={(checked) => toggleAlwaysAutoConfirmInstalls(checked)}
           />
-        </label>
+        </div>
         <p className="text-xs text-muted-foreground">
           Skip dependency details too and accept the default of not installing optional dependencies. Enable Auto-confirm clean installs first.
         </p>
@@ -1164,16 +1159,14 @@ export function Settings({
         )}
       </div>
       <div className="rounded-lg border border-border bg-muted/20 p-3 space-y-2">
-        <label className="flex items-center justify-between gap-4">
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Sort versions by date</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Sort versions by date"
             checked={versionSortByDate}
-            onChange={(e) => toggleVersionSortByDate(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleVersionSortByDate(checked)}
           />
-        </label>
+        </div>
         <p className="text-xs text-muted-foreground">
           When off (default), stable releases appear first with alpha/beta below them. When on, versions are sorted purely by release date, newest first, regardless of release type.
         </p>
@@ -1295,16 +1288,14 @@ export function Settings({
         <p className="text-xs text-destructive">{ts.statuses['update_sweep_interval_hours']?.error}</p>
       )}
 
-      <label className="mt-4 flex items-center justify-between">
+      <div className="mt-4 flex items-center justify-between gap-4">
         <span className="text-sm">Show changelogs before updating</span>
-        <input
-          type="checkbox"
+        <Switch
           checked={showUpdateChangelogs}
-          onChange={(e) => void handleShowUpdateChangelogsChange(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => void handleShowUpdateChangelogsChange(checked)}
           aria-label="Show changelogs before updating"
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Review what changed before an update is applied. Changelogs come from the signed catalog,
         so this works offline; mods with nothing published simply say so.
@@ -1322,15 +1313,14 @@ export function Settings({
       icon={Rocket}
       title="Launch Mode"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Use in-app launcher (direct Java launch)</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="Use in-app launcher (direct Java launch)"
           checked={directLaunch}
-          onChange={(e) => toggleLaunchMode(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleLaunchMode(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         <strong>Off (default):</strong> Delegates to the official Mojang launcher — handles authentication and Minecraft execution.
         The Mojang launcher opens with your instance pre-selected via <code className="bg-muted px-1 py-0.5 rounded-sm">--profile</code>.
@@ -1646,15 +1636,14 @@ export function Settings({
       card="jvm-defaults"
       title="JVM Defaults"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">AlwaysPreTouch</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="AlwaysPreTouch"
           checked={alwaysPreTouch}
-          onChange={(e) => toggleAlwaysPreTouch(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleAlwaysPreTouch(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Recommended for G1GC, may cause issues with ZGC/Shenandoah.
       </p>
@@ -1846,15 +1835,14 @@ export function Settings({
       description="Where Agora may fetch content from, beyond the curated catalog."
       contentClassName="space-y-4"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Modrinth Integration</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="Modrinth Integration"
           checked={modrinth}
-          onChange={(e) => toggleModrinth(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleModrinth(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Search Modrinth's whole library alongside the curated catalog, and enable live Modrinth
         features, when permitted by Privacy settings (turn on Advanced mode in Settings &gt; General to
@@ -1876,88 +1864,80 @@ export function Settings({
           is on and reachable, so turning one off usually just moves installs to the next source
           rather than hiding the entry. An entry disappears only when every source it lists is off.
         </p>
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Modrinth-sourced catalog entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Modrinth-sourced catalog entries"
+            size="sm"
             checked={curatedSources['modrinth_id'] ?? true}
-            onChange={(e) => toggleCuratedSource('modrinth_id', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('modrinth_id', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">GitHub-sourced catalog entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="GitHub-sourced catalog entries"
+            size="sm"
             checked={curatedSources['github_release'] ?? true}
-            onChange={(e) => toggleCuratedSource('github_release', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('github_release', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Direct-hash catalog entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Direct-hash catalog entries"
+            size="sm"
             checked={curatedSources['direct_hash'] ?? true}
-            onChange={(e) => toggleCuratedSource('direct_hash', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('direct_hash', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Curated pack entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Curated pack entries"
+            size="sm"
             checked={curatedSources['curated_pack'] ?? true}
-            onChange={(e) => toggleCuratedSource('curated_pack', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('curated_pack', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Technic-sourced pack entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Technic-sourced pack entries"
+            size="sm"
             checked={curatedSources['technic_pack'] ?? true}
-            onChange={(e) => toggleCuratedSource('technic_pack', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('technic_pack', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Packs curated from content sources</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Packs curated from content sources"
+            size="sm"
             checked={curatedSources['provider_pack'] ?? true}
-            onChange={(e) => toggleCuratedSource('provider_pack', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('provider_pack', checked)}
           />
-        </label>
+        </div>
       </div>
 
       <div className="rounded-lg border border-border bg-card p-3">
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <span className="text-sm">Technic browsing</span>
             <p className="text-xs text-muted-foreground mt-0.5">
               Browse and install modpacks from Technic. Solder-backed and zip packs are downloaded from third-party hosts with the integrity the pack's author provides — see the install confirmation before files are written.
             </p>
           </div>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Technic browsing"
             checked={technic}
-            onChange={(e) => toggleTechnic(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleTechnic(checked)}
           />
-        </label>
+        </div>
       </div>
 
       <div className="rounded-lg border border-border bg-card p-3">
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <span className="text-sm">Allow low security downloads</span>
             <p className="text-xs text-muted-foreground mt-0.5">
@@ -1965,32 +1945,28 @@ export function Settings({
               Content with weaker checks (an MD5, or a host the source did not declare) does not need this: it installs after a warning.
             </p>
           </div>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Allow low security downloads"
             checked={allowUnverifiedPacks}
-            onChange={(e) => toggleAllowUnverifiedPacks(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleAllowUnverifiedPacks(checked)}
           />
-        </label>
+        </div>
       </div>
 
       <div className="rounded-lg border border-border bg-card p-3">
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <span className="text-sm">Reduced security mode</span>
             <p className="text-xs text-muted-foreground mt-0.5">
               Lets plugins reach any website, and lets modpacks place files anywhere in their instance (including mods in their overrides). Programs are still refused and hashes are still checked. For plugins and packs you trust.
             </p>
           </div>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Reduced security mode"
             checked={reducedSecurity}
-            onChange={(e) => toggleReducedSecurity(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleReducedSecurity(checked)}
           />
-        </label>
+        </div>
       </div>
 
       <ContentProvidersList />
@@ -2021,15 +1997,14 @@ export function Settings({
         </p>
       </div>
 
-      <label className="flex items-center justify-between pt-2 border-t border-border">
+      <div className="flex items-center justify-between gap-4 pt-2 border-t border-border">
         <span className="text-sm">AI / MCP Server</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="AI / MCP Server"
           checked={aiMcp}
-          onChange={(e) => toggleAiMcp(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleAiMcp(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Enable the local MCP server for external AI tools.
       </p>

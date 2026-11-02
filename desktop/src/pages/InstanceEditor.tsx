@@ -135,6 +135,7 @@ import {
 } from '../lib/tauri';
 import { InstanceTemplatePanel } from '../components/InstanceTemplatePanel';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { formatDateTime, formatPlayTime } from '@/lib/utils';
 import { copiedMemoryNote, formatMemoryMb, readCopiedMemory } from '@/lib/importDisplay';
 import { OrphanCleanupDialog } from '../components/OrphanCleanupDialog';
@@ -3448,12 +3449,11 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                     <span className="block font-medium">Estimate from pack size</span>
                     <span className="block text-muted-foreground">Recalculates when enabled content changes.</span>
                   </span>
-                  <input
+                  <Switch
                     aria-label="Automatic memory allocation"
-                    type="checkbox"
                     checked={instanceMemoryMode === 'auto'}
                     disabled={recoveryBlocked}
-                    onChange={(event) => setInstanceMemoryMode(event.target.checked ? 'auto' : 'manual')}
+                    onCheckedChange={(checked) => setInstanceMemoryMode(checked ? 'auto' : 'manual')}
                   />
                 </span>
                 {copiedMemoryLabel && (
@@ -3495,20 +3495,18 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 )}
               </label>
 
-              <label className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
                 <span>
                   <span className="block text-sm font-medium">Choose the best GC automatically</span>
                   <span className="block text-xs text-muted-foreground">Uses Generational ZGC on Java 21+ and tuned G1GC on older Java.</span>
                 </span>
-                <input
+                <Switch
                   aria-label="Automatic GC selection"
-                  type="checkbox"
                   checked={instanceGcMode === 'auto'}
                   disabled={recoveryBlocked}
-                  onChange={(e) => setInstanceGcMode(e.target.checked ? 'auto' : 'high_efficiency')}
-                  className="h-5 w-5 shrink-0 accent-primary"
+                  onCheckedChange={(checked) => setInstanceGcMode(checked ? 'auto' : 'high_efficiency')}
                 />
-              </label>
+              </div>
 
               {instanceGcMode !== 'auto' && (
                 <label className="block space-y-2">
@@ -3527,20 +3525,18 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 </label>
               )}
 
-              <label className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
                 <span>
                   <span className="block text-sm font-medium">Pre-touch allocated memory</span>
                   <span className="block text-xs text-muted-foreground">Reduces in-game stutter at the cost of a longer startup. Recommended for G1GC.</span>
                 </span>
-                <input
+                <Switch
                   aria-label="Pre-touch allocated memory"
-                  type="checkbox"
                   checked={instanceAlwaysPreTouch}
                   disabled={recoveryBlocked}
-                  onChange={(e) => setInstanceAlwaysPreTouch(e.target.checked)}
-                  className="h-5 w-5 shrink-0 accent-primary"
+                  onCheckedChange={setInstanceAlwaysPreTouch}
                 />
-              </label>
+              </div>
 
               <div className="rounded-lg bg-muted px-3 py-2 text-xs">
                 <div className="flex items-center justify-between gap-2">
@@ -3604,18 +3600,17 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
             {/* Allow incompatible override (Advanced Mode only) */}
             {advancedMode && (
               <div className="space-y-2">
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={instanceJavaAllowOverride}
-                    disabled={recoveryBlocked}
-                    onChange={(e) => setInstanceJavaAllowOverride(e.target.checked)}
-                    className="h-4 w-4 accent-primary"
-                  />
+                <div className="flex items-center justify-between gap-3">
                   <span className="text-sm">
                     Allow this Java version even when Minecraft requests a different version (⚠ advanced users only)
                   </span>
-                </label>
+                  <Switch
+                    aria-label="Allow this Java version even when Minecraft requests a different version"
+                    checked={instanceJavaAllowOverride}
+                    disabled={recoveryBlocked}
+                    onCheckedChange={setInstanceJavaAllowOverride}
+                  />
+                </div>
                 {instanceJavaAllowOverride && (
                   <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
                     <p className="text-xs text-amber-700 dark:text-amber-400 font-medium">⚠ Compatibility warning</p>

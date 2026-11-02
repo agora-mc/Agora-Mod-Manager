@@ -43,6 +43,7 @@ import type { BazaarItem } from '../components/browse/bazaar-model';
 import { InstallFlow } from '../components/InstallFlow';
 import { usePackInstall } from '../components/PackInstallProgress';
 import { showToast } from '../components/Toast';
+import { Switch } from '../components/ui/switch';
 import {
   saveBrowseSnapshot,
   peekBrowseSnapshot,
@@ -1649,15 +1650,14 @@ function BrowseContent({
           ))}
         </select>
         {activeInstance && (
-          <label className="flex items-center gap-2 text-sm" title={`Leave out what ${activeInstance.row.name} already has`}>
-            <input
-              type="checkbox"
+          <div className="flex items-center gap-2 text-sm" title={`Leave out what ${activeInstance.row.name} already has`}>
+            <Switch
+              aria-label="Hide installed"
               checked={hideInstalled}
-              onChange={(e) => setHideInstalled(e.target.checked)}
-              className="h-4 w-4 accent-primary"
+              onCheckedChange={setHideInstalled}
             />
             Hide installed
-          </label>
+          </div>
         )}
       </div>
 

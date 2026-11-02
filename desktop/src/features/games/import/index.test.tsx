@@ -33,7 +33,7 @@ describe('Import saves default', () => {
     answer();
     render(<GameImportPage gameId="skyrim-se" />);
     fireEvent.click(await screen.findByRole('button', { name: 'Use this setup' }));
-    expect(await screen.findByRole('checkbox')).not.toBeChecked();
+    expect(await screen.findByRole('switch')).not.toBeChecked();
   });
 
   it('starts with the copy box ticked when this game saved that choice', async () => {
@@ -44,6 +44,6 @@ describe('Import saves default', () => {
       key: 'game.skyrim-se.importCopySaves',
     }));
     fireEvent.click(await screen.findByRole('button', { name: 'Use this setup' }));
-    expect(await screen.findByRole('checkbox')).toBeChecked();
+    expect(await screen.findByRole('switch')).toBeChecked();
   });
 });

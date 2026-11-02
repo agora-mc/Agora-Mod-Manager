@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { isGamesError } from '../shared/types';
 import {
   addToStore,
@@ -168,10 +169,14 @@ export function LibraryStoreSection({ gameId }: LibraryStoreSectionProps) {
       {!loadError && items === null && <p className="text-sm text-muted-foreground">Reading your library…</p>}
 
       {items !== null && items.length > 0 && (
-        <label className="flex items-center gap-2 text-sm text-muted-foreground">
-          <input type="checkbox" checked={showAll} onChange={(event) => setShowAll(event.target.checked)} />
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Switch
+            aria-label="Show mods for every game"
+            checked={showAll}
+            onCheckedChange={setShowAll}
+          />
           Show mods for every game
-        </label>
+        </div>
       )}
 
       {items !== null && items.length === 0 && damaged.length === 0 && (
