@@ -706,6 +706,186 @@ struct StagedEntry {
     sha256: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFormat {
+    Zip,
+    SevenZ,
+    /// Read through Windows' own `tar.exe`; see `rar.rs`.
+    Rar,
+}
+
+/// The archive's format from its first bytes, never its extension.
+fn detect_archive_format(archive_path: &Path) -> Result<ArchiveFormat, ContentError> {
+    let mut f = std::fs::File::open(archive_path)?;
+    let mut magic = [0u8; 8];
+    let n = f.read(&mut magic)?;
+    if n >= 4 && (&magic[..4] == b"PK\x03\x04" || &magic[..4] == b"PK\x05\x06") {
+        Ok(ArchiveFormat::Zip)
+    } else if n >= 6 && magic[..6] == [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] {
+        Ok(ArchiveFormat::SevenZ)
+    } else if rar::is_rar_magic(&magic[..n]) {
+        Ok(ArchiveFormat::Rar)
+    } else {
+        Err(ContentError::UnsupportedArchiveFormat)
+    }
+}
+
+/// One file entry found while listing an archive, before anything is extracted.
+#[derive(Debug, Clone)]
+struct ListedArchiveEntry {
+    /// The entry's position in the archive, for zip extraction by index.
+    index: usize,
+    /// The name exactly as the archive stores it (7z matches entries by this).
+    name: String,
+    rel_path: RelPath,
+    size: u64,
+}
+
+/// List a zip's file entries without reading their bytes, applying the store's path rules.
+fn list_zip_entries(archive_path: &Path) -> Result<Vec<ListedArchiveEntry>, ContentError> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut zip =
+        zip::ZipArchive::new(file).map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
+    let mut listed = Vec::new();
+    for i in 0..zip.len() {
+        let entry = zip
+            .by_index(i)
+            .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
+        let entry_name = entry
+            .name()
+            .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?
+            .into_owned();
+        if entry.is_dir() || entry_name.ends_with('/') {
+            continue;
+        }
+        if let Some(mode) = entry.unix_mode() {
+            if (mode & 0o170000) == 0o120000 {
+                return Err(ContentError::InvalidPath {
+                    path: entry_name.clone(),
+                    reason: "zip symlink entry is not allowed".into(),
+                });
+            }
+        }
+        let rel_path = validate_entry_path(&entry_name)?;
+        listed.push(ListedArchiveEntry {
+            index: i,
+            name: entry_name,
+            rel_path,
+            size: entry.size(),
+        });
+    }
+    validate_path_set(
+        &listed
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(listed)
+}
+
+/// List a 7z's file entries without reading their bytes, applying the store's path rules.
+fn list_sevenz_entries(archive_path: &Path) -> Result<Vec<ListedArchiveEntry>, ContentError> {
+    let archive = match sevenz_rust2::Archive::read(
+        &mut std::fs::File::open(archive_path)?,
+        &sevenz_rust2::Password::empty(),
+    ) {
+        Ok(a) => a,
+        Err(sevenz_rust2::Error::PasswordRequired | sevenz_rust2::Error::MaybeBadPassword(_)) => {
+            return Err(ContentError::PasswordProtected);
+        }
+        Err(e) => return Err(ContentError::CorruptArchive(format!("{e}"))),
+    };
+    for block in &archive.blocks {
+        for coder in &block.coders {
+            if coder.encoder_method_id() == [0x06, 0xF1, 0x07, 0x01] {
+                return Err(ContentError::PasswordProtected);
+            }
+        }
+    }
+    let mut listed = Vec::new();
+    for entry in &archive.files {
+        if entry.is_directory || entry.name.ends_with('/') || entry.is_anti_item {
+            continue;
+        }
+        if entry.has_windows_attributes {
+            let attrs = entry.windows_attributes;
+            let is_reparse_point = (attrs & 0x0400) != 0;
+            let unix_mode = (attrs >> 16) as u16;
+            let is_unix_symlink = (unix_mode & 0o170000) == 0o120000;
+            if is_reparse_point || is_unix_symlink {
+                return Err(ContentError::InvalidPath {
+                    path: entry.name.clone(),
+                    reason: "symlinks or reparse points are not allowed".into(),
+                });
+            }
+        }
+        let rel_path = validate_entry_path(&entry.name)?;
+        listed.push(ListedArchiveEntry {
+            index: listed.len(),
+            name: entry.name.clone(),
+            rel_path,
+            size: entry.size,
+        });
+    }
+    validate_path_set(
+        &listed
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(listed)
+}
+
+/// Every file entry in a zip, 7z or RAR archive, without extracting anything.
+///
+/// This is the same reader `add_archive` uses, so recognition sees exactly the files an import
+/// would store, with the same path and symlink rules. The paths are relative, forward-slash and
+/// validated. An unsupported or unreadable archive is an error, never an empty list.
+pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<String>, ContentError> {
+    if !archive_path.exists() {
+        return Err(ContentError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("archive not found: {}", archive_path.display()),
+        )));
+    }
+    let entries = match detect_archive_format(archive_path)? {
+        ArchiveFormat::Zip => list_zip_entries(archive_path)?,
+        ArchiveFormat::SevenZ => list_sevenz_entries(archive_path)?,
+        ArchiveFormat::Rar => rar::list_rar_entries(archive_path)?,
+    };
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.rel_path.as_str().to_string())
+        .collect())
+}
+
+/// Whether the store already holds an item whose SHA-256 is `sha256`: an archive imported as that
+/// archive, or a file stored whole. A damaged record is skipped; it cannot be the copy asked about.
+pub fn contains_hash(ctx: &Ctx, sha256: &str) -> Result<bool, ContentError> {
+    if !is_sha256_hex(sha256) {
+        return Err(ContentError::InvalidHash(sha256.to_string()));
+    }
+    for entry in list_items(ctx)? {
+        let Some(item) = entry.readable() else {
+            continue;
+        };
+        for source in &item.sources {
+            if let ContentSource::Archive {
+                sha256: archived, ..
+            } = source
+            {
+                if archived.eq_ignore_ascii_case(sha256) {
+                    return Ok(true);
+                }
+            }
+        }
+        if item.files.len() == 1 && item.files[0].sha256.eq_ignore_ascii_case(sha256) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Add a zip, 7z or RAR archive as a content item. The format is chosen by the file's first bytes,
 /// never its extension. Zip and 7z are read in process; RAR is read through Windows' own
 /// `tar.exe` (`rar.rs`), because the only mature RAR library is not GPL-compatible. All three go
@@ -763,72 +943,13 @@ pub fn add_archive_replacing(
     let archive_sha256 = hash_file_path(archive_path)?;
     let archive_display_path = archive_path.to_string_lossy().to_string();
 
-    enum ArchiveFormat {
-        Zip,
-        SevenZ,
-        /// Read through Windows' own `tar.exe`; see `rar.rs`.
-        Rar,
-    }
-
-    let format = {
-        let mut f = std::fs::File::open(archive_path)?;
-        let mut magic = [0u8; 8];
-        let n = f.read(&mut magic)?;
-        if n >= 4 && (&magic[..4] == b"PK\x03\x04" || &magic[..4] == b"PK\x05\x06") {
-            ArchiveFormat::Zip
-        } else if n >= 6 && magic[..6] == [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C] {
-            ArchiveFormat::SevenZ
-        } else if rar::is_rar_magic(&magic[..n]) {
-            ArchiveFormat::Rar
-        } else {
-            return Err(ContentError::UnsupportedArchiveFormat);
-        }
-    };
+    let format = detect_archive_format(archive_path)?;
 
     let (staged_entries, mut guard, staging_dir) = match format {
         ArchiveFormat::Zip => {
-            let file = std::fs::File::open(archive_path)?;
-            let mut zip = zip::ZipArchive::new(file)
-                .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
-
-            // 1. First pass: validate entry names, types, and collect declared sizes
-            let mut declared_total_size: u64 = 0;
-            let mut validated_paths = Vec::new();
-            let mut file_indices = Vec::new();
-
-            for i in 0..zip.len() {
-                let entry = zip
-                    .by_index(i)
-                    .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
-
-                let entry_name = entry
-                    .name()
-                    .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?
-                    .into_owned();
-
-                // Folder entries are ignored; only files count
-                if entry.is_dir() || entry_name.ends_with('/') {
-                    continue;
-                }
-
-                // Refuse zip symlink entries (unix mode S_IFLNK)
-                if let Some(mode) = entry.unix_mode() {
-                    if (mode & 0o170000) == 0o120000 {
-                        return Err(ContentError::InvalidPath {
-                            path: entry_name.clone(),
-                            reason: "zip symlink entry is not allowed".into(),
-                        });
-                    }
-                }
-
-                let rel_path = validate_entry_path(&entry_name)?;
-                declared_total_size = declared_total_size.saturating_add(entry.size());
-                validated_paths.push(rel_path);
-                file_indices.push(i);
-            }
-
-            // Refuse empty items (no files) and collisions across paths
-            validate_path_set(&validated_paths)?;
+            // 1. First pass: validate entry names, types, and collect declared sizes.
+            let listed = list_zip_entries(archive_path)?;
+            let declared_total_size: u64 = listed.iter().map(|entry| entry.size).sum();
 
             // 2. Untrusted sizes: check free disk space
             let content_root = ctx.paths.content_root();
@@ -843,14 +964,18 @@ pub fn add_archive_replacing(
             std::fs::create_dir_all(&staging_dir)?;
             let guard = StagingGuard::new(&staging_dir);
 
+            let file = std::fs::File::open(archive_path)?;
+            let mut zip = zip::ZipArchive::new(file)
+                .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
+
             // 4. Extract and stream-hash each file
-            let mut staged_entries = Vec::with_capacity(file_indices.len());
-            for (idx, &file_idx) in file_indices.iter().enumerate() {
+            let mut staged_entries = Vec::with_capacity(listed.len());
+            for (idx, listed_entry) in listed.iter().enumerate() {
                 let mut entry = zip
-                    .by_index(file_idx)
+                    .by_index(listed_entry.index)
                     .map_err(|e| ContentError::CorruptArchive(format!("{e}")))?;
-                let rel_path = validated_paths[idx].clone();
-                let declared_size = entry.size();
+                let rel_path = listed_entry.rel_path.clone();
+                let declared_size = listed_entry.size;
 
                 let staged_file_path = staging_dir.join(format!("obj_{idx}"));
                 use std::io::Write;
@@ -895,58 +1020,11 @@ pub fn add_archive_replacing(
         }
         ArchiveFormat::Rar => rar::stage_rar(ctx, archive_path)?,
         ArchiveFormat::SevenZ => {
-            let file = std::fs::File::open(archive_path)?;
-            let archive = match sevenz_rust2::Archive::read(
-                &mut std::fs::File::open(archive_path)?,
-                &sevenz_rust2::Password::empty(),
-            ) {
-                Ok(a) => a,
-                Err(
-                    sevenz_rust2::Error::PasswordRequired
-                    | sevenz_rust2::Error::MaybeBadPassword(_),
-                ) => {
-                    return Err(ContentError::PasswordProtected);
-                }
-                Err(e) => return Err(ContentError::CorruptArchive(format!("{e}"))),
-            };
-
-            for block in &archive.blocks {
-                for coder in &block.coders {
-                    if coder.encoder_method_id() == [0x06, 0xF1, 0x07, 0x01] {
-                        return Err(ContentError::PasswordProtected);
-                    }
-                }
-            }
-
-            let mut declared_total_size: u64 = 0;
-            let mut validated_paths = Vec::new();
-            let mut file_names = Vec::new();
-
-            for entry in &archive.files {
-                if entry.is_directory || entry.name.ends_with('/') || entry.is_anti_item {
-                    continue;
-                }
-
-                if entry.has_windows_attributes {
-                    let attrs = entry.windows_attributes;
-                    let is_reparse_point = (attrs & 0x0400) != 0;
-                    let unix_mode = (attrs >> 16) as u16;
-                    let is_unix_symlink = (unix_mode & 0o170000) == 0o120000;
-                    if is_reparse_point || is_unix_symlink {
-                        return Err(ContentError::InvalidPath {
-                            path: entry.name.clone(),
-                            reason: "symlinks or reparse points are not allowed".into(),
-                        });
-                    }
-                }
-
-                let rel_path = validate_entry_path(&entry.name)?;
-                declared_total_size = declared_total_size.saturating_add(entry.size);
-                validated_paths.push(rel_path);
-                file_names.push(entry.name.clone());
-            }
-
-            validate_path_set(&validated_paths)?;
+            let listed = list_sevenz_entries(archive_path)?;
+            let declared_total_size: u64 = listed.iter().map(|entry| entry.size).sum();
+            let validated_paths: Vec<RelPath> =
+                listed.iter().map(|entry| entry.rel_path.clone()).collect();
+            let file_names: Vec<String> = listed.iter().map(|entry| entry.name.clone()).collect();
 
             let content_root = ctx.paths.content_root();
             std::fs::create_dir_all(&content_root)?;
@@ -968,6 +1046,7 @@ pub fn add_archive_replacing(
             let mut staged_entries: Vec<Option<StagedEntry>> =
                 (0..file_names.len()).map(|_| None).collect();
 
+            let file = std::fs::File::open(archive_path)?;
             let mut reader =
                 match sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()) {
                     Ok(r) => r,

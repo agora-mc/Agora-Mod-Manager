@@ -32,6 +32,27 @@ pub struct ContentClassification {
     pub content_kind: String,
 }
 
+/// How a recognised download enters Agora's content system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DownloadAdd {
+    /// Unpack the archive into the store. A FOMOD installer in it is answered afterwards.
+    Archive,
+    /// Keep the file whole as one library item under `folder` (a game's content folder).
+    File { folder: String },
+}
+
+/// What a game package recognises a downloaded file as, by its archive entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadRecognition {
+    /// The content kind in the game's own words, e.g. `mod`, `resource pack`, `FOMOD installer`.
+    pub kind: String,
+    /// Why it was recognised, in words a player can read, e.g. `has fabric.mod.json`.
+    pub reason: String,
+    /// How adding it to the library should store it.
+    pub add: DownloadAdd,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub code: String,
@@ -69,6 +90,19 @@ pub trait GamePackage: Send + Sync {
         _archive: ExtractedArchive,
     ) -> GameFuture<'a, Option<Vec<ContentClassification>>> {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Recognise a downloaded archive as content for one of this package's games, by its entry
+    /// names alone. `file_name` is the download's own name (it may not be trusted); `entries` are
+    /// the archive's file paths with forward slashes, listed without extracting. Returning `None`
+    /// means "not this game's content", and Agora stays quiet about the file.
+    fn recognize_download(
+        &self,
+        _game: &GameId,
+        _file_name: &str,
+        _entries: &[String],
+    ) -> Option<DownloadRecognition> {
+        None
     }
 
     fn load_order_rules<'a>(

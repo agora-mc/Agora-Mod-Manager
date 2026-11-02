@@ -310,6 +310,11 @@ enum Commands {
         #[command(subcommand)]
         action: GamesCmd,
     },
+    /// Notice mod archives downloaded in the browser, by their contents.
+    Downloads {
+        #[command(subcommand)]
+        action: DownloadsCmd,
+    },
     /// Save, list, apply, or delete instance templates (captured configs and JVM settings).
     Template {
         #[command(subcommand)]
@@ -359,6 +364,17 @@ enum Commands {
     Backup {
         #[command(subcommand)]
         action: cli_packs::BackupCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DownloadsCmd {
+    /// Classify the common mod archives in a folder and print what Agora would offer. Reads only:
+    /// nothing is imported, and no file is moved or changed.
+    Scan {
+        /// Folder to scan. Defaults to the folder Agora watches, else your Downloads folder.
+        #[arg(long)]
+        folder: Option<PathBuf>,
     },
 }
 
@@ -5823,6 +5839,44 @@ async fn run_command(
                             println!("  [{:?}] {}", diff.kind, diff.path);
                         }
                     }
+                }
+            }
+        },
+        Commands::Downloads { action } => match action {
+            DownloadsCmd::Scan { folder } => {
+                let folder = match folder {
+                    Some(folder) => folder,
+                    None => agora_core::download_watch::folder(ctx)
+                        .map_err(|error| anyhow::anyhow!(error))?,
+                };
+                let rows = agora_core::download_watch::scan_folder_now(ctx, &folder)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else if rows.is_empty() {
+                    println!(
+                        "Nothing in {} looks like a mod for an enabled game.",
+                        folder.display()
+                    );
+                } else {
+                    let table: Vec<Vec<String>> = rows
+                        .iter()
+                        .map(|row| {
+                            vec![
+                                row.file_name.clone(),
+                                row.game_id.clone(),
+                                row.kind.clone(),
+                                row.reason.clone(),
+                                format_size(row.size),
+                                if row.already_in_library {
+                                    "already in your library".to_string()
+                                } else {
+                                    "would be offered".to_string()
+                                },
+                            ]
+                        })
+                        .collect();
+                    print_table(&["File", "Game", "Kind", "Why", "Size", "Status"], &table);
                 }
             }
         },

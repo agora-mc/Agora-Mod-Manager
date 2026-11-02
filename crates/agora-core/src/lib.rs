@@ -29,6 +29,7 @@ pub mod data_migration;
 pub mod db;
 pub mod dependency_ops;
 pub mod download;
+pub mod download_watch;
 pub mod error;
 pub mod event_sink;
 pub mod game_base;

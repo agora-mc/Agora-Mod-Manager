@@ -43,6 +43,8 @@ import { MINECRAFT_GAME_ID } from './features/games/shared/types';
 import { useGameShell } from './features/games/shared/useGameShell';
 import { useGameSwitch } from './features/games/shared/useGameSwitch';
 import { GameSwitcher } from './features/games/shell/GameSwitcher';
+import { DownloadsNotifier } from './features/downloads/DownloadsNotifier';
+import { useNewDownloads } from './features/downloads/useNewDownloads';
 import { GameTabPage } from './features/games/shell/GameTabPage';
 import { GameInstancePage } from './features/games/shell/GameInstancePage';
 import { GAME_SHELL_TABS, gameTabForSidebarTab, sidebarTabForGameTab } from './features/games/shell/gameNav';
@@ -344,6 +346,7 @@ function AppContent() {
   const registry = useRegistryState();
   // Which game the shell shows, and the header switcher's list (MASTER_SPEC 26.14).
   const gameShell = useGameShell();
+  const newDownloads = useNewDownloads();
   const { activeGame, shownGame, ready: gameShellReady, setActiveGame, turnedOffGames } = gameShell;
   const startupGameCheckedRef = useRef(false);
 
@@ -998,6 +1001,7 @@ function AppContent() {
           onSelectPluginPage={navigateToPluginPage}
           tabs={tabs}
           activeTab={sidebarTab}
+          badges={{ library: newDownloads.count }}
           onSelectTab={selectShellTab}
           onOpenCommandPalette={() => setCommandPaletteOpen(true)}
           switcher={gameShell.switcherVisible ? (
@@ -1262,6 +1266,7 @@ function AppContent() {
             : undefined}
           onSwitchGame={switchGame}
         />
+        <DownloadsNotifier />
         <ToastContainer />
         {crashInvestigation && (
           <CrashInvestigator

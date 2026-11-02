@@ -31,6 +31,21 @@ impl GamePackage for DeclarativePackage {
     fn definition(&self) -> &agora_game_api::PackageDefinition {
         &self.0
     }
+
+    fn recognize_download(
+        &self,
+        game: &GameId,
+        _file_name: &str,
+        entries: &[String],
+    ) -> Option<agora_game_api::DownloadRecognition> {
+        let definition = self
+            .0
+            .games
+            .iter()
+            .find(|definition| &definition.id == game)?;
+        let layout = definition.content_layout.as_ref()?;
+        crate::download_watch::recognize_with_layout(entries, layout)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
