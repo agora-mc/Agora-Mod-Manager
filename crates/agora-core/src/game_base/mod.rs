@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -503,29 +503,55 @@ pub fn install_size(
 /// Test seam for the crash window between the base folder's rename into place and the write of its
 /// record. While paused, the build holds its base lock, so a test can check that another build of
 /// the same id cannot take it.
-static PAUSE_AFTER_BASE_RENAME: AtomicBool = AtomicBool::new(false);
-static BASE_RENAME_PAUSED: AtomicBool = AtomicBool::new(false);
+///
+/// Keyed by the base root rather than by a process-wide flag: `cargo test` runs a binary's tests in
+/// one process, and other tests build bases too. Only the build whose root the test passed in (a
+/// fresh temporary folder) pauses; every other build carries on.
+#[cfg(debug_assertions)]
+static PAUSE_AFTER_BASE_RENAME_AT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(debug_assertions)]
+static BASE_RENAME_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// Test seam: make the next `build_base` on this process stop right after it renames its folder
-/// into place, until `pause` is false again. Off by default.
+/// Test seam: make the next `build_base` under `base_root` stop right after it renames its folder
+/// into place, until this is called with `None`. Off by default and absent from release builds.
+#[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn set_base_build_pause_after_rename(pause: bool) {
-    PAUSE_AFTER_BASE_RENAME.store(pause, Ordering::SeqCst);
+pub fn set_base_build_pause_after_rename(base_root: Option<&Path>) {
+    let mut target = PAUSE_AFTER_BASE_RENAME_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *target = base_root.map(Path::to_path_buf);
     BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
 }
 
 /// Whether a paused build has reached its rename and is waiting.
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn base_build_pause_reached() -> bool {
     BASE_RENAME_PAUSED.load(Ordering::SeqCst)
 }
 
-fn pause_after_rename_if_asked() {
-    if !PAUSE_AFTER_BASE_RENAME.load(Ordering::SeqCst) {
+#[cfg(debug_assertions)]
+fn pause_after_rename_if_asked(base_root: &Path) {
+    let should_pause = PAUSE_AFTER_BASE_RENAME_AT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_deref()
+        == Some(base_root);
+    if !should_pause {
         return;
     }
     BASE_RENAME_PAUSED.store(true, Ordering::SeqCst);
-    while PAUSE_AFTER_BASE_RENAME.load(Ordering::SeqCst) {
+    loop {
+        let still_asked = PAUSE_AFTER_BASE_RENAME_AT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(base_root);
+        if !still_asked {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
     BASE_RENAME_PAUSED.store(false, Ordering::SeqCst);
@@ -769,7 +795,8 @@ pub fn build_base(
     }
 
     guard.active = false;
-    pause_after_rename_if_asked();
+    #[cfg(debug_assertions)]
+    pause_after_rename_if_asked(&base_root);
 
     let created_unix_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,

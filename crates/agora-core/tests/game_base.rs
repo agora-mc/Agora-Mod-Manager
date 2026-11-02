@@ -895,6 +895,7 @@ fn an_interrupted_build_does_not_brick_its_base_id() {
     assert_eq!(leftovers, [base_id]);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
     use std::time::Duration;
@@ -909,7 +910,7 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
     };
     let base_id = make_base_id(runtime);
 
-    agora_core::game_base::set_base_build_pause_after_rename(true);
+    agora_core::game_base::set_base_build_pause_after_rename(Some(&root));
     let build_paths = paths.clone();
     let build_install = install.clone();
     let build_root = root.clone();
@@ -942,7 +943,7 @@ fn a_base_build_holds_its_lock_between_the_rename_and_the_record() {
         Duration::from_millis(100),
         None,
     );
-    agora_core::game_base::set_base_build_pause_after_rename(false);
+    agora_core::game_base::set_base_build_pause_after_rename(None);
     let outcome = handle.join().unwrap().expect("the base build succeeds");
 
     assert!(reached, "the base build never reached its rename");
