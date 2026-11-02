@@ -23,6 +23,7 @@ import {
 } from '../lib/tauri';
 import { useRegistryState } from '../lib/useRegistryState';
 import { RegistryStatusView } from '../components/registry-status-view';
+import { Switch } from '../components/ui/switch';
 import { DeviceFlowPanel } from '../components/DeviceFlowPanel';
 import { MsaDeviceFlowPanel } from '../components/MsaDeviceFlowPanel';
 import { LauncherImportWizard } from '../components/LauncherImportWizard';
@@ -703,22 +704,11 @@ function ServiceToggle({
     <div className="rounded-xl border border-border bg-card p-4">
       <div className="flex items-center justify-between gap-4">
         <span className="font-medium text-sm">{title}</span>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={checked}
+        <Switch
           aria-label={title}
-          onClick={() => onChange(!checked)}
-          className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
-            checked ? 'bg-primary' : 'bg-muted'
-          }`}
-        >
-          <span
-            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform ${
-              checked ? 'translate-x-5' : 'translate-x-0.5'
-            }`}
-          />
-        </button>
+          checked={checked}
+          onCheckedChange={onChange}
+        />
       </div>
       <p className="mt-2 text-xs text-muted-foreground">{description}</p>
     </div>
@@ -822,24 +812,13 @@ function JavaStep({
               Older exact versions download automatically when needed for specific instances.
             </p>
           </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={checked}
+          <Switch
             aria-label="Prepare Java 25 for modern Minecraft"
-            onClick={() => {
-              if (!busy) setChecked(!checked);
+            checked={checked}
+            onCheckedChange={(value) => {
+              if (!busy) setChecked(value);
             }}
-            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
-              checked ? 'bg-primary' : 'bg-muted'
-            }`}
-          >
-            <span
-              className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-sm transition-transform ${
-                checked ? 'translate-x-5' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
+          />
         </div>
       </div>
 
