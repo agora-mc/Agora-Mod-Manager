@@ -729,20 +729,28 @@ fn plan_inner(
                 });
             }
         }
-        all_files.sort_by(|a, b| a.lower_path.cmp(&b.lower_path));
-
-        for i in 0..all_files.len() {
-            let cur = &all_files[i];
-            let prefix = format!("{}/", cur.lower_path);
-            if let Some(next) = all_files.get(i + 1) {
-                if next.lower_path.starts_with(&prefix) {
+        // Any file whose path is a folder prefix of another path is a conflict, whatever sorts
+        // between them (a sibling such as `x-extra.esp` sorts between `x` and `x/y`).
+        let mut files_by_path: HashMap<&str, &FileLayerItem> = HashMap::new();
+        for item in &all_files {
+            files_by_path
+                .entry(item.lower_path.as_str())
+                .or_insert(item);
+        }
+        for cur in &all_files {
+            let mut rest = cur.lower_path.as_str();
+            while let Some(slash) = rest.find('/') {
+                let prefix_end = cur.lower_path.len() - rest.len() + slash;
+                let prefix = &cur.lower_path[..prefix_end];
+                if let Some(file) = files_by_path.get(prefix) {
                     return Err(DeployError::FileFolderConflict {
-                        file_path: cur.original_path.to_string(),
-                        file_layer: cur.layer_id.clone(),
-                        folder_path: next.original_path.to_string(),
-                        folder_layer: next.layer_id.clone(),
+                        file_path: file.original_path.to_string(),
+                        file_layer: file.layer_id.clone(),
+                        folder_path: cur.original_path.to_string(),
+                        folder_layer: cur.layer_id.clone(),
                     });
                 }
+                rest = &rest[slash + 1..];
             }
         }
     }

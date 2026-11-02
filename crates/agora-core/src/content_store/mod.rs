@@ -346,14 +346,23 @@ pub(crate) fn now_unix_ms() -> i64 {
     }
 }
 
+/// Reserved DOS device names, per Microsoft's "Naming Files, Paths, and Namespaces"
+/// (<https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>): `CON`, `PRN`, `AUX`,
+/// `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, and the superscript forms `COM¹`/`COM²`/`COM³` and
+/// `LPT¹`/`LPT²`/`LPT³`. `COM0` and `LPT0` are refused too: the same page shows `COM0` as a device
+/// symlink, and refusing a name Windows may route to a device is the safe direction.
+///
+/// Windows ignores trailing spaces in a name, including before the extension (`aux .txt` is
+/// `AUX`), so they are trimmed before matching. The caller passes the part before the first dot.
 pub fn is_windows_device_name(stem: &str) -> bool {
-    let s = stem.to_ascii_uppercase();
+    let s = stem.trim_end_matches([' ', '.']).to_ascii_uppercase();
     matches!(
         s.as_str(),
         "CON"
             | "PRN"
             | "AUX"
             | "NUL"
+            | "COM0"
             | "COM1"
             | "COM2"
             | "COM3"
@@ -363,6 +372,10 @@ pub fn is_windows_device_name(stem: &str) -> bool {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
+            | "LPT0"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -372,6 +385,9 @@ pub fn is_windows_device_name(stem: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
     )
 }
 
@@ -528,6 +544,36 @@ fn disk_free_space(path: &Path) -> Option<u64> {
         }
     }
     crate::helpers::available_disk_space_bytes(path)
+}
+
+/// Refuse a declared total size that cannot fit, including 1 GiB of headroom. Free space that
+/// cannot be determined refuses too: an unknown value must not silently disable the limit. The
+/// arithmetic is checked, so an absurd declared size cannot wrap.
+pub(crate) fn ensure_room_for_declared(
+    content_root: &Path,
+    declared_total: u64,
+) -> Result<(), ContentError> {
+    declared_size_fits(declared_total, disk_free_space(content_root))
+}
+
+/// The decision [`ensure_room_for_declared`] makes, separate from the platform query so it can be
+/// tested where free space is always known.
+fn declared_size_fits(declared_total: u64, available: Option<u64>) -> Result<(), ContentError> {
+    let required = declared_total
+        .checked_add(ONE_GIB)
+        .ok_or_else(|| ContentError::Other("the declared size is too large".into()))?;
+    let available = available.ok_or_else(|| {
+        ContentError::Other(
+            "Agora could not check the free disk space, so it did not accept this content".into(),
+        )
+    })?;
+    if available < required {
+        return Err(ContentError::InsufficientSpace {
+            required,
+            available,
+        });
+    }
+    Ok(())
 }
 
 /// Whether an existing object can be kept as is. A protected object of the right size is trusted
@@ -787,15 +833,7 @@ pub fn add_archive_replacing(
             // 2. Untrusted sizes: check free disk space
             let content_root = ctx.paths.content_root();
             std::fs::create_dir_all(&content_root)?;
-            let required = declared_total_size.saturating_add(ONE_GIB);
-            if let Some(available) = disk_free_space(&content_root) {
-                if available < required {
-                    return Err(ContentError::InsufficientSpace {
-                        required,
-                        available,
-                    });
-                }
-            }
+            ensure_room_for_declared(&content_root, declared_total_size)?;
 
             // 3. Staging directory setup
             let staging_root = ctx.paths.content_staging_dir();
@@ -821,7 +859,7 @@ pub fn add_archive_replacing(
                 let mut hasher = Sha256::new();
                 let mut buf = [0u8; HASH_BUFFER_SIZE];
                 let mut bytes_written = 0u64;
-                let mut limited = (&mut entry).take(declared_size + 1);
+                let mut limited = (&mut entry).take(declared_size.saturating_add(1));
 
                 loop {
                     let n = limited.read(&mut buf).map_err(|e| {
@@ -912,15 +950,7 @@ pub fn add_archive_replacing(
 
             let content_root = ctx.paths.content_root();
             std::fs::create_dir_all(&content_root)?;
-            let required = declared_total_size.saturating_add(ONE_GIB);
-            if let Some(available) = disk_free_space(&content_root) {
-                if available < required {
-                    return Err(ContentError::InsufficientSpace {
-                        required,
-                        available,
-                    });
-                }
-            }
+            ensure_room_for_declared(&content_root, declared_total_size)?;
 
             let staging_root = ctx.paths.content_staging_dir();
             std::fs::create_dir_all(&staging_root)?;
@@ -967,7 +997,7 @@ pub fn add_archive_replacing(
                 let mut hasher = Sha256::new();
                 let mut buf = [0u8; HASH_BUFFER_SIZE];
                 let mut bytes_written = 0u64;
-                let mut limited = entry_reader.take(declared_size + 1);
+                let mut limited = entry_reader.take(declared_size.saturating_add(1));
 
                 use std::io::Write;
                 loop {
@@ -1226,15 +1256,7 @@ pub fn add_collected(
     }
     let content_root = ctx.paths.content_root();
     std::fs::create_dir_all(&content_root)?;
-    let required = declared_total_size.saturating_add(ONE_GIB);
-    if let Some(available) = disk_free_space(&content_root) {
-        if available < required {
-            return Err(ContentError::InsufficientSpace {
-                required,
-                available,
-            });
-        }
-    }
+    ensure_room_for_declared(&content_root, declared_total_size)?;
 
     // Staging directory setup
     let staging_root = ctx.paths.content_staging_dir();
@@ -1589,7 +1611,17 @@ pub fn set_item_metadata(
     let _lock = ctx
         .lock_manager
         .acquire(LockResource::ContentStore, "content-metadata")?;
+    set_item_metadata_locked(ctx, item_id_or_prefix, metadata)
+}
 
+/// [`set_item_metadata`] for a caller that already holds the content-store lock. Taking the lock
+/// again would deadlock, so the store's own icon path uses this to record the object and the item
+/// together.
+pub(crate) fn set_item_metadata_locked(
+    ctx: &Ctx,
+    item_id_or_prefix: &str,
+    metadata: ItemMetadata,
+) -> Result<ContentItem, ContentError> {
     let mut item = get_item(ctx, item_id_or_prefix)?;
     item.description = metadata.description;
     item.page_url = metadata.page_url;
@@ -1615,7 +1647,19 @@ fn is_sha256_hex(text: &str) -> bool {
 /// Store raw bytes as a protected content object and return the object's SHA-256. Used for bytes
 /// that are not an item file, such as a saved icon. The bytes are never unpacked, and identical
 /// bytes share one object.
+///
+/// The content-store lock is held while the object lands, so a concurrent sweep cannot delete it
+/// before the caller records it in an item. A caller that records the hash in the same operation
+/// takes the lock once and uses [`store_object_bytes_locked`].
 pub fn store_object_bytes(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentError> {
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::ContentStore, "content-object")?;
+    store_object_bytes_locked(ctx, bytes)
+}
+
+/// [`store_object_bytes`] for a caller that already holds the content-store lock.
+pub(crate) fn store_object_bytes_locked(ctx: &Ctx, bytes: &[u8]) -> Result<String, ContentError> {
     let sha256 = format!("{:x}", Sha256::digest(bytes));
     let size = bytes.len() as u64;
     let obj_path = ctx.paths.content_object_path(&sha256);
@@ -2153,12 +2197,17 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
     //    refuses too (fail closed), naming the file.
     //
     //    The target's own record is read only to learn its object hashes; a damaged record still
-    //    can be removed, and is checked by its id alone.
-    let target_hashes: Vec<String> = std::fs::read_to_string(&target_manifest_path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<ContentItem>(&content).ok())
-        .map(|item| item.files.into_iter().map(|file| file.sha256).collect())
-        .unwrap_or_default();
+    //    can be removed, but only when no instance could be using objects whose hashes cannot be
+    //    read (checked below).
+    let parsed_target = std::fs::read_to_string(&target_manifest_path)
+        .map_err(|error| error.to_string())
+        .and_then(|content| {
+            serde_json::from_str::<ContentItem>(&content).map_err(|error| error.to_string())
+        });
+    let target_hashes: Vec<String> = match &parsed_target {
+        Ok(item) => item.files.iter().map(|file| file.sha256.clone()).collect(),
+        Err(_) => Vec::new(),
+    };
     let usage = crate::library::instances_using(ctx, &item_id, &target_hashes);
 
     if let Some(unreadable) = usage.unreadable.first() {
@@ -2200,6 +2249,19 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
     // references to other items), so it does not block the removal. It may still hold the hash of
     // an object, though, so while any record is unreadable no object is deleted: they stay until
     // the next removal with every record readable sweeps whatever nothing references.
+    //
+    // A damaged target has no readable object hashes, so a Minecraft instance that recorded only
+    // an object hash cannot be seen as using it. Refuse rather than delete files an instance may
+    // still need; removing the record alone would let the next sweep delete them.
+    if parsed_target.is_err() && crate::library::any_instance_records_objects(ctx) {
+        return Err(ContentError::UnreadableManifest {
+            item_id,
+            manifest: target_manifest_path.display().to_string(),
+            error: "the record cannot be read, so the files it stores cannot be identified; an \
+                    instance may still use them"
+                .into(),
+        });
+    }
     // 1. Read every other manifest, noting whether any is unreadable.
     let items_dir = ctx.paths.content_items_dir();
     let mut other_items = Vec::new();
@@ -2228,11 +2290,24 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
         }
     }
 
-    // 2. Collect referenced hashes from all remaining items
+    // 2. Collect every object hash a remaining item records: its files, its saved icon, and a
+    //    hash its source published. The sweep must keep all of them, or removing one item would
+    //    delete another item's icon.
     let mut remaining_hashes = HashSet::new();
     for it in &other_items {
         for f in &it.files {
             remaining_hashes.insert(f.sha256.clone());
+        }
+        if let Some(icon) = &it.icon_sha256 {
+            remaining_hashes.insert(icon.clone());
+        }
+        for source in &it.sources {
+            match source {
+                ContentSource::Archive { sha256, .. } | ContentSource::Catalog { sha256, .. } => {
+                    remaining_hashes.insert(sha256.clone());
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2263,4 +2338,36 @@ pub fn remove_item(ctx: &Ctx, item_id_or_prefix: &str) -> Result<(), ContentErro
     clean_staging_dir(&ctx.paths);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod free_space_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_free_space_does_not_disable_the_declared_size_limit() {
+        let result = declared_size_fits(10, None);
+        assert!(
+            matches!(result, Err(ContentError::Other(_))),
+            "an unknown free-space value must refuse, not skip the check: {result:?}"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_declared_size_is_refused() {
+        let result = declared_size_fits(u64::MAX, Some(u64::MAX));
+        assert!(
+            result.is_err(),
+            "declared size plus headroom must not wrap: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_declared_size_that_fits_passes() {
+        assert!(declared_size_fits(10, Some(ONE_GIB + 10)).is_ok());
+        assert!(matches!(
+            declared_size_fits(10, Some(ONE_GIB + 9)),
+            Err(ContentError::InsufficientSpace { .. })
+        ));
+    }
 }

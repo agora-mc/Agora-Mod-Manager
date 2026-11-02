@@ -22,8 +22,8 @@ use agora_game_api::RelPath;
 use sha2::{Digest, Sha256};
 
 use super::{
-    disk_free_space, fold_case, is_reparse_point_or_symlink, validate_entry_path,
-    validate_path_set, ContentError, StagedEntry, StagingGuard, HASH_BUFFER_SIZE, ONE_GIB,
+    ensure_room_for_declared, fold_case, is_reparse_point_or_symlink, validate_entry_path,
+    validate_path_set, ContentError, StagedEntry, StagingGuard, HASH_BUFFER_SIZE,
 };
 use crate::ctx::Ctx;
 
@@ -539,15 +539,7 @@ pub(super) fn stage_rar(
     // 2. Untrusted sizes: check free disk space.
     let content_root = ctx.paths.content_root();
     std::fs::create_dir_all(&content_root)?;
-    let required = plan.declared_total.saturating_add(ONE_GIB);
-    if let Some(available) = disk_free_space(&content_root) {
-        if available < required {
-            return Err(ContentError::InsufficientSpace {
-                required,
-                available,
-            });
-        }
-    }
+    ensure_room_for_declared(&content_root, plan.declared_total)?;
 
     // 3. Staging directory setup.
     let staging_root = ctx.paths.content_staging_dir();

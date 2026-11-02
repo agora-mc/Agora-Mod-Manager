@@ -168,9 +168,9 @@ fn add_content_folder(ctx: &CoreContext, name: &str, files: &[(&str, &[u8])]) ->
 }
 
 // ---------------------------------------------------------------------------
-// Review tests for the content store core (final multi-game review). Each `#[ignore]` test proves
-// a bug and fails today; run them with
-//   cargo test -p agora-core --test review_store_core -- --ignored
+// Review tests for the content store core (final multi-game review). Each test proves a fixed
+// bug; run them with
+//   cargo nextest run -p agora-core --test review_store_core
 // ---------------------------------------------------------------------------
 
 use agora_core::content_store as cs;
@@ -195,7 +195,6 @@ fn add_one_file(ctx: &CoreContext, name: &str, bytes: &[u8]) -> String {
 }
 
 #[test]
-#[ignore = "proves bug: remove_item sweeps every object no item FILE references, so removing one item deletes the saved icon of another"]
 fn removing_one_item_deletes_another_items_saved_icon() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = CoreContext::for_testing(tmp.path().to_path_buf());
@@ -223,7 +222,6 @@ fn removing_one_item_deletes_another_items_saved_icon() {
 }
 
 #[test]
-#[ignore = "proves bug: store_object_bytes (icon saves) writes into the store without the ContentStore lock that add/remove/GC hold"]
 fn storing_an_icon_object_waits_for_the_content_store_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let ctx = CoreContext::for_testing(tmp.path().to_path_buf());
@@ -250,7 +248,6 @@ fn storing_an_icon_object_waits_for_the_content_store_lock() {
 }
 
 #[test]
-#[ignore = "proves bug: the file-versus-folder check only compares each path with the NEXT sorted path, so a sibling like 'x-extra.esp' (sorts between 'x' and 'x/y') hides the conflict"]
 fn file_folder_conflict_is_found_when_a_sibling_sorts_between_them() {
     let tmp = TempDir::new().unwrap();
     let def = make_test_definition();
@@ -275,4 +272,99 @@ fn file_folder_conflict_is_found_when_a_sibling_sorts_between_them() {
         "'Data/x' is a file in one layer and a folder in another: {:?}",
         result.as_ref().map(|p| p.files.len())
     );
+}
+
+/// A Minecraft instance manifest recording the store fields the real installs write. `item_id`
+/// is `None` for an entry that recorded only the object hash.
+fn write_minecraft_instance(ctx: &CoreContext, id: &str, hash: &str, item_id: Option<&str>) {
+    let dir = ctx.paths.instance_dir(id).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let entry = serde_json::json!({
+        "filename": "stored.jar",
+        "source": "manual",
+        "version": "1.0.0",
+        "sha256": hash,
+        "content_item_id": item_id,
+        "object_sha256": hash,
+        "installed_at": "2026-01-01T00:00:00Z"
+    });
+    let manifest = serde_json::json!({
+        "manifest_version": 2,
+        "instance_id": id,
+        "name": "Hash Only",
+        "minecraft_version": "1.20.1",
+        "loader": "fabric",
+        "loader_version": "0.15.11",
+        "mods": [entry],
+        "resourcepacks": [],
+        "shaders": [],
+        "datapacks": [],
+        "worlds": []
+    });
+    std::fs::write(
+        dir.join("instance_manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn removing_a_damaged_item_fails_closed_when_an_instance_may_use_its_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = CoreContext::for_testing(tmp.path().to_path_buf());
+
+    let work = tempfile::tempdir().unwrap();
+    let path = work.path().join("damaged.jar");
+    std::fs::write(&path, b"damaged item bytes").unwrap();
+    let outcome = cs::add_file(&ctx, &path, Some("Damaged"), None).unwrap();
+    let item_id = outcome.item().item_id.clone();
+    let hash = outcome.item().files[0].sha256.clone();
+    let object_path = ctx.paths.content_object_path(&hash);
+    assert!(object_path.exists());
+
+    // The instance records only the object hash, never the item id.
+    write_minecraft_instance(&ctx, "mc-hash-only", &hash, None);
+
+    // Damage the item's own record: its file hashes cannot be read any more.
+    std::fs::write(ctx.paths.content_item_path(&item_id), b"{ not an item").unwrap();
+
+    let result = cs::remove_item(&ctx, &item_id);
+    assert!(
+        matches!(result, Err(cs::ContentError::UnreadableManifest { .. })),
+        "a damaged record whose objects may be in use must not be removed: {result:?}"
+    );
+    assert!(
+        ctx.paths.content_item_path(&item_id).exists(),
+        "the damaged record is kept"
+    );
+    assert!(
+        object_path.exists(),
+        "the object a hash-only instance may use is kept"
+    );
+}
+
+#[test]
+fn windows_device_names_cover_zero_superscripts_and_a_space_before_the_extension() {
+    for name in [
+        "CON", "con", "PRN", "AUX", "NUL", "COM0", "LPT0", "COM1", "LPT9", "COM¹", "COM²", "COM³",
+        "LPT¹", "LPT²", "LPT³", "aux ",
+    ] {
+        assert!(
+            cs::is_windows_device_name(name),
+            "{name:?} is a reserved device name"
+        );
+    }
+    assert!(
+        !cs::is_windows_device_name("COM10"),
+        "COM10 is not reserved"
+    );
+    assert!(!cs::is_windows_device_name("auxiliary"));
+
+    for path in ["aux .txt", "COM¹.txt", "LPT0.log", "con .esp"] {
+        let error = cs::validate_entry_path(path).unwrap_err().to_string();
+        assert!(
+            error.contains("device name"),
+            "{path:?} must be refused as a device name: {error}"
+        );
+    }
 }
