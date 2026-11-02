@@ -59,7 +59,13 @@ export interface PluginsView {
 export interface PluginChange {
   /** Whether the line or the lock actually changed. */
   changed: boolean;
-  plugins: PluginsView;
+  /**
+   * The list after the change. `null` only when the change was saved but the list could not be
+   * read back; `reloadError` then says why.
+   */
+  plugins: PluginsView | null;
+  /** Why the list could not be read back after a change that was saved. */
+  reloadError: string | null;
 }
 
 export interface MoveReport {
@@ -160,7 +166,9 @@ function isPluginsView(value: unknown): value is PluginsView {
 }
 
 function isPluginChange(value: unknown): value is PluginChange {
-  return isObject(value) && typeof value.changed === 'boolean' && isPluginsView(value.plugins);
+  if (!isObject(value) || typeof value.changed !== 'boolean') return false;
+  if (isPluginsView(value.plugins)) return value.reloadError === null || value.reloadError === undefined;
+  return value.plugins === null && typeof value.reloadError === 'string' && value.reloadError.length > 0;
 }
 
 function isMoveChange(value: unknown): value is MoveChange {

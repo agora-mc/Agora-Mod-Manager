@@ -42,6 +42,7 @@ export function ContentSharingSettings() {
   const [load, setLoad] = useState<Load>({ status: 'loading' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
 
   const reload = useCallback(() => {
     setLoad({ status: 'loading' });
@@ -61,9 +62,12 @@ export function ContentSharingSettings() {
 
   const change = async (share: boolean) => {
     setError(null);
+    setWarnings([]);
     setBusy(true);
     try {
       const preview = await previewContentSharingConversion(share);
+      // Core warns when it could not list something; an empty summary is not the same as no work.
+      setWarnings(preview.warnings);
       const { filesConverted, bytes } = preview.summary;
       let convert = false;
       if (filesConverted > 0) {
@@ -80,20 +84,25 @@ export function ContentSharingSettings() {
         const converted = report.summary.filesConverted;
         const skipped = report.summary.skipped.length;
         const failed = report.failures.length;
+        const reported = [...new Set([...preview.warnings, ...report.warnings])];
+        setWarnings(reported);
         if (failed > 0) {
           setError(
             `Converted ${converted} file${converted === 1 ? '' : 's'}, but ${failed} instance${failed === 1 ? '' : 's'} could not be converted. ${report.failures.map((failure) => failure.message).join(' ')}`,
           );
-        } else if (skipped > 0) {
-          showToast(
-            `Converted ${converted} file${converted === 1 ? '' : 's'}. ${skipped} file${skipped === 1 ? ' was' : 's were'} left as ${skipped === 1 ? 'it is' : 'they are'} because ${skipped === 1 ? 'it does' : 'they do'} not match what Agora installed.`,
-            'success',
-          );
-        } else {
-          showToast(
-            `Converted ${converted} file${converted === 1 ? '' : 's'}.`,
-            'success',
-          );
+        } else if (reported.length === 0) {
+          // With warnings on the card this is not a clean success, so nothing claims it is.
+          if (skipped > 0) {
+            showToast(
+              `Converted ${converted} file${converted === 1 ? '' : 's'}. ${skipped} file${skipped === 1 ? ' was' : 's were'} left as ${skipped === 1 ? 'it is' : 'they are'} because ${skipped === 1 ? 'it does' : 'they do'} not match what Agora installed.`,
+              'success',
+            );
+          } else {
+            showToast(
+              `Converted ${converted} file${converted === 1 ? '' : 's'}.`,
+              'success',
+            );
+          }
         }
       }
     } catch (reason) {
@@ -141,6 +150,17 @@ export function ContentSharingSettings() {
             aria-label="Share mod files between instances"
           />
         </div>
+      )}
+      {warnings.length > 0 && (
+        <ul
+          role="status"
+          className="space-y-1 text-xs text-amber-700 dark:text-amber-300"
+          data-testid="content-sharing-warnings"
+        >
+          {warnings.map((warning, index) => (
+            <li key={`${index}-${warning}`}>{warning}</li>
+          ))}
+        </ul>
       )}
       {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
     </SettingsSection>

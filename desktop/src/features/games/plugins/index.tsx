@@ -25,6 +25,7 @@ import {
   setGamePluginLocked,
   sortGamePlugins,
   updateGameMasterlist,
+  type PluginChange,
   type PluginFinding,
   type PluginRow,
   type PluginsView,
@@ -91,14 +92,24 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
 
   const showView = (next: PluginsView) => setLoad({ status: 'loaded', view: next });
 
+  /** A saved change: show the list, or say it was saved and reload it when the re-read failed. */
+  const applyChange = (change: PluginChange, saved: string) => {
+    if (change.plugins !== null) {
+      showView(change.plugins);
+      setNotice(saved);
+      return;
+    }
+    fetchList();
+    setNotice(`Saved, but the list could not be read back. ${change.reloadError ?? ''}`.trim());
+  };
+
   const toggleActive = (row: PluginRow) =>
     run(
       `active:${row.name}`,
       () => setGamePluginActive(instanceId, row.name, !row.active),
       (change) => {
-        showView(change.plugins);
         const now = row.active ? 'off' : 'on';
-        setNotice(change.changed ? `${row.name} is now ${now}.` : `${row.name} was already ${now}.`);
+        applyChange(change, change.changed ? `${row.name} is now ${now}.` : `${row.name} was already ${now}.`);
       },
     );
 
@@ -107,9 +118,8 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
       `lock:${row.name}`,
       () => setGamePluginLocked(instanceId, row.name, !row.locked),
       (change) => {
-        showView(change.plugins);
         const now = row.locked ? 'unlocked' : 'locked';
-        setNotice(change.changed ? `${row.name} is ${now}.` : `${row.name} was already ${now}.`);
+        applyChange(change, change.changed ? `${row.name} is ${now}.` : `${row.name} was already ${now}.`);
       },
     );
 
