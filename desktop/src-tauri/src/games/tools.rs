@@ -932,6 +932,8 @@ mod tests {
             cancelled: false,
             failed_folder: None,
             failure: None,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
             copied_layer: None,
             install_changes: InstallChanges::default(),
             swap: None,

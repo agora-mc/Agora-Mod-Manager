@@ -124,7 +124,7 @@ pub fn run_proxy_command(
             save(ProxySetting::Manual { url, username }, password)?;
         }
     }
-    let setting = agora_core::http_client::saved_proxy(&conn);
+    let setting = agora_core::http_client::saved_proxy(&conn).redacted();
     if output_fmt.is_json_output() {
         println!(
             "{}",

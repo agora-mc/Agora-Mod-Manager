@@ -3,7 +3,10 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use agora_game_api::{
@@ -193,6 +196,11 @@ pub trait Launcher {
     fn locate_vfs_dll(&self) -> Result<PathBuf, String>;
     /// Start the game: under the virtual file system when `prepared.vfs` is set.
     fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError>;
+    /// Start the game and keep the last part of its stdout and stderr, for a tool run. The
+    /// default keeps no output, which is what a game launch wants.
+    fn launch_capturing(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        self.launch(prepared)
+    }
 }
 
 /// Starts real processes.
@@ -206,6 +214,110 @@ impl Launcher for SystemLauncher {
     fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
         launch(prepared)
     }
+
+    fn launch_capturing(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        launch_capturing(prepared)
+    }
+}
+
+/// How much of a process's stdout and stderr is kept, per stream, from the end.
+pub const CAPTURED_OUTPUT_LIMIT: usize = 64 * 1024;
+
+/// The last part of a process's stdout and stderr.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedOutput {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stdout: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr: String,
+}
+
+impl CapturedOutput {
+    pub fn is_empty(&self) -> bool {
+        self.stdout.is_empty() && self.stderr.is_empty()
+    }
+}
+
+/// Reads a child's stdout and stderr while it runs, keeping only the last
+/// [`CAPTURED_OUTPUT_LIMIT`] bytes of each so a chatty tool cannot grow the app's memory.
+pub struct OutputCapture {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl OutputCapture {
+    /// Start reading a child's piped output. `None` when neither stream was piped.
+    pub fn start(child: &mut std::process::Child) -> Option<Self> {
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        if stdout.is_none() && stderr.is_none() {
+            return None;
+        }
+        let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+        let mut readers = Vec::new();
+        if let Some(out) = stdout {
+            readers.push(read_into(out, Arc::clone(&stdout_buffer)));
+        }
+        if let Some(err) = stderr {
+            readers.push(read_into(err, Arc::clone(&stderr_buffer)));
+        }
+        Some(Self {
+            stdout: stdout_buffer,
+            stderr: stderr_buffer,
+            readers,
+        })
+    }
+
+    /// Wait briefly for the readers, then return what was kept. A reader still open because
+    /// something outside the run holds the pipe is left to end on its own.
+    pub fn finish(self) -> CapturedOutput {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        for reader in self.readers {
+            while !reader.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
+        }
+        CapturedOutput {
+            stdout: take_text(&self.stdout),
+            stderr: take_text(&self.stderr),
+        }
+    }
+}
+
+fn read_into(
+    mut reader: impl Read + Send + 'static,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let Ok(mut kept) = buffer.lock() else {
+                        break;
+                    };
+                    kept.extend_from_slice(&chunk[..read]);
+                    if kept.len() > CAPTURED_OUTPUT_LIMIT {
+                        let excess = kept.len() - CAPTURED_OUTPUT_LIMIT;
+                        kept.drain(..excess);
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn take_text(buffer: &Arc<Mutex<Vec<u8>>>) -> String {
+    let Ok(bytes) = buffer.lock() else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&bytes).trim_end().to_string()
 }
 
 /// A spawned game process and its captured OS identity.
@@ -213,11 +325,21 @@ pub struct LaunchedGame {
     pub child: std::process::Child,
     pub identity: ProcessIdentity,
     pub program: PathBuf,
+    /// The child's output, when the launch was asked to keep it.
+    pub output: Option<OutputCapture>,
 }
 
 impl LaunchedGame {
     pub fn pid(&self) -> u32 {
         self.identity.pid
+    }
+
+    /// Finish keeping the output, if this launch kept any.
+    pub fn finish_output(&mut self) -> CapturedOutput {
+        self.output
+            .take()
+            .map(OutputCapture::finish)
+            .unwrap_or_default()
     }
 }
 
@@ -496,17 +618,37 @@ pub fn prepare_base_launch_with(
 /// Spawn the game process according to a prepared launch, under the virtual file system when the
 /// preparation asked for it.
 pub fn launch(prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+    spawn(prepared, false)
+}
+
+/// Like [`launch`], but keeps the last part of the process's stdout and stderr. Used for tool
+/// runs, whose output is what tells the player why a tool failed.
+pub fn launch_capturing(prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+    spawn(prepared, true)
+}
+
+fn spawn(prepared: &PreparedLaunch, capture: bool) -> Result<LaunchedGame, LaunchError> {
     if let Some(vfs) = &prepared.vfs {
-        return launch_under_vfs(&prepared.resolved, vfs);
+        return launch_under_vfs(&prepared.resolved, vfs, capture);
     }
     let mut cmd = std::process::Command::new(&prepared.resolved.program);
     cmd.args(&prepared.resolved.args);
     cmd.current_dir(&prepared.resolved.cwd);
     cmd.envs(&prepared.resolved.env);
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    if capture {
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    }
 
-    let child = cmd.spawn().map_err(LaunchError::Io)?;
+    let mut child = cmd.spawn().map_err(LaunchError::Io)?;
+    let output = if capture {
+        OutputCapture::start(&mut child)
+    } else {
+        None
+    };
     let pid = child.id();
     let identity =
         process_identity::capture(pid).map_err(|e| LaunchError::ProcessCapture(format!("{e}")))?;
@@ -515,6 +657,7 @@ pub fn launch(prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
         child,
         identity,
         program: prepared.resolved.program.clone(),
+        output,
     })
 }
 

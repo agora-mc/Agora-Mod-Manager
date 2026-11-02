@@ -141,6 +141,18 @@ impl Launcher for StagingLauncher {
         }
         agora_core::game_launch::launch(&plain)
     }
+
+    fn launch_capturing(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        let mut plain = prepared.clone();
+        if let (true, Some(vfs)) = (self.stage, &prepared.vfs) {
+            plain.resolved.cwd = vfs.upper.clone();
+        }
+        plain.vfs = None;
+        for (key, value) in &self.env {
+            plain.resolved.env.insert(key.clone(), value.clone().into());
+        }
+        agora_core::game_launch::launch_capturing(&plain)
+    }
 }
 
 fn literal_args(args: &[&str]) -> Vec<LaunchValue> {
@@ -3847,7 +3859,11 @@ fn a_nonzero_exit_is_discarded_and_the_outcome_says_which_code() {
         .unwrap();
 
     assert!(!out.promoted, "{out:?}");
-    assert_eq!(out.failure.as_deref(), Some("the tool exited with code 3"));
+    let failure = out.failure.as_deref().expect("the outcome says why");
+    assert!(
+        failure.starts_with("the tool exited with code 3"),
+        "{failure}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5401,7 +5417,7 @@ fn mod_tool_fixture() -> (Fixture, ModTool) {
     let f = fixture(Vec::new());
     let dir = TempDir::new().unwrap();
     let exe = dir.path().join("Tool.exe");
-    std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_agora-tool-test-helper"), &exe).unwrap();
     let folder = dir.path().join("Out");
     (
         f,
@@ -5418,16 +5434,7 @@ fn add_mod_tool(f: &Fixture, tool: &ModTool, _tag: &str) -> game_user_tools::Use
         f,
         "My Tool",
         &tool.exe.to_string_lossy(),
-        &[
-            "/c",
-            "mkdir",
-            "Out",
-            "&",
-            "echo",
-            "%AGORA_RUN%",
-            ">",
-            r"Out\x.txt",
-        ],
+        &["--write", "Out/x.txt", "--content-env", "AGORA_RUN"],
         true,
         Some("Out"),
     )
@@ -5490,7 +5497,7 @@ fn a_mod_output_run_that_fails_or_leaves_the_folder_empty_imports_nothing() {
         &f,
         "Empty",
         &tool.exe.to_string_lossy(),
-        &["/c", "exit", "0"],
+        &[],
         true,
         Some("Out"),
     );
@@ -5513,19 +5520,7 @@ fn a_mod_output_run_that_fails_or_leaves_the_folder_empty_imports_nothing() {
         &f,
         "Failed",
         &tool.exe.to_string_lossy(),
-        &[
-            "/c",
-            "mkdir",
-            "Out",
-            "&",
-            "echo",
-            "x>",
-            r"Out\x.txt",
-            "&",
-            "exit",
-            "/b",
-            "1",
-        ],
+        &["--write", "Out/x.txt", "--content", "x", "--exit", "1"],
         true,
         Some("Out"),
     );
@@ -5541,7 +5536,14 @@ fn a_mod_output_run_that_fails_or_leaves_the_folder_empty_imports_nothing() {
         &f,
         "Cancelled",
         &tool.exe.to_string_lossy(),
-        &["/c", "mkdir", "Out", "&", "echo", "x>", r"Out\x.txt"],
+        &[
+            "--write",
+            "Out/x.txt",
+            "--content",
+            "x",
+            "--sleep-ms",
+            "60000",
+        ],
         true,
         Some("Out"),
     );
@@ -5562,6 +5564,49 @@ fn a_mod_output_run_that_fails_or_leaves_the_folder_empty_imports_nothing() {
     assert!(!out.promoted, "{out:?}");
     assert!(content_layer_item(&f, "tool-output:").is_none());
     assert!(item_names(&f).is_empty());
+}
+
+#[test]
+fn a_failed_run_keeps_the_tools_output_and_says_why() {
+    let (f, tool) = mod_tool_fixture();
+    let user = add_user_tool_full(
+        &f,
+        "Noisy",
+        &tool.exe.to_string_lossy(),
+        &[
+            "--stdout",
+            "built 12 parts",
+            "--stderr",
+            "the game folder is missing",
+            "--exit",
+            "9",
+        ],
+        true,
+        Some("Out"),
+    );
+
+    let out = run_user_tool(&f, &user.id, &StagingLauncher::plain(), false).unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(9));
+    let failure = out.failure.as_deref().expect("the outcome says why");
+    assert!(failure.contains("the game folder is missing"), "{failure}");
+    assert!(failure.contains("built 12 parts"), "{failure}");
+    assert_eq!(out.stdout_tail.trim(), "built 12 parts");
+    assert_eq!(out.stderr_tail.trim(), "the game folder is missing");
+    let failed = out.failed_folder.expect("the discarded run is kept");
+    assert_eq!(
+        std::fs::read_to_string(failed.join("tool-stdout.txt"))
+            .unwrap()
+            .trim(),
+        "built 12 parts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(failed.join("tool-stderr.txt"))
+            .unwrap()
+            .trim(),
+        "the game folder is missing"
+    );
 }
 
 #[test]

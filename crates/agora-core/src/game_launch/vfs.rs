@@ -204,6 +204,7 @@ pub fn config_json(vfs: &VfsLaunch, ready_event: &str) -> serde_json::Value {
 pub fn launch_under_vfs(
     _resolved: &ResolvedLaunch,
     _vfs: &VfsLaunch,
+    _capture: bool,
 ) -> Result<LaunchedGame, LaunchError> {
     Err(LaunchError::VfsUnavailable {
         reason: "the virtual file system is only available on Windows".to_string(),
@@ -216,8 +217,9 @@ pub fn launch_under_vfs(
 pub fn launch_under_vfs(
     resolved: &ResolvedLaunch,
     vfs: &VfsLaunch,
+    capture: bool,
 ) -> Result<LaunchedGame, LaunchError> {
-    windows::launch_under_vfs(resolved, vfs)
+    windows::launch_under_vfs(resolved, vfs, capture)
 }
 
 #[cfg(windows)]
@@ -270,6 +272,7 @@ mod windows {
     pub(super) fn launch_under_vfs(
         resolved: &ResolvedLaunch,
         vfs: &VfsLaunch,
+        capture: bool,
     ) -> Result<LaunchedGame, LaunchError> {
         if !vfs.dll.is_file() {
             return Err(unavailable(format!(
@@ -302,8 +305,13 @@ mod windows {
         cmd.env("AGORA_VFS_CONFIG", &vfs.config_path);
         // For a process that cannot read its configuration and so does not know where to log.
         cmd.env("AGORA_VFS_LOG", &vfs.log);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        if capture {
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+        } else {
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
         cmd.creation_flags(CREATE_SUSPENDED);
 
         let mut child = cmd.spawn().map_err(LaunchError::Io)?;
@@ -321,12 +329,18 @@ mod windows {
             }
         }
 
+        let output = if capture {
+            crate::game_launch::OutputCapture::start(&mut child)
+        } else {
+            None
+        };
         let identity = process_identity::capture(child.id())
             .map_err(|e| LaunchError::ProcessCapture(format!("{e}")))?;
         Ok(LaunchedGame {
             child,
             identity,
             program: resolved.program.clone(),
+            output,
         })
     }
 
