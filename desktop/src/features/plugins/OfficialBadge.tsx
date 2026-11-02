@@ -21,10 +21,19 @@ export function OfficialBadge({ status }: { status: OfficialStatus | null | unde
  * why rather than quietly dropping the badge.
  */
 export function OfficialStatusNote({ status }: { status: OfficialStatus | null | undefined }) {
-  if (status?.state !== 'unverified') return null;
-  return (
-    <p className="text-xs text-amber-600 dark:text-amber-400" data-testid="official-status-note">
-      It was installed as an official plugin but no longer verifies: {status.reason}
-    </p>
-  );
+  if (status?.state === 'unverified') {
+    return (
+      <p className="text-xs text-amber-600 dark:text-amber-400" data-testid="official-status-note">
+        It was installed as an official plugin but no longer verifies: {status.reason}
+      </p>
+    );
+  }
+  if (status?.state === 'catalogUnavailable' || status?.state === 'notListed') {
+    return (
+      <p className="text-xs text-amber-600 dark:text-amber-400" data-testid="official-status-note">
+        {status.reason}
+      </p>
+    );
+  }
+  return null;
 }

@@ -180,6 +180,16 @@ impl CoreContext {
         match crate::db::local_state_connection(&db_path) {
             Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
             Ok(conn) => {
+                // An install that was interrupted can leave the previous
+                // version stranded in the rollback folder and the game missing.
+                // Finish or undo it before anything reads the records.
+                match crate::plugins::install::recover_interrupted_installs(&conn, &paths) {
+                    Ok(recovered) => warnings.extend(recovered),
+                    Err(e) => {
+                        warnings.push(format!("Cannot recover interrupted plugin installs: {e}"))
+                    }
+                }
+
                 // A game package is data: it runs no code, so it loads whatever the
                 // emergency stop says and needs no script permission; installing the
                 // plugin (and granting `game:define`) was the opt-in. The one filter
@@ -212,10 +222,16 @@ impl CoreContext {
                             // a community plugin named `aaaa.x` could take
                             // `skyrim-se` before the official plugin was read.
                             // Stable, so each group stays in plugin-id order.
+                            // Blocked (Unverified) official plugins come first
+                            // too: they hold their game ids even though they do
+                            // not load, so the reservation must happen before
+                            // any community package is read.
                             records.sort_by_key(|record| {
-                                !matches!(
+                                matches!(
                                     official.get(record.id().as_str()),
-                                    Some(crate::plugins::official::OfficialStatus::Official { .. })
+                                    None | Some(
+                                        crate::plugins::official::OfficialStatus::Community
+                                    )
                                 )
                             });
                             for record in records {
@@ -241,7 +257,52 @@ impl CoreContext {
                                             "Plugin {} is blocked and its games are not loaded: {reason}.",
                                             record.id()
                                         ));
+                                        // The files did not verify, so the games are
+                                        // not loaded. The ids it holds still belong
+                                        // to this install, though: a community
+                                        // package must not take a game over by
+                                        // shadowing a blocked official one.
+                                        for pkg_contrib in
+                                            &record.manifest.contributions.game_packages
+                                        {
+                                            let Ok(rel) =
+                                                agora_game_api::RelPath::new(&pkg_contrib.path)
+                                            else {
+                                                continue;
+                                            };
+                                            let file_path = record.install_dir.join(rel.as_str());
+                                            let Ok(content) = std::fs::read_to_string(&file_path)
+                                            else {
+                                                continue;
+                                            };
+                                            let Ok(package_def) =
+                                                serde_json::from_str::<
+                                                    agora_game_api::PackageDefinition,
+                                                >(&content)
+                                            else {
+                                                continue;
+                                            };
+                                            game_builder.reserve_blocked(&package_def);
+                                        }
                                         continue;
+                                    }
+                                    Some(
+                                        crate::plugins::official::OfficialStatus::CatalogUnavailable {
+                                            reason,
+                                        },
+                                    )
+                                    | Some(
+                                        crate::plugins::official::OfficialStatus::NotListed {
+                                            reason,
+                                        },
+                                    ) => {
+                                        // It still loads from its installed files;
+                                        // say (once, on the plugin and here) that
+                                        // it could not be checked this time.
+                                        warnings.push(format!(
+                                            "Plugin {} is loaded from its installed files: {reason}",
+                                            record.id()
+                                        ));
                                     }
                                     Some(crate::plugins::official::OfficialStatus::Community)
                                     | None => {}

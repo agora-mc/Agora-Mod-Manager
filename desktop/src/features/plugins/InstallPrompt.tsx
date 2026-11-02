@@ -75,8 +75,12 @@ export function InstallPrompt({
     ? stringArray(manifestNetworkValue.hosts)
     : [];
   const blocked = unsupportedCapabilities.length > 0;
-  // Asked once, at the first install. An update keeps the answer already given.
-  const asksAboutCode = preview.runsCode === true && !preview.replacesVersion;
+  // Asked when the code is new to this person: a first install, an update that
+  // brings code, changed code, or code from a different publisher. An update
+  // that keeps the same code keeps the answer already given.
+  const asksAboutCode =
+    preview.runsCode === true &&
+    (preview.codeChanged ?? !preview.replacesVersion);
 
   return (
     <div className="rounded-lg border border-border bg-muted/30 p-4">
@@ -100,6 +104,14 @@ export function InstallPrompt({
           {preview.migratesData
             ? ' It changes how it stores data — Agora will keep a copy of the old data first.'
             : ''}
+        </p>
+      ) : null}
+
+      {preview.publisherChanged === true ? (
+        <p className="mt-3 flex items-start gap-2 text-sm text-amber-700 dark:text-amber-400">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          This update is signed by a different publisher than the one you installed. Only
+          continue if you got it from somewhere you trust.
         </p>
       ) : null}
 

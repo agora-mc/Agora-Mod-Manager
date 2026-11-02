@@ -700,6 +700,32 @@ pub fn capability_for_event(event: &str) -> Option<Capability> {
 /// How much of a plugin's HTTP response is read before giving up.
 const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
 
+/// Read a stream, stopping one byte past `limit`.
+///
+/// The check happens while reading, so an oversized body is refused before it
+/// is held in memory rather than after.
+fn read_capped(mut reader: impl std::io::Read, limit: usize) -> PluginResult<Vec<u8>> {
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    reader
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| {
+            PluginError::new(
+                PluginErrorCode::OperationFailed,
+                format!("could not read the response body: {e}"),
+            )
+        })?;
+    if body.len() > limit {
+        return Err(PluginError::new(
+            PluginErrorCode::ResourceExhausted,
+            format!("the response is larger than the {limit} byte limit"),
+        ));
+    }
+    Ok(body)
+}
+
 fn net_fetch_json(
     cx: &DispatchContext<'_>,
     args: &serde_json::Value,
@@ -748,19 +774,11 @@ fn net_fetch_json(
     })?;
 
     let status = response.status().as_u16();
-    let body = response.text().map_err(|e| {
-        PluginError::new(
-            PluginErrorCode::OperationFailed,
-            format!("could not read the response body: {e}"),
-        )
-    })?;
-    if body.len() > MAX_FETCH_BYTES {
-        return Err(PluginError::new(
-            PluginErrorCode::ResourceExhausted,
-            format!("the response is larger than the {MAX_FETCH_BYTES} byte limit"),
-        ));
-    }
-    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+    // Read at most one byte past the limit. Reading the whole body first would
+    // let a host that answers with a huge stream exhaust this process's memory
+    // before the size check ever ran.
+    let body = read_capped(response, MAX_FETCH_BYTES)?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
         PluginError::new(
             PluginErrorCode::OperationFailed,
             format!("the response was not JSON: {e}"),
@@ -806,6 +824,41 @@ fn ui_notify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_body_larger_than_the_limit_is_refused_while_reading() {
+        let exactly = std::io::Cursor::new(vec![b'x'; 16]);
+        assert_eq!(read_capped(exactly, 16).unwrap().len(), 16);
+
+        /// An endless body that counts how many bytes were pulled from it, so
+        /// the test can tell "stopped at the cap" from "read it all".
+        struct Endless {
+            served: usize,
+            max: usize,
+        }
+        impl std::io::Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.served >= self.max {
+                    return Ok(0);
+                }
+                self.served += 1;
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+
+        let too_large = Endless {
+            served: 0,
+            max: 10_000,
+        };
+        let mut too_large = too_large;
+        let error = read_capped(&mut too_large, 16).unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::ResourceExhausted);
+        assert_eq!(
+            too_large.served, 17,
+            "it reads at most one byte past the limit, not the whole body"
+        );
+    }
 
     #[test]
     fn every_method_name_is_unique() {

@@ -133,8 +133,12 @@ export interface PluginSummary {
 export type OfficialStatus =
   | { state: 'official'; version: string }
   | { state: 'community' }
-  /** Installed as official but no longer verifies; follows community rules. */
-  | { state: 'unverified'; reason: string };
+  /** Installed as official but no longer verifies; blocked from loading. */
+  | { state: 'unverified'; reason: string }
+  /** Catalog missing/corrupt/offline: installed files still match, so it loads. */
+  | { state: 'catalogUnavailable'; reason: string }
+  /** Catalog no longer lists this version: it loads, with an update if offered. */
+  | { state: 'notListed'; reason: string };
 
 export type OfficialInstallState =
   | 'notInstalled'
@@ -188,6 +192,8 @@ export interface InstallPreview {
   /** Hosts this package would reach that the installed version could not. */
   addedHosts: string[];
   updateSource: UpdateSourceSummary | null;
+  /** This update is signed by a different publisher than the one pinned. */
+  publisherChanged?: boolean;
   migratesData: boolean;
   /** Reaches any host, or a very long host list: needs Reduced security mode. */
   needsReducedSecurity?: boolean;
@@ -197,6 +203,8 @@ export interface InstallPreview {
   runsCode?: boolean;
   /** The plugin has code and the installed version did not. */
   addsCode?: boolean;
+  /** The code is new or changed, so "<name> runs code. Allow it?" is asked again. */
+  codeChanged?: boolean;
 }
 
 export type UpdateVerdict =

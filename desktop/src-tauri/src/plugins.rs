@@ -261,9 +261,13 @@ pub async fn plugin_apply_update(
     app: AppHandle,
     plugin_id: String,
     accept_capabilities: bool,
+    allow_scripts: Option<bool>,
 ) -> LauncherResult<UpdateOutcome> {
     service(&app)?
-        .apply_update(&parse_id(&plugin_id)?, accept_capabilities)
+        .apply_update(
+            &parse_id(&plugin_id)?,
+            consent(accept_capabilities, allow_scripts),
+        )
         .await
 }
 

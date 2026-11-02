@@ -262,15 +262,43 @@ pub fn set_script_consent(
     conn: &Connection,
     plugin_id: &PluginId,
     allowed: bool,
+    code_hash: Option<&str>,
     now: &str,
 ) -> LauncherResult<()> {
     conn.execute(
-        "INSERT INTO plugin_script_consent (plugin_id, allowed, decided_at)
-         VALUES (?1, ?2, ?3)
+        "INSERT INTO plugin_script_consent (plugin_id, allowed, decided_at, code_hash)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(plugin_id) DO UPDATE SET
              allowed = excluded.allowed,
-             decided_at = excluded.decided_at",
-        params![plugin_id.as_str(), allowed as i64, now],
+             decided_at = excluded.decided_at,
+             code_hash = excluded.code_hash",
+        params![plugin_id.as_str(), allowed as i64, now, code_hash],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+
+/// The code digest the stored answer was given for, if any.
+pub fn script_consent_code_hash(
+    conn: &Connection,
+    plugin_id: &PluginId,
+) -> LauncherResult<Option<String>> {
+    conn.query_row(
+        "SELECT code_hash FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map(|row| row.flatten())
+    .map_err(db_error)
+}
+
+/// Forget the answer. Used when the installed version has no code: consent
+/// belongs to code, and a later version that brings code must ask again.
+pub fn clear_script_consent(conn: &Connection, plugin_id: &PluginId) -> LauncherResult<()> {
+    conn.execute(
+        "DELETE FROM plugin_script_consent WHERE plugin_id = ?1",
+        params![plugin_id.as_str()],
     )
     .map_err(db_error)?;
     Ok(())

@@ -2012,6 +2012,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             package_tree_sha256 TEXT NOT NULL,
             package_size INTEGER NOT NULL,
             min_agora_version TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (plugin_id, version)
         )
     """)
@@ -2956,7 +2957,11 @@ OFFICIAL_VERSION_RE = re.compile(
 OFFICIAL_GAME_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # Matches the 64 MiB a plugin package may expand to; the zip is smaller still.
 OFFICIAL_PACKAGE_MAX_BYTES = 64 * 1024 * 1024
-OFFICIAL_PLUGIN_RELEASE_KEYS = {"version", "package_url", "sha256", "tree_sha256", "size"}
+OFFICIAL_PLUGIN_RELEASE_KEYS = {
+    "version", "package_url", "sha256", "tree_sha256", "size", "revoked",
+}
+# `revoked` is optional; its absence means "not revoked".
+OFFICIAL_PLUGIN_RELEASE_REQUIRED = OFFICIAL_PLUGIN_RELEASE_KEYS - {"revoked"}
 OFFICIAL_PLUGIN_KEYS = {
     "id", "name", "description", "game_ids", "min_agora_version", "current", "previous",
 }
@@ -2968,9 +2973,12 @@ def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
     unknown = sorted(set(release) - OFFICIAL_PLUGIN_RELEASE_KEYS)
     if unknown:
         raise SystemExit(f"{path}: {label!r} has unknown field(s): {', '.join(unknown)}")
-    missing = sorted(OFFICIAL_PLUGIN_RELEASE_KEYS - set(release))
+    missing = sorted(OFFICIAL_PLUGIN_RELEASE_REQUIRED - set(release))
     if missing:
         raise SystemExit(f"{path}: {label!r} is missing: {', '.join(missing)}")
+    revoked = release.get("revoked", False)
+    if not isinstance(revoked, bool):
+        raise SystemExit(f"{path}: {label}.revoked must be true or false, got {revoked!r}")
     version = release["version"]
     if not isinstance(version, str) or not OFFICIAL_VERSION_RE.fullmatch(version):
         raise SystemExit(f"{path}: {label}.version must be a semantic version, got {version!r}")
@@ -3015,6 +3023,7 @@ def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
         "sha256": sha256,
         "tree_sha256": tree_sha256,
         "size": size,
+        "revoked": revoked,
     }
 
 
@@ -3120,8 +3129,8 @@ def insert_official_plugins(
                 INSERT INTO official_plugins (
                     plugin_id, version, channel, name, description, game_ids_json,
                     package_url, package_sha256, package_tree_sha256, package_size,
-                    min_agora_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    min_agora_version, revoked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry["id"],
@@ -3135,6 +3144,7 @@ def insert_official_plugins(
                     release["tree_sha256"],
                     release["size"],
                     entry["min_agora_version"],
+                    int(release["revoked"]),
                 ),
             )
 

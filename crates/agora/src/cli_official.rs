@@ -52,8 +52,12 @@ fn state_text(info: &OfficialPluginInfo) -> String {
         OfficialInstallState::UpdateAvailable => "update available".into(),
         OfficialInstallState::NotOfficial => match &info.installed_status {
             Some(OfficialStatus::Unverified { reason }) => {
-                format!("installed, no longer verified ({reason})")
+                format!("installed, blocked ({reason})")
             }
+            Some(
+                OfficialStatus::CatalogUnavailable { reason }
+                | OfficialStatus::NotListed { reason },
+            ) => format!("installed, loaded with a warning ({reason})"),
             _ => "installed, but not the official package".into(),
         },
     }

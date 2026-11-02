@@ -20,11 +20,19 @@
 //!    which is not signed), and its stored manifest and grants are what that
 //!    folder's `agora-plugin.json` says they should be.
 //!
-//! Lose any one and the plugin is [`OfficialStatus::Unverified`], with the reason.
-//! An unverified plugin is **blocked**, not demoted to a community plugin: it is
-//! not loaded, whatever the emergency stop says, until it is updated, rolled back
-//! or reinstalled. The same goes for any plugin that uses an official plugin's id
-//! without being that plugin.
+//! Lose one of the *file* checks — the files were edited, the catalog explicitly
+//! revoked the version, or this copy was never the official package — and the
+//! plugin is [`OfficialStatus::Unverified`], with the reason. That is **blocked**,
+//! not demoted to a community plugin: it is not loaded, whatever the emergency
+//! stop says, until it is updated, rolled back or reinstalled.
+//!
+//! Not being able to *check* is different. If the catalog is missing, corrupt or
+//! offline, or it no longer lists an old version, the installed files are checked
+//! against the hashes recorded when they were installed: matching files keep
+//! loading ([`OfficialStatus::CatalogUnavailable`] / [`OfficialStatus::NotListed`])
+//! with a warning, and any scripts among them wait until a verified catalog says
+//! the plugin is official again. A player's game does not disappear because the
+//! network did.
 //!
 //! # What an official install does differently
 //!
@@ -133,6 +141,9 @@ pub struct OfficialEntry {
     pub package_tree_sha256: String,
     pub package_size: u64,
     pub min_agora_version: String,
+    /// Explicitly withdrawn by the signed catalog. Distinct from "no longer
+    /// listed", which only means the catalog keeps a short history.
+    pub revoked: bool,
 }
 
 impl OfficialEntry {
@@ -244,14 +255,23 @@ impl OfficialCatalog {
         if has_table == 0 {
             return Ok(Self::default());
         }
-        let mut stmt = conn
-            .prepare(
-                "SELECT plugin_id, version, channel, name, description, game_ids_json,
-                        package_url, package_sha256, package_size, min_agora_version,
-                        package_tree_sha256
-                 FROM official_plugins ORDER BY plugin_id, channel, version",
+        // `revoked` is newer than the table. An older cached registry does not
+        // have it, which reads as "nothing revoked" rather than an error.
+        let has_revoked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('official_plugins') WHERE name = 'revoked'",
+                [],
+                |row| row.get(0),
             )
             .map_err(unreadable)?;
+        let revoked_column = if has_revoked > 0 { "revoked" } else { "0" };
+        let sql = format!(
+            "SELECT plugin_id, version, channel, name, description, game_ids_json,
+                    package_url, package_sha256, package_size, min_agora_version,
+                    package_tree_sha256, {revoked_column}
+             FROM official_plugins ORDER BY plugin_id, channel, version"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(unreadable)?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -266,13 +286,26 @@ impl OfficialCatalog {
                     row.get::<_, i64>(8)?,
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             })
             .map_err(unreadable)?;
         let mut entries = Vec::new();
         for row in rows {
-            let (id, version, channel, name, description, games, url, sha, size, min, tree) =
-                row.map_err(unreadable)?;
+            let (
+                id,
+                version,
+                channel,
+                name,
+                description,
+                games,
+                url,
+                sha,
+                size,
+                min,
+                tree,
+                revoked,
+            ) = row.map_err(unreadable)?;
             let channel = match channel.as_str() {
                 "current" => EntryChannel::Current,
                 "previous" => EntryChannel::Previous,
@@ -302,6 +335,7 @@ impl OfficialCatalog {
                 // A negative size is not a size; 0 fails `check`.
                 package_size: u64::try_from(size).unwrap_or(0),
                 min_agora_version: min,
+                revoked: revoked != 0,
             });
         }
         Ok(Self { entries })
@@ -384,11 +418,51 @@ pub enum OfficialStatus {
     /// and it does not verify (edited, revoked, re-pinned, or never was the
     /// official package). It is blocked from loading, and `reason` says why.
     Unverified { reason: String },
+    /// The signed catalog could not be checked (missing, corrupt or offline).
+    /// The installed files match the hashes recorded when they were installed,
+    /// so the plugin keeps loading with a warning. Its scripts do not run until
+    /// the catalog verifies again.
+    CatalogUnavailable { reason: String },
+    /// The catalog verified, but it no longer lists this installed version
+    /// (usually because it is two or more releases behind). The installed files
+    /// match the hashes recorded at install, so it keeps loading with a warning
+    /// and an update, if the catalog offers one.
+    NotListed { reason: String },
 }
 
 impl OfficialStatus {
     pub fn is_official(&self) -> bool {
         matches!(self, OfficialStatus::Official { .. })
+    }
+
+    /// Whether the plugin's game packages load in this state.
+    ///
+    /// Only a hard block — tampered files, explicit revocation, or an impostor
+    /// id — stops them. A catalog that cannot be checked, or that dropped an
+    /// old version, does not make the player's game disappear.
+    pub fn loads(&self) -> bool {
+        !matches!(self, OfficialStatus::Unverified { .. })
+    }
+
+    /// The warning to show next to the plugin and its games, when it loads in a
+    /// state that could not be verified.
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            OfficialStatus::CatalogUnavailable { reason }
+            | OfficialStatus::NotListed { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Whether this standing permits the plugin's scripts to run. Only a
+    /// verified official, or a community plugin (absent from the map), does;
+    /// the two warning states are specifically "loads data only until the
+    /// catalog verifies again".
+    pub fn scripts_allowed_by_status(&self) -> bool {
+        matches!(
+            self,
+            OfficialStatus::Official { .. } | OfficialStatus::Community
+        )
     }
 }
 
@@ -609,11 +683,24 @@ fn evaluate(
             provenance.entry_version
         ));
     }
+    // The recorded files are checked before the catalog is consulted, so a
+    // tampered install is blocked in every state, including "catalog offline".
+    if let Err(reason) = verify_recorded_files(provenance, record, packages_root) {
+        return unverified(reason);
+    }
     let Some(entry) = catalog.find(id, &version) else {
-        return unverified(format!(
-            "the signed catalog no longer lists version {version} of `{id}`"
-        ));
+        return OfficialStatus::NotListed {
+            reason: format!(
+                "a newer version is available; version {version} is no longer listed by the \
+                 catalog"
+            ),
+        };
     };
+    if entry.revoked {
+        return unverified(format!(
+            "the signed catalog explicitly revokes version {version} of `{id}`"
+        ));
+    }
     if let Err(problem) = entry.check() {
         return unverified(format!("the signed catalog entry is unusable: {problem}"));
     }
@@ -622,24 +709,39 @@ fn evaluate(
             "the signed catalog now pins a different package for version {version}"
         ));
     }
+    if entry.package_tree_sha256 != provenance.tree_sha256 {
+        return unverified(format!(
+            "the signed catalog now pins different files for version {version}"
+        ));
+    }
+    OfficialStatus::Official { version }
+}
+
+/// Check the installed files against what was recorded when they were installed.
+///
+/// Used when there is no signed entry to compare with (the catalog is missing,
+/// or has dropped this version). The hashes are local state, not a signature, so
+/// this detects an edited install but cannot vouch for its provenance; that is
+/// exactly the "keeps loading, with a warning" case.
+fn verify_recorded_files(
+    provenance: &OfficialProvenance,
+    record: &store::PluginRecord,
+    packages_root: &Path,
+) -> Result<(), String> {
     if record.install_dir != install::package_dir(packages_root, record.id()) {
-        return unverified(
-            "its files are not in the folder the official installer puts them in".into(),
-        );
+        return Err("its files are not in the folder the official installer puts them in".into());
     }
     match tree_digest(&record.install_dir) {
-        Ok(digest) if digest == entry.package_tree_sha256 => {}
+        Ok(digest) if digest == provenance.tree_sha256 => {}
         Ok(_) => {
-            return unverified(
+            return Err(
                 "files in the plugin's folder changed after it was installed from the official \
                  package"
                     .into(),
             )
         }
-        Err(e) => return unverified(format!("its installed files could not be verified: {e}")),
+        Err(e) => return Err(format!("its installed files could not be verified: {e}")),
     }
-    // The folder is now known to be the signed one. The record in local state
-    // must say what that folder says.
     let on_disk = std::fs::read_to_string(
         record
             .install_dir
@@ -652,11 +754,11 @@ fn evaluate(
     match on_disk {
         Ok(manifest) if manifest == record.manifest => {}
         Ok(_) => {
-            return unverified(
+            return Err(
                 "the plugin's stored manifest differs from the one in its official package".into(),
             )
         }
-        Err(e) => return unverified(format!("the manifest in its folder could not be read: {e}")),
+        Err(e) => return Err(format!("the manifest in its folder could not be read: {e}")),
     }
     let asked: std::collections::BTreeSet<agora_plugin_api::Capability> = record
         .manifest
@@ -667,12 +769,34 @@ fn evaluate(
         .filter_map(|name| name.parse::<agora_plugin_api::Capability>().ok())
         .collect();
     if let Some(extra) = record.granted.iter().find(|cap| !asked.contains(cap)) {
-        return unverified(format!(
+        return Err(format!(
             "it holds the capability `{}`, which its official manifest never asks for",
             extra.as_str()
         ));
     }
-    OfficialStatus::Official { version }
+    Ok(())
+}
+
+/// A plugin installed from the signed catalog while the catalog cannot be read.
+///
+/// The installed files still have to match what was recorded; if they do, the
+/// plugin keeps loading with a warning instead of vanishing until the network or
+/// the registry comes back.
+fn evaluate_unavailable(
+    provenance: &OfficialProvenance,
+    record: &store::PluginRecord,
+    packages_root: &Path,
+    reason: &str,
+) -> OfficialStatus {
+    match verify_recorded_files(provenance, record, packages_root) {
+        Ok(()) => OfficialStatus::CatalogUnavailable {
+            reason: format!(
+                "Agora could not check this plugin against the catalog ({reason}). Its installed \
+                 files match what was installed."
+            ),
+        },
+        Err(problem) => OfficialStatus::Unverified { reason: problem },
+    }
 }
 
 /// The standing of every installed plugin that is official, or uses an official
@@ -682,11 +806,12 @@ fn evaluate(
 /// registry is read only when something is installed, and only the plugins that
 /// were installed as official, or whose id the catalog lists, are evaluated.
 ///
-/// If the registry cannot be verified, every plugin installed as official is
-/// reported [`OfficialStatus::Unverified`] with that reason; the error is not
-/// swallowed into "no official plugins". Plugins that were never installed as
-/// official cannot be told from community plugins without a catalog, so they stay
-/// community.
+/// If the registry cannot be verified, every plugin installed as official keeps
+/// loading in [`OfficialStatus::CatalogUnavailable`] when its files still match
+/// what was installed, and is [`OfficialStatus::Unverified`] when they do not;
+/// the error is not swallowed into "no official plugins". Plugins that were never
+/// installed as official cannot be told from community plugins without a
+/// catalog, so they stay community.
 pub fn verify_installed(
     conn: &Connection,
     app_data_dir: &Path,
@@ -717,12 +842,15 @@ pub fn verify_installed(
                 }
             }
             Err(e) => {
-                if recorded.is_some() {
+                if let Some(recorded) = recorded {
                     out.insert(
                         id.to_string(),
-                        OfficialStatus::Unverified {
-                            reason: unavailable_reason(e),
-                        },
+                        evaluate_unavailable(
+                            recorded,
+                            record,
+                            &packages_root,
+                            &unavailable_reason(e),
+                        ),
                     );
                 }
             }
@@ -861,10 +989,44 @@ impl PluginService {
             match load_signed_catalog(&self.inner.registry_trust, self.inner.ctx.paths.root()) {
                 Ok(catalog) => catalog,
                 Err(e) => {
+                    // The catalog cannot offer anything, but an installed
+                    // official plugin still has a standing and a warning, and
+                    // the Game support list needs it to warn on the game.
+                    let reason = unavailable_reason(&e);
+                    let conn = self.inner.conn()?;
+                    let records = store::list(&conn)?;
+                    let statuses = verify_installed(
+                        &conn,
+                        self.inner.ctx.paths.root(),
+                        &self.inner.registry_trust,
+                    )?;
+                    let plugins = records
+                        .iter()
+                        .filter(|record| !store::is_tombstone(record))
+                        .filter_map(|record| {
+                            let status = statuses.get(record.id().as_str())?.clone();
+                            let installed_version = Some(record.manifest.version.to_string());
+                            Some(OfficialPluginInfo {
+                                id: record.id().to_string(),
+                                name: record.manifest.name.clone(),
+                                description: record.manifest.description.clone(),
+                                game_ids: Vec::new(),
+                                version: installed_version.clone().unwrap_or_default(),
+                                previous_version: None,
+                                size_bytes: 0,
+                                min_agora_version: "0.0.0".into(),
+                                state: OfficialInstallState::NotOfficial,
+                                can_roll_back: false,
+                                installed_version,
+                                installed_status: Some(status),
+                                problem: None,
+                            })
+                        })
+                        .collect();
                     return Ok(OfficialPluginList {
-                        plugins: Vec::new(),
-                        unavailable_reason: Some(unavailable_reason(&e)),
-                    })
+                        plugins,
+                        unavailable_reason: Some(reason),
+                    });
                 }
             };
         let conn = self.inner.conn()?;
@@ -1139,6 +1301,25 @@ impl PluginService {
                 format!(
                     "The package for `{}` {} identifies itself as `{}` {}. It was refused.",
                     entry.plugin_id, entry.version, preview.manifest.id, preview.manifest.version
+                ),
+            ));
+        }
+        // Official plugins are data-only: they ship a game definition, not a
+        // script. A package with an entrypoint is Agora's own release mistake,
+        // not something a user could meaningfully consent to, so it is refused.
+        if preview.runs_code {
+            return Err(refused(
+                "ERR_OFFICIAL_PLUGIN_HAS_CODE",
+                format!(
+                    "The official package for `{}` {} contains code (`{}`). Official plugins \
+                     are data-only, so nothing was installed.",
+                    entry.plugin_id,
+                    entry.version,
+                    preview
+                        .manifest
+                        .entrypoint
+                        .as_deref()
+                        .unwrap_or("an entrypoint")
                 ),
             ));
         }

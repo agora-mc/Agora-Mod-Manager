@@ -611,10 +611,16 @@ function PluginRow({
   }, [onRefresh, pluginId]);
 
   const applyUpdate = useCallback(
-    async (acceptCapabilities: boolean) => {
+    async (acceptCapabilities: boolean, allowCode: boolean) => {
       setUpdateBusy(true);
       try {
-        const result = await applyPluginUpdate(pluginId, acceptCapabilities);
+        // The code answer only matters when the user accepted the preview;
+        // an "apply" that turns into a consent prompt did not answer it yet.
+        const result = await applyPluginUpdate(
+          pluginId,
+          acceptCapabilities,
+          acceptCapabilities ? allowCode : false,
+        );
         if (!isUpdateOutcome(result)) {
           showToast('Agora did not return a usable update outcome.', 'error');
           return;
@@ -839,7 +845,7 @@ function PluginRow({
         <UpdateResult
           verdict={updateVerdict}
           busy={updateBusy}
-          onApply={() => void applyUpdate(false)}
+          onApply={() => void applyUpdate(false, false)}
         />
       ) : null}
 
@@ -852,7 +858,7 @@ function PluginRow({
             confirmLabel="Update"
             busyLabel="Updating…"
             onCancel={() => setUpdatePreview(null)}
-            onConfirm={() => void applyUpdate(true)}
+            onConfirm={(allowCode) => void applyUpdate(true, allowCode)}
           />
         </div>
       ) : null}

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 20;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 21;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -774,6 +774,31 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (20)",
+            [],
+        )?;
+    }
+
+    if current < 21 {
+        // Which code the consent was given for. Without it a code-less version
+        // in between would let a later version inherit an answer given for
+        // different code. A digest of the manifest's entrypoint is enough to
+        // tell "the code the user allowed" from "new code".
+        // The table may already carry the column when an older schema_version
+        // row was lost (the migration tests delete rows to replay history), so
+        // add it only when it is missing.
+        let has_code_hash: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plugin_script_consent') WHERE name = 'code_hash'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_code_hash == 0 {
+            conn.execute(
+                "ALTER TABLE plugin_script_consent ADD COLUMN code_hash TEXT",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (21)",
             [],
         )?;
     }
