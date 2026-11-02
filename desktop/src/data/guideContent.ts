@@ -41,11 +41,11 @@ export interface GuideOverview {
 /** Orientation shown at the top of the app's Home page and the website's docs home. */
 export const GUIDE_OVERVIEW: GuideOverview = {
   title: 'What Agora manages',
-  body: 'Agora looks after the files and settings around your modded games: instances, mods, packs, Java runtimes, snapshots, compatibility checks, and recovery. Minecraft is built in and is the default. Other games come as plugins, starting with Skyrim Special Edition. For Minecraft, the official launcher still runs the game by default and handles your Microsoft account.',
+  body: 'Agora looks after the files and settings around your modded games: instances, mods, packs, Java runtimes, snapshots, compatibility checks, and recovery. Minecraft is included as the default, other games come as plugins, starting with Skyrim Special Edition. For Minecraft, the official launcher still runs the game by default and handles your Microsoft account, but you can sign in through Agora and launch directly if you adjust the corresponding setting.',
   terms: [
     {
       term: 'Instance',
-      definition: 'An isolated Minecraft setup with its own version, loader, mods, and settings.',
+      definition: 'An isolated game setup with its own version, loader, mods, and settings.',
     },
     {
       term: 'Mod loader',
@@ -827,7 +827,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           title: 'Add a game',
           body: 'Other games arrive as small add-ons that you install once. Your Minecraft instances are not affected.',
           steps: [
-            'On Home, find the More games card and press Install next to the game. The same card is in Settings > Game support, which helps if you dismissed it on Home.',
+            'On Home, find the "More games" card and press Install next to the game. The same card is in Settings > Game support, which helps if you dismissed it on Home.',
             'If Agora shows what the add-on wants to do, read it first, and approve it only if you are happy with it.',
             'Restart Agora when it asks (Restart now).',
             'Once Agora has found a copy of the game on this computer (Steam, GOG, Epic Games Store or Microsoft Store), a game switcher appears at the top of the sidebar. Choose the game there to open its Instances, Library, Import and Setup pages.',

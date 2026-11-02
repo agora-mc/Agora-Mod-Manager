@@ -4,7 +4,7 @@ import { GITHUB_REPO_URL, DISCORD_URL, SPONSORS_URL } from '@/lib/site';
 const PILLARS = [
   {
     title: 'Built for more than one game',
-    body: 'Minecraft is built in and is the default. Other games come as plugins: Skyrim Special Edition is the first, an official plugin you can install from the More games card on Home or in Settings > Game support. The curated catalog is mostly Minecraft today.',
+    body: 'Minecraft is included as the default, other games come as plugins. Official game plugins are built and maintained by the Agora team, but Agora also supports community plugins for other games. Install official game plugins from the "More games" card on Home or in Settings > Game support.',
   },
   {
     title: 'Customizable to you',
@@ -61,7 +61,7 @@ export default function AboutPage() {
           The Agora Difference
         </h1>
         <p className="mx-auto mt-3 max-w-xl text-lg text-ink-muted">
-          A different kind of mod manager: Minecraft built in, other games through plugins.
+          A different kind of mod manager. Minecraft is included as the default, other games come as plugins.
         </p>
       </header>
 

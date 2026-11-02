@@ -33,8 +33,8 @@ export default async function HomePage() {
           Agora Mod Manager
         </h1>
         <p className="mx-auto mt-4 max-w-2xl text-lg leading-8 text-ink-muted">
-          A bespoke, boutique, community-curated mod manager. Minecraft is built in; other games come as
-          plugins. Curated, not warehoused &mdash; every entry hand-picked and community reviewed.
+          A bespoke, boutique, community-curated mod manager. Minecraft is included as the default, other games
+          come as plugins. Curated, not warehoused &mdash; every entry hand-picked and community reviewed.
         </p>
 
         <HeroTrailer />

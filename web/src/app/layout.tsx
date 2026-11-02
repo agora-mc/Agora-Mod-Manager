@@ -8,7 +8,7 @@ export const metadata: Metadata = {
     template: '%s · Agora',
   },
   description:
-    'A community-curated, multi-game mod manager. Minecraft is built in, and other games come as plugins. Dependency-aware installs, recovery tools, and an ad-free public catalog.',
+    'A community-curated mod manager for games. Minecraft is included as the default, other games come as plugins. Dependency-aware installs, recovery tools, and an ad-free public catalog.',
 };
 
 /*

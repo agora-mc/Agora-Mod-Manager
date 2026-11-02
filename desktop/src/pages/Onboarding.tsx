@@ -321,7 +321,7 @@ function WelcomeStep({ onContinue }: { onContinue: () => void }) {
       <Stepper current="welcome" />
       <h2 className="text-2xl font-bold mb-2">Welcome to Agora</h2>
       <p className="text-muted-foreground mb-4">
-        A decentralized, ad-free, community run, open-source mod manager and discovery platform. Minecraft is built in; other games come as plugins.
+        A decentralized, ad-free, community run, open-source mod manager and discovery platform. Minecraft is included as the default, other games come as plugins.
       </p>
       <div className="flex justify-end">
         <button

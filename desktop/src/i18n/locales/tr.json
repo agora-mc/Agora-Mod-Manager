@@ -1,7 +1,7 @@
 {
   "app": {
     "name": "Agora",
-    "tagline": "Boutique, topluluk tarafından derlenmiş mod yöneticisi. Minecraft yerleşiktir; diğer oyunlar eklenti olarak gelir."
+    "tagline": "Boutique, topluluk tarafından derlenmiş mod yöneticisi. Minecraft varsayılan olarak dahildir, diğer oyunlar eklenti olarak gelir."
   },
   "nav": {
     "home": "Ana Sayfa",
@@ -49,7 +49,7 @@
   "onboarding": {
     "welcome": {
       "title": "Agora'ya Hoş Geldiniz",
-      "description": "Boutique, topluluk tarafından derlenmiş mod yöneticisi. Minecraft yerleşiktir; diğer oyunlar eklenti olarak gelir.",
+      "description": "Boutique, topluluk tarafından derlenmiş mod yöneticisi. Minecraft varsayılan olarak dahildir, diğer oyunlar eklenti olarak gelir.",
       "getStarted": "Başlayın"
     }
   },

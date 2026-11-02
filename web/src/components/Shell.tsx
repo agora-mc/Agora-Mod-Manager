@@ -73,7 +73,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
                   className="h-8 w-8 rounded-md opacity-90 ring-1 ring-gold/20"
                 />
                 <p className="max-w-sm leading-6">
-                  Agora — a bespoke, boutique, community-curated mod manager for Minecraft and, through plugins, other games.
+                  Agora — a bespoke, boutique, community-curated mod manager for games. Minecraft is included as the default, other games come as plugins.
                 </p>
               </div>
               <div className="ui-text flex flex-wrap gap-x-5 gap-y-2">

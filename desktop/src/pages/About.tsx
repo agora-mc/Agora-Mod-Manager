@@ -22,7 +22,7 @@ const PILLARS = [
   {
     icon: Layers,
     title: 'Built for more than one game',
-    body: 'Minecraft is built in and is the default. Other games come as plugins: Skyrim Special Edition is the first, an official plugin you can install from the More games card on Home or in Settings > Game support. The curated catalog is mostly Minecraft today.',
+    body: 'Minecraft is included as the default, other games come as plugins. Official game plugins are built and maintained by the Agora team, but Agora also supports community plugins for other games. Install official game plugins from the "More games" card on Home or in Settings > Game support.',
   },
   {
     icon: SlidersHorizontal,
