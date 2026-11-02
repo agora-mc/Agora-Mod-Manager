@@ -12,10 +12,19 @@ import { cn } from "@/lib/utils"
  */
 const Switch = React.forwardRef<
   React.ElementRef<typeof SwitchPrimitives.Root>,
-  React.ComponentPropsWithoutRef<typeof SwitchPrimitives.Root> & { size?: "sm" | "md" }
->(({ className, size = "md", ...props }, ref) => (
+  React.ComponentPropsWithoutRef<typeof SwitchPrimitives.Root> & {
+    size?: "sm" | "md"
+    /** "danger" turns the on state red, for switches whose on state is a warning (Lockdown Mode). */
+    tone?: "default" | "danger"
+  }
+>(({ className, size = "md", tone = "default", ...props }, ref) => (
   <SwitchPrimitives.Root
-    className={cn("agora-switch peer", size === "sm" && "agora-switch--sm", className)}
+    className={cn(
+      "agora-switch peer",
+      size === "sm" && "agora-switch--sm",
+      tone === "danger" && "agora-switch--danger",
+      className,
+    )}
     {...props}
     ref={ref}
   >

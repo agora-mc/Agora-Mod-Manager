@@ -1541,6 +1541,23 @@ main [data-skip-landing][tabindex="-1"]:focus {
     inset 0 1px 1px hsl(0 0% 100% / 0.22),
     0 0 1rem 0 hsl(var(--primary) / 0.6);
 }
+/* Danger tone: the on state is a warning (Lockdown Mode), so it glows red instead of the accent. */
+.agora-switch--danger[data-state="checked"] {
+  background: hsl(var(--destructive));
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--destructive) / 0.65),
+    inset 0 1px 1px hsl(0 0% 100% / 0.18),
+    0 0 0.75rem -0.125rem hsl(var(--destructive) / 0.6);
+}
+.agora-switch--danger[data-state="checked"]:hover:not(:disabled) {
+  box-shadow:
+    inset 0 0 0 1px hsl(var(--destructive) / 0.65),
+    inset 0 1px 1px hsl(0 0% 100% / 0.22),
+    0 0 1rem 0 hsl(var(--destructive) / 0.65);
+}
+.agora-switch--danger .agora-switch__check {
+  stroke: hsl(var(--destructive));
+}
 .agora-switch:focus-visible {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 3px;

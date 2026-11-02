@@ -288,9 +288,7 @@ export function Privacy() {
             aria-label="Lockdown Mode"
             checked={lockdown}
             onCheckedChange={handleLockdown}
-            className={cn(
-              lockdown && '**:data-[state=checked]:bg-red-600',
-            )}
+            tone="danger"
           />
         </label>
       </div>

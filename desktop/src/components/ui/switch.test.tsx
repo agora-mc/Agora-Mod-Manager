@@ -95,4 +95,11 @@ describe('Switch', () => {
     expect(css).toContain('transition-duration: 0.01ms !important');
     expect(css).toContain('@media (prefers-reduced-motion: reduce)');
   });
+  it('turns red when on in the danger tone, and only then', () => {
+    const { rerender } = render(<Switch aria-label="Lockdown Mode" tone="danger" checked />);
+    expect(screen.getByRole('switch', { name: 'Lockdown Mode' })).toHaveClass('agora-switch--danger');
+    rerender(<Switch aria-label="Lockdown Mode" checked />);
+    expect(screen.getByRole('switch', { name: 'Lockdown Mode' })).not.toHaveClass('agora-switch--danger');
+    expect(cssFile()).toMatch(/\.agora-switch--danger\[data-state="checked"\]\s*\{[^}]*--destructive/);
+  });
 });
