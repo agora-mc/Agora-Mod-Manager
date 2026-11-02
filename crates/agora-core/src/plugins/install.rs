@@ -437,35 +437,40 @@ pub fn read_package_manifest_bytes(bytes: &[u8]) -> LauncherResult<PackageConten
     };
     let manifest = PluginManifest::parse(&text).map_err(|e| invalid_package(e.message))?;
 
-    // The digest of the entrypoint identifies the code in this package, so a
-    // preview can tell whether it is code the user already answered for.
+    // The digest covers every file the host could load as a module, not only
+    // the entrypoint: `import "./util.js"` is resolved inside the package, so
+    // changing util.js must count as changing the code. The manifest and update
+    // source are host metadata and are never loaded as modules, so they are
+    // left out (their changes are handled by their own rules).
     let code_digest = if let Some(entrypoint) = &manifest.entrypoint {
         use sha2::{Digest, Sha256};
-        let mut digest = None;
+        let mut files = std::collections::BTreeMap::new();
         for index in 0..zip.len() {
             let mut entry = zip
                 .by_index(index)
                 .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?;
-            let name = entry
-                .name()
-                .map_err(|e| invalid_package(format!("unreadable entry in the package: {e}")))?
-                .into_owned();
-            if name.replace('\\', "/") == *entrypoint {
-                let mut hasher = Sha256::new();
-                std::io::copy(&mut entry, &mut hasher)
-                    .map_err(|e| invalid_package(format!("could not read `{entrypoint}`: {e}")))?;
-                digest = Some(hex::encode(hasher.finalize()));
-                break;
+            if entry.is_dir() {
+                continue;
             }
-        }
-        match digest {
-            Some(digest) => Some(digest),
-            None => {
-                return Err(invalid_package(format!(
-                    "the manifest names `{entrypoint}` as the entrypoint, but the package does not contain it"
-                )))
+            let name =
+                normalize_relative(&entry.name().map_err(|e| {
+                    invalid_package(format!("unreadable entry in the package: {e}"))
+                })?);
+            if name == MANIFEST_FILENAME || name == UPDATE_SOURCE_FILENAME {
+                continue;
             }
+            let mut hasher = Sha256::new();
+            std::io::copy(&mut entry, &mut hasher)
+                .map_err(|e| invalid_package(format!("could not read `{name}`: {e}")))?;
+            files.insert(name, hex::encode(hasher.finalize()));
         }
+        let entrypoint = normalize_relative(entrypoint);
+        if !files.contains_key(&entrypoint) {
+            return Err(invalid_package(format!(
+                "the manifest names `{entrypoint}` as the entrypoint, but the package does not contain it"
+            )));
+        }
+        Some(finish_script_digest(&files))
     } else {
         None
     };
@@ -839,15 +844,96 @@ pub fn script_digest(
     let Some(entrypoint) = &manifest.entrypoint else {
         return Ok(None);
     };
-    let path = plugin_dir.join(entrypoint);
-    let bytes = std::fs::read(&path).map_err(|e| {
-        io_error(format!(
-            "could not read the plugin entrypoint {}: {e}",
-            path.display()
-        ))
-    })?;
+    // The host's module loader reads and parses any file inside the package
+    // that a module names, not just `.js` files. So every file except the two
+    // host metadata files is part of the code identity; excluding data by
+    // extension would leave a way to smuggle a module behind an unchanged
+    // entrypoint.
+    let mut files = std::collections::BTreeMap::new();
+    let mut entries = 0usize;
+    let mut total = 0u64;
+    collect_script_files(plugin_dir, plugin_dir, &mut files, &mut entries, &mut total)?;
+    let entrypoint = normalize_relative(entrypoint);
+    if !files.contains_key(&entrypoint) {
+        return Err(io_error(format!(
+            "the plugin entrypoint `{entrypoint}` is missing"
+        )));
+    }
+    Ok(Some(finish_script_digest(&files)))
+}
+
+fn collect_script_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut std::collections::BTreeMap<String, String>,
+    entries: &mut usize,
+    total: &mut u64,
+) -> LauncherResult<()> {
     use sha2::{Digest, Sha256};
-    Ok(Some(hex::encode(Sha256::digest(&bytes))))
+    let read = std::fs::read_dir(dir)
+        .map_err(|e| io_error(format!("could not read {}: {e}", dir.display())))?;
+    for item in read {
+        let item = item.map_err(|e| io_error(format!("could not read {}: {e}", dir.display())))?;
+        let path = item.path();
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| io_error("a plugin file is outside its folder"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let meta = std::fs::symlink_metadata(&path)
+            .map_err(|e| io_error(format!("could not inspect {}: {e}", path.display())))?;
+        if meta.is_dir() {
+            collect_script_files(root, &path, files, entries, total)?;
+            continue;
+        }
+        if rel == MANIFEST_FILENAME || rel == UPDATE_SOURCE_FILENAME {
+            continue;
+        }
+        *entries += 1;
+        if *entries > MAX_ENTRIES {
+            return Err(io_error(
+                "the plugin folder holds too many files to fingerprint",
+            ));
+        }
+        if meta.is_file() {
+            *total = total.saturating_add(meta.len());
+            if *total > MAX_TOTAL_BYTES {
+                return Err(io_error("the plugin folder is too large to fingerprint"));
+            }
+            let bytes = std::fs::read(&path)
+                .map_err(|e| io_error(format!("could not read {}: {e}", path.display())))?;
+            files.insert(rel, hex::encode(Sha256::digest(&bytes)));
+        } else {
+            // A link or device is not read as code here, but adding or removing
+            // one must still change the identity. The loader rejects links out
+            // of the package; a link inside it resolves to a file hashed above.
+            files.insert(rel, "other".into());
+        }
+    }
+    Ok(())
+}
+
+/// Collapse `.` and empty segments, so the same file has one name whether it
+/// came from a zip entry or from walking a folder.
+fn normalize_relative(name: &str) -> String {
+    name.replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A stable digest over the file map: relative paths and content hashes, sorted.
+fn finish_script_digest(files: &std::collections::BTreeMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (rel, hash) in files {
+        hasher.update(rel.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Resolve which capabilities a fresh install should be granted.

@@ -1538,6 +1538,44 @@ fn script_zip_with_source(id: &str, version: &str, key: &PublicKey) -> Vec<u8> {
     buffer.into_inner()
 }
 
+/// A script package with extra files beside `main.js`, e.g. an imported
+/// module and a data file.
+fn script_zip_with_files(id: &str, version: &str, files: &[(&str, &str)]) -> Vec<u8> {
+    use std::io::Write;
+    let manifest = format!(
+        r#"{{
+        "manifest": 1,
+        "id": "{id}",
+        "name": "Scripted",
+        "version": "{version}",
+        "license": "GPL-3.0-only",
+        "apiRange": ">=0.1, <0.2",
+        "entrypoint": "main.js",
+        "activation": ["onStartup"],
+        "capabilities": {{ "required": ["instance:read"] }}
+    }}"#
+    );
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("agora-plugin.json", options).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.start_file("main.js", options).unwrap();
+        zip.write_all(
+            b"export function noop() { return 1; }
+",
+        )
+        .unwrap();
+        for (name, body) in files {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buffer.into_inner()
+}
+
 const COMMUNITY_SCRIPT: &str = "acme.community";
 
 impl World {
@@ -2352,4 +2390,116 @@ async fn an_unverified_official_plugin_with_scripts_does_not_run_them() {
 
     world.service.activate_all().unwrap();
     assert!(!world.running(PLUGIN));
+}
+
+/// Consent is tied to every file the host can load as a module, not just the
+/// entrypoint: changing an imported module is changing the code.
+#[tokio::test]
+async fn an_update_that_changes_only_an_imported_module_asks_again() {
+    let world = World::new();
+    let first = script_zip_with_files(
+        COMMUNITY_SCRIPT,
+        "1.0.0",
+        &[
+            ("util.js", "export const value = 1;\n"),
+            ("data.json", "{\"n\":1}\n"),
+        ],
+    );
+    let installed = world.service.install_package_bytes(&first, true).unwrap();
+    assert!(installed.scripts_allowed);
+
+    // The same files under a new version are the same code: the answer stands.
+    let same_files = script_zip_with_files(
+        COMMUNITY_SCRIPT,
+        "1.1.0",
+        &[
+            ("util.js", "export const value = 1;\n"),
+            ("data.json", "{\"n\":1}\n"),
+        ],
+    );
+    let kept = world
+        .service
+        .install_package_bytes(
+            &same_files,
+            Consent {
+                capabilities: true,
+                scripts: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        kept.scripts_allowed,
+        "unchanged files keep the earlier answer"
+    );
+
+    // main.js and the data file are untouched; only the imported module changed.
+    let second = script_zip_with_files(
+        COMMUNITY_SCRIPT,
+        "2.0.0",
+        &[
+            ("util.js", "export const value = 2;\n"),
+            ("data.json", "{\"n\":1}\n"),
+        ],
+    );
+    let preview = world.service.preview_package_bytes(&second).unwrap();
+    assert!(
+        preview.code_changed,
+        "a changed imported module is new code"
+    );
+    let updated = world
+        .service
+        .install_package_bytes(
+            &second,
+            Consent {
+                capabilities: true,
+                scripts: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        !updated.scripts_allowed,
+        "the earlier allow was for different code"
+    );
+}
+
+/// We chose the strict line: the module loader will parse any file it is asked
+/// to import, so every file in the package (except the host metadata) is part
+/// of the identity. A data file change therefore asks again too.
+#[tokio::test]
+async fn an_update_that_changes_only_a_data_file_is_new_code_too() {
+    let world = World::new();
+    let first = script_zip_with_files(
+        COMMUNITY_SCRIPT,
+        "1.0.0",
+        &[
+            ("util.js", "export const value = 1;\n"),
+            ("data.json", "{\"n\":1}\n"),
+        ],
+    );
+    world.service.install_package_bytes(&first, true).unwrap();
+
+    let second = script_zip_with_files(
+        COMMUNITY_SCRIPT,
+        "2.0.0",
+        &[
+            ("util.js", "export const value = 1;\n"),
+            ("data.json", "{\"n\":2}\n"),
+        ],
+    );
+    let preview = world.service.preview_package_bytes(&second).unwrap();
+    assert!(
+        preview.code_changed,
+        "every package file is in the code identity, so data changes re-ask"
+    );
+    let updated = world
+        .service
+        .install_package_bytes(
+            &second,
+            Consent {
+                capabilities: true,
+                scripts: false,
+            },
+        )
+        .unwrap();
+    assert!(!updated.scripts_allowed);
 }
