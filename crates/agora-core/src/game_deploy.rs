@@ -1628,10 +1628,15 @@ fn build_deployment(
     }
 
     // Existing deployment is not up to date. A farm whose update stopped partway (the marker is
-    // there) is not trusted: it is discarded without a harvest, and built again. Otherwise the farm
-    // is harvested first, then updated in place where it can be, and discarded where it cannot.
+    // there) is not trusted: it is discarded without a harvest, and built again. A farm being torn
+    // down is finished the same way: its missing files are not the game's deletions. Otherwise the
+    // farm is harvested first, then updated in place where it can be, and discarded where it cannot.
     let harvest = if updating_marker(&deployment_dir).exists() {
         discard_untrusted_farm(&deployment_dir)?;
+        None
+    } else if removal_marker(&deployment_dir).exists() {
+        // Finish the teardown the marker announced, without harvesting what is left of it.
+        remove_farm_and_record(&deployment_dir)?;
         None
     } else if record_path.exists() {
         let harvested = harvest_changes(ctx, instance_id, &deployment_dir, &manifest)?;
@@ -1682,12 +1687,25 @@ fn build_deployment(
                 Some(harvested.report)
             }
         }
+    } else if game_dir.exists() {
+        // A farm with no record is the state a stop between the rename and the record leaves. If
+        // Agora's own marker says it built the folder it is rebuilt; otherwise it is moved aside,
+        // never deleted, so no deploy is stuck behind it.
+        if farm_marker(&deployment_dir).exists() {
+            discard_untrusted_farm(&deployment_dir)?;
+        } else {
+            move_unproven_farm_aside(&deployment_dir)?;
+        }
+        None
     } else {
         None
     };
 
     // Build the new deployment
     std::fs::create_dir_all(&deployment_dir)?;
+    if !farm_marker(&deployment_dir).exists() {
+        std::fs::write(farm_marker(&deployment_dir), instance_id.as_bytes())?;
+    }
     let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
     let staging_dir = deployment_dir.join(format!("game.partial-{unique}"));
     std::fs::create_dir_all(&staging_dir)?;
@@ -2037,7 +2055,11 @@ pub fn undeploy(ctx: &Ctx, instance_id: &str) -> Result<HarvestReport, DeployErr
     let _lock = ctx
         .lock_manager
         .acquire(LockResource::Instance(instance_id.to_string()), "undeploy")?;
+    undeploy_locked(ctx, instance_id)
+}
 
+/// [`undeploy`] with the instance's lock already held.
+pub(crate) fn undeploy_locked(ctx: &Ctx, instance_id: &str) -> Result<HarvestReport, DeployError> {
     let manifest = crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
         crate::game_instance::InstanceError::NotFound(id) => DeployError::InstanceNotFound(id),
         other => DeployError::Other(other.to_string()),
@@ -2070,6 +2092,13 @@ pub fn undeploy(ctx: &Ctx, instance_id: &str) -> Result<HarvestReport, DeployErr
             let pids: Vec<String> = running.iter().map(|p| p.pid.to_string()).collect();
             return Err(DeployError::ProcessesRunning(pids.join(", ")));
         }
+    }
+
+    if removal_marker(&deployment_dir).exists() {
+        // A teardown stopped part way. Finish it; what is missing from the half-removed farm is
+        // not the game's deletions.
+        remove_farm_and_record(&deployment_dir)?;
+        return Ok(HarvestReport::default());
     }
 
     if record_path.exists() {
@@ -2410,15 +2439,34 @@ fn harvest_internal(
     Ok(harvested.report)
 }
 
-/// Delete a deployment's game folder and its record.
+/// Delete a deployment's game folder and its record. The teardown is marked before anything goes,
+/// so a stop part way is finished as a teardown; a folder Agora cannot prove it built is refused.
 fn remove_farm_and_record(deployment_dir: &Path) -> Result<(), DeployError> {
     let game_dir = deployment_dir.join("game");
     let record_path = deployment_dir.join("deployment.json");
+    let marker = removal_marker(deployment_dir);
+
+    let marked = record_path.exists() || marker.exists();
+    if game_dir.exists() && !marked {
+        return Err(DeployError::InvalidDeploymentDir(format!(
+            "refusing to delete '{}': no deployment record or teardown marker beside it",
+            game_dir.display()
+        )));
+    }
+    if record_path.exists() {
+        if marker.exists() {
+            std::fs::remove_file(&record_path)?;
+        } else {
+            std::fs::rename(&record_path, &marker)?;
+        }
+    }
     if game_dir.exists() {
         std::fs::remove_dir_all(&game_dir)?;
     }
-    if record_path.exists() {
-        std::fs::remove_file(&record_path)?;
+    for leftover in [&marker, &farm_marker(deployment_dir)] {
+        if leftover.exists() {
+            std::fs::remove_file(leftover)?;
+        }
     }
     Ok(())
 }
@@ -2435,10 +2483,25 @@ fn remove_farm_and_record(deployment_dir: &Path) -> Result<(), DeployError> {
 
 /// The record, set aside while its farm is updated in place.
 const UPDATING_FILE: &str = "deployment.json.updating";
+/// Written before a farm is torn down, so a stop part way is finished as a teardown and never
+/// read as the game having deleted files.
+const REMOVING_FILE: &str = "deployment.json.removing";
+/// Marks a folder as a farm Agora built. A farm without its record can be rebuilt from it.
+const FARM_FILE: &str = "deployment.json.farm";
 
 /// The updating marker of a deployment folder.
 fn updating_marker(deployment_dir: &Path) -> PathBuf {
     deployment_dir.join(UPDATING_FILE)
+}
+
+/// The teardown marker of a deployment folder.
+fn removal_marker(deployment_dir: &Path) -> PathBuf {
+    deployment_dir.join(REMOVING_FILE)
+}
+
+/// The marker that says Agora built the farm in this deployment folder.
+fn farm_marker(deployment_dir: &Path) -> PathBuf {
+    deployment_dir.join(FARM_FILE)
 }
 
 /// A path as the record and the plan compare it: case-folded, as the farm's own paths are keyed.
@@ -2807,8 +2870,9 @@ fn apply_marked(
     })
 }
 
-/// Discard a farm whose update stopped partway. Nothing is harvested from it: its state is not
-/// known. The marker goes last, so a stop during the discard leaves the next deploy to discard again.
+/// Discard a farm whose update stopped partway, or whose record is missing. Nothing is harvested
+/// from it: its state is not known. The markers go last, so a stop during the discard leaves the
+/// next deploy to discard again.
 fn discard_untrusted_farm(deployment_dir: &Path) -> Result<(), DeployError> {
     let record_path = deployment_dir.join("deployment.json");
     if record_path.exists() {
@@ -2818,11 +2882,26 @@ fn discard_untrusted_farm(deployment_dir: &Path) -> Result<(), DeployError> {
     if game_dir.exists() {
         std::fs::remove_dir_all(&game_dir)?;
     }
-    let marker = updating_marker(deployment_dir);
-    if marker.exists() {
-        std::fs::remove_file(&marker)?;
+    for marker in [
+        updating_marker(deployment_dir),
+        removal_marker(deployment_dir),
+        farm_marker(deployment_dir),
+    ] {
+        if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
     }
     Ok(())
+}
+
+/// Move a farm folder Agora cannot prove it built out of the way, instead of deleting it. The
+/// folder is kept beside the deployment, named so a person can find it.
+fn move_unproven_farm_aside(deployment_dir: &Path) -> Result<PathBuf, DeployError> {
+    let game_dir = deployment_dir.join("game");
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let aside = deployment_dir.join(format!("game.unproven-{unique}"));
+    std::fs::rename(&game_dir, &aside)?;
+    Ok(aside)
 }
 
 // ---------------------------------------------------------------------------

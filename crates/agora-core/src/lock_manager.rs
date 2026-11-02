@@ -226,6 +226,8 @@ pub enum LockResource {
     ContentStore,
     /// Exclusive access for per-user game files journaled swap.
     GameUserFiles(GameId, StoreId),
+    /// Exclusive access to building a base by id (the rename into place through its record).
+    Base(String),
 }
 
 impl LockResource {
@@ -261,6 +263,10 @@ impl LockResource {
                     game.as_str(),
                     store.as_str()
                 ))
+            }
+            LockResource::Base(id) => {
+                app_paths::validate_path_component(id)?;
+                Ok(format!("base-{id}"))
             }
         }
     }

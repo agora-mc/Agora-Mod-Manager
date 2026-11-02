@@ -1,5 +1,4 @@
 //! Final review of the multi-game branch: proofs of bugs in the per-user files swap.
-//! Every test is `#[ignore]`d; run with `--ignored` to see it fail.
 #![allow(unused_imports, dead_code)]
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -175,7 +174,6 @@ fn put(path: &PathBuf, text: &str) {
 }
 
 #[test]
-#[ignore = "proves bug: a swap killed between overwriting a real file and journaling it loses the user's original (restore skips swapped=false and deletes the backup)"]
 fn crash_between_overwrite_and_journal_update_loses_the_users_file() {
     let h = TestHarness::new();
     let def = test_skyrim_definition();
@@ -212,7 +210,6 @@ fn crash_between_overwrite_and_journal_update_loses_the_users_file() {
 }
 
 #[test]
-#[ignore = "proves bug: re-running an interrupted restore overwrites the instance's saved copy with the user's original file"]
 fn rerun_of_an_interrupted_restore_overwrites_the_sessions_instance_copy() {
     let h = TestHarness::new();
     let def = test_skyrim_definition();
@@ -248,7 +245,7 @@ fn rerun_of_an_interrupted_restore_overwrites_the_sessions_instance_copy() {
 }
 
 #[test]
-#[ignore = "proves bug: a read-only user INI (the usual Skyrim advice) makes restore fail on every session, which then blocks every later launch"]
+#[allow(clippy::permissions_set_readonly_false)]
 fn read_only_user_file_blocks_restore_and_every_later_launch() {
     let h = TestHarness::new();
     let def = test_skyrim_definition();

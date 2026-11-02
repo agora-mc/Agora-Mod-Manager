@@ -268,6 +268,20 @@ fn probe_garbage_journal_refuses_swap() {
 }
 
 #[test]
+fn probe_garbage_journal_is_an_error_not_none() {
+    let h = TestHarness::new();
+    let def = test_skyrim_definition();
+    let jp = journal_path_of(&h, &def);
+    std::fs::create_dir_all(jp.parent().unwrap()).unwrap();
+    std::fs::write(&jp, b"{ not json").unwrap();
+    let state = status(&h.ctx, &def.id, &StoreId::steam());
+    assert!(
+        state.is_err(),
+        "an unreadable journal must be an error state, not 'no session'"
+    );
+}
+
+#[test]
 fn probe_restore_without_a_session_is_harmless() {
     let h = TestHarness::new();
     let def = test_skyrim_definition();

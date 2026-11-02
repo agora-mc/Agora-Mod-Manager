@@ -334,7 +334,6 @@ pub fn create_with_options(
         .paths
         .instance_dir(&instance_id)
         .map_err(|e| InstanceError::InvalidId(instance_id.clone(), e.to_string()))?;
-    std::fs::create_dir_all(&instance_dir)?;
 
     let manifest = GameInstanceManifest {
         manifest_version: 3,
@@ -356,6 +355,19 @@ pub fn create_with_options(
         "instance_manifest.json.{}.tmp",
         uuid::Uuid::new_v4()
     ));
+
+    if let Some(parent) = instance_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Creating the folder is how a create wins its id. A folder that is already there belongs to
+    // another create (or an earlier one): this one must not touch it.
+    match std::fs::create_dir(&instance_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(InstanceError::AlreadyExists(instance_id));
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     let write_result: Result<(), InstanceError> = (|| {
         std::fs::write(&tmp_path, &manifest_bytes)?;
@@ -519,6 +531,16 @@ pub fn is_minecraft_instance(ctx: &Ctx, id: &str) -> bool {
 /// Delete a generic game instance and its folder. Refuses Minecraft instances and folders
 /// outside `<instances_root>`.
 pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
+    // A delete changes the instance's records and folders, so it takes the same lock as every other
+    // writer. While it is held nothing can deploy or launch the instance out from under it.
+    let _lock = ctx
+        .lock_manager
+        .acquire(
+            crate::lock_manager::LockResource::Instance(id.to_string()),
+            "delete",
+        )
+        .map_err(|e| InstanceError::Other(e.to_string()))?;
+
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
@@ -556,6 +578,21 @@ pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
         .map_err(|e| InstanceError::InvalidId(id.to_string(), e.to_string()))?;
     if instance_dir.parent() != Some(&ctx.paths.instances_root()) {
         return Err(InstanceError::InvalidInstanceDir(instance_dir));
+    }
+
+    // The instance's deployed folder is Agora's and is rebuilt on demand, but the game may have
+    // written into it. Take it down as a launch end does: harvest those changes first, and refuse
+    // (changing nothing) when that cannot run. A game still running from it is refused there.
+    let deployment_folder = crate::game_deploy::deployment_dir(ctx, id)?
+        .and_then(|game| game.parent().map(std::path::Path::to_path_buf));
+    if instance_dir.join("instance_manifest.json").exists() {
+        crate::game_deploy::undeploy_locked(ctx, id)?;
+    }
+    // What is left is the empty folder Agora made for the farm; the instance is going, so it does.
+    if let Some(folder) = deployment_folder {
+        if folder.is_dir() {
+            let _ = std::fs::remove_dir(&folder);
+        }
     }
 
     // The row goes first: a folder left behind by a failed removal is inert,

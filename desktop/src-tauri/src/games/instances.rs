@@ -299,7 +299,7 @@ fn list_instances(app: &tauri::AppHandle, game_id: &str) -> Result<InstanceList,
         .filter(|record| record.game.as_str() == game.as_str())
     {
         let manifest = game_instance::get_manifest(&ctx, &record.instance_id).map_err(map_error)?;
-        let running = is_running(&ctx, record, &manifest);
+        let running = is_running(&ctx, record, &manifest)?;
         instances.push(card_for(record, &manifest, running));
     }
     Ok(InstanceList { instances })
@@ -316,7 +316,7 @@ fn instance_detail(
         .games
         .game(&record.game)
         .ok_or_else(|| game_missing(record.game.as_str()))?;
-    let running = is_running(&ctx, &record, &manifest);
+    let running = is_running(&ctx, &record, &manifest)?;
     let runtime = runtime_of(&record, &manifest);
     Ok(InstanceDetail {
         instance_id: record.instance_id.clone(),
@@ -439,7 +439,7 @@ fn delete_instance(
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
     let manifest = game_instance::get_manifest(&ctx, instance_id).map_err(map_error)?;
-    if is_running(&ctx, &record, &manifest) {
+    if is_running(&ctx, &record, &manifest)? {
         return Err(running_error(instance_id));
     }
     let outcome = game_instance::delete(&ctx, instance_id).map_err(map_error)?;
@@ -492,7 +492,7 @@ fn set_deployment(
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
     let manifest = game_instance::get_manifest(&ctx, instance_id).map_err(map_error)?;
-    if is_running(&ctx, &record, &manifest) {
+    if is_running(&ctx, &record, &manifest)? {
         return Err(running_error(instance_id));
     }
     agora_core::game_deploy::set_deployment(&ctx, instance_id, chosen).map_err(core_failed)?;
@@ -511,7 +511,7 @@ fn launch_instance(
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
     let manifest = game_instance::get_manifest(&ctx, instance_id).map_err(map_error)?;
-    if is_running(&ctx, &record, &manifest) {
+    if is_running(&ctx, &record, &manifest)? {
         return Err(running_error(instance_id));
     }
     let definition = ctx
@@ -651,20 +651,21 @@ fn runtime_of(
     }
 }
 
-/// Whether the game is running from this instance right now, from the user-file session.
+/// Whether the game is running from this instance right now, from the user-file session. An
+/// unreadable session is an error, not "not running": the page shows it instead of guessing.
 fn is_running(
     ctx: &agora_core::ctx::Ctx,
     record: &GameInstanceRecord,
     manifest: &GameInstanceManifest,
-) -> bool {
+) -> Result<bool, GamesError> {
     match runtime_of(record, manifest) {
-        Some(runtime) => running_from_session(
-            game_user_files::status(ctx, &record.game, &runtime.store),
+        Some(runtime) => Ok(running_from_session(
+            game_user_files::status(ctx, &record.game, &runtime.store).map_err(core_failed)?,
             &record.instance_id,
-        ),
+        )),
         // An instance with no recorded runtime has no store to look a session up under. It has
         // never been launched through a store this build can name, so no session can be ours.
-        None => false,
+        None => Ok(false),
     }
 }
 

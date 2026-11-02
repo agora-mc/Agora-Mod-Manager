@@ -1,5 +1,4 @@
 //! Final review of the multi-game branch: proofs of bugs in deploy teardown and harvest.
-//! Every test is `#[ignore]`d; run with `--ignored` to see it fail.
 #![allow(unused_imports, dead_code)]
 
 use std::path::Path;
@@ -200,7 +199,6 @@ fn record_path(ctx: &CoreContext, id: &str) -> std::path::PathBuf {
 
 #[cfg(windows)]
 #[test]
-#[ignore = "proves bug: a teardown that stops half way (file in use) leaves a record whose next harvest reads the half-deleted farm as game deletions and deletes writable-layer files"]
 fn interrupted_farm_removal_makes_the_next_harvest_delete_writable_files() {
     use std::os::windows::fs::OpenOptionsExt;
     let tmp = TempDir::new().unwrap();
@@ -248,7 +246,6 @@ fn interrupted_farm_removal_makes_the_next_harvest_delete_writable_files() {
 }
 
 #[test]
-#[ignore = "proves bug: deleting an instance leaves its deployed game folder (and any unharvested game writes) behind forever"]
 fn deleting_an_instance_removes_its_deployed_farm() {
     let tmp = TempDir::new().unwrap();
     let (ctx, def, inst) = setup(&tmp);
@@ -269,7 +266,6 @@ fn deleting_an_instance_removes_its_deployed_farm() {
 }
 
 #[test]
-#[ignore = "proves bug: a deploy killed between renaming the new farm into place and writing its record leaves a farm no deploy can replace and no undeploy can clean"]
 fn farm_without_a_record_blocks_every_later_deploy() {
     let tmp = TempDir::new().unwrap();
     let (ctx, def, inst) = setup(&tmp);
@@ -289,7 +285,6 @@ fn farm_without_a_record_blocks_every_later_deploy() {
 }
 
 #[test]
-#[ignore = "proves bug: when a second create with the same chosen id lands during the first's base build, the first's failed insert deletes the second's instance folder and leaves its row behind"]
 fn losing_a_same_id_create_race_deletes_the_winners_folder() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let tmp = TempDir::new().unwrap();

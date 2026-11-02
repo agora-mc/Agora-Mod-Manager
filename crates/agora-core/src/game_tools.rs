@@ -808,6 +808,7 @@ fn output_forbidden_roots(
     let roots = vec![
         lexical_path(&base.source_location),
         lexical_path(&base.source_location.join("Data")),
+        lexical_path(&base.location),
         lexical_path(&instance_dir),
         lexical_path(&deployment_folder(base, instance_id)?),
         lexical_path(ctx.paths.root()),
@@ -1382,7 +1383,7 @@ fn refuse_during_session(
     definition: &GameDefinition,
     store: &StoreId,
 ) -> Result<(), ToolError> {
-    match game_user_files::status(ctx, &definition.id, store) {
+    match game_user_files::status(ctx, &definition.id, store)? {
         Some(session) if session.running => Err(ToolError::SessionRunning(session.instance)),
         _ => Ok(()),
     }
@@ -1394,7 +1395,7 @@ fn release_session(
     definition: &GameDefinition,
     store: &StoreId,
 ) -> Result<(), ToolError> {
-    if game_user_files::status(ctx, &definition.id, store).is_none() {
+    if game_user_files::status(ctx, &definition.id, store)?.is_none() {
         return Ok(());
     }
     match game_user_files::restore(ctx, definition, store) {
@@ -3749,4 +3750,41 @@ fn files_by_key(root: &Path) -> Result<BTreeMap<String, (String, PathBuf)>, Tool
         out.insert(fold_path_case(&rel), (rel, abs));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pinned_base_itself_is_a_forbidden_output_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().join("app_data"));
+        let base = BaseManifest {
+            manifest_version: 1,
+            base_id: "elsewhere".into(),
+            runtime: agora_game_api::RuntimeIdentity {
+                game: agora_game_api::GameId::new("test-game").unwrap(),
+                store: StoreId::new("steam").unwrap(),
+                version: "1.0.0".into(),
+                build: None,
+            },
+            mode: crate::game_base::BaseMode::Linked,
+            source_install: agora_game_api::InstallId::new("steam:1").unwrap(),
+            source_product: None,
+            source_location: tmp.path().join("install"),
+            location: tmp.path().join("other-root").join("elsewhere"),
+            created_unix_ms: 0,
+            files: Vec::new(),
+            skipped: Vec::new(),
+        };
+
+        let roots = output_forbidden_roots(&ctx, "inst", &base).unwrap();
+
+        assert!(
+            roots.contains(&real_path(&base.location)),
+            "the pinned base {} is not a forbidden output root: {roots:?}",
+            base.location.display()
+        );
+    }
 }
