@@ -379,4 +379,19 @@ describe('pack import without a connection', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Import' }));
     expect(await screen.findByText(/the new instance was removed/)).toBeTruthy();
   });
+
+  it('shows a non-fatal detail warning without calling the import a failure', async () => {
+    answer({
+      import_instance_pack: () => ({
+        instance_id: 'friend-pack',
+        report: null,
+        warnings: ['Could not look up project details: no connection.'],
+      }),
+    });
+    renderImport('C:\\packs\\friend.mrpack');
+    fireEvent.click(await screen.findByRole('button', { name: 'Import' }));
+
+    expect(await screen.findByText(/Could not look up project details/)).toBeTruthy();
+    expect(screen.getByText(/Pack installed successfully/)).toBeTruthy();
+  });
 });

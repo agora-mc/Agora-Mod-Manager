@@ -304,6 +304,7 @@ export function PackInstallProvider({ children }: { children: ReactNode }) {
     instanceId: string,
     label: string,
     report: PackImportReport | null = null,
+    warnings: string[] = [],
   ) => {
     // A pack whose mods did not all install, or could not all be checked, is
     // not "installed successfully": say what happened and keep the details.
@@ -316,7 +317,10 @@ export function PackInstallProvider({ children }: { children: ReactNode }) {
       instanceName: label,
       status: 'completed',
       phase: 'done',
-      message: report !== null && issues ? `Imported. ${importHeadline(report)}` : 'Pack installed successfully.',
+      message: (report !== null && issues
+        ? `Imported. ${importHeadline(report)}`
+        : 'Pack installed successfully.')
+        + (warnings.length > 0 ? ` ${warnings.join(' ')}` : ''),
       progress: 1,
     }));
     setRevision((value) => value + 1);
@@ -415,7 +419,13 @@ export function PackInstallProvider({ children }: { children: ReactNode }) {
       [id]: initialTask(id, label, 'pack-file', null, label),
     }));
     void importInstancePack(sourcePath, reviewedSha256, name, skipUnfetchable, installAnyway)
-      .then((outcome) => completeImportedTask(id, outcome.instance_id, label, outcome.report))
+      .then((outcome) => completeImportedTask(
+        id,
+        outcome.instance_id,
+        label,
+        outcome.report,
+        outcome.warnings ?? [],
+      ))
       .catch((cause) => {
         if (errorCode(cause) === PACK_HASH_STOP_CODE && !installAnyway) {
           // Not a failure to hide: name every file and let the user decide.
