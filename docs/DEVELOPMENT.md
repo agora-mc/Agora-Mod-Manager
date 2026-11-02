@@ -89,7 +89,8 @@ python ../scripts/verify_db.py
 
 Use `--skip-sign` only for local development. Production clients must not trust unsigned catalog output.
 Use `--skip-official-asset-check` only for local development or tests: the release compile downloads
-every official plugin package and refuses an entry whose URL, size or sha256 does not match.
+every official plugin package, leaves out an entry whose asset is missing and warns, and refuses an
+entry whose bytes do not match its pinned size or sha256.
 
 ## Official plugin packages
 

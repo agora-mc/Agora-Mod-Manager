@@ -12,7 +12,9 @@ Covers: validate_sha256, _get_registry_repo, _load_poll_blacklist,
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
@@ -2257,18 +2259,34 @@ class OfficialPluginTests(unittest.TestCase):
             self.compile(official_fetcher=lambda url: payload.upper())
         self.assertIn("current.sha256", str(caught.exception.code))
 
-        def missing(url):
-            raise OSError("404")
-
-        with self.assertRaises(SystemExit) as caught:
-            self.compile(official_fetcher=missing)
-        self.assertIn("does not resolve", str(caught.exception.code))
-
         data["current"]["size"] = len(payload) + 1
         self.write(data)
         with self.assertRaises(SystemExit) as caught:
             self.compile(official_fetcher=lambda url: payload)
         self.assertIn("current.size", str(caught.exception.code))
+
+    def test_a_missing_official_package_leaves_the_entry_out_with_a_warning(self):
+        payload = b"acme fixture package"
+        data = self.entry()
+        del data["previous"]
+        data["current"]["sha256"] = hashlib.sha256(payload).hexdigest()
+        data["current"]["size"] = len(payload)
+        self.write(data)
+
+        def missing(url):
+            raise OSError("404")
+
+        with self.assertLogs(_compile.logger, level="WARNING") as logs:
+            rows = self.rows(self.compile(official_fetcher=missing))
+        self.assertEqual(rows, [])
+        self.assertIn("left out of the catalog", "\n".join(logs.output))
+
+        # In Actions the same message is a workflow annotation, so the run shows it as a warning.
+        printed = io.StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), contextlib.redirect_stdout(printed):
+            self.compile(official_fetcher=missing)
+        self.assertIn("::warning::", printed.getvalue())
+        self.assertIn("left out of the catalog", printed.getvalue())
 
     def test_the_schema_version_is_unchanged_so_older_clients_still_read_the_registry(self):
         self.write(self.entry())

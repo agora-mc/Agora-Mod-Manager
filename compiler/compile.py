@@ -2985,25 +2985,36 @@ def _fetch_official_package(url: str) -> bytes:
         response.close()
 
 
-def _verify_official_release(
+def _github_annotation_text(text: str) -> str:
+    """Escape a message for a GitHub Actions workflow command."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _official_asset_warning(message: str) -> None:
+    """Warn once in the log, and as an Actions annotation when the compile runs in Actions."""
+    logger.warning("%s", message)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{_github_annotation_text(message)}", flush=True)
+
+
+def _official_asset_missing(
     path: Path,
     label: str,
     release: dict[str, Any],
     fetch: Callable[[str], bytes],
-) -> None:
-    """Refuse an entry whose URL does not serve the bytes its size and sha256 pin.
+) -> str | None:
+    """Why a release's asset is missing, or None when the bytes match its pins.
 
-    A catalog that lists an official plugin is the app's only source for that
-    download, so an asset that is missing, private or was replaced must stop the
-    compile instead of shipping an entry that cannot install.
+    A fetch failure means the asset was not published or is not reachable. That
+    is not a reason to block every other catalog entry, so the caller leaves this
+    plugin out and warns. A download that succeeds but does not match the pinned
+    size or sha256 is a wrong entry and stops the compile.
     """
     url = release["package_url"]
     try:
         data = fetch(url)
-    except Exception as exc:  # noqa: BLE001 - every fetch failure is the same refusal
-        raise SystemExit(
-            f"{path}: {label}.package_url does not resolve to a package: {url}: {exc}"
-        ) from exc
+    except Exception as exc:  # noqa: BLE001 - every fetch failure means the same thing
+        return f"{path}: {label}.package_url does not resolve to a package: {url}: {exc}"
     if len(data) != release["size"]:
         raise SystemExit(
             f"{path}: {label}.size is {release['size']} but {url} served {len(data)} bytes"
@@ -3013,6 +3024,7 @@ def _verify_official_release(
         raise SystemExit(
             f"{path}: {label}.sha256 is {release['sha256']} but {url} served {actual}"
         )
+    return None
 
 
 def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
@@ -3148,9 +3160,14 @@ def load_official_plugins(
             if previous["version"] == current["version"]:
                 raise SystemExit(f"{path}: previous must be a different version from current")
         if fetch is not None:
-            _verify_official_release(path, "current", current, fetch)
-            if previous is not None:
-                _verify_official_release(path, "previous", previous, fetch)
+            missing = _official_asset_missing(path, "current", current, fetch)
+            if missing is None and previous is not None:
+                missing = _official_asset_missing(path, "previous", previous, fetch)
+            if missing is not None:
+                _official_asset_warning(
+                    f"Official plugin {plugin_id} left out of the catalog: {missing}"
+                )
+                continue
         results.append(
             (
                 path,
