@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Mountain, Music, Volume2, CloudRain, CloudSnow, Sun, ZoomIn, ZoomOut, Sparkles, Rainbow, ChevronDown, ChevronRight, Lock, LockOpen, RotateCcw } from 'lucide-react';
 import { MUSIC_TRACK_CHOICES, INSTRUMENT_CHOICES } from '../features/ambience/engine/audio/trackChoices';
 import { useAmbience } from '../features/ambience/AmbienceProvider';
+import { Switch } from '../components/ui/switch';
 
 /**
  * "Leave this alone" for one of the world's own clocks. Pressed, the day stops
@@ -271,19 +272,17 @@ export function LivingBackground() {
           </div>
           <div id="living-bg-panel-body" className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <div className="space-y-1 text-sm">
-              <label className="flex items-center gap-3">
-                <input
-                  type="checkbox"
+              <div className="flex items-center gap-3">
+                <Switch
                   aria-label="Ambient sounds"
                   checked={soundOn}
-                  onChange={(e) => setSoundOn(e.target.checked)}
-                  className="h-5 w-5 accent-primary"
+                  onCheckedChange={setSoundOn}
                 />
                 <span className="inline-flex items-center gap-2">
                   <Volume2 className="h-4 w-4" aria-hidden="true" />
                   Ambient sounds
                 </span>
-              </label>
+              </div>
               <div className="flex items-center gap-2">
                 <input
                   type="range"
@@ -415,29 +414,20 @@ export function LivingBackground() {
               </div>
             </div>
 
-            <label className="flex items-center gap-3 text-sm">
-              <input
-                type="checkbox"
+            <div className="flex items-center gap-3 text-sm">
+              <Switch
                 aria-label="Cursor companion"
                 checked={buddy}
-                onChange={toggleBuddy}
-                className="h-5 w-5 accent-primary"
+                onCheckedChange={() => toggleBuddy()}
               />
               <span className="inline-flex items-center gap-2">
                 <Sparkles className="h-4 w-4" aria-hidden="true" />
                 Cursor companion
               </span>
-            </label>
+            </div>
 
             <div>
-              <label className="flex items-start gap-3 text-sm">
-                <input
-                  type="checkbox"
-                  aria-label="Rainbow"
-                  checked={rainbow}
-                  onChange={(e) => { setRainbowValue(e.target.checked); setRainbow(e.target.checked); }}
-                  className="mt-0.5 h-5 w-5 accent-primary"
-                />
+              <div className="flex items-start justify-between gap-3 text-sm">
                 <span>
                   <span className="inline-flex items-center gap-2 font-medium">
                     <Rainbow className="h-4 w-4" aria-hidden="true" />
@@ -445,21 +435,24 @@ export function LivingBackground() {
                   </span>
                   <span className="block text-xs text-muted-foreground">Keeps one up. A rainstorm's own fades after a few seconds.</span>
                 </span>
-              </label>
-              <br></br>
-              <label className="flex items-start gap-3 text-sm">
-                <input
-                  type="checkbox"
-                  aria-label="Hide the standard background"
-                  checked={clearBackground}
-                  onChange={(e) => setClearBackground(e.target.checked)}
-                  className="mt-0.5 h-5 w-5 accent-primary"
+                <Switch
+                  aria-label="Rainbow"
+                  checked={rainbow}
+                  onCheckedChange={(checked) => { setRainbowValue(checked); setRainbow(checked); }}
                 />
+              </div>
+              <br></br>
+              <div className="flex items-start justify-between gap-3 text-sm">
                 <span>
                   <span className="block font-medium">Hide the standard background</span>
                   <span className="block text-xs text-muted-foreground">Page background to 0% opacity behind the world.</span>
                 </span>
-              </label>
+                <Switch
+                  aria-label="Hide the standard background"
+                  checked={clearBackground}
+                  onCheckedChange={setClearBackground}
+                />
+              </div>
             </div>
 
             <label className="space-y-1 text-sm">
