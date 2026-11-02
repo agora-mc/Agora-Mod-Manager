@@ -39,7 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OFFICIAL_ROOT = REPO_ROOT / "packages" / "official"
 REGISTRY_ROOT = REPO_ROOT / "registry" / "official-plugins"
 DEFAULT_OUT = REPO_ROOT / "dist" / "official-plugins"
-DEFAULT_REPO = "agora-mc/Agora-Launcher"
+DEFAULT_REPO = "agora-mc/Agora-Mod-Manager"
 MIN_AGORA_VERSION = "0.1.0"
 NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # 1980-01-01 00:00:00 is the earliest timestamp a ZIP can represent.
