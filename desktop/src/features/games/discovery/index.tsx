@@ -3,3 +3,4 @@
  */
 
 export { SetupInstallsSection } from './SetupInstallsSection';
+export { AddGameFolderButton, gameErrorMessage } from './addGameFolder';

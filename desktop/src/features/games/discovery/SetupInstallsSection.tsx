@@ -7,15 +7,14 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { FolderPlus, RefreshCw, Trash2 } from 'lucide-react';
+import { RefreshCw, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
-import { pickDirectory } from '@/lib/tauri';
-import { isGamesError, type InstallSummary } from '../shared/types';
+import type { InstallSummary } from '../shared/types';
 import { listGameSupport, type GameSupportRow } from '../support/api';
 import { gamesToOffer } from '../support/enabled';
+import { AddGameFolderButton, gameErrorMessage } from './addGameFolder';
 import {
-  addGameFolder,
   discoverGames,
   listInstalledGames,
   removeGameFolder,
@@ -41,13 +40,6 @@ const STORE_NAMES: Record<string, string> = {
 
 function storeName(store: string): string {
   return STORE_NAMES[store] ?? store;
-}
-
-/** The message to show for a failure: the core's own sentence when there is one. */
-function messageOf(error: unknown): string {
-  if (isGamesError(error)) return error.message;
-  if (error instanceof Error) return error.message;
-  return 'Something went wrong. Try again.';
 }
 
 /** Why an install's version or runtime is unknown, as sentences for a person. */
@@ -89,7 +81,7 @@ export function SetupInstallsSection(_props: SetupInstallsSectionProps) {
     } catch (caught) {
       setGames(null);
       setScan(null);
-      setError(messageOf(caught));
+      setError(gameErrorMessage(caught));
     } finally {
       setLoading(false);
     }
@@ -98,29 +90,6 @@ export function SetupInstallsSection(_props: SetupInstallsSectionProps) {
   useEffect(() => {
     void load();
   }, [load]);
-
-  const addFolder = async () => {
-    setNotice(null);
-    let picked: string | null;
-    try {
-      picked = await pickDirectory('Choose the folder the game is installed in');
-    } catch (caught) {
-      setError(messageOf(caught));
-      return;
-    }
-    if (!picked) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const added = await addGameFolder(picked);
-      setNotice(`Added ${added.path} as ${added.gameName}.`);
-      await load();
-    } catch (caught) {
-      setError(messageOf(caught));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const removeFolder = async (folder: ListedGameFolder) => {
     const ok = await confirm({
@@ -138,7 +107,7 @@ export function SetupInstallsSection(_props: SetupInstallsSectionProps) {
       setNotice(`Stopped searching ${removed}. Its files were not touched.`);
       await load();
     } catch (caught) {
-      setError(messageOf(caught));
+      setError(gameErrorMessage(caught));
     } finally {
       setBusy(false);
     }
@@ -174,10 +143,18 @@ export function SetupInstallsSection(_props: SetupInstallsSectionProps) {
             <RefreshCw aria-hidden="true" />
             Rescan
           </Button>
-          <Button type="button" size="sm" onClick={addFolder} disabled={busy || loading}>
-            <FolderPlus aria-hidden="true" />
-            Add a game folder…
-          </Button>
+          <AddGameFolderButton
+            size="sm"
+            disabled={busy || loading}
+            onError={(message) => {
+              setNotice(null);
+              setError(message);
+            }}
+            onAdded={async (added) => {
+              setNotice(`Added ${added.path} as ${added.gameName}.`);
+              await load();
+            }}
+          />
         </div>
       </header>
 

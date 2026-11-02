@@ -22,6 +22,7 @@ function answer(overrides: Record<string, unknown> = {}) {
       return reply;
     }
     if (command === 'games_support_list') return rows;
+    if (command === 'games_list') return { games: [] };
     if (command === 'list_official_plugins') return { plugins: [], unavailableReason: null };
     if (command === 'games_support_set_enabled') return null;
     if (command === 'get_setting') return null;
@@ -75,6 +76,39 @@ describe('GameSupportSettings', () => {
     render(<GameSupportSettings />);
     fireEvent.click(await screen.findByRole('button', { name: 'Try again' }));
     expect(await screen.findByRole('checkbox', { name: 'Offer Valheim' })).toBeInTheDocument();
+  });
+
+  it('offers Add game folder for a game discovery did not find, and marks it found after the add', async () => {
+    let hasInstall = false;
+    answer({
+      games_support_list: [
+        rows[0],
+        { gameId: 'skyrim-se', name: 'Skyrim Special Edition', source: { kind: 'plugin', pluginId: 'agora.skyrim' }, enabled: true, canDisable: true },
+      ],
+      games_list: () => ({
+        games: hasInstall
+          ? [{ gameId: 'skyrim-se', name: 'Skyrim Special Edition', installs: [{}] }]
+          : [],
+      }),
+      pick_directory: 'D:/Games/Skyrim',
+      games_add_folder: () => {
+        hasInstall = true;
+        return { path: 'D:/Games/Skyrim', gameId: 'skyrim-se', gameName: 'Skyrim Special Edition' };
+      },
+    });
+    render(<GameSupportSettings />);
+
+    expect(await screen.findByText('Not found on this computer.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Add game folder for Minecraft: Java Edition' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add game folder for Skyrim Special Edition' }));
+
+    expect(await screen.findByText('Added D:/Games/Skyrim as Skyrim Special Edition.')).toBeInTheDocument();
+    expect(await screen.findByText('Found on this computer.')).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith('pick_directory', {
+      title: 'Choose the folder the game is installed in',
+    });
+    expect(invokeMock).toHaveBeenCalledWith('games_add_folder', { path: 'D:/Games/Skyrim' });
   });
 
   it('turns a game on and records it, sending the id and state', async () => {

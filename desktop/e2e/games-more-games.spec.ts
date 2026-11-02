@@ -86,6 +86,34 @@ async function boot(page: Page) {
   });
 }
 
+/**
+ * Answers the folder flow from a small stateful script. `games_list` is empty until a folder is
+ * added, so the card and Settings both see "not found" first and "found" after.
+ */
+async function driveAddFolder(page: Page, config: {
+  before: unknown[];
+  after: unknown[];
+  picked: string;
+  added: { path: string; gameId: string; gameName: string };
+}) {
+  await page.addInitScript((script) => {
+    const tauri = (window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+    }).__TAURI_INTERNALS__;
+    const original = tauri.invoke;
+    let added = false;
+    tauri.invoke = (command: string, args: Record<string, unknown> = {}) => {
+      if (command === 'games_list') return Promise.resolve({ games: added ? script.after : script.before });
+      if (command === 'pick_directory') return Promise.resolve(script.picked);
+      if (command === 'games_add_folder') {
+        added = true;
+        return Promise.resolve(script.added);
+      }
+      return original(command, args);
+    };
+  }, config);
+}
+
 test.afterEach(async ({ page }) => {
   await expectNoUnmockedCommands(page);
 });
@@ -103,6 +131,65 @@ test('Home shows a game to add, asks for consent, and says to restart', async ({
   await expect(page.getByText('Add a game to Agora')).toBeVisible();
 
   await page.getByRole('button', { name: 'Install', exact: true }).click();
-  await expect(page.getByText('Restart Agora to add Skyrim Special Edition.')).toBeVisible();
+  await expect(page.getByText('Restart Agora to finish adding Skyrim Special Edition.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Restart now' })).toBeVisible();
+});
+
+test('a plugin with no install found can be pointed at its folder from Settings › Game support', async ({ page }) => {
+  const skyrimInstall = {
+    installId: 'direct-d-games-skyrim',
+    store: 'direct',
+    name: 'Skyrim Special Edition',
+    location: 'D:/Games/Skyrim',
+    storeVersion: null,
+    storeBuild: null,
+    addOnCount: 0,
+    installBytes: null,
+    runtime: { status: 'unidentified', reasons: ['The executable could not be read.'] },
+  };
+  await installGamesMock(page, {
+    replies: {
+      ...BOOT_REPLIES,
+      list_official_plugins: { plugins: [skyrimPlugin], unavailableReason: null },
+      games_support_list: [
+        { gameId: 'minecraft', name: 'Minecraft: Java Edition', source: { kind: 'builtIn' }, enabled: true, canDisable: false },
+        { gameId: 'skyrim-se', name: 'Skyrim Special Edition', source: { kind: 'plugin', pluginId: 'agora.skyrim' }, enabled: true, canDisable: true },
+      ],
+      // Settings reads these on the way to the Game support list.
+      games_base_list: { bases: [], damaged: [] },
+      is_portable_mode: false,
+      msa_get_status: null,
+      msa_list_accounts: [],
+      credential_storage_status: null,
+      get_auth_status: false,
+    },
+    sequences: {
+      install_official_plugin: [
+        { outcome: 'needsConsent', preview: consentPreview },
+        { outcome: 'installed', plugin: { id: 'agora.skyrim', name: 'Skyrim Special Edition', version: '1.0.0' } },
+      ],
+    },
+    settings: { active_game: 'minecraft' },
+  });
+  await driveAddFolder(page, {
+    before: [],
+    after: [{ gameId: 'skyrim-se', name: 'Skyrim Special Edition', installs: [skyrimInstall] }],
+    picked: 'D:/Games/Skyrim',
+    added: { path: 'D:/Games/Skyrim', gameId: 'skyrim-se', gameName: 'Skyrim Special Edition' },
+  });
+  await page.goto('/');
+
+  // Install from More games: the game is added, but discovery does not find it yet.
+  await page.getByRole('button', { name: 'Install Skyrim Special Edition' }).click();
+  await page.getByRole('button', { name: 'Install', exact: true }).click();
+  await expect(page.getByText('Agora did not find Skyrim Special Edition on this computer. Add the folder it is in.')).toBeVisible();
+
+  // The same player can finish the job from Settings › Game support.
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('tablist', { name: / pages$/ }).getByRole('tab', { name: 'Game support' }).click();
+  await expect(page.getByText('Not found on this computer.')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Add game folder for Skyrim Special Edition' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Added D:/Games/Skyrim as Skyrim Special Edition.' })).toBeVisible();
+  await expect(page.getByText('Found on this computer.')).toBeVisible();
 });

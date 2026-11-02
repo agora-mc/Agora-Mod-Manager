@@ -18,7 +18,13 @@ Skyrim SE is an official plugin (`packages/official/skyrim-se/`, plugin id
 `packages/official/**` or `registry/official-plugins/**` changes. It builds each package zip
 reproducibly, verifies that `registry/official-plugins/<plugin-id>.json` pins those exact bytes, and
 attaches the zip to the `official-<name>-v<version>` release. That release URL is the one the signed
-registry names, so the asset must be published before a catalog that lists it.
+registry names, so the asset must be published before a catalog that lists it. The catalog compile
+now enforces this: it downloads every `package_url` in `registry/official-plugins/`. A missing,
+private or unreachable asset leaves that plugin entry out of the catalog and logs a warning (shown
+as a GitHub Actions `::warning::` annotation in the nightly run); the rest of the catalog still
+compiles. A package whose bytes do not match the pinned `size` or `sha256` is a hard failure,
+because that means the registry entry itself is wrong. Publishing the asset before the entry is
+still the order that gets the plugin into the catalog.
 
 To release a new plugin version:
 

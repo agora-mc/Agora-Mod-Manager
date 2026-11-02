@@ -12,6 +12,7 @@ This page covers local builds and validation. Player instructions belong in the 
 | `packages/official/` | Official plugin packages released separately from the app (Skyrim SE) |
 | `crates/agora/` | Standalone CLI |
 | `crates/agora-plugin-api/`, `crates/agora-plugin-host/` | Plugin contract, and the QuickJS host that runs plugin scripts |
+| `crates/agora-vfs/`, `crates/agora-vfs-inject/` | Windows copy-on-write VFS injected into games, and the import-table injector it shares with the launcher |
 | `crates/agora-game-api/` | Experimental game package/host contract; [manifest v3 design](architecture/game-api.md) |
 | `sdk/`, `examples/plugins/`, `docs/plugins/` | Plugin author types, runnable examples (exercised by core's end-to-end tests), and the author guide |
 | `desktop/` | Tauri desktop application and React UI |
@@ -82,11 +83,14 @@ Activate the environment, then:
 
 ```bash
 pip install -r requirements.txt
-python compile.py --skip-sign --no-governance-write --governance-mode off --out ../registry.db
+python compile.py --skip-sign --skip-official-asset-check --no-governance-write --governance-mode off --out ../registry.db
 python ../scripts/verify_db.py
 ```
 
 Use `--skip-sign` only for local development. Production clients must not trust unsigned catalog output.
+Use `--skip-official-asset-check` only for local development or tests: the release compile downloads
+every official plugin package, leaves out an entry whose asset is missing and warns, and refuses an
+entry whose bytes do not match its pinned size or sha256.
 
 ## Official plugin packages
 
@@ -154,12 +158,25 @@ Rust:
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p agora-core -p agora-game-api -p agora-game-minecraft -p agora-game-creation -p agora-cli --all-targets --all-features -- -D warnings
+cargo clippy -p agora-core -p agora-game-api -p agora-game-minecraft -p agora-game-creation -p agora-plugin-host -p agora-cli --all-targets --all-features -- -D warnings
 cargo test -p agora-core --lib --tests
 cargo test -p agora-game-api -p agora-game-minecraft -p agora-game-creation --lib --tests
+cargo test -p agora-plugin-host --lib --tests
 cargo test -p agora-cli
 cargo check -p agora-desktop
 ```
+
+On Windows, also build and lint the VFS crates. The ignored matrix and real-injection tests
+run in the `vfs-injection` CI job; they need no administrator rights and start only Agora's
+test fixtures, never a real game:
+
+```bash
+cargo clippy -p agora-vfs -p agora-vfs-inject --all-targets -- -D warnings
+cargo test -p agora-vfs -p agora-vfs-inject --lib --tests
+```
+
+The commands for the ignored tests, and what each needs, are in
+[`crates/agora-vfs/README.md`](../crates/agora-vfs/README.md#tests).
 
 Desktop frontend (from `desktop/`): `npm run build && npm run typecheck:e2e && npm run test:unit`.
 `npm run build` runs the boundary checks, `tsc` and `vite build`. `typecheck:e2e` checks the
