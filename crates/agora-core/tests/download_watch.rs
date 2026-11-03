@@ -406,3 +406,37 @@ fn the_nexus_label_is_only_a_label() {
         .unwrap();
     assert_eq!(plain.nexus_mod_id, None);
 }
+
+// A re-download under the same name replaces its old notice: one file, one row.
+#[test]
+fn a_changed_file_replaces_its_old_notice() {
+    let (_tmp, ctx) = test_ctx();
+    let downloads = tempfile::tempdir().unwrap();
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+    let path = downloads.path().join("Cool.zip");
+    create_zip(&path, &[("Cool.esp", b"esp")]);
+    assert_eq!(scan_until_stable(&mut state, &ctx).len(), 1);
+    create_zip(&path, &[("Cool.esp", b"a different, longer payload")]);
+    state.scan(&ctx).unwrap();
+    assert_eq!(state.scan(&ctx).unwrap().len(), 1);
+
+    let rows = download_watch::list(&ctx).unwrap();
+    assert_eq!(rows.len(), 1, "one file, one row; got {} rows", rows.len());
+}
+
+// A baseline file replaced with different content is offered: the baseline remembers the content.
+#[test]
+fn a_baseline_file_replaced_with_new_content_is_offered() {
+    let (_tmp, ctx) = test_ctx();
+    let downloads = tempfile::tempdir().unwrap();
+    let path = downloads.path().join("Cool.zip");
+    create_zip(&path, &[("Cool.esp", b"esp")]);
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+    create_zip(&path, &[("Other.esp", b"a different, longer payload")]);
+    let found = scan_until_stable(&mut state, &ctx);
+    assert_eq!(found.len(), 1, "the replaced file is new content");
+}

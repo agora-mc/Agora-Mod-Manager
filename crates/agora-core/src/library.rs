@@ -10,7 +10,7 @@
 //! so an item is joined to it by object hash (and by a recorded item id when one is present).
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agora_game_api::LayerSource;
 use serde::{Deserialize, Serialize};
@@ -1065,27 +1065,19 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
         warnings: Vec::new(),
         unreadable: Vec::new(),
     };
-    let root = ctx.paths.instances_root();
-    if !root.exists() {
-        return scan;
+    let mut dirs = Vec::new();
+    collect_instance_dirs(&ctx.paths.instances_root(), None, &mut dirs, &mut scan);
+    // An instance in Recently deleted still restores its items, so it still uses them. Both
+    // Agora's game trash and Minecraft's keep `<entry>/instance/instance_manifest.json`; a purged
+    // entry's folder is gone, so it stops counting on its own.
+    for root in [
+        ctx.paths.recently_deleted_games_root(),
+        ctx.paths.recently_deleted_root(),
+    ] {
+        collect_instance_dirs(&root, Some("instance"), &mut dirs, &mut scan);
     }
-    let entries = match std::fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            let message = format!("Instances could not be listed: {error}");
-            scan.warnings.push(message.clone());
-            scan.unreadable.push(UnreadableInstanceManifest {
-                manifest_path: root.display().to_string(),
-                error: message,
-            });
-            return scan;
-        }
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
+
+    for dir in dirs {
         let manifest_path = dir.join("instance_manifest.json");
         if !manifest_path.is_file() {
             continue;
@@ -1158,4 +1150,42 @@ fn scan_instances(ctx: &Ctx) -> InstanceScan {
         });
     }
     scan
+}
+
+/// Every folder under `root`, or every `<folder>/<subdir>` when `subdir` is given. An unreadable
+/// root is a warning and a fail-closed unreadable manifest, never a silent "no instances".
+fn collect_instance_dirs(
+    root: &Path,
+    subdir: Option<&str>,
+    dirs: &mut Vec<PathBuf>,
+    scan: &mut InstanceScan,
+) {
+    if !root.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let message = format!("Instances could not be listed: {error}");
+            scan.warnings.push(message.clone());
+            scan.unreadable.push(UnreadableInstanceManifest {
+                manifest_path: root.display().to_string(),
+                error: message,
+            });
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let dir = match subdir {
+            Some(subdir) => dir.join(subdir),
+            None => dir,
+        };
+        if dir.is_dir() {
+            dirs.push(dir);
+        }
+    }
 }
