@@ -102,7 +102,7 @@ export function RecentlyDeletedPanel({
               <div className="min-w-0">
                 <p className="wrap-break-word font-medium">{entry.name}</p>
                 <p className="text-xs text-muted-foreground">
-                  Deleted {formatDeletedDay(entry.deletedAt)} · {formatDeletedSize(entry.sizeBytes)} · removed for good after {formatDeletedDay(entry.expiresAt)}
+                  Deleted {formatDeletedDay(entry.deletedAt)} · {formatDeletedSize(entry.sizeBytes)} · to the Recycle Bin after {formatDeletedDay(entry.expiresAt)}
                 </p>
               </div>
             </div>
