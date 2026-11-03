@@ -1,5 +1,4 @@
 import { test, expect, type Page } from '@playwright/test';
-import { setSwitch } from './support/switches';
 import { expectNoUnmockedCommands, instanceHeaderReplies, installGamesMock } from './support/games-mock';
 
 /**
@@ -63,7 +62,7 @@ const odin = {
   sourceKind: 'archive',
   sourceLabel: 'Archive: odin.zip',
   addedAtUnixMs: 1,
-  gameIds: [],
+  gameIds: [] as string[],
 };
 
 const sky = {
@@ -74,7 +73,7 @@ const sky = {
   sourceKind: 'archive',
   sourceLabel: 'Archive: sky.7z',
   addedAtUnixMs: 1,
-  gameIds: [],
+  gameIds: [] as string[],
 };
 
 /** A store item as the Library lists it (`games_library_list`). */
