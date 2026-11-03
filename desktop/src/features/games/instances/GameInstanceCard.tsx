@@ -3,6 +3,8 @@
  * Minecraft's) filled with this game's facts, and the actions the games backend supports today.
  * Launch starts the game from here through the shared launch controller, so the instance page
  * shows the same launch; an answer that needs a decision sends the player there with "Review".
+ * Stop takes Launch's place while the game runs; Clone sits where Minecraft's does. Only the
+ * actions the instance's own capabilities allow are shown.
  */
 
 import {
@@ -15,7 +17,8 @@ import {
 } from '@/components/instance-kit';
 import type { InstanceCard } from './api';
 import { createdOn, playedWhen } from './instanceDates';
-import { GAME_INSTANCE_CAPABILITIES, GameInstanceTile, InstanceChips } from './instanceIdentity';
+import { gameKitCapabilities, GameInstanceTile, InstanceChips } from './instanceIdentity';
+import { playedText } from './instanceActions';
 import { dismissGameLaunch, startGameLaunch, useAnyGameLaunching, useGameLaunch } from './launchController';
 
 interface GameInstanceCardProps {
@@ -23,12 +26,19 @@ interface GameInstanceCardProps {
   /** Open the instance's page (Edit, and Review after a launch that needs an answer). */
   onOpen: () => void;
   onDelete: () => void;
+  /** Clone (opens the dialog). */
+  onClone: () => void;
+  /** Stop the running game (asks first). */
+  onStop: () => void;
   /** This card's delete is in flight. */
   deleting: boolean;
+  /** This card's Stop is in flight. */
+  stopping?: boolean;
   /** Another card's action is in flight: hold this card's changes until it finishes. */
   locked: boolean;
   /** A launch from this card has answered; the list reloads to show the running state. */
   onLaunchSettled: () => void;
+  /** Overrides the card's own capabilities (tests). */
   capabilities?: InstanceCapabilities;
 }
 
@@ -36,11 +46,15 @@ export function GameInstanceCard({
   card,
   onOpen,
   onDelete,
+  onClone,
+  onStop,
   deleting,
+  stopping = false,
   locked,
   onLaunchSettled,
-  capabilities = GAME_INSTANCE_CAPABILITIES,
+  capabilities: capabilitiesOverride,
 }: GameInstanceCardProps) {
+  const capabilities = capabilitiesOverride ?? gameKitCapabilities(card.capabilities);
   const launch = useGameLaunch(card.instanceId);
   const anyLaunching = useAnyGameLaunching();
   const { reply, error } = launch;
@@ -55,7 +69,16 @@ export function GameInstanceCard({
   };
 
   const actions: InstanceAction[] = [];
-  if (!card.running) {
+  if (card.running) {
+    actions.push({
+      id: 'stop',
+      label: stopping ? 'Stopping…' : 'Stop',
+      ariaLabel: `Stop ${card.name}`,
+      busy: stopping,
+      title: 'Close the game. Anything not saved in the game is lost.',
+      onSelect: onStop,
+    });
+  } else {
     actions.push({
       id: 'launch',
       label: launch.busy ? 'Starting…' : 'Launch',
@@ -74,6 +97,14 @@ export function GameInstanceCard({
     onSelect: onOpen,
   });
   actions.push({
+    id: 'clone',
+    label: 'Clone',
+    ariaLabel: `Clone ${card.name}`,
+    disabled: locked || launch.busy,
+    title: 'Make a copy of this instance',
+    onSelect: onClone,
+  });
+  actions.push({
     id: 'delete',
     label: 'Delete',
     ariaLabel: `Delete ${card.name}`,
@@ -84,10 +115,12 @@ export function GameInstanceCard({
   });
 
   const created = createdOn(card.createdAt);
+  const lastPlayed = card.lastPlayedAt ?? card.lastLaunchedAt;
+  const played = capabilities.playTime ? playedText(card.playTimeMs) : null;
   const status = card.running ? (
     <RunningIndicator>Running now</RunningIndicator>
-  ) : card.lastLaunchedAt ? (
-    `Last played ${playedWhen(card.lastLaunchedAt)}`
+  ) : lastPlayed ? (
+    `Last played ${playedWhen(lastPlayed)}${played === null ? '' : ` · ${played}`}`
   ) : (
     'Never played'
   );

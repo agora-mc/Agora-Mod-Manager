@@ -51,6 +51,7 @@ import { LaunchFailedBanner } from '../components/LaunchFailedBanner';
 import { HealthNotice, ReviewBeforeLaunchButtons } from '../components/HealthLaunchControls';
 import { PackInstallProgressBar, usePackInstall, type PackInstallTask } from '../components/PackInstallProgress';
 import { useConfirm } from '@/components/ui/confirm';
+import { CloneDialog } from '@/components/instance-kit';
 import { Switch } from '@/components/ui/switch';
 import { formatPlayTime } from '@/lib/utils';
 import {
@@ -1575,62 +1576,21 @@ function CloneInstanceDialog({
   onClose: () => void;
   onCloned: () => void;
 }) {
-  const [name, setName] = useState(`Copy of ${instance.name}`);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const submit = async () => {
-    if (!name.trim()) {
-      setError('Enter a name for the clone.');
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      await cloneInstance(instance.instance_id, name.trim(), DEFAULT_CLONE_PREFS);
-      onCloned();
-    } catch (e) {
-      setError(formatError(e));
-      setBusy(false);
-    }
-  };
-
   return (
-    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="max-w-md">
-        <DialogTitle>Clone Instance</DialogTitle>
-        <DialogDescription>
+    <CloneDialog
+      sourceName={instance.name}
+      description={
+        <>
           Creates a full copy of "{instance.name}" including saves, mods, resource packs,
           shaders, config, and options. The original instance is not modified.
-        </DialogDescription>
-        <div className="space-y-4">
-          <label className="block">
-            <span className="text-sm font-medium">New instance name</span>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-            />
-          </label>
-          {error && <p className="text-xs text-destructive">{error}</p>}
-        </div>
-        <div className="mt-6 flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            disabled={busy}
-            className="rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={submit}
-            disabled={busy}
-            className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {busy ? 'Cloning…' : 'Clone'}
-          </button>
-        </div>
-      </DialogContent>
-    </Dialog>
+        </>
+      }
+      onClose={onClose}
+      errorText={formatError}
+      onSubmit={async (name) => {
+        await cloneInstance(instance.instance_id, name, DEFAULT_CLONE_PREFS);
+        onCloned();
+      }}
+    />
   );
 }

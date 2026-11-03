@@ -7,6 +7,9 @@ import { GAME_IMPORT_REQUEST_EVENT, peekGameImportRequest, takeGameImportRequest
 import { GameImportDialog } from '../import';
 import { CreateInstanceDialog } from './CreateInstanceDialog';
 import { GameInstanceCard } from './GameInstanceCard';
+import { DEFAULT_RETENTION_DAYS, GameRecentlyDeleted } from './GameRecentlyDeleted';
+import { GameCloneDialog, useStopGameInstance } from './instanceActions';
+import { daysText } from '@/components/instance-kit';
 import {
   deleteGameInstance,
   gamesErrorCode,
@@ -30,7 +33,8 @@ type LoadState =
 
 /**
  * The Instances tab of a non-Minecraft game: the same page as Minecraft's "My Instances" (hero,
- * card grid, empty state), with this game's cards. Launch, Edit and Delete are on each card.
+ * card grid, empty state, Recently deleted), with this game's cards. Each card carries the
+ * actions its instance allows: Launch or Stop, Edit, Clone and Delete.
  */
 export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageProps) {
   const { confirm } = useConfirm();
@@ -41,6 +45,10 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [stoppingId, setStoppingId] = useState<string | null>(null);
+  const [cloneTarget, setCloneTarget] = useState<InstanceCard | null>(null);
+  const [retentionDays, setRetentionDays] = useState(DEFAULT_RETENTION_DAYS);
+  const stopInstance = useStopGameInstance();
   // Only the newest request may answer: a slow list must not overwrite a newer one.
   const latest = useRef(0);
 
@@ -96,9 +104,12 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
   }, [refresh]);
 
   const remove = async (card: InstanceCard) => {
+    const restorable = card.capabilities.trash;
     const approved = await confirm({
       title: `Delete ${card.name}?`,
-      body: 'This removes the instance and its folder. The game install and the pinned base are kept.',
+      body: restorable
+        ? `It moves to Recently deleted, below the cards, where you can restore it for ${daysText(retentionDays)}. The game install and the pinned base are kept.`
+        : 'This removes the instance and its folder for good. The game install and the pinned base are kept.',
       confirmLabel: 'Delete instance',
       tone: 'danger',
     });
@@ -124,16 +135,32 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
       const left = deleted.leftInPlace === null
         ? ''
         : ` A deployed game folder Agora could not check was left at ${deleted.leftInPlace}.`;
+      const done = deleted.trashEntryId === null
+        ? `${card.name} was deleted.`
+        : `${card.name} was moved to Recently deleted.`;
       setNotice(
         deleted.orphanedBase === null
-          ? `${card.name} was deleted.${left}`
-          : `${card.name} was deleted. The base ${deleted.orphanedBase} is no longer used by any instance. Remove it in Settings, on this game's Bases page, if you want the disk space back.${left}`,
+          ? `${done}${left}`
+          : `${done} The base ${deleted.orphanedBase} is no longer used by any instance. Remove it in Settings, on this game's Bases page, if you want the disk space back.${left}`,
       );
       load();
     } catch (error) {
       setActionError(`${card.name} was not deleted. ${gamesErrorMessage(error)}`);
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const stop = async (card: InstanceCard) => {
+    setActionError(null);
+    setNotice(null);
+    try {
+      const outcome = await stopInstance(card.instanceId, card.name, () => setStoppingId(card.instanceId));
+      if (outcome.status === 'done') setNotice(outcome.message);
+      if (outcome.status === 'failed') setActionError(outcome.message);
+      if (outcome.status !== 'cancelled') refresh();
+    } finally {
+      setStoppingId(null);
     }
   };
 
@@ -198,6 +225,9 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
                 card={card}
                 onOpen={() => onOpenInstance(card.instanceId)}
                 onDelete={() => void remove(card)}
+                onClone={() => setCloneTarget(card)}
+                onStop={() => void stop(card)}
+                stopping={stoppingId === card.instanceId}
                 deleting={busyId === card.instanceId}
                 locked={busyId !== null}
                 onLaunchSettled={refresh}
@@ -222,6 +252,29 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
               }
             />
           }
+        />
+      )}
+
+      {state.status !== 'failed' && (
+        <GameRecentlyDeleted
+          gameId={gameId}
+          refreshKey={state}
+          onRestored={refresh}
+          onRetentionDays={setRetentionDays}
+        />
+      )}
+
+      {cloneTarget !== null && (
+        <GameCloneDialog
+          instanceId={cloneTarget.instanceId}
+          name={cloneTarget.name}
+          onClose={() => setCloneTarget(null)}
+          onCloned={(clone) => {
+            setCloneTarget(null);
+            setActionError(null);
+            setNotice(`Made ${clone.name}, a copy of ${cloneTarget.name}.`);
+            refresh();
+          }}
         />
       )}
 

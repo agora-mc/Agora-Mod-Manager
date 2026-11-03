@@ -93,6 +93,7 @@ import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
 import { GameSupportSettings } from './settings/GameSupportSettings';
 import { NewInstancesSettings } from './settings/game/NewInstancesSettings';
+import { RecentlyDeletedSettings } from './settings/game/RecentlyDeletedSettings';
 import { settingsFrame } from './settings/game/settingsFrame';
 import { InstallsSection } from '../features/games/discovery';
 import { BasesSection } from '../features/games/bases';
@@ -2473,16 +2474,21 @@ export function Settings({
       id: 'game',
       label: selectedGameShortName,
       icon: SelectedGameIcon,
-      hint: 'Installs, bases, recovery',
+      hint: 'Instances, installs, bases',
       blurb: `Your choices for ${selectedGameName}.`,
       pages: [
         {
           id: 'new-instances',
-          label: 'New instances',
-          cards: ['game-new-instances'],
-          content: card('game-new-instances', (
-            <NewInstancesSettings gameId={selectedGameId} gameName={selectedGameShortName} />
-          )),
+          label: 'Instances',
+          cards: ['game-new-instances', 'game-recently-deleted'],
+          content: (
+            <>
+              {card('game-new-instances', (
+                <NewInstancesSettings gameId={selectedGameId} gameName={selectedGameShortName} />
+              ))}
+              {card('game-recently-deleted', <RecentlyDeletedSettings gameName={selectedGameShortName} />)}
+            </>
+          ),
         },
         {
           id: 'installs',

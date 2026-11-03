@@ -7,18 +7,36 @@
 import { InstanceIcon, MetaChip } from '@/components/InstanceIcon';
 import { instanceFamilyHue } from '@/lib/instanceIdentity';
 import { HueChip, type InstanceCapabilities } from '@/components/instance-kit';
-import type { DeploymentMode } from './api';
+import type { DeploymentMode, InstanceCapabilities as GameCapabilities } from './api';
 import { deploymentLabel } from './instanceText';
 import { useGameInstanceIcon } from './instanceIcons';
 
 /**
- * What a game instance can do today. Rename, clone, group, stop, trash and play time light up
- * here as their games commands land; until then the kit simply does not show them.
+ * What a game instance can do when the backend has not said (an older reply): launch and delete.
+ * Everything else lights up from the instance's own `capabilities`.
  */
 export const GAME_INSTANCE_CAPABILITIES: InstanceCapabilities = {
   launch: true,
   delete: true,
 };
+
+/**
+ * The instance's capabilities in the kit's words. The backend says `stop` where the kit says
+ * `kill`; Delete is always there (to Recently deleted when `trash` is set, for good otherwise).
+ */
+export function gameKitCapabilities(capabilities: GameCapabilities | undefined): InstanceCapabilities {
+  if (capabilities === undefined) return GAME_INSTANCE_CAPABILITIES;
+  return {
+    launch: capabilities.launch,
+    kill: capabilities.stop,
+    rename: capabilities.rename,
+    clone: capabilities.clone,
+    trash: capabilities.trash,
+    delete: true,
+    openFolder: capabilities.openFolder,
+    playTime: capabilities.playTime,
+  };
+}
 
 const STORE_NAMES: Record<string, string> = {
   steam: 'Steam',

@@ -1,8 +1,10 @@
 /**
  * The header every page of a game instance shares: a thin adapter that fills the kit's
  * `InstancePageHeader` (the same header as Minecraft's instance page) with this instance: its
- * tile, name and facts on the left, Launch and how ready it is on the right, and whatever a launch
- * answers right under it, so a launch started from any page (or from the instance's card) is seen.
+ * tile, name (with Rename) and facts on the left, Open in Folder, Launch (Stop while the game runs)
+ * and how ready it is on the right, and whatever a launch answers right under it, so a launch
+ * started from any page (or from the instance's card) is seen. Only what the instance's
+ * capabilities allow is shown.
  */
 
 import { useEffect, useState } from 'react';
@@ -11,14 +13,16 @@ import {
   InstancePageHeader,
   InstanceTileButton,
   ReadinessLine,
+  RenameLink,
   SetImageButton,
   type InstanceAction,
   type ReadinessView,
 } from '@/components/instance-kit';
-import { gamesErrorMessage, type DeploymentMode, type InstanceCheck, type LaunchReply } from './api';
+import { gamesErrorMessage, openGameInstanceFolder, type DeploymentMode, type InstanceCheck, type LaunchReply } from './api';
 import { checkHeadline, deploymentLabel, elapsedText, fallbackTradeoffs } from './instanceText';
 import { createdOn, playedWhen } from './instanceDates';
-import { GAME_INSTANCE_CAPABILITIES, GameInstanceTile, InstanceChips } from './instanceIdentity';
+import { gameKitCapabilities, GameInstanceTile, InstanceChips } from './instanceIdentity';
+import { playedText, useRenameGameInstance, useStopGameInstance, type ActionOutcome } from './instanceActions';
 import { chooseGameInstanceIcon, useGameInstanceIcon } from './instanceIcons';
 import { useInstanceSession } from './instanceSession';
 
@@ -42,6 +46,44 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
   const customIcon = useGameInstanceIcon(session.instanceId);
   const [imageBusy, setImageBusy] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
+  const [headerNotice, setHeaderNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+  const stopInstance = useStopGameInstance();
+  const renameInstance = useRenameGameInstance();
+
+  const report = (outcome: ActionOutcome) => {
+    if (outcome.status === 'cancelled') return;
+    setHeaderNotice({ tone: outcome.status === 'done' ? 'info' : 'error', text: outcome.message });
+    session.refreshInstance();
+  };
+
+  const stop = async (name: string) => {
+    setHeaderNotice(null);
+    try {
+      report(await stopInstance(session.instanceId, name, () => setStopping(true)));
+    } finally {
+      setStopping(false);
+    }
+  };
+
+  const rename = async (name: string) => {
+    setHeaderNotice(null);
+    report(await renameInstance(session.instanceId, name));
+  };
+
+  const openFolder = async () => {
+    setHeaderNotice(null);
+    try {
+      await openGameInstanceFolder(session.instanceId);
+    } catch (failure) {
+      setHeaderNotice({ tone: 'error', text: `The folder could not be opened. ${gamesErrorMessage(failure)}` });
+    }
+  };
+
+  // A notice belongs to the instance it was about.
+  useEffect(() => {
+    setHeaderNotice(null);
+  }, [session.instanceId]);
 
   const chooseImage = async () => {
     setImageBusy(true);
@@ -77,10 +119,19 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
   const created = createdOn(detail.createdAt);
   const elapsed = launchStartedAt === null ? 0 : (now - launchStartedAt) / 1000;
 
-  // While the game runs there is nothing to press until games can be stopped (`kill`): the
-  // header says it is running instead of showing a dead button.
-  const launch: InstanceAction | undefined = detail.running
-    ? undefined
+  const capabilities = gameKitCapabilities(detail.capabilities);
+
+  // While the game runs the big button is Stop, when Agora can stop it; otherwise the header says
+  // it is running instead of showing a dead button.
+  const primary: InstanceAction | undefined = detail.running
+    ? {
+        id: 'stop',
+        label: stopping ? 'Stopping…' : 'Stop',
+        ariaLabel: `Stop ${detail.name}`,
+        busy: stopping,
+        title: 'Close the game. Anything not saved in the game is lost.',
+        onSelect: () => void stop(detail.name),
+      }
     : {
         id: 'launch',
         label: busy === 'launch' ? 'Starting…' : 'Launch',
@@ -90,7 +141,20 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
         onSelect: () => void session.launch(),
       };
 
-  const showBanners = busy === 'launch' || reply !== null || actionError !== null || imageError !== null;
+  const secondary: InstanceAction[] = [
+    {
+      id: 'openFolder',
+      label: '📂 Open in Folder',
+      ariaLabel: 'Open in Folder',
+      title: "Open this instance's folder in your file manager",
+      onSelect: () => void openFolder(),
+    },
+  ];
+
+  const lastPlayed = detail.lastPlayedAt ?? detail.lastLaunchedAt;
+  const played = capabilities.playTime ? playedText(detail.playTimeMs) : null;
+
+  const showBanners = busy === 'launch' || reply !== null || actionError !== null || imageError !== null || headerNotice !== null;
 
   return (
     <InstancePageHeader
@@ -102,6 +166,7 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
         </InstanceTileButton>
       }
       name={detail.name}
+      nameAccessory={capabilities.rename && <RenameLink onSelect={() => void rename(detail.name)} />}
       status={detail.running && (
         <span className="rounded-full bg-primary px-2.5 py-0.5 text-xs font-semibold text-primary-foreground" role="status">
           Running now
@@ -117,17 +182,30 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
         />
       }
       facts={[
-        detail.lastLaunchedAt ? `Last played ${playedWhen(detail.lastLaunchedAt)}` : 'Never played',
+        lastPlayed ? `Last played ${playedWhen(lastPlayed)}` : 'Never played',
+        played,
         created === null ? null : `Created ${created}`,
       ]}
       factsTrail={<SetImageButton onSelect={() => void chooseImage()} disabled={imageBusy} />}
-      capabilities={GAME_INSTANCE_CAPABILITIES}
-      primaryAction={launch}
+      capabilities={capabilities}
+      secondaryActions={secondary}
+      primaryAction={primary}
       readiness={!detail.running && (
         <ReadinessLine readiness={readinessView(check, checkError, refreshing)} onSelect={onShowChecks} />
       )}
       banners={showBanners && (
         <>
+          {headerNotice !== null && (
+            <div
+              role={headerNotice.tone === 'error' ? 'alert' : 'status'}
+              className={headerNotice.tone === 'error'
+                ? 'flex items-start justify-between gap-3 rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive'
+                : 'flex items-start justify-between gap-3 rounded-lg border border-border p-3 text-sm'}
+            >
+              <p>{headerNotice.text}</p>
+              <button type="button" className="shrink-0 text-xs underline" onClick={() => setHeaderNotice(null)}>Dismiss</button>
+            </div>
+          )}
           {imageError !== null && (
             <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
               {imageError}

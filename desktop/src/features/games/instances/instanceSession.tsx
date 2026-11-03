@@ -49,6 +49,8 @@ export interface InstanceSession {
   setLaunchAnyway: (value: boolean) => void;
   /** Read the instance and run its checks again, keeping the last answer on screen meanwhile. */
   reload: () => void;
+  /** Read the instance again (name, running, play time) without re-running the checks. */
+  refreshInstance: () => void;
   changeDeployment: (choice: DeploymentChoice) => Promise<void>;
   launch: (deployment?: DeploymentMode) => Promise<void>;
   answerFallback: (next: DeploymentMode, always: boolean) => Promise<void>;
@@ -239,11 +241,12 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
     launchAnyway,
     setLaunchAnyway,
     reload,
+    refreshInstance: refreshDetail,
     changeDeployment,
     launch,
     answerFallback,
     dismissReply,
-  }), [instanceId, page, busy, launchStartedAt, reply, actionError, launchAnyway, reload, changeDeployment, launch, answerFallback, dismissReply]);
+  }), [instanceId, page, busy, launchStartedAt, reply, actionError, launchAnyway, reload, refreshDetail, changeDeployment, launch, answerFallback, dismissReply]);
 
   return <InstanceSessionContext.Provider value={session}>{children}</InstanceSessionContext.Provider>;
 }
