@@ -4,6 +4,7 @@ pub mod crash_diagnostics;
 pub mod crash_export;
 pub mod crash_investigator;
 pub mod dependency_ops;
+pub mod downloads;
 pub mod games;
 pub use agora_core::{download, error, models};
 pub use agora_game_minecraft::loader_manifests;
@@ -160,6 +161,7 @@ pub fn run() {
         .manage(LauncherState::default())
         .manage(mcp::McpServerManager::default())
         .manage(plugins::ManagedPlugins::default())
+        .manage(downloads::DownloadsWatcher::default())
         .manage(pending_cli_launch)
         .plugin(tauri_plugin_shell::init())
         // Deliberately no `tauri_plugin_sql` or `tauri_plugin_store`. Every
@@ -337,6 +339,11 @@ pub fn run() {
             commands::list_snapshot_versions,
             commands::export_crash_report,
             commands::get_setting,
+            downloads::downloads_list,
+            downloads::downloads_scan,
+            downloads::downloads_ignore,
+            downloads::downloads_add,
+            downloads::downloads_default_folder,
             commands::set_setting,
             commands::evaluate_controlify_offer,
             commands::decline_controlify_offer,
@@ -606,7 +613,17 @@ pub fn run() {
                             app.handle().clone(),
                             ctx.lock_manager.locks_root().to_path_buf(),
                         );
+                        let downloads_ctx = ctx.clone();
                         app.manage(ManagedCoreContext::new(std::sync::Mutex::new(ctx)));
+                        let watcher = app
+                            .state::<downloads::DownloadsWatcher>()
+                            .inner()
+                            .clone();
+                        downloads::watch_downloads(
+                            app.handle().clone(),
+                            downloads_ctx,
+                            watcher,
+                        );
                         Some(maintenance_ctx)
                     }
                     Err(e) => {

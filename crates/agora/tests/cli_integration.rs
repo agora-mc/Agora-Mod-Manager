@@ -5,6 +5,7 @@
 //! purity, error envelopes, exit codes, and import registration.  Tests
 //! avoid network access and never touch the user's real data root.
 
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -199,6 +200,7 @@ const TOP_LEVEL_COMMANDS: &[&str] = &[
     "plugin",
     "provider",
     "games",
+    "downloads",
     "template",
     "bisect",
     "governance",
@@ -6993,4 +6995,43 @@ fn import_plan_then_run_copies_a_prism_fixture_instance() {
         .join("mods")
         .join("a.jar")
         .is_file());
+}
+
+#[test]
+fn downloads_scan_recognises_a_jar_by_its_contents() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let downloads = tempfile::tempdir().unwrap();
+    let jar = downloads.path().join("Mystery-123-1.0.0-1700000000.jar");
+    {
+        let file = File::create(&jar).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("fabric.mod.json", options).unwrap();
+        zip.write_all(b"{}").unwrap();
+        zip.start_file("example/Mod.class", options).unwrap();
+        zip.write_all(b"class").unwrap();
+        zip.finish().unwrap();
+    }
+
+    let folder = downloads.path().to_string_lossy().to_string();
+    let run = run_agora(
+        &data_dir,
+        &["downloads", "scan", "--folder", &folder, "--json"],
+    );
+    assert!(
+        run.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let parsed = assert_json_stdout(&run);
+    let rows = parsed.as_array().expect("a list of recognised downloads");
+    assert_eq!(rows.len(), 1, "{parsed}");
+    assert_eq!(rows[0]["gameId"], "minecraft");
+    assert_eq!(rows[0]["kind"], "mod");
+    assert_eq!(rows[0]["reason"], "has fabric.mod.json");
+    assert_eq!(rows[0]["nexusModId"], "123");
+    assert_eq!(rows[0]["alreadyInLibrary"], false);
+    assert!(jar.is_file(), "the scan leaves the download alone");
 }

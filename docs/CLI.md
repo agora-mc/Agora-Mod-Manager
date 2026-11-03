@@ -253,6 +253,17 @@ master it cannot get past is reported as blocked: the only fix is to move that p
 the master, which sort does not do. `plugins masterlist` downloads the masterlist, and only when
 you ask for it.
 
+### Downloads
+
+Agora does not use the Nexus Mods or CurseForge APIs. It can notice the mod archives you
+download in a browser, but it recognises them by what is inside the archive, never by the file
+name. This command makes one classification pass for a folder and prints what Agora would offer
+in the desktop app's Library. Nothing is imported, and no file is moved, changed or deleted.
+
+| Command | Purpose |
+| --- | --- |
+| `agora downloads scan [--folder <path>] [--json]` | Classify the common mod archives (`.zip`, `.7z`, `.rar`, `.jar`, `.mrpack`) in a folder and print each one's game, kind and the reason it was recognised. Browser partials are skipped, and an unrelated archive is left out. Anything already in the content store is marked `already in your library`. The default folder is the one Agora watches, else your Downloads folder |
+
 ### Catalog
 
 | Command | Purpose |

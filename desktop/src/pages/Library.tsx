@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { isGamesError } from '@/features/games/shared/types';
+import { NewDownloadsSection } from '@/features/downloads/NewDownloadsSection';
 import {
   addLibraryItem,
   fillMissingLibraryDetails,
@@ -333,6 +334,8 @@ export function LibraryPage() {
           </ul>
         </div>
       )}
+
+      <NewDownloadsSection onLibraryChanged={() => void load()} />
 
       {unused && (unused.items.length > 0 || unused.warnings.length > 0) && (
         <div

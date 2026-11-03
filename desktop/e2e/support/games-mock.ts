@@ -55,6 +55,12 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
           warnings: [],
         },
         set_content_sharing: null,
+        // The shell asks for recognised downloads on every page for the Library badge. A null
+        // list is a failed read; an empty one is "nothing new", which is what these specs mean.
+        downloads_list: [],
+        downloads_scan: 0,
+        downloads_default_folder: null,
+        downloads_ignore: null,
         ...table.replies,
       };
       const sequences: Record<string, unknown[]> = {};
@@ -97,6 +103,28 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
               settings[String(args.key)] = args.value;
               persistSettings();
               return Promise.resolve(null);
+            }
+            if (command === 'downloads_add' || command === 'downloads_ignore') {
+              // Adding or ignoring a recognised download takes it out of the Library list, as the
+              // real store does. A spec may still answer the command itself through `replies`.
+              const list = replies.downloads_list;
+              if (Array.isArray(list)) {
+                const index = list.findIndex(
+                  (row) =>
+                    row !== null
+                    && typeof row === 'object'
+                    && (row as { sha256?: unknown }).sha256 === args.sha256,
+                );
+                if (index >= 0) list.splice(index, 1);
+              }
+              if (Object.prototype.hasOwnProperty.call(replies, command)) {
+                return Promise.resolve(replies[command]);
+              }
+              return Promise.resolve(
+                command === 'downloads_add'
+                  ? { status: 'added', itemId: 'f'.repeat(64) }
+                  : null,
+              );
             }
             if (command === 'games_support_set_enabled') {
               // The list a Settings toggle changes is the same one later reads get.
@@ -216,4 +244,7 @@ export const OTHER_SLICES_REPLIES: Record<string, unknown> = {
   games_library_instances: { instances: [], warnings: [] },
   games_library_icon: null,
   games_library_cache_icon: { saved: false, matched: 0, iconDataUrl: null },
+  downloads_list: [],
+  downloads_scan: 0,
+  downloads_default_folder: null,
 };

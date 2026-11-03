@@ -23,7 +23,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ensure_room_for_declared, fold_case, is_reparse_point_or_symlink, validate_entry_path,
-    validate_path_set, ContentError, StagedEntry, StagingGuard, HASH_BUFFER_SIZE,
+    validate_path_set, ContentError, ListedArchiveEntry, StagedEntry, StagingGuard,
+    HASH_BUFFER_SIZE,
 };
 use crate::ctx::Ctx;
 
@@ -324,6 +325,34 @@ fn run_listing(tar: &Path, archive: &Path) -> Result<Vec<u8>, ContentError> {
         return Err(tar_failure(&output.stderr));
     }
     Ok(output.stdout)
+}
+
+/// List a RAR's file entries without extracting anything, through the same `tar -tvf` listing and
+/// rules `stage_rar` uses.
+pub(super) fn list_rar_entries(
+    archive_path: &Path,
+) -> Result<Vec<ListedArchiveEntry>, ContentError> {
+    let tar = tar_exe_path()?;
+    let listing = run_listing(&tar, archive_path)?;
+    let entries = parse_tar_listing(&listing)?;
+    if entries.is_empty() {
+        return Err(ContentError::CorruptArchive(
+            "Windows' tar found no files in this RAR archive: it is damaged, or not a RAR archive"
+                .to_string(),
+        ));
+    }
+    let plan = plan_from_listing(entries)?;
+    Ok(plan
+        .files
+        .into_iter()
+        .enumerate()
+        .map(|(index, (rel_path, size))| ListedArchiveEntry {
+            name: rel_path.as_str().to_string(),
+            index,
+            rel_path,
+            size,
+        })
+        .collect())
 }
 
 /// Total size of the files under `dir`, ignoring anything that cannot be read.
