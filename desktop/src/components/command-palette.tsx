@@ -28,6 +28,11 @@ interface CommandPaletteProps {
   /** Games the user can switch to. Shown only when there is one (the switcher's rule). */
   switchGameItems?: { gameId: string; label: string }[];
   onSwitchGame?: (gameId: string) => void;
+  /**
+   * The selected game's short name when it is not Minecraft, so its own Settings pages
+   * (Instances, Installs, Bases, Recovery) are offered too.
+   */
+  gameSettingsName?: string | null;
 }
 
 /** The palette's navigation entries, the same for every game (see `gameNav`). */
@@ -58,6 +63,7 @@ export function CommandPalette({
   onNavigate,
   switchGameItems = NO_GAMES,
   onSwitchGame,
+  gameSettingsName = null,
 }: CommandPaletteProps) {
   const { plugins, ofKind } = usePlugins();
   const [query, setQuery] = useState('');
@@ -108,7 +114,7 @@ export function CommandPalette({
       // Named sections of Settings, found by their label or what they cover.
       // Only offered where Settings is a destination of the shown game.
       ...(settingsItems.some((item) => item.tab === 'settings')
-        ? matchSettingsSections(query).map((entry) => ({
+        ? matchSettingsSections(query, gameSettingsName).map((entry) => ({
             __type: 'setting' as const,
             label: entry.label,
             tab: 'settings' as const,
@@ -153,7 +159,7 @@ export function CommandPalette({
     });
     if (commands.length) r.push({ __section: 'Plugin commands' }, ...commands);
     return r;
-  }, [query, instances, ofKind, plugins, switchGameItems]);
+  }, [query, instances, ofKind, plugins, switchGameItems, gameSettingsName]);
 
   // Indices into `results` that point to actionable (non-section) items.
   const actionableIndices = useMemo(

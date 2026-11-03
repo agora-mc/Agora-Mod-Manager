@@ -54,7 +54,7 @@ Keep these rules in mind:
 - Use `--dry-run` on install, remove, and update operations before executing a complex plan.
 - Create a snapshot before manual or high-risk changes.
 - Use disposable instances when learning destructive commands.
-- `instance delete` moves the instance to Recently deleted, where it can be restored for 30 days; then it goes to the OS trash. `snapshots restore`, `snapshots delete`, `lockfile import`, and some install conflict choices can replace or remove files.
+- `instance delete` moves the instance to Recently deleted, where it can be restored for 30 days (or the time set in Settings > General > Storage); then it goes to the OS trash. `snapshots restore`, `snapshots delete`, `lockfile import`, and some install conflict choices can replace or remove files.
 - Never place access tokens or account codes in command history, log files, or bug reports.
 - `--data-dir` isolates files under the Agora data root, but Microsoft credentials use the operating-system credential store. `auth status`, `auth login`, and `auth logout` therefore inspect or change the same credential entry used by the desktop app. The exception is a portable copy (a `portable.txt` beside the executable, with no `AGORA_DATA_DIR` override), which never uses the operating-system store and keeps its credentials encrypted in its own data folder.
 
@@ -332,7 +332,7 @@ Clone flags can omit saves, mods, resource packs, shader packs, screenshots, con
 
 Locking prevents ordinary content mutation. Unlock explicitly before applying intended changes.
 
-Deleted instances wait in Recently deleted for 30 days. `instance deleted` lists them with their entry ID (the ID to pass to `restore` and `purge`, which is not the instance ID), name, deletion time, and size. `instance restore` brings one back with its files and records; if its original ID has been taken, it returns under a new one and says so. `instance purge` sends one to the OS trash now and asks first unless you pass `--yes`; Agora cannot restore it afterwards, though the OS trash may still hold the files. Agora also runs the same 30-day cleanup when an instance command starts, so expired entries reach the trash without the desktop app open.
+Deleted instances wait in Recently deleted for 30 days, or for the time set in the desktop app's Settings > General > Storage (the `games_recently_deleted_days` setting, shared by every game). `instance deleted` lists them with their entry ID (the ID to pass to `restore` and `purge`, which is not the instance ID), name, deletion time, and size. `instance restore` brings one back with its files and records; if its original ID has been taken, it returns under a new one and says so. `instance purge` sends one to the OS trash now and asks first unless you pass `--yes`; Agora cannot restore it afterwards, though the OS trash may still hold the files. Agora also runs the same cleanup when an instance command starts, so expired entries reach the trash without the desktop app open.
 
 ```bash
 agora --json instance deleted

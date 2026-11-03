@@ -47,6 +47,7 @@ import { InstanceIcon, LoaderChip, MetaChip } from '../components/InstanceIcon';
 import { formatInstalledDate } from '../components/installed-content/contentTableState';
 import { LauncherImportWizard } from '../components/LauncherImportWizard';
 import { RecentlyDeleted, deleteDialogBody } from '../components/RecentlyDeleted';
+import { readRecentlyDeletedDays } from '../lib/recentlyDeletedDays';
 import { LaunchFailedBanner } from '../components/LaunchFailedBanner';
 import { HealthNotice, ReviewBeforeLaunchButtons } from '../components/HealthLaunchControls';
 import { PackInstallProgressBar, usePackInstall, type PackInstallTask } from '../components/PackInstallProgress';
@@ -696,7 +697,7 @@ function InstanceCard({
   const remove = async () => {
     if (!await confirm({
       title: `Delete instance "${instance.name}"?`,
-      body: deleteDialogBody(instance),
+      body: deleteDialogBody(instance, await readRecentlyDeletedDays()),
       confirmLabel: 'Delete',
       tone: 'danger',
     })) return;

@@ -7,7 +7,8 @@
 //! pack file inventory, launch history, update cache). Restoring puts the
 //! folder and those rows back, so the instance behaves exactly as before.
 //!
-//! A cleanup pass hands entries older than [`RETENTION_DAYS`], or beyond
+//! A cleanup pass hands entries older than the retention window (the host's
+//! "Recently deleted" setting, which every game shares), or beyond
 //! [`SIZE_BUDGET_BYTES`] in total, to the OS trash through the adapter's
 //! [`TrashFn`]. Every step fails closed: an error leaves the entry (or the
 //! live instance) exactly where it was.
@@ -26,10 +27,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use std::path::{Path, PathBuf};
 
-/// How long an entry stays restorable. A month is long enough to notice a
-/// mistake after a holiday, short enough that deleted modpacks (often several
-/// GB) do not silently eat the disk.
-pub const RETENTION_DAYS: i64 = 30;
+/// How long an entry stays restorable when the host passes no other window. A
+/// month is long enough to notice a mistake after a holiday, short enough that
+/// deleted modpacks (often several GB) do not silently eat the disk. The window
+/// itself is the player's: the host reads the setting every game shares and
+/// passes it in, so this crate needs nothing more from core for it.
+pub const DEFAULT_RETENTION_DAYS: i64 = 30;
 
 /// Total size of all entries before the oldest are sent to the OS trash early.
 pub const SIZE_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
@@ -675,9 +678,9 @@ fn read_entry_file(root: &Path, entry_id: &str) -> LauncherResult<StoredEntry> {
     Ok(stored)
 }
 
-fn expires_at(deleted_at: &str) -> String {
+fn expires_at(deleted_at: &str, retention_days: i64) -> String {
     chrono::DateTime::parse_from_rfc3339(deleted_at)
-        .map(|t| (t + chrono::Duration::days(RETENTION_DAYS)).to_rfc3339())
+        .map(|t| (t + chrono::Duration::days(retention_days.max(1))).to_rfc3339())
         .unwrap_or_default()
 }
 
@@ -710,7 +713,8 @@ pub(crate) fn stash_instance(
         minecraft_version: row.minecraft_version.clone(),
         loader: row.loader.clone(),
         import_source: row.import_source.clone(),
-        expires_at: expires_at(&deleted_at),
+        // Provisional: `list_entries` recomputes it from the current window.
+        expires_at: expires_at(&deleted_at, DEFAULT_RETENTION_DAYS),
         deleted_at,
         size_bytes,
     };
@@ -759,9 +763,10 @@ pub(crate) fn stash_instance(
     Ok(info)
 }
 
-/// All valid entries, newest first. Unreadable or incomplete entries are
-/// skipped (and left on disk).
-pub fn list_entries(root: &Path) -> Vec<RecentlyDeletedEntry> {
+/// All valid entries, newest first, each expiring `retention_days` after it
+/// was deleted (so a changed window moves existing entries too). Unreadable or
+/// incomplete entries are skipped (and left on disk).
+pub fn list_entries(root: &Path, retention_days: i64) -> Vec<RecentlyDeletedEntry> {
     let Ok(read) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -770,7 +775,7 @@ pub fn list_entries(root: &Path) -> Vec<RecentlyDeletedEntry> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter_map(|id| read_entry(root, &id).ok())
         .map(|mut s| {
-            s.info.expires_at = expires_at(&s.info.deleted_at);
+            s.info.expires_at = expires_at(&s.info.deleted_at, retention_days);
             s.info
         })
         .collect();
@@ -914,11 +919,16 @@ pub fn purge_entry(root: &Path, entry_id: &str, trash: &TrashFn) -> LauncherResu
     Ok(())
 }
 
-/// Purge entries older than the retention window, then the oldest until the
+/// Purge entries older than `retention_days`, then the oldest until the
 /// total fits the size budget. Also removes empty shells left by a restore
 /// whose tidy-up failed. Never errors as a whole: failures are counted.
-pub fn cleanup(root: &Path, now: chrono::DateTime<chrono::Utc>, trash: &TrashFn) -> CleanupSummary {
-    cleanup_with_budget(root, now, trash, SIZE_BUDGET_BYTES)
+pub fn cleanup(
+    root: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    trash: &TrashFn,
+    retention_days: i64,
+) -> CleanupSummary {
+    cleanup_with_budget(root, now, trash, SIZE_BUDGET_BYTES, retention_days)
 }
 
 pub(crate) fn cleanup_with_budget(
@@ -926,6 +936,7 @@ pub(crate) fn cleanup_with_budget(
     now: chrono::DateTime<chrono::Utc>,
     trash: &TrashFn,
     budget: u64,
+    retention_days: i64,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
     // Truly empty folders hold nothing; `remove_dir` refuses anything else.
@@ -937,7 +948,7 @@ pub(crate) fn cleanup_with_budget(
             }
         }
     }
-    let mut entries = list_entries(root);
+    let mut entries = list_entries(root, retention_days);
     entries.sort_by(|a, b| a.deleted_at.cmp(&b.deleted_at)); // oldest first
     let mut total: u64 = entries.iter().map(|e| e.size_bytes).sum();
     for entry in entries {

@@ -24,6 +24,7 @@ export const SETTINGS_CARD_AUDIENCE = {
   'runtime-reclaim': 'all-games',
   'download-watch': 'all-games',
   'content-sharing': 'minecraft',
+  'recently-deleted': 'all-games',
   updates: 'all-games',
   'instance-updates': 'minecraft',
 
@@ -56,7 +57,6 @@ export const SETTINGS_CARD_AUDIENCE = {
 
   // The selected game's own section (rail id `game`), in Launching's place.
   'game-new-instances': 'other-games',
-  'game-recently-deleted': 'other-games',
   'game-installs': 'other-games',
   'game-bases': 'other-games',
   'game-recovery': 'other-games',

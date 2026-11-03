@@ -36,16 +36,19 @@ pub async fn prewarm_recent_instances(ctx: Ctx) -> Result<WarmupSummary, String>
         .map_err(|error| format!("startup maintenance worker failed: {error}"))?
 }
 
-/// Send expired "Recently deleted" entries to the OS trash on the background
-/// lane. Failures are counted and leave the entry in place.
+/// Send "Recently deleted" entries older than `retention_days` to the OS
+/// trash on the background lane. Failures are counted and leave the entry in
+/// place.
 pub async fn cleanup_recently_deleted(
     ctx: Ctx,
     trash: crate::instance_service::TrashFn,
+    retention_days: i64,
 ) -> Result<crate::recently_deleted::CleanupSummary, String> {
     let scheduler = ctx.task_scheduler.clone();
     scheduler
         .run_blocking(BlockingPriority::Background, move || {
-            crate::instance_service::InstanceService::new(ctx).cleanup_recently_deleted(&trash)
+            crate::instance_service::InstanceService::new(ctx)
+                .cleanup_recently_deleted(&trash, retention_days)
         })
         .await
         .map_err(|error| format!("recently deleted cleanup worker failed: {error}"))

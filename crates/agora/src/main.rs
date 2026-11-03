@@ -1022,7 +1022,7 @@ enum InstanceCmd {
     /// Health, revert, loader version, Java, and wrapper maintenance.
     #[command(flatten)]
     Tools(cli_tools::InstanceToolsCmd),
-    /// Delete an instance. It stays in Recently deleted for 30 days.
+    /// Delete an instance. It stays in Recently deleted (30 days unless changed in Settings).
     Delete { id: String },
     /// List instances in Recently deleted (ID, name, deleted when, size).
     Deleted,
@@ -2346,7 +2346,7 @@ fn run_recently_deleted_cleanup(
     json: bool,
 ) -> agora_game_minecraft::recently_deleted::CleanupSummary {
     let summary = agora_game_minecraft::instance_service::InstanceService::new(ctx.clone())
-        .cleanup_recently_deleted(trash);
+        .cleanup_recently_deleted(trash, agora_core::game_instance::trash::retention_days(ctx));
     if summary.purged > 0 || summary.failed > 0 {
         let message = format!(
             "Recently deleted: {} sent to the OS trash, {} could not be (left in place)",
@@ -3911,24 +3911,28 @@ async fn run_instance_command(
         }
         InstanceCmd::Delete { id } => {
             InstanceService::new(ctx.clone()).delete(&id)?;
+            let days = agora_core::game_instance::trash::retention_days(ctx);
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "status": "deleted",
                         "instanceId": id,
-                        "recoverableDays": 30
+                        "recoverableDays": days
                     })
                 );
             } else {
                 println!(
-                    "Deleted instance '{}'. Agora keeps a copy in Recently deleted for 30 days: run `agora instance deleted` to find it and `agora instance restore <ENTRY>` to bring it back.",
-                    id
+                    "Deleted instance '{}'. Agora keeps a copy in Recently deleted for {} day{}: run `agora instance deleted` to find it and `agora instance restore <ENTRY>` to bring it back.",
+                    id,
+                    days,
+                    if days == 1 { "" } else { "s" }
                 );
             }
         }
         InstanceCmd::Deleted => {
-            let entries = InstanceService::new(ctx.clone()).list_recently_deleted()?;
+            let entries = InstanceService::new(ctx.clone())
+                .list_recently_deleted(agora_core::game_instance::trash::retention_days(ctx))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
             } else if entries.is_empty() {
@@ -3972,7 +3976,8 @@ async fn run_instance_command(
         }
         InstanceCmd::Purge { entry, yes } => {
             let svc = InstanceService::new(ctx.clone());
-            let listed = svc.list_recently_deleted()?;
+            let listed =
+                svc.list_recently_deleted(agora_core::game_instance::trash::retention_days(ctx))?;
             let Some(found) = listed.iter().find(|e| e.entry_id == entry) else {
                 anyhow::bail!(
                     "No deleted instance with ID '{entry}'. Run `agora instance deleted` to see them."

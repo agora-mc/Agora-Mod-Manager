@@ -78,11 +78,42 @@ export const SETTINGS_SECTION_ENTRIES: SettingsSectionEntry[] = [
   },
 ];
 
-/** Entries whose label or keywords contain the query. An empty query finds all. */
-export function matchSettingsSections(query: string): SettingsSectionEntry[] {
+/**
+ * The selected game's own Settings pages (rail id `game`), for the palette. Only for a game other
+ * than Minecraft: with Minecraft selected that section has no pages. `gameName` is the short name
+ * the Settings rail shows, so an entry reads like the place it opens.
+ */
+export function gameSettingsEntries(gameName: string): SettingsSectionEntry[] {
+  const page = (
+    label: string,
+    icon: string,
+    keywords: string[],
+    id: GameSettingsPage,
+  ): SettingsSectionEntry => ({
+    label: `${gameName} settings: ${label}`,
+    icon,
+    keywords: [gameName, ...keywords],
+    target: { tab: 'game', page: id },
+  });
+  return [
+    page('Instances', '📦', ['new instances', 'create', 'defaults', 'recently deleted'], 'new-instances'),
+    page('Installs', '📁', ['install', 'game folder', 'steam', 'gog', 'add a game folder'], 'installs'),
+    page('Bases', '🧱', ['base', 'pinned', 'build a base'], 'bases'),
+    page('Recovery', '🛟', ['recover', 'repair', 'restore', 'backup'], 'recovery'),
+  ];
+}
+
+/**
+ * Entries whose label or keywords contain the query. An empty query finds all. `gameName`
+ * adds the selected game's own pages (see `gameSettingsEntries`).
+ */
+export function matchSettingsSections(query: string, gameName?: string | null): SettingsSectionEntry[] {
+  const entries = gameName
+    ? [...SETTINGS_SECTION_ENTRIES, ...gameSettingsEntries(gameName)]
+    : SETTINGS_SECTION_ENTRIES;
   const needle = query.trim().replace(/\s+/g, ' ').toLowerCase();
-  if (!needle) return [...SETTINGS_SECTION_ENTRIES];
-  return SETTINGS_SECTION_ENTRIES.filter((entry) =>
+  if (!needle) return [...entries];
+  return entries.filter((entry) =>
     [entry.label, ...entry.keywords].some((word) => word.toLowerCase().includes(needle)),
   );
 }

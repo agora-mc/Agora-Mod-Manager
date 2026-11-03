@@ -50,6 +50,7 @@ import { GameTabPage } from './features/games/shell/GameTabPage';
 import { GameInstancePage } from './features/games/shell/GameInstancePage';
 import { gameTabForSidebarTab, sidebarTabForGameTab } from './features/games/shell/gameNav';
 import { gameShortName } from './features/games/shared/gameNames';
+import { gameDisplayName, isMinecraftSelected } from './pages/settings/gameScope';
 import { useProcessController } from './lib/useProcessController';
 import { useInstanceHealthMonitor } from './lib/useInstanceHealthMonitor';
 import { useRegistryState } from './lib/useRegistryState';
@@ -1291,6 +1292,9 @@ function AppContent() {
             ? gameShell.foundGames.map((game) => ({ gameId: game.gameId, label: game.name }))
             : undefined}
           onSwitchGame={switchGame}
+          gameSettingsName={isMinecraftSelected(activeGame)
+            ? null
+            : gameShortName(gameDisplayName(activeGame ?? MINECRAFT_GAME_ID, gameShell.foundGames.find((game) => game.gameId === activeGame)?.name))}
         />
         <DownloadsNotifier />
         <ToastContainer />

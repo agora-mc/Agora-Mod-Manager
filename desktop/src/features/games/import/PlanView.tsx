@@ -3,11 +3,100 @@
  * skipped and why, and the button that makes it happen.
  */
 
+import { CircleSlash, FileCode2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { formatBytes } from '@/components/installed-content/contentTableState';
-import type { Mo2PlanDto } from './api';
+import { plural } from '@/features/library/format';
+import type { Mo2PlanDto, PlannedMod, Problem } from './api';
 import { plannedModsLabel } from './planRules';
+
+/** The Library card's chip, so a mod reads the same here as it will in the Library. */
+const CHIP = 'inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground';
+
+/** The mod's place in MO2's priority order (its line in modlist.txt), as a small chip. */
+function PriorityChip({ line }: { line: number }) {
+  return (
+    <span
+      className="inline-flex h-6 min-w-8 shrink-0 items-center justify-center rounded-md bg-muted px-1.5 text-xs font-semibold tabular-nums text-muted-foreground"
+      title={`Priority ${line} (line ${line} of modlist.txt)`}
+      aria-label={`Priority ${line}`}
+    >
+      {line}
+    </span>
+  );
+}
+
+/** The first letter as a tile, as the Library shows an item without an icon. */
+function LetterTile({ name, muted }: { name: string; muted: boolean }) {
+  return (
+    <span
+      aria-hidden="true"
+      className={[
+        'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted text-sm font-semibold',
+        muted ? 'text-muted-foreground/60' : 'text-muted-foreground',
+      ].join(' ')}
+    >
+      {name.trim().charAt(0).toLocaleUpperCase() || '?'}
+    </span>
+  );
+}
+
+function PlannedModRow({ mod }: { mod: PlannedMod }) {
+  return (
+    <li className="flex items-center gap-3 px-3 py-2" data-testid="import-plan-mod">
+      <PriorityChip line={mod.line} />
+      <LetterTile name={mod.folder} muted={!mod.enabled} />
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className={['wrap-break-word text-sm font-medium', mod.enabled ? '' : 'text-muted-foreground'].join(' ')}>
+            {mod.folder}
+          </span>
+          {!mod.enabled && <span className={CHIP}>Disabled</span>}
+          {mod.pluginFiles.length > 0 && (
+            <span className={CHIP} title={mod.pluginFiles.join(', ')}>
+              <FileCode2 className="h-3 w-3" aria-hidden="true" />
+              {plural(mod.pluginFiles.length, 'plugin')}
+            </span>
+          )}
+        </div>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          {plural(mod.files, 'file')}, {formatBytes(mod.bytes)}
+          <span aria-hidden="true"> · </span>
+          {mod.provenance}
+        </p>
+      </div>
+    </li>
+  );
+}
+
+/** Core's reason as a sentence: capitalised, without the "; skipped" the heading already says. */
+export function skipReasonText(reason: string): string {
+  const trimmed = reason.trim().replace(/;\s*skipped\.?$/i, '').trim();
+  return trimmed.charAt(0).toLocaleUpperCase() + trimmed.slice(1);
+}
+
+function SkippedRow({ problem }: { problem: Problem }) {
+  return (
+    <li className="flex items-center gap-3 px-3 py-2">
+      {problem.line !== null ? (
+        <PriorityChip line={problem.line} />
+      ) : (
+        <span className="h-6 min-w-8 shrink-0" aria-hidden="true" />
+      )}
+      <span
+        aria-hidden="true"
+        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-dashed border-border text-muted-foreground"
+      >
+        <CircleSlash className="h-4 w-4" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="wrap-break-word text-sm font-medium">{problem.entry}</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">{skipReasonText(problem.reason)}</p>
+      </div>
+    </li>
+  );
+}
 
 interface PlanViewProps {
   plan: Mo2PlanDto;
@@ -64,17 +153,12 @@ export function PlanView({ plan, blockReason, busy, onImport }: PlanViewProps) {
       {plan.mods.length > 0 && (
         <div>
           <h4 className="text-sm font-medium">Mods, highest priority first</h4>
-          <ul className="mt-2 max-h-72 space-y-1 overflow-y-auto rounded-lg border border-border p-2 text-sm" aria-label="Mods in this profile">
+          <ul
+            className="mt-2 max-h-80 divide-y divide-border overflow-y-auto rounded-lg border border-border bg-card"
+            aria-label="Mods in this profile"
+          >
             {plan.mods.map((mod) => (
-              <li key={`${mod.line}-${mod.folder}`} className="flex flex-wrap justify-between gap-2">
-                <span>
-                  <span className="text-muted-foreground">line {mod.line}</span> {mod.folder}
-                  {!mod.enabled && <span className="ml-2 text-muted-foreground">(disabled)</span>}
-                </span>
-                <span className="text-muted-foreground">
-                  {mod.files} files, {formatBytes(mod.bytes)}. {mod.provenance}.
-                </span>
-              </li>
+              <PlannedModRow key={`${mod.line}-${mod.folder}`} mod={mod} />
             ))}
           </ul>
         </div>
@@ -84,14 +168,15 @@ export function PlanView({ plan, blockReason, busy, onImport }: PlanViewProps) {
         <div>
           <h4 className="text-sm font-medium">Skipped ({plan.problems.length})</h4>
           <p className="mt-1 text-sm text-muted-foreground">
-            These lines are not imported. Nothing else is changed by skipping them.
+            These are not imported. Nothing else is changed by skipping them.
           </p>
-          <ul className="mt-2 space-y-1 text-sm" data-testid="import-plan-problems">
+          <ul
+            className="mt-2 divide-y divide-border rounded-lg border border-border bg-card"
+            aria-label="Skipped"
+            data-testid="import-plan-problems"
+          >
             {plan.problems.map((problem) => (
-              <li key={`${problem.line ?? 'none'}-${problem.entry}`}>
-                {problem.line !== null ? `line ${problem.line}: ` : ''}
-                <span className="font-medium">{problem.entry}</span>: {problem.reason}
-              </li>
+              <SkippedRow key={`${problem.line ?? 'none'}-${problem.entry}`} problem={problem} />
             ))}
           </ul>
         </div>

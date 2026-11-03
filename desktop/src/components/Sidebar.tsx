@@ -150,8 +150,11 @@ export function Sidebar({
               {!collapsed && badge > 0 && (
                 <span
                   className={[
-                    'shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold',
-                    isActive ? 'bg-primary-foreground/20 text-primary-foreground' : 'bg-primary text-primary-foreground',
+                    'shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums forced-colors:border forced-colors:border-[CanvasText]',
+                    // On the active row the accent is behind the chip, and an accent can be any
+                    // colour (a custom yellow keeps white text), so the chip takes the page's own
+                    // surface and text colours instead, which every theme keeps readable together.
+                    isActive ? 'bg-background text-foreground shadow-xs' : 'bg-primary text-primary-foreground',
                   ].join(' ')}
                   aria-label={`${badge} new`}
                   data-testid={`nav-badge-${tab.id}`}
@@ -161,7 +164,10 @@ export function Sidebar({
               )}
               {collapsed && badge > 0 && (
                 <span
-                  className="absolute right-1 top-1 h-2 w-2 rounded-full bg-primary"
+                  className={[
+                    'absolute right-1 top-1 h-2 w-2 rounded-full',
+                    isActive ? 'bg-background ring-1 ring-foreground/60' : 'bg-primary',
+                  ].join(' ')}
                   aria-label={`${badge} new`}
                   data-testid={`nav-badge-${tab.id}`}
                 />

@@ -1080,8 +1080,8 @@ impl InstanceService {
     }
 
     /// Delete an instance by moving it into Agora's "Recently deleted" area
-    /// (`recently_deleted.rs`), from where it can be restored for
-    /// [`crate::recently_deleted::RETENTION_DAYS`] days.
+    /// (`recently_deleted.rs`), from where it can be restored for as long as
+    /// the player's Recently deleted setting says.
     ///
     /// Fails closed: any error leaves the instance exactly where it was.
     /// A pack-locked instance is refused (unlock it first), and so is one
@@ -1186,12 +1186,16 @@ impl InstanceService {
         Ok(())
     }
 
-    /// Entries in "Recently deleted", newest first.
+    /// Entries in "Recently deleted", newest first, each expiring
+    /// `retention_days` after its deletion. The host reads the window from the
+    /// setting every game shares.
     pub fn list_recently_deleted(
         &self,
+        retention_days: i64,
     ) -> LauncherResult<Vec<crate::recently_deleted::RecentlyDeletedEntry>> {
         Ok(crate::recently_deleted::list_entries(
             &self.ctx.paths.recently_deleted_root(),
+            retention_days,
         ))
     }
 
@@ -1203,13 +1207,17 @@ impl InstanceService {
         entry_id: &str,
     ) -> LauncherResult<crate::recently_deleted::RestoreOutcome> {
         let root = self.ctx.paths.recently_deleted_root();
-        let entry = crate::recently_deleted::list_entries(&root)
-            .into_iter()
-            .find(|e| e.entry_id == entry_id)
-            .ok_or_else(|| LauncherError::Generic {
-                code: "ERR_INSTANCE_RESTORE".into(),
-                message: "That deleted instance is no longer available.".into(),
-            })?;
+        // Only the entry is needed here, not when it expires.
+        let entry = crate::recently_deleted::list_entries(
+            &root,
+            crate::recently_deleted::DEFAULT_RETENTION_DAYS,
+        )
+        .into_iter()
+        .find(|e| e.entry_id == entry_id)
+        .ok_or_else(|| LauncherError::Generic {
+            code: "ERR_INSTANCE_RESTORE".into(),
+            message: "That deleted instance is no longer available.".into(),
+        })?;
         let original = self.validate_id(&entry.instance_id)?;
         let op = self
             .ctx
@@ -1267,11 +1275,12 @@ impl InstanceService {
         )
     }
 
-    /// Cleanup pass: entries past their window or over the size budget go to
-    /// the OS trash; failures leave the entry in place.
+    /// Cleanup pass: entries older than `retention_days` or over the size
+    /// budget go to the OS trash; failures leave the entry in place.
     pub fn cleanup_recently_deleted(
         &self,
         trash: &TrashFn,
+        retention_days: i64,
     ) -> crate::recently_deleted::CleanupSummary {
         // First repair anything a crash left half-done.
         if let Ok(mut conn) = self.connection() {
@@ -1285,6 +1294,7 @@ impl InstanceService {
             &self.ctx.paths.recently_deleted_root(),
             chrono::DateTime::<chrono::Utc>::from(self.ctx.clock.now()),
             trash,
+            retention_days,
         )
     }
 
@@ -3136,6 +3146,8 @@ $#
         use crate::instance_service::TrashFn;
         use std::sync::Mutex;
 
+        const DAYS: i64 = crate::recently_deleted::DEFAULT_RETENTION_DAYS;
+
         fn request(id: &str) -> CreateInstanceRequest {
             CreateInstanceRequest {
                 name: format!("Name {id}"),
@@ -3290,7 +3302,7 @@ $#
             service.delete("pack").unwrap();
             assert!(service.list().unwrap().is_empty());
             assert!(!dir.exists());
-            let entries = service.list_recently_deleted().unwrap();
+            let entries = service.list_recently_deleted(DAYS).unwrap();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].instance_id, "pack");
             assert_eq!(entries[0].name, "Name pack");
@@ -3304,7 +3316,7 @@ $#
             assert!(!outcome.renamed);
             assert_eq!(files_of(&dir), files_before);
             assert_eq!(db_state(&ctx, "pack"), db_before);
-            assert!(service.list_recently_deleted().unwrap().is_empty());
+            assert!(service.list_recently_deleted(DAYS).unwrap().is_empty());
             assert_eq!(service.list().unwrap()[0].name, "Name pack");
             let _ = std::fs::remove_dir_all(root);
         }
@@ -3316,7 +3328,7 @@ $#
             let service = InstanceService::new(ctx.clone());
             service.delete("pack").unwrap();
             seed(&ctx, "pack"); // a new instance took the id
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
 
             let outcome = service.restore_deleted(&entry.entry_id).unwrap();
             assert!(outcome.renamed);
@@ -3365,17 +3377,59 @@ $#
             let (trash, seen) = fake_trash(root.join("bin"));
 
             // Day 20: nothing is old enough.
-            let summary = service.cleanup_recently_deleted(&trash);
+            let summary = service.cleanup_recently_deleted(&trash, DAYS);
             assert_eq!((summary.purged, summary.failed, summary.kept), (0, 0, 2));
 
             // Day 31: "old" is past 30 days, "fresh" (11 days) is not.
             clock.advance(std::time::Duration::from_secs(11 * 24 * 3600));
-            let summary = service.cleanup_recently_deleted(&trash);
+            let summary = service.cleanup_recently_deleted(&trash, DAYS);
             assert_eq!((summary.purged, summary.failed, summary.kept), (1, 0, 1));
             assert_eq!(seen.lock().unwrap().len(), 1);
-            let left = service.list_recently_deleted().unwrap();
+            let left = service.list_recently_deleted(DAYS).unwrap();
             assert_eq!(left.len(), 1);
             assert_eq!(left[0].instance_id, "fresh");
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn the_players_window_decides_expiry_for_existing_entries_too() {
+            let (ctx, root) = context();
+            seed(&ctx, "pack");
+            let service = InstanceService::new(ctx.clone());
+            service.delete("pack").unwrap();
+            // Back-date the entry by eight days, as if it had been deleted then.
+            let entry_id = service.list_recently_deleted(DAYS).unwrap()[0]
+                .entry_id
+                .clone();
+            let file = ctx
+                .paths
+                .recently_deleted_root()
+                .join(&entry_id)
+                .join("entry.json");
+            let mut stored: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            let deleted_at = chrono::Utc::now() - chrono::Duration::days(8);
+            stored["deleted_at"] = serde_json::json!(deleted_at.to_rfc3339());
+            std::fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+            let expiry = |days: i64| {
+                let entry = service.list_recently_deleted(days).unwrap().remove(0);
+                chrono::DateTime::parse_from_rfc3339(&entry.expires_at)
+                    .unwrap()
+                    .signed_duration_since(deleted_at)
+            };
+            // An existing entry's "after <date>" follows whichever window is set now.
+            assert_eq!(expiry(7), chrono::Duration::days(7));
+            assert_eq!(expiry(90), chrono::Duration::days(90));
+
+            // Eight days old: kept under the default 30 days, gone under a 7-day window.
+            let (trash, seen) = fake_trash(root.join("bin"));
+            let summary = service.cleanup_recently_deleted(&trash, 30);
+            assert_eq!((summary.purged, summary.kept), (0, 1));
+            let summary = service.cleanup_recently_deleted(&trash, 7);
+            assert_eq!((summary.purged, summary.kept), (1, 0));
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            assert!(service.list_recently_deleted(DAYS).unwrap().is_empty());
             let _ = std::fs::remove_dir_all(root);
         }
 
@@ -3387,15 +3441,15 @@ $#
             seed(&ctx, "pack");
             let service = InstanceService::new(ctx.clone());
             service.delete("pack").unwrap();
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             clock.advance(std::time::Duration::from_secs(40 * 24 * 3600));
 
-            let summary = service.cleanup_recently_deleted(&failing_trash());
+            let summary = service.cleanup_recently_deleted(&failing_trash(), DAYS);
             assert_eq!((summary.purged, summary.failed), (0, 1));
             assert!(service
                 .purge_deleted(&entry.entry_id, &failing_trash())
                 .is_err());
-            assert_eq!(service.list_recently_deleted().unwrap().len(), 1);
+            assert_eq!(service.list_recently_deleted(DAYS).unwrap().len(), 1);
             service.restore_deleted(&entry.entry_id).unwrap();
             assert!(ctx
                 .paths
@@ -3419,7 +3473,7 @@ $#
             let service = InstanceService::new(ctx.clone());
 
             service.delete("linked").unwrap();
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             // The size counted the instance's own files, not the link target.
             assert!(entry.size_bytes < 1_000_000);
             assert_eq!(
@@ -3436,7 +3490,7 @@ $#
 
             // Purging detaches the link before the (fake) trash sees the tree.
             service.delete("linked").unwrap();
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             let (trash, seen) = fake_trash(root.join("bin"));
             service.purge_deleted(&entry.entry_id, &trash).unwrap();
             let moved = seen.lock().unwrap()[0].clone();
@@ -3469,7 +3523,7 @@ $#
                 service.delete(id).unwrap();
                 clock.advance(std::time::Duration::from_secs(60));
             }
-            let entries = service.list_recently_deleted().unwrap();
+            let entries = service.list_recently_deleted(DAYS).unwrap();
             let each = entries[0].size_bytes;
             let (trash, seen) = fake_trash(root.join("bin"));
             // Room for two of the three: only the oldest goes.
@@ -3478,11 +3532,12 @@ $#
                 chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
                 &trash,
                 each * 2 + 10,
+                DAYS,
             );
             assert_eq!((summary.purged, summary.kept), (1, 2));
             assert_eq!(seen.lock().unwrap().len(), 1);
             let left: Vec<_> = service
-                .list_recently_deleted()
+                .list_recently_deleted(DAYS)
                 .unwrap()
                 .into_iter()
                 .map(|e| e.instance_id)
@@ -3501,7 +3556,7 @@ $#
             let error = service.delete("pack").unwrap_err();
             assert!(error.to_string().contains("locked"));
             assert_eq!(files_of(&ctx.paths.instance_dir("pack").unwrap()), before);
-            assert!(service.list_recently_deleted().unwrap().is_empty());
+            assert!(service.list_recently_deleted(DAYS).unwrap().is_empty());
             assert_eq!(service.list().unwrap().len(), 1);
             let _ = std::fs::remove_dir_all(root);
         }
@@ -3526,7 +3581,7 @@ $#
                 .join("mods/a.jar")
                 .is_file());
             assert_eq!(service.list().unwrap().len(), 1);
-            assert!(service.list_recently_deleted().unwrap().is_empty());
+            assert!(service.list_recently_deleted(DAYS).unwrap().is_empty());
             let _ = std::fs::remove_dir_all(root);
         }
 
@@ -3563,7 +3618,7 @@ $#
                     "{bad:?}"
                 );
             }
-            assert_eq!(service.list_recently_deleted().unwrap().len(), 1);
+            assert_eq!(service.list_recently_deleted(DAYS).unwrap().len(), 1);
             let _ = std::fs::remove_dir_all(root);
         }
 
@@ -3573,18 +3628,18 @@ $#
             seed(&ctx, "pack");
             let service = InstanceService::new(ctx.clone());
             service.delete("pack").unwrap();
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             let json = ctx
                 .paths
                 .recently_deleted_root()
                 .join(&entry.entry_id)
                 .join("entry.json");
             std::fs::write(&json, b"{ not json").unwrap();
-            assert!(service.list_recently_deleted().unwrap().is_empty());
+            assert!(service.list_recently_deleted(DAYS).unwrap().is_empty());
             assert!(service.restore_deleted(&entry.entry_id).is_err());
             // Cleanup must not destroy what it cannot read.
             let (trash, seen) = fake_trash(root.join("bin"));
-            service.cleanup_recently_deleted(&trash);
+            service.cleanup_recently_deleted(&trash, DAYS);
             assert!(seen.lock().unwrap().is_empty());
             assert!(ctx
                 .paths
@@ -3690,7 +3745,7 @@ $#
             );
             let service = InstanceService::new(ctx.clone());
             service.delete("linked").unwrap();
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             let link = ctx
                 .paths
                 .recently_deleted_root()
@@ -3848,7 +3903,7 @@ $#
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
             let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
             assert_eq!(count("SELECT COUNT(*) FROM crash_survival_mods"), 0);
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
 
             // Same id: everything comes back, grants and linked rows included.
             service.restore_deleted(&entry.entry_id).unwrap();
@@ -3861,7 +3916,7 @@ $#
             // Renamed restore: no grant for the new id.
             service.delete("pack").unwrap();
             seed(&ctx, "pack");
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             let outcome = service.restore_deleted(&entry.entry_id).unwrap();
             assert!(outcome.renamed);
             assert_eq!(count("SELECT COUNT(*) FROM mcp_approval_grants"), 0);
@@ -3888,9 +3943,9 @@ $#
             }
             assert_eq!(service.list().unwrap().len(), 1);
             let (trash, _) = fake_trash(root.join("bin"));
-            service.cleanup_recently_deleted(&trash);
+            service.cleanup_recently_deleted(&trash, DAYS);
             assert!(service.list().unwrap().is_empty());
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             service.restore_deleted(&entry.entry_id).unwrap();
             assert!(ctx
                 .paths
@@ -3920,7 +3975,7 @@ $#
             }
             std::fs::remove_dir_all(ctx.paths.instance_dir("pack").unwrap()).unwrap();
             let (trash, _) = fake_trash(root.join("bin"));
-            service.cleanup_recently_deleted(&trash);
+            service.cleanup_recently_deleted(&trash, DAYS);
             assert_eq!(service.list().unwrap().len(), 1);
             let _ = std::fs::remove_dir_all(root);
         }
@@ -3931,7 +3986,7 @@ $#
             seed(&ctx, "pack");
             let service = InstanceService::new(ctx.clone());
             service.delete("pack").unwrap();
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             // Crash simulation: folder moved back, rows not restored.
             std::fs::rename(
                 ctx.paths
@@ -3943,9 +3998,9 @@ $#
             .unwrap();
             assert!(service.list().unwrap().is_empty());
             let (trash, _) = fake_trash(root.join("bin"));
-            service.cleanup_recently_deleted(&trash);
+            service.cleanup_recently_deleted(&trash, DAYS);
             assert_eq!(service.list().unwrap().len(), 1);
-            assert!(service.list_recently_deleted().unwrap().is_empty());
+            assert!(service.list_recently_deleted(DAYS).unwrap().is_empty());
             let _ = std::fs::remove_dir_all(root);
         }
 
@@ -3955,7 +4010,7 @@ $#
             seed(&ctx, "pack");
             let service = InstanceService::new(ctx.clone());
             service.delete("pack").unwrap();
-            let entry = service.list_recently_deleted().unwrap().remove(0);
+            let entry = service.list_recently_deleted(DAYS).unwrap().remove(0);
             let json_path = ctx
                 .paths
                 .recently_deleted_root()
