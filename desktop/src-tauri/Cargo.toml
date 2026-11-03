@@ -1,6 +1,6 @@
 [package]
 name = "agora-desktop"
-version = "0.1.0"
+version = "0.9.5"
 description = "Agora, a multi-game mod manager"
 authors = ["Agora Contributors"]
 edition = "2021"

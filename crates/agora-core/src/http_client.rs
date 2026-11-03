@@ -328,7 +328,7 @@ impl ClientCategory {
     }
 
     fn user_agent(&self) -> &'static str {
-        "AgoraLauncher/1.0"
+        "AgoraModManager/1.0"
     }
 
     fn max_response_bytes(&self) -> Option<u64> {

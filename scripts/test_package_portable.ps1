@@ -21,7 +21,7 @@ $output = Join-Path $testRoot 'out'
 $zip = Join-Path $output 'agora-desktop-v1.2.3-windows-x64-portable.zip'
 $unpacked = Join-Path $testRoot 'unpacked'
 Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
-foreach ($file in @('Agora Launcher.exe', 'agora.exe', 'portable.txt', 'README.txt', 'agora_vfs.dll', 'agora-vfs-helper.exe', 'x86\agora_vfs.dll', 'x86\agora-vfs-helper.exe')) {
+foreach ($file in @('Agora Mod Manager.exe', 'agora.exe', 'portable.txt', 'README.txt', 'agora_vfs.dll', 'agora-vfs-helper.exe', 'x86\agora_vfs.dll', 'x86\agora-vfs-helper.exe')) {
     if (-not (Test-Path -LiteralPath (Join-Path $unpacked $file))) { throw "Missing $file" }
 }
 if ((Get-Content -LiteralPath (Join-Path $unpacked 'x86\agora_vfs.dll')).Trim() -ne 'fixture x86\agora_vfs.dll') {
@@ -31,7 +31,7 @@ $marker = [IO.File]::ReadAllBytes((Join-Path $unpacked 'portable.txt'))
 if ($marker[0] -ne 100 -or (Get-Content -LiteralPath (Join-Path $unpacked 'portable.txt')).Trim() -ne 'data') {
     throw 'Marker must name data without a BOM'
 }
-if ((Get-FileHash -LiteralPath $exe).Hash -ne (Get-FileHash -LiteralPath (Join-Path $unpacked 'Agora Launcher.exe')).Hash) {
+if ((Get-FileHash -LiteralPath $exe).Hash -ne (Get-FileHash -LiteralPath (Join-Path $unpacked 'Agora Mod Manager.exe')).Hash) {
     throw 'Packaged executable changed'
 }
 if ((Get-FileHash -LiteralPath $cli).Hash -ne (Get-FileHash -LiteralPath (Join-Path $unpacked 'agora.exe')).Hash) {

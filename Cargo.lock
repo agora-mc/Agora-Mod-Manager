@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agora-cli"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "agora-core",
  "agora-game-api",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "agora-core"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "aes-gcm",
  "agora-game-api",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "agora-desktop"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "aes-gcm",
  "agora-core",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "agora-game-api"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "semver",
  "serde",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "agora-game-creation"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "agora-game-api",
  "serde",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "agora-game-minecraft"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "aes-gcm",
  "agora-core",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "agora-plugin-api"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "semver",
  "serde",
@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "agora-plugin-host"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "agora-plugin-api",
  "rquickjs",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "agora-vfs"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "agora-game-api",
  "agora-vfs-inject",
@@ -268,14 +268,14 @@ dependencies = [
 
 [[package]]
 name = "agora-vfs-early-import"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "agora-vfs-inject"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "detours-sys2",
  "windows-sys 0.59.0",

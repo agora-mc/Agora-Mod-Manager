@@ -1224,7 +1224,7 @@ pub async fn run_network_diagnostics(ctx: &Ctx) -> Vec<DiagnosticCheck> {
 pub fn github_headers(token: &str, accept: Option<&str>) -> Vec<(String, String)> {
     let mut headers = vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
-        ("User-Agent".to_string(), "agora-launcher".to_string()),
+        ("User-Agent".to_string(), "agora-mod-manager".to_string()),
     ];
     if let Some(accept) = accept {
         headers.push(("Accept".to_string(), accept.to_string()));

@@ -6,7 +6,7 @@ The CLI can modify the same data used by the desktop application. Read the safet
 
 ## Build or install
 
-The desktop app includes the CLI: `agora.exe` in the install folder on Windows and beside `Agora Launcher.exe` in the portable ZIP, `Agora Launcher.app/Contents/MacOS/agora` on macOS, and `/usr/bin/agora` from the Linux packages. Settings → Services → AI assistant shows its exact path. It is not added to `PATH`, so call it by that path or add it yourself. The standalone `agora-cli-*` archives on the release page are for machines without the desktop app.
+The desktop app includes the CLI: `agora.exe` in the install folder on Windows and beside `Agora Mod Manager.exe` in the portable ZIP, `Agora Mod Manager.app/Contents/MacOS/agora` on macOS, and `/usr/bin/agora` from the Linux packages. Settings → Services → AI assistant shows its exact path. It is not added to `PATH`, so call it by that path or add it yourself. The standalone `agora-cli-*` archives on the release page are for machines without the desktop app.
 
 To build it from source, from the repository root:
 
