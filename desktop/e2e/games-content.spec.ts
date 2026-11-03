@@ -77,6 +77,40 @@ const sky = {
   gameIds: [],
 };
 
+/** A store item as the Library lists it (`games_library_list`). */
+function libraryRow(item: typeof odin, extra: Record<string, unknown> = {}) {
+  return {
+    itemId: item.itemId,
+    name: item.name,
+    description: null,
+    version: null,
+    gameId: item.gameIds.length === 1 ? item.gameIds[0] : null,
+    gameIds: item.gameIds,
+    pageUrl: null,
+    iconSha256: null,
+    sourceKind: item.sourceKind,
+    sourceLabel: item.sourceLabel,
+    instances: [],
+    fileCount: item.fileCount,
+    totalSize: item.totalSize,
+    addedAtUnixMs: item.addedAtUnixMs,
+    pluginFiles: [],
+    hasInstaller: false,
+    ...extra,
+  };
+}
+
+/** The Library's three reads, with `items` (rows) and `damaged` records. */
+function library(items: unknown[], damaged: unknown[] = []) {
+  return {
+    games_library_list: { items, damaged, warnings: [] },
+    games_library_instances: { instances: [], warnings: [] },
+    games_library_unused: { items: [], totalSize: 0, warnings: [] },
+  };
+}
+
+const odinHere = { ...odin, gameIds: ['skyrim-se'] };
+
 const oneRow = {
   position: 1,
   itemId: odin.itemId,
@@ -146,20 +180,21 @@ test.afterEach(async ({ page }) => {
 
 test('an empty library says what to do, and adding an archive confirms it', async ({ page }) => {
   await boot(page, {
-    games_content_list: { items: [], damaged: [] },
+    ...library([]),
     pick_open_file: '/mods/Odin Patch.zip',
-    games_content_add: { status: 'added', item: odin, objectsNew: 1, objectsRestored: 0 },
+    games_content_add: { status: 'added', item: odinHere, objectsNew: 1, objectsRestored: 0 },
   });
   await openLibrary(page);
 
-  await expect(page.getByText('Your library is empty.')).toBeVisible();
-  await page.getByRole('button', { name: 'Add an archive…' }).click();
+  const empty = page.getByTestId('library-empty');
+  await expect(empty).toContainText('Nothing in your Skyrim SE library yet');
+  await empty.getByRole('button', { name: 'Add an archive…' }).click();
   await expect(page.getByText('Added Odin Patch (1 file).', { exact: true })).toBeVisible();
 });
 
 test('a stored item can be checked, and the check says what is wrong with it', async ({ page }) => {
   await boot(page, {
-    games_content_list: { items: [odin], damaged: [] },
+    ...library([libraryRow(odinHere)]),
     games_content_verify: {
       itemId: odin.itemId,
       checked: 1,
@@ -172,20 +207,22 @@ test('a stored item can be checked, and the check says what is wrong with it', a
   await openLibrary(page);
 
   const item = page.getByTestId('library-item');
-  await expect(item.getByText('Archive: odin.zip')).toBeVisible();
-  await item.getByRole('button', { name: 'Check everything' }).click();
+  await expect(item).toContainText('Archive: odin.zip');
+  await item.getByRole('button', { name: 'More for Odin Patch' }).click();
+  await page.getByRole('menuitem', { name: 'Check every file' }).click();
   await expect(item.getByText('1 problem found:')).toBeVisible();
   await expect(item).toContainText('The file changed: its contents no longer match the recorded hash.');
 });
 
 test('removing a stored item asks first, then removes it', async ({ page }) => {
   await boot(page, {
-    games_content_list: { items: [odin], damaged: [] },
+    ...library([libraryRow(odinHere)]),
     games_content_remove: null,
   });
   await openLibrary(page);
 
-  await page.getByTestId('library-item').getByRole('button', { name: 'Remove' }).click();
+  await page.getByTestId('library-item').getByRole('button', { name: 'More for Odin Patch' }).click();
+  await page.getByRole('menuitem', { name: 'Remove from library…' }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog).toContainText('Remove Odin Patch from your library?');
   await dialog.getByRole('button', { name: 'Remove' }).click();
@@ -193,15 +230,15 @@ test('removing a stored item asks first, then removes it', async ({ page }) => {
 });
 
 test('a library that cannot be read says so and offers a retry, rather than looking empty', async ({ page }) => {
-  await boot(page, { games_content_list: { items: [], damaged: [] } }, {
-    failures: { games_content_list: { code: 'core_failed', message: 'The store index is damaged.' } },
+  await boot(page, library([]), {
+    failures: { games_library_list: { code: 'core_failed', message: 'The store index is damaged.' } },
   });
   await openLibrary(page);
 
   const alert = page.getByRole('alert');
   await expect(alert).toContainText('Your library could not be read: The store index is damaged.');
   await expect(alert.getByRole('button', { name: 'Try again' })).toBeVisible();
-  await expect(page.getByText('Your library is empty.')).toHaveCount(0);
+  await expect(page.getByTestId('library-empty')).toHaveCount(0);
 });
 
 test('an instance’s content lists its load order and says where each item goes', async ({ page }) => {
@@ -317,29 +354,33 @@ test('an archive with an installer asks its questions, previews the files, then 
   await expect(wizard).toContainText('It has been added to this instance.');
 });
 
-test('the Library shows the mods for this game and those that name none; a switch shows the rest', async ({ page }) => {
-  const forFallout = { ...sky, itemId: 'ffff0001', name: 'Fallout Texture Pack', gameIds: ['fallout-4'] };
-  const forSkyrim = { ...sky, itemId: 'ffff0002', name: 'Skyrim Lighting', gameIds: ['skyrim-se'] };
-  await boot(page, { games_content_list: { items: [odin, forFallout, forSkyrim], damaged: [] } });
+test('the Library shows only this game’s mods; the ones tied to no game have their own filter', async ({ page }) => {
+  const forFallout = libraryRow({ ...sky, itemId: 'ffff0001', name: 'Fallout Texture Pack', gameIds: ['fallout-4'] });
+  const forSkyrim = libraryRow({ ...sky, itemId: 'ffff0002', name: 'Skyrim Lighting', gameIds: ['skyrim-se'] }, {
+    pluginFiles: ['Lighting.esp'],
+  });
+  await boot(page, library([libraryRow(odin), forFallout, forSkyrim]));
   await openLibrary(page);
 
   const rows = page.getByTestId('library-item');
-  await expect(rows).toHaveCount(2);
-  await expect(page.getByText('Odin Patch')).toBeVisible();
-  await expect(page.getByText('Skyrim Lighting')).toBeVisible();
+  await expect(rows).toHaveCount(1);
+  await expect(rows).toContainText('Skyrim Lighting');
+  await expect(rows).toContainText('Lighting.esp');
   await expect(page.getByText('Fallout Texture Pack')).toHaveCount(0);
+  await expect(page.getByText('Odin Patch')).toHaveCount(0);
 
-  await setSwitch(page.getByLabel('Show mods for every game'), true);
-  await expect(rows).toHaveCount(3);
-  await expect(page.getByText('Fallout Texture Pack')).toBeVisible();
+  await page.getByRole('button', { name: /Not tied to a game/ }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows).toContainText('Odin Patch');
+  await expect(page.getByText('Fallout Texture Pack')).toHaveCount(0);
 });
 
 test('a stored record the store cannot read is listed with its reason and can be removed', async ({ page }) => {
   await boot(page, {
-    games_content_list: {
-      items: [odin],
-      damaged: [{ itemId: 'abc123', message: 'items/abc123.json is not a valid item record: EOF while parsing' }],
-    },
+    ...library(
+      [libraryRow(odinHere)],
+      [{ itemId: 'abc123', message: 'items/abc123.json is not a valid item record: EOF while parsing' }],
+    ),
     games_content_remove: null,
   });
   await openLibrary(page);

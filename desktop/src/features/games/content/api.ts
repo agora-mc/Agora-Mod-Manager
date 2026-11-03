@@ -137,17 +137,11 @@ export async function listStore(): Promise<StoreList> {
 }
 
 /**
- * The items the Library of `gameId` shows: those recorded for that game, and those that name no
- * game (added by hand, so nothing says they belong elsewhere). `showAll` lifts the filter.
+ * Add an archive or a folder to the store. A blank name keeps the item's own. `gameId` records the
+ * game whose Library added it, unless the item already names one.
  */
-export function itemsForGame(items: StoreItem[], gameId: string, showAll: boolean): StoreItem[] {
-  if (showAll) return items;
-  return items.filter((item) => item.gameIds.length === 0 || item.gameIds.includes(gameId));
-}
-
-/** Add an archive or a folder to the store. A blank name keeps the item's own. */
-export const addToStore = (sourcePath: string, name: string | null) =>
-  invoke<StoreAdded>('games_content_add', { sourcePath, name });
+export const addToStore = (sourcePath: string, name: string | null, gameId: string | null = null) =>
+  invoke<StoreAdded>('games_content_add', { sourcePath, name, gameId });
 
 /** Check a stored item. `full` hashes every file. */
 export const verifyStored = (itemId: string, full: boolean) =>

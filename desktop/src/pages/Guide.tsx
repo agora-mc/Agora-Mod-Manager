@@ -54,6 +54,7 @@ const TOPIC_DESTINATIONS: Record<string, TopicDestination> = {
   'browse-registry': { label: 'Open Browse', tab: 'browse' },
   'install-update': { label: 'Find content to install', tab: 'browse' },
   'content-management': { label: 'Open My Instances', tab: 'instances' },
+  downloads: { label: 'Open Library', tab: 'library' },
   launching: { label: 'Open My Instances', tab: 'instances' },
   'crash-recovery': { label: 'Open My Instances', tab: 'instances' },
   'snapshots-loadouts': { label: 'Open My Instances', tab: 'instances' },

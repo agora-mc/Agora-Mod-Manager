@@ -1,11 +1,11 @@
-﻿import { useCallback, useEffect, useRef, useState, type ComponentProps } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react';
 import { isTextEntryTarget } from '@/lib/keyboardTargets';
 import { listen } from '@tauri-apps/api/event';
 import { Sidebar } from './components/Sidebar';
 import { CommandPalette } from './components/command-palette';
 import { Home } from './pages/Home';
 import { Browse } from './pages/Browse';
-import { LibraryPage } from './pages/Library';
+import { LibraryPage } from './features/library/LibraryPage';
 import { requestBrowseSearch } from './lib/browseSearchRequest';
 import { Instances } from './pages/Instances';
 import { Governance } from './pages/Governance';
@@ -43,6 +43,9 @@ import { MINECRAFT_GAME_ID } from './features/games/shared/types';
 import { useGameShell } from './features/games/shared/useGameShell';
 import { useGameSwitch } from './features/games/shared/useGameSwitch';
 import { GameSwitcher } from './features/games/shell/GameSwitcher';
+import { DownloadsNotifier } from './features/downloads/DownloadsNotifier';
+import { useNewDownloads } from './features/downloads/useNewDownloads';
+import { downloadsForGame } from './features/downloads/api';
 import { GameTabPage } from './features/games/shell/GameTabPage';
 import { GameInstancePage } from './features/games/shell/GameInstancePage';
 import { gameTabForSidebarTab, sidebarTabForGameTab } from './features/games/shell/gameNav';
@@ -358,7 +361,16 @@ function AppContent() {
   const registry = useRegistryState();
   // Which game the shell shows, and the header switcher's list (MASTER_SPEC 26.14).
   const gameShell = useGameShell();
+  const newDownloads = useNewDownloads();
   const { activeGame, shownGame, ready: gameShellReady, setActiveGame, turnedOffGames } = gameShell;
+  // Short names by game id, for pages that name a game ("Skyrim SE").
+  const gameNames = useMemo<Record<string, string>>(
+    () => Object.fromEntries([
+      [MINECRAFT_GAME_ID, 'Minecraft'],
+      ...gameShell.foundGames.map((game) => [game.gameId, gameShortName(game.name)]),
+    ]),
+    [gameShell.foundGames],
+  );
   const startupGameCheckedRef = useRef(false);
 
   // The background interval is only a backstop. Content changes made anywhere
@@ -1011,6 +1023,7 @@ function AppContent() {
           onSelectPluginPage={navigateToPluginPage}
           tabs={tabs}
           activeTab={sidebarTab}
+          badges={{ library: downloadsForGame(newDownloads.rows, shownGame).length }}
           onSelectTab={selectShellTab}
           onOpenCommandPalette={() => setCommandPaletteOpen(true)}
           switcher={gameShell.switcherVisible ? (
@@ -1114,6 +1127,7 @@ function AppContent() {
               <GameTabPage
                 gameId={destination.gameId}
                 tab={destination.tab}
+                gameNames={gameNames}
                 onOpenInstance={(instanceId) => navigateToGameInstance(destination.gameId, instanceId)}
               />
             ) : destination.type === 'game-instance' ? (
@@ -1173,7 +1187,7 @@ function AppContent() {
                     }
                   />
                 )}
-                {effectiveTab === 'library' && <LibraryPage />}
+                {effectiveTab === 'library' && <LibraryPage key={MINECRAFT_GAME_ID} gameNames={gameNames} />}
                 {effectiveTab === 'instances' && (
                   <Instances
                     onEditInstance={(id) => navigateToInstanceDetail(id)}
@@ -1278,6 +1292,7 @@ function AppContent() {
             : undefined}
           onSwitchGame={switchGame}
         />
+        <DownloadsNotifier />
         <ToastContainer />
         {crashInvestigation && (
           <CrashInvestigator

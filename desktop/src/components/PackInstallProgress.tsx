@@ -532,6 +532,11 @@ export function usePackInstall() {
   return context;
 }
 
+/** The pack-install context, or null outside the provider (a page rendered on its own in a test). */
+export function usePackInstallOptional() {
+  return useContext(PackInstallContext);
+}
+
 export function PackInstallProgressBar({ task, compact = false }: { task: PackInstallTask; compact?: boolean }) {
   const percent = displayPercent(task);
   const detail = task.bytesTotal > 0

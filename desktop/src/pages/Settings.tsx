@@ -88,6 +88,7 @@ import {
 import { TemplateSettings } from './settings/TemplateSettings';
 import { RuntimeReclaim } from './settings/RuntimeReclaim';
 import { ContentSharingSettings } from './settings/ContentSharingSettings';
+import { DownloadWatchSettings } from './settings/DownloadWatchSettings';
 import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
 import { GameSupportSettings } from './settings/GameSupportSettings';
@@ -2395,9 +2396,10 @@ export function Settings({
         {
           id: 'storage',
           label: 'Storage',
-          cards: ['runtime-reclaim', 'content-sharing'],
+          cards: ['download-watch', 'runtime-reclaim', 'content-sharing'],
           content: (
             <>
+              {card('download-watch', <DownloadWatchSettings />)}
               {card('content-sharing', <ContentSharingSettings />)}
               {card('runtime-reclaim', <RuntimeReclaim />)}
             </>

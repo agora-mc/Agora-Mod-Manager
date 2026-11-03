@@ -7,7 +7,6 @@ import {
   addInstanceContent,
   formatBytes,
   listInstanceContent,
-  itemsForGame,
   listStore,
   moveInstanceContent,
   verifyStored,
@@ -58,22 +57,6 @@ describe('listStore', () => {
   it('passes the backend error through when the command fails', async () => {
     invokeMock.mockRejectedValueOnce({ code: 'core_failed', message: 'The store index is damaged.' });
     await expect(listStore()).rejects.toMatchObject({ code: 'core_failed', message: 'The store index is damaged.' });
-  });
-});
-
-describe('itemsForGame', () => {
-  const byHand = { ...storeItem, itemId: 'a', gameIds: [] };
-  const skyrimOnly = { ...storeItem, itemId: 'b', gameIds: ['skyrim-se'] };
-  const fallout = { ...storeItem, itemId: 'c', gameIds: ['fallout-4'] };
-  const both = { ...storeItem, itemId: 'd', gameIds: ['fallout-4', 'skyrim-se'] };
-
-  it('keeps the items for the game and those that name no game', () => {
-    const shown = itemsForGame([byHand, skyrimOnly, fallout, both], 'skyrim-se', false);
-    expect(shown.map((item) => item.itemId)).toEqual(['a', 'b', 'd']);
-  });
-
-  it('shows everything when asked to', () => {
-    expect(itemsForGame([byHand, skyrimOnly, fallout], 'skyrim-se', true)).toHaveLength(3);
   });
 });
 

@@ -715,6 +715,73 @@ export const GUIDE_TOPICS: GuideTopic[] = [
     },
   },
   {
+    id: 'downloads',
+    title: 'Mods you download in your browser',
+    shortTitle: 'New downloads',
+    category: 'Manage',
+    description: 'Let Agora notice mod archives in your Downloads folder and add them to your Library.',
+    keywords: ['downloads', 'nexus manual download', 'watch folder', 'new downloads', 'manual mod'],
+    basic: {
+      summary: 'Many mod sites still use a browser download instead of a button inside the launcher. Agora can watch one folder, recognise the mod archives in it by what is inside, and list them in your Library. Nothing is imported until you add it.',
+      outcomes: [
+        'Turn on download watching and choose the folder.',
+        'Add a recognised archive to your Library.',
+        'Ignore a file and stop Agora offering it.',
+      ],
+      sections: [
+        {
+          title: 'Turn it on',
+          body: 'Open Settings, Storage, and turn on "Notice mod downloads". Agora watches your Downloads folder unless you choose another one with Change folder. Watching happens only while Agora is running.',
+          bullets: [
+            'It is off by default, so Agora never asks about files you did not ask it to watch.',
+            'Only common mod archives (.zip, .7z, .rar, .jar, .mrpack) for a game you have turned on are offered.',
+            'Files already in the folder when you turn it on are not offered. Neither are browser partial downloads.',
+          ],
+        },
+        {
+          title: 'Add or ignore',
+          body: 'Open Library and look for New downloads. Each row says the file name, its size, the game and kind Agora recognised, and why. Add to library stores it through that game\'s normal flow. Ignore remembers the file by its contents so it is not offered again.',
+          bullets: [
+            'A file Agora already has is marked "Already in your library" and is not offered again.',
+            'An archive with a FOMOD installer opens the same questions Agora asks during an install.',
+            'The downloaded file is never moved, changed or deleted. Add to library copies it into Agora\'s store.',
+          ],
+          callout: {
+            tone: 'note',
+            title: 'File names are not trusted',
+            text: 'Agora decides what a file is by its contents, because download names are not standardized. A name that looks like a Nexus download adds a label only; it never changes what Agora thinks the file is.',
+          },
+        },
+        {
+          title: 'A quiet notification',
+          body: 'Agora can show one short message per batch of new downloads. Turn that off in the same Settings card if you would rather just check the Library badge. There are no dialog boxes for individual files.',
+        },
+      ],
+    },
+    advanced: {
+      summary: 'See what the CLI would offer, and what Agora does and does not read.',
+      outcomes: [
+        'Check a folder without importing anything.',
+        'Understand the limits of recognition.',
+      ],
+      sections: [
+        {
+          title: 'Scan from the CLI',
+          body: 'agora downloads scan --folder <path> makes one classification pass and prints each recognised file, its game, its kind and the reason. Add --json for machine output. It never imports, moves or changes a file.',
+        },
+        {
+          title: 'What recognition means',
+          body: 'For Minecraft, a jar carrying loader metadata (Fabric, Quilt, Forge or NeoForge) is a mod; a pack.mcmeta archive with assets/ or data/ is a resource or data pack; a shaders/ folder makes a shader pack; and an .mrpack with its pack index is a modpack. Other games use the content layout their own package declares, such as a fomod/ folder or the extensions and folders a game calls its data.',
+          callout: {
+            tone: 'warning',
+            title: 'Recognition is not a safety check',
+            text: 'A recognised archive is still an unverified file from the internet. Add only what you meant to download, and prefer sources you trust.',
+          },
+        },
+      ],
+    },
+  },
+  {
     id: 'launching',
     title: 'Launching Minecraft and health checks',
     shortTitle: 'Launch & health',
@@ -844,7 +911,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           steps: [
             'Open the game and choose Instances > New instance.',
             'Name it, and pick the install to build from if you have more than one, such as a Steam copy and a GOG copy.',
-            'Choose a base. A Linked base shares most files with your install, so it takes little extra space, but a change to a linked file also changes the install. A Copied base takes about the size of the game again, and changes to it never reach the install. We suggest Linked base, unless you plan to change the game's own files by hand.',
+            'Choose a base. A Linked base shares most files with your install, so it takes little extra space, but a change to a linked file also changes the install. A Copied base takes about the size of the game again, and changes to it never reach the install. We suggest Linked base, unless you plan to change the game files by hand.',
             'Leave How it will run on Automatic unless you have a reason. You can change it later on the instance\'s Overview.',
             'Choose Create and wait while the base is built.',
           ],

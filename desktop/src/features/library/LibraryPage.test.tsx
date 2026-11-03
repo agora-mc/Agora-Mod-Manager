@@ -3,8 +3,13 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
+// New downloads have their own tests; here the section stays empty.
+vi.mock('@/features/downloads/useNewDownloads', () => ({
+  useNewDownloads: () => ({ rows: [], count: 0, error: null, reload: async () => undefined }),
+}));
 
-import { LibraryPage } from './Library';
+import { LibraryPage } from './LibraryPage';
+import { ConfirmProvider } from '@/components/ui/confirm';
 
 const first = {
   itemId: 'a'.repeat(64),
@@ -12,11 +17,17 @@ const first = {
   description: 'A saved description.',
   version: '1.0.0',
   gameId: 'minecraft',
+  gameIds: ['minecraft'],
   pageUrl: null,
   iconSha256: null,
   sourceKind: 'file',
   sourceLabel: 'File: first.jar',
   instances: [],
+  fileCount: 1,
+  totalSize: 1024,
+  addedAtUnixMs: 1,
+  pluginFiles: [] as string[],
+  hasInstaller: false,
 };
 
 const second = {
@@ -25,8 +36,31 @@ const second = {
   name: 'Second item',
   description: null,
   version: '2.0.0',
-  gameId: 'skyrim-se',
   sourceLabel: 'Archive: second.zip',
+};
+
+const skyrimItem = {
+  ...first,
+  itemId: 'c'.repeat(64),
+  name: 'Lux',
+  description: 'A lighting overhaul.',
+  gameId: 'skyrim-se',
+  gameIds: ['skyrim-se'],
+  sourceKind: 'archive',
+  sourceLabel: 'Archive: lux.7z',
+  pluginFiles: ['Lux.esp', 'Lux - Orbis.esp'],
+  hasInstaller: true,
+};
+
+const untied = {
+  ...first,
+  itemId: 'd'.repeat(64),
+  name: 'Odin Patch',
+  description: null,
+  gameId: null,
+  gameIds: [] as string[],
+  sourceKind: 'archive',
+  sourceLabel: 'Archive: odin.zip',
 };
 
 const installedMod = {
@@ -47,7 +81,7 @@ function route() {
   invokeMock.mockImplementation(async (command: string) => {
     switch (command) {
       case 'games_library_list':
-        return { items: [first, second], damaged: [], warnings: [] };
+        return { items: [first, second, skyrimItem, untied], damaged: [], warnings: [] };
       case 'games_library_instances':
         return {
           instances: [{ instanceId: 'mc1', name: 'Minecraft One', gameId: 'minecraft' }],
@@ -77,7 +111,7 @@ describe('LibraryPage', () => {
     render(<LibraryPage />);
     expect(await screen.findByText('A saved description.')).toBeInTheDocument();
     expect(screen.getByText('No description was saved.')).toBeInTheDocument();
-    expect(screen.getByText('File: first.jar')).toBeInTheDocument();
+    expect(screen.getByText(/File: first.jar/)).toBeInTheDocument();
   });
 
   it('filters the list as the user searches', async () => {
@@ -164,6 +198,7 @@ describe('LibraryPage', () => {
       name: 'Old Mod',
       totalSize: 2 * 1024 * 1024,
       gameId: 'minecraft',
+      gameIds: ['minecraft'],
     };
     let removed = false;
     invokeMock.mockImplementation(async (command: string) => {
@@ -234,5 +269,80 @@ describe('LibraryPage', () => {
     expect(summary).toHaveTextContent("Instance 'mc-broken' could not be read");
     expect(within(summary).queryByRole('button', { name: 'Review unused items' }))
       .not.toBeInTheDocument();
+  });
+
+  it('shows only the open game’s items, and the untied ones under their own filter', async () => {
+    render(<LibraryPage />);
+    await screen.findByText('A saved description.');
+    expect(screen.getByText('First item')).toBeInTheDocument();
+    expect(screen.getByText('Second item')).toBeInTheDocument();
+    expect(screen.queryByText('Lux')).not.toBeInTheDocument();
+    expect(screen.queryByText('Odin Patch')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Not tied to a game/ }));
+    await waitFor(() => expect(screen.getByText('Odin Patch')).toBeInTheDocument());
+    expect(screen.queryByText('First item')).not.toBeInTheDocument();
+    expect(screen.getByText(/Nothing says which game these are for/)).toBeInTheDocument();
+  });
+
+  it('is the same page for another game, with its plugins, installer and own section', async () => {
+    render(
+      <LibraryPage
+        gameId="skyrim-se"
+        gameName="Skyrim SE"
+        gameSection={<p>Curated items for Skyrim</p>}
+      />,
+    );
+    await screen.findByText('A lighting overhaul.');
+    expect(screen.getByRole('heading', { name: 'Library' })).toBeInTheDocument();
+    expect(screen.queryByText('First item')).not.toBeInTheDocument();
+    const card = screen.getByTestId('library-item');
+    expect(within(card).getByText('2 plugins')).toBeInTheDocument();
+    expect(within(card).getByText('Lux - Orbis.esp')).toBeInTheDocument();
+    expect(within(card).getByText('Installer')).toBeInTheDocument();
+    expect(screen.getByText('Curated items for Skyrim')).toBeInTheDocument();
+    // Fill in details is a Modrinth lookup: Minecraft's part, not this game's.
+    expect(screen.queryByRole('button', { name: 'Fill in missing details' })).not.toBeInTheDocument();
+  });
+
+  it('records the game when an archive is added from that game’s Library', async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command: string, args: unknown) => {
+      if (command === 'pick_open_file') return 'D:/mods/odin.zip';
+      if (command === 'games_content_add') {
+        return {
+          status: 'added',
+          item: { ...untied, fileCount: 1, gameIds: ['skyrim-se'], addedAtUnixMs: 1 },
+          objectsNew: 1,
+          objectsRestored: 0,
+        };
+      }
+      return base(command, args);
+    });
+    render(<LibraryPage gameId="skyrim-se" gameName="Skyrim SE" />);
+    await screen.findByText('A lighting overhaul.');
+    fireEvent.click(screen.getByRole('button', { name: 'Add an archive…' }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('games_content_add', {
+        sourcePath: 'D:/mods/odin.zip',
+        name: null,
+        gameId: 'skyrim-se',
+      }),
+    );
+    expect(await screen.findByText('Added Odin Patch (1 file).')).toBeInTheDocument();
+  });
+
+  it('says the library could not be read and offers a retry, rather than looking empty', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'games_library_list') throw { code: 'core_failed', message: 'The store index is damaged.' };
+      if (command === 'games_library_instances') return { instances: [], warnings: [] };
+      if (command === 'games_library_unused') return { items: [], totalSize: 0, warnings: [] };
+      throw new Error(`unmocked command in a library test: ${command}`);
+    });
+    render(<ConfirmProvider><LibraryPage /></ConfirmProvider>);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Your library could not be read: The store index is damaged.');
+    expect(within(alert).getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+    expect(screen.queryByTestId('library-empty')).not.toBeInTheDocument();
   });
 });

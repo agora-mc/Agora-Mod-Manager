@@ -5,8 +5,8 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
 import {
   addLibraryItem,
-  filterLibraryByGame,
   instancesForItem,
+  itemsInView,
   listLibrary,
   listLibraryInstances,
   loadLibraryIcon,
@@ -20,11 +20,17 @@ const first: LibraryItem = {
   description: 'A saved description.',
   version: '1.0.0',
   gameId: 'minecraft',
+  gameIds: ['minecraft'],
   pageUrl: null,
   iconSha256: null,
   sourceKind: 'file',
   sourceLabel: 'File: first.jar',
   instances: [],
+  fileCount: 1,
+  totalSize: 1024,
+  addedAtUnixMs: 1,
+  pluginFiles: [],
+  hasInstaller: false,
 };
 
 const second: LibraryItem = {
@@ -34,7 +40,9 @@ const second: LibraryItem = {
   description: null,
   version: '2.0.0',
   gameId: 'skyrim-se',
+  gameIds: ['skyrim-se'],
   sourceLabel: 'Archive: second.zip',
+  pluginFiles: ['Second.esp'],
 };
 
 const installedMod = {
@@ -163,10 +171,18 @@ describe('loadLibraryIcon', () => {
 });
 
 describe('search and filters', () => {
-  it('filters by game and keeps items with no recorded game out of a game filter', () => {
-    const unrecorded = { ...first, itemId: 'c'.repeat(64), gameId: null };
-    expect(filterLibraryByGame([first, second, unrecorded], 'minecraft')).toEqual([first]);
-    expect(filterLibraryByGame([first, second], null)).toHaveLength(2);
+  it('shows a game its own items, and items tied to no game only under their own filter', () => {
+    const untied = { ...first, itemId: 'c'.repeat(64), gameId: null, gameIds: [] };
+    const both = { ...first, itemId: 'd'.repeat(64), gameId: null, gameIds: ['skyrim-se', 'minecraft'] };
+    const all = [first, second, untied, both];
+    expect(itemsInView(all, 'minecraft', 'game')).toEqual([first, both]);
+    expect(itemsInView(all, 'skyrim-se', 'game')).toEqual([second, both]);
+    expect(itemsInView(all, 'skyrim-se', 'untied')).toEqual([untied]);
+    expect(itemsInView(all, 'fallout-4', 'game')).toEqual([]);
+  });
+
+  it('finds an item by one of its plugin files', () => {
+    expect(searchLibrary([first, second], 'second.esp')).toEqual([second]);
   });
 
   it('searches names, descriptions, versions and sources', () => {
@@ -180,7 +196,9 @@ describe('search and filters', () => {
     expect(instancesForItem(first, [minecraftInstance, skyrimInstance])).toEqual([
       minecraftInstance,
     ]);
-    expect(instancesForItem({ ...first, gameId: null }, [minecraftInstance, skyrimInstance]))
+    expect(instancesForItem({ ...first, gameIds: [] }, [minecraftInstance, skyrimInstance]))
+      .toHaveLength(2);
+    expect(instancesForItem({ gameIds: ['minecraft', 'skyrim-se'] }, [minecraftInstance, skyrimInstance]))
       .toHaveLength(2);
   });
 });

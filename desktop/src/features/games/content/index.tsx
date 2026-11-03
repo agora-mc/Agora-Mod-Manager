@@ -1,7 +1,7 @@
 /**
- * Content slots owned by the content slice: the Library tab's store section and an
- * instance's Content tab (which also mounts the FOMOD wizard from the fomod folder).
+ * Content slots owned by the content slice: an instance's Content tab (which also mounts the
+ * FOMOD wizard from the fomod folder). The Library is one page for every game, in
+ * `features/library`.
  */
 
-export { LibraryStoreSection } from './LibraryStoreSection';
 export { InstanceContentTab } from './InstanceContentTab';
