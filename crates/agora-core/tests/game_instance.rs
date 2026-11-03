@@ -6,8 +6,9 @@ use agora_core::game_base::{
 };
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{
-    create, delete, delete_with_options, get, get_manifest, prepare_launch_with_discovery,
-    record_launch, DeleteOptions, GameInstanceManifest, InstanceError,
+    create, delete, delete_permanently, delete_with_options, get, get_manifest,
+    prepare_launch_with_discovery, record_launch, DeleteOptions, GameInstanceManifest,
+    InstanceError,
 };
 use agora_core::game_launch::LaunchError;
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
@@ -300,8 +301,8 @@ fn remove_base_refuses_pinned_base_naming_instances_and_succeeds_after_both_dele
         other => panic!("expected BaseError::InUse, got: {other:?}"),
     }
 
-    // Delete first instance
-    let outcome1 = delete(&ctx, &rec1.instance_id).unwrap();
+    // Delete first instance (for good, so the base is really unused)
+    let outcome1 = delete_permanently(&ctx, &rec1.instance_id).unwrap();
     assert_eq!(outcome1.orphaned_base, None);
 
     // remove_base still refuses naming the second instance
@@ -313,7 +314,7 @@ fn remove_base_refuses_pinned_base_naming_instances_and_succeeds_after_both_dele
     }
 
     // Delete second instance
-    let outcome2 = delete(&ctx, &rec2.instance_id).unwrap();
+    let outcome2 = delete_permanently(&ctx, &rec2.instance_id).unwrap();
     assert_eq!(outcome2.orphaned_base, Some(base_id.clone()));
 
     // Now remove_base succeeds!
@@ -407,6 +408,7 @@ fn deleting_an_instance_with_an_unreadable_base_record_needs_the_force_answer() 
         &rec.instance_id,
         DeleteOptions {
             force_unreadable_base: true,
+            recoverable: true,
         },
     )
     .unwrap();
@@ -600,6 +602,7 @@ fn a_forced_delete_fails_closed_when_the_base_roots_cannot_be_read() {
         &rec.instance_id,
         DeleteOptions {
             force_unreadable_base: true,
+            recoverable: true,
         },
     );
 

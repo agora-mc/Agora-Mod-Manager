@@ -1090,6 +1090,53 @@ pub fn status(
     }))
 }
 
+/// The parts of a session a stop needs: when it began, where the game runs from, and the process
+/// identities the launch recorded. Reading is the same fail-closed read `status` does.
+#[derive(Debug, Clone)]
+pub struct SessionDetails {
+    pub instance: String,
+    pub running: bool,
+    pub created_at: String,
+    pub running_from: PathBuf,
+    pub processes: Vec<ProcessIdentity>,
+    pub starting_launcher: Option<ProcessIdentity>,
+}
+
+/// Read a session's details. An unreadable journal is an error, never "no session".
+pub fn details(
+    ctx: &Ctx,
+    game: &GameId,
+    store: &StoreId,
+) -> Result<Option<SessionDetails>, UserFilesError> {
+    let journal_path = ctx
+        .paths
+        .user_files_journal_path(game.as_str(), store.as_str());
+    if !journal_path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&journal_path).map_err(|e| {
+        UserFilesError::Other(format!(
+            "the user-files journal {} cannot be read: {e}",
+            journal_path.display()
+        ))
+    })?;
+    let journal: Journal = serde_json::from_str(&text).map_err(|e| {
+        UserFilesError::Other(format!(
+            "the user-files journal {} cannot be read: {e}",
+            journal_path.display()
+        ))
+    })?;
+    let running = is_session_running(&journal);
+    Ok(Some(SessionDetails {
+        instance: journal.instance_id,
+        running,
+        created_at: journal.created_at,
+        running_from: journal.running_from,
+        processes: journal.processes,
+        starting_launcher: journal.starting_launcher,
+    }))
+}
+
 /// List active/recoverable user-file sessions across all games, optionally filtered.
 pub fn list_statuses(
     ctx: &Ctx,

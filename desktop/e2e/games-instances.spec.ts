@@ -29,6 +29,16 @@ const skyrim = {
   installs: [skyrimInstall],
 };
 
+const capabilities = {
+  launch: true,
+  stop: true,
+  rename: true,
+  clone: true,
+  trash: true,
+  openFolder: true,
+  playTime: true,
+};
+
 const grounded = {
   instanceId: 'grounded-1',
   gameId: 'skyrim-se',
@@ -38,7 +48,10 @@ const grounded = {
   pinned: true,
   deployment: null,
   lastLaunchedAt: '2026-10-20 18:30:00',
+  lastPlayedAt: '2026-10-20 18:30:00',
+  playTimeMs: 7_200_000,
   running: false,
+  capabilities,
 };
 
 const modded = {
@@ -50,7 +63,10 @@ const modded = {
   pinned: false,
   deployment: 'links',
   lastLaunchedAt: null,
+  lastPlayedAt: null,
+  playTimeMs: 0,
   running: false,
+  capabilities,
 };
 
 const groundedDetail = {
@@ -69,7 +85,10 @@ const groundedDetail = {
   saves: 'shared',
   createdAt: '2026-10-01 10:00:00',
   lastLaunchedAt: '2026-10-20 18:30:00',
+  lastPlayedAt: '2026-10-20 18:30:00',
+  playTimeMs: 7_200_000,
   running: false,
+  capabilities,
 };
 
 const extenderFinding = {

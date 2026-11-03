@@ -18,6 +18,14 @@ use crate::game_discovery::DiscoveryReport;
 use crate::game_launch::{LaunchError, LaunchRoots, Launcher, PreparedLaunch, SystemLauncher};
 use crate::game_registry::{IdentifiedInstall, RuntimeResolution};
 
+mod clone;
+mod session;
+pub mod trash;
+
+pub use clone::{clone_instance, CloneOptions, ClonedInstance};
+pub use session::{end_session, stop, SessionEnd, StopOutcome};
+pub use trash::{DeletedEntry, PurgeSummary, RestoreOutcome, TrashFn};
+
 /// A generic instance manifest stored at `<instances_root>/<id>/instance_manifest.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameInstanceManifest {
@@ -122,15 +130,31 @@ pub struct DeleteOutcome {
     /// A deployed game folder Agora could not prove was this instance's, left where it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_in_place: Option<PathBuf>,
+    /// The Recently deleted entry the instance went to, when the delete was recoverable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash_entry_id: Option<String>,
 }
 
 /// Options for [`delete`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct DeleteOptions {
     /// Delete the instance even when its base record cannot be read. The instance's own folder goes;
     /// a deployed game folder Agora cannot prove is the instance's stays, and is named in the
     /// outcome.
     pub force_unreadable_base: bool,
+    /// Keep the instance in Recently deleted instead of removing its folder. On by default: a
+    /// delete is a player action and its work should be recoverable. A rollback of a half-created
+    /// instance passes false.
+    pub recoverable: bool,
+}
+
+impl Default for DeleteOptions {
+    fn default() -> Self {
+        Self {
+            force_unreadable_base: false,
+            recoverable: true,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,10 +163,21 @@ pub enum InstanceError {
     RuntimeUnidentified(Vec<String>),
     #[error("instance '{0}' already exists")]
     AlreadyExists(String),
+    /// A deleted instance's id has been taken again; restoring needs a new name.
+    #[error("an instance called '{0}' exists again; choose a new name to restore it")]
+    RestoreIdTaken(String),
+    /// A recoverable operation refused, with a code the page branches on.
+    #[error("{message}")]
+    Trash { code: &'static str, message: String },
     #[error("instance '{0}' not found")]
     NotFound(String),
     #[error("instance '{0}' is running; close the game first")]
     Running(String),
+    #[error("nothing is running for instance '{0}'")]
+    NothingRunning(String),
+    /// The session's process was not one Agora started, so it is never killed.
+    #[error("the game running for instance '{0}' was not started by Agora; close it yourself")]
+    NotStartedByAgora(String),
     #[error("instance '{0}' is a Minecraft instance; use 'agora launch {0}' to launch or 'agora instance delete {0}' to delete")]
     MinecraftInstance(String),
     #[error("invalid instance ID '{0}': {1}")]
@@ -172,6 +207,8 @@ pub enum InstanceError {
     Deploy(#[from] crate::game_deploy::DeployError),
     #[error(transparent)]
     UserFiles(#[from] crate::game_user_files::UserFilesError),
+    #[error(transparent)]
+    Saves(#[from] crate::game_saves::SavesError),
     #[error(transparent)]
     Plugins(#[from] crate::game_plugins::PluginListError),
     #[error(transparent)]
@@ -485,7 +522,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<GameInstanceRecord>, InstanceError> {
     let mut stmt = match conn.prepare(
         "SELECT instance_id, game, name, base_json, created_at, last_launched_at
          FROM game_instances
-         ORDER BY last_launched_at DESC NULLS LAST, created_at DESC",
+         ORDER BY COALESCE(last_played_at, last_launched_at) DESC NULLS LAST, created_at DESC",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return Ok(Vec::new()),
@@ -542,8 +579,8 @@ pub fn is_minecraft_instance(ctx: &Ctx, id: &str) -> bool {
     .is_ok()
 }
 
-/// Delete a generic game instance and its folder. Refuses Minecraft instances and folders
-/// outside `<instances_root>`.
+/// Delete a generic game instance, moving its folder to Recently deleted so it can be restored.
+/// Refuses Minecraft instances and folders outside `<instances_root>`.
 pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
     delete_with_options(ctx, id, DeleteOptions::default())
 }
@@ -662,6 +699,46 @@ pub fn delete_with_options(
         }
     }
 
+    if options.recoverable {
+        // Move the folder into Agora's own holding area before the row goes, so a crash leaves
+        // either a restorable entry or a live instance, never a row with no files.
+        let row = trash::read_row(&conn, id)?;
+        let entry = if instance_dir.exists() {
+            let entry = trash::stash(
+                &ctx.paths.recently_deleted_games_root(),
+                row,
+                &instance_dir,
+                chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
+            )?;
+            if let Err(error) =
+                conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])
+            {
+                let _ = trash::undo_stash(
+                    &ctx.paths.recently_deleted_games_root(),
+                    &entry,
+                    &instance_dir,
+                );
+                return Err(error.into());
+            }
+            Some(entry)
+        } else {
+            // A row whose folder is already gone has nothing to recover.
+            conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])?;
+            None
+        };
+        if let BaseReference::Pinned { id: base_id, .. } = &base_ref {
+            let _ = crate::game_tool_copy::remove_deleted_instance_copy(ctx, id, base_id);
+        }
+        return Ok(DeleteOutcome {
+            instance_id: id.to_string(),
+            // The base stays while the instance is restorable: suggesting its removal would break
+            // a later restore.
+            orphaned_base: None,
+            left_in_place,
+            trash_entry_id: entry.map(|entry| entry.entry_id),
+        });
+    }
+
     // The row goes first: a folder left behind by a failed removal is inert,
     // while a row whose folder is gone is a broken instance.
     conn.execute("DELETE FROM game_instances WHERE instance_id = ?1", [id])?;
@@ -692,7 +769,21 @@ pub fn delete_with_options(
         instance_id: id.to_string(),
         orphaned_base,
         left_in_place,
+        trash_entry_id: None,
     })
+}
+
+/// Remove an instance and its folder for good, without a Recently deleted entry. For rollbacks of
+/// something Agora itself just made; a player's delete is recoverable.
+pub fn delete_permanently(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
+    delete_with_options(
+        ctx,
+        id,
+        DeleteOptions {
+            force_unreadable_base: false,
+            recoverable: false,
+        },
+    )
 }
 
 /// The deployment folder Agora would have made for `id`, searched across the base roots it knows,
@@ -749,22 +840,83 @@ pub fn record_launch(ctx: &Ctx, id: &str) -> Result<(), InstanceError> {
     Ok(())
 }
 
-/// Give a generic game instance a new name, in the list and in its manifest.
+/// Give a generic game instance a new name, in the list and in its manifest. The id never changes.
 pub fn rename(ctx: &Ctx, id: &str, name: &str) -> Result<(), InstanceError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(InstanceError::Other("Give the instance a name.".into()));
+    }
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
+    // The manifest is updated first: a row renamed over an unreadable manifest would be a
+    // half-renamed instance. A failed row update puts the manifest back.
+    let mut manifest = get_manifest(ctx, id)?;
+    let previous = manifest.name.clone();
+    manifest.name = name.to_string();
+    crate::game_deploy::write_instance_manifest_atomic(ctx, id, &manifest)?;
     let count = conn.execute(
         "UPDATE game_instances SET name = ?1 WHERE instance_id = ?2",
         [name, id],
     )?;
     if count == 0 {
+        manifest.name = previous;
+        let _ = crate::game_deploy::write_instance_manifest_atomic(ctx, id, &manifest);
         return Err(InstanceError::NotFound(id.to_string()));
     }
-    let mut manifest = get_manifest(ctx, id)?;
-    manifest.name = name.to_string();
-    crate::game_deploy::write_instance_manifest_atomic(ctx, id, &manifest)?;
     Ok(())
+}
+
+/// How long the player has spent in an instance, and when it last ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayStats {
+    pub total_play_ms: i64,
+    pub last_played_at: Option<String>,
+}
+
+/// The instance's recorded play time and last session end.
+pub fn play_stats(ctx: &Ctx, id: &str) -> Result<PlayStats, InstanceError> {
+    let db_path = ctx.paths.local_state_db();
+    let conn = crate::db::local_state_connection(&db_path)
+        .map_err(|e| InstanceError::Other(e.to_string()))?;
+    conn.query_row(
+        "SELECT total_play_ms, last_played_at FROM game_instances WHERE instance_id = ?1",
+        [id],
+        |row| {
+            Ok(PlayStats {
+                total_play_ms: row.get(0)?,
+                last_played_at: row.get(1)?,
+            })
+        },
+    )
+    .optional()?
+    .ok_or_else(|| InstanceError::NotFound(id.to_string()))
+}
+
+/// Add one session to an instance's play time, ending now. A session that started in the future
+/// (a clock jump) adds nothing rather than a negative total.
+pub fn record_play_time(
+    ctx: &Ctx,
+    id: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Result<PlayStats, InstanceError> {
+    let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now());
+    let elapsed = (now - started_at).num_milliseconds().max(0);
+    let db_path = ctx.paths.local_state_db();
+    let conn = crate::db::local_state_connection(&db_path)
+        .map_err(|e| InstanceError::Other(e.to_string()))?;
+    let count = conn.execute(
+        "UPDATE game_instances
+            SET total_play_ms = total_play_ms + ?1,
+                last_played_at = ?2
+          WHERE instance_id = ?3",
+        rusqlite::params![elapsed, now.format("%Y-%m-%d %H:%M:%S").to_string(), id],
+    )?;
+    if count == 0 {
+        return Err(InstanceError::NotFound(id.to_string()));
+    }
+    play_stats(ctx, id)
 }
 
 /// What a launch does when the virtual file system (rung 1) cannot start.

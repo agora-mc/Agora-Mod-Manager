@@ -327,6 +327,13 @@ impl AppPaths {
         self.root.join("recently-deleted")
     }
 
+    /// Agora-managed holding area for deleted generic game instances
+    /// (`recently-deleted-games/`). Kept apart from Minecraft's area so each
+    /// list can be shown and cleaned up without knowing the other's entries.
+    pub fn recently_deleted_games_root(&self) -> PathBuf {
+        self.root.join("recently-deleted-games")
+    }
+
     /// Root directory for reusable instance templates (`templates/`).
     pub fn templates_root(&self) -> PathBuf {
         self.root.join("templates")

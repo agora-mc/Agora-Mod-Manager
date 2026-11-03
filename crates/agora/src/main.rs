@@ -7356,6 +7356,7 @@ async fn run_command(
                 GameInstanceCmd::Delete { instance_id, force } => {
                     let options = agora_core::game_instance::DeleteOptions {
                         force_unreadable_base: force,
+                        recoverable: true,
                     };
                     match agora_core::game_instance::delete_with_options(ctx, &instance_id, options)
                     {
