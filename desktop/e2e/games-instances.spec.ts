@@ -168,14 +168,76 @@ test('the Instances tab shows each instance as a card with its runtime, pinning 
   await expect(cardFor(page, 'Modded')).toContainText('Never');
 });
 
-test('a card offers Launch, Edit and Delete, and no button for what games cannot do yet', async ({ page }) => {
-  await boot(page, { games_instance_list: { instances: [grounded] } });
+test('a card offers Launch, Edit, Clone and Delete, and no button for what the instance cannot do', async ({ page }) => {
+  await boot(page, {
+    games_instance_list: {
+      instances: [grounded, { ...modded, capabilities: { ...capabilities, clone: false, launch: false } }],
+    },
+  });
 
   const card = cardFor(page, 'Grounded');
-  await expect(card.getByRole('button')).toHaveText(['Launch', 'Edit', 'Delete']);
+  await expect(card.getByRole('button')).toHaveText(['Launch', 'Edit', 'Clone', 'Delete']);
+  await expect(card).toContainText('2 h played');
+  await expect(cardFor(page, 'Modded').getByRole('button')).toHaveText(['Edit', 'Delete']);
   await expect(card.getByRole('button', { name: 'Open', exact: true })).toHaveCount(0);
   await expect(page.getByTestId('game-instances-tab').getByRole('heading', { name: 'Instances', exact: true })).toBeVisible();
-  await expect(page.getByText('1 instance', { exact: true })).toBeVisible();
+  await expect(page.getByText('2 instances', { exact: true })).toBeVisible();
+});
+
+test('a running instance offers Stop, which asks first and then stops the game', async ({ page }) => {
+  await boot(page, { games_instance_list: { instances: [{ ...grounded, running: true }] } });
+
+  const card = cardFor(page, 'Grounded');
+  await expect(card.getByRole('button', { name: /Launch/ })).toHaveCount(0);
+  await card.getByRole('button', { name: 'Stop Grounded' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toContainText('Anything you have not saved in the game is lost.');
+  await dialog.getByRole('button', { name: 'Stop the game' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Grounded was stopped.' })).toBeVisible();
+});
+
+test('Clone leaves the saves behind by default and names the copy', async ({ page }) => {
+  await boot(page, { games_instance_list: { instances: [grounded] } });
+
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Clone Grounded' }).click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByRole('switch', { name: 'Also copy saves' })).toHaveAttribute('aria-checked', 'false');
+  await expect(dialog.getByRole('textbox')).toHaveValue('Copy of Grounded');
+  await dialog.getByRole('button', { name: 'Clone', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Made Copy of Grounded, a copy of Grounded.' })).toBeVisible();
+});
+
+test('a deleted instance waits in Recently deleted, which can be emptied', async ({ page }) => {
+  await boot(page, {
+    games_instance_list: { instances: [grounded] },
+    games_instance_delete: { instanceId: 'grounded-1', orphanedBase: null, leftInPlace: null, trashEntryId: 'entry-1' },
+    games_instance_deleted_list: {
+      entries: [{
+        entryId: 'entry-0',
+        instanceId: 'old-1',
+        gameId: 'skyrim-se',
+        name: 'Old setup',
+        deletedAt: '2026-11-01T10:00:00Z',
+        expiresAt: '2026-11-15T10:00:00Z',
+        sizeBytes: 5 * 1024 ** 2,
+      }],
+      retentionDays: 14,
+    },
+  });
+
+  const region = page.getByRole('region', { name: 'Recently deleted' });
+  await expect(region).toContainText('Old setup');
+  await expect(region).toContainText('stay here for 14 days');
+
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Delete Grounded' }).click();
+  const confirm = page.getByRole('dialog');
+  await expect(confirm).toContainText('restore it for 14 days');
+  await confirm.getByRole('button', { name: 'Delete instance' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Grounded was moved to Recently deleted.' })).toBeVisible();
+
+  await region.getByRole('button', { name: 'Empty' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Empty' }).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
 });
 
 test('a launch from the card that the checks refused starts nothing and leads to the instance page', async ({ page }) => {

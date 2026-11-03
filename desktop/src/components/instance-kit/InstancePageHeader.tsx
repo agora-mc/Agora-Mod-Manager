@@ -13,7 +13,7 @@ import { emphasisOf, supportedActions, type InstanceAction, type InstanceCapabil
 interface InstancePageHeaderProps {
   tile: ReactNode;
   name: string;
-  /** Beside the name, inside the heading (Minecraft's "Rename"). */
+  /** Beside the name, on its baseline (Minecraft's "Rename"). Not part of the heading's name. */
   nameAccessory?: ReactNode;
   /** Beside the heading ("Running now"). */
   status?: ReactNode;
@@ -76,10 +76,12 @@ export function InstancePageHeader({
           {tile}
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-3">
-              <h2 className="wrap-break-word text-2xl font-bold">
-                {name}
-                {nameAccessory && <> {nameAccessory}</>}
-              </h2>
+              {/* The accessory sits on the heading's baseline, as Minecraft's Rename does, but
+                  outside it, so the heading's name is the instance's name alone. */}
+              <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+                <h2 className="wrap-break-word text-2xl font-bold">{name}</h2>
+                {nameAccessory}
+              </div>
               {status}
             </div>
             {chips && <div className="mt-1.5 flex flex-wrap items-center gap-1.5">{chips}</div>}
@@ -151,6 +153,20 @@ function HeaderPrimaryButton({ action }: { action: InstanceAction }) {
     >
       <Icon className={cn('h-5 w-5', action.busy ? 'animate-spin' : 'fill-current')} aria-hidden="true" />
       {action.label}
+    </button>
+  );
+}
+
+/** Minecraft's "Rename" beside an instance's name in its page header. */
+export function RenameLink({ onSelect, disabled, label = 'Rename' }: { onSelect: () => void; disabled?: boolean; label?: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      disabled={disabled}
+      className="text-xs text-muted-foreground hover:text-foreground underline"
+    >
+      {label}
     </button>
   );
 }

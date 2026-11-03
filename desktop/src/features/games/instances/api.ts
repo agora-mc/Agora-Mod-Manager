@@ -525,3 +525,11 @@ export async function setGameInstanceIcon(instanceId: string, sourcePath: string
   if (!isImageDataUrl(reply)) throw shapeError('games_instance_set_icon');
   return reply;
 }
+
+/**
+ * Open an instance's folder in the file manager. A game instance lives in the same instances
+ * folder as Minecraft's, so this is the command Minecraft's "Open in Folder" uses.
+ */
+export async function openGameInstanceFolder(instanceId: string): Promise<void> {
+  await invoke<unknown>('open_instance_folder', { instanceId });
+}

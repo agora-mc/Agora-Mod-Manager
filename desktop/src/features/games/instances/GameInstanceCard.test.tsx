@@ -1,7 +1,8 @@
 /**
  * The games instance card and the launch it shares with the instance page: Launch on the card,
- * Edit opening the page, no buttons for what games cannot do yet, and an answer that needs a
- * decision sending the player to the page with "Review".
+ * Edit opening the page, Clone and Stop when the instance allows them (never a dead button), play
+ * time beside last played, and an answer that needs a decision sending the player to the page
+ * with "Review".
  */
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { renderHook } from '@testing-library/react';
@@ -46,10 +47,14 @@ const reply = (status: LaunchReply['status'], extra: Partial<LaunchReply> = {}):
   ...extra,
 });
 
-function renderCard(card: InstanceCard = grounded, handlers: Partial<{ onOpen: () => void; onDelete: () => void; onLaunchSettled: () => void }> = {}) {
+type Handlers = { onOpen: () => void; onDelete: () => void; onClone: () => void; onStop: () => void; onLaunchSettled: () => void };
+
+function renderCard(card: InstanceCard = grounded, handlers: Partial<Handlers> = {}) {
   const props = {
     onOpen: vi.fn(),
     onDelete: vi.fn(),
+    onClone: vi.fn(),
+    onStop: vi.fn(),
     onLaunchSettled: vi.fn(),
     ...handlers,
   };
@@ -67,14 +72,43 @@ beforeEach(() => {
 });
 
 describe('GameInstanceCard', () => {
-  it('offers Launch, Edit and Delete, and nothing games cannot do yet', () => {
+  it('offers Launch, Edit, Clone and Delete in Minecraft order, and nothing games cannot do', () => {
     const { card } = renderCard();
     const buttons = within(card).getAllByRole('button');
-    expect(buttons.map((button) => button.textContent)).toEqual(['Launch', 'Edit', 'Delete']);
-    for (const name of ['Open', 'Clone', 'Group', 'Stop', 'Troubleshoot']) {
+    expect(buttons.map((button) => button.textContent)).toEqual(['Launch', 'Edit', 'Clone', 'Delete']);
+    for (const name of ['Open', 'Group', 'Stop', 'Troubleshoot']) {
       expect(within(card).queryByRole('button', { name })).toBeNull();
     }
     for (const button of buttons) expect(button).toBeEnabled();
+  });
+
+  it('leaves out Clone and Launch when the instance does not allow them', () => {
+    const { card } = renderCard({
+      ...grounded,
+      capabilities: { ...grounded.capabilities, clone: false, launch: false },
+    });
+    expect(within(card).getAllByRole('button').map((button) => button.textContent)).toEqual(['Edit', 'Delete']);
+  });
+
+  it('opens Clone from the card', () => {
+    const { card, onClone } = renderCard();
+    fireEvent.click(within(card).getByRole('button', { name: 'Clone Grounded' }));
+    expect(onClone).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows play time next to last played, as Minecraft does', () => {
+    const { card } = renderCard({ ...grounded, playTimeMs: 26_400_000, lastPlayedAt: '2026-10-31 20:00:00' });
+    expect(card).toHaveTextContent(/Last played Oct 31, 2026.* · 7\.3 h played/);
+  });
+
+  it('leaves play time out when the instance does not track it', () => {
+    const { card } = renderCard({
+      ...grounded,
+      playTimeMs: 26_400_000,
+      capabilities: { ...grounded.capabilities, playTime: false },
+    });
+    expect(card).not.toHaveTextContent('played ·');
+    expect(card).not.toHaveTextContent('h played');
   });
 
   it('shows the runtime chip, when it was played and when it was made, without seconds', () => {
@@ -98,12 +132,22 @@ describe('GameInstanceCard', () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  it('has no Launch while the game runs, and says it is running', () => {
-    const { card } = renderCard({ ...grounded, running: true });
+  it('shows Stop in place of Launch while the game runs, and says it is running', () => {
+    const { card, onStop } = renderCard({ ...grounded, running: true });
     expect(within(card).queryByRole('button', { name: /Launch/ })).toBeNull();
     expect(card).toHaveTextContent('Running now');
     expect(card).toHaveClass('instance-card--running');
     expect(within(card).getByRole('button', { name: 'Delete Grounded' })).toBeDisabled();
+    expect(within(card).getAllByRole('button')[0]).toHaveTextContent('Stop');
+    fireEvent.click(within(card).getByRole('button', { name: 'Stop Grounded' }));
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it('has no Stop for a running game Agora cannot stop', () => {
+    const { card } = renderCard({ ...grounded, running: true, capabilities: { ...grounded.capabilities, stop: false } });
+    expect(within(card).queryByRole('button', { name: /Stop/ })).toBeNull();
+    expect(within(card).queryByRole('button', { name: /Launch/ })).toBeNull();
+    expect(card).toHaveTextContent('Running now');
   });
 
   it('launches from the card, then lets the list reload; a plain start leaves no banner', async () => {

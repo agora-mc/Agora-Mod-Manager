@@ -202,7 +202,7 @@ describe('Settings for another game', () => {
 
     fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
     expect(screen.getByText('Your choices for Skyrim Special Edition.')).toBeInTheDocument();
-    expect(within(pages()).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['New instances', 'Installs', 'Bases', 'Recovery']);
+    expect(within(pages()).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Instances', 'Installs', 'Bases', 'Recovery']);
 
     fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs' }));
     expect(await screen.findByText('D:/Steam/steamapps/common/Skyrim Special Edition')).toBeInTheDocument();

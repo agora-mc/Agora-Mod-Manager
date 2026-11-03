@@ -15,7 +15,7 @@ type Load<T> =
   | { status: 'failed'; message: string }
   | { status: 'loaded'; value: T };
 
-interface Choice<Value extends string> {
+export interface Choice<Value extends string> {
   value: Value;
   label: string;
 }
@@ -46,7 +46,7 @@ function optionLabel<Value extends string>(choice: Choice<Value>, recommended: V
  * in a narrow window). When the saved choice is not the recommended one, a quiet line says what
  * Agora recommends, so the advice is visible without opening the list.
  */
-function GameSettingRow<Value extends string>({
+export function GameSettingRow<Value extends string>({
   label,
   description,
   value,
