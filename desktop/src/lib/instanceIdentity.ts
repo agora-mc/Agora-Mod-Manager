@@ -58,14 +58,36 @@ export interface InstanceTint {
   angle: number;
 }
 
-export function instanceTint(seed: string, loader?: string | null): InstanceTint {
-  const base = LOADER_HUE[normalizeLoader(loader)] ?? FALLBACK_HUE;
+/**
+ * `family` replaces the loader's hue family, for a game with no loader to group by (see
+ * `instanceFamilyHue`). Minecraft never passes it.
+ */
+export function instanceTint(seed: string, loader?: string | null, family?: number | null): InstanceTint {
+  const base = family ?? LOADER_HUE[normalizeLoader(loader)] ?? FALLBACK_HUE;
   const h = hash32(seed || 'instance');
   const jitter = (h % 23) - 11; // −11…+11, narrow enough that families never meet
   const spread = 24 + ((h >>> 5) % 22); // 24…45 between the two stops
   const angle = 110 + ((h >>> 11) % 70); // 110…179deg
   const hueA = (base + jitter + 360) % 360;
   return { hueA, hueB: (hueA + spread) % 360, angle };
+}
+
+/**
+ * A hue family drawn from the instance itself, for a game with no loader. Every instance on a
+ * game's page is the same game, and nearly always the same store, so a family taken from either
+ * would paint every tile alike (the "all teal" grid). The rule is otherwise Minecraft's: the
+ * family, then the per-instance jitter, spread and angle of `instanceTint`.
+ */
+export function instanceFamilyHue(seed: string): number {
+  // FNV alone keeps ids that differ only in their last character ("grounded-1", "grounded-2")
+  // a fixed step apart, so the hues cluster; the murmur3 finalizer spreads them over the wheel.
+  let h = hash32(`family:${seed || 'instance'}`);
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return (h >>> 0) % 360;
 }
 
 /**

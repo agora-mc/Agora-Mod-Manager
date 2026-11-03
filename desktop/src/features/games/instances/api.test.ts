@@ -11,11 +11,13 @@ import {
   gamesErrorCode,
   gamesErrorMessage,
   getGameInstance,
+  getGameInstanceIcon,
   launchGameInstance,
   listGameInstances,
   onCreateProgress,
   onInstanceExited,
   setGameInstanceDeployment,
+  setGameInstanceIcon,
 } from './api';
 
 const card = {
@@ -256,5 +258,30 @@ describe('error helpers', () => {
     expect(gamesErrorMessage(new Error('boom'))).toBe('boom');
     expect(gamesErrorMessage(undefined)).toBe('Something went wrong, and Agora did not say what.');
     expect(gamesErrorCode('plain string')).toBeNull();
+  });
+});
+
+describe('instance images', () => {
+  beforeEach(() => invokeMock.mockReset());
+
+  it('reads no image as null and an image as its data URL', async () => {
+    invokeMock.mockResolvedValueOnce(null);
+    await expect(getGameInstanceIcon('grounded-1')).resolves.toBeNull();
+    invokeMock.mockResolvedValueOnce('data:image/png;base64,AAAA');
+    await expect(getGameInstanceIcon('grounded-1')).resolves.toBe('data:image/png;base64,AAAA');
+    expect(invokeMock).toHaveBeenCalledWith('games_instance_icon', { instanceId: 'grounded-1' });
+  });
+
+  it('rejects a reply that is not an image, rather than showing it', async () => {
+    invokeMock.mockResolvedValueOnce('https://example.com/a.png');
+    await expect(getGameInstanceIcon('grounded-1')).rejects.toThrow('games_instance_icon');
+    invokeMock.mockResolvedValueOnce(null);
+    await expect(setGameInstanceIcon('grounded-1', 'D:/a.png')).rejects.toThrow('games_instance_set_icon');
+  });
+
+  it('sends the picked file and answers the stored image', async () => {
+    invokeMock.mockResolvedValueOnce('data:image/gif;base64,R0lG');
+    await expect(setGameInstanceIcon('grounded-1', 'D:/a.gif')).resolves.toBe('data:image/gif;base64,R0lG');
+    expect(invokeMock).toHaveBeenCalledWith('games_instance_set_icon', { instanceId: 'grounded-1', sourcePath: 'D:/a.gif' });
   });
 });

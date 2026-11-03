@@ -70,10 +70,10 @@ describe('CreateInstanceDialog per-game defaults', () => {
     await waitForInstalls();
 
     expect(screen.getByLabelText('How it will run')).toHaveValue('auto');
-    expect(screen.getByRole('button', { name: /Linked base/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('radio', { name: /Linked base/ })).toHaveAttribute('aria-checked', 'true');
 
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Grounded' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Create instance' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_instance_create', expect.objectContaining({
       gameId: 'skyrim-se',
@@ -90,7 +90,7 @@ describe('CreateInstanceDialog per-game defaults', () => {
     expect(screen.getByLabelText('How it will run')).toHaveValue('copies');
 
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Grounded' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Create instance' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_instance_create', expect.objectContaining({
       deployment: 'copies',
@@ -102,7 +102,33 @@ describe('CreateInstanceDialog per-game defaults', () => {
     renderDialog();
     await waitForInstalls();
 
-    expect(screen.getByRole('button', { name: /Copied base/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('radio', { name: /Copied base/ })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('marks the recommended choices, even when the saved default is another one', async () => {
+    answer({ 'game.skyrim-se.baseType': 'copied', 'game.skyrim-se.deployment': 'copies' });
+    renderDialog();
+    await waitForInstalls();
+
+    const linked = screen.getByRole('radio', { name: /Linked base/ });
+    expect(linked).toHaveAttribute('aria-checked', 'false');
+    expect(linked).toHaveTextContent('Recommended');
+    expect(screen.getByRole('radio', { name: /Copied base/ })).not.toHaveTextContent('Recommended');
+    expect(screen.getByRole('option', { name: 'Automatic (recommended)' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Copied files' })).toBeInTheDocument();
+  });
+
+  it('says what is missing until there is a name', async () => {
+    answer();
+    renderDialog();
+    await waitForInstalls();
+
+    expect(screen.getByLabelText('Name')).toHaveAttribute('placeholder', 'e.g. Survival playthrough');
+    expect(screen.getByText('Type a name to enable Create.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Grounded' } });
+    expect(screen.queryByText('Type a name to enable Create.')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeEnabled();
   });
 
   it('does not use another game\'s deployment for this one', async () => {

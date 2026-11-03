@@ -846,7 +846,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
             'Name it, and pick the install to build from if you have more than one, such as a Steam copy and a GOG copy.',
             'Choose a base. A Linked base shares most files with your install, so it takes little extra space, but a change to a linked file also changes the install. A Copied base takes about the size of the game again, and changes to it never reach the install. If you have the space, we suggest Copied base.',
             'Leave How it will run on Automatic unless you have a reason. You can change it later on the instance\'s Overview.',
-            'Choose Create instance and wait while the base is built.',
+            'Choose Create and wait while the base is built.',
           ],
           callout: {
             tone: 'note',

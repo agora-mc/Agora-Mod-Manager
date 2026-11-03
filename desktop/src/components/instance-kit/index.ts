@@ -11,6 +11,7 @@ export { InstanceActionBar, InstanceActionButton } from './InstanceActionBar';
 export { InstanceGrid, InstanceCardSkeleton, INSTANCE_GRID_CLASS, type InstanceGridGroup } from './InstanceGrid';
 export { EmptyState } from './EmptyState';
 export { InstancePageHeader } from './InstancePageHeader';
+export { InstanceTileButton, SetImageButton } from './InstanceTileButton';
 export { ReadinessLine, READINESS_TEXT_CLASS } from './ReadinessLine';
 export { InstanceTabBar, type InstanceTab } from './InstanceTabBar';
 export { CreateInstanceFrame } from './CreateInstanceFrame';

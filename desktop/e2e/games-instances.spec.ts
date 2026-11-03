@@ -314,15 +314,18 @@ test('creating an instance needs a name, explains how it runs, and opens the new
   await expect(dialog.getByRole('heading', { name: 'New instance of Skyrim Special Edition' })).toBeVisible();
   await expect(dialog.getByLabel('How it will run')).toHaveValue('auto');
   await expect(dialog.getByLabel('How it will run')).toContainText('Virtual file system');
-  await expect(dialog.getByRole('button', { name: 'Create instance' })).toBeDisabled();
+  await expect(dialog.getByLabel('How it will run')).toContainText('Automatic (recommended)');
+  await expect(dialog.getByRole('radio', { name: /Linked base/ })).toContainText('Recommended');
+  await expect(dialog.getByText('Type a name to enable Create.')).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Create', exact: true })).toBeDisabled();
 
   // A name of only spaces is still no name.
   await dialog.getByLabel('Name').fill('   ');
-  await expect(dialog.getByRole('button', { name: 'Create instance' })).toBeDisabled();
+  await expect(dialog.getByRole('button', { name: 'Create', exact: true })).toBeDisabled();
 
   await dialog.getByLabel('Name').fill('Grounded');
-  await expect(dialog.getByRole('button', { name: 'Create instance' })).toBeEnabled();
-  await dialog.getByRole('button', { name: 'Create instance' }).click();
+  await expect(dialog.getByRole('button', { name: 'Create', exact: true })).toBeEnabled();
+  await dialog.getByRole('button', { name: 'Create', exact: true }).click();
 
   await expect(page.getByTestId('instance-hero').getByRole('heading', { name: 'Grounded', exact: true })).toBeVisible();
 });

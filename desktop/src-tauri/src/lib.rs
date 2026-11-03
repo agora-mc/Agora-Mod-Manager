@@ -501,6 +501,8 @@ pub fn run() {
             commands::open_external_url,
             games::discovery::games_list,
             games::icons::games_icon,
+            games::instance_icons::games_instance_set_icon,
+            games::instance_icons::games_instance_icon,
             games::discovery::games_discover,
             games::discovery::games_add_folder,
             games::discovery::games_remove_folder,

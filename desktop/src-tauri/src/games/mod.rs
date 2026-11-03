@@ -14,6 +14,7 @@ pub mod fomod;
 pub mod icons;
 pub mod import;
 pub mod ini_saves;
+pub mod instance_icons;
 pub mod instances;
 pub mod library;
 pub mod plugins;

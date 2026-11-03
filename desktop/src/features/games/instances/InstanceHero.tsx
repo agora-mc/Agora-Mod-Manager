@@ -7,17 +7,19 @@
 
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { InstanceIcon } from '@/components/InstanceIcon';
 import {
   InstancePageHeader,
+  InstanceTileButton,
   ReadinessLine,
+  SetImageButton,
   type InstanceAction,
   type ReadinessView,
 } from '@/components/instance-kit';
-import type { DeploymentMode, InstanceCheck, LaunchReply } from './api';
+import { gamesErrorMessage, type DeploymentMode, type InstanceCheck, type LaunchReply } from './api';
 import { checkHeadline, deploymentLabel, elapsedText, fallbackTradeoffs } from './instanceText';
 import { createdOn, playedWhen } from './instanceDates';
-import { GAME_INSTANCE_CAPABILITIES, InstanceChips } from './instanceIdentity';
+import { GAME_INSTANCE_CAPABILITIES, GameInstanceTile, InstanceChips } from './instanceIdentity';
+import { chooseGameInstanceIcon, useGameInstanceIcon } from './instanceIcons';
 import { useInstanceSession } from './instanceSession';
 
 /** The checks' answer as the kit's readiness line. */
@@ -37,6 +39,21 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
   const session = useInstanceSession();
   const { page, busy, launchStartedAt, reply, actionError } = session;
   const [now, setNow] = useState(() => Date.now());
+  const customIcon = useGameInstanceIcon(session.instanceId);
+  const [imageBusy, setImageBusy] = useState(false);
+  const [imageError, setImageError] = useState<string | null>(null);
+
+  const chooseImage = async () => {
+    setImageBusy(true);
+    setImageError(null);
+    try {
+      await chooseGameInstanceIcon(session.instanceId);
+    } catch (failure) {
+      setImageError(`The image was not set. ${gamesErrorMessage(failure)}`);
+    } finally {
+      setImageBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (busy !== 'launch') return;
@@ -73,13 +90,17 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
         onSelect: () => void session.launch(),
       };
 
-  const showBanners = busy === 'launch' || reply !== null || actionError !== null;
+  const showBanners = busy === 'launch' || reply !== null || actionError !== null || imageError !== null;
 
   return (
     <InstancePageHeader
       testId="instance-hero"
       running={detail.running}
-      tile={<InstanceIcon name={detail.name} seed={detail.instanceId} size={64} />}
+      tile={
+        <InstanceTileButton hasImage={customIcon !== null} onSelect={() => void chooseImage()} disabled={imageBusy}>
+          <GameInstanceTile instanceId={detail.instanceId} name={detail.name} size={64} />
+        </InstanceTileButton>
+      }
       name={detail.name}
       status={detail.running && (
         <span className="rounded-full bg-primary px-2.5 py-0.5 text-xs font-semibold text-primary-foreground" role="status">
@@ -99,6 +120,7 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
         detail.lastLaunchedAt ? `Last played ${playedWhen(detail.lastLaunchedAt)}` : 'Never played',
         created === null ? null : `Created ${created}`,
       ]}
+      factsTrail={<SetImageButton onSelect={() => void chooseImage()} disabled={imageBusy} />}
       capabilities={GAME_INSTANCE_CAPABILITIES}
       primaryAction={launch}
       readiness={!detail.running && (
@@ -106,6 +128,11 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
       )}
       banners={showBanners && (
         <>
+          {imageError !== null && (
+            <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+              {imageError}
+            </p>
+          )}
           {actionError !== null && (
             <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
               {actionError}
