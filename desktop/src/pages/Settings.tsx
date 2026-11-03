@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import {
   AlertTriangle,
   Bot,
@@ -7,6 +7,7 @@ import {
   Compass,
   Cpu,
   FolderSearch,
+  Gamepad2,
   Landmark,
   PackageCheck,
   Paintbrush,
@@ -87,7 +88,10 @@ import { ContentSharingSettings } from './settings/ContentSharingSettings';
 import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
 import { GameSupportSettings } from './settings/GameSupportSettings';
-import { GameSettingsSection } from './settings/GameSettingsSection';
+import { NewInstancesSettings } from './settings/game/NewInstancesSettings';
+import { InstallsBasesSettings } from './settings/game/InstallsBasesSettings';
+import { GameIcon } from '../features/games/shared/GameIcon';
+import { gameShortName } from '../features/games/shared/gameNames';
 import {
   gameDisplayName,
   isMinecraftSelected,
@@ -201,6 +205,7 @@ export function Settings({
   activeGame,
   activeGameName,
   onSwitchToMinecraft,
+  onOpenGameSetup,
 }: {
   onResetLayout: () => void;
   /** Lets a settings card hand the user off to a full page (Living Background). */
@@ -211,11 +216,23 @@ export function Settings({
   activeGameName?: string | null;
   /** The shell's switch; Settings does not change the remembered game on its own. */
   onSwitchToMinecraft?: () => void;
+  /** Opens a game's Setup page, from that game's "Installs & bases" page. */
+  onOpenGameSetup?: (gameId: string) => void;
 }) {
   const ts = useTypedSettings();
   const { confirm } = useConfirm();
   const minecraftSelected = isMinecraftSelected(activeGame);
   const selectedGameName = gameDisplayName(activeGame ?? 'minecraft', activeGameName);
+  const selectedGameShortName = gameShortName(selectedGameName);
+  const selectedGameId = activeGame ?? 'minecraft';
+  // The selected game's exe icon in the rail and the hero. A component type, so it is made once
+  // per game rather than on every render (a new type would remount it and fetch the icon again).
+  const SelectedGameIcon = useMemo(() => {
+    function SelectedGameIcon({ className = 'h-4 w-4' }: { className?: string }) {
+      return <GameIcon gameId={selectedGameId} className={className} fallback={<Gamepad2 className={className} />} />;
+    }
+    return SelectedGameIcon;
+  }, [selectedGameId]);
 
   /** True when a card belongs on the page for the selected game. */
   const showsCard = (card: SettingsCardId): boolean => isSettingsCardVisible(card, minecraftSelected);
@@ -1192,7 +1209,7 @@ export function Settings({
       )}
       {appVersion && (
         <p className="text-xs text-muted-foreground">
-          Agora Launcher <span className="font-medium">{appVersion}</span>
+          Agora Mod Manager <span className="font-medium">{appVersion}</span>
         </p>
       )}
       <div className="flex flex-wrap gap-2">
@@ -2444,6 +2461,39 @@ export function Settings({
         },
       ],
     },
+    // The selected game's own section, in the rail slot Launching has for Minecraft. The id stays
+    // `game` for every game, so a deep link (`requestSettingsSection`) works whichever is selected;
+    // with Minecraft selected it has no cards, so it is not in the rail.
+    {
+      id: 'game',
+      label: selectedGameShortName,
+      icon: SelectedGameIcon,
+      hint: 'New instances, installs, bases',
+      blurb: `Your choices for ${selectedGameName}.`,
+      pages: [
+        {
+          id: 'new-instances',
+          label: 'New instances',
+          cards: ['game-new-instances'],
+          content: card('game-new-instances', (
+            <NewInstancesSettings gameId={selectedGameId} gameName={selectedGameShortName} />
+          )),
+        },
+        {
+          id: 'installs-bases',
+          label: 'Installs & bases',
+          cards: ['game-installs', 'game-bases'],
+          content: showsCard('game-installs') ? (
+            <InstallsBasesSettings
+              gameId={selectedGameId}
+              gameName={selectedGameShortName}
+              onOpenSetup={onOpenGameSetup ? () => onOpenGameSetup(selectedGameId) : undefined}
+              onOpenGameSupport={() => openGameSupport()}
+            />
+          ) : null,
+        },
+      ],
+    },
     {
       id: 'launching',
       label: 'Launching',
@@ -2552,33 +2602,33 @@ export function Settings({
             <h2 className="text-2xl font-bold">Settings</h2>
             <p className="text-sm text-muted-foreground">{activeTab.blurb}</p>
           </div>
+          {!minecraftSelected && (
+            // Which game the page is for. Minecraft's own sections come back when Minecraft is
+            // selected, which this chip can do without leaving Settings.
+            <span
+              className="settings-hero-chip inline-flex items-center gap-1.5"
+              data-testid="settings-game-chip"
+              title={`Showing settings for ${selectedGameName}. Minecraft settings appear when Minecraft is selected.`}
+            >
+              <SelectedGameIcon className="h-3.5 w-3.5" />
+              <span>For {selectedGameShortName}</span>
+              {onSwitchToMinecraft && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <button
+                    type="button"
+                    onClick={onSwitchToMinecraft}
+                    className="rounded-sm underline decoration-1 underline-offset-2 hover:decoration-2 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    Switch to Minecraft
+                  </button>
+                </>
+              )}
+            </span>
+          )}
           {appVersion && <span className="settings-hero-chip">Agora {appVersion}</span>}
         </div>
       </section>
-
-      {!minecraftSelected && (
-        <>
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card p-4">
-            <p className="text-sm">
-              Showing settings for {selectedGameName}. Minecraft settings appear when Minecraft is selected.
-            </p>
-            {onSwitchToMinecraft && (
-              <button
-                type="button"
-                onClick={onSwitchToMinecraft}
-                className="rounded-lg border border-input px-3 py-1.5 text-xs font-medium hover:bg-accent"
-              >
-                Switch to Minecraft
-              </button>
-            )}
-          </div>
-          <GameSettingsSection
-            gameId={activeGame ?? ''}
-            gameName={selectedGameName}
-            onOpenGameSupport={openGameSupport}
-          />
-        </>
-      )}
 
       {/* Inline error banner for any setting that failed to load. Page-level:
           a failed key can belong to any tab, and hiding the warning behind the

@@ -30,6 +30,13 @@ export const DEFAULT_GAME_SETTINGS: GameSettings = {
   importCopySaves: 'off',
 };
 
+/**
+ * What Agora advises for each setting, shown as "(recommended)" wherever the choice is offered.
+ * Kept apart from the user's saved choice on purpose: someone who saves Copied as their default
+ * still sees Linked marked as recommended. Today the advice is the same as the unset default.
+ */
+export const RECOMMENDED_GAME_SETTINGS: GameSettings = { ...DEFAULT_GAME_SETTINGS };
+
 type SettingName = keyof GameSettings;
 
 const CHOICES: { [K in SettingName]: readonly GameSettings[K][] } = {

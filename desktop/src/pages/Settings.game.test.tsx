@@ -17,7 +17,7 @@ const skyrimListing = {
   installs: [
     {
       installId: 'steam:489830',
-      store: 'Steam',
+      store: 'steam',
       name: 'Skyrim Special Edition',
       location: 'D:/Steam/steamapps/common/Skyrim Special Edition',
       storeVersion: null,
@@ -27,6 +27,27 @@ const skyrimListing = {
       installBytes: null,
     },
   ],
+};
+
+const skyrimBases = {
+  bases: [{
+    baseId: 'skyrim-se-1',
+    gameId: 'skyrim-se',
+    store: 'steam',
+    version: '1.6.1170',
+    build: null,
+    mode: 'copied',
+    location: 'E:/AgoraBases/skyrim-se-1',
+    present: true,
+    fileCount: 3,
+    linkedFileCount: 0,
+    linkedBytes: 0,
+    copiedBytes: 2048,
+    skippedCount: 0,
+    createdUnixMs: 1,
+    usedBy: [{ instanceId: 'sk-1', name: 'Grounded' }],
+  }],
+  damaged: [],
 };
 
 function answer(replies: Record<string, unknown> = {}) {
@@ -58,6 +79,7 @@ function renderSettings(activeGame: string | undefined, extra: Partial<Component
 
 const sections = () => screen.getByRole('navigation', { name: 'Settings sections' });
 const pages = () => screen.getByRole('tablist', { name: / pages$/ });
+const railLabels = () => within(sections()).getAllByRole('tab').map((tab) => tab.getAttribute('aria-label'));
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -71,7 +93,7 @@ describe('Settings for Minecraft', () => {
     renderSettings('minecraft');
 
     expect(await screen.findByRole('heading', { name: 'Advanced mode' })).toBeInTheDocument();
-    expect(within(sections()).getByRole('tab', { name: 'Launching' })).toBeInTheDocument();
+    expect(railLabels()).toEqual(['General', 'Appearance', 'Accounts', 'Launching', 'Services']);
 
     fireEvent.click(within(sections()).getByRole('tab', { name: 'Launching' }));
     expect(await screen.findByRole('heading', { name: 'Launch Mode' })).toBeInTheDocument();
@@ -110,8 +132,18 @@ describe('Settings for Minecraft', () => {
 
     expect(within(sections()).getByRole('tab', { name: 'General' })).toHaveAttribute('aria-selected', 'true');
     expect(within(sections()).queryByRole('tab', { name: 'Launching' })).toBeNull();
-    expect(screen.getByText(/Showing settings for Skyrim Special Edition/)).toBeInTheDocument();
+    expect(screen.getByTestId('settings-game-chip')).toHaveTextContent('For Skyrim SE');
     expect(onSwitchToMinecraft).not.toHaveBeenCalled();
+  });
+
+  it("opens the game section's deep link as General while Minecraft is selected", async () => {
+    const { requestSettingsSection } = await import('../lib/settingsSection');
+    requestSettingsSection({ tab: 'game', page: 'installs-bases' });
+    renderSettings('minecraft');
+
+    expect(await screen.findByRole('heading', { name: 'Advanced mode' })).toBeInTheDocument();
+    expect(within(sections()).getByRole('tab', { name: 'General' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByTestId('settings-game-chip')).toBeNull();
   });
 
   it('shows today\'s page while the active game has not loaded', async () => {
@@ -119,48 +151,24 @@ describe('Settings for Minecraft', () => {
 
     expect(await screen.findByRole('heading', { name: 'Advanced mode' })).toBeInTheDocument();
     expect(within(sections()).getByRole('tab', { name: 'Launching' })).toBeInTheDocument();
-    expect(screen.queryByText(/Minecraft settings appear when Minecraft is selected/)).toBeNull();
+    expect(screen.queryByTestId('settings-game-chip')).toBeNull();
   });
 });
 
 describe('Settings for another game', () => {
-  it('hides each Minecraft-only card and the emptied Launching section', async () => {
-    answer({
-      games_list: { games: [skyrimListing] },
-      games_base_list: {
-        bases: [{
-          baseId: 'skyrim-se-1',
-          gameId: 'skyrim-se',
-          store: 'Steam',
-          version: '1.6.1170',
-          build: null,
-          mode: 'copied',
-          location: 'E:/AgoraBases/skyrim-se-1',
-          present: true,
-          fileCount: 3,
-          linkedFileCount: 0,
-          linkedBytes: 0,
-          copiedBytes: 2048,
-          skippedCount: 0,
-          createdUnixMs: 1,
-          usedBy: [],
-        }],
-        damaged: [],
-      },
-    });
+  it('puts the game in the rail where Launching sits and hides each Minecraft-only card', async () => {
+    answer({ games_list: { games: [skyrimListing] }, games_base_list: skyrimBases });
     const onSwitchToMinecraft = vi.fn();
     renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition', onSwitchToMinecraft });
 
-    expect(await screen.findByText(/Showing settings for Skyrim Special Edition\. Minecraft settings appear when Minecraft is selected\./)).toBeInTheDocument();
-    expect(within(sections()).queryByRole('tab', { name: 'Launching' })).toBeNull();
+    expect(await screen.findByRole('heading', { name: 'Advanced mode' })).toBeInTheDocument();
+    expect(railLabels()).toEqual(['General', 'Appearance', 'Accounts', 'Skyrim SE', 'Services']);
+    expect(screen.getByTestId('settings-game-chip')).toHaveTextContent('For Skyrim SE');
     expect(screen.queryByRole('heading', { name: 'Launch Mode' })).toBeNull();
     expect(screen.queryByRole('heading', { name: 'Java Runtime Management' })).toBeNull();
-
-    const gameSection = await screen.findByRole('heading', { name: 'Skyrim Special Edition' });
-    expect(gameSection).toBeInTheDocument();
-    expect(await screen.findByText(/D:\/Steam\/steamapps\/common\/Skyrim Special Edition/)).toBeInTheDocument();
-    expect(await screen.findByText(/1 base for Skyrim Special Edition, using 2.0 KB/)).toBeInTheDocument();
-    expect(screen.getByText(/E:\/AgoraBases\/skyrim-se-1/)).toBeInTheDocument();
+    // Nothing of the game's is stacked above the normal layout any more.
+    expect(screen.queryByRole('heading', { name: 'New instances' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Install folders' })).toBeNull();
 
     expect(within(pages()).getByRole('tab', { name: 'Walkthrough' })).toBeInTheDocument();
     expect(within(pages()).queryByRole('tab', { name: 'Templates' })).toBeNull();
@@ -180,6 +188,37 @@ describe('Settings for another game', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Switch to Minecraft' }));
     expect(onSwitchToMinecraft).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the game's installs and bases on their own page, with the way to Setup", async () => {
+    answer({ games_list: { games: [skyrimListing] }, games_base_list: skyrimBases });
+    const onOpenGameSetup = vi.fn();
+    renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition', onOpenGameSetup });
+
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
+    expect(screen.getByText('Your choices for Skyrim Special Edition.')).toBeInTheDocument();
+    expect(within(pages()).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['New instances', 'Installs & bases']);
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs & bases' }));
+
+    expect(await screen.findByText('D:/Steam/steamapps/common/Skyrim Special Edition')).toBeInTheDocument();
+    expect(await screen.findByText((_, element) => element?.tagName === 'P'
+      && /^1 base for Skyrim SE, using 2\.0 KB of their own\.$/.test(element.textContent ?? ''))).toBeInTheDocument();
+    expect(screen.getByText('E:/AgoraBases/skyrim-se-1')).toBeInTheDocument();
+    expect(screen.getByText(/Copied · used by 1 instance/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Manage in Setup' }));
+    expect(onOpenGameSetup).toHaveBeenCalledWith('skyrim-se');
+  });
+
+  it('opens a deep link to the game section for whichever game is selected', async () => {
+    const { requestSettingsSection } = await import('../lib/settingsSection');
+    requestSettingsSection({ tab: 'game', page: 'installs-bases' });
+    answer({ games_list: { games: [] } });
+    renderSettings('valheim', { activeGameName: 'Valheim' });
+
+    expect(within(sections()).getByRole('tab', { name: 'Valheim' })).toHaveAttribute('aria-selected', 'true');
+    expect(within(pages()).getByRole('tab', { name: 'Installs & bases' })).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByRole('heading', { name: 'Bases' })).toBeInTheDocument();
   });
 
   it('keeps the app-wide Walkthrough, Storage and Content sources pages for another game', async () => {
@@ -215,38 +254,50 @@ describe('Settings for another game', () => {
     expect(await screen.findByRole('heading', { name: 'GitHub Account' })).toBeInTheDocument();
     expect(within(sections()).getByRole('tab', { name: 'Accounts' })).toHaveAttribute('aria-selected', 'true');
     expect(within(sections()).getByRole('tab', { name: 'Launching' })).toBeInTheDocument();
+    expect(within(sections()).queryByRole('tab', { name: 'Skyrim SE' })).toBeNull();
   });
 
   it('treats an unknown plugin game id like any other non-Minecraft game', async () => {
     answer({ games_list: { games: [] } });
     renderSettings('valheim');
 
-    expect(await screen.findByText(/Showing settings for Valheim\./)).toBeInTheDocument();
+    expect(await screen.findByTestId('settings-game-chip')).toHaveTextContent('For Valheim');
     expect(within(sections()).queryByRole('tab', { name: 'Launching' })).toBeNull();
-    expect(await screen.findByRole('heading', { name: 'Valheim' })).toBeInTheDocument();
+    expect(within(sections()).getByRole('tab', { name: 'Valheim' })).toBeInTheDocument();
   });
 
   it('says plainly when the game has no found install and no bases', async () => {
     answer({ games_list: { games: [] }, games_base_list: { bases: [], damaged: [] } });
     renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
 
-    expect(await screen.findByText('Agora has not found an install of Skyrim Special Edition on this computer.')).toBeInTheDocument();
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs & bases' }));
+    expect(await screen.findByText('Agora has not found an install of Skyrim SE on this computer.')).toBeInTheDocument();
     expect(await screen.findByText('No bases built yet.')).toBeInTheDocument();
   });
 
-  it("shows this game's saved defaults and writes each change under its game id", async () => {
+  it("shows this game's saved defaults, marks the recommended choice apart from them, and saves under the game id", async () => {
     answer({ games_list: { games: [skyrimListing] }, get_setting: (args?: unknown) => {
       const key = String((args as { key?: unknown } | undefined)?.key ?? '');
       return key === 'game.skyrim-se.baseType' ? 'copied' : null;
     } });
     renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
 
-    const base = await screen.findByLabelText('Base type for new instances and bases');
+    const base = await screen.findByLabelText('Base type');
     expect(base).toHaveValue('copied');
-    expect(screen.getByLabelText('How new instances run')).toHaveValue('auto');
+    // The saved choice is selected; the recommendation stays on Linked.
+    expect(within(base).getByRole('option', { name: 'Linked base (recommended)' })).toBeInTheDocument();
+    expect(within(base).getByRole('option', { name: 'Copied base' })).toBeInTheDocument();
+    expect(screen.getByText('Agora recommends Linked base.')).toBeInTheDocument();
+    const deployment = screen.getByLabelText('How new instances run');
+    expect(deployment).toHaveValue('auto');
+    expect(within(deployment).getByRole('option', { name: 'Automatic (recommended)' })).toBeInTheDocument();
     expect(screen.getByLabelText('Saves when importing a profile')).toHaveValue('off');
+    // Only the setting that differs from the advice says so.
+    expect(screen.getAllByText(/^Agora recommends/)).toHaveLength(1);
 
-    fireEvent.change(screen.getByLabelText('How new instances run'), { target: { value: 'links' } });
+    fireEvent.change(deployment, { target: { value: 'links' } });
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('set_setting', {
       key: 'game.skyrim-se.deployment',
       value: 'links',
@@ -259,7 +310,8 @@ describe('Settings for another game', () => {
       return key === 'game.skyrim-se.baseType' ? 'copied' : null;
     } });
     const { rerender } = renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
-    expect(await screen.findByLabelText('Base type for new instances and bases')).toHaveValue('copied');
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
+    expect(await screen.findByLabelText('Base type')).toHaveValue('copied');
 
     rerender(
       <Settings
@@ -269,14 +321,17 @@ describe('Settings for another game', () => {
       />,
     );
 
-    expect(await screen.findByLabelText('Base type for new instances and bases')).toHaveValue('linked');
+    expect(within(sections()).getByRole('tab', { name: 'Valheim' })).toHaveAttribute('aria-selected', 'true');
+    await waitFor(() => expect(screen.getByLabelText('Base type')).toHaveValue('linked'));
   });
 
   it('opens the Game support page from the game section', async () => {
     answer({ games_list: { games: [] } });
     renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Game support toggles' }));
+    fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs & bases' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Game support' }));
     await waitFor(() =>
       expect(within(sections()).getByRole('tab', { name: 'General' })).toHaveAttribute('aria-selected', 'true'));
     expect(within(pages()).getByRole('tab', { name: 'Game support' })).toHaveAttribute('aria-selected', 'true');

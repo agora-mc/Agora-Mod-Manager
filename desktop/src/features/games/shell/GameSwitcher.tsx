@@ -4,14 +4,17 @@
  * sees it. Every choice is a `<button>` so the controller can reach it.
  */
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useState } from 'react';
 import { ChevronDown, ChevronUp, Gamepad2 } from 'lucide-react';
-import { loadGameIcon } from '../shared/icons';
+import { GameIcon } from '../shared/GameIcon';
 import { MINECRAFT_GAME_ID } from '../shared/types';
 
 export interface GameSwitcherOption {
   gameId: string;
+  /** The full name: the accessible name and the tooltip. */
   label: string;
+  /** What the sidebar shows ("Skyrim SE"); the full name when omitted. */
+  shortLabel?: string;
 }
 
 interface GameSwitcherProps {
@@ -19,49 +22,6 @@ interface GameSwitcherProps {
   shownGame: string;
   onSwitch: (gameId: string) => void;
   collapsed: boolean;
-}
-
-/**
- * The game's exe icon, or `fallback` while it loads and whenever there is none.
- * Minecraft is skipped rather than asked: discovery never finds it, so the
- * command would answer `null` after a full scan for nothing.
- */
-function GameSwitcherIcon({ gameId, fallback }: { gameId: string; fallback: ReactNode }) {
-  const [icon, setIcon] = useState<string | null>(null);
-  const [pending, setPending] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    setIcon(null);
-    setPending(true);
-    if (gameId === MINECRAFT_GAME_ID) {
-      setPending(false);
-      return () => {
-        cancelled = true;
-      };
-    }
-    loadGameIcon(gameId)
-      .then((dataUrl) => {
-        if (cancelled) return;
-        setIcon(dataUrl);
-        setPending(false);
-      })
-      .catch(() => {
-        // Decoration, not data: a failed lookup keeps today's letter/gamepad.
-        if (!cancelled) {
-          setIcon(null);
-          setPending(false);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [gameId]);
-
-  if (!pending && icon) {
-    return <img src={icon} alt="" className="h-4 w-4 shrink-0 rounded-sm object-contain" />;
-  }
-  return <>{fallback}</>;
 }
 
 export function GameSwitcher({ options, shownGame, onSwitch, collapsed }: GameSwitcherProps) {
@@ -81,14 +41,14 @@ export function GameSwitcher({ options, shownGame, onSwitch, collapsed }: GameSw
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         aria-label={`Game: ${current.label}. Choose a game`}
-        title={collapsed ? current.label : undefined}
+        title={current.label}
         className={[
           'flex w-full items-center gap-2 rounded-lg border border-border px-2.5 py-2 text-left text-sm font-medium hover:bg-accent',
           collapsed ? 'justify-center px-0' : '',
         ].join(' ')}
       >
-        <GameSwitcherIcon gameId={current.gameId} fallback={gamepad} />
-        {!collapsed && <span className="min-w-0 flex-1 truncate">{current.label}</span>}
+        <GameIcon gameId={current.gameId} fallback={gamepad} />
+        {!collapsed && <span className="min-w-0 flex-1 truncate">{current.shortLabel ?? current.label}</span>}
         {!collapsed && (open ? <ChevronUp className="h-4 w-4 shrink-0" aria-hidden="true" /> : <ChevronDown className="h-4 w-4 shrink-0" aria-hidden="true" />)}
       </button>
       {open && (
@@ -101,7 +61,7 @@ export function GameSwitcher({ options, shownGame, onSwitch, collapsed }: GameSw
                 type="button"
                 aria-pressed={isCurrent}
                 aria-label={option.label}
-                title={collapsed ? option.label : undefined}
+                title={option.label}
                 onClick={() => {
                   setOpen(false);
                   if (!isCurrent) onSwitch(option.gameId);
@@ -114,8 +74,8 @@ export function GameSwitcher({ options, shownGame, onSwitch, collapsed }: GameSw
                     : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
                 ].join(' ')}
               >
-                <GameSwitcherIcon gameId={option.gameId} fallback={collapsed ? fallbackLetter(option) : gamepad} />
-                {!collapsed && <span className="min-w-0 flex-1 truncate">{option.label}</span>}
+                <GameIcon gameId={option.gameId} fallback={collapsed ? fallbackLetter(option) : gamepad} />
+                {!collapsed && <span className="min-w-0 flex-1 truncate">{option.shortLabel ?? option.label}</span>}
               </button>
             );
           })}
