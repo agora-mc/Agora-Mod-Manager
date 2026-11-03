@@ -1,6 +1,7 @@
 /**
  * Opening a named Settings section from elsewhere in the app (the command
- * palette, today).
+ * palette, and a game's pages that send players to its installs, bases or
+ * recovery).
  *
  * Settings remembers its top-level tab, not its sub-page, and it only reads
  * what it remembers when it mounts. A request is therefore held here until the
@@ -22,6 +23,23 @@ let pending: SettingsSectionTarget | null = null;
 export function requestSettingsSection(target: SettingsSectionTarget): void {
   pending = target;
   window.dispatchEvent(new CustomEvent(SETTINGS_SECTION_EVENT));
+}
+
+/**
+ * Open Settings at `target`, from any page. The shell listens for `agora-navigate` and opens
+ * Settings, which then takes the held request.
+ */
+export function openSettingsSection(target: SettingsSectionTarget): void {
+  requestSettingsSection(target);
+  window.dispatchEvent(new CustomEvent('agora-navigate', { detail: 'settings' }));
+}
+
+/** The pages of the selected game's own Settings section (rail id `game`). */
+export type GameSettingsPage = 'new-instances' | 'installs' | 'bases' | 'recovery';
+
+/** Open one page of the selected game's Settings section. */
+export function openGameSettings(page: GameSettingsPage): void {
+  openSettingsSection({ tab: 'game', page });
 }
 
 /** Read the held request without consuming it (a mount's first render). */

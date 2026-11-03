@@ -21,7 +21,7 @@ export function PlanView({ plan, blockReason, busy, onImport }: PlanViewProps) {
   return (
     <section
       aria-labelledby="import-plan-heading"
-      className="space-y-4 rounded-xl border border-border bg-card p-5"
+      className="space-y-4 rounded-xl border border-border bg-background/60 p-4"
       data-testid="import-plan"
     >
       <div className="flex flex-wrap items-start justify-between gap-3">

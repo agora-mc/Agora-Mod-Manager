@@ -1,6 +1,6 @@
 /**
- * Discovery slot owned by the discovery slice: the Setup tab's installs and game folders.
+ * Discovery slot owned by the discovery slice: a game's installs and game folders, in Settings.
  */
 
-export { SetupInstallsSection } from './SetupInstallsSection';
+export { InstallsSection } from './InstallsSection';
 export { AddGameFolderButton, gameErrorMessage } from './addGameFolder';

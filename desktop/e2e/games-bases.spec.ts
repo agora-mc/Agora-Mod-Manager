@@ -1,8 +1,8 @@
 import { test, expect, type Page } from '@playwright/test';
-import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
+import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES, SETTINGS_PAGE_REPLIES } from './support/games-mock';
 
 /**
- * Setup → pinned bases (MASTER_SPEC §26.4): the list, the checks, building a base, and removing one.
+ * Settings › (game) › Bases (MASTER_SPEC §26.4): the list, the checks, building a base, and removing one.
  * Every command these tests reach is answered from the table in `support/games-mock.ts`; anything
  * else fails the test.
  */
@@ -10,6 +10,7 @@ import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES } from
 /** The boot commands the shell answers with empty data. Shared by every test here. */
 const BOOT_REPLIES = {
   ...OTHER_SLICES_REPLIES,
+  ...SETTINGS_PAGE_REPLIES,
   get_windows_accent_color: null,
   get_registry_status: { has_cached_db: false, checked: true, message: 'Missing' },
   check_registry_update: { has_cached_db: false, checked: true, message: 'Missing' },
@@ -118,10 +119,12 @@ async function boot(page: Page, replies: Record<string, unknown>, install: unkno
   });
 }
 
-async function openSetup(page: Page) {
+async function openBases(page: Page) {
   await page.goto('/');
-  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Setup', exact: true }).click();
-  await expect(page.getByTestId('setup-bases')).toBeVisible();
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('tab', { name: 'Skyrim SE' }).click();
+  await page.getByRole('tab', { name: 'Bases', exact: true }).click();
+  await expect(page.getByTestId('bases-section')).toBeVisible();
 }
 
 test.afterEach(async ({ page }) => {
@@ -130,7 +133,7 @@ test.afterEach(async ({ page }) => {
 
 test('the bases are listed with their mode, disk use and users, and a base in use cannot be removed', async ({ page }) => {
   await boot(page, { games_base_list: { bases: [usedBase, spareBase], damaged: [] } });
-  await openSetup(page);
+  await openBases(page);
 
   const cards = page.getByTestId('base-card');
   await expect(cards).toHaveCount(2);
@@ -151,7 +154,7 @@ test('a quick check reports a clean base, and a full check runs on request', asy
     games_base_list: { bases: [usedBase], damaged: [] },
     games_base_verify: cleanQuick,
   });
-  await openSetup(page);
+  await openBases(page);
 
   const card = page.getByTestId('base-card');
   await card.getByRole('button', { name: 'Check base (quick)' }).click();
@@ -174,7 +177,7 @@ test('a base that needs attention names the damaged files', async ({ page }) => 
       ],
     },
   });
-  await openSetup(page);
+  await openBases(page);
 
   await page.getByTestId('base-card').getByRole('button', { name: 'Check every file (full)' }).click();
   const result = page.getByTestId('base-check-result');
@@ -190,7 +193,7 @@ test('removing an unused base asks first, then removes it and says so', async ({
     games_base_list: { bases: [spareBase], damaged: [] },
     games_base_remove: { baseId: spareBase.baseId, status: 'removed' },
   });
-  await openSetup(page);
+  await openBases(page);
 
   await page.getByTestId('base-card').getByRole('button', { name: 'Remove base' }).click();
   const dialog = page.getByRole('dialog');
@@ -201,7 +204,7 @@ test('removing an unused base asks first, then removes it and says so', async ({
 
 test('cancelling the removal keeps the base', async ({ page }) => {
   await boot(page, { games_base_list: { bases: [spareBase], damaged: [] } });
-  await openSetup(page);
+  await openBases(page);
 
   await page.getByTestId('base-card').getByRole('button', { name: 'Remove base' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click();
@@ -214,7 +217,7 @@ test('building a Copied base explains the mode, then reports what was built', as
     games_base_list: { bases: [], damaged: [] },
     games_base_build: builtCopied,
   });
-  await openSetup(page);
+  await openBases(page);
 
   await page.getByRole('button', { name: 'Build a base' }).click();
   const dialog = page.getByRole('dialog');
@@ -238,7 +241,7 @@ test('a Linked build that cannot link offers a Copied build with its cost, and d
     games_base_list: { bases: [], damaged: [] },
     games_base_build: { status: 'link_unavailable', reason: 'base is on another volume', copiedBytesNeeded: 16 * GB },
   });
-  await openSetup(page);
+  await openBases(page);
 
   await page.getByRole('button', { name: 'Build a base' }).click();
   const dialog = page.getByRole('dialog');
@@ -261,7 +264,7 @@ test('an install whose version Agora cannot tell cannot be built from', async ({
     runtime: { status: 'unidentified', reasons: ['the executable could not be read'] },
   };
   await boot(page, { games_base_list: { bases: [], damaged: [] } }, unidentified);
-  await openSetup(page);
+  await openBases(page);
 
   await page.getByRole('button', { name: 'Build a base' }).click();
   const dialog = page.getByRole('dialog');
@@ -273,7 +276,7 @@ test('an install whose version Agora cannot tell cannot be built from', async ({
 
 test('an empty list says what to do next', async ({ page }) => {
   await boot(page, { games_base_list: { bases: [], damaged: [] } });
-  await openSetup(page);
+  await openBases(page);
 
   const empty = page.getByTestId('bases-empty');
   await expect(empty).toContainText('No pinned bases yet.');
@@ -283,7 +286,7 @@ test('an empty list says what to do next', async ({ page }) => {
 
 test('a list that does not come back as a list is an error, not an empty list', async ({ page }) => {
   await boot(page, { games_base_list: null });
-  await openSetup(page);
+  await openBases(page);
 
   await expect(page.getByRole('alert')).toContainText('Agora could not read the list of bases. Try again.');
   await expect(page.getByTestId('bases-empty')).toHaveCount(0);
@@ -299,7 +302,7 @@ test('a backend error shows its own message', async ({ page }) => {
       ? Promise.reject({ code: 'base_failed', message: 'Agora could not read the list of instances, so it cannot tell which bases are in use.' })
       : original(command, args));
   });
-  await openSetup(page);
+  await openBases(page);
 
   await expect(page.getByRole('alert')).toContainText('Agora could not read the list of instances');
   await expect(page.getByTestId('bases-empty')).toHaveCount(0);
@@ -310,7 +313,7 @@ test('a damaged base record is listed with its file and reason, offers no checks
     games_base_list: { bases: [], damaged: [damagedRecord] },
     games_base_remove: { baseId: damagedRecord.baseId, status: 'removed' },
   });
-  await openSetup(page);
+  await openBases(page);
 
   const card = page.getByTestId('damaged-base-card');
   await expect(card).toHaveCount(1);
@@ -334,7 +337,7 @@ test('a damaged base record in use cannot be removed, and names the instances th
   await boot(page, {
     games_base_list: { bases: [], damaged: [{ ...damagedRecord, usedBy: [{ instanceId: 'nordic-run', name: 'Nordic Run' }] }] },
   });
-  await openSetup(page);
+  await openBases(page);
 
   const card = page.getByTestId('damaged-base-card');
   await expect(card).toContainText('Used by Nordic Run. Remove or move those instances before removing this base.');
@@ -343,7 +346,7 @@ test('a damaged base record in use cannot be removed, and names the instances th
 
 test('a damaged record beside built bases is listed with them, and the list is not empty', async ({ page }) => {
   await boot(page, { games_base_list: { bases: [spareBase], damaged: [damagedRecord] } });
-  await openSetup(page);
+  await openBases(page);
 
   await expect(page.getByTestId('base-card')).toHaveCount(1);
   await expect(page.getByTestId('damaged-base-card')).toHaveCount(1);

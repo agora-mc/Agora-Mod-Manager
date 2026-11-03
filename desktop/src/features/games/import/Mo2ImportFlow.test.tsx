@@ -12,7 +12,7 @@ vi.mock('./api', () => ({
   listenImportProgress: vi.fn(async () => () => undefined),
 }));
 
-import { GameImportPage } from './index';
+import { Mo2ImportFlow } from './Mo2ImportFlow';
 
 function answer(settings: Record<string, unknown> = {}) {
   invokeMock.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
@@ -31,14 +31,14 @@ beforeEach(() => {
 describe('Import saves default', () => {
   it('leaves imported saves where they are unless the game asks for a copy', async () => {
     answer();
-    render(<GameImportPage gameId="skyrim-se" />);
+    render(<Mo2ImportFlow gameId="skyrim-se" />);
     fireEvent.click(await screen.findByRole('button', { name: 'Use this setup' }));
     expect(await screen.findByRole('switch')).not.toBeChecked();
   });
 
   it('starts with the copy box ticked when this game saved that choice', async () => {
     answer({ 'game.skyrim-se.importCopySaves': 'on' });
-    render(<GameImportPage gameId="skyrim-se" />);
+    render(<Mo2ImportFlow gameId="skyrim-se" />);
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('get_setting', {
       key: 'game.skyrim-se.importCopySaves',

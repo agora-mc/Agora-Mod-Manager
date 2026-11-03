@@ -1,5 +1,5 @@
 /**
- * One pinned base on the Setup tab: what it is, who uses it, its checks, and its removal.
+ * One pinned base on a game's Bases page in Settings: what it is, who uses it, its checks, and its removal.
  */
 
 import { useState } from 'react';

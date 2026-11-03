@@ -25,14 +25,12 @@ interface CommandPaletteProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onNavigate: (tab: Tab, instanceId?: string) => void;
-  /** Replaces the default navigation entries while a non-Minecraft game is shown. */
-  navigationItems?: { label: string; tab: Tab; icon: string }[];
   /** Games the user can switch to. Shown only when there is one (the switcher's rule). */
   switchGameItems?: { gameId: string; label: string }[];
   onSwitchGame?: (gameId: string) => void;
 }
 
-/** The palette's navigation entries. A non-Minecraft game adds its own (see `gameNav`). */
+/** The palette's navigation entries, the same for every game (see `gameNav`). */
 export const PALETTE_NAVIGATION_ITEMS: { label: string; tab: Tab; icon: string }[] = [
   { label: 'Home', tab: 'home', icon: '🏠' },
   { label: 'Browse', tab: 'browse', icon: '🔍' },
@@ -58,7 +56,6 @@ export function CommandPalette({
   open,
   onOpenChange,
   onNavigate,
-  navigationItems,
   switchGameItems = NO_GAMES,
   onSwitchGame,
 }: CommandPaletteProps) {
@@ -103,7 +100,7 @@ export function CommandPalette({
     const filteredInstances = instances.filter((inst) =>
       query ? inst.name.toLowerCase().includes(query.toLowerCase()) : true,
     );
-    const settingsItems = navigationItems ?? PALETTE_NAVIGATION_ITEMS;
+    const settingsItems = PALETTE_NAVIGATION_ITEMS;
     const filteredSettings: ResultItem[] = [
       ...settingsItems.filter((item) =>
         query ? item.label.toLowerCase().includes(query.toLowerCase()) : true,
@@ -156,7 +153,7 @@ export function CommandPalette({
     });
     if (commands.length) r.push({ __section: 'Plugin commands' }, ...commands);
     return r;
-  }, [query, instances, ofKind, plugins, navigationItems, switchGameItems]);
+  }, [query, instances, ofKind, plugins, switchGameItems]);
 
   // Indices into `results` that point to actionable (non-section) items.
   const actionableIndices = useMemo(

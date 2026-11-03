@@ -138,7 +138,7 @@ describe('Settings for Minecraft', () => {
 
   it("opens the game section's deep link as General while Minecraft is selected", async () => {
     const { requestSettingsSection } = await import('../lib/settingsSection');
-    requestSettingsSection({ tab: 'game', page: 'installs-bases' });
+    requestSettingsSection({ tab: 'game', page: 'bases' });
     renderSettings('minecraft');
 
     expect(await screen.findByRole('heading', { name: 'Advanced mode' })).toBeInTheDocument();
@@ -190,34 +190,44 @@ describe('Settings for another game', () => {
     expect(onSwitchToMinecraft).toHaveBeenCalledTimes(1);
   });
 
-  it("shows the game's installs and bases on their own page, with the way to Setup", async () => {
-    answer({ games_list: { games: [skyrimListing] }, games_base_list: skyrimBases });
-    const onOpenGameSetup = vi.fn();
-    renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition', onOpenGameSetup });
+  it("gives the game's installs, bases and recovery a page each, with their full controls", async () => {
+    answer({
+      games_list: { games: [skyrimListing] },
+      games_discover: { folders: [], warnings: [] },
+      games_base_list: skyrimBases,
+      games_user_files_status: { sessions: [] },
+      games_support_list: [{ gameId: 'skyrim-se', name: 'Skyrim Special Edition', source: { kind: 'builtIn' }, enabled: true, canDisable: true }],
+    });
+    renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
 
     fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
     expect(screen.getByText('Your choices for Skyrim Special Edition.')).toBeInTheDocument();
-    expect(within(pages()).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['New instances', 'Installs & bases']);
-    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs & bases' }));
+    expect(within(pages()).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['New instances', 'Installs', 'Bases', 'Recovery']);
 
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs' }));
     expect(await screen.findByText('D:/Steam/steamapps/common/Skyrim Special Edition')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Rescan' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add a game folder…' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Game support' })).toBeInTheDocument();
+
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Bases' }));
     expect(await screen.findByText((_, element) => element?.tagName === 'P'
       && /^1 base for Skyrim SE, using 2\.0 KB of their own\.$/.test(element.textContent ?? ''))).toBeInTheDocument();
     expect(screen.getByText('E:/AgoraBases/skyrim-se-1')).toBeInTheDocument();
-    expect(screen.getByText(/Copied · used by 1 instance/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Build a base' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Manage in Setup' }));
-    expect(onOpenGameSetup).toHaveBeenCalledWith('skyrim-se');
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Recovery' }));
+    expect(await screen.findByTestId('recovery-empty')).toBeInTheDocument();
   });
 
   it('opens a deep link to the game section for whichever game is selected', async () => {
     const { requestSettingsSection } = await import('../lib/settingsSection');
-    requestSettingsSection({ tab: 'game', page: 'installs-bases' });
+    requestSettingsSection({ tab: 'game', page: 'bases' });
     answer({ games_list: { games: [] } });
     renderSettings('valheim', { activeGameName: 'Valheim' });
 
     expect(within(sections()).getByRole('tab', { name: 'Valheim' })).toHaveAttribute('aria-selected', 'true');
-    expect(within(pages()).getByRole('tab', { name: 'Installs & bases' })).toHaveAttribute('aria-selected', 'true');
+    expect(within(pages()).getByRole('tab', { name: 'Bases' })).toHaveAttribute('aria-selected', 'true');
     expect(await screen.findByRole('heading', { name: 'Bases' })).toBeInTheDocument();
   });
 
@@ -267,13 +277,14 @@ describe('Settings for another game', () => {
   });
 
   it('says plainly when the game has no found install and no bases', async () => {
-    answer({ games_list: { games: [] }, games_base_list: { bases: [], damaged: [] } });
+    answer({ games_list: { games: [] }, games_discover: { folders: [], warnings: [] }, games_base_list: { bases: [], damaged: [] } });
     renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
 
     fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
-    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs & bases' }));
-    expect(await screen.findByText('Agora has not found an install of Skyrim SE on this computer.')).toBeInTheDocument();
-    expect(await screen.findByText('No bases built yet.')).toBeInTheDocument();
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs' }));
+    expect(await screen.findByText('Agora did not find this game on this computer.')).toBeInTheDocument();
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Bases' }));
+    expect(await screen.findByText('No pinned bases yet.')).toBeInTheDocument();
   });
 
   it("shows this game's saved defaults, marks the recommended choice apart from them, and saves under the game id", async () => {
@@ -326,11 +337,11 @@ describe('Settings for another game', () => {
   });
 
   it('opens the Game support page from the game section', async () => {
-    answer({ games_list: { games: [] } });
+    answer({ games_list: { games: [] }, games_discover: { folders: [], warnings: [] } });
     renderSettings('skyrim-se', { activeGameName: 'Skyrim Special Edition' });
 
     fireEvent.click(within(sections()).getByRole('tab', { name: 'Skyrim SE' }));
-    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs & bases' }));
+    fireEvent.click(within(pages()).getByRole('tab', { name: 'Installs' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Game support' }));
     await waitFor(() =>
       expect(within(sections()).getByRole('tab', { name: 'General' })).toHaveAttribute('aria-selected', 'true'));

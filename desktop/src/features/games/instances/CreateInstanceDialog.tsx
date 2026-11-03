@@ -7,6 +7,7 @@ import {
   recommendedLabel,
   type ChoiceOption,
 } from '@/components/instance-kit';
+import { openGameSettings } from '@/lib/settingsSection';
 import { listInstalledGames } from '../discovery/api';
 import type { GameListing, InstallSummary } from '../shared/types';
 import { listGameSupport, type GameSupportRow } from '../support/api';
@@ -145,9 +146,21 @@ export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: 
         'This game is turned off, so it is not offered here. Turn it on in Settings, Game support, to create an instance.',
         'alert',
       )}
-      {installs.status === 'loaded' && !installs.turnedOff && available.length === 0 && stateNote(
-        `Agora has not found an install of ${gameName} on this machine. Rescan the installs in Setup, then try again.`,
-        'alert',
+      {installs.status === 'loaded' && !installs.turnedOff && available.length === 0 && (
+        <p role="alert" className="rounded-lg border border-border bg-muted/40 p-3 text-sm">
+          Agora has not found an install of {gameName} on this machine. Rescan or add its folder on the{' '}
+          <button
+            type="button"
+            className="font-medium text-primary hover:underline"
+            onClick={() => {
+              onOpenChange(false);
+              openGameSettings('installs');
+            }}
+          >
+            Installs page in Settings
+          </button>
+          , then try again.
+        </p>
       )}
 
       {ready && (

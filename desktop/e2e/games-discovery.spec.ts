@@ -1,15 +1,16 @@
 import { test, expect, type Page } from '@playwright/test';
-import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
+import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES, SETTINGS_PAGE_REPLIES } from './support/games-mock';
 
 /**
- * Setup › Installs (MASTER_SPEC §26.3, §26.14): the installs Agora found, grouped by game, and
- * the game folders the user adds and removes. The table answers the commands the shell needs at
+ * Settings › (game) › Installs (MASTER_SPEC §26.3, §26.14): the installs Agora found for the
+ * game, and the game folders the user adds and removes. The table answers the commands the shell needs at
  * boot; the discovery commands themselves are answered by a small script that also records each
  * call, so a test can check what the screen asked for and react to an add or a remove.
  */
 
 const BOOT_REPLIES = {
   ...OTHER_SLICES_REPLIES,
+  ...SETTINGS_PAGE_REPLIES,
   get_windows_accent_color: null,
   get_registry_status: { has_cached_db: false, checked: true, message: 'Missing' },
   check_registry_update: { has_cached_db: false, checked: true, message: 'Missing' },
@@ -123,18 +124,20 @@ async function calls(page: Page): Promise<{ command: string; args: Record<string
   return page.evaluate(() => (window as unknown as { __discoveryCalls: { command: string; args: Record<string, unknown> }[] }).__discoveryCalls);
 }
 
-async function openSetup(page: Page) {
+async function openInstalls(page: Page) {
   await page.goto('/');
   await page.getByTestId('game-switcher').getByRole('button', { name: 'Game: Minecraft. Choose a game' }).click();
   await page.getByRole('button', { name: 'Skyrim Special Edition', exact: true }).click();
-  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Setup' }).click();
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'Settings' }).click();
+  await page.getByRole('tab', { name: 'Skyrim SE' }).click();
+  await page.getByRole('tab', { name: 'Installs', exact: true }).click();
 }
 
 test.afterEach(async ({ page }) => {
   await expectNoUnmockedCommands(page);
 });
 
-test('the installs are listed by game, and a folder can be added and then shows up', async ({ page }) => {
+test('the installs of the game are listed, and a folder can be added and then shows up', async ({ page }) => {
   await installGamesMock(page, { replies: BOOT_REPLIES });
   await driveDiscovery(page, {
     games: [skyrim],
@@ -142,9 +145,9 @@ test('the installs are listed by game, and a folder can be added and then shows 
     picked: COPY_PATH,
     added: { path: COPY_PATH, gameId: 'skyrim-se', gameName: 'Skyrim Special Edition' },
   });
-  await openSetup(page);
+  await openInstalls(page);
 
-  const section = page.getByTestId('setup-installs');
+  const section = page.getByTestId('installs-section');
   await expect(section.getByRole('heading', { name: 'Installs' })).toBeVisible();
   const card = page.getByTestId('install-card').first();
   await expect(card).toContainText('Skyrim Special Edition');
@@ -156,7 +159,7 @@ test('the installs are listed by game, and a folder can be added and then shows 
   await expect(page.getByRole('status').filter({ hasText: 'Added' })).toHaveText(
     `Added ${COPY_PATH} as Skyrim Special Edition.`,
   );
-  await expect(page.getByTestId('setup-folder-row')).toContainText(COPY_PATH);
+  await expect(page.getByTestId('installs-folder-row')).toContainText(COPY_PATH);
   await expect(page.getByTestId('install-card')).toHaveCount(2);
 
   const added = (await calls(page)).filter((call) => call.command === 'games_add_folder');
@@ -166,30 +169,30 @@ test('the installs are listed by game, and a folder can be added and then shows 
 test('cancelling the folder picker adds nothing', async ({ page }) => {
   await installGamesMock(page, { replies: BOOT_REPLIES });
   await driveDiscovery(page, { games: [skyrim], picked: null });
-  await openSetup(page);
+  await openInstalls(page);
 
-  await page.getByTestId('setup-installs').getByRole('button', { name: 'Add a game folder…' }).click();
+  await page.getByTestId('installs-section').getByRole('button', { name: 'Add a game folder…' }).click();
   await expect(page.getByTestId('install-card')).toHaveCount(1);
   expect((await calls(page)).some((call) => call.command === 'games_add_folder')).toBe(false);
 });
 
 test('an empty scan says what to do next and offers the folder picker', async ({ page }) => {
-  // Setup is reached only while a game is found, so Skyrim is found first; a Rescan then finds
+  // The game's Settings are reached only while a game is found, so Skyrim is found first; a Rescan then finds
   // nothing, which is the empty state a user can actually reach.
   await installGamesMock(page, { replies: BOOT_REPLIES });
   await driveDiscovery(page, { games: [skyrim] });
-  await openSetup(page);
+  await openInstalls(page);
   await expect(page.getByTestId('install-card')).toHaveCount(1);
   await page.evaluate(() => {
     (window as unknown as { __discoveryEmpty: boolean }).__discoveryEmpty = true;
   });
-  await page.getByTestId('setup-installs').getByRole('button', { name: 'Rescan' }).click();
+  await page.getByTestId('installs-section').getByRole('button', { name: 'Rescan' }).click();
 
   const empty = page.getByTestId('installs-empty');
   await expect(empty).toContainText('Agora did not find this game on this computer.');
   await expect(empty).toContainText('Add a game folder…');
   await expect(page.getByTestId('install-card')).toHaveCount(0);
-  await expect(page.getByTestId('setup-folders')).toContainText('None yet.');
+  await expect(page.getByTestId('installs-folders')).toContainText('None yet.');
 });
 
 test('a failed scan shows its error and no list, so it is not read as nothing found', async ({ page }) => {
@@ -204,7 +207,7 @@ test('a failed scan shows its error and no list, so it is not read as nothing fo
       },
     },
   });
-  await openSetup(page);
+  await openInstalls(page);
 
   const alert = page.getByRole('alert');
   await expect(alert).toContainText('Your game folders list is damaged.');
@@ -219,9 +222,9 @@ test('removing a folder asks first, and only a confirmed removal removes it', as
     games: [skyrim],
     folders: [{ path: COPY_PATH, present: true }],
   });
-  await openSetup(page);
+  await openInstalls(page);
 
-  const row = page.getByTestId('setup-folder-row');
+  const row = page.getByTestId('installs-folder-row');
   await expect(row).toContainText(COPY_PATH);
   await page.getByRole('button', { name: `Stop searching ${COPY_PATH}` }).click();
   const dialog = page.getByRole('dialog');
@@ -233,7 +236,7 @@ test('removing a folder asks first, and only a confirmed removal removes it', as
   await page.getByRole('button', { name: `Stop searching ${COPY_PATH}` }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Stop searching', exact: true }).click();
   await expect(page.getByRole('status').filter({ hasText: 'Stopped searching' })).toContainText('Its files were not touched.');
-  await expect(page.getByTestId('setup-folder-row')).toHaveCount(0);
+  await expect(page.getByTestId('installs-folder-row')).toHaveCount(0);
   const removed = (await calls(page)).filter((call) => call.command === 'games_remove_folder');
   expect(removed).toEqual([{ command: 'games_remove_folder', args: { path: COPY_PATH } }]);
 });

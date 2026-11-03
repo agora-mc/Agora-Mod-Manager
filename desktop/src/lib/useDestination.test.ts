@@ -9,6 +9,8 @@
 import { act, renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { useDestination } from './useDestination';
+import { takeGameImportRequest } from './gameImportRequest';
+import { takePendingSettingsSection } from './settingsSection';
 
 /**
  * jsdom implements pushState but never fires `popstate` for `history.back()`,
@@ -143,5 +145,38 @@ describe('useDestination', () => {
     expect(harness.depth()).toBe(1);
     act(() => result.current.goBack());
     expect(result.current.destination).toEqual({ type: 'game-tab', gameId: 'skyrim-se', tab: 'instances' });
+  });
+
+  it("sends an old link to a game's Setup page to that game's Settings section", () => {
+    window.history.replaceState({ __agora: { type: 'game-tab', gameId: 'skyrim-se', tab: 'setup' }, __agoraDepth: 2 }, '');
+    const { result } = renderHook(() => useDestination());
+
+    expect(result.current.destination).toEqual({ type: 'tab', tab: 'settings' });
+    expect(result.current.canGoBack).toBe(true);
+    expect(takePendingSettingsSection()).toEqual({ tab: 'game', page: 'installs' });
+    expect(window.history.state).toMatchObject({ __agora: { type: 'tab', tab: 'settings' }, __agoraDepth: 2 });
+  });
+
+  it("opens an old link to a game's Import page as its Instances page with the import dialog asked for", () => {
+    window.history.replaceState({ __agora: { type: 'game-tab', gameId: 'skyrim-se', tab: 'import' }, __agoraDepth: 0 }, '');
+    const { result } = renderHook(() => useDestination());
+
+    expect(result.current.destination).toEqual({ type: 'game-tab', gameId: 'skyrim-se', tab: 'instances' });
+    expect(takeGameImportRequest('valheim')).toBe(false);
+    expect(takeGameImportRequest('skyrim-se')).toBe(true);
+    expect(takeGameImportRequest('skyrim-se')).toBe(false);
+  });
+
+  it('upgrades an old Setup entry reached with Back, too', () => {
+    const { result } = renderHook(() => useDestination());
+    act(() => result.current.navigateToTab('browse'));
+    act(() => {
+      window.dispatchEvent(new PopStateEvent('popstate', {
+        state: { __agora: { type: 'game-tab', gameId: 'skyrim-se', tab: 'setup' }, __agoraDepth: 0 },
+      }));
+    });
+
+    expect(result.current.destination).toEqual({ type: 'tab', tab: 'settings' });
+    expect(takePendingSettingsSection()).toEqual({ tab: 'game', page: 'installs' });
   });
 });

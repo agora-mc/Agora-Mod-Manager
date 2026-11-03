@@ -219,3 +219,15 @@ export const OTHER_SLICES_REPLIES: Record<string, unknown> = {
   games_library_icon: null,
   games_library_cache_icon: { saved: false, matched: 0, iconDataUrl: null },
 };
+
+/**
+ * What the Settings page reads when it opens, for tests that reach a game's own Settings pages
+ * (Installs, Bases, Recovery). Signed out, keyring storage unknown, not portable.
+ */
+export const SETTINGS_PAGE_REPLIES: Record<string, unknown> = {
+  is_portable_mode: false,
+  msa_get_status: null,
+  msa_list_accounts: [],
+  credential_storage_status: null,
+  get_auth_status: false,
+};

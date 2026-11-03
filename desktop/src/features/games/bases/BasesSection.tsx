@@ -1,13 +1,14 @@
 /**
- * The Setup tab's pinned bases (MASTER_SPEC §26.4): the bases built for this game, each with its
+ * Settings › (game) › Bases (MASTER_SPEC §26.4): the bases built for this game, each with its
  * checks and its removal, the base records Agora cannot read (with their removal), and a way to
  * build a new one.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { useConfirm } from '@/components/ui/confirm';
+import { formatBytes } from '../content/api';
+import type { SectionFrame } from '../shared/sectionFrame';
 import { isGamesError } from '../shared/types';
 import { listBases, removeBase, type BaseSummary, type DamagedBaseSummary } from './api';
 import { BaseCard } from './BaseCard';
@@ -27,9 +28,13 @@ export function errorMessage(error: unknown): string {
 
 interface BasesSectionProps {
   gameId: string;
+  /** The game's short name, for the line that totals the bases' own disk use. */
+  gameName: string;
+  /** The card the page puts the section in. */
+  frame: SectionFrame;
 }
 
-export function BasesSection({ gameId }: BasesSectionProps) {
+export function BasesSection({ gameId, gameName, frame }: BasesSectionProps) {
   const [load, setLoad] = useState<Load>({ status: 'loading' });
   const [notice, setNotice] = useState<string | null>(null);
   const [buildOpen, setBuildOpen] = useState(false);
@@ -92,25 +97,19 @@ export function BasesSection({ gameId }: BasesSectionProps) {
     );
   }
 
-  return (
-    <Card data-testid="setup-bases">
-      <CardHeader className="flex flex-row flex-wrap items-start justify-between gap-4">
-        <div className="space-y-1.5">
-          <CardTitle>Pinned bases</CardTitle>
-          <CardDescription>
-            A base is a verified copy of one version of the game. Instances built from it keep working when your store
-            updates the game. Bases no instance uses can be removed.
-          </CardDescription>
-        </div>
-        <Button
-          type="button"
-          onClick={() => setBuildOpen(true)}
-          disabled={load.status === 'loading'}
-        >
-          Build a base
-        </Button>
-      </CardHeader>
-      <CardContent className="space-y-4">
+  const ownBytes = load.status === 'loaded' ? load.bases.reduce((sum, base) => sum + base.copiedBytes, 0) : 0;
+
+  return frame({
+    title: 'Bases',
+    description: 'A base is a verified copy of one version of the game. Instances built from it keep working when your store updates the game. Bases no instance uses can be removed.',
+    actions: (
+      <Button type="button" size="sm" className="shrink-0" onClick={() => setBuildOpen(true)} disabled={load.status === 'loading'}>
+        Build a base
+      </Button>
+    ),
+    testId: 'bases-section',
+    children: (
+      <>
         {notice && (
           <p role="status" className="rounded-lg border border-border bg-muted/40 p-3 text-sm">
             {notice}
@@ -161,6 +160,13 @@ export function BasesSection({ gameId }: BasesSectionProps) {
         )}
 
         {load.status === 'loaded' && load.bases.length > 0 && (
+          <p className="text-sm" data-testid="bases-total">
+            {load.bases.length} base{load.bases.length === 1 ? '' : 's'} for {gameName}, using{' '}
+            <span className="font-medium">{formatBytes(ownBytes)}</span> of their own.
+          </p>
+        )}
+
+        {load.status === 'loaded' && load.bases.length > 0 && (
           <ul className="space-y-3" aria-label="Pinned bases">
             {load.bases.map((base) => (
               <li key={base.baseId}>
@@ -169,17 +175,17 @@ export function BasesSection({ gameId }: BasesSectionProps) {
             ))}
           </ul>
         )}
-      </CardContent>
 
-      <BuildBaseDialog
-        open={buildOpen}
-        onOpenChange={setBuildOpen}
-        gameId={gameId}
-        onBuilt={(message) => {
-          setNotice(message);
-          refresh();
-        }}
-      />
-    </Card>
-  );
+        <BuildBaseDialog
+          open={buildOpen}
+          onOpenChange={setBuildOpen}
+          gameId={gameId}
+          onBuilt={(message) => {
+            setNotice(message);
+            refresh();
+          }}
+        />
+      </>
+    ),
+  });
 }

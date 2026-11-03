@@ -16,7 +16,7 @@ export type InstanceDeployment = 'auto' | 'virtual' | 'links' | 'copies';
 export type ImportCopySaves = 'on' | 'off';
 
 export interface GameSettings {
-  /** How a new instance's base is built, and how a base is built from Setup. */
+  /** How a new instance's base is built, and the starting choice for "Build a base". */
   baseType: BaseType;
   /** The deployment mode preselected for a new instance. */
   deployment: InstanceDeployment;

@@ -1,5 +1,5 @@
 /**
- * The checks the Import screen makes on a plan before it offers "Import". Kept apart from the
+ * The checks the import dialog makes on a plan before it offers "Import". Kept apart from the
  * component so they can be tested without a window.
  */
 
@@ -12,7 +12,7 @@ import type { Mo2PlanDto } from './api';
  */
 export function planBlockReason(plan: Mo2PlanDto, gameId: string): string | null {
   if (plan.gameId !== gameId) {
-    return `This setup is for ${plan.mo2GameName} (${plan.gameId}), not this game. Open that game's Import tab to bring it in.`;
+    return `This setup is for ${plan.mo2GameName} (${plan.gameId}), not this game. Switch to that game and use “Import instances” on its Instances page.`;
   }
   if (plan.mods.length === 0) {
     return 'The profile lists no mods Agora can import, so there is nothing to bring in.';

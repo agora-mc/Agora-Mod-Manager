@@ -830,12 +830,12 @@ export const GUIDE_TOPICS: GuideTopic[] = [
             'On Home, find the "More games" card and press Install next to the game. The same card is in Settings > Game support, which helps if you dismissed it on Home.',
             'If Agora shows what the add-on wants to do, read it first, and approve it only if you are happy with it.',
             'Restart Agora when it asks (Restart now).',
-            'Once Agora has found a copy of the game on this computer (Steam, GOG, Epic Games Store or Microsoft Store), a game switcher appears at the top of the sidebar. Choose the game there to open its Instances, Library, Import and Setup pages.',
+            'Once Agora has found a copy of the game on this computer (Steam, GOG, Epic Games Store or Microsoft Store), a game switcher appears at the top of the sidebar. Choose the game there to open its Instances and Library pages. Its installs, bases and recovery are in Settings, under the game\'s name.',
           ],
           callout: {
             tone: 'tip',
             title: 'If Agora did not find your game',
-            text: 'Use Add game folder in Settings > Game support and pick the folder the game is installed in. After you install or move the game later, Rescan on the game\'s Setup page looks again.',
+            text: 'Use Add game folder in Settings > Game support and pick the folder the game is installed in. After you install or move the game later, Rescan on the game\'s Installs page in Settings looks again.',
           },
         },
         {
@@ -844,7 +844,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           steps: [
             'Open the game and choose Instances > New instance.',
             'Name it, and pick the install to build from if you have more than one, such as a Steam copy and a GOG copy.',
-            'Choose a base. A Linked base shares most files with your install, so it takes little extra space, but a change to a linked file also changes the install. A Copied base takes about the size of the game again, and changes to it never reach the install. If you have the space, we suggest Copied base.',
+            'Choose a base. A Linked base shares most files with your install, so it takes little extra space, but a change to a linked file also changes the install. A Copied base takes about the size of the game again, and changes to it never reach the install. We suggest Linked base, unless you plan to change the game's own files by hand.',
             'Leave How it will run on Automatic unless you have a reason. You can change it later on the instance\'s Overview.',
             'Choose Create and wait while the base is built.',
           ],
@@ -910,7 +910,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Bring a Mod Organizer 2 setup',
-          body: 'The game\'s Import page lists Mod Organizer 2 setups on this computer. Choose a profile, use Preview the import to see what will happen, then confirm with Import profile. It becomes a new instance, and your Mod Organizer 2 setup is only read, not changed.',
+          body: 'On the game\'s Instances page, Import instances lists the Mod Organizer 2 setups on this computer. Choose a setup and a profile, use Preview the import to see what will happen, then confirm with Import profile. It becomes a new instance, and your Mod Organizer 2 setup is only read, not changed.',
         },
         {
           title: 'When something goes wrong',
@@ -919,7 +919,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
             'Overview > Launch checks says what stopped a launch, and Check again re-runs them. Launch anyway under Advanced options skips them, but the game may then crash, so we suggest it only when you know why a check is wrong.',
             'The Plugins tab lists Problems with the load order.',
             'If Agora was closed while a tool ran, the Tools tab says A tool swap was interrupted and offers Put the Data folder back. Do that before you launch.',
-            'Setup > Recovery lists game files that are still swapped and offers Put the files back.',
+            'Settings > (your game) > Recovery lists game files that are still swapped and offers Put the files back.',
           ],
         },
       ],

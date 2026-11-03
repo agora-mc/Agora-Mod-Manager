@@ -1,5 +1,5 @@
 /**
- * A base record Agora cannot read, on the Setup tab. It cannot be checked, because checking needs the
+ * A base record Agora cannot read, on a game's Bases page in Settings. It cannot be checked, because checking needs the
  * record; it can be removed once no instance uses it.
  */
 

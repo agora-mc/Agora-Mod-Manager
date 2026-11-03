@@ -1,23 +1,21 @@
 import { test, expect, type Page } from '@playwright/test';
-import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
+import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES, SETTINGS_PAGE_REPLIES } from './support/games-mock';
 
 /**
- * The import slice's screens on a non-Minecraft game: the Import tab (Mod Organizer 2), the
- * Library's curated items, and the Setup tab's recovery section. Every command is answered from
+ * The import slice's screens on a non-Minecraft game: the Mod Organizer 2 import dialog on the
+ * Instances page, the Library's curated items, and the Recovery page of the game's Settings. Every command is answered from
  * a table; anything else fails the test (see `support/games-mock.ts`).
  *
  * Commands whose reply depends on the request (a dry run and a real import share one command) are
  * answered by `answerWith`, which sits in front of the mock and matches on the request's fields.
  */
 
-// One sidebar for every game: the same entries, with the game's own (Import, Setup) after My Instances.
+// One sidebar for every game: the same entries, and none of the game's own.
 const GAME_NAV = [
   'Home',
   'Browse',
   'Library',
   'My Instances',
-  'Import',
-  'Setup',
   'Community Governance',
   'Help & Guide',
   'Field Guide',
@@ -51,6 +49,7 @@ const skyrim = {
 /** The boot commands the shell answers with empty data. Shared by every test here. */
 const BOOT_REPLIES = {
   ...OTHER_SLICES_REPLIES,
+  ...SETTINGS_PAGE_REPLIES,
   get_windows_accent_color: null,
   get_registry_status: { has_cached_db: false, checked: true, message: 'Missing' },
   check_registry_update: { has_cached_db: false, checked: true, message: 'Missing' },
@@ -247,6 +246,19 @@ function sidebarNav(page: Page) {
   return page.getByRole('navigation', { name: 'Main navigation' });
 }
 
+/** "Import instances" on the game's Instances page, where a game session starts. */
+async function openImport(page: Page) {
+  await page.getByTestId('game-instances-tab').getByRole('button', { name: 'Import instances' }).click();
+  await expect(page.getByTestId('game-import-dialog')).toBeVisible();
+}
+
+/** A page of the game's own section in Settings. */
+async function openGameSettings(page: Page, name: string) {
+  await sidebarNav(page).getByRole('button', { name: 'Settings' }).click();
+  await page.getByRole('tab', { name: 'Skyrim SE' }).click();
+  await page.getByRole('tab', { name, exact: true }).click();
+}
+
 async function navLabels(page: Page): Promise<string[]> {
   return (await sidebarNav(page).getByRole('button').allTextContents()).map((text) => text.trim());
 }
@@ -255,7 +267,7 @@ test.afterEach(async ({ page }) => {
   await expectNoUnmockedCommands(page);
 });
 
-test.describe('Import tab', () => {
+test.describe('Import dialog', () => {
   test('finds a setup, previews the profile, and imports it after confirming', async ({ page }) => {
     await boot(
       page,
@@ -266,7 +278,7 @@ test.describe('Import tab', () => {
       { games_import_mo2_scan: { setups: [setup], warnings: [] } },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Import' }).click();
+    await openImport(page);
     await expect(page.getByRole('heading', { name: 'Import from Mod Organizer 2' })).toBeVisible();
     await page.getByRole('list', { name: 'Setups found' }).getByRole('button', { name: 'Use this setup' }).click();
 
@@ -284,12 +296,14 @@ test.describe('Import tab', () => {
     await expect(done).toContainText('Imported as “Default (MO2 import)”');
     await expect(done).toContainText('2 mod(s) stored');
     await expect(done).toContainText('Still to do');
+    // The new instance is one step away, as a created one is.
+    await expect(page.getByRole('button', { name: 'Open “Default (MO2 import)”' })).toBeVisible();
   });
 
   test('says so when no setup is found, and offers a folder to choose', async ({ page }) => {
     await boot(page, [], { games_import_mo2_scan: { setups: [], warnings: [] } });
 
-    await sidebarNav(page).getByRole('button', { name: 'Import' }).click();
+    await openImport(page);
     await expect(page.getByTestId('import-empty')).toContainText('No Mod Organizer 2 setups were found');
     await expect(page.getByRole('button', { name: 'Choose a setup folder…' })).toBeVisible();
   });
@@ -301,7 +315,7 @@ test.describe('Import tab', () => {
       {},
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Import' }).click();
+    await openImport(page);
     await expect(page.getByRole('alert')).toContainText('The drives could not be read.');
     await expect(page.getByTestId('import-empty')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Look again' })).toBeEnabled();
@@ -314,7 +328,7 @@ test.describe('Import tab', () => {
       { games_import_mo2_scan: { setups: [], warnings: [] } },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Import' }).click();
+    await openImport(page);
     await expect(page.getByTestId('import-empty')).toBeVisible();
     await page.getByRole('button', { name: 'Choose a setup folder…' }).click();
     await expect(page.getByRole('alert')).toContainText('The folder picker could not open.');
@@ -334,7 +348,7 @@ test.describe('Import tab', () => {
       { games_import_mo2_scan: { setups: [setup], warnings: [] } },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Import' }).click();
+    await openImport(page);
     await page.getByRole('button', { name: 'Use this setup' }).click();
     await page.getByRole('button', { name: 'Preview the import' }).click();
 
@@ -471,7 +485,7 @@ test.describe('Library curated items', () => {
   });
 });
 
-test.describe('Setup recovery', () => {
+test.describe('Settings recovery', () => {
   test('lists a swapped session and puts its files back after confirming', async ({ page }) => {
     await boot(
       page,
@@ -496,7 +510,7 @@ test.describe('Setup recovery', () => {
       { games_user_files_status: { sessions: [userFilesSession] } },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Setup' }).click();
+    await openGameSettings(page, 'Recovery');
     const session = page.getByTestId('recovery-session');
     await expect(session).toContainText('steam copy of skyrim-se');
     await expect(session).toContainText('1 file(s), 1 swapped');
@@ -516,7 +530,7 @@ test.describe('Setup recovery', () => {
       { games_user_files_status: { sessions: [{ ...userFilesSession, running: true }] } },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Setup' }).click();
+    await openGameSettings(page, 'Recovery');
     const session = page.getByTestId('recovery-session');
     await expect(session).toContainText('Game is running');
     await expect(session.getByRole('button', { name: 'Put the files back' })).toHaveCount(0);
@@ -525,7 +539,7 @@ test.describe('Setup recovery', () => {
   test('no swapped sessions says nothing needs recovering', async ({ page }) => {
     await boot(page, [], { games_user_files_status: { sessions: [] } });
 
-    await sidebarNav(page).getByRole('button', { name: 'Setup' }).click();
+    await openGameSettings(page, 'Recovery');
     await expect(page.getByTestId('recovery-empty')).toContainText('Nothing needs recovering');
   });
 
@@ -536,7 +550,7 @@ test.describe('Setup recovery', () => {
       { games_user_files_status: { sessions: [userFilesSession] } },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Setup' }).click();
+    await openGameSettings(page, 'Recovery');
     await page.getByTestId('recovery-session').getByRole('button', { name: 'Put the files back' }).click();
     await page.getByRole('button', { name: 'Restore files', exact: true }).click();
 

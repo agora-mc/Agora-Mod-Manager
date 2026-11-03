@@ -2,7 +2,7 @@
 import { isTextEntryTarget } from '@/lib/keyboardTargets';
 import { listen } from '@tauri-apps/api/event';
 import { Sidebar } from './components/Sidebar';
-import { CommandPalette, PALETTE_NAVIGATION_ITEMS } from './components/command-palette';
+import { CommandPalette } from './components/command-palette';
 import { Home } from './pages/Home';
 import { Browse } from './pages/Browse';
 import { LibraryPage } from './pages/Library';
@@ -45,7 +45,7 @@ import { useGameSwitch } from './features/games/shared/useGameSwitch';
 import { GameSwitcher } from './features/games/shell/GameSwitcher';
 import { GameTabPage } from './features/games/shell/GameTabPage';
 import { GameInstancePage } from './features/games/shell/GameInstancePage';
-import { GAME_ONLY_TABS, gameTabForSidebarTab, sidebarTabForGameTab, withGameOnlyEntries } from './features/games/shell/gameNav';
+import { gameTabForSidebarTab, sidebarTabForGameTab } from './features/games/shell/gameNav';
 import { gameShortName } from './features/games/shared/gameNames';
 import { useProcessController } from './lib/useProcessController';
 import { useInstanceHealthMonitor } from './lib/useInstanceHealthMonitor';
@@ -247,12 +247,6 @@ function destinationGame(dest: Destination): string | null {
   if (isAppWideDestination(dest)) return null;
   return MINECRAFT_GAME_ID;
 }
-
-/** The command palette's entries for a non-Minecraft game: the same list, plus Import and Setup. */
-const GAME_PALETTE_NAVIGATION_ITEMS: { label: string; tab: Tab; icon: string }[] = withGameOnlyEntries(
-  PALETTE_NAVIGATION_ITEMS,
-  GAME_ONLY_TABS.map((entry) => ({ label: entry.label, tab: entry.id, icon: entry.emoji })),
-);
 
 /** Deliberate recoverable not-found view for unrecognized destinations. */
 function NotFoundView({ canGoBack, onGoHome, onGoBack }: { canGoBack: boolean; onGoHome: () => void; onGoBack: () => void }) {
@@ -622,9 +616,10 @@ function AppContent() {
   // than owning a permanent sidebar slot. `'lab'` remains a valid destination.
   const [tabHome, tabBrowse, tabLibrary, tabInstances, tabGovernance, tabGuide, tabFieldGuide, tabAbout, tabSettings] = BASE_TABS;
   // One sidebar for every game (2026-11-03). Minecraft's list is the reference; another game uses
-  // the same entries in the same places, with its own extra entries (Import, Setup) right after My
-  // Instances. Shared entries a game has no page for yet open its closest page (see gameNav).
-  const sharedTabs = [
+  // the same entries in the same places, and adds none: its import is a dialog on My Instances and
+  // its installs, bases and recovery live in Settings. Shared entries a game has no page for yet
+  // open its closest page (see gameNav).
+  const tabs = [
     tabHome,
     tabBrowse,
     tabLibrary,
@@ -636,12 +631,6 @@ function AppContent() {
     tabAbout,
     tabSettings,
   ];
-  const tabs = shownGame === MINECRAFT_GAME_ID
-    ? sharedTabs
-    : withGameOnlyEntries(
-      sharedTabs,
-      GAME_ONLY_TABS.map((entry) => ({ id: entry.id, label: entry.label, icon: entry.icon })),
-    );
 
   // Resolve the current UI state from the destination. A tab that became
   // unavailable (e.g. living background toggled off while open) falls back.
@@ -1126,7 +1115,6 @@ function AppContent() {
                 gameId={destination.gameId}
                 tab={destination.tab}
                 onOpenInstance={(instanceId) => navigateToGameInstance(destination.gameId, instanceId)}
-                onOpenImport={() => navigateToGameTab(destination.gameId, 'import' satisfies GameTabId)}
               />
             ) : destination.type === 'game-instance' ? (
               <GameInstancePage
@@ -1230,7 +1218,6 @@ function AppContent() {
                     activeGame={activeGame}
                     activeGameName={gameShell.foundGames.find((game) => game.gameId === activeGame)?.name}
                     onSwitchToMinecraft={() => switchGame(MINECRAFT_GAME_ID, { navigate: false })}
-                    onOpenGameSetup={(gameId) => navigateToGameTab(gameId, 'setup' satisfies GameTabId)}
                     onNavigateTab={navigateToTab}
                     onResetLayout={() => {
                       const reset = {
@@ -1286,7 +1273,6 @@ function AppContent() {
           open={commandPaletteOpen}
           onOpenChange={setCommandPaletteOpen}
           onNavigate={handleNavigate}
-          navigationItems={shownGame === MINECRAFT_GAME_ID ? undefined : GAME_PALETTE_NAVIGATION_ITEMS}
           switchGameItems={gameShell.switcherVisible
             ? gameShell.foundGames.map((game) => ({ gameId: game.gameId, label: game.name }))
             : undefined}

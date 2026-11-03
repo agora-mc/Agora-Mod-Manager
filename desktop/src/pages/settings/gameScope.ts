@@ -57,6 +57,7 @@ export const SETTINGS_CARD_AUDIENCE = {
   'game-new-instances': 'other-games',
   'game-installs': 'other-games',
   'game-bases': 'other-games',
+  'game-recovery': 'other-games',
 } as const satisfies Record<string, SettingsAudience>;
 
 export type SettingsCardId = keyof typeof SETTINGS_CARD_AUDIENCE;

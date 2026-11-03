@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { CheckCircle2, Loader2, RefreshCw } from 'lucide-react';
+import { ArrowRight, CheckCircle2, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { openGameSettings } from '@/lib/settingsSection';
 import type { CheckFinding } from './api';
 import {
   checkHeadline,
@@ -225,6 +226,12 @@ function FindingCard({ finding }: { finding: CheckFinding }) {
           <span className="font-medium">What to do: </span>
           {finding.repair}
         </p>
+      )}
+      {finding.kind === 'base' && (
+        <Button type="button" variant="outline" size="sm" className="mt-1" onClick={() => openGameSettings('bases')}>
+          Open Bases in Settings
+          <ArrowRight aria-hidden="true" />
+        </Button>
       )}
     </li>
   );
