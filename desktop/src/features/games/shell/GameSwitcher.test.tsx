@@ -77,3 +77,33 @@ describe('GameSwitcher icons', () => {
     });
   });
 });
+
+describe('GameSwitcher names', () => {
+  beforeEach(() => {
+    loadGameIconMock.mockReset();
+    loadGameIconMock.mockResolvedValue(null);
+  });
+
+  it('shows the short name and keeps the full one as the accessible name and tooltip', async () => {
+    const user = userEvent.setup();
+    render(
+      <GameSwitcher
+        options={[
+          { gameId: 'minecraft', label: 'Minecraft' },
+          { gameId: 'skyrim-se', label: 'The Elder Scrolls V: Skyrim Special Edition', shortLabel: 'Skyrim SE' },
+        ]}
+        shownGame="skyrim-se"
+        onSwitch={() => undefined}
+        collapsed={false}
+      />,
+    );
+    const current = screen.getByRole('button', { name: 'Game: The Elder Scrolls V: Skyrim Special Edition. Choose a game' });
+    expect(current).toHaveTextContent('Skyrim SE');
+    expect(current).toHaveAttribute('title', 'The Elder Scrolls V: Skyrim Special Edition');
+
+    await user.click(current);
+    const option = screen.getByRole('button', { name: 'The Elder Scrolls V: Skyrim Special Edition' });
+    expect(option).toHaveTextContent('Skyrim SE');
+    expect(screen.getByRole('button', { name: 'Minecraft' })).toHaveTextContent('Minecraft');
+  });
+});

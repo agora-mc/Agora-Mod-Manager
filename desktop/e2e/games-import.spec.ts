@@ -10,7 +10,21 @@ import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES } from
  * answered by `answerWith`, which sits in front of the mock and matches on the request's fields.
  */
 
-const GAME_NAV = ['Instances', 'Library', 'Import', 'Setup', 'Settings'];
+// One sidebar for every game: the same entries, with the game's own (Import, Setup) after My Instances.
+const GAME_NAV = [
+  'Home',
+  'Browse',
+  'Library',
+  'My Instances',
+  'Import',
+  'Setup',
+  'Community Governance',
+  'Help & Guide',
+  'Field Guide',
+  'Living Background',
+  'The Agora Difference',
+  'Settings',
+];
 
 const skyrimInstall = {
   installId: 'steam-489830',

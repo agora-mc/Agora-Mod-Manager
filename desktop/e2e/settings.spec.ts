@@ -249,7 +249,7 @@ test('software updates section shows the packaged app version from Tauri', async
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('tab', { name: 'Updates' }).click();
   await expect(page.getByRole('heading', { name: 'Software Updates' })).toBeVisible();
-  await expect(page.locator('#settings-updates')).toContainText('Agora Launcher 9.8.7-test');
+  await expect(page.locator('#settings-updates')).toContainText('Agora Mod Manager 9.8.7-test');
 });
 
 test('open application data folder invokes the open_data_folder command', async ({ page }) => {

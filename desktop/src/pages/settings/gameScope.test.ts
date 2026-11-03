@@ -12,7 +12,8 @@ const CARD_FILES = [
   '../Settings.tsx',
   './AiAssistantCard.tsx',
   './AppearanceSettings.tsx',
-  './GameSettingsSection.tsx',
+  './game/InstallsBasesSettings.tsx',
+  './game/NewInstancesSettings.tsx',
   './GameSupportSettings.tsx',
   './RuntimeReclaim.tsx',
   './TemplateSettings.tsx',
@@ -60,6 +61,13 @@ describe('gameScope helpers', () => {
     expect(isSettingsCardVisible('java-runtime', false)).toBe(false);
     expect(isSettingsCardVisible('game-support', false)).toBe(true);
     expect(isSettingsCardVisible('github-account', false)).toBe(true);
+  });
+
+  it("shows the selected game's own cards only while that game is selected", () => {
+    expect(isSettingsCardVisible('game-new-instances', false)).toBe(true);
+    expect(isSettingsCardVisible('game-installs', false)).toBe(true);
+    expect(isSettingsCardVisible('game-new-instances', true)).toBe(false);
+    expect(isSettingsCardVisible('game-bases', true)).toBe(false);
   });
 
   it('prefers a discovered game name and otherwise humanizes the id', () => {

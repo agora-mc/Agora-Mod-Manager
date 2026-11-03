@@ -21,7 +21,21 @@ const MINECRAFT_NAV = [
   'The Agora Difference',
   'Settings',
 ];
-const GAME_NAV = ['Instances', 'Library', 'Import', 'Setup', 'Settings'];
+// One sidebar for every game: the same entries, with the game's own (Import, Setup) after My Instances.
+const GAME_NAV = [
+  'Home',
+  'Browse',
+  'Library',
+  'My Instances',
+  'Import',
+  'Setup',
+  'Community Governance',
+  'Help & Guide',
+  'Field Guide',
+  'Living Background',
+  'The Agora Difference',
+  'Settings',
+];
 
 const skyrimInstall = {
   installId: 'steam-489830',
@@ -110,7 +124,7 @@ test('the switcher is shown once Skyrim is found, and lists Minecraft first', as
   await expect(switcher).toBeVisible();
   await switcher.getByRole('button', { name: 'Game: Minecraft. Choose a game' }).click();
   const options = switcher.getByRole('group', { name: 'Games' }).getByRole('button');
-  await expect(options).toHaveText(['Minecraft', 'Skyrim Special Edition']);
+  await expect(options).toHaveText(['Minecraft', 'Skyrim SE']);
 });
 
 test('switching to Skyrim swaps the sidebar to its tabs and back again', async ({ page }) => {

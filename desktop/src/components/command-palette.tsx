@@ -25,14 +25,15 @@ interface CommandPaletteProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onNavigate: (tab: Tab, instanceId?: string) => void;
-  /** Replaces the Minecraft navigation entries while a non-Minecraft game is shown. */
+  /** Replaces the default navigation entries while a non-Minecraft game is shown. */
   navigationItems?: { label: string; tab: Tab; icon: string }[];
   /** Games the user can switch to. Shown only when there is one (the switcher's rule). */
   switchGameItems?: { gameId: string; label: string }[];
   onSwitchGame?: (gameId: string) => void;
 }
 
-const SETTINGS_ITEMS: { label: string; tab: Tab; icon: string }[] = [
+/** The palette's navigation entries. A non-Minecraft game adds its own (see `gameNav`). */
+export const PALETTE_NAVIGATION_ITEMS: { label: string; tab: Tab; icon: string }[] = [
   { label: 'Home', tab: 'home', icon: '🏠' },
   { label: 'Browse', tab: 'browse', icon: '🔍' },
   { label: 'Library', tab: 'library', icon: '📚' },
@@ -102,7 +103,7 @@ export function CommandPalette({
     const filteredInstances = instances.filter((inst) =>
       query ? inst.name.toLowerCase().includes(query.toLowerCase()) : true,
     );
-    const settingsItems = navigationItems ?? SETTINGS_ITEMS;
+    const settingsItems = navigationItems ?? PALETTE_NAVIGATION_ITEMS;
     const filteredSettings: ResultItem[] = [
       ...settingsItems.filter((item) =>
         query ? item.label.toLowerCase().includes(query.toLowerCase()) : true,

@@ -5,12 +5,14 @@ import { MINECRAFT_GAME_ID } from '../../features/games/shared/types';
  *
  * `all-games` cards stay on screen whichever game is selected. `minecraft` cards
  * describe Minecraft only (Java, the Mojang launcher, mod updates, skins), so
- * they are hidden while another game is selected. Every card carries one of
+ * they are hidden while another game is selected. `other-games` cards are the
+ * selected game's own section (new instances, installs, bases), shown only while
+ * a game other than Minecraft is selected. Every card carries one of
  * these ids through `SettingsSection`, and the table below is the single place
  * that decides its audience: a new card cannot compile without being classified,
  * and `gameScope.test.ts` fails if a card is added without one.
  */
-export type SettingsAudience = 'all-games' | 'minecraft';
+export type SettingsAudience = 'all-games' | 'minecraft' | 'other-games';
 
 export const SETTINGS_CARD_AUDIENCE = {
   // General
@@ -51,9 +53,10 @@ export const SETTINGS_CARD_AUDIENCE = {
   plugins: 'all-games',
   privacy: 'all-games',
 
-  // The selected game's own section, shown above the tabs while that game is
-  // selected. It is app-wide in the sense that it is not a Minecraft card.
-  'selected-game': 'all-games',
+  // The selected game's own section (rail id `game`), in Launching's place.
+  'game-new-instances': 'other-games',
+  'game-installs': 'other-games',
+  'game-bases': 'other-games',
 } as const satisfies Record<string, SettingsAudience>;
 
 export type SettingsCardId = keyof typeof SETTINGS_CARD_AUDIENCE;
@@ -63,9 +66,14 @@ export function isMinecraftSelected(activeGame: string | null | undefined): bool
   return activeGame === null || activeGame === undefined || activeGame === MINECRAFT_GAME_ID;
 }
 
-/** A card is shown for Minecraft always, and for other games only when it is app-wide. */
+/**
+ * App-wide cards are always shown; Minecraft's only while Minecraft is selected, and the
+ * selected game's own only while another game is.
+ */
 export function isSettingsCardVisible(card: SettingsCardId, minecraftSelected: boolean): boolean {
-  return minecraftSelected || SETTINGS_CARD_AUDIENCE[card] === 'all-games';
+  const audience: SettingsAudience = SETTINGS_CARD_AUDIENCE[card];
+  if (audience === 'all-games') return true;
+  return minecraftSelected ? audience === 'minecraft' : audience === 'other-games';
 }
 
 /**

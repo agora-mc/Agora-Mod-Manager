@@ -77,8 +77,8 @@ test('app shell renders with Agora branding', async ({ page }) => {
   await page.goto('/');
   // The app should load the home page (Vite app shell).
   await expect(page.locator('body')).toBeVisible();
-  // Look for the Agora Launcher text (sidebar brand) somewhere on the page.
-  await expect(page.getByText('Agora Launcher')).toBeVisible({ timeout: 10000 });
+  // Look for the Agora Mod Manager text (sidebar brand) somewhere on the page.
+  await expect(page.getByText('Agora Mod Manager')).toBeVisible({ timeout: 10000 });
 });
 
 test('navigation to browse works', async ({ page }) => {

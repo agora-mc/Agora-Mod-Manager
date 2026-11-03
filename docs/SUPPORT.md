@@ -22,7 +22,7 @@ For the standalone CLI:
 agora --version
 ```
 
-The desktop shows its exact packaged version in **Settings > Software Updates** in the form `Agora Launcher 0.1.0`. Record it together with the `v*` release from which the package came. **Check for Updates** reports update availability but is not a substitute for the displayed current-version label. For a source build, record the Git commit as well.
+The desktop shows its exact packaged version in **Settings > Software Updates** in the form `Agora Mod Manager 0.1.0`. Record it together with the `v*` release from which the package came. **Check for Updates** reports update availability but is not a substitute for the displayed current-version label. For a source build, record the Git commit as well.
 
 ## Know which log is which
 

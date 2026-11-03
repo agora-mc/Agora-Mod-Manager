@@ -24,22 +24,11 @@ import {
   type ListedGameFolder,
   type ScanWarning,
 } from './api';
+import { storeName } from '../shared/stores';
 
 interface SetupInstallsSectionProps {
   /** The game the Setup tab was opened for. Installs of every game are listed here. */
   gameId: string;
-}
-
-const STORE_NAMES: Record<string, string> = {
-  steam: 'Steam',
-  gog: 'GOG',
-  epic: 'Epic Games Store',
-  'microsoft-store': 'Microsoft Store',
-  direct: 'a folder you added',
-};
-
-function storeName(store: string): string {
-  return STORE_NAMES[store] ?? store;
 }
 
 /** Why an install's version or runtime is unknown, as sentences for a person. */

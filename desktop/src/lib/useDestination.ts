@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 export type Tab = 'home' | 'browse' | 'library' | 'instances' | 'governance' | 'ai' | 'guide' | 'field-guide' | 'living-background' | 'lab' | 'about' | 'settings'
-  // The four tabs of a non-Minecraft game (MASTER_SPEC §26.14). Sidebar ids only: a game tab
-  // is opened as a `game-tab` destination, which carries the game it belongs to.
-  | 'game-instances' | 'game-library' | 'game-import' | 'game-setup';
+  // The sidebar entries only a non-Minecraft game has (MASTER_SPEC §26.14). Sidebar ids only: a
+  // game page is opened as a `game-tab` destination, which carries the game it belongs to. A
+  // game's Instances and Library sit under the shared `instances` and `library` entries.
+  | 'game-import' | 'game-setup';
 
 /** The four game tabs, by the name a `game-tab` destination uses. */
 export type GameTabId = 'instances' | 'library' | 'import' | 'setup';

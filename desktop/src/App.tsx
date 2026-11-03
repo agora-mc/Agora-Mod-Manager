@@ -2,7 +2,7 @@
 import { isTextEntryTarget } from '@/lib/keyboardTargets';
 import { listen } from '@tauri-apps/api/event';
 import { Sidebar } from './components/Sidebar';
-import { CommandPalette } from './components/command-palette';
+import { CommandPalette, PALETTE_NAVIGATION_ITEMS } from './components/command-palette';
 import { Home } from './pages/Home';
 import { Browse } from './pages/Browse';
 import { LibraryPage } from './pages/Library';
@@ -45,7 +45,8 @@ import { useGameSwitch } from './features/games/shared/useGameSwitch';
 import { GameSwitcher } from './features/games/shell/GameSwitcher';
 import { GameTabPage } from './features/games/shell/GameTabPage';
 import { GameInstancePage } from './features/games/shell/GameInstancePage';
-import { GAME_SHELL_TABS, gameTabForSidebarTab, sidebarTabForGameTab } from './features/games/shell/gameNav';
+import { GAME_ONLY_TABS, gameTabForSidebarTab, sidebarTabForGameTab, withGameOnlyEntries } from './features/games/shell/gameNav';
+import { gameShortName } from './features/games/shared/gameNames';
 import { useProcessController } from './lib/useProcessController';
 import { useInstanceHealthMonitor } from './lib/useInstanceHealthMonitor';
 import { useRegistryState } from './lib/useRegistryState';
@@ -212,27 +213,46 @@ function destToTab(dest: Destination): Tab {
   if (dest.type === 'tab') return dest.tab;
   if (dest.type === 'instance-detail') return 'instances';
   if (dest.type === 'game-tab') return sidebarTabForGameTab(dest.tab);
-  if (dest.type === 'game-instance') return 'game-instances';
+  if (dest.type === 'game-instance') return 'instances';
   // A plugin page is not one of the built-in tabs, so none of them is
   // highlighted while it is open; the sidebar marks the plugin entry instead.
   return 'home'; // mod-detail doesn't change the tab
 }
 
 /**
- * The game a destination belongs to. Settings is shared by every game, so it names none (null).
- * Everything else that is not a game's own page is Minecraft's.
+ * Pages that belong to the app rather than to one game. They keep whichever game is selected:
+ * opening Help & Guide while Skyrim is selected leaves Skyrim selected and its sidebar in place.
+ */
+const APP_WIDE_TABS: ReadonlySet<Tab> = new Set<Tab>([
+  'governance',
+  'guide',
+  'field-guide',
+  'living-background',
+  'lab',
+  'about',
+  'settings',
+]);
+
+function isAppWideDestination(dest: Destination): boolean {
+  return dest.type === 'tab' && APP_WIDE_TABS.has(dest.tab);
+}
+
+/**
+ * The game a destination belongs to. App-wide pages (Settings, Help & Guide, ...) are shared by
+ * every game, so they name none (null). Everything else that is not a game's own page is
+ * Minecraft's.
  */
 function destinationGame(dest: Destination): string | null {
   if (dest.type === 'game-tab' || dest.type === 'game-instance') return dest.gameId;
-  if (dest.type === 'tab' && dest.tab === 'settings') return null;
+  if (isAppWideDestination(dest)) return null;
   return MINECRAFT_GAME_ID;
 }
 
-/** The sidebar entries a non-Minecraft game shows. Settings stays shared. */
-const GAME_SHELL_NAVIGATION_ITEMS: { label: string; tab: Tab; icon: string }[] = [
-  ...GAME_SHELL_TABS.map((entry) => ({ label: entry.label, tab: entry.id, icon: entry.emoji })),
-  { label: 'Settings', tab: 'settings' as Tab, icon: '⚙️' },
-];
+/** The command palette's entries for a non-Minecraft game: the same list, plus Import and Setup. */
+const GAME_PALETTE_NAVIGATION_ITEMS: { label: string; tab: Tab; icon: string }[] = withGameOnlyEntries(
+  PALETTE_NAVIGATION_ITEMS,
+  GAME_ONLY_TABS.map((entry) => ({ label: entry.label, tab: entry.id, icon: entry.emoji })),
+);
 
 /** Deliberate recoverable not-found view for unrecognized destinations. */
 function NotFoundView({ canGoBack, onGoHome, onGoBack }: { canGoBack: boolean; onGoHome: () => void; onGoBack: () => void }) {
@@ -504,9 +524,10 @@ function AppContent() {
     return () => window.removeEventListener('agora-navigate', handler);
   }, [navigateToTab]);
 
-  // Game navigation. A game tab is opened for whichever game the shell shows.
+  // Game navigation. Every game shares one sidebar: while a non-Minecraft game is shown, its
+  // entries (and the shared ones that stand in for a page it lacks) open that game's pages.
   const selectShellTab = useCallback((tab: Tab) => {
-    const gameTab = gameTabForSidebarTab(tab);
+    const gameTab = shownGame === MINECRAFT_GAME_ID ? null : gameTabForSidebarTab(tab);
     if (gameTab) {
       navigateToGameTab(shownGame, gameTab);
     } else {
@@ -517,13 +538,14 @@ function AppContent() {
   const switchGame = useGameSwitch({ setActiveGame, navigateToTab, navigateToGameTab });
 
   // Turning off the game being viewed must not leave its page on screen: the switcher has already
-  // moved to Minecraft, so remember that choice too and say once why the page changed. Settings is
-  // shared by every game, so it stays open and simply shows Minecraft's cards.
+  // moved to Minecraft, so remember that choice too and say once why the page changed. Settings and
+  // the other app-wide pages are shared by every game, so they stay open (Settings simply shows
+  // Minecraft's cards).
   const turnedOffNoticeRef = useRef<string | null>(null);
   useEffect(() => {
     if (!gameShellReady) return;
     const openGame = destinationGame(destination)
-      ?? (destination.type === 'tab' && destination.tab === 'settings' ? activeGame : null);
+      ?? (isAppWideDestination(destination) ? activeGame : null);
     if (openGame === null || openGame === MINECRAFT_GAME_ID) return;
     const turnedOff = turnedOffGames.find((game) => game.gameId === openGame);
     if (!turnedOff) {
@@ -599,7 +621,10 @@ function AppContent() {
   // for the guide's "New to modding" tier, reached from Help & Guide rather
   // than owning a permanent sidebar slot. `'lab'` remains a valid destination.
   const [tabHome, tabBrowse, tabLibrary, tabInstances, tabGovernance, tabGuide, tabFieldGuide, tabAbout, tabSettings] = BASE_TABS;
-  const minecraftTabs = [
+  // One sidebar for every game (2026-11-03). Minecraft's list is the reference; another game uses
+  // the same entries in the same places, with its own extra entries (Import, Setup) right after My
+  // Instances. Shared entries a game has no page for yet open its closest page (see gameNav).
+  const sharedTabs = [
     tabHome,
     tabBrowse,
     tabLibrary,
@@ -611,13 +636,12 @@ function AppContent() {
     tabAbout,
     tabSettings,
   ];
-  // A non-Minecraft game shows its own four tabs and the shared Settings, nothing else.
   const tabs = shownGame === MINECRAFT_GAME_ID
-    ? minecraftTabs
-    : [
-      ...GAME_SHELL_TABS.map((entry) => ({ id: entry.id, label: entry.label, icon: entry.icon })),
-      tabSettings,
-    ];
+    ? sharedTabs
+    : withGameOnlyEntries(
+      sharedTabs,
+      GAME_ONLY_TABS.map((entry) => ({ id: entry.id, label: entry.label, icon: entry.icon })),
+    );
 
   // Resolve the current UI state from the destination. A tab that became
   // unavailable (e.g. living background toggled off while open) falls back.
@@ -1004,7 +1028,11 @@ function AppContent() {
             <GameSwitcher
               options={[
                 { gameId: MINECRAFT_GAME_ID, label: 'Minecraft' },
-                ...gameShell.foundGames.map((game) => ({ gameId: game.gameId, label: game.name })),
+                ...gameShell.foundGames.map((game) => ({
+                  gameId: game.gameId,
+                  label: game.name,
+                  shortLabel: gameShortName(game.name),
+                })),
               ]}
               shownGame={shownGame}
               onSwitch={switchGame}
@@ -1201,6 +1229,7 @@ function AppContent() {
                     activeGame={activeGame}
                     activeGameName={gameShell.foundGames.find((game) => game.gameId === activeGame)?.name}
                     onSwitchToMinecraft={() => switchGame(MINECRAFT_GAME_ID, { navigate: false })}
+                    onOpenGameSetup={(gameId) => navigateToGameTab(gameId, 'setup' satisfies GameTabId)}
                     onNavigateTab={navigateToTab}
                     onResetLayout={() => {
                       const reset = {
@@ -1256,7 +1285,7 @@ function AppContent() {
           open={commandPaletteOpen}
           onOpenChange={setCommandPaletteOpen}
           onNavigate={handleNavigate}
-          navigationItems={shownGame === MINECRAFT_GAME_ID ? undefined : GAME_SHELL_NAVIGATION_ITEMS}
+          navigationItems={shownGame === MINECRAFT_GAME_ID ? undefined : GAME_PALETTE_NAVIGATION_ITEMS}
           switchGameItems={gameShell.switcherVisible
             ? gameShell.foundGames.map((game) => ({ gameId: game.gameId, label: game.name }))
             : undefined}
