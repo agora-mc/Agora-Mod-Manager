@@ -7,11 +7,9 @@ import {
   type RecentlyDeletedEntry,
 } from '../lib/tauri';
 import { useConfirm } from '@/components/ui/confirm';
-import { RecentlyDeletedPanel } from '@/components/instance-kit';
+import { RecentlyDeletedPanel, daysText } from '@/components/instance-kit';
 import { importSourceLabel, isFileImportSource } from '../lib/importDisplay';
-
-/** How long Agora keeps a deleted instance before moving it to the OS trash. */
-export const RECENTLY_DELETED_DAYS = 30;
+import { RECOMMENDED_RETENTION_DAYS, useRecentlyDeletedDays } from '../lib/recentlyDeletedDays';
 
 function launcherName(source: string | null | undefined): string | null {
   if (!source) return null;
@@ -21,17 +19,21 @@ function launcherName(source: string | null | undefined): string | null {
   return 'Modrinth App';
 }
 
-/** Say exactly what Delete does: Agora's copy only, restorable for 30 days. */
-export function deleteDialogBody(instance: { name: string; import_source?: string | null }): string {
+/** Say exactly what Delete does: Agora's copy only, restorable for the player's window. */
+export function deleteDialogBody(
+  instance: { name: string; import_source?: string | null },
+  retentionDays: number = RECOMMENDED_RETENTION_DAYS,
+): string {
   const launcher = launcherName(instance.import_source);
   const untouched = isFileImportSource(instance.import_source)
     ? ` The pack file ${launcher} isn't touched.`
     : launcher ? ` Your ${launcher} files aren't touched.` : '';
-  return `Removes Agora's copy of ${instance.name}.${untouched} You can restore it from Recently deleted for ${RECENTLY_DELETED_DAYS} days.`;
+  return `Removes Agora's copy of ${instance.name}.${untouched} You can restore it from Recently deleted for ${daysText(retentionDays)}.`;
 }
 
 /**
- * Instances deleted in the last 30 days, with Restore and Delete now.
+ * Instances deleted within the player's window (the setting every game shares), with Restore
+ * and Delete now.
  * Renders nothing while the list is empty. `refreshKey` changes when the
  * instance list does, so a fresh delete shows up without a manual reload.
  */
@@ -43,6 +45,7 @@ export function RecentlyDeleted({
   onRestored: () => void;
 }) {
   const { confirm } = useConfirm();
+  const retentionDays = useRecentlyDeletedDays();
   const [entries, setEntries] = useState<RecentlyDeletedEntry[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -110,7 +113,7 @@ export function RecentlyDeleted({
         expiresAt: entry.expires_at,
         sizeBytes: entry.size_bytes,
       }))}
-      retentionDays={RECENTLY_DELETED_DAYS}
+      retentionDays={retentionDays}
       busy={busy !== null}
       notice={notice}
       error={error}

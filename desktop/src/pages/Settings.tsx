@@ -93,7 +93,7 @@ import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
 import { GameSupportSettings } from './settings/GameSupportSettings';
 import { NewInstancesSettings } from './settings/game/NewInstancesSettings';
-import { RecentlyDeletedSettings } from './settings/game/RecentlyDeletedSettings';
+import { RecentlyDeletedSettings } from './settings/RecentlyDeletedSettings';
 import { settingsFrame } from './settings/game/settingsFrame';
 import { InstallsSection } from '../features/games/discovery';
 import { BasesSection } from '../features/games/bases';
@@ -2397,11 +2397,12 @@ export function Settings({
         {
           id: 'storage',
           label: 'Storage',
-          cards: ['download-watch', 'runtime-reclaim', 'content-sharing'],
+          cards: ['download-watch', 'runtime-reclaim', 'content-sharing', 'recently-deleted'],
           content: (
             <>
               {card('download-watch', <DownloadWatchSettings />)}
               {card('content-sharing', <ContentSharingSettings />)}
+              {card('recently-deleted', <RecentlyDeletedSettings />)}
               {card('runtime-reclaim', <RuntimeReclaim />)}
             </>
           ),
@@ -2480,15 +2481,10 @@ export function Settings({
         {
           id: 'new-instances',
           label: 'Instances',
-          cards: ['game-new-instances', 'game-recently-deleted'],
-          content: (
-            <>
-              {card('game-new-instances', (
-                <NewInstancesSettings gameId={selectedGameId} gameName={selectedGameShortName} />
-              ))}
-              {card('game-recently-deleted', <RecentlyDeletedSettings gameName={selectedGameShortName} />)}
-            </>
-          ),
+          cards: ['game-new-instances'],
+          content: card('game-new-instances', (
+            <NewInstancesSettings gameId={selectedGameId} gameName={selectedGameShortName} />
+          )),
         },
         {
           id: 'installs',

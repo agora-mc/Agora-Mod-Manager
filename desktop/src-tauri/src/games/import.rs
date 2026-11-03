@@ -441,15 +441,16 @@ impl From<&Mo2RunReport> for RunDto {
     }
 }
 
-/// A provenance claim as a person reads it. Claims are shown as claims, never as verified.
+/// A provenance claim as a player reads it, a quiet note under the mod's name. Claims are shown
+/// as claims, never as verified: "(not checked)" says Agora has not confirmed it.
 fn provenance_text(provenance: &Mo2Provenance) -> String {
     match provenance {
         Mo2Provenance::Claimed {
             modid: Some(id), ..
-        } => format!("claims Nexus mod {id}, not verified"),
-        Mo2Provenance::Claimed { modid: None, .. } => "meta.ini has no mod id".to_string(),
-        Mo2Provenance::Absent => "no meta.ini".to_string(),
-        Mo2Provenance::Unreadable { reason } => format!("meta.ini unreadable: {reason}"),
+        } => format!("Nexus mod {id} (not checked)"),
+        Mo2Provenance::Claimed { modid: None, .. } => "No Nexus mod ID in meta.ini".to_string(),
+        Mo2Provenance::Absent => "No meta.ini".to_string(),
+        Mo2Provenance::Unreadable { reason } => format!("meta.ini could not be read: {reason}"),
     }
 }
 
@@ -539,10 +540,7 @@ mod tests {
             game_name: None,
             note: String::new(),
         };
-        assert_eq!(
-            provenance_text(&claimed),
-            "claims Nexus mod 42, not verified"
-        );
-        assert_eq!(provenance_text(&Mo2Provenance::Absent), "no meta.ini");
+        assert_eq!(provenance_text(&claimed), "Nexus mod 42 (not checked)");
+        assert_eq!(provenance_text(&Mo2Provenance::Absent), "No meta.ini");
     }
 }

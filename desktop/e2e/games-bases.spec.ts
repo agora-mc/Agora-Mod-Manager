@@ -149,6 +149,16 @@ test('the bases are listed with their mode, disk use and users, and a base in us
   await expect(spare.getByRole('button', { name: 'Remove base' })).toBeEnabled();
 });
 
+test("the command palette opens the selected game's Bases settings page", async ({ page }) => {
+  await boot(page, { games_base_list: { bases: [usedBase, spareBase], damaged: [] } });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Open command palette' }).click();
+  await page.getByPlaceholder('Type a command or search…').fill('bases');
+  await page.getByRole('option', { name: /Skyrim SE settings: Bases/ }).click();
+  await expect(page.getByTestId('bases-section')).toBeVisible();
+  await expect(page.getByRole('tab', { name: 'Bases', exact: true })).toHaveAttribute('aria-selected', 'true');
+});
+
 test('a quick check reports a clean base, and a full check runs on request', async ({ page }) => {
   await boot(page, {
     games_base_list: { bases: [usedBase], damaged: [] },

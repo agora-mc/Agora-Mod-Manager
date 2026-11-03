@@ -5,7 +5,7 @@ import { test, expect, type Page } from '@playwright/test';
  * deleted instance shows up under "Recently deleted", and Restore brings it
  * back (saying so when the id had been taken).
  */
-async function installMock(page: Page, opts: { restoreRenamed: boolean }) {
+async function installMock(page: Page, opts: { restoreRenamed: boolean; days?: number }) {
   await page.addInitScript(({ opts }) => {
     const callbacks = new Map<number, (...args: unknown[]) => void>();
     let callbackId = 0;
@@ -49,6 +49,7 @@ async function installMock(page: Page, opts: { restoreRenamed: boolean }) {
           const key = args.key as string;
           if (key === 'onboarding_complete') return Promise.resolve(true);
           if (key === 'launch_mode') return Promise.resolve('direct');
+          if (key === 'games_recently_deleted_days' && opts.days !== undefined) return Promise.resolve(opts.days);
           return Promise.resolve(false);
         }
         if (command === 'get_registry_status') {
@@ -123,6 +124,18 @@ test.describe('Recently deleted', () => {
     expect(await calls(page, 'restore_deleted_instance')).toBe(1);
     const args = await page.evaluate(() => (window as any).__lastCommandArgs['restore_deleted_instance']);
     expect(args.entryId).toBe('20260101T000000Z-abc');
+  });
+
+  test('the shared Recently deleted setting decides how long, in the dialog and the list', async ({ page }) => {
+    await installMock(page, { restoreRenamed: false, days: 14 });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'My Instances' }).click();
+    await page.getByRole('button', { name: 'Delete', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('You can restore it from Recently deleted for 14 days.');
+    await dialog.getByRole('button', { name: 'Delete' }).click();
+    const section = page.getByRole('region', { name: 'Recently deleted' });
+    await expect(section).toContainText('Deleted instances stay here for 14 days, then move to your Recycle Bin.');
   });
 
   test('restore says so when the original name was taken', async ({ page }) => {

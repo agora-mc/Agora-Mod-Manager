@@ -672,13 +672,16 @@ pub fn run() {
                             }
                         }
                     });
-                    // Recently deleted: entries past 30 days (or over the size
-                    // budget) go to the OS trash; failures leave them in place.
+                    // Recently deleted: entries past the player's window (the
+                    // setting every game shares) or over the size budget go to
+                    // the OS trash; failures leave them in place.
                     let cleanup_ctx = ctx.clone();
                     tauri::async_runtime::spawn(async move {
+                        let days = agora_core::game_instance::trash::retention_days(&cleanup_ctx);
                         match agora_game_minecraft::maintenance::cleanup_recently_deleted(
                             cleanup_ctx,
                             crate::instances::trash_adapter(),
+                            days,
                         )
                         .await
                         {

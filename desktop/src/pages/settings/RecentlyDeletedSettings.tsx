@@ -1,25 +1,15 @@
 import { useEffect, useState } from 'react';
 import { ArchiveRestore } from 'lucide-react';
-import { formatError, getSetting, setSetting } from '../../../lib/tauri';
-import { SettingsSection } from '../SettingsSection';
-import { GameSettingRow, type Choice } from './NewInstancesSettings';
-
-/** The setting core reads for the window (`game_instance::trash::RETENTION_SETTING`). */
-export const RECENTLY_DELETED_DAYS_KEY = 'games_recently_deleted_days';
-/** Core's default and its upper bound (`DEFAULT_RETENTION_DAYS`, `MAX_RETENTION_DAYS`). */
-export const RECOMMENDED_DAYS = 30;
-const MAX_DAYS = 366;
+import { formatError, getSetting, setSetting } from '../../lib/tauri';
+import {
+  RECENTLY_DELETED_DAYS_KEY,
+  RECOMMENDED_RETENTION_DAYS,
+  parseRetentionDays,
+} from '../../lib/recentlyDeletedDays';
+import { SettingsSection } from './SettingsSection';
+import { GameSettingRow, type Choice } from './game/NewInstancesSettings';
 
 const PRESETS = [7, 14, 30, 60, 90];
-
-/** Read the stored window the way core does: a number or a numeric string, clamped; else 30. */
-export function parseRetentionDays(value: unknown): number {
-  const number = typeof value === 'number'
-    ? value
-    : typeof value === 'string' && value.trim() !== '' ? Number(value.trim()) : Number.NaN;
-  if (!Number.isFinite(number)) return RECOMMENDED_DAYS;
-  return Math.min(MAX_DAYS, Math.max(1, Math.trunc(number)));
-}
 
 function dayChoices(current: number): Choice<string>[] {
   const days = PRESETS.includes(current) ? PRESETS : [...PRESETS, current].sort((a, b) => a - b);
@@ -27,11 +17,11 @@ function dayChoices(current: number): Choice<string>[] {
 }
 
 /**
- * How long a deleted instance stays in Recently deleted before it moves to the Recycle Bin. Core
- * keeps one window for every game it manages (Minecraft's own list keeps 30 days), so the card
- * says so instead of pretending the choice is this game's alone.
+ * How long a deleted instance stays in Recently deleted before it moves to the Recycle Bin. One
+ * window for every game (Minecraft included), so it lives in General > Storage rather than on a
+ * game's own page.
  */
-export function RecentlyDeletedSettings({ gameName }: { gameName: string }) {
+export function RecentlyDeletedSettings() {
   const [days, setDays] = useState<number | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -70,10 +60,11 @@ export function RecentlyDeletedSettings({ gameName }: { gameName: string }) {
 
   return (
     <SettingsSection
-      card="game-recently-deleted"
+      card="recently-deleted"
+      id="settings-recently-deleted"
       icon={ArchiveRestore}
       title="Recently deleted"
-      description={`A deleted ${gameName} instance waits in Recently deleted, under the instance cards, where you can restore it.`}
+      description="When you delete an instance of any game, Agora keeps it in Recently deleted, below your instances, so you can restore it."
     >
       {days === null && loadError === null && <p className="text-xs text-muted-foreground">Reading this setting…</p>}
       {loadError !== null && (
@@ -83,9 +74,9 @@ export function RecentlyDeletedSettings({ gameName }: { gameName: string }) {
         <ul className="divide-y divide-border rounded-lg border border-border">
           <GameSettingRow
             label="Keep deleted instances for"
-            description="After this, Agora moves them to your Recycle Bin. The same time applies to every game except Minecraft."
+            description="After this, Agora moves them to your Recycle Bin. The same time applies to every game, and to instances already there."
             value={String(days)}
-            recommended={String(RECOMMENDED_DAYS)}
+            recommended={String(RECOMMENDED_RETENTION_DAYS)}
             choices={dayChoices(days)}
             disabled={saving}
             onChange={(value) => void change(value)}

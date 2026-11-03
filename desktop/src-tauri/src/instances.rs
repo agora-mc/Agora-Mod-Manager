@@ -156,7 +156,9 @@ pub fn list_recently_deleted<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> LauncherResult<Vec<agora_game_minecraft::recently_deleted::RecentlyDeletedEntry>> {
     let ctx = crate::core_context(app)?;
-    agora_game_minecraft::instance_service::InstanceService::new(ctx).list_recently_deleted()
+    // One window for every game: the setting the games' own Recently deleted reads.
+    let days = agora_core::game_instance::trash::retention_days(&ctx);
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).list_recently_deleted(days)
 }
 
 pub fn restore_deleted_instance<R: tauri::Runtime>(
