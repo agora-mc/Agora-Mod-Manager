@@ -283,6 +283,20 @@ mod tests {
             .is_none());
     }
 
+    // proves bug: any path component named `shaders` makes a zip a "shader pack", so a game
+    // project or a mod's source zip with `src/shaders/*.glsl` is offered for the shaderpacks folder.
+    #[test]
+    #[ignore = "proves bug"]
+    fn a_zip_with_a_deep_shaders_folder_is_not_a_shader_pack() {
+        let package = game_package();
+        let found = package.recognize_download(
+            &GameId::minecraft(),
+            "my-game-project.zip",
+            &entries(&["proj/src/shaders/a.glsl", "proj/src/main.c", "proj/README.md"]),
+        );
+        assert!(found.is_none(), "recognised as {:?}", found.map(|f| f.kind));
+    }
+
     #[test]
     fn a_different_game_is_not_minecraft_content() {
         let package = game_package();

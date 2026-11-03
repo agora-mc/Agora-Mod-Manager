@@ -406,3 +406,41 @@ fn the_nexus_label_is_only_a_label() {
         .unwrap();
     assert_eq!(plain.nexus_mod_id, None);
 }
+
+// proves bug: a re-download under the same name adds a second notice and never replaces the first,
+// so the Library lists two rows for one path; the old row's Add fails with "has changed".
+#[test]
+#[ignore = "proves bug"]
+fn a_changed_file_replaces_its_old_notice() {
+    let (_tmp, ctx) = test_ctx();
+    let downloads = tempfile::tempdir().unwrap();
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+    let path = downloads.path().join("Cool.zip");
+    create_zip(&path, &[("Cool.esp", b"esp")]);
+    assert_eq!(scan_until_stable(&mut state, &ctx).len(), 1);
+    create_zip(&path, &[("Cool.esp", b"a different, longer payload")]);
+    state.scan(&ctx).unwrap();
+    assert_eq!(state.scan(&ctx).unwrap().len(), 1);
+
+    let rows = download_watch::list(&ctx).unwrap();
+    assert_eq!(rows.len(), 1, "one file, one row; got {} rows", rows.len());
+}
+
+// proves bug: the baseline is by name only, so a file that was in the folder at start and is later
+// replaced with different recognised content is never offered.
+#[test]
+#[ignore = "proves bug"]
+fn a_baseline_file_replaced_with_new_content_is_offered() {
+    let (_tmp, ctx) = test_ctx();
+    let downloads = tempfile::tempdir().unwrap();
+    let path = downloads.path().join("Cool.zip");
+    create_zip(&path, &[("Cool.esp", b"esp")]);
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+    create_zip(&path, &[("Other.esp", b"a different, longer payload")]);
+    let found = scan_until_stable(&mut state, &ctx);
+    assert_eq!(found.len(), 1, "the replaced file is new content");
+}
