@@ -171,7 +171,9 @@ pub fn default_folder() -> Option<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct WatchState {
     folder: PathBuf,
-    baseline: HashSet<String>,
+    /// Each file present when the watch started, with the content marker it had then. A file whose
+    /// marker changes is new content, not part of the baseline.
+    baseline: HashMap<String, (u64, u128)>,
     previous: HashMap<String, (u64, u128)>,
     published: HashSet<String>,
 }
@@ -182,7 +184,7 @@ impl WatchState {
         let folder = folder(ctx)?;
         let baseline = read_folder(&folder)?
             .into_iter()
-            .map(|entry| entry.name)
+            .filter_map(|entry| entry.marker.map(|marker| (entry.name, marker)))
             .collect();
         Ok(Self {
             folder,
@@ -207,24 +209,29 @@ impl WatchState {
         let ignored = stored_ignored(ctx)?;
         let mut notices = stored_notices(ctx)?;
         let mut added = Vec::new();
+        let mut notices_changed = false;
 
         for entry in read_folder(&self.folder)? {
             if !looks_like_archive(&entry.name) || is_partial(&entry.name) {
                 continue;
             }
-            if self.baseline.contains(&entry.name) {
-                continue;
-            }
             let Some(marker) = entry.marker else {
                 continue;
             };
+            if self.baseline.get(&entry.name).copied() == Some(marker) {
+                continue;
+            }
+            self.baseline.remove(&entry.name);
             if self.published.contains(&entry.name) {
                 if self.previous.get(&entry.name) == Some(&marker) {
                     continue;
                 }
                 // The file changed after it was offered (a fresh download under the same name):
-                // it is new content again, not the file already seen.
+                // it is new content again, and its old notice is stale.
                 self.published.remove(&entry.name);
+                let before = notices.len();
+                notices.retain(|notice| notice.path != entry.path);
+                notices_changed |= notices.len() != before;
             }
             if self.previous.get(&entry.name) != Some(&marker) {
                 self.previous.insert(entry.name.clone(), marker);
@@ -256,11 +263,16 @@ impl WatchState {
                 nexus_mod_id,
                 found_at_unix_ms: content_store::now_unix_ms(),
             };
+            // One file has one notice: replace any older row for the same path (including
+            // duplicates left by a previous version).
+            let before = notices.len();
+            notices.retain(|stored| stored.path != notice.path);
+            notices_changed |= notices.len() != before;
             notices.push(notice.clone());
             added.push(notice);
         }
 
-        if !added.is_empty() {
+        if !added.is_empty() || notices_changed {
             save_notices(ctx, &notices)?;
         }
         Ok(added)

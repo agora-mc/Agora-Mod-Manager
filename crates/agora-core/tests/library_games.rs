@@ -306,10 +306,8 @@ fn recording_a_game_never_replaces_one_already_recorded() {
     );
 }
 
-// proves bug: an instance in Recently deleted is outside `instances_root`, so it ties nothing and
-// uses nothing: its items are offered as "unused", and removing them breaks Restore.
+// A restorable deleted instance still needs its items, so "Unused items" must not offer them.
 #[test]
-#[ignore = "proves bug"]
 fn an_item_a_restorable_deleted_instance_needs_is_not_unused() {
     let (_tmp, ctx) = test_ctx();
     let work = tempfile::tempdir().unwrap();
@@ -324,5 +322,32 @@ fn an_item_a_restorable_deleted_instance_needs_is_not_unused() {
     assert!(
         !unused.items.iter().any(|row| row.item_id == item),
         "the deleted-but-restorable instance still needs the item"
+    );
+
+    // A purged entry's folder is gone, so it no longer uses anything.
+    std::fs::remove_dir_all(&entry).unwrap();
+    let unused = library::list_unused(&ctx).unwrap();
+    assert!(
+        unused.items.iter().any(|row| row.item_id == item),
+        "a purged entry stops counting"
+    );
+}
+
+// Minecraft's own Recently deleted area is scanned the same way.
+#[test]
+fn an_item_a_restorable_minecraft_deleted_instance_needs_is_not_unused() {
+    let (_tmp, ctx) = test_ctx();
+    let work = tempfile::tempdir().unwrap();
+    let item = add_zip(&ctx, &work, "NeededMc", &[("Needed.esp", b"esp")]);
+    write_generic_instance(&ctx, "mc", "minecraft", std::slice::from_ref(&item));
+    let live = ctx.paths.instance_dir("mc").unwrap();
+    let entry = ctx.paths.recently_deleted_root().join("entry1");
+    std::fs::create_dir_all(&entry).unwrap();
+    std::fs::rename(&live, entry.join("instance")).unwrap();
+
+    let unused = library::list_unused(&ctx).unwrap();
+    assert!(
+        !unused.items.iter().any(|row| row.item_id == item),
+        "Minecraft's deleted-but-restorable instance still needs the item"
     );
 }

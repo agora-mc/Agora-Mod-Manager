@@ -103,11 +103,72 @@ fn copy_icon(
 ) -> LauncherResult<String> {
     let (bytes, extension, _) = read_icon_source(source_path)?;
     let destination = destination.with_extension(extension);
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| icon_error(error.to_string()))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| icon_error("The icon has no folder to be kept in."))?;
+    refuse_link_chain(instance_dir, parent)?;
+    if is_link_or_reparse(&destination) {
+        return Err(icon_error(
+            "An existing icon in this instance is a link; Agora will not write through it.",
+        ));
     }
+    // An icon of another type left in place would still be a way to write outside the instance.
+    if destination.file_stem().and_then(|stem| stem.to_str()) == Some("instance-icon") {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("instance-icon.")
+                    && is_link_or_reparse(&entry.path())
+                {
+                    return Err(icon_error(
+                        "An existing icon in this instance is a link; Agora will not write next to it.",
+                    ));
+                }
+            }
+        }
+    }
+    std::fs::create_dir_all(parent).map_err(|error| icon_error(error.to_string()))?;
     std::fs::write(&destination, bytes).map_err(|error| icon_error(error.to_string()))?;
     relative_icon_path(&destination, instance_dir)
+}
+
+/// Whether `path` is a symlink, junction, or any other Windows reparse point. Checked with
+/// `symlink_metadata`, so a link is seen as itself rather than followed.
+fn is_link_or_reparse(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT covers junctions and mount points too.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refuse when any folder between `instance_dir` and `parent` is a link, since creating or writing
+/// in it would put the file outside the instance.
+fn refuse_link_chain(instance_dir: &Path, parent: &Path) -> LauncherResult<()> {
+    let mut current = parent;
+    while current != instance_dir && current.starts_with(instance_dir) {
+        if is_link_or_reparse(current) {
+            return Err(icon_error(
+                "This instance's icon folder is a link; Agora will not write through it.",
+            ));
+        }
+        match current.parent() {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    Ok(())
 }
 
 fn remove_stored_icon(instance_dir: &Path, relative: Option<&str>) {
@@ -401,5 +462,49 @@ mod game_instance_icon_tests {
         assert!(get_game_instance_icon(&ctx, "missing").is_err());
         assert!(get_game_instance_icon(&ctx, "../escape").is_err());
         assert!(set_game_instance_icon(&ctx, "missing", &source(&tmp, "a.png", PNG)).is_err());
+    }
+
+    // A junction needs no administrator rights on Windows, so it is the realistic way the icon
+    // folder can already be a link.
+    #[cfg(windows)]
+    #[test]
+    fn an_icon_folder_that_is_a_junction_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        let dir = ctx.paths.instance_dir("grounded").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        junction::create(&outside, dir.join(".agora")).unwrap();
+
+        let error =
+            set_game_instance_icon(&ctx, "grounded", &source(&tmp, "a.png", PNG)).unwrap_err();
+        assert!(error.to_string().contains("link"), "{error}");
+        assert!(
+            !outside.join("instance-icon.png").exists(),
+            "nothing is written outside the instance"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_existing_icon_that_is_a_junction_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(&tmp);
+        make_instance(&ctx, "grounded");
+        let dir = ctx.paths.instance_dir("grounded").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(dir.join(".agora")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // An icon of another type, so the new PNG's own path is not the link.
+        junction::create(&outside, dir.join(".agora/instance-icon.jpg")).unwrap();
+
+        let error =
+            set_game_instance_icon(&ctx, "grounded", &source(&tmp, "a.png", PNG)).unwrap_err();
+        assert!(error.to_string().contains("link"), "{error}");
+        assert!(
+            !dir.join(".agora/instance-icon.png").exists(),
+            "nothing is written beside the link"
+        );
     }
 }

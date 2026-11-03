@@ -80,11 +80,11 @@ fn recognize_minecraft_download(
         }
         if entries
             .iter()
-            .any(|entry| entry.split('/').any(|part| part == "shaders"))
+            .any(|entry| entry == "shaders" || entry.starts_with("shaders/"))
         {
             return Some(recognition(
                 "shader pack",
-                "has a shaders/ folder",
+                "has a shaders/ folder at its root",
                 "shaderpacks",
             ));
         }
@@ -283,16 +283,19 @@ mod tests {
             .is_none());
     }
 
-    // proves bug: any path component named `shaders` makes a zip a "shader pack", so a game
-    // project or a mod's source zip with `src/shaders/*.glsl` is offered for the shaderpacks folder.
+    // Only a `shaders/` folder at the archive root is a shader pack; a game project's
+    // `src/shaders/` is not.
     #[test]
-    #[ignore = "proves bug"]
     fn a_zip_with_a_deep_shaders_folder_is_not_a_shader_pack() {
         let package = game_package();
         let found = package.recognize_download(
             &GameId::minecraft(),
             "my-game-project.zip",
-            &entries(&["proj/src/shaders/a.glsl", "proj/src/main.c", "proj/README.md"]),
+            &entries(&[
+                "proj/src/shaders/a.glsl",
+                "proj/src/main.c",
+                "proj/README.md",
+            ]),
         );
         assert!(found.is_none(), "recognised as {:?}", found.map(|f| f.kind));
     }

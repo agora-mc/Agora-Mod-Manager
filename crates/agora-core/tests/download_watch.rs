@@ -407,10 +407,8 @@ fn the_nexus_label_is_only_a_label() {
     assert_eq!(plain.nexus_mod_id, None);
 }
 
-// proves bug: a re-download under the same name adds a second notice and never replaces the first,
-// so the Library lists two rows for one path; the old row's Add fails with "has changed".
+// A re-download under the same name replaces its old notice: one file, one row.
 #[test]
-#[ignore = "proves bug"]
 fn a_changed_file_replaces_its_old_notice() {
     let (_tmp, ctx) = test_ctx();
     let downloads = tempfile::tempdir().unwrap();
@@ -428,10 +426,8 @@ fn a_changed_file_replaces_its_old_notice() {
     assert_eq!(rows.len(), 1, "one file, one row; got {} rows", rows.len());
 }
 
-// proves bug: the baseline is by name only, so a file that was in the folder at start and is later
-// replaced with different recognised content is never offered.
+// A baseline file replaced with different content is offered: the baseline remembers the content.
 #[test]
-#[ignore = "proves bug"]
 fn a_baseline_file_replaced_with_new_content_is_offered() {
     let (_tmp, ctx) = test_ctx();
     let downloads = tempfile::tempdir().unwrap();
