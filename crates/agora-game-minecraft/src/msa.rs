@@ -101,7 +101,7 @@ const MC_LOGIN_URL: &str = "https://api.minecraftservices.com/authentication/log
 const MC_ENTITLEMENTS_URL: &str = "https://api.minecraftservices.com/entitlements/mcstore";
 const MC_PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
 
-const USER_AGENT: &str = "Agora Launcher";
+const USER_AGENT: &str = "Agora Mod Manager";
 
 /// RFC 8628 default when the server omits `interval`.
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 5;

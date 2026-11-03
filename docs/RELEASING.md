@@ -45,7 +45,7 @@ The Windows desktop job also publishes
 `agora-desktop-vX.Y.Z-windows-x64-portable.zip` and its `.zip.sha256` checksum.
 This is distinct from the standalone CLI ZIP. The archive contains the signed desktop
 executable, `portable.txt`, and instructions; extract it into a writable folder and run
-`Agora Launcher.exe`. WebView2 Runtime must already be installed. The normal MSI/NSIS
+`Agora Mod Manager.exe`. WebView2 Runtime must already be installed. The normal MSI/NSIS
 installers remain installed applications; portable mode is distributed separately.
 
 Data and WebView preferences live in the adjacent `data` folder unless `AGORA_DATA_DIR`
@@ -222,12 +222,14 @@ Every release publishes the same asset scheme:
 | `desktop` | `windows-x64-setup.exe` (NSIS), `windows-x64.msi`, `windows-x64-portable.zip` (+ `.sha256`), `macos-arm64.dmg`, `macos-x64.dmg`, `macos-arm64.app.tar.gz` and `macos-x64.app.tar.gz` (updater archives), `linux-x64.AppImage`, `linux-x64.deb`, `linux-x64.rpm` |
 | `cli` | `windows-x64.zip`, `linux-x64.tar.gz`, `macos-arm64.tar.gz`, `macos-x64.tar.gz` |
 
-Tauri names its bundles `Agora.Launcher_<version>_<arch>.<ext>`, which says nothing
-about desktop vs CLI and mixes `x64`, `x86_64`, and `amd64`. The
-`assemble-release` job post-processes the draft with
+Tauri names its bundles `Agora Mod Manager_<version>_<arch>.<ext>` after the product
+name, and GitHub stores the spaces as dots, so the uploaded names start
+`Agora.Mod.Manager`. (Drafts published before the rename start `Agora.Launcher`, and
+the script still accepts them.) The names say nothing about desktop vs CLI and mix
+`x64`, `x86_64`, and `amd64`. The `assemble-release` job post-processes the draft with
 `scripts/finalize_release_assets.py` before verification:
 
-- it renames each `Agora.Launcher*` bundle in place and fails on a name or an
+- it renames each `Agora.Mod.Manager*` bundle in place and fails on a name or an
   embedded version it does not recognize;
 - it deletes the updater `*.sig` sidecar assets — the signatures also live
   inline in `latest.json`, which is what the updater consumes;

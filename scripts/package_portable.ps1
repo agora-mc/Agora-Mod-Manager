@@ -35,7 +35,7 @@ $name = "agora-desktop-$tag-windows-x64-portable"
 $output = New-Item -ItemType Directory -Force -Path $OutputDirectory
 $stage = Join-Path $output.FullName ($name + '-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $stage | Out-Null
-Copy-Item -LiteralPath $binary.FullName -Destination (Join-Path $stage 'Agora Launcher.exe')
+Copy-Item -LiteralPath $binary.FullName -Destination (Join-Path $stage 'Agora Mod Manager.exe')
 # Beside portable.txt, so the CLI resolves the same data folder as the app.
 Copy-Item -LiteralPath $cliBinary.FullName -Destination (Join-Path $stage 'agora.exe')
 # Where Agora looks for them: beside the executable, and the 32-bit pair in x86\.
@@ -47,9 +47,9 @@ foreach ($relative in $vfsRelative) {
 # ASCII avoids a BOM being interpreted as part of the portable data path.
 Set-Content -LiteralPath (Join-Path $stage 'portable.txt') -Value 'data' -Encoding ascii
 @'
-Agora Launcher - Windows portable
+Agora Mod Manager - Windows portable
 
-Extract the entire ZIP to a writable folder, then run Agora Launcher.exe.
+Extract the entire ZIP to a writable folder, then run Agora Mod Manager.exe.
 No installer is needed. Microsoft Edge WebView2 Runtime must be installed.
 Agora keeps application data and browser preferences in the adjacent data folder.
 AGORA_DATA_DIR overrides this location if you have set that environment variable.
@@ -60,7 +60,7 @@ Anyone who can read the data folder can read them; keep the drive safe.
 agora.exe is Agora's command-line tool, for scripts and AI assistant apps. It uses
 the same data folder. Settings > Services > AI assistant has a message to copy.
 
-To update, close Agora and replace Agora Launcher.exe, agora.exe, agora_vfs.dll,
+To update, close Agora and replace Agora Mod Manager.exe, agora.exe, agora_vfs.dll,
 agora-vfs-helper.exe and the x86 folder from the new portable ZIP.
 Keep portable.txt and your data folder. Do not run the MSI/EXE installer to update
 this portable copy. Back up your data before moving or updating the folder.

@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.9.5"
 edition = "2021"
 authors = ["Agora Contributors"]
 license = "GPL-3.0-only"

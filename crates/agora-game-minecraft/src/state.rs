@@ -96,7 +96,7 @@ impl AppState {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("AgoraLauncher/1.0")
+            .user_agent("AgoraModManager/1.0")
             .build()
             .unwrap_or_else(|_| {
                 reqwest::Client::builder()

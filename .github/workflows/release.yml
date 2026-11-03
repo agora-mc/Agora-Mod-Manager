@@ -536,7 +536,7 @@ jobs:
             gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber
           done
 
-      # Renames Tauri's Agora.Launcher_* bundles into the shared
+      # Renames Tauri's Agora.Mod.Manager_* bundles (and pre-rename Agora.Launcher_*) into the shared
       # agora-<kind>-<tag>-<platform>-<arch> scheme, deletes the *.sig sidecars,
       # rewrites latest.json to the new names, and writes a SHA256SUMS that
       # covers every downloadable artifact. Idempotent, so a re-run is safe.

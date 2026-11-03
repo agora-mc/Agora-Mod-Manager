@@ -2251,25 +2251,75 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
             with self.subTest(old_name=old_name):
                 self.assertEqual(fra.desktop_asset_rename(old_name, "0.9.3"), new_name)
 
+    def test_desktop_asset_rename_covers_the_product_stem_names(self):
+        # GitHub turns the spaces in "Agora Mod Manager" into dots on upload.
+        cases = {
+            "Agora.Mod.Manager_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+            "Agora.Mod.Manager_0.9.3_x64_en-US.msi": "agora-desktop-v0.9.3-windows-x64.msi",
+            "Agora.Mod.Manager_0.9.3_aarch64.dmg": "agora-desktop-v0.9.3-macos-arm64.dmg",
+            "Agora.Mod.Manager_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg",
+            "Agora.Mod.Manager_0.9.3_amd64.AppImage": "agora-desktop-v0.9.3-linux-x64.AppImage",
+            "Agora.Mod.Manager_0.9.3_amd64.deb": "agora-desktop-v0.9.3-linux-x64.deb",
+            "Agora.Mod.Manager-0.9.3-1.x86_64.rpm": "agora-desktop-v0.9.3-linux-x64.rpm",
+            "Agora.Mod.Manager_aarch64.app.tar.gz": "agora-desktop-v0.9.3-macos-arm64.app.tar.gz",
+            "Agora.Mod.Manager_x64.app.tar.gz": "agora-desktop-v0.9.3-macos-x64.app.tar.gz",
+        }
+        for old_name, new_name in cases.items():
+            with self.subTest(old_name=old_name):
+                self.assertEqual(fra.desktop_asset_rename(old_name, "0.9.3"), new_name)
+
     def test_desktop_asset_rename_accepts_any_msi_locale(self):
         self.assertEqual(
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64_pt-BR.msi", "0.9.3"),
+            "agora-desktop-v0.9.3-windows-x64.msi",
+        )
+        self.assertEqual(
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.9.3_x64_pt-BR.msi", "0.9.3"),
             "agora-desktop-v0.9.3-windows-x64.msi",
         )
 
     def test_desktop_asset_rename_rejects_mismatched_version(self):
         with self.assertRaisesRegex(fra.ReleaseAssetError, "0.1.0"):
             fra.desktop_asset_rename("Agora.Launcher_0.1.0_x64-setup.exe", "0.9.3")
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "0.1.0"):
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.1.0_x64-setup.exe", "0.9.3")
 
     def test_desktop_asset_rename_rejects_unknown_bundle(self):
         with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64.snap", "0.9.3")
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.9.3_x64.snap", "0.9.3")
+
+    def test_desktop_asset_rename_rejects_unknown_product_stems(self):
+        # Hostile near-misses: a mixed stem, a wrong case, a raw spaced name
+        # (GitHub never stores one), and an empty product before the version.
+        for name in (
+            "Agora.Mod.Launcher_0.9.3_x64-setup.exe",
+            "Agora.Modmanager_0.9.3_x64-setup.exe",
+            "agora.mod.manager_0.9.3_x64-setup.exe",
+            "Agora Mod Manager_0.9.3_x64-setup.exe",
+            "_0.9.3_x64-setup.exe",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+                    fra.desktop_asset_rename(name, "0.9.3")
 
     def test_desktop_asset_rename_rejects_drifted_updater_archive(self):
         # Tauri does not version .app.tar.gz names; if that ever changes, the
         # table must be updated rather than silently mis-renaming the archive.
         with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64.app.tar.gz", "0.9.3")
+        # No arch suffix: which macOS build it belongs to cannot be told, so it is refused.
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+            fra.desktop_asset_rename("Agora.Mod.Manager.app.tar.gz", "0.9.3")
+
+    def test_is_tauri_bundle_name_matches_both_product_stems_only(self):
+        for name in ("Agora.Launcher_0.9.3_x64.dmg", "Agora.Mod.Manager_0.9.3_x64.dmg"):
+            with self.subTest(name=name):
+                self.assertTrue(fra.is_tauri_bundle_name(name))
+        for name in ("", "agora-desktop-v0.9.3-windows-x64.msi", "Agora Mod Manager_0.9.3.msi", "Agora.Modmanager_0.9.3.msi", "agora.mod.manager_0.9.3.msi"):
+            with self.subTest(name=name):
+                self.assertFalse(fra.is_tauri_bundle_name(name))
 
     def test_plan_desktop_renames_skips_signature_sidecars(self):
         names = [
@@ -2282,6 +2332,20 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
             {"Agora.Launcher_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg"},
         )
 
+    def test_plan_desktop_renames_skips_signature_sidecars_of_product_stem_names(self):
+        names = [
+            "Agora.Mod.Manager_0.9.3_x64.dmg",
+            "Agora.Mod.Manager_0.9.3_x64.dmg.sig",
+            "Agora.Mod.Manager_x64.app.tar.gz.sig",
+        ]
+        self.assertEqual(
+            fra.plan_desktop_renames(names, "0.9.3"),
+            {"Agora.Mod.Manager_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg"},
+        )
+
+    def test_plan_desktop_renames_handles_an_empty_release(self):
+        self.assertEqual(fra.plan_desktop_renames([], "0.9.3"), {})
+
     def test_plan_desktop_renames_rejects_colliding_targets(self):
         names = [
             "Agora.Launcher_0.9.3_x64_en-US.msi",
@@ -2289,6 +2353,26 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
         ]
         with self.assertRaises(fra.ReleaseAssetError):
             fra.plan_desktop_renames(names, "0.9.3")
+        product_names = [
+            "Agora.Mod.Manager_0.9.3_x64_en-US.msi",
+            "Agora.Mod.Manager_0.9.3_x64_pt-BR.msi",
+        ]
+        with self.assertRaises(fra.ReleaseAssetError):
+            fra.plan_desktop_renames(product_names, "0.9.3")
+
+    def test_plan_desktop_renames_maps_a_mixed_old_and_new_release(self):
+        # A draft published before the rename can hold old names beside new ones.
+        names = [
+            "Agora.Launcher_0.9.3_x64-setup.exe",
+            "Agora.Mod.Manager_0.9.3_aarch64.dmg",
+        ]
+        self.assertEqual(
+            fra.plan_desktop_renames(names, "0.9.3"),
+            {
+                "Agora.Launcher_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+                "Agora.Mod.Manager_0.9.3_aarch64.dmg": "agora-desktop-v0.9.3-macos-arm64.dmg",
+            },
+        )
 
 
 class TestFinalizeReleaseAssetsChecksums(unittest.TestCase):
@@ -2388,6 +2472,32 @@ class TestFinalizeReleaseAssetsLatestJson(unittest.TestCase):
         latest = {
             "platforms": {
                 "windows-x86_64": {"url": "https://example.test/Agora.Launcher_0.9.3_x64.msi"}
+            }
+        }
+        with self.assertRaises(fra.ReleaseAssetError):
+            fra.rewrite_latest_urls(latest, {})
+
+    def test_rewrites_product_stem_urls(self):
+        latest = {
+            "platforms": {
+                "windows-x86_64-nsis": {
+                    "url": "https://github.com/o/r/releases/download/v0.9.3/Agora.Mod.Manager_0.9.3_x64-setup.exe",
+                },
+            }
+        }
+        renames = {
+            "Agora.Mod.Manager_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+        }
+        rewritten = fra.rewrite_latest_urls(latest, renames)
+        self.assertEqual(
+            rewritten["platforms"]["windows-x86_64-nsis"]["url"],
+            "https://github.com/o/r/releases/download/v0.9.3/agora-desktop-v0.9.3-windows-x64-setup.exe",
+        )
+
+    def test_uncovered_product_stem_url_is_an_error(self):
+        latest = {
+            "platforms": {
+                "windows-x86_64": {"url": "https://example.test/Agora.Mod.Manager_0.9.3_x64.msi"}
             }
         }
         with self.assertRaises(fra.ReleaseAssetError):
@@ -2507,6 +2617,63 @@ class TestFinalizeReleaseAssetsApply(unittest.TestCase):
         with mock.patch.object(fra, "plan_and_apply") as plan:
             self.assertEqual(fra.main(["--repo", "o/r", "--tag", self.TAG]), 0)
         plan.assert_called_once_with("o/r", self.TAG, "0.9.3")
+
+    def test_plan_and_apply_renames_product_stem_bundles(self):
+        new_names = tuple(name.replace("Agora.Launcher", "Agora.Mod.Manager") for name in self.OLD_NAMES)
+        expected = fra.expected_asset_names(self.TAG)
+        bundle_targets = {fra.desktop_asset_rename(name, "0.9.3") for name in new_names}
+        # Everything the release must hold that no bundle rename produces (CLI, portable, checksum).
+        non_bundle = [name for name in expected if name not in bundle_targets]
+        before = [
+            *(self._asset(name, index + 1) for index, name in enumerate(new_names)),
+            *(self._asset(name + ".sig", 100 + index) for index, name in enumerate(new_names)),
+            *(self._asset(name, 300 + index) for index, name in enumerate(non_bundle)),
+            self._asset("latest.json", 600),
+        ]
+        after = [self._asset(name, 200 + index) for index, name in enumerate(expected)]
+        after.append(self._asset("latest.json", 600))
+        latest = {
+            "platforms": {
+                "windows-x86_64-nsis": {
+                    "url": f"https://github.com/o/r/releases/download/{self.TAG}/Agora.Mod.Manager_0.9.3_x64-setup.exe",
+                },
+            }
+        }
+        uploads: dict[str, str] = {}
+
+        def fake_download(repo, tag, name, directory):
+            path = Path(directory) / name
+            path.write_text(json.dumps(latest), encoding="utf-8")
+            return path
+
+        def fake_upload(repo, tag, path):
+            uploads[Path(path).name] = Path(path).read_text(encoding="utf-8")
+
+        manager = mock.Mock()
+        with (
+            mock.patch.object(fra, "fetch_assets", side_effect=[before, after]),
+            mock.patch.object(fra, "delete_asset", manager.delete),
+            mock.patch.object(fra, "rename_asset", manager.rename),
+            mock.patch.object(fra, "download_asset", side_effect=fake_download),
+            mock.patch.object(fra, "upload_asset", side_effect=fake_upload),
+            mock.patch.object(fra, "asset_digest", return_value="a" * 64),
+        ):
+            fra.plan_and_apply("o/r", self.TAG, "0.9.3")
+
+        renamed = {call.args[1]["name"]: call.args[2] for call in manager.rename.call_args_list}
+        self.assertEqual(set(renamed), set(new_names))
+        self.assertEqual(
+            renamed["Agora.Mod.Manager_0.9.3_x64-setup.exe"],
+            "agora-desktop-v0.9.3-windows-x64-setup.exe",
+        )
+        deleted = sorted(call.args[1]["name"] for call in manager.delete.call_args_list)
+        self.assertEqual(deleted, sorted(name + ".sig" for name in new_names))
+        rewritten = json.loads(uploads["latest.json"])
+        self.assertTrue(
+            rewritten["platforms"]["windows-x86_64-nsis"]["url"].endswith(
+                "/agora-desktop-v0.9.3-windows-x64-setup.exe"
+            )
+        )
 
 
 class TestStageCliSidecar(unittest.TestCase):

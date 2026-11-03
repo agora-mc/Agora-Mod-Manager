@@ -7712,7 +7712,7 @@ pub struct BundledCli {
 ///
 /// Installers put it beside the desktop executable: `agora.exe` in the install
 /// folder on Windows, `Contents/MacOS/agora` on macOS, `/usr/bin/agora` from a
-/// Linux package, and next to `Agora Launcher.exe` in the portable ZIP.
+/// Linux package, and next to `Agora Mod Manager.exe` in the portable ZIP.
 #[tauri::command]
 pub fn bundled_cli_path() -> Option<BundledCli> {
     let exe = std::env::current_exe().ok()?;
