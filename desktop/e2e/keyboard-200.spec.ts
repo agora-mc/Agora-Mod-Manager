@@ -392,7 +392,7 @@ test('Instance editor: "Skip to mods" jumps past the header and sub-tabs to the 
   await expect(page.getByRole('heading', { name: /Installed Mods/ })).toBeVisible({ timeout: 15_000 });
 
   // The skip link is the first control on the page, ahead of Back.
-  await page.getByRole('button', { name: '← Back' }).focus();
+  await page.getByRole('button', { name: '← Instances' }).focus();
   await page.keyboard.press('Shift+Tab');
   const skip = page.getByRole('button', { name: 'Skip to mods' });
   await expect(skip).toBeFocused();

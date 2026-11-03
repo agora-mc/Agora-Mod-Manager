@@ -1,6 +1,6 @@
 /**
- * The bordered "← Back" button on top of a sub-page. Used by Minecraft's instance page and by
- * every game's instance page, so going back looks the same everywhere.
+ * The bordered "← Back" button on top of a sub-page. Minecraft's instance page and every game's
+ * instance page label it "← Instances", so going back looks and reads the same everywhere.
  */
 
 interface BackButtonProps {

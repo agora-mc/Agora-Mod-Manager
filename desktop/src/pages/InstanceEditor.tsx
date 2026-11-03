@@ -160,7 +160,8 @@ import {
 } from '@/components/ui/dialog';
 import { formatInstalledDate } from '../components/installed-content/contentTableState';
 import { InstanceIcon, LoaderChip, MetaChip } from '../components/InstanceIcon';
-import { ImagePlus, Play } from 'lucide-react';
+import { Play } from 'lucide-react';
+import { InstanceTileButton, SetImageButton } from '@/components/instance-kit';
 import { showToast } from '../components/Toast';
 import { describeExternalChange, useExternalInstanceChanges } from '../lib/externalChanges';
 
@@ -1870,7 +1871,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         <LiveInteractiveHost
           instanceId={instanceId}
           presentation={presentation}
-          leading={<BackButton onBack={onBack} />}
+          leading={<BackButton onBack={onBack} label="Instances" />}
           onUseStandardView={() => setPresentationPref('standard')}
           onNavigateStandard={(destination: StandardDestination) => {
             // Full details are the same Standard ModDetail surface used by
@@ -2000,7 +2001,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   if (loading) {
     return (
       <div className="space-y-6">
-        <BackButton onBack={onBack} />
+        <BackButton onBack={onBack} label="Instances" />
         <div className="rounded-xl border border-dashed border-border bg-card p-6 text-center text-muted-foreground">
           Loading instance…
         </div>
@@ -2011,7 +2012,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   if (error && !row) {
     return (
       <div className="space-y-6">
-        <BackButton onBack={onBack} />
+        <BackButton onBack={onBack} label="Instances" />
         <div className="rounded-lg bg-destructive p-3 text-sm text-destructive-foreground">
           {error}
         </div>
@@ -2050,7 +2051,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         </button>
       )}
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <BackButton onBack={onBack} />
+        <BackButton onBack={onBack} label="Instances" />
         <button
           type="button"
           onClick={() => setPresentationPref('high-interaction')}
@@ -2077,19 +2078,9 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
           <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
             <div className="flex items-start gap-4">
               {row?.is_locked ? headerIcon : (
-                <button
-                  type="button"
-                  onClick={handleSetInstanceIcon}
-                  disabled={recoveryBlocked}
-                  className="instance-icon-button shrink-0"
-                  title={headerIconSrc ? 'Change instance image' : 'Set a custom instance image'}
-                  aria-label={headerIconSrc ? 'Change instance image' : 'Set instance image'}
-                >
+                <InstanceTileButton hasImage={Boolean(headerIconSrc)} onSelect={handleSetInstanceIcon} disabled={recoveryBlocked}>
                   {headerIcon}
-                  <span className="instance-icon-button__overlay">
-                    <ImagePlus className="h-5 w-5" aria-hidden="true" />
-                  </span>
-                </button>
+                </InstanceTileButton>
               )}
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-3">
@@ -2195,18 +2186,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                     · {formatPlayTime(row?.total_play_ms)} played
                   </span>
                 )}
-                {!row?.is_locked && (
-                  <button
-                    type="button"
-                    onClick={handleSetInstanceIcon}
-                    disabled={recoveryBlocked}
-                    className="inline-flex items-center gap-1 rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
-                    title="Set a custom instance image"
-                  >
-                    <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
-                    Set image
-                  </button>
-                )}
+                {!row?.is_locked && <SetImageButton onSelect={handleSetInstanceIcon} disabled={recoveryBlocked} />}
                 </div>
               </div>
             </div>

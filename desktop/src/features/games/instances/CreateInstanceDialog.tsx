@@ -1,13 +1,17 @@
-import { useEffect, useId, useState } from 'react';
-import { Button } from '@/components/ui/button';
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
+import { useEffect, useState } from 'react';
+import {
+  ChoiceCards,
+  CreateInstanceFrame,
+  FORM_CONTROL_CLASS,
+  FormField,
+  recommendedLabel,
+  type ChoiceOption,
+} from '@/components/instance-kit';
 import { listInstalledGames } from '../discovery/api';
 import type { GameListing, InstallSummary } from '../shared/types';
 import { listGameSupport, type GameSupportRow } from '../support/api';
 import { isGameTurnedOff } from '../support/enabled';
-import { loadGameSettingsOrDefaults, type GameSettings } from '../settings/gameSettings';
+import { loadGameSettingsOrDefaults, RECOMMENDED_GAME_SETTINGS, type GameSettings } from '../settings/gameSettings';
 import {
   createGameInstance,
   gamesErrorMessage,
@@ -16,6 +20,7 @@ import {
   type CreateProgress,
 } from './api';
 import { baseModeCopy, DEPLOYMENT_OPTIONS, progressText } from './instanceText';
+import { runtimeText } from './instanceIdentity';
 
 interface CreateInstanceDialogProps {
   open: boolean;
@@ -30,7 +35,13 @@ type InstallsState =
   | { status: 'failed'; message: string }
   | { status: 'loaded'; game: GameListing | null; turnedOff: boolean };
 
-const BASE_MODES: readonly BaseMode[] = ['linked', 'copied'];
+/** The base choices, with the one Agora advises (from the same source as Settings) badged. */
+const BASE_CHOICES: readonly ChoiceOption<BaseMode>[] = (['linked', 'copied'] as const).map((mode) => ({
+  value: mode,
+  label: baseModeCopy(mode).label,
+  description: baseModeCopy(mode).explain,
+  recommended: mode === RECOMMENDED_GAME_SETTINGS.baseType,
+}));
 
 /**
  * Creates an instance from an install of the game. The base is built from the install (or an
@@ -38,9 +49,6 @@ const BASE_MODES: readonly BaseMode[] = ['linked', 'copied'];
  * own page, where it can be changed later.
  */
 export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: CreateInstanceDialogProps) {
-  const nameId = useId();
-  const installId = useId();
-  const deploymentId = useId();
   const [installs, setInstalls] = useState<InstallsState>({ status: 'loading' });
   const [name, setName] = useState('');
   const [chosenInstall, setChosenInstall] = useState('');
@@ -95,144 +103,125 @@ export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: 
     }
   };
 
+  const stateNote = (text: string, tone: 'status' | 'alert') => (
+    <p role={tone} className={tone === 'status' ? 'text-sm text-muted-foreground' : 'rounded-lg border border-border bg-muted/40 p-3 text-sm'}>
+      {text}
+    </p>
+  );
+  const ready = installs.status === 'loaded' && !installs.turnedOff && available.length > 0;
+  const deploymentOption = DEPLOYMENT_OPTIONS.find((option) => option.id === deployment);
+
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (!creating) onOpenChange(next); }}>
-      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>New instance of {gameName}</DialogTitle>
-          <DialogDescription>
-            An instance is a separate setup of the game. Its mods and saves stay with it, and the game install is shared.
-          </DialogDescription>
-        </DialogHeader>
-
-        {installs.status === 'loading' && <p role="status" className="text-sm text-muted-foreground">Looking for installs…</p>}
-
-        {installs.status === 'failed' && (
-          <p role="alert" className="text-sm text-destructive">
-            Agora could not look for installs. {installs.message}
-          </p>
-        )}
-
-        {installs.status === 'loaded' && installs.turnedOff && (
-          <p role="alert" className="rounded-lg border border-border p-3 text-sm">
-            This game is turned off, so it is not offered here. Turn it on in Settings, Game support, to create an instance.
-          </p>
-        )}
-
-        {installs.status === 'loaded' && !installs.turnedOff && available.length === 0 && (
-          <p role="alert" className="rounded-lg border border-border p-3 text-sm">
-            Agora has not found an install of {gameName} on this machine. Rescan the installs in Setup, then try again.
-          </p>
-        )}
-
-        {installs.status === 'loaded' && !installs.turnedOff && available.length > 0 && (
-          <form
-            className="space-y-5"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void submit();
-            }}
+    <CreateInstanceFrame
+      open={open}
+      onOpenChange={onOpenChange}
+      testId="create-game-instance-dialog"
+      title={`New instance of ${gameName}`}
+      description="An instance is a separate setup of the game. Its mods and saves stay with it, and the game install is shared."
+      onSubmit={() => void submit()}
+      canSubmit={canCreate}
+      busy={creating}
+      progress={creating
+        ? `Building the base… ${progress !== null ? progressText(progress.filesDone, progress.filesTotal) : 'Starting…'}`
+        : null}
+      error={error}
+      footer={ready ? undefined : (
+        <div className="flex justify-end pt-2">
+          <button
+            type="button"
+            onClick={() => onOpenChange(false)}
+            className="rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent"
           >
-            <div className="space-y-2">
-              <Label htmlFor={nameId}>Name</Label>
-              <Input
-                id={nameId}
+            Close
+          </button>
+        </div>
+      )}
+    >
+      {installs.status === 'loading' && stateNote('Looking for installs…', 'status')}
+      {installs.status === 'failed' && (
+        <p role="alert" className="text-sm text-destructive">Agora could not look for installs. {installs.message}</p>
+      )}
+      {installs.status === 'loaded' && installs.turnedOff && stateNote(
+        'This game is turned off, so it is not offered here. Turn it on in Settings, Game support, to create an instance.',
+        'alert',
+      )}
+      {installs.status === 'loaded' && !installs.turnedOff && available.length === 0 && stateNote(
+        `Agora has not found an install of ${gameName} on this machine. Rescan the installs in Setup, then try again.`,
+        'alert',
+      )}
+
+      {ready && (
+        <>
+          <FormField label="Name" hint={name.trim() === '' ? 'Type a name to enable Create.' : undefined}>
+            {(control) => (
+              <input
+                {...control}
                 value={name}
-                placeholder={`For example, ${gameName} with my mods`}
+                placeholder="e.g. Survival playthrough"
                 onChange={(event) => setName(event.target.value)}
                 disabled={creating}
                 autoComplete="off"
+                autoFocus
+                className={FORM_CONTROL_CLASS}
               />
-            </div>
+            )}
+          </FormField>
 
-            <div className="space-y-2">
-              <Label htmlFor={installId}>Install to build from</Label>
+          <FormField label="Install to build from" hint={selected?.location}>
+            {(control) => (
               <select
-                id={installId}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                {...control}
+                className={FORM_CONTROL_CLASS}
                 value={chosenInstall}
                 onChange={(event) => setChosenInstall(event.target.value)}
                 disabled={creating}
               >
                 {available.map((install) => (
                   <option key={install.installId} value={install.installId}>
-                    {install.name} · {install.store}{install.storeVersion ? ` ${install.storeVersion}` : ''}
+                    {install.name} · {runtimeText(install.store, install.storeVersion) ?? install.store}
                   </option>
                 ))}
               </select>
-              {selected !== null && (
-                <p className="text-xs text-muted-foreground">{selected.location}</p>
-              )}
-            </div>
+            )}
+          </FormField>
 
-            <fieldset className="space-y-2" disabled={creating}>
-              <legend className="text-sm font-medium">Base</legend>
-              <p className="text-xs text-muted-foreground">
-                The base is a pinned copy of the game files that instances share. Agora reuses one that already exists.
-              </p>
-              <div className="grid gap-2 sm:grid-cols-2">
-                {BASE_MODES.map((mode) => {
-                  const copy = baseModeCopy(mode);
-                  const chosen = mode === baseMode;
-                  return (
-                    <button
-                      key={mode}
-                      type="button"
-                      aria-pressed={chosen}
-                      onClick={() => setBaseMode(mode)}
-                      className={[
-                        'rounded-lg border p-3 text-left text-sm transition-colors',
-                        chosen ? 'border-primary bg-primary/10' : 'border-border hover:bg-accent',
-                      ].join(' ')}
-                    >
-                      <span className="block font-semibold">{copy.label}</span>
-                      <span className="mt-1 block text-xs text-muted-foreground">{copy.explain}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </fieldset>
+          <div>
+            <span className="text-sm font-medium">Base</span>
+            <ChoiceCards
+              label="Base"
+              options={BASE_CHOICES}
+              value={baseMode}
+              onChange={setBaseMode}
+              disabled={creating}
+              className="mt-1 sm:grid-cols-1"
+            />
+            <span className="mt-1 block text-xs text-muted-foreground">
+              The base is a pinned copy of the game files that instances share. Agora reuses one that already exists.
+            </span>
+          </div>
 
-            <div className="space-y-2">
-              <Label htmlFor={deploymentId}>How it will run</Label>
+          <FormField
+            label="How it will run"
+            hint={<>{deploymentOption?.explain} You can change this later on the instance's Overview.</>}
+          >
+            {(control) => (
               <select
-                id={deploymentId}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                {...control}
+                className={FORM_CONTROL_CLASS}
                 value={deployment}
                 onChange={(event) => setDeployment(event.target.value as GameSettings['deployment'])}
                 disabled={creating}
               >
                 {DEPLOYMENT_OPTIONS.map((option) => (
-                  <option key={option.id} value={option.id}>{option.label}</option>
+                  <option key={option.id} value={option.id}>
+                    {recommendedLabel({ label: option.label, recommended: option.id === RECOMMENDED_GAME_SETTINGS.deployment })}
+                  </option>
                 ))}
               </select>
-              <p className="text-xs text-muted-foreground">
-                {DEPLOYMENT_OPTIONS.find((option) => option.id === deployment)?.explain}
-                {' '}You can change this later on the instance's Overview.
-              </p>
-            </div>
-
-            {creating && (
-              <p role="status" className="text-sm">
-                Building the base… {progress !== null ? progressText(progress.filesDone, progress.filesTotal) : 'Starting…'}
-              </p>
             )}
-
-            {error !== null && (
-              <p role="alert" className="text-sm text-destructive">{error}</p>
-            )}
-
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={creating}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={!canCreate}>
-                {creating ? 'Creating…' : 'Create instance'}
-              </Button>
-            </DialogFooter>
-          </form>
-        )}
-      </DialogContent>
-    </Dialog>
+          </FormField>
+        </>
+      )}
+    </CreateInstanceFrame>
   );
 }

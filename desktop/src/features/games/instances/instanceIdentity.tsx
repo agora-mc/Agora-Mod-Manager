@@ -4,10 +4,12 @@
  * a coloured dot (as Minecraft's loader chip does); the facts after it are muted.
  */
 
-import { MetaChip } from '@/components/InstanceIcon';
+import { InstanceIcon, MetaChip } from '@/components/InstanceIcon';
+import { instanceFamilyHue } from '@/lib/instanceIdentity';
 import { HueChip, type InstanceCapabilities } from '@/components/instance-kit';
 import type { DeploymentMode } from './api';
 import { deploymentLabel } from './instanceText';
+import { useGameInstanceIcon } from './instanceIcons';
 
 /**
  * What a game instance can do today. Rename, clone, group, stop, trash and play time light up
@@ -64,5 +66,22 @@ export function InstanceChips({ store, version, build, deployment, pinned }: Ins
       <MetaChip>{deploymentLabel(deployment)}</MetaChip>
       <MetaChip>{pinned ? 'Pinned base' : 'Runs from install'}</MetaChip>
     </>
+  );
+}
+
+/**
+ * A game instance's tile: the image the player set, or Minecraft's generated tile (gradient and
+ * initials) with a hue family drawn from the instance, so no two instances look alike.
+ */
+export function GameInstanceTile({ instanceId, name, size }: { instanceId: string; name: string; size?: number }) {
+  const icon = useGameInstanceIcon(instanceId);
+  return (
+    <InstanceIcon
+      name={name}
+      seed={instanceId}
+      familyHue={instanceFamilyHue(instanceId)}
+      iconSrc={icon}
+      size={size}
+    />
   );
 }

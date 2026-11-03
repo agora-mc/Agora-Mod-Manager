@@ -24,6 +24,8 @@ interface InstancePageHeaderProps {
   factsLead?: ReactNode;
   /** Facts, shown on one row separated by " · " ("Last played …", "7 h played", "Created …"). */
   facts?: readonly ReactNode[];
+  /** After the facts, with no separator (Minecraft's "Set image"). */
+  factsTrail?: ReactNode;
   /** Outlined buttons above Launch. Unsupported ones are left out when `capabilities` is given. */
   secondaryActions?: readonly InstanceAction[];
   capabilities?: InstanceCapabilities;
@@ -50,6 +52,7 @@ export function InstancePageHeader({
   notices,
   factsLead,
   facts = [],
+  factsTrail,
   secondaryActions = [],
   capabilities,
   primaryAction,
@@ -81,7 +84,7 @@ export function InstancePageHeader({
             </div>
             {chips && <div className="mt-1.5 flex flex-wrap items-center gap-1.5">{chips}</div>}
             {notices}
-            {(factsLead || shownFacts.length > 0) && (
+            {(factsLead || shownFacts.length > 0 || factsTrail) && (
               <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground" data-testid="instance-facts">
                 {factsLead}
                 {shownFacts.map((fact, index) => (
@@ -90,6 +93,7 @@ export function InstancePageHeader({
                     <span>{fact}</span>
                   </Fragment>
                 ))}
+                {factsTrail}
               </div>
             )}
           </div>

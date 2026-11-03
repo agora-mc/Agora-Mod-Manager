@@ -4856,6 +4856,12 @@ runs. Minecraft is the reference; another game must look like the same app, not 
   (`InstanceCapabilities`: launch, kill, rename, clone, group, lock, trash, delete, notes, open
   folder, image, export, play time, troubleshoot). The kit shows only supported actions, never a
   greyed-out "coming soon". A button may still wait on something transient (a launch in flight).
+- **One identity system.** Every instance tile is `InstanceIcon`: the image the player set, or a
+  generated gradient with initials. Minecraft takes the hue family from the loader; another game has
+  no loader and nearly always one store, so its family comes from the instance id
+  (`instanceFamilyHue`) and no two instances look alike. A game instance's image is kept by core in
+  the instance's own `.agora/instance-icon.<ext>` with Minecraft's type and size limits
+  (`agora_core::icon`), set through "Set image" on its page header.
 - **Shared launches.** A game launch lives in `features/games/instances/launchController.ts`, one
   state per instance, so a launch started from a card is the same launch the instance page shows.
 - **§26.14's "a slice never edits the shell" is retired.** It kept anyone from owning the

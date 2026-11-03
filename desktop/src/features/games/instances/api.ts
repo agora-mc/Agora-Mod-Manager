@@ -313,3 +313,26 @@ export function onCreateProgress(handler: (progress: CreateProgress) => void): P
 export function onInstanceExited(handler: (exited: InstanceExited) => void): Promise<UnlistenFn> {
   return listen<InstanceExited>(INSTANCE_EXITED_EVENT, (event) => handler(event.payload));
 }
+
+// ---------------------------------------------------------------------------
+// An instance's own image ("Set image"), kept by core in the instance's folder.
+// ---------------------------------------------------------------------------
+
+function isImageDataUrl(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('data:image/');
+}
+
+/** The instance's image as a data URL, or null when it has none and its tile is generated. */
+export async function getGameInstanceIcon(instanceId: string): Promise<string | null> {
+  const reply: unknown = await invoke<unknown>('games_instance_icon', { instanceId });
+  if (reply === null) return null;
+  if (!isImageDataUrl(reply)) throw shapeError('games_instance_icon');
+  return reply;
+}
+
+/** Copy the image at `sourcePath` in as the instance's image; resolves to it as a data URL. */
+export async function setGameInstanceIcon(instanceId: string, sourcePath: string): Promise<string> {
+  const reply: unknown = await invoke<unknown>('games_instance_set_icon', { instanceId, sourcePath });
+  if (!isImageDataUrl(reply)) throw shapeError('games_instance_set_icon');
+  return reply;
+}

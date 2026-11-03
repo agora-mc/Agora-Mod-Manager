@@ -5,7 +5,6 @@
  * shows the same launch; an answer that needs a decision sends the player there with "Review".
  */
 
-import { InstanceIcon } from '@/components/InstanceIcon';
 import {
   InstanceActionBar,
   InstanceCardBanner,
@@ -16,7 +15,7 @@ import {
 } from '@/components/instance-kit';
 import type { InstanceCard } from './api';
 import { createdOn, playedWhen } from './instanceDates';
-import { GAME_INSTANCE_CAPABILITIES, InstanceChips } from './instanceIdentity';
+import { GAME_INSTANCE_CAPABILITIES, GameInstanceTile, InstanceChips } from './instanceIdentity';
 import { dismissGameLaunch, startGameLaunch, useAnyGameLaunching, useGameLaunch } from './launchController';
 
 interface GameInstanceCardProps {
@@ -97,7 +96,7 @@ export function GameInstanceCard({
     <InstanceCardFrame
       testId="instance-card"
       running={card.running}
-      tile={<InstanceIcon name={card.name} seed={card.instanceId} />}
+      tile={<GameInstanceTile instanceId={card.instanceId} name={card.name} />}
       name={card.name}
       chips={
         <InstanceChips store={card.store} version={card.version} deployment={card.deployment} pinned={card.pinned} />
