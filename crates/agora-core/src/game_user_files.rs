@@ -398,6 +398,15 @@ fn session_running_apart_from_starting(journal: &Journal) -> bool {
         if process_identity::verify(proc).is_ok() {
             return true;
         }
+        // The launcher may be gone while a game it started lives on: the job it was launched in
+        // still holds everything that descends from it.
+        if proc
+            .job
+            .as_deref()
+            .is_some_and(|job| crate::process_job::active(job) > 0)
+        {
+            return true;
+        }
     }
     if journal.running_from.exists() {
         let procs = crate::game_launch::processes_running_from(&journal.running_from);

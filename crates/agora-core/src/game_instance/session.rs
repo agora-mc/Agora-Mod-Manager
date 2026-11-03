@@ -12,9 +12,10 @@ use agora_game_api::{GameDefinition, StoreId};
 use sysinfo::{Pid, System};
 
 use crate::ctx::Ctx;
-use crate::game_instance::{self, GameInstanceManifest, GameInstanceRecord, InstanceError};
+use crate::game_instance::{self, InstanceError};
 use crate::game_user_files;
 use crate::process_identity::{self, ProcessIdentity};
+use crate::process_job;
 
 /// How long a stop waits for the processes it ended to actually go.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,18 +35,6 @@ pub struct StopOutcome {
     /// The processes ended (the game and the children it started).
     pub processes_ended: usize,
     pub play_time_ms: i64,
-}
-
-/// The store whose session belongs to this instance: the pinned base's, else the identity the
-/// manifest kept.
-fn store_of(record: &GameInstanceRecord, manifest: &GameInstanceManifest) -> Option<StoreId> {
-    match &record.base {
-        agora_game_api::BaseReference::Pinned { runtime, .. } => Some(runtime.store.clone()),
-        agora_game_api::BaseReference::Unpinned { .. } => manifest
-            .runtime_identity
-            .as_ref()
-            .map(|runtime| runtime.store.clone()),
-    }
 }
 
 /// End the game's session the way a normal exit does: put the player's files back and add the
@@ -90,7 +79,7 @@ pub fn stop(
     let record = game_instance::get(ctx, instance_id)?
         .ok_or_else(|| InstanceError::NotFound(instance_id.to_string()))?;
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
-    let store = store_of(&record, &manifest).ok_or_else(|| {
+    let store = game_instance::session_store(&record.base, &manifest).ok_or_else(|| {
         InstanceError::Other(format!(
             "'{instance_id}' has never been launched through a store Agora can name, so there is no session to stop."
         ))
@@ -105,18 +94,32 @@ pub fn stop(
         return Err(InstanceError::NothingRunning(instance_id.to_string()));
     }
 
+    // The job the launch made holds everything the game started, including a game whose launcher
+    // has already exited. It is the proof of "Agora started this": nothing outside it is reached.
+    let jobs: Vec<&str> = details
+        .processes
+        .iter()
+        .filter_map(|identity| identity.job.as_deref())
+        .collect();
+    let in_jobs: usize = jobs.iter().map(|job| process_job::active(job)).sum();
+    // A launch with no job (another platform, or the job could not be made) is judged by the
+    // identity it recorded: the process must still be the one Agora started.
     let alive: Vec<&ProcessIdentity> = details
         .processes
         .iter()
         .filter(|identity| process_identity::verify(identity).is_ok())
         .collect();
-    if alive.is_empty() {
-        // The journal says a process runs from the game folder, but not which one Agora started.
+    if in_jobs == 0 && alive.is_empty() {
+        // The journal says a process runs from the game folder, but not one Agora started.
         return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
     }
 
-    let processes_ended = terminate_tree(&alive);
-    wait_until_gone(&alive, STOP_TIMEOUT)?;
+    let mut processes_ended = 0;
+    for job in &jobs {
+        processes_ended += process_job::terminate(job).map_err(InstanceError::Other)?;
+    }
+    processes_ended += terminate_tree(&alive);
+    wait_until_gone(&alive, &jobs, STOP_TIMEOUT)?;
 
     let play_time_ms = match end_session(ctx, definition, &store)? {
         Some(end) => {
@@ -166,7 +169,9 @@ fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
         let start_time = process.start_time();
         targets.push((pid, start_time));
         for (child_pid, child) in system.processes() {
-            if child.parent() == Some(pid) {
+            // A child cannot be older than its parent: an older one only names a parent that has
+            // since exited and whose pid was reused.
+            if child.parent() == Some(pid) && child.start_time() >= start_time {
                 queue.push(*child_pid);
             }
         }
@@ -186,12 +191,17 @@ fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
 }
 
 /// Wait until none of the given identities matches a live process, or the timeout expires.
-fn wait_until_gone(roots: &[&ProcessIdentity], timeout: Duration) -> Result<(), InstanceError> {
+fn wait_until_gone(
+    roots: &[&ProcessIdentity],
+    jobs: &[&str],
+    timeout: Duration,
+) -> Result<(), InstanceError> {
     let deadline = Instant::now() + timeout;
     loop {
         if roots
             .iter()
             .all(|identity| process_identity::verify(identity).is_err())
+            && jobs.iter().all(|job| process_job::active(job) == 0)
         {
             return Ok(());
         }

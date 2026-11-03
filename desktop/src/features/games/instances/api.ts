@@ -428,9 +428,13 @@ export async function restoreDeletedGameInstance(
   return reply as unknown as RestoredInstance;
 }
 
-/** Send one deleted entry to the OS trash, or every entry when no `entryId` is given. */
-export async function purgeDeletedGameInstances(entryId?: string): Promise<PurgedDeleted> {
+/**
+ * Send one deleted entry to the OS trash, or every entry of `gameId` when no `entryId` is given.
+ * Another game's deleted instances are never touched by "all".
+ */
+export async function purgeDeletedGameInstances(gameId: string, entryId?: string): Promise<PurgedDeleted> {
   const reply: unknown = await invoke<unknown>('games_instance_purge_deleted', {
+    gameId,
     entryId: entryId ?? null,
   });
   if (

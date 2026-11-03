@@ -324,12 +324,12 @@ describe('rename, clone, stop and Recently deleted wrappers', () => {
     });
 
     invokeMock.mockResolvedValueOnce({ purged: 1, failed: 0, kept: 0 });
-    await expect(purgeDeletedGameInstances('entry-1')).resolves.toEqual({ purged: 1, failed: 0, kept: 0 });
-    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_purge_deleted', { entryId: 'entry-1' });
+    await expect(purgeDeletedGameInstances('skyrim-se', 'entry-1')).resolves.toEqual({ purged: 1, failed: 0, kept: 0 });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_purge_deleted', { gameId: 'skyrim-se', entryId: 'entry-1' });
 
     invokeMock.mockResolvedValueOnce({ purged: 2, failed: 1, kept: 0 });
-    await purgeDeletedGameInstances();
-    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_purge_deleted', { entryId: null });
+    await purgeDeletedGameInstances('skyrim-se');
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_purge_deleted', { gameId: 'skyrim-se', entryId: null });
   });
 
   it.each([
@@ -343,7 +343,7 @@ describe('rename, clone, stop and Recently deleted wrappers', () => {
       ? stopGameInstance('grounded-1')
       : command === 'games_instance_deleted_list'
         ? listDeletedGameInstances('skyrim-se')
-        : purgeDeletedGameInstances();
+        : purgeDeletedGameInstances('skyrim-se');
     await expect(call).rejects.toThrow(`${command} did not return`);
   });
 });

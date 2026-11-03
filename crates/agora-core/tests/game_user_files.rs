@@ -428,6 +428,7 @@ fn agora_killed_while_running_then_restarted() {
         pid: 999_999_999,
         start_time: 12345,
         expected_exe: None,
+        job: None,
     }];
     std::fs::write(&journal_path, serde_json::to_string(&journal).unwrap()).unwrap();
 

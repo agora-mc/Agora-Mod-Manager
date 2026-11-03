@@ -82,6 +82,7 @@ pub mod paths;
 pub mod pe_version;
 pub mod plugins;
 pub mod process_identity;
+pub mod process_job;
 pub mod process_session_manager;
 pub mod providers;
 pub mod ranking;

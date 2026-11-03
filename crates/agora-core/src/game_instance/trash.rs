@@ -463,18 +463,203 @@ fn free_id_for_name(
     ))
 }
 
+/// Written into an entry before its files are moved out, so a restore cut off part way can be
+/// finished (or called off) from the entry alone.
+const RESTORING_FILE: &str = "restoring.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Restoring {
+    new_id: String,
+    new_name: String,
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn try_lock_instance(
+    ctx: &Ctx,
+    instance_id: &str,
+    operation: &str,
+) -> Result<crate::lock_manager::LockGuard, InstanceError> {
+    // No waiting: an instance another operation holds is busy, and a pass over the trash moves
+    // on rather than queueing behind it.
+    ctx.lock_manager
+        .acquire_with_timeout(
+            crate::lock_manager::LockResource::Instance(instance_id.to_string()),
+            operation,
+            std::time::Duration::ZERO,
+            None,
+        )
+        .map_err(|error| err("ERR_INSTANCE_BUSY", error.to_string()))
+}
+
+fn row_exists(conn: &Connection, id: &str) -> Result<bool, InstanceError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM game_instances WHERE instance_id = ?1",
+            [id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Put the manifest's id and name right, then add the row. The files are already in place.
+fn finish_restore(
+    conn: &Connection,
+    dest: &Path,
+    stored: &StoredEntry,
+    restoring: &Restoring,
+) -> Result<(), InstanceError> {
+    if restoring.new_id != stored.entry.instance_id || restoring.new_name != stored.row.name {
+        let manifest_path = dest.join("instance_manifest.json");
+        let bytes = std::fs::read(&manifest_path)
+            .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot read the manifest", e))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| err("ERR_INSTANCE_RESTORE", format!("Manifest unreadable: {e}")))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| err("ERR_INSTANCE_RESTORE", "Manifest is not an object."))?;
+        object.insert(
+            "instance_id".into(),
+            serde_json::Value::String(restoring.new_id.clone()),
+        );
+        object.insert(
+            "name".into(),
+            serde_json::Value::String(restoring.new_name.clone()),
+        );
+        let out = serde_json::to_vec_pretty(&value)
+            .map_err(|e| err("ERR_INSTANCE_RESTORE", e.to_string()))?;
+        write_atomic(&manifest_path, &out)
+            .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot update manifest", e))?;
+    }
+    let row = &stored.row;
+    conn.execute(
+        "INSERT INTO game_instances
+             (instance_id, game, name, base_json, created_at, last_launched_at,
+              total_play_ms, last_played_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            &restoring.new_id,
+            &row.game,
+            &restoring.new_name,
+            &row.base_json,
+            &row.created_at,
+            &row.last_launched_at,
+            row.total_play_ms,
+            &row.last_played_at,
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+fn tidy_entry(root: &Path, entry_id: &str) {
+    if let Ok(dir) = entry_dir(root, entry_id) {
+        let _ = std::fs::remove_file(dir.join(ENTRY_FILE));
+        let _ = std::fs::remove_file(dir.join(RESTORING_FILE));
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+/// Bring one entry's loose ends back to a state a person can act on, with the entry's original
+/// instance id locked by the caller:
+/// * a delete cut off after the folder moved but before the row went leaves a row with no folder;
+///   the entry holds the files, so the row is dropped and the entry is restorable;
+/// * a restore cut off after the move leaves the folder in place and no row; it is finished;
+/// * a restore cut off before the move is called off.
+fn recover_entry(
+    ctx: &Ctx,
+    conn: &Connection,
+    root: &Path,
+    stored: &StoredEntry,
+) -> Result<(), InstanceError> {
+    let entry_id = &stored.entry.entry_id;
+    let dir = entry_dir(root, entry_id)?;
+    let instances_root = ctx.paths.instances_root();
+    let source = dir.join(INSTANCE_SUBDIR);
+
+    let restoring_path = dir.join(RESTORING_FILE);
+    if restoring_path.is_file() {
+        let restoring: Option<Restoring> = std::fs::read_to_string(&restoring_path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        let Some(restoring) = restoring else {
+            return Ok(());
+        };
+        validate_path_component(&restoring.new_id)
+            .map_err(|error| err("ERR_INSTANCE_RESTORE", error.to_string()))?;
+        if is_plain_dir(&source) {
+            // The files never left: the restore did not get far enough to matter.
+            let _ = std::fs::remove_file(&restoring_path);
+        } else if is_plain_dir(&instances_root.join(&restoring.new_id))
+            && !row_exists(conn, &restoring.new_id)?
+        {
+            finish_restore(
+                conn,
+                &instances_root.join(&restoring.new_id),
+                stored,
+                &restoring,
+            )?;
+            tidy_entry(root, entry_id);
+        }
+        return Ok(());
+    }
+
+    if is_plain_dir(&source)
+        && row_exists(conn, &stored.entry.instance_id)?
+        && std::fs::symlink_metadata(instances_root.join(&stored.entry.instance_id)).is_err()
+    {
+        conn.execute(
+            "DELETE FROM game_instances WHERE instance_id = ?1",
+            [&stored.entry.instance_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Finish or call off whatever a crash left half done in Recently deleted. Safe to run at any
+/// time: an entry whose instance is busy is skipped, and nothing is touched unless an entry's
+/// own record says what happened.
+pub fn recover_interrupted(ctx: &Ctx) {
+    let root = ctx.paths.recently_deleted_games_root();
+    let Ok(read) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let Ok(conn) = crate::db::local_state_connection(&ctx.paths.local_state_db()) else {
+        return;
+    };
+    for id in read
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+    {
+        let Ok(stored) = read_entry_file(&root, &id) else {
+            continue;
+        };
+        let Ok(_lock) = try_lock_instance(ctx, &stored.entry.instance_id, "recover") else {
+            continue;
+        };
+        let _ = recover_entry(ctx, &conn, &root, &stored);
+    }
+}
+
 /// Restore an entry. With no `new_name`, the original id is restored and a taken id is refused
 /// with [`InstanceError::RestoreIdTaken`]; with a name, a fresh id comes from it and the manifest
 /// and row are rewritten together.
+///
+/// The entry is marked before anything moves, so a crash at any point leaves either the entry
+/// whole or an instance that [`recover_interrupted`] can finish.
 pub fn restore(
     ctx: &Ctx,
     entry_id: &str,
     new_name: Option<&str>,
 ) -> Result<RestoreOutcome, InstanceError> {
     let root = ctx.paths.recently_deleted_games_root();
-    let stored = read_entry(&root, entry_id)?;
+    let stored = read_entry_file(&root, entry_id)?;
     let original = stored.entry.instance_id.clone();
-    let source = entry_dir(&root, entry_id)?.join(INSTANCE_SUBDIR);
 
     // Serialize with a delete or another writer of the same original id: the id is what both
     // operations judge as taken or free.
@@ -489,6 +674,11 @@ pub fn restore(
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
         .map_err(|e| InstanceError::Other(e.to_string()))?;
     let instances_root = ctx.paths.instances_root();
+
+    // A cut-off delete left a row behind with no folder; it is not a real holder of the id.
+    recover_entry(ctx, &conn, &root, &stored)?;
+    let stored = read_entry(&root, entry_id)?;
+    let source = entry_dir(&root, entry_id)?.join(INSTANCE_SUBDIR);
 
     let (new_id, new_name, renamed) = match new_name.map(str::trim).filter(|n| !n.is_empty()) {
         Some(name) => {
@@ -510,43 +700,18 @@ pub fn restore(
         return Err(InstanceError::RestoreIdTaken(new_id));
     }
 
-    // Rewrite the manifest in the entry before moving it, so a crash leaves either the old
-    // folder in the entry or a consistent folder in instances. The original bytes go back on any
-    // failure.
-    let manifest_path = source.join("instance_manifest.json");
-    let original_manifest = if renamed {
-        Some(
-            std::fs::read(&manifest_path)
-                .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot read the manifest", e))?,
-        )
-    } else {
-        None
+    let restoring = Restoring {
+        new_id: new_id.clone(),
+        new_name: new_name.clone(),
     };
-    if renamed {
-        let bytes = original_manifest.as_ref().expect("set above");
-        let mut value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|e| err("ERR_INSTANCE_RESTORE", format!("Manifest unreadable: {e}")))?;
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| err("ERR_INSTANCE_RESTORE", "Manifest is not an object."))?;
-        object.insert(
-            "instance_id".into(),
-            serde_json::Value::String(new_id.clone()),
-        );
-        object.insert("name".into(), serde_json::Value::String(new_name.clone()));
-        let out = serde_json::to_vec_pretty(&value)
-            .map_err(|e| err("ERR_INSTANCE_RESTORE", e.to_string()))?;
-        std::fs::write(&manifest_path, out)
-            .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot update manifest", e))?;
-    }
-    let undo_manifest = |bytes: &Option<Vec<u8>>| {
-        if let Some(bytes) = bytes {
-            let _ = std::fs::write(&manifest_path, bytes);
-        }
-    };
+    let restoring_path = entry_dir(&root, entry_id)?.join(RESTORING_FILE);
+    let marker =
+        serde_json::to_vec(&restoring).map_err(|e| err("ERR_INSTANCE_RESTORE", e.to_string()))?;
+    write_atomic(&restoring_path, &marker)
+        .map_err(|e| io_err("ERR_INSTANCE_RESTORE", "Cannot mark the entry", e))?;
 
     if let Err(e) = std::fs::rename(&source, &dest) {
-        undo_manifest(&original_manifest);
+        let _ = std::fs::remove_file(&restoring_path);
         return Err(io_err(
             "ERR_INSTANCE_RESTORE",
             "Cannot move the files back",
@@ -554,37 +719,17 @@ pub fn restore(
         ));
     }
 
-    let mut row = stored.row.clone();
-    row.instance_id = new_id.clone();
-    row.name = new_name.clone();
-    let inserted = conn.execute(
-        "INSERT INTO game_instances
-             (instance_id, game, name, base_json, created_at, last_launched_at,
-              total_play_ms, last_played_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            &row.instance_id,
-            &row.game,
-            &row.name,
-            &row.base_json,
-            &row.created_at,
-            &row.last_launched_at,
-            row.total_play_ms,
-            &row.last_played_at,
-        ],
-    );
-    if let Err(e) = inserted {
+    if let Err(error) = finish_restore(&conn, &dest, &stored, &restoring) {
+        // Put the files back where they were found, so the entry is whole again.
         if std::fs::rename(&dest, &source).is_ok() {
-            undo_manifest(&original_manifest);
+            let _ = std::fs::remove_file(&restoring_path);
         }
-        return Err(db_err(e));
+        return Err(error);
     }
 
     // Committed. Tidy the (now empty) entry; if that fails, listing skips it because its files
     // are gone.
-    let dir = entry_dir(&root, entry_id)?;
-    let _ = std::fs::remove_file(dir.join(ENTRY_FILE));
-    let _ = std::fs::remove_dir(&dir);
+    tidy_entry(&root, entry_id);
     Ok(RestoreOutcome {
         instance_id: new_id,
         original_instance_id: original,
@@ -592,7 +737,11 @@ pub fn restore(
     })
 }
 
-fn purge_one(root: &Path, entry_id: &str, trash: &TrashFn) -> Result<(), InstanceError> {
+fn purge_one(ctx: &Ctx, root: &Path, entry_id: &str, trash: &TrashFn) -> Result<(), InstanceError> {
+    // Only something Agora wrote is Agora's to send away: a folder with no valid record is left
+    // for whoever put it there.
+    let stored = read_entry_file(root, entry_id)?;
+    let _lock = try_lock_instance(ctx, &stored.entry.instance_id, "purge")?;
     let dir = entry_dir(root, entry_id)?;
     if !is_plain_dir(&dir) {
         return Err(err(
@@ -622,11 +771,18 @@ fn purge_one(root: &Path, entry_id: &str, trash: &TrashFn) -> Result<(), Instanc
 
 /// Send one entry to the OS trash now.
 pub fn purge(ctx: &Ctx, entry_id: &str, trash: &TrashFn) -> Result<(), InstanceError> {
-    purge_one(&ctx.paths.recently_deleted_games_root(), entry_id, trash)
+    purge_one(
+        ctx,
+        &ctx.paths.recently_deleted_games_root(),
+        entry_id,
+        trash,
+    )
 }
 
-/// Send every entry to the OS trash. Failures are counted and left in place.
-pub fn purge_all(ctx: &Ctx, trash: &TrashFn) -> PurgeSummary {
+/// Send every entry of one game to the OS trash. Another game's entries are not touched, and
+/// neither is anything in the folder that is not an entry Agora wrote. Failures are counted and
+/// left in place.
+pub fn purge_all(ctx: &Ctx, game_id: &str, trash: &TrashFn) -> PurgeSummary {
     let root = ctx.paths.recently_deleted_games_root();
     let Ok(read) = std::fs::read_dir(&root) else {
         return PurgeSummary::default();
@@ -638,13 +794,14 @@ pub fn purge_all(ctx: &Ctx, trash: &TrashFn) -> PurgeSummary {
         .collect();
     ids.sort();
     for id in ids {
-        let Ok(dir) = entry_dir(&root, &id) else {
+        let Ok(stored) = read_entry_file(&root, &id) else {
+            summary.kept += 1;
             continue;
         };
-        if !is_plain_dir(&dir) {
+        if stored.entry.game != game_id {
             continue;
         }
-        match purge_one(&root, &id, trash) {
+        match purge_one(ctx, &root, &id, trash) {
             Ok(()) => summary.purged += 1,
             Err(_) => summary.failed += 1,
         }
@@ -655,6 +812,7 @@ pub fn purge_all(ctx: &Ctx, trash: &TrashFn) -> PurgeSummary {
 /// Purge entries past the retention window. Failures are counted, never raised: one unreadable
 /// entry must not stop the rest from being cleaned up.
 pub fn cleanup(ctx: &Ctx, now: chrono::DateTime<chrono::Utc>, trash: &TrashFn) -> PurgeSummary {
+    recover_interrupted(ctx);
     let root = ctx.paths.recently_deleted_games_root();
     let days = retention_days(ctx);
     let Ok(read) = std::fs::read_dir(&root) else {
@@ -686,7 +844,7 @@ pub fn cleanup(ctx: &Ctx, now: chrono::DateTime<chrono::Utc>, trash: &TrashFn) -
             summary.kept += 1;
             continue;
         }
-        match purge_one(&root, &id, trash) {
+        match purge_one(ctx, &root, &id, trash) {
             Ok(()) => summary.purged += 1,
             Err(_) => summary.failed += 1,
         }

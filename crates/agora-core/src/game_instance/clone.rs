@@ -39,18 +39,11 @@ fn store_of(ctx: &Ctx, instance_id: &str) -> Result<StoreId, InstanceError> {
     let record = game_instance::get(ctx, instance_id)?
         .ok_or_else(|| InstanceError::NotFound(instance_id.to_string()))?;
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
-    match &record.base {
-        agora_game_api::BaseReference::Pinned { runtime, .. } => Ok(runtime.store.clone()),
-        agora_game_api::BaseReference::Unpinned { .. } => manifest
-            .runtime_identity
-            .as_ref()
-            .map(|runtime| runtime.store.clone())
-            .ok_or_else(|| {
-                InstanceError::Other(format!(
-                    "'{instance_id}' has never been launched through a store Agora can name."
-                ))
-            }),
-    }
+    game_instance::session_store(&record.base, &manifest).ok_or_else(|| {
+        InstanceError::Other(format!(
+            "'{instance_id}' has never been launched through a store Agora can name."
+        ))
+    })
 }
 
 /// Copy a folder tree, never following a link out of it. A link fails the clone rather than being
@@ -167,13 +160,6 @@ pub fn clone_instance(
     let source_manifest = game_instance::get_manifest(ctx, source_id)?;
     let store = store_of(ctx, source_id)?;
 
-    // A running game is writing the files a clone would copy: wait for it to close.
-    if let Some(session) = game_user_files::status(ctx, &definition.id, &store)? {
-        if session.running && session.instance == source_id {
-            return Err(InstanceError::Running(source_id.to_string()));
-        }
-    }
-
     let _lock = ctx
         .lock_manager
         .acquire(
@@ -181,6 +167,15 @@ pub fn clone_instance(
             "clone",
         )
         .map_err(|e| InstanceError::Other(e.to_string()))?;
+
+    // A running game is writing the files a clone would copy: wait for it to close. Judged with
+    // the lock held, because a launch that was starting when the clone was asked holds the same
+    // lock, and its game is running by the time the clone gets it.
+    if let Some(session) = game_user_files::status(ctx, &definition.id, &store)? {
+        if session.running && session.instance == source_id {
+            return Err(InstanceError::Running(source_id.to_string()));
+        }
+    }
 
     // The id is settled before any file is copied, so a taken name costs nothing.
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())

@@ -385,13 +385,16 @@ pub async fn games_instance_restore_deleted(
     blocking(move || restore_deleted(&app, &entry_id, name.as_deref())).await
 }
 
-/// Send one deleted entry to the OS trash, or every entry when no `entry_id` is given.
+/// Send one deleted entry to the OS trash, or every entry of `game_id` when no `entry_id` is
+/// given. "All" is scoped to the game whose page asked: another game's entries are not its to
+/// empty.
 #[tauri::command]
 pub async fn games_instance_purge_deleted(
     app: tauri::AppHandle,
+    game_id: String,
     entry_id: Option<String>,
 ) -> Result<PurgedDeleted, GamesError> {
-    blocking(move || purge_deleted(&app, entry_id.as_deref())).await
+    blocking(move || purge_deleted(&app, &game_id, entry_id.as_deref())).await
 }
 
 /// The launch checks for an instance, without starting anything.
@@ -446,6 +449,9 @@ where
 fn list_instances(app: &tauri::AppHandle, game_id: &str) -> Result<InstanceList, GamesError> {
     let game = parse_game_id(game_id)?;
     let ctx = crate::core_context(app)?;
+    // A delete or restore cut off by a crash is finished or called off before the list is read,
+    // so the page never shows an instance whose folder is in Recently deleted.
+    game_instance::trash::recover_interrupted(&ctx);
     let records = game_instance::list(&ctx).map_err(map_error)?;
     let mut instances = Vec::new();
     for record in records
@@ -750,8 +756,10 @@ fn restore_deleted(
 
 fn purge_deleted(
     app: &tauri::AppHandle,
+    game_id: &str,
     entry_id: Option<&str>,
 ) -> Result<PurgedDeleted, GamesError> {
+    let game = parse_game_id(game_id)?;
     let ctx = crate::core_context(app)?;
     let trash = trash_adapter();
     let summary = match entry_id {
@@ -763,7 +771,7 @@ fn purge_deleted(
                 kept: 0,
             }
         }
-        None => game_instance::trash::purge_all(&ctx, &trash),
+        None => game_instance::trash::purge_all(&ctx, game.as_str(), &trash),
     };
     Ok(PurgedDeleted {
         purged: summary.purged,

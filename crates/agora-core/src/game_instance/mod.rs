@@ -579,6 +579,22 @@ pub fn is_minecraft_instance(ctx: &Ctx, id: &str) -> bool {
     .is_ok()
 }
 
+/// The store whose user-files session belongs to an instance: the pinned base's runtime, else the
+/// identity the manifest kept. Every check for "is this instance running" asks the same question,
+/// so a manifest without a runtime identity cannot hide a running game from one of them.
+pub(crate) fn session_store(
+    base: &BaseReference,
+    manifest: &GameInstanceManifest,
+) -> Option<agora_game_api::StoreId> {
+    match base {
+        BaseReference::Pinned { runtime, .. } => Some(runtime.store.clone()),
+        BaseReference::Unpinned { .. } => manifest
+            .runtime_identity
+            .as_ref()
+            .map(|runtime| runtime.store.clone()),
+    }
+}
+
 /// Delete a generic game instance, moving its folder to Recently deleted so it can be restored.
 /// Refuses Minecraft instances and folders outside `<instances_root>`.
 pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {
@@ -651,8 +667,8 @@ pub fn delete_with_options(
     // A launch that is swapping or spawning has no game process yet, but it is running: the
     // journal says so. An unreadable journal is not "not running"; it refuses.
     if let Ok(manifest) = get_manifest(ctx, id) {
-        if let Some(runtime) = &manifest.runtime_identity {
-            match crate::game_user_files::status(ctx, &manifest.game, &runtime.store) {
+        if let Some(store) = session_store(&base_ref, &manifest) {
+            match crate::game_user_files::status(ctx, &manifest.game, &store) {
                 Ok(Some(session)) if session.running && session.instance == id => {
                     return Err(InstanceError::Running(id.to_string()));
                 }
@@ -846,6 +862,15 @@ pub fn rename(ctx: &Ctx, id: &str, name: &str) -> Result<(), InstanceError> {
     if name.is_empty() {
         return Err(InstanceError::Other("Give the instance a name.".into()));
     }
+    // The manifest is rewritten whole, so this takes the lock every other writer of it takes: a
+    // deploy or a delete in flight is waited for rather than overwritten.
+    let _lock = ctx
+        .lock_manager
+        .acquire(
+            crate::lock_manager::LockResource::Instance(id.to_string()),
+            "rename",
+        )
+        .map_err(|e| InstanceError::Other(e.to_string()))?;
     let db_path = ctx.paths.local_state_db();
     let conn = crate::db::local_state_connection(&db_path)
         .map_err(|e| InstanceError::Other(e.to_string()))?;
