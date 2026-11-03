@@ -128,6 +128,16 @@ pub fn verify(identity: &ProcessIdentity) -> LauncherResult<()> {
         }
     };
 
+    // On Unix a killed process stays in the table as a zombie until its parent reaps it; it is
+    // not running.
+    #[cfg(unix)]
+    if process.status() == sysinfo::ProcessStatus::Zombie {
+        return Err(LauncherError::ProcessStale {
+            pid: identity.pid,
+            detail: "Process has exited (zombie)".into(),
+        });
+    }
+
     // Compare start_time – this is the strongest reuse detector.
     let current_start = process.start_time();
     if current_start != identity.start_time {
