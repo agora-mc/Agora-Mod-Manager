@@ -1,0 +1,93 @@
+/**
+ * The warm panel every main page opens on: a badge, the title, a sentence, small chips and the
+ * page's actions. Minecraft's `.agora-hero.compact` block from "My Instances", so a page built on
+ * it is the same page in every game. The colours follow the theme and the accent (`index.css`).
+ */
+
+import type { ReactNode } from 'react';
+import type { LucideIcon } from 'lucide-react';
+import { cn } from '@/lib/utils';
+
+interface PageHeroProps {
+  icon: LucideIcon;
+  title: ReactNode;
+  description?: ReactNode;
+  /** Small facts under the description ("3 instances", "● Grounded running"). */
+  chips?: readonly ReactNode[];
+  /** The page's buttons, right of the text (`PageHeroAction`). */
+  actions?: ReactNode;
+  className?: string;
+  testId?: string;
+}
+
+export function PageHero({ icon: Icon, title, description, chips = [], actions, className, testId }: PageHeroProps) {
+  const shownChips = chips.filter((chip) => chip !== null && chip !== undefined && chip !== false && chip !== '');
+  return (
+    <section
+      className={cn('agora-hero compact flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between', className)}
+      data-testid={testId}
+    >
+      <div className="flex items-start gap-3">
+        <span className="settings-hero-badge" aria-hidden="true">
+          <Icon className="h-5 w-5" />
+        </span>
+        <div className="min-w-0">
+          <h2 className="mb-2 text-2xl font-bold">{title}</h2>
+          {description && <p className="text-muted-foreground">{description}</p>}
+          {shownChips.length > 0 && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {shownChips.map((chip, index) => (
+                <span key={index} className="settings-hero-chip">{chip}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+      {actions && <div className="flex flex-wrap gap-2">{actions}</div>}
+    </section>
+  );
+}
+
+interface PageHeroActionProps {
+  icon?: LucideIcon;
+  children: ReactNode;
+  onClick: () => void;
+  /** The page's main action: filled with the accent. One per hero. */
+  primary?: boolean;
+  disabled?: boolean;
+  title?: string;
+  'aria-label'?: string;
+  testId?: string;
+}
+
+/** A hero button in Minecraft's two weights: filled primary, or a card-coloured outline. */
+export function PageHeroAction({
+  icon: Icon,
+  children,
+  onClick,
+  primary = false,
+  disabled,
+  title,
+  'aria-label': ariaLabel,
+  testId,
+}: PageHeroActionProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={ariaLabel}
+      data-testid={testId}
+      className={cn(
+        'inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50',
+        primary
+          ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+          : 'border border-border bg-card hover:bg-accent',
+      )}
+    >
+      {Icon && <Icon className="h-4 w-4" aria-hidden="true" />}
+      {children}
+    </button>
+  );
+}

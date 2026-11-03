@@ -1126,6 +1126,7 @@ function AppContent() {
                 gameId={destination.gameId}
                 tab={destination.tab}
                 onOpenInstance={(instanceId) => navigateToGameInstance(destination.gameId, instanceId)}
+                onOpenImport={() => navigateToGameTab(destination.gameId, 'import' satisfies GameTabId)}
               />
             ) : destination.type === 'game-instance' ? (
               <GameInstancePage

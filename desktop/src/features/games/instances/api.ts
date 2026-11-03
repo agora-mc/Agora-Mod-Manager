@@ -22,6 +22,8 @@ export interface InstanceCard {
   pinned: boolean;
   deployment: DeploymentMode | null;
   lastLaunchedAt: string | null;
+  /** When the instance was made. Optional: a card from an older backend has none. */
+  createdAt?: string | null;
   running: boolean;
 }
 
@@ -162,6 +164,7 @@ function isCard(value: unknown): value is InstanceCard {
     && isOptionalString(value.store)
     && isOptionalString(value.version)
     && isOptionalString(value.lastLaunchedAt)
+    && isOptionalString(value.createdAt)
     && isDeployment(value.deployment);
 }
 

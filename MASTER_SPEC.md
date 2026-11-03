@@ -4672,7 +4672,8 @@ that the slices build on:
 
 Every slot renders its slice's own component (`GameTabPage`, `GameInstancePage`). The scaffold's
 `features/games/shared/SlotPlaceholder.tsx` is still in the tree and nothing uses it. A slice
-replaces its own component and never edits the shell.
+replaced its own component and never edited the shell. That rule is retired (§29): it kept
+any slice from owning the experience across slots, so each rebuilt Minecraft's pieces locally.
 
 ### 26.15 Open Questions
 
@@ -4833,3 +4834,30 @@ supports.
 ---
 
 **This MASTER_SPEC.md is the single authoritative spec. The previously-separate plan files (1782081355093-crash-investigator-plan.md, 1782611768583-agora-v1-launcher-refactor.md, dependency-aware-mod-ops-plan.md) have been deleted; their key decisions are captured in section 19 above. BACKLOG.md remains the canonical per-phase task tracker.**
+
+## 29. SHARED INSTANCE EXPERIENCE
+
+*(Numbered 29 after §27 and §28; it changes how §26's game pages are built.)*
+
+Every game gets one instance experience: the same list page, card, create-dialog frame, instance
+header, tab strip and settings structure as Minecraft. What differs between games is data in slots:
+the chips, the create form's fields, the instance tabs, where readiness comes from, and how a launch
+runs. Minecraft is the reference; another game must look like the same app, not a sibling of it.
+
+- **The kit.** `desktop/src/components/instance-kit/` holds the shared pieces (`PageHero`,
+  `InstanceCardFrame`, `InstanceActionBar`, `InstanceGrid`, `EmptyState`, `InstancePageHeader`,
+  `ReadinessLine`, `InstanceTabBar`, `CreateInstanceFrame`, `FormField`, `ChoiceCards`) and their
+  types; `BackButton` is in `components/ui/`. They were extracted from Minecraft's markup and classes,
+  so Minecraft can adopt them with no visual change.
+- **Presentational only.** The kit makes no IPC calls and knows no game. Each game adapts its own
+  data into the kit's props where it already lives (`pages/` for Minecraft, `features/games/` for
+  the rest), so behaviour stays in `agora-core` and the interactive-feature boundary is untouched.
+- **Capabilities, not disabled buttons.** A game declares what its instances can do
+  (`InstanceCapabilities`: launch, kill, rename, clone, group, lock, trash, delete, notes, open
+  folder, image, export, play time, troubleshoot). The kit shows only supported actions, never a
+  greyed-out "coming soon". A button may still wait on something transient (a launch in flight).
+- **Shared launches.** A game launch lives in `features/games/instances/launchController.ts`, one
+  state per instance, so a launch started from a card is the same launch the instance page shows.
+- **§26.14's "a slice never edits the shell" is retired.** It kept anyone from owning the
+  experience across slots and caused the duplication this section removes. Slices may change the
+  shell and the kit when their work needs it; the kit's owner reviews kit changes.

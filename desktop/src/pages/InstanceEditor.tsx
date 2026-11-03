@@ -5,6 +5,7 @@ import { useAdvancedMode } from '../components/AdvancedModeContext';
 import { PluginInstancePanels } from '../features/plugins/PluginSurfaces';
 import { PluginSurface } from '../features/plugins/PluginSurface';
 import { ConsoleView } from '../components/ConsoleView';
+import { BackButton } from '@/components/ui/back-button';
 import { WorldsPanel } from '../components/WorldsPanel';
 import { WindowSizeEditor } from '../components/WindowSizeEditor';
 import { LaunchHooksEditor } from '../components/LaunchHooksEditor';
@@ -4042,17 +4043,6 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         </Dialog>
       )}
     </div>
-  );
-}
-
-function BackButton({ onBack }: { onBack: () => void }) {
-  return (
-    <button
-      onClick={onBack}
-      className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-    >
-      ← Back
-    </button>
   );
 }
 
