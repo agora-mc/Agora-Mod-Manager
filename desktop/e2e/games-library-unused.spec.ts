@@ -13,11 +13,17 @@ const item = {
   description: 'This description was saved to disk.',
   version: '1.0.0',
   gameId: 'minecraft',
+  gameIds: ['minecraft'],
   pageUrl: null,
   iconSha256: null,
   sourceKind: 'file',
   sourceLabel: 'File: saved.jar',
   instances: [],
+  fileCount: 1,
+  totalSize: 2048,
+  addedAtUnixMs: 1,
+  pluginFiles: [],
+  hasInstaller: false,
 };
 
 const unusedItem = {
@@ -25,6 +31,7 @@ const unusedItem = {
   name: 'Old Mod',
   totalSize: 2 * 1024 * 1024,
   gameId: 'minecraft',
+  gameIds: ['minecraft'],
 };
 
 const BOOT_REPLIES = {

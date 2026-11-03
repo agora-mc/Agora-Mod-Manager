@@ -23,9 +23,30 @@ const ignored = {
   path: 'C:\\Users\\me\\Downloads\\Plain.zip',
   fileName: 'Plain.zip',
   sha256: 'b'.repeat(64),
+  kind: 'resource pack',
+  reason: 'has pack.mcmeta and assets/',
+  nexusModId: null,
+};
+
+/** A Skyrim download: Minecraft's Library does not list it. */
+const forSkyrim = {
+  ...download,
+  path: 'C:/Users/me/Downloads/Cool.7z',
+  fileName: 'Cool.7z',
+  sha256: 'c'.repeat(64),
   gameId: 'skyrim-se',
   kind: 'game content',
   reason: '`Cool.esp` matches the game content layout',
+  nexusModId: null,
+};
+
+const modpack = {
+  ...download,
+  path: 'C:/Users/me/Downloads/Fabulously Optimized.mrpack',
+  fileName: 'Fabulously Optimized.mrpack',
+  sha256: 'd'.repeat(64),
+  kind: 'modpack',
+  reason: 'has modrinth.index.json',
   nexusModId: null,
 };
 
@@ -71,7 +92,7 @@ test.afterEach(async ({ page }) => {
 });
 
 test('the Library adds a recognised download and the badge goes away', async ({ page }) => {
-  await boot(page, [download]);
+  await boot(page, [download, forSkyrim]);
   await page.goto('/');
 
   await expect(page.getByTestId('nav-badge-library')).toHaveText('1');
@@ -81,9 +102,10 @@ test('the Library adds a recognised download and the badge goes away', async ({ 
 
   const section = page.getByTestId('new-downloads');
   await expect(section).toBeVisible();
+  // Only Minecraft's download: the Skyrim one waits in Skyrim's Library.
   await expect(section.getByTestId('new-download')).toHaveCount(1);
-  await expect(section.getByText('has fabric.mod.json')).toBeVisible();
-  await expect(section.getByText('Nexus mod 32274')).toBeVisible();
+  await expect(section.getByText('It has fabric.mod.json.')).toBeVisible();
+  await expect(section.getByTestId('new-download')).toContainText('Nexus mod 32274');
 
   await section.getByRole('button', { name: 'Add to library' }).click();
 
@@ -106,4 +128,50 @@ test('the Library ignores a download by hash', async ({ page }) => {
   await section.getByRole('button', { name: 'Ignore' }).click();
 
   await expect(section.getByTestId('new-download')).toHaveCount(0);
+});
+
+
+test('a modpack download opens the pack import review, not the library', async ({ page }) => {
+  await boot(page, [modpack]);
+  await page.addInitScript(() => {
+    const target = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+    };
+    const inner = target.__TAURI_INTERNALS__.invoke;
+    target.__TAURI_INTERNALS__.invoke = (command: string, args: Record<string, unknown> = {}) => {
+      if (command === 'plan_pack_import') {
+        (window as unknown as { __planned?: unknown }).__planned = args.sourcePath;
+        return Promise.resolve({
+          pack_name: 'Fabulously Optimized',
+          instance: {
+            id: 'fo', name: 'Fabulously Optimized', minecraft_version: '1.21.4', loader: 'fabric', loader_version: '0.16.9',
+          },
+          entries: [],
+          file_sha256: 'd'.repeat(64),
+          file_size: 512,
+          name_taken: false,
+          suggested_name: 'Fabulously Optimized',
+          left_out: [],
+          problems: [],
+          soft_problems: [],
+          notes: [],
+        });
+      }
+      return inner(command, args);
+    };
+  });
+  await page.goto('/');
+
+  await page.getByRole('navigation', { name: 'Main navigation' })
+    .getByRole('button', { name: /^Library/ })
+    .click();
+
+  const section = page.getByTestId('new-downloads');
+  await expect(section.getByTestId('new-download')).toContainText('Modpack');
+  await expect(section.getByRole('button', { name: 'Add to library' })).toHaveCount(0);
+  await section.getByRole('button', { name: 'Import as new instance…' }).click();
+
+  await expect(page.getByRole('dialog')).toBeVisible();
+  expect(await page.evaluate(() => (window as unknown as { __planned?: unknown }).__planned))
+    .toBe(modpack.path);
 });

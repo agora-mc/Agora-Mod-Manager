@@ -215,9 +215,10 @@ pub fn store_item(item: &ContentItem) -> StoreItem {
     }
 }
 
-/// The games the store recorded on the item: one per curated catalog source, in order, once each.
+/// The games the store recorded on the item: its own recorded game, then one per curated catalog
+/// source, in order, once each.
 fn item_game_ids(item: &ContentItem) -> Vec<String> {
-    let mut games: Vec<String> = Vec::new();
+    let mut games: Vec<String> = item.game_id.iter().cloned().collect();
     for source in &item.sources {
         if let ContentSource::Catalog { game, .. } = source {
             if !games.contains(game) {
@@ -468,9 +469,13 @@ pub async fn games_content_add(
     app: tauri::AppHandle,
     source_path: String,
     name: Option<String>,
+    game_id: Option<String>,
 ) -> Result<StoreAdded, GamesError> {
     let path = checked_source_path(&source_path)?;
     let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    let game_id = game_id
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty());
     tokio::task::spawn_blocking(move || -> Result<StoreAdded, GamesError> {
         let ctx = crate::core_context(&app)?;
         let outcome = if path.is_dir() {
@@ -479,6 +484,15 @@ pub async fn games_content_add(
             content_store::add_archive(&ctx, &path, name.as_deref())
         }
         .map_err(content_error)?;
+        // Added from a game's Library: the item belongs to that game unless it already names one.
+        if let Some(game_id) = game_id {
+            let item =
+                content_store::record_game_if_missing(&ctx, &outcome.item().item_id, &game_id)
+                    .map_err(content_error)?;
+            let mut added = store_added(&outcome);
+            added.item = store_item(&item);
+            return Ok(added);
+        }
         Ok(store_added(&outcome))
     })
     .await

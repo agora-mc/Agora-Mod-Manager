@@ -44,19 +44,20 @@ describe('DownloadWatchSettings', () => {
   it('is off by default and shows the folder it would watch', async () => {
     render(<DownloadWatchSettings />);
 
-    expect(await screen.findByText('Not watching (off)')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Notice mod downloads' })).toBeEnabled());
+    expect(screen.getByText('Watch for new mods')).toBeInTheDocument();
     expect(
       screen.getByRole('switch', { name: 'Notice mod downloads' }),
     ).not.toBeChecked();
     expect(
-      screen.getByRole('switch', { name: 'Show a notification for new downloads' }),
+      screen.getByRole('switch', { name: 'Tell me when a new mod arrives' }),
     ).toBeChecked();
     expect(await screen.findByText('C:\\Users\\me\\Downloads')).toBeInTheDocument();
   });
 
   it('turns watching on and records the folder baseline', async () => {
     render(<DownloadWatchSettings />);
-    await screen.findByText('Not watching (off)');
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Notice mod downloads' })).toBeEnabled());
 
     fireEvent.click(screen.getByRole('switch', { name: 'Notice mod downloads' }));
 
@@ -67,15 +68,15 @@ describe('DownloadWatchSettings', () => {
       }),
     );
     expect(invokeMock).toHaveBeenCalledWith('downloads_scan');
-    expect(await screen.findByText('Watching for new mods (on)')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Notice mod downloads' })).toBeChecked());
   });
 
   it('can turn the toast off without turning watching off', async () => {
     render(<DownloadWatchSettings />);
-    await screen.findByText('Not watching (off)');
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Notice mod downloads' })).toBeEnabled());
 
     fireEvent.click(
-      screen.getByRole('switch', { name: 'Show a notification for new downloads' }),
+      screen.getByRole('switch', { name: 'Tell me when a new mod arrives' }),
     );
 
     await waitFor(() =>

@@ -97,3 +97,16 @@ export function formatDownloadSize(bytes: number): string {
   if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${bytes} bytes`;
 }
+
+/** The downloads a game's Library offers: those recognised for that game. */
+export function downloadsForGame(rows: NewDownload[], gameId: string): NewDownload[] {
+  return rows.filter((row) => row.gameId === gameId);
+}
+
+/**
+ * A Modrinth modpack (`.mrpack`). It is not a library item: it becomes a new instance through
+ * "Import pack file", the same review My Instances opens.
+ */
+export function isModpackDownload(row: Pick<NewDownload, 'kind' | 'fileName'>): boolean {
+  return row.kind === 'modpack' || row.fileName.toLowerCase().endsWith('.mrpack');
+}

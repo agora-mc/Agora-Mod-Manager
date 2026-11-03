@@ -16,13 +16,26 @@ export interface LibraryItem {
   /** `null` means no description was saved. It never contains invented text. */
   description: string | null;
   version: string | null;
+  /** The one game the item belongs to, when there is exactly one answer. */
   gameId: string | null;
+  /**
+   * Every game the item is tied to: recorded, catalog, the item it was made from, and each
+   * instance that uses it. Empty means "not tied to a game"; nothing is guessed.
+   */
+  gameIds: string[];
   pageUrl: string | null;
   /** The saved icon's object hash. Its bytes are loaded lazily by `loadLibraryIcon`. */
   iconSha256: string | null;
   sourceKind: string;
   sourceLabel: string;
   instances: LibraryInstance[];
+  fileCount: number;
+  totalSize: number;
+  addedAtUnixMs: number;
+  /** Plugin files at the item's top level (games with a plugin list only). */
+  pluginFiles: string[];
+  /** The item carries a FOMOD installer, which asks its questions when it is added. */
+  hasInstaller: boolean;
 }
 
 export interface DamagedLibraryItem {
@@ -53,6 +66,8 @@ export interface UnusedItem {
   name: string;
   totalSize: number;
   gameId: string | null;
+  /** The games the item is tied to without an instance. Empty means "not tied to a game". */
+  gameIds: string[];
 }
 
 /** Items no instance uses, with their total size. Warnings mean the list may be incomplete. */
@@ -72,6 +87,10 @@ function isLibraryInstance(value: unknown): value is LibraryInstance {
   );
 }
 
+function isStringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string');
+}
+
 function isLibraryItem(value: unknown): value is LibraryItem {
   if (value === null || typeof value !== 'object') return false;
   const row = value as Record<string, unknown>;
@@ -81,12 +100,18 @@ function isLibraryItem(value: unknown): value is LibraryItem {
     && (row.description === null || typeof row.description === 'string')
     && (row.version === null || typeof row.version === 'string')
     && (row.gameId === null || typeof row.gameId === 'string')
+    && isStringList(row.gameIds)
     && (row.pageUrl === null || typeof row.pageUrl === 'string')
     && (row.iconSha256 === null || typeof row.iconSha256 === 'string')
     && typeof row.sourceKind === 'string'
     && typeof row.sourceLabel === 'string'
     && Array.isArray(row.instances)
     && row.instances.every(isLibraryInstance)
+    && typeof row.fileCount === 'number'
+    && typeof row.totalSize === 'number'
+    && typeof row.addedAtUnixMs === 'number'
+    && isStringList(row.pluginFiles)
+    && typeof row.hasInstaller === 'boolean'
   );
 }
 
@@ -122,6 +147,7 @@ function isUnusedItem(value: unknown): value is UnusedItem {
     && typeof row.name === 'string'
     && typeof row.totalSize === 'number'
     && (row.gameId === null || typeof row.gameId === 'string')
+    && isStringList(row.gameIds)
   );
 }
 
@@ -186,31 +212,34 @@ export async function addLibraryItem(
   return outcome.status === 'needs_installer' ? { status: 'needs_installer' } : { status: 'added' };
 }
 
-/** Instances of the item's game. An item with no recorded game may go to any instance. */
+/**
+ * Instances an item can be added to: those of a game the item is tied to. An item tied to no game
+ * may go to any instance of any game.
+ */
 export function instancesForItem(
-  item: LibraryItem,
+  item: Pick<LibraryItem, 'gameIds'>,
   instances: LibraryInstance[],
 ): LibraryInstance[] {
-  if (!item.gameId) return instances;
-  return instances.filter((instance) => instance.gameId === item.gameId);
+  if (item.gameIds.length === 0) return instances;
+  return instances.filter((instance) => item.gameIds.includes(instance.gameId));
 }
 
-/** Games that appear in the library, sorted, for the game filter. */
-export function libraryGames(items: LibraryItem[]): string[] {
-  const games = new Set<string>();
-  for (const item of items) {
-    if (item.gameId) games.add(item.gameId);
-  }
-  return [...games].sort((left, right) => left.localeCompare(right));
-}
+/**
+ * Which of the Library's two lists to show for a game: the items tied to that game, or the items
+ * tied to no game at all (every game's Library offers those under their own filter, so nothing is
+ * hidden or filed under the wrong game).
+ */
+export type LibraryView = 'game' | 'untied';
 
-/** Filter by game. `null` means every game. */
-export function filterLibraryByGame(
-  items: LibraryItem[],
-  gameId: string | null,
-): LibraryItem[] {
-  if (!gameId) return items;
-  return items.filter((item) => item.gameId === gameId);
+/** The items a game's Library shows in `view`. */
+export function itemsInView<T extends { gameIds: string[] }>(
+  items: T[],
+  gameId: string,
+  view: LibraryView,
+): T[] {
+  return view === 'untied'
+    ? items.filter((item) => item.gameIds.length === 0)
+    : items.filter((item) => item.gameIds.includes(gameId));
 }
 
 /** Search names, descriptions, versions, sources and instances. Empty means everything. */
@@ -223,7 +252,7 @@ export function searchLibrary(items: LibraryItem[], query: string): LibraryItem[
       item.description ?? '',
       item.version ?? '',
       item.sourceLabel,
-      item.gameId ?? '',
+      ...item.pluginFiles,
       ...item.instances.map((instance) => instance.name),
     ]
       .join(' ')

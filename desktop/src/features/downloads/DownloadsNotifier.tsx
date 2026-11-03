@@ -18,7 +18,7 @@ export function DownloadsNotifier() {
       void getSetting(SETTINGS.downloadsToast.key)
         .then((raw) => {
           if (SETTINGS.downloadsToast.parse(raw)) {
-            showToast('New mod downloads are ready in your Library.');
+            showToast('New mods are waiting in your Library.');
           }
         })
         .catch(() => undefined);

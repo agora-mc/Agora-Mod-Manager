@@ -43,7 +43,13 @@ pub struct LibraryItem {
     /// The item's own description, or a catalog entry's, or none. Never filled with a guess.
     pub description: Option<String>,
     pub version: Option<String>,
+    /// The one game the item belongs to, when there is exactly one answer. `None` when nothing
+    /// ties the item to a game, or when instances of several games use it.
     pub game_id: Option<String>,
+    /// Every game the item is tied to, and nothing guessed: the game recorded on the item, the
+    /// catalog entry's game, the game of the item an installer or a Thunderstore import made it
+    /// from, and the game of each instance that uses it. Empty means "not tied to a game".
+    pub game_ids: Vec<String>,
     pub page_url: Option<String>,
     /// SHA-256 of the saved icon object, when one is stored.
     pub icon_sha256: Option<String>,
@@ -53,6 +59,15 @@ pub struct LibraryItem {
     pub source_label: String,
     /// The instances that have this item, by name.
     pub instances: Vec<LibraryInstanceRef>,
+    pub file_count: usize,
+    pub total_size: u64,
+    pub added_at_unix_ms: i64,
+    /// Plugin files (by the item's games' plugin-list patterns) at the item's top level or one
+    /// folder down, by file name. Empty for a game with no plugin list.
+    pub plugin_files: Vec<String>,
+    /// The item carries a FOMOD installer (`fomod/ModuleConfig.xml`), which asks its questions
+    /// when it is added to an instance.
+    pub has_installer: bool,
 }
 
 /// A store record that cannot be read. Listed so the user can see it and remove it, never skipped.
@@ -97,6 +112,9 @@ pub struct UnusedItem {
     pub name: String,
     pub total_size: u64,
     pub game_id: Option<String>,
+    /// The games the item is tied to without an instance: recorded, catalog, or the item it was
+    /// made from. Empty means "not tied to a game".
+    pub game_ids: Vec<String>,
 }
 
 /// Items no instance uses, with their total size. Unreadable instance manifests are warnings: the
@@ -131,6 +149,7 @@ impl LibraryIcon {
 pub fn list(ctx: &Ctx) -> Result<LibraryListing, ContentError> {
     let entries = content_store::list_items(ctx)?;
     let scan = scan_instances(ctx);
+    let own_games = own_games_by_item(&entries);
     let mut warnings = scan.warnings.clone();
     let mut registry = RegistryLookup::new(ctx);
     let mut items = Vec::new();
@@ -146,24 +165,35 @@ pub fn list(ctx: &Ctx) -> Result<LibraryListing, ContentError> {
                 let hashes: HashSet<&str> =
                     item.files.iter().map(|file| file.sha256.as_str()).collect();
                 let using = scan.using(&item.item_id, &hashes);
+                let mut game_ids = games_without_instances(&item, &own_games);
+                for instance in &using {
+                    push_unique(&mut game_ids, &instance.game_id);
+                }
                 let game_id = item
                     .game_id
                     .clone()
                     .or_else(|| catalog_game(&item))
-                    .or_else(|| unique_game(&using));
+                    .or_else(|| (game_ids.len() == 1).then(|| game_ids[0].clone()));
                 let description = resolve_description(&item, &mut registry, &mut warnings);
                 let (source_kind, source_label) = source_of(&item);
+                let plugin_files = plugin_files(ctx, &item, &game_ids);
                 items.push(LibraryItem {
                     item_id: item.item_id.clone(),
                     name: item.name.clone(),
                     description,
                     version: item.version.clone(),
                     game_id,
+                    game_ids,
                     page_url: item.page_url.clone(),
                     icon_sha256: item.icon_sha256.clone(),
                     source_kind,
                     source_label,
                     instances: using,
+                    file_count: item.files.len(),
+                    total_size: item.total_size,
+                    added_at_unix_ms: item.added_at_unix_ms,
+                    plugin_files,
+                    has_installer: has_installer(&item),
                 });
             }
         }
@@ -736,14 +766,90 @@ fn catalog_game(item: &ContentItem) -> Option<String> {
     })
 }
 
-fn unique_game(instances: &[LibraryInstanceRef]) -> Option<String> {
-    let mut games = instances.iter().map(|instance| instance.game_id.as_str());
-    let first = games.next()?;
-    if games.all(|game| game == first) {
-        Some(first.to_string())
-    } else {
-        None
+/// The games each readable item names by itself: its recorded game and its catalog entry's game.
+fn own_games_by_item(entries: &[ItemEntry]) -> BTreeMap<String, Vec<String>> {
+    let mut games = BTreeMap::new();
+    for item in entries.iter().filter_map(ItemEntry::readable) {
+        let mut own = Vec::new();
+        if let Some(game) = item.game_id.as_deref() {
+            push_unique(&mut own, game);
+        }
+        for source in &item.sources {
+            if let ContentSource::Catalog { game, .. } = source {
+                push_unique(&mut own, game);
+            }
+        }
+        games.insert(item.item_id.clone(), own);
     }
+    games
+}
+
+/// The games an item is tied to without looking at instances: its own, then those of the item a
+/// FOMOD installer or a Thunderstore import made it from (that item's own games, one level).
+fn games_without_instances(
+    item: &ContentItem,
+    own_games: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut games = own_games.get(&item.item_id).cloned().unwrap_or_default();
+    for source in &item.sources {
+        let parent = match source {
+            ContentSource::FomodInstall { from_item, .. }
+            | ContentSource::Thunderstore { from_item, .. } => from_item,
+            _ => continue,
+        };
+        for game in own_games.get(parent).into_iter().flatten() {
+            push_unique(&mut games, game);
+        }
+    }
+    games
+}
+
+fn push_unique(games: &mut Vec<String>, game: &str) {
+    if !game.is_empty() && !games.iter().any(|known| known == game) {
+        games.push(game.to_string());
+    }
+}
+
+/// Plugin files the item carries for any of `games` (by each game's plugin-list patterns), at the
+/// item's top level or one folder down. Deeper files are an installer's options, not plugins the
+/// game loads as they are.
+fn plugin_files(ctx: &Ctx, item: &ContentItem, games: &[String]) -> Vec<String> {
+    let patterns: Vec<String> = games
+        .iter()
+        .filter_map(|game| agora_game_api::GameId::new(game).ok())
+        .filter_map(|game| ctx.games.game(&game).cloned())
+        .filter_map(|definition| definition.plugin_list)
+        .flat_map(|rule| rule.patterns)
+        .map(|pattern| pattern.to_ascii_lowercase())
+        .collect();
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<String> = Vec::new();
+    for file in &item.files {
+        let path = file.path.as_str();
+        if path.split('/').count() > 2 {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let lower = name.to_ascii_lowercase();
+        let matches = patterns
+            .iter()
+            .any(|pattern| agora_game_api::glob_match(pattern, &lower));
+        if matches && !found.iter().any(|known| known.eq_ignore_ascii_case(name)) {
+            found.push(name.to_string());
+        }
+    }
+    found
+}
+
+/// Whether the item holds a FOMOD installer at its top level or inside one wrapper folder.
+fn has_installer(item: &ContentItem) -> bool {
+    item.files.iter().any(|file| {
+        let lower = file.path.as_str().to_ascii_lowercase();
+        lower == "fomod/moduleconfig.xml"
+            || (lower.ends_with("/fomod/moduleconfig.xml") && lower.split('/').count() == 3)
+    })
 }
 
 /// An item's description: its own, then the catalog entry it came from. A missing catalog is not
@@ -911,6 +1017,7 @@ pub fn any_instance_records_objects(ctx: &Ctx) -> bool {
 pub fn list_unused(ctx: &Ctx) -> Result<UnusedListing, ContentError> {
     let entries = content_store::list_items(ctx)?;
     let scan = scan_instances(ctx);
+    let own_games = own_games_by_item(&entries);
     if !scan.unreadable.is_empty() {
         return Ok(UnusedListing {
             items: Vec::new(),
@@ -934,6 +1041,7 @@ pub fn list_unused(ctx: &Ctx) -> Result<UnusedListing, ContentError> {
             name: item.name.clone(),
             total_size: item.total_size,
             game_id: item.game_id.clone().or_else(|| catalog_game(item)),
+            game_ids: games_without_instances(item, &own_games),
         });
     }
     items.sort_by(|a, b| {

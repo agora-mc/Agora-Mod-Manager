@@ -1713,6 +1713,29 @@ pub fn set_item_metadata(
     set_item_metadata_locked(ctx, item_id_or_prefix, metadata)
 }
 
+/// Record the game an item was added for, unless it already names one. An item added from a
+/// game's Library belongs to that game; a game recorded earlier (by a catalog install or a
+/// download) is never replaced. Returns the item as stored.
+pub fn record_game_if_missing(
+    ctx: &Ctx,
+    item_id_or_prefix: &str,
+    game_id: &str,
+) -> Result<ContentItem, ContentError> {
+    let game_id = game_id.trim();
+    if game_id.is_empty() {
+        return get_item(ctx, item_id_or_prefix);
+    }
+    let _lock = ctx
+        .lock_manager
+        .acquire(LockResource::ContentStore, "content-metadata")?;
+    let mut item = get_item(ctx, item_id_or_prefix)?;
+    if item.game_id.is_none() {
+        item.game_id = Some(game_id.to_string());
+        write_manifest_atomic(&ctx.paths, &item)?;
+    }
+    Ok(item)
+}
+
 /// [`set_item_metadata`] for a caller that already holds the content-store lock. Taking the lock
 /// again would deadlock, so the store's own icon path uses this to record the object and the item
 /// together.

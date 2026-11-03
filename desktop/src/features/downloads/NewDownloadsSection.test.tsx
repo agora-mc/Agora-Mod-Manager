@@ -58,23 +58,51 @@ describe('NewDownloadsSection', () => {
     invokeMock.mockReset();
   });
 
-  it('shows why each file was recognised and marks one already in the library', async () => {
-    route([mod, already]);
-    render(<NewDownloadsSection />);
+  it('lists only the open game’s downloads, says what each one is and why', async () => {
+    const skyrimToo = { ...already, alreadyInLibrary: false, sha256: 'e'.repeat(64), fileName: 'Other.7z' };
+    route([mod, skyrimToo]);
+    render(<NewDownloadsSection gameId="minecraft" />);
 
     const rows = await screen.findAllByTestId('new-download');
-    expect(rows).toHaveLength(2);
-
+    expect(rows).toHaveLength(1);
     const first = rows[0];
     expect(within(first).getByText(mod.fileName)).toBeInTheDocument();
-    expect(within(first).getByText(/Minecraft · mod · has fabric\.mod\.json/)).toBeInTheDocument();
-    expect(within(first).getByText('Nexus mod 32274')).toBeInTheDocument();
+    expect(first).toHaveTextContent('Mod · 2.0 MB · Nexus mod 32274');
+    expect(within(first).getByText('It has fabric.mod.json.')).toBeInTheDocument();
     expect(within(first).getByRole('button', { name: 'Add to library' })).toBeInTheDocument();
+    expect(screen.queryByText('Other.7z')).not.toBeInTheDocument();
+  });
 
-    const second = rows[1];
-    expect(within(second).getByText('Already in your library.')).toBeInTheDocument();
-    expect(within(second).queryByRole('button', { name: 'Add to library' })).not.toBeInTheDocument();
-    expect(within(second).queryByText(/Nexus mod/)).not.toBeInTheDocument();
+  it('marks a download already in the library and offers no add', async () => {
+    route([already]);
+    render(<NewDownloadsSection gameId="skyrim-se" />);
+
+    const row = await screen.findByTestId('new-download');
+    expect(within(row).getByText('Already in your library')).toBeInTheDocument();
+    expect(within(row).getByText("Cool.esp matches the game's content layout.")).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: 'Add to library' })).not.toBeInTheDocument();
+    expect(within(row).queryByText(/Nexus mod/)).not.toBeInTheDocument();
+  });
+
+  it('offers a modpack as a new instance, not a library item', async () => {
+    const pack = {
+      ...mod,
+      path: 'C:/Users/me/Downloads/Pack.mrpack',
+      fileName: 'Pack.mrpack',
+      sha256: 'f'.repeat(64),
+      kind: 'modpack',
+      reason: 'has modrinth.index.json',
+      nexusModId: null,
+    };
+    route([pack]);
+    render(<NewDownloadsSection gameId="minecraft" />);
+
+    const row = await screen.findByTestId('new-download');
+    expect(within(row).getByText(/^Modpack/)).toBeInTheDocument();
+    // Outside the app's pack-install provider the import cannot start, so the button says so by
+    // being disabled rather than doing nothing.
+    expect(within(row).getByRole('button', { name: 'Import as new instance…' })).toBeDisabled();
+    expect(within(row).queryByRole('button', { name: 'Add to library' })).not.toBeInTheDocument();
   });
 
   it('adds a download to the library and removes the row', async () => {
@@ -82,7 +110,7 @@ describe('NewDownloadsSection', () => {
     route([mod], () => {
       added += 1;
     });
-    render(<NewDownloadsSection />);
+    render(<NewDownloadsSection gameId="minecraft" />);
 
     fireEvent.click(await screen.findByRole('button', { name: 'Add to library' }));
 
@@ -100,7 +128,7 @@ describe('NewDownloadsSection', () => {
 
   it('ignores a download by hash and removes the row', async () => {
     route([mod]);
-    render(<NewDownloadsSection />);
+    render(<NewDownloadsSection gameId="minecraft" />);
 
     fireEvent.click(await screen.findByRole('button', { name: 'Ignore' }));
 
@@ -114,7 +142,7 @@ describe('NewDownloadsSection', () => {
 
   it('renders nothing when there are no new downloads', async () => {
     route([]);
-    const { container } = render(<NewDownloadsSection />);
+    const { container } = render(<NewDownloadsSection gameId="minecraft" />);
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('downloads_list'));
     expect(container).toBeEmptyDOMElement();
   });

@@ -29,6 +29,8 @@ pub struct LibraryRow {
     pub description: Option<String>,
     pub version: Option<String>,
     pub game_id: Option<String>,
+    /// Every game the item is tied to; empty means "not tied to a game".
+    pub game_ids: Vec<String>,
     pub page_url: Option<String>,
     /// The saved icon's object hash. Its bytes are fetched only by `games_library_icon`, when the
     /// row that needs it renders.
@@ -36,6 +38,11 @@ pub struct LibraryRow {
     pub source_kind: String,
     pub source_label: String,
     pub instances: Vec<LibraryInstanceRow>,
+    pub file_count: usize,
+    pub total_size: u64,
+    pub added_at_unix_ms: i64,
+    pub plugin_files: Vec<String>,
+    pub has_installer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,6 +84,7 @@ pub struct UnusedItemRow {
     pub name: String,
     pub total_size: u64,
     pub game_id: Option<String>,
+    pub game_ids: Vec<String>,
 }
 
 /// Items no instance uses, with their total size and any manifest that could not be read.
@@ -166,6 +174,7 @@ pub async fn games_library_list(app: tauri::AppHandle) -> Result<LibraryListing,
                 description: item.description,
                 version: item.version,
                 game_id: item.game_id,
+                game_ids: item.game_ids,
                 page_url: item.page_url,
                 icon_sha256: item.icon_sha256,
                 source_kind: item.source_kind.to_string(),
@@ -179,6 +188,11 @@ pub async fn games_library_list(app: tauri::AppHandle) -> Result<LibraryListing,
                         game_id: instance.game_id,
                     })
                     .collect(),
+                file_count: item.file_count,
+                total_size: item.total_size,
+                added_at_unix_ms: item.added_at_unix_ms,
+                plugin_files: item.plugin_files,
+                has_installer: item.has_installer,
             })
             .collect();
         Ok(LibraryListing {
@@ -215,6 +229,7 @@ pub async fn games_library_unused(app: tauri::AppHandle) -> Result<UnusedListing
                     name: item.name,
                     total_size: item.total_size,
                     game_id: item.game_id,
+                    game_ids: item.game_ids,
                 })
                 .collect(),
             total_size: listing.total_size,

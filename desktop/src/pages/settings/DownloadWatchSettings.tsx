@@ -109,29 +109,27 @@ export function DownloadWatchSettings() {
       id="settings-download-watch"
       icon={Download}
       title="Notice mod downloads"
-      description="While Agora is running, it can notice mod archives you download in your browser and list them in your Library. It recognises them by what is inside, never by the file name, and never imports one on its own."
+      description="While Agora is open, it can spot mods you download in your browser and list them in the Library of their game, ready to add. It looks inside each file to know what it is, and never adds anything on its own."
     >
       <div className="space-y-4">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 text-sm">
-            <p className="font-medium">
-              {notice ? 'Watching for new mods (on)' : 'Not watching (off)'}
-            </p>
+            <p className="font-medium">Watch for new mods</p>
             <p className="mt-1 text-xs text-muted-foreground">
-              Only common mod archives (.zip, .7z, .rar, .jar, .mrpack) for a game you have turned
-              on are offered. Anything else is ignored.
+              Looks at .jar, .zip, .7z, .rar and .mrpack files for the games you have turned on.
+              Everything else is left alone.
             </p>
           </div>
           <Switch
             checked={notice}
-            disabled={busy}
+            disabled={busy || ts.loading}
             onCheckedChange={(checked) => void toggleNotice(checked)}
             aria-label="Notice mod downloads"
           />
         </div>
 
         <div className="space-y-2">
-          <p className="text-sm font-medium">Folder</p>
+          <p className="text-sm font-medium">Folder to watch</p>
           <p className="break-all rounded-lg border border-border bg-background px-3 py-2 text-xs text-muted-foreground">
             {folder ?? defaultFolder ?? 'Your Downloads folder'}
           </p>
@@ -160,16 +158,16 @@ export function DownloadWatchSettings() {
 
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0 text-sm">
-            <p className="font-medium">Show a notification for new downloads</p>
+            <p className="font-medium">Tell me when a new mod arrives</p>
             <p className="mt-1 text-xs text-muted-foreground">
-              One quiet message per batch. The downloads still appear in your Library either way.
+              A short message in the corner. New mods are listed in the Library either way.
             </p>
           </div>
           <Switch
             checked={toast}
-            disabled={busy}
+            disabled={busy || ts.loading}
             onCheckedChange={(checked) => void toggleToast(checked)}
-            aria-label="Show a notification for new downloads"
+            aria-label="Tell me when a new mod arrives"
           />
         </div>
 
