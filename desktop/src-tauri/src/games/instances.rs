@@ -376,7 +376,7 @@ fn create_instance(
         .ok_or_else(|| {
             GamesError::new(
                 INSTALL_NOT_FOUND,
-                format!("No install '{install_id}' was found. Rescan the installs in Setup and try again."),
+                format!("No install '{install_id}' was found. Rescan the installs in Settings, on the game's Installs page, and try again."),
             )
         })?;
     if install.game.as_str() != game.as_str() {
@@ -845,7 +845,7 @@ fn base_finding(problem: &BaseProblem, blocks: bool) -> CheckFinding {
         detail: format!("{}: {}.{linked}", problem.path, problem_text(&problem.kind)),
         why: "The game's files differ from what Agora recorded when it built the base, so the game may behave oddly or crash."
             .to_string(),
-        repair: Some("Verify this base under Setup, pinned bases, or launch anyway at your own risk.".to_string()),
+        repair: Some("Verify this base on the game's Bases page in Settings, or launch anyway at your own risk.".to_string()),
     }
 }
 

@@ -21,14 +21,12 @@ const MINECRAFT_NAV = [
   'The Agora Difference',
   'Settings',
 ];
-// One sidebar for every game: the same entries, with the game's own (Import, Setup) after My Instances.
+// One sidebar for every game: the same entries, and none of the game's own.
 const GAME_NAV = [
   'Home',
   'Browse',
   'Library',
   'My Instances',
-  'Import',
-  'Setup',
   'Community Governance',
   'Help & Guide',
   'Field Guide',

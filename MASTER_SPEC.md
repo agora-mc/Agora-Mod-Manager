@@ -4645,9 +4645,14 @@ that the slices build on:
 - **What is remembered.** The chosen game is stored under the `active_game` setting. A launch
   opens that game's Instances tab, not Minecraft's Home. If discovery no longer finds the game, or
   fails, the app shows Minecraft and leaves the stored choice alone.
-- **The game's own navigation.** A non-Minecraft game shows Instances, Library, Import and Setup,
-  and the shared Settings. Minecraft-only entries are hidden. An instance page has Overview,
-  Content, Plugins, INI & saves and Tools.
+- **The game's own navigation.** A non-Minecraft game uses the one shared sidebar; its pages are
+  Instances and Library, under My Instances and Library. It has no entries of its own (2026-11-03,
+  "needless extra pages"): the Mod Organizer 2 import is a dialog opened from "Import instances"
+  on its Instances page, as Minecraft's "Import Instances" is, and its installs, bases and recovery
+  are the Installs, Bases and Recovery pages of its section in the Settings rail, next to New
+  instances. An old link to the retired Import or Setup page lands on Instances with the import
+  dialog open, or on that Settings section. An instance page has Overview, Content, Plugins,
+  INI & saves and Tools.
 - **Command layer.** Commands live in `desktop/src-tauri/src/games/`, one file per slice, and are
   registered in `lib.rs`. The scaffold's rule survives in `games/error.rs`: a command whose body does
   not exist fails with `not_implemented` and names itself, so nothing answers with a fake `null` or
@@ -4661,10 +4666,10 @@ that the slices build on:
 | Instances tab; instance Overview | instances | `GameInstancesPage`, `InstanceOverviewTab` |
 | Library: content store section | content | `LibraryStoreSection` |
 | Library: curated catalog section | catalog | `LibraryCatalogSection` |
-| Import tab | import | `GameImportPage` |
-| Setup: installs and custom folders | discovery | `SetupInstallsSection` |
-| Setup: pinned bases | bases | `SetupBasesSection` |
-| Setup: recovery | userFiles | `SetupRecoverySection` |
+| Instances: import dialog | import | `GameImportDialog` |
+| Settings › game › Installs: installs and custom folders | discovery | `InstallsSection` |
+| Settings › game › Bases: pinned bases | bases | `BasesSection` |
+| Settings › game › Recovery | userFiles | `RecoverySection` |
 | Instance Content; FOMOD wizard | content (mounts fomod) | `InstanceContentTab`, `FomodWizard` |
 | Instance Plugins | plugins | `InstancePluginsTab` |
 | Instance INI & saves | iniSaves | `InstanceIniSavesTab` |

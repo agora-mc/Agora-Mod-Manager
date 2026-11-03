@@ -12,7 +12,6 @@ const CARD_FILES = [
   '../Settings.tsx',
   './AiAssistantCard.tsx',
   './AppearanceSettings.tsx',
-  './game/InstallsBasesSettings.tsx',
   './game/NewInstancesSettings.tsx',
   './GameSupportSettings.tsx',
   './RuntimeReclaim.tsx',
@@ -68,6 +67,7 @@ describe('gameScope helpers', () => {
     expect(isSettingsCardVisible('game-installs', false)).toBe(true);
     expect(isSettingsCardVisible('game-new-instances', true)).toBe(false);
     expect(isSettingsCardVisible('game-bases', true)).toBe(false);
+    expect(isSettingsCardVisible('game-recovery', true)).toBe(false);
   });
 
   it('prefers a discovered game name and otherwise humanizes the id', () => {

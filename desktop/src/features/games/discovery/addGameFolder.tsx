@@ -1,6 +1,6 @@
 /**
  * The one "add a game folder" flow: pick a folder, let core identify and remember it, and hand the
- * accepted folder back to the screen that asked. Setup, Settings › Game support and More games all
+ * accepted folder back to the screen that asked. A game's Installs page, Settings › Game support and More games all
  * use this, so there is one behaviour and one set of words for the same action.
  */
 
@@ -19,7 +19,7 @@ export function gameErrorMessage(error: unknown): string {
 }
 
 interface AddGameFolderButtonProps extends Omit<ButtonProps, 'onClick' | 'children' | 'onError'> {
-  /** The visible label. The default is Setup's. */
+  /** The visible label. The default is the Installs page's. */
   label?: string;
   /** A label for a screen reader when several buttons share the visible label. */
   ariaLabel?: string;

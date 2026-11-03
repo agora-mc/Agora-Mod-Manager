@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { requestGameImport } from './gameImportRequest';
+import { requestSettingsSection } from './settingsSection';
 
-export type Tab = 'home' | 'browse' | 'library' | 'instances' | 'governance' | 'ai' | 'guide' | 'field-guide' | 'living-background' | 'lab' | 'about' | 'settings'
-  // The sidebar entries only a non-Minecraft game has (MASTER_SPEC §26.14). Sidebar ids only: a
-  // game page is opened as a `game-tab` destination, which carries the game it belongs to. A
-  // game's Instances and Library sit under the shared `instances` and `library` entries.
-  | 'game-import' | 'game-setup';
+// A non-Minecraft game's pages are `game-tab` destinations, which carry the game they belong to;
+// in the sidebar they sit under the shared `instances` and `library` entries (MASTER_SPEC §26.14).
+export type Tab = 'home' | 'browse' | 'library' | 'instances' | 'governance' | 'ai' | 'guide' | 'field-guide' | 'living-background' | 'lab' | 'about' | 'settings';
 
-/** The four game tabs, by the name a `game-tab` destination uses. */
-export type GameTabId = 'instances' | 'library' | 'import' | 'setup';
+/** A non-Minecraft game's own pages, by the name a `game-tab` destination uses. */
+export type GameTabId = 'instances' | 'library';
 
 /** The pages of one instance of a non-Minecraft game. */
 export type GameInstancePage = 'overview' | 'content' | 'plugins' | 'ini-saves' | 'tools';
 
-export const GAME_TAB_IDS: readonly GameTabId[] = ['instances', 'library', 'import', 'setup'];
+export const GAME_TAB_IDS: readonly GameTabId[] = ['instances', 'library'];
 export const GAME_INSTANCE_PAGE_IDS: readonly GameInstancePage[] = ['overview', 'content', 'plugins', 'ini-saves', 'tools'];
 
 /**
@@ -23,7 +23,7 @@ export const GAME_INSTANCE_PAGE_IDS: readonly GameInstancePage[] = ['overview', 
  * - `tab` — one of the sidebar tabs (home, browse, instances, governance, ai, guide, settings).
  * - `mod-detail` — browsing a specific curated item.
  * - `instance-detail` — editing a specific instance.
- * - `game-tab` — one of a non-Minecraft game's four tabs (Instances, Library, Import, Setup).
+ * - `game-tab` — one of a non-Minecraft game's own pages (Instances, Library).
  * - `game-instance` — an instance page of a non-Minecraft game.
  * - `plugin-page` — a page contributed by a community plugin, identified by its
  *   namespaced contribution id (`publisher.plugin/local`). Namespaced rather
@@ -36,7 +36,7 @@ export type Destination =
   | { type: 'mod-detail'; itemId: string; browseInstanceId?: string; browseContentType?: string }
   | { type: 'instance-detail'; instanceId: string }
   | { type: 'plugin-page'; contributionId: string }
-  // A game's own tab (Instances, Library, Import, Setup) and an instance page of that game.
+  // A game's own page (Instances, Library) and an instance page of that game.
   | { type: 'game-tab'; gameId: string; tab: GameTabId }
   | { type: 'game-instance'; gameId: string; instanceId: string; page: GameInstancePage };
 
@@ -88,6 +88,27 @@ function isValidDestination(d: unknown): d is Destination {
 
 const HOME: Destination = { type: 'tab', tab: 'home' };
 
+/**
+ * A destination saved before a game's Import and Setup pages were folded into its Instances page
+ * and its Settings section (an entry in the browser history, which survives a reload). Returns
+ * where that page lives now, after asking the new place to open the right part of it, or null for
+ * anything else. Never a blank page: an old link lands where its content went.
+ */
+function upgradeRetiredDestination(d: unknown): Destination | null {
+  if (!d || typeof d !== 'object') return null;
+  const dest = d as Record<string, unknown>;
+  if (dest.type !== 'game-tab' || typeof dest.gameId !== 'string') return null;
+  if (dest.tab === 'import') {
+    requestGameImport(dest.gameId);
+    return { type: 'game-tab', gameId: dest.gameId, tab: 'instances' };
+  }
+  if (dest.tab === 'setup') {
+    requestSettingsSection({ tab: 'game', page: 'installs' });
+    return { type: 'tab', tab: 'settings' };
+  }
+  return null;
+}
+
 export function useDestination(): UseDestinationReturn {
   // Depth into the browser's history stack, not a mirror of it.
   //
@@ -121,7 +142,11 @@ export function useDestination(): UseDestinationReturn {
     // the destination across refreshes. Only write Home when no valid
     // Agora destination exists in the history.
     const existingState = window.history.state as Record<string, unknown> | null;
-    const restoredDest = existingState?.__agora as Destination | undefined;
+    const upgraded = upgradeRetiredDestination(existingState?.__agora);
+    if (upgraded) {
+      window.history.replaceState({ ...existingState, __agora: upgraded }, '');
+    }
+    const restoredDest = (upgraded ?? existingState?.__agora) as Destination | undefined;
     if (restoredDest && isValidDestination(restoredDest)) {
       const restoredDepth = typeof existingState?.__agoraDepth === 'number'
         ? existingState.__agoraDepth
@@ -137,7 +162,11 @@ export function useDestination(): UseDestinationReturn {
 
     const handlePopState = (e: PopStateEvent) => {
       const state = e.state as Record<string, unknown> | null;
-      const restored = state?.__agora as Destination | undefined;
+      const upgraded = upgradeRetiredDestination(state?.__agora);
+      if (upgraded) {
+        window.history.replaceState({ ...state, __agora: upgraded }, '');
+      }
+      const restored = (upgraded ?? state?.__agora) as Destination | undefined;
       if (restored && isValidDestination(restored)) {
         const depth = typeof state?.__agoraDepth === 'number' ? state.__agoraDepth : 0;
         depthRef.current = depth;

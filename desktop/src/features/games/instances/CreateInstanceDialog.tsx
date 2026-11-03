@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { openGameSettings } from '@/lib/settingsSection';
 import { listInstalledGames } from '../discovery/api';
 import type { GameListing, InstallSummary } from '../shared/types';
 import { listGameSupport, type GameSupportRow } from '../support/api';
@@ -121,7 +122,18 @@ export function CreateInstanceDialog({ open, gameId, onOpenChange, onCreated }: 
 
         {installs.status === 'loaded' && !installs.turnedOff && available.length === 0 && (
           <p role="alert" className="rounded-lg border border-border p-3 text-sm">
-            Agora has not found an install of {gameName} on this machine. Rescan the installs in Setup, then try again.
+            Agora has not found an install of {gameName} on this machine. Rescan or add its folder on the{' '}
+            <button
+              type="button"
+              className="font-medium text-primary hover:underline"
+              onClick={() => {
+                onOpenChange(false);
+                openGameSettings('installs');
+              }}
+            >
+              Installs page in Settings
+            </button>
+            , then try again.
           </p>
         )}
 

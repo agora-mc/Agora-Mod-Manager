@@ -97,7 +97,7 @@ function GameSettingRow<Value extends string>({
 
 /**
  * The selected game's "New instances" page: the choices that fill in the create form (and the
- * Build a base form in Setup) for this game. Each game keeps its own, under keys that name it.
+ * Build a base form on the Bases page) for this game. Each game keeps its own, under keys that name it.
  */
 export function NewInstancesSettings({ gameId, gameName }: { gameId: string; gameName: string }) {
   const [settings, setSettings] = useState<Load<GameSettings>>({ status: 'loading' });
@@ -155,7 +155,7 @@ export function NewInstancesSettings({ gameId, gameName }: { gameId: string; gam
         <ul className="divide-y divide-border rounded-lg border border-border">
           <GameSettingRow
             label="Base type"
-            description="Linked shares most game files with the install and takes little space. Copied keeps its own copy of the game files. Setup uses this too when it builds a base."
+            description="Linked shares most game files with the install and takes little space. Copied keeps its own copy of the game files. “Build a base” on the Bases page starts with this choice too."
             value={choices.baseType}
             recommended={RECOMMENDED_GAME_SETTINGS.baseType}
             choices={BASE_TYPE_CHOICES}

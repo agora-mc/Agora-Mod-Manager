@@ -6,9 +6,12 @@ import {
   Coffee,
   Compass,
   Cpu,
+  FolderOpen,
   FolderSearch,
   Gamepad2,
   Landmark,
+  Layers,
+  LifeBuoy,
   PackageCheck,
   Paintbrush,
   Plug,
@@ -89,7 +92,10 @@ import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
 import { GameSupportSettings } from './settings/GameSupportSettings';
 import { NewInstancesSettings } from './settings/game/NewInstancesSettings';
-import { InstallsBasesSettings } from './settings/game/InstallsBasesSettings';
+import { settingsFrame } from './settings/game/settingsFrame';
+import { InstallsSection } from '../features/games/discovery';
+import { BasesSection } from '../features/games/bases';
+import { RecoverySection } from '../features/games/userFiles';
 import { GameIcon } from '../features/games/shared/GameIcon';
 import { gameShortName } from '../features/games/shared/gameNames';
 import {
@@ -205,7 +211,6 @@ export function Settings({
   activeGame,
   activeGameName,
   onSwitchToMinecraft,
-  onOpenGameSetup,
 }: {
   onResetLayout: () => void;
   /** Lets a settings card hand the user off to a full page (Living Background). */
@@ -216,8 +221,6 @@ export function Settings({
   activeGameName?: string | null;
   /** The shell's switch; Settings does not change the remembered game on its own. */
   onSwitchToMinecraft?: () => void;
-  /** Opens a game's Setup page, from that game's "Installs & bases" page. */
-  onOpenGameSetup?: (gameId: string) => void;
 }) {
   const ts = useTypedSettings();
   const { confirm } = useConfirm();
@@ -2468,7 +2471,7 @@ export function Settings({
       id: 'game',
       label: selectedGameShortName,
       icon: SelectedGameIcon,
-      hint: 'New instances, installs, bases',
+      hint: 'Installs, bases, recovery',
       blurb: `Your choices for ${selectedGameName}.`,
       pages: [
         {
@@ -2480,17 +2483,39 @@ export function Settings({
           )),
         },
         {
-          id: 'installs-bases',
-          label: 'Installs & bases',
-          cards: ['game-installs', 'game-bases'],
-          content: showsCard('game-installs') ? (
-            <InstallsBasesSettings
+          id: 'installs',
+          label: 'Installs',
+          cards: ['game-installs'],
+          content: card('game-installs', (
+            <InstallsSection
               gameId={selectedGameId}
-              gameName={selectedGameShortName}
-              onOpenSetup={onOpenGameSetup ? () => onOpenGameSetup(selectedGameId) : undefined}
-              onOpenGameSupport={() => openGameSupport()}
+              frame={settingsFrame('game-installs', FolderOpen, (
+                <p className="text-xs text-muted-foreground">
+                  To stop offering {selectedGameShortName}, turn it off in{' '}
+                  <button type="button" onClick={() => openGameSupport()} className="font-medium text-primary hover:underline">
+                    Game support
+                  </button>
+                  .
+                </p>
+              ))}
             />
-          ) : null,
+          )),
+        },
+        {
+          id: 'bases',
+          label: 'Bases',
+          cards: ['game-bases'],
+          content: card('game-bases', (
+            <BasesSection gameId={selectedGameId} gameName={selectedGameShortName} frame={settingsFrame('game-bases', Layers)} />
+          )),
+        },
+        {
+          id: 'recovery',
+          label: 'Recovery',
+          cards: ['game-recovery'],
+          content: card('game-recovery', (
+            <RecoverySection gameId={selectedGameId} frame={settingsFrame('game-recovery', LifeBuoy)} />
+          )),
         },
       ],
     },

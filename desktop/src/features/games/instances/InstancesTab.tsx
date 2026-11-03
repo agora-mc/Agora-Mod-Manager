@@ -3,6 +3,8 @@ import { Boxes, Download, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
 import { EmptyState, InstanceGrid, PageHero, PageHeroAction } from '@/components/instance-kit';
+import { GAME_IMPORT_REQUEST_EVENT, peekGameImportRequest, takeGameImportRequest } from '@/lib/gameImportRequest';
+import { GameImportDialog } from '../import';
 import { CreateInstanceDialog } from './CreateInstanceDialog';
 import { GameInstanceCard } from './GameInstanceCard';
 import {
@@ -19,8 +21,6 @@ interface GameInstancesPageProps {
   gameId: string;
   /** Open an instance's page. The shell owns the navigation; the slice only calls this. */
   onOpenInstance: (instanceId: string) => void;
-  /** Open the game's Import tab. Without it the page offers no import. */
-  onOpenImport?: () => void;
 }
 
 type LoadState =
@@ -32,10 +32,12 @@ type LoadState =
  * The Instances tab of a non-Minecraft game: the same page as Minecraft's "My Instances" (hero,
  * card grid, empty state), with this game's cards. Launch, Edit and Delete are on each card.
  */
-export function GameInstancesPage({ gameId, onOpenInstance, onOpenImport }: GameInstancesPageProps) {
+export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageProps) {
   const { confirm } = useConfirm();
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [createOpen, setCreateOpen] = useState(false);
+  // An old link to the retired Import page lands here with the import dialog open.
+  const [importOpen, setImportOpen] = useState(() => peekGameImportRequest(gameId));
   const [notice, setNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -67,6 +69,15 @@ export function GameInstancesPage({ gameId, onOpenInstance, onOpenImport }: Game
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    const take = () => {
+      if (takeGameImportRequest(gameId)) setImportOpen(true);
+    };
+    take();
+    window.addEventListener(GAME_IMPORT_REQUEST_EVENT, take);
+    return () => window.removeEventListener(GAME_IMPORT_REQUEST_EVENT, take);
+  }, [gameId]);
 
   // A game that closes turns its card back from Running.
   useEffect(() => {
@@ -116,7 +127,7 @@ export function GameInstancesPage({ gameId, onOpenInstance, onOpenImport }: Game
       setNotice(
         deleted.orphanedBase === null
           ? `${card.name} was deleted.${left}`
-          : `${card.name} was deleted. The base ${deleted.orphanedBase} is no longer used by any instance. Remove it under Setup, pinned bases, if you want the disk space back.${left}`,
+          : `${card.name} was deleted. The base ${deleted.orphanedBase} is no longer used by any instance. Remove it in Settings, on this game's Bases page, if you want the disk space back.${left}`,
       );
       load();
     } catch (error) {
@@ -128,13 +139,11 @@ export function GameInstancesPage({ gameId, onOpenInstance, onOpenImport }: Game
 
   const instances = state.status === 'loaded' ? state.instances : [];
   const running = instances.find((card) => card.running) ?? null;
-  const importAction = onOpenImport
-    ? (
-        <PageHeroAction icon={Download} onClick={onOpenImport}>
-          Import instances
-        </PageHeroAction>
-      )
-    : null;
+  const importAction = (
+    <PageHeroAction icon={Download} onClick={() => setImportOpen(true)}>
+      Import instances
+    </PageHeroAction>
+  );
 
   return (
     <section className="space-y-6" data-testid="game-instances-tab">
@@ -206,17 +215,23 @@ export function GameInstancesPage({ gameId, onOpenInstance, onOpenImport }: Game
                   <PageHeroAction primary icon={Plus} onClick={() => setCreateOpen(true)}>
                     Create the first instance
                   </PageHeroAction>
-                  {onOpenImport && (
-                    <PageHeroAction icon={Download} onClick={onOpenImport}>
-                      Import from another mod manager
-                    </PageHeroAction>
-                  )}
+                  <PageHeroAction icon={Download} onClick={() => setImportOpen(true)}>
+                    Import from Mod Organizer 2
+                  </PageHeroAction>
                 </>
               }
             />
           }
         />
       )}
+
+      <GameImportDialog
+        gameId={gameId}
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={refresh}
+        onOpenInstance={onOpenInstance}
+      />
 
       <CreateInstanceDialog
         open={createOpen}
