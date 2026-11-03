@@ -1,10 +1,13 @@
 /**
  * An instance of a non-Minecraft game, with its five pages (Overview, Content, Plugins,
- * INI & saves, Tools). The shell draws the header every page shares (the instance and Launch) and
- * the page switch; each page is a slot.
+ * INI & saves, Tools). The shell draws what every page shares, from the instance kit like
+ * Minecraft's instance page: Back, the header (the instance and Launch) and the tab strip; each
+ * page is a slot.
  */
 
 import type { GameInstancePage as GameInstancePageId } from '@/lib/useDestination';
+import { BackButton } from '@/components/ui/back-button';
+import { InstanceTabBar } from '@/components/instance-kit';
 import { InstanceHero, InstanceOverviewTab, InstanceSessionProvider } from '../instances';
 import { InstanceContentTab } from '../content';
 import { InstancePluginsTab } from '../plugins';
@@ -24,31 +27,11 @@ export function GameInstancePage({ gameId, instanceId, page, onNavigatePage, onB
   return (
     <InstanceSessionProvider key={instanceId} instanceId={instanceId}>
       <div className="space-y-4" data-testid="game-instance-page">
-        <button
-          type="button"
-          onClick={onBack}
-          className="text-sm font-medium text-muted-foreground underline-offset-4 hover:text-foreground hover:underline"
-        >
-          ← Instances
-        </button>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <BackButton onBack={onBack} label="Instances" />
+        </div>
         <InstanceHero onShowChecks={() => onNavigatePage('overview')} />
-        <nav aria-label="Instance pages" className="agora-tabbar">
-          {GAME_INSTANCE_PAGE_TABS.map((entry) => {
-            const isActive = entry.id === page;
-            return (
-              <button
-                key={entry.id}
-                type="button"
-                aria-current={isActive ? 'page' : undefined}
-                data-active={isActive}
-                onClick={() => onNavigatePage(entry.id)}
-                className="agora-tab text-sm"
-              >
-                {entry.label}
-              </button>
-            );
-          })}
-        </nav>
+        <InstanceTabBar tabs={GAME_INSTANCE_PAGE_TABS} active={page} onSelect={onNavigatePage} />
         {page === 'overview' && <InstanceOverviewTab gameId={gameId} instanceId={instanceId} />}
         {page === 'content' && <InstanceContentTab gameId={gameId} instanceId={instanceId} />}
         {page === 'plugins' && <InstancePluginsTab gameId={gameId} instanceId={instanceId} />}

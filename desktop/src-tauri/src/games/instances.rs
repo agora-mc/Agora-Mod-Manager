@@ -73,6 +73,8 @@ pub struct InstanceCard {
     /// `virtual`, `links` or `copies` when chosen; `None` means automatic (the game's default).
     pub deployment: Option<String>,
     pub last_launched_at: Option<String>,
+    /// When the instance was made (SQLite UTC, no zone), for the card's "Created" line.
+    pub created_at: String,
     pub running: bool,
 }
 
@@ -700,6 +702,7 @@ fn card_for(
         pinned: is_pinned(record),
         deployment: manifest.deployment.map(|mode| mode.as_str().to_string()),
         last_launched_at: record.last_launched_at.clone(),
+        created_at: record.created_at.clone(),
         running,
     }
 }
@@ -1341,6 +1344,7 @@ mod tests {
             "pinned",
             "deployment",
             "lastLaunchedAt",
+            "createdAt",
             "running",
         ] {
             assert!(card.get(key).is_some(), "card is missing {key}");

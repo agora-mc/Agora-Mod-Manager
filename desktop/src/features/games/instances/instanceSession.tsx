@@ -5,15 +5,16 @@
  *
  * The last answer for each instance is kept for the rest of the session, so reopening an instance
  * shows its checks at once and refreshes them in the background instead of starting blank.
+ *
+ * The launch itself (request, answer, the virtual file system question) lives in
+ * `launchController.ts`, so a launch started from an instance card shows here too.
  */
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   checkGameInstance,
   getGameInstance,
-  gamesErrorCode,
   gamesErrorMessage,
-  launchGameInstance,
   onInstanceExited,
   setGameInstanceDeployment,
   type DeploymentChoice,
@@ -22,6 +23,7 @@ import {
   type InstanceDetail,
   type LaunchReply,
 } from './api';
+import { clearGameLaunches, dismissGameLaunch, gameLaunchState, startGameLaunch, useGameLaunch } from './launchController';
 
 export interface InstanceSnapshot {
   detail: InstanceDetail;
@@ -58,9 +60,10 @@ const RUNNING_POLL_MS = 2000;
 
 const lastSeen = new Map<string, InstanceSnapshot>();
 
-/** Forget every remembered answer. Tests use it; nothing else needs to. */
+/** Forget every remembered answer and launch. Tests use it; nothing else needs to. */
 export function clearInstanceSessionCache(): void {
   lastSeen.clear();
+  clearGameLaunches();
 }
 
 const InstanceSessionContext = createContext<InstanceSession | null>(null);
@@ -79,10 +82,13 @@ export function useOptionalInstanceSession(): InstanceSession | null {
 
 export function InstanceSessionProvider({ instanceId, children }: { instanceId: string; children: ReactNode }) {
   const [page, setPage] = useState<InstancePageState>({ status: 'loading' });
-  const [busy, setBusy] = useState<'deployment' | 'launch' | null>(null);
-  const [launchStartedAt, setLaunchStartedAt] = useState<number | null>(null);
-  const [reply, setReply] = useState<LaunchReply | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [changing, setChanging] = useState(false);
+  const [ownError, setActionError] = useState<string | null>(null);
+  const launchState = useGameLaunch(instanceId);
+  const busy: InstanceSession['busy'] = launchState.busy ? 'launch' : changing ? 'deployment' : null;
+  const launchStartedAt = launchState.startedAt;
+  const reply = launchState.reply;
+  const actionError = ownError ?? launchState.error;
   const [launchAnyway, setLaunchAnyway] = useState(false);
   // An answer that arrives after the user moved to another instance is remembered, not shown.
   const shownId = useRef(instanceId);
@@ -126,7 +132,9 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
   useEffect(() => {
     const cached = lastSeen.get(instanceId);
     setPage(cached ? { status: 'loaded', ...cached, refreshing: true, refreshError: null } : { status: 'loading' });
-    setReply(null);
+    // A launch that started is over as far as this page is concerned; a question or a refusal
+    // (from a card's launch, say) still waits for an answer here.
+    if (gameLaunchState(instanceId).reply?.status === 'launched') dismissGameLaunch(instanceId);
     setActionError(null);
     setLaunchAnyway(false);
     loadReporting();
@@ -178,7 +186,7 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
   }, [running, busy, refreshDetail]);
 
   const changeDeployment = useCallback(async (choice: DeploymentChoice) => {
-    setBusy('deployment');
+    setChanging(true);
     setActionError(null);
     try {
       await setGameInstanceDeployment(instanceId, choice);
@@ -186,47 +194,32 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
       setActionError(`The way this instance runs was not changed. ${gamesErrorMessage(failure)}`);
       return;
     } finally {
-      setBusy(null);
+      setChanging(false);
     }
     // The change is saved at this point; a failed refresh must not read as a failed change.
     refreshDetail();
   }, [instanceId, refreshDetail]);
 
   const launch = useCallback(async (deployment?: DeploymentMode) => {
-    setBusy('launch');
-    setLaunchStartedAt(Date.now());
-    setReply(null);
     setActionError(null);
-    try {
-      const answer = await launchGameInstance(instanceId, { launchAnyway, deployment });
-      setReply(answer);
-      if (answer.status === 'launched') refreshDetail();
-    } catch (failure) {
-      setActionError(
-        gamesErrorCode(failure) === 'instance_running'
-          ? 'The game is already running from this instance.'
-          : `The game did not start. ${gamesErrorMessage(failure)}`,
-      );
-      refreshDetail();
-    } finally {
-      setBusy(null);
-      setLaunchStartedAt(null);
-    }
+    const answer = await startGameLaunch(instanceId, { launchAnyway, deployment });
+    // Launched, or failed outright: either way the header's running state may have changed.
+    if (answer === null || answer.status === 'launched') refreshDetail();
   }, [instanceId, launchAnyway, refreshDetail]);
 
   // The question the virtual file system raises: run once from the next rung, always from it, or
   // stop. Nothing runs until the user picks one.
   const answerFallback = useCallback(async (next: DeploymentMode, always: boolean) => {
-    setReply(null);
+    dismissGameLaunch(instanceId);
     if (always) {
-      setBusy('deployment');
+      setChanging(true);
       try {
         await setGameInstanceDeployment(instanceId, next);
       } catch (failure) {
         setActionError(`The way this instance runs was not changed. ${gamesErrorMessage(failure)}`);
         return;
       } finally {
-        setBusy(null);
+        setChanging(false);
       }
       await launch();
       return;
@@ -234,7 +227,7 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
     await launch(next);
   }, [instanceId, launch]);
 
-  const dismissReply = useCallback(() => setReply(null), []);
+  const dismissReply = useCallback(() => dismissGameLaunch(instanceId), [instanceId]);
 
   const session = useMemo<InstanceSession>(() => ({
     instanceId,

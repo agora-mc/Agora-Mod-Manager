@@ -1,23 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Boxes, Play, Plus, Trash2 } from 'lucide-react';
+import { Boxes, Download, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { InstanceIcon, MetaChip } from '@/components/InstanceIcon';
 import { useConfirm } from '@/components/ui/confirm';
+import { EmptyState, InstanceGrid, PageHero, PageHeroAction } from '@/components/instance-kit';
 import { CreateInstanceDialog } from './CreateInstanceDialog';
+import { GameInstanceCard } from './GameInstanceCard';
 import {
   deleteGameInstance,
   gamesErrorCode,
   gamesErrorMessage,
   listGameInstances,
+  onInstanceExited,
   type DeletedInstance,
   type InstanceCard,
 } from './api';
-import { deploymentLabel, formatWhen } from './instanceText';
 
 interface GameInstancesPageProps {
   gameId: string;
   /** Open an instance's page. The shell owns the navigation; the slice only calls this. */
   onOpenInstance: (instanceId: string) => void;
+  /** Open the game's Import tab. Without it the page offers no import. */
+  onOpenImport?: () => void;
 }
 
 type LoadState =
@@ -25,8 +28,11 @@ type LoadState =
   | { status: 'failed'; message: string }
   | { status: 'loaded'; instances: InstanceCard[] };
 
-/** The Instances tab of a non-Minecraft game: its instances as cards, with create and delete. */
-export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageProps) {
+/**
+ * The Instances tab of a non-Minecraft game: the same page as Minecraft's "My Instances" (hero,
+ * card grid, empty state), with this game's cards. Launch, Edit and Delete are on each card.
+ */
+export function GameInstancesPage({ gameId, onOpenInstance, onOpenImport }: GameInstancesPageProps) {
   const { confirm } = useConfirm();
   const [state, setState] = useState<LoadState>({ status: 'loading' });
   const [createOpen, setCreateOpen] = useState(false);
@@ -48,9 +54,35 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
       });
   }, [gameId]);
 
+  // Read the list again without the loading skeleton: after a launch, or when a game closes.
+  const refresh = useCallback(() => {
+    const request = ++latest.current;
+    listGameInstances(gameId)
+      .then((list) => {
+        if (request === latest.current) setState({ status: 'loaded', instances: list.instances });
+      })
+      .catch(() => undefined);
+  }, [gameId]);
+
   useEffect(() => {
     load();
   }, [load]);
+
+  // A game that closes turns its card back from Running.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    onInstanceExited(() => refresh())
+      .then((stop) => {
+        if (cancelled) stop();
+        else unlisten = stop;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refresh]);
 
   const remove = async (card: InstanceCard) => {
     const approved = await confirm({
@@ -94,20 +126,37 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
     }
   };
 
+  const instances = state.status === 'loaded' ? state.instances : [];
+  const running = instances.find((card) => card.running) ?? null;
+  const importAction = onOpenImport
+    ? (
+        <PageHeroAction icon={Download} onClick={onOpenImport}>
+          Import instances
+        </PageHeroAction>
+      )
+    : null;
+
   return (
     <section className="space-y-6" data-testid="game-instances-tab">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">Instances</h2>
-          <p className="text-sm text-muted-foreground">
-            Each instance is its own setup of this game: its mods, its load order and its saves.
-          </p>
-        </div>
-        <Button type="button" onClick={() => setCreateOpen(true)} disabled={state.status !== 'loaded'}>
-          <Plus aria-hidden="true" />
-          New instance
-        </Button>
-      </header>
+      <PageHero
+        icon={Boxes}
+        title="Instances"
+        description="Each instance is its own setup of this game: its mods, its load order and its saves."
+        chips={state.status === 'loaded' && instances.length > 0
+          ? [
+              `${instances.length} instance${instances.length === 1 ? '' : 's'}`,
+              running === null ? null : `● ${running.name} running`,
+            ]
+          : []}
+        actions={
+          <>
+            {importAction}
+            <PageHeroAction primary icon={Plus} onClick={() => setCreateOpen(true)} disabled={state.status !== 'loaded'}>
+              New instance
+            </PageHeroAction>
+          </>
+        }
+      />
 
       {notice !== null && (
         <p role="status" className="rounded-lg border border-border bg-card p-3 text-sm">
@@ -120,82 +169,53 @@ export function GameInstancesPage({ gameId, onOpenInstance }: GameInstancesPageP
         </p>
       )}
 
-      {state.status === 'loading' && (
-        <p className="text-sm text-muted-foreground" role="status">Loading instances…</p>
-      )}
-
-      {state.status === 'failed' && (
+      {state.status === 'failed' ? (
         <div role="alert" className="space-y-3 rounded-xl border border-destructive/50 bg-destructive/10 p-6">
           <h3 className="font-semibold">The instances could not be loaded</h3>
           <p className="text-sm">{state.message}</p>
           <Button type="button" variant="outline" onClick={load}>Try again</Button>
         </div>
-      )}
-
-      {state.status === 'loaded' && state.instances.length === 0 && (
-        <div className="space-y-3 rounded-xl border border-dashed border-border bg-card/60 p-8 text-center" data-testid="instances-empty">
-          <Boxes className="mx-auto size-10 text-muted-foreground" aria-hidden="true" />
-          <h3 className="text-lg font-semibold">No instances yet</h3>
-          <p className="mx-auto max-w-md text-sm text-muted-foreground">
-            An instance starts from an install of this game that Agora found on this machine. Create one, then add mods to it.
-          </p>
-          <Button type="button" onClick={() => setCreateOpen(true)}>
-            <Plus aria-hidden="true" />
-            Create the first instance
-          </Button>
-        </div>
-      )}
-
-      {state.status === 'loaded' && state.instances.length > 0 && (
-        <ul className="grid gap-4 md:grid-cols-2" aria-label="Instances">
-          {state.instances.map((card) => (
-            <li
-              key={card.instanceId}
-              className={`instance-card flex flex-col gap-4 rounded-xl border border-border bg-card p-4${card.running ? ' instance-card--running' : ''}`}
-              data-testid="instance-card"
-            >
-              <div className="flex min-w-0 items-start gap-3">
-                <InstanceIcon name={card.name} seed={card.instanceId} />
-                <div className="min-w-0">
-                  <h3 className="wrap-break-word font-semibold">{card.name}</h3>
-                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                    <MetaChip>{[card.store, card.version].filter(Boolean).join(' ') || 'Runtime not recorded'}</MetaChip>
-                    <MetaChip>{deploymentLabel(card.deployment)}</MetaChip>
-                    <MetaChip>{card.pinned ? 'Pinned base' : 'Runs from install'}</MetaChip>
-                  </div>
-                  <p className="mt-1.5 text-xs text-muted-foreground">
-                    {card.running ? (
-                      <span className="inline-flex items-center gap-1.5 text-green-600 dark:text-green-400">
-                        <span className="instance-status-dot" aria-hidden="true" />
-                        Running now
-                      </span>
-                    ) : card.lastLaunchedAt ? (
-                      `Last played ${formatWhen(card.lastLaunchedAt)}`
-                    ) : (
-                      'Never played'
-                    )}
-                  </p>
-                </div>
-              </div>
-              <div className="mt-auto flex flex-wrap gap-2">
-                <Button type="button" onClick={() => onOpenInstance(card.instanceId)}>
-                  <Play aria-hidden="true" />
-                  Open
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => void remove(card)}
-                  disabled={busyId !== null || card.running}
-                  aria-label={`Delete ${card.name}`}
-                >
-                  <Trash2 aria-hidden="true" />
-                  Delete
-                </Button>
-              </div>
-            </li>
-          ))}
-        </ul>
+      ) : (
+        <InstanceGrid
+          loading={state.status === 'loading'}
+          label="Instances"
+          groups={[{
+            id: '',
+            label: 'Instances',
+            count: instances.length,
+            cards: instances.map((card) => (
+              <GameInstanceCard
+                key={card.instanceId}
+                card={card}
+                onOpen={() => onOpenInstance(card.instanceId)}
+                onDelete={() => void remove(card)}
+                deleting={busyId === card.instanceId}
+                locked={busyId !== null}
+                onLaunchSettled={refresh}
+              />
+            )),
+          }]}
+          empty={
+            <EmptyState
+              testId="instances-empty"
+              icon={Boxes}
+              title="No instances yet"
+              body="An instance starts from an install of this game that Agora found on this machine. Create one, then add mods to it."
+              actions={
+                <>
+                  <PageHeroAction primary icon={Plus} onClick={() => setCreateOpen(true)}>
+                    Create the first instance
+                  </PageHeroAction>
+                  {onOpenImport && (
+                    <PageHeroAction icon={Download} onClick={onOpenImport}>
+                      Import from another mod manager
+                    </PageHeroAction>
+                  )}
+                </>
+              }
+            />
+          }
+        />
       )}
 
       <CreateInstanceDialog

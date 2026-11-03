@@ -140,13 +140,50 @@ test('the Instances tab shows each instance as a card with its runtime, pinning 
   const cards = page.getByTestId('instance-card');
   await expect(cards).toHaveCount(2);
 
-  await expect(cardFor(page, 'Grounded')).toContainText('steam 1.6.1170');
+  await expect(cardFor(page, 'Grounded')).toContainText('Steam 1.6.1170');
   await expect(cardFor(page, 'Grounded')).toContainText('Pinned base');
   await expect(cardFor(page, 'Grounded')).toContainText('Automatic');
 
   await expect(cardFor(page, 'Modded')).toContainText('Runs from install');
   await expect(cardFor(page, 'Modded')).toContainText('Linked files');
   await expect(cardFor(page, 'Modded')).toContainText('Never');
+});
+
+test('a card offers Launch, Edit and Delete, and no button for what games cannot do yet', async ({ page }) => {
+  await boot(page, { games_instance_list: { instances: [grounded] } });
+
+  const card = cardFor(page, 'Grounded');
+  await expect(card.getByRole('button')).toHaveText(['Launch', 'Edit', 'Delete']);
+  await expect(card.getByRole('button', { name: 'Open', exact: true })).toHaveCount(0);
+  await expect(page.getByTestId('game-instances-tab').getByRole('heading', { name: 'Instances', exact: true })).toBeVisible();
+  await expect(page.getByText('1 instance', { exact: true })).toBeVisible();
+});
+
+test('a launch from the card that the checks refused starts nothing and leads to the instance page', async ({ page }) => {
+  await boot(page, {
+    games_instance_list: { instances: [grounded] },
+    games_instance_get: groundedDetail,
+    games_instance_check: blockedCheck,
+    games_instance_launch: {
+      status: 'refused',
+      pid: null,
+      deployment: null,
+      notice: null,
+      findings: [extenderFinding],
+      reason: null,
+      next: null,
+    },
+  });
+
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Launch Grounded' }).click();
+  const banner = cardFor(page, 'Grounded').getByTestId('card-launch-refused');
+  await expect(banner).toContainText('Nothing was started.');
+  await banner.getByRole('button', { name: 'Review Grounded' }).click();
+
+  // The page shows the same launch's answer, where the checks and launch-anyway live.
+  await expect(page.getByTestId('instance-hero').getByRole('heading', { name: 'Grounded', exact: true })).toBeVisible();
+  await expect(page.getByRole('alert').filter({ hasText: 'The launch was stopped by these checks' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '← Instances' })).toBeVisible();
 });
 
 test('an empty game says what to do next, and the first instance is one button away', async ({ page }) => {
@@ -174,7 +211,7 @@ test('an instance opens to its Overview, where a framework that does not match b
     games_instance_check: blockedCheck,
   });
 
-  await cardFor(page, 'Grounded').getByRole('button', { name: 'Open' }).click();
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Edit Grounded' }).click();
 
   await expect(page.getByTestId('instance-hero').getByRole('heading', { name: 'Grounded', exact: true })).toBeVisible();
   await expect(page.getByTestId('frameworks-status')).toHaveText('Do not match this game version');
@@ -203,7 +240,7 @@ test('a clean check says so, and a launch the checks refused starts nothing and 
     },
   });
 
-  await cardFor(page, 'Grounded').getByRole('button', { name: 'Open' }).click();
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Edit Grounded' }).click();
   await expect(page.getByTestId('frameworks-status')).toHaveText('Match this game version');
 
   await page.getByRole('button', { name: 'Launch Grounded' }).click();
@@ -232,7 +269,7 @@ test('when the virtual file system will not start, the page asks before it runs 
     },
   });
 
-  await cardFor(page, 'Grounded').getByRole('button', { name: 'Open' }).click();
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Edit Grounded' }).click();
   await page.getByRole('button', { name: 'Launch Grounded' }).click();
 
   const question = page.getByTestId('vfs-question');
@@ -306,7 +343,7 @@ test('a launch that starts names the process, how it runs, and what the page doe
     },
   });
 
-  await cardFor(page, 'Grounded').getByRole('button', { name: 'Open' }).click();
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Edit Grounded' }).click();
   await page.getByRole('button', { name: 'Launch Grounded' }).click();
 
   const result = page.getByRole('status').filter({ hasText: 'The game is starting (process 4242)' });

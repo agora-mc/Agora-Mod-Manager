@@ -1,51 +1,36 @@
 /**
- * The header every page of a game instance shares, in the shape of the Minecraft instance page:
- * the instance's tile, name and facts on the left, Launch and how ready it is on the right, and
- * whatever a launch answers right under it, so a launch started from any page is seen.
+ * The header every page of a game instance shares: a thin adapter that fills the kit's
+ * `InstancePageHeader` (the same header as Minecraft's instance page) with this instance: its
+ * tile, name and facts on the left, Launch and how ready it is on the right, and whatever a launch
+ * answers right under it, so a launch started from any page (or from the instance's card) is seen.
  */
 
 import { useEffect, useState } from 'react';
-import { Loader2, Play } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { InstanceIcon, MetaChip } from '@/components/InstanceIcon';
+import { InstanceIcon } from '@/components/InstanceIcon';
+import {
+  InstancePageHeader,
+  ReadinessLine,
+  type InstanceAction,
+  type ReadinessView,
+} from '@/components/instance-kit';
 import type { DeploymentMode, InstanceCheck, LaunchReply } from './api';
 import { checkHeadline, deploymentLabel, elapsedText, fallbackTradeoffs } from './instanceText';
+import { createdOn, playedWhen } from './instanceDates';
+import { GAME_INSTANCE_CAPABILITIES, InstanceChips } from './instanceIdentity';
 import { useInstanceSession } from './instanceSession';
 
-type Readiness = 'blocked' | 'review' | 'ready' | 'unknown';
-
-function readinessOf(check: InstanceCheck | null, checkError: string | null): Readiness {
-  if (checkError !== null || check === null) return 'unknown';
-  if (check.status === 'findings') return 'blocked';
-  if (check.status === 'warnings') return 'review';
-  return 'ready';
-}
-
-const READINESS_CLASS: Record<Readiness, string> = {
-  blocked: 'text-destructive',
-  review: 'text-amber-700 dark:text-amber-300',
-  ready: 'text-green-700 dark:text-green-400',
-  unknown: 'text-muted-foreground',
-};
-
-/** A backend time (SQLite UTC, no zone), or null when it does not parse. */
-function parseStored(value: string): Date | null {
-  const parsed = new Date(`${value.trim().replace(' ', 'T')}Z`);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-}
-
-/** `Created Oct 1, 2026`, or null when the stored date does not parse. */
-function createdText(value: string): string | null {
-  const parsed = parseStored(value);
-  if (parsed === null) return null;
-  return `Created ${new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric' }).format(parsed)}`;
-}
-
-/** `Oct 29, 2026, 6:30 PM`; a value that does not parse is shown as it came. */
-function playedWhen(value: string): string {
-  const parsed = parseStored(value);
-  if (parsed === null) return value;
-  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(parsed);
+/** The checks' answer as the kit's readiness line. */
+export function readinessView(check: InstanceCheck | null, checkError: string | null, refreshing: boolean): ReadinessView {
+  if (checkError !== null) return { level: 'unknown', headline: 'The checks could not run' };
+  const level = check === null
+    ? 'unknown'
+    : check.status === 'findings'
+      ? 'blocked'
+      : check.status === 'warnings'
+        ? 'check'
+        : 'ready';
+  return { level, headline: checkHeadline(check), refreshing: refreshing && check !== null };
 }
 
 export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
@@ -72,81 +57,55 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
   if (page.status !== 'loaded') return null;
 
   const { detail, check, checkError, refreshing } = page;
-  const readiness = readinessOf(check, checkError);
-  const runtime = [detail.store, detail.version, detail.build].filter(Boolean).join(' ');
-  const created = createdText(detail.createdAt);
+  const created = createdOn(detail.createdAt);
   const elapsed = launchStartedAt === null ? 0 : (now - launchStartedAt) / 1000;
 
+  // While the game runs there is nothing to press until games can be stopped (`kill`): the
+  // header says it is running instead of showing a dead button.
+  const launch: InstanceAction | undefined = detail.running
+    ? undefined
+    : {
+        id: 'launch',
+        label: busy === 'launch' ? 'Starting…' : 'Launch',
+        ariaLabel: `Launch ${detail.name}`,
+        busy: busy === 'launch',
+        disabled: busy !== null,
+        onSelect: () => void session.launch(),
+      };
+
+  const showBanners = busy === 'launch' || reply !== null || actionError !== null;
+
   return (
-    <section
-      className={`rounded-xl border bg-card p-6 ${detail.running ? 'instance-card--running border-border' : 'border-border'}`}
-      data-testid="instance-hero"
-    >
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-        <div className="flex min-w-0 items-start gap-4">
-          <InstanceIcon name={detail.name} seed={detail.instanceId} size={64} />
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-3">
-              <h2 className="wrap-break-word text-2xl font-bold">{detail.name}</h2>
-              {detail.running && (
-                <span className="rounded-full bg-primary px-2.5 py-0.5 text-xs font-semibold text-primary-foreground" role="status">
-                  Running now
-                </span>
-              )}
-            </div>
-            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-              <MetaChip>{detail.gameName}</MetaChip>
-              {runtime !== '' && <MetaChip>{runtime}</MetaChip>}
-              <MetaChip>{deploymentLabel(detail.deployment)}</MetaChip>
-              <MetaChip>{detail.pinned ? 'Pinned base' : 'Runs from install'}</MetaChip>
-            </div>
-            <p className="mt-2 text-xs text-muted-foreground">
-              {detail.running ? (
-                <span className="inline-flex items-center gap-1.5 text-green-600 dark:text-green-400">
-                  <span className="instance-status-dot" aria-hidden="true" />
-                  Playing now
-                </span>
-              ) : detail.lastLaunchedAt ? (
-                `Last played ${playedWhen(detail.lastLaunchedAt)}`
-              ) : (
-                'Never played'
-              )}
-              {created !== null && <span> · {created}</span>}
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-col items-start gap-2 xl:items-end">
-          <button
-            type="button"
-            onClick={() => void session.launch()}
-            disabled={busy !== null || detail.running}
-            className="inline-flex items-center gap-2 rounded-lg bg-primary px-5 py-3 text-base font-semibold text-primary-foreground shadow-xs hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-            aria-label={`Launch ${detail.name}`}
-          >
-            {busy === 'launch' ? (
-              <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
-            ) : (
-              <Play className="h-5 w-5 fill-current" aria-hidden="true" />
-            )}
-            {busy === 'launch' ? 'Starting…' : detail.running ? 'Running' : 'Launch'}
-          </button>
-          <button
-            type="button"
-            onClick={onShowChecks}
-            className={`max-w-sm text-left text-xs font-medium underline-offset-4 hover:underline xl:text-right ${READINESS_CLASS[readiness]}`}
-            data-testid="instance-readiness"
-          >
-            {checkError !== null ? 'The checks could not run' : checkHeadline(check)}
-            {refreshing && check !== null && (
-              <span className="ml-1.5 font-normal text-muted-foreground">· checking again…</span>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {(busy === 'launch' || reply !== null || actionError !== null) && (
-        <div className="mt-4 space-y-3 border-t border-border pt-4">
+    <InstancePageHeader
+      testId="instance-hero"
+      running={detail.running}
+      tile={<InstanceIcon name={detail.name} seed={detail.instanceId} size={64} />}
+      name={detail.name}
+      status={detail.running && (
+        <span className="rounded-full bg-primary px-2.5 py-0.5 text-xs font-semibold text-primary-foreground" role="status">
+          Running now
+        </span>
+      )}
+      chips={
+        <InstanceChips
+          store={detail.store}
+          version={detail.version}
+          build={detail.build}
+          deployment={detail.deployment}
+          pinned={detail.pinned}
+        />
+      }
+      facts={[
+        detail.lastLaunchedAt ? `Last played ${playedWhen(detail.lastLaunchedAt)}` : 'Never played',
+        created === null ? null : `Created ${created}`,
+      ]}
+      capabilities={GAME_INSTANCE_CAPABILITIES}
+      primaryAction={launch}
+      readiness={!detail.running && (
+        <ReadinessLine readiness={readinessView(check, checkError, refreshing)} onSelect={onShowChecks} />
+      )}
+      banners={showBanners && (
+        <>
           {actionError !== null && (
             <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
               {actionError}
@@ -167,9 +126,9 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
               onDismiss={session.dismissReply}
             />
           )}
-        </div>
+        </>
       )}
-    </section>
+    />
   );
 }
 

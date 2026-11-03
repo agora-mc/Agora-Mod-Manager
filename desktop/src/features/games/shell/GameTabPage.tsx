@@ -17,12 +17,14 @@ interface GameTabPageProps {
   tab: GameTabId;
   /** Open an instance's page from the Instances tab. */
   onOpenInstance: (instanceId: string) => void;
+  /** Open the Import tab (the Instances page offers it next to New instance). */
+  onOpenImport?: () => void;
 }
 
-export function GameTabPage({ gameId, tab, onOpenInstance }: GameTabPageProps) {
+export function GameTabPage({ gameId, tab, onOpenInstance, onOpenImport }: GameTabPageProps) {
   switch (tab) {
     case 'instances':
-      return <GameInstancesPage gameId={gameId} onOpenInstance={onOpenInstance} />;
+      return <GameInstancesPage gameId={gameId} onOpenInstance={onOpenInstance} onOpenImport={onOpenImport} />;
     case 'library':
       return (
         <div className="space-y-6">
