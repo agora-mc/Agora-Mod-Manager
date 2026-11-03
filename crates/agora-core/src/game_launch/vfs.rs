@@ -316,6 +316,8 @@ mod windows {
 
         let mut child = cmd.spawn().map_err(LaunchError::Io)?;
         let process = child.as_raw_handle() as HANDLE;
+        // Still suspended, so nothing it starts can escape the job. Stop ends the job.
+        let job = crate::process_job::attach(&child);
 
         // From here on the process exists: any failure must end it.
         // SAFETY: `process` is the live handle `child` owns and `event` outlives the call.
@@ -334,8 +336,9 @@ mod windows {
         } else {
             None
         };
-        let identity = process_identity::capture(child.id())
+        let mut identity = process_identity::capture(child.id())
             .map_err(|e| LaunchError::ProcessCapture(format!("{e}")))?;
+        identity.job = job;
         Ok(LaunchedGame {
             child,
             identity,

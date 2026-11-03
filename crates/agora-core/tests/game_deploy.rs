@@ -1308,6 +1308,7 @@ impl agora_core::game_launch::Launcher for FakeLauncher {
                 pid,
                 start_time: 0,
                 expected_exe: None,
+                job: None,
             },
             program: prepared.resolved.program.clone(),
             output: None,

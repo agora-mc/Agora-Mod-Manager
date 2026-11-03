@@ -13,6 +13,17 @@ export type DeploymentMode = 'virtual' | 'links' | 'copies';
 export type DeploymentChoice = DeploymentMode | 'auto';
 export type BaseMode = 'linked' | 'copied';
 
+/** What the page may offer for this game and instance. */
+export interface InstanceCapabilities {
+  launch: boolean;
+  stop: boolean;
+  rename: boolean;
+  clone: boolean;
+  trash: boolean;
+  openFolder: boolean;
+  playTime: boolean;
+}
+
 export interface InstanceCard {
   instanceId: string;
   gameId: string;
@@ -24,7 +35,10 @@ export interface InstanceCard {
   lastLaunchedAt: string | null;
   /** When the instance was made. Optional: a card from an older backend has none. */
   createdAt?: string | null;
+  lastPlayedAt: string | null;
+  playTimeMs: number;
   running: boolean;
+  capabilities: InstanceCapabilities;
 }
 
 export interface InstanceList {
@@ -47,7 +61,10 @@ export interface InstanceDetail {
   saves: 'shared' | 'own';
   createdAt: string;
   lastLaunchedAt: string | null;
+  lastPlayedAt: string | null;
+  playTimeMs: number;
   running: boolean;
+  capabilities: InstanceCapabilities;
 }
 
 export type FindingKind = 'framework' | 'load_order' | 'tool' | 'base';
@@ -103,6 +120,53 @@ export interface DeletedInstance {
   orphanedBase: string | null;
   /** A deployed game folder Agora could not prove was the instance's, left where it was. */
   leftInPlace: string | null;
+  /** The Recently deleted entry it can be restored from. */
+  trashEntryId: string | null;
+}
+
+export interface RenamedInstance {
+  instanceId: string;
+  name: string;
+}
+
+export interface ClonedInstance {
+  instanceId: string;
+  name: string;
+}
+
+export interface StoppedInstance {
+  instanceId: string;
+  processesEnded: number;
+  playTimeMs: number;
+}
+
+/** One entry in Recently deleted. */
+export interface DeletedEntry {
+  entryId: string;
+  instanceId: string;
+  gameId: string;
+  name: string;
+  deletedAt: string;
+  expiresAt: string;
+  sizeBytes: number;
+}
+
+export interface DeletedList {
+  entries: DeletedEntry[];
+  /** The player's retention window, in days. */
+  retentionDays: number;
+}
+
+export interface RestoredInstance {
+  instanceId: string;
+  originalInstanceId: string;
+  renamed: boolean;
+}
+
+export interface PurgedDeleted {
+  purged: number;
+  failed: number;
+  kept: number;
 }
 
 export interface InstanceDeployment {
@@ -154,6 +218,12 @@ function isDeployment(value: unknown): value is DeploymentMode | null {
   return value === null || (typeof value === 'string' && DEPLOYMENTS.includes(value));
 }
 
+function isCapabilities(value: unknown): value is InstanceCapabilities {
+  if (!isRecord(value)) return false;
+  return ['launch', 'stop', 'rename', 'clone', 'trash', 'openFolder', 'playTime']
+    .every((key) => typeof value[key] === 'boolean');
+}
+
 function isCard(value: unknown): value is InstanceCard {
   if (!isRecord(value)) return false;
   return typeof value.instanceId === 'string'
@@ -161,11 +231,25 @@ function isCard(value: unknown): value is InstanceCard {
     && typeof value.name === 'string'
     && typeof value.pinned === 'boolean'
     && typeof value.running === 'boolean'
+    && typeof value.playTimeMs === 'number'
     && isOptionalString(value.store)
     && isOptionalString(value.version)
     && isOptionalString(value.lastLaunchedAt)
     && isOptionalString(value.createdAt)
-    && isDeployment(value.deployment);
+    && isOptionalString(value.lastPlayedAt)
+    && isDeployment(value.deployment)
+    && isCapabilities(value.capabilities);
+}
+
+function isDeletedEntry(value: unknown): value is DeletedEntry {
+  if (!isRecord(value)) return false;
+  return typeof value.entryId === 'string'
+    && typeof value.instanceId === 'string'
+    && typeof value.gameId === 'string'
+    && typeof value.name === 'string'
+    && typeof value.deletedAt === 'string'
+    && typeof value.expiresAt === 'string'
+    && typeof value.sizeBytes === 'number';
 }
 
 function isFinding(value: unknown): value is CheckFinding {
@@ -222,6 +306,9 @@ export async function getGameInstance(instanceId: string): Promise<InstanceDetai
     || typeof reply.name !== 'string'
     || typeof reply.pinned !== 'boolean'
     || typeof reply.running !== 'boolean'
+    || typeof reply.playTimeMs !== 'number'
+    || !isOptionalString(reply.lastPlayedAt)
+    || !isCapabilities(reply.capabilities)
     || (reply.saves !== 'shared' && reply.saves !== 'own')
   ) {
     throw shapeError('games_instance_get');
@@ -256,10 +343,112 @@ export async function deleteGameInstance(instanceId: string, deleteAnyway = fals
     || typeof reply.instanceId !== 'string'
     || !isOptionalString(reply.orphanedBase)
     || !isOptionalString(reply.leftInPlace)
+    || !isOptionalString(reply.trashEntryId)
   ) {
     throw shapeError('games_instance_delete');
   }
   return reply as unknown as DeletedInstance;
+}
+
+/** Give an instance a new display name. Its id and folder do not change. */
+export async function renameGameInstance(instanceId: string, name: string): Promise<RenamedInstance> {
+  const reply: unknown = await invoke<unknown>('games_instance_rename', { instanceId, name });
+  if (
+    !isRecord(reply)
+    || typeof reply.instanceId !== 'string'
+    || typeof reply.name !== 'string'
+  ) {
+    throw shapeError('games_instance_rename');
+  }
+  return reply as unknown as RenamedInstance;
+}
+
+/** Copy an instance's content, plugin order, INIs and settings. Saves only when asked. */
+export async function cloneGameInstance(
+  instanceId: string,
+  name: string,
+  copySaves = false,
+): Promise<ClonedInstance> {
+  const reply: unknown = await invoke<unknown>('games_instance_clone', { instanceId, name, copySaves });
+  if (
+    !isRecord(reply)
+    || typeof reply.instanceId !== 'string'
+    || typeof reply.name !== 'string'
+  ) {
+    throw shapeError('games_instance_clone');
+  }
+  return reply as unknown as ClonedInstance;
+}
+
+/** Stop the game Agora started for an instance, then run the normal session end. */
+export async function stopGameInstance(instanceId: string): Promise<StoppedInstance> {
+  const reply: unknown = await invoke<unknown>('games_instance_stop', { instanceId });
+  if (
+    !isRecord(reply)
+    || typeof reply.instanceId !== 'string'
+    || typeof reply.processesEnded !== 'number'
+    || typeof reply.playTimeMs !== 'number'
+  ) {
+    throw shapeError('games_instance_stop');
+  }
+  return reply as unknown as StoppedInstance;
+}
+
+/** The instances of one game in Recently deleted, newest first. */
+export async function listDeletedGameInstances(gameId: string): Promise<DeletedList> {
+  const reply: unknown = await invoke<unknown>('games_instance_deleted_list', { gameId });
+  if (
+    !isRecord(reply)
+    || !Array.isArray(reply.entries)
+    || !reply.entries.every(isDeletedEntry)
+    || typeof reply.retentionDays !== 'number'
+  ) {
+    throw shapeError('games_instance_deleted_list');
+  }
+  return reply as unknown as DeletedList;
+}
+
+/**
+ * Restore a deleted instance. Without a name its original id is used and a taken id is refused
+ * (`instance_id_taken`); with a name it comes back under a new id.
+ */
+export async function restoreDeletedGameInstance(
+  entryId: string,
+  name?: string,
+): Promise<RestoredInstance> {
+  const reply: unknown = await invoke<unknown>('games_instance_restore_deleted', {
+    entryId,
+    name: name ?? null,
+  });
+  if (
+    !isRecord(reply)
+    || typeof reply.instanceId !== 'string'
+    || typeof reply.originalInstanceId !== 'string'
+    || typeof reply.renamed !== 'boolean'
+  ) {
+    throw shapeError('games_instance_restore_deleted');
+  }
+  return reply as unknown as RestoredInstance;
+}
+
+/**
+ * Send one deleted entry to the OS trash, or every entry of `gameId` when no `entryId` is given.
+ * Another game's deleted instances are never touched by "all".
+ */
+export async function purgeDeletedGameInstances(gameId: string, entryId?: string): Promise<PurgedDeleted> {
+  const reply: unknown = await invoke<unknown>('games_instance_purge_deleted', {
+    gameId,
+    entryId: entryId ?? null,
+  });
+  if (
+    !isRecord(reply)
+    || typeof reply.purged !== 'number'
+    || typeof reply.failed !== 'number'
+    || typeof reply.kept !== 'number'
+  ) {
+    throw shapeError('games_instance_purge_deleted');
+  }
+  return reply as unknown as PurgedDeleted;
 }
 
 export async function checkGameInstance(instanceId: string): Promise<InstanceCheck> {

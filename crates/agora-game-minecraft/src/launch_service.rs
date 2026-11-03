@@ -590,6 +590,7 @@ impl LaunchService {
                 pid: 0,
                 start_time: 0,
                 expected_exe: None,
+                job: None,
             };
             let started = LaunchStarted {
                 pid: 0,

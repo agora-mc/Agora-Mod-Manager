@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 21;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 22;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -799,6 +799,40 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         }
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (21)",
+            [],
+        )?;
+    }
+
+    if current < 22 {
+        // How long the player has spent in a generic game instance, and when it last ended.
+        // `last_launched_at` (v18) is when the session began; the total is summed on a normal or
+        // stopped exit, so a crash does not count a night of idle time. The columns are added only
+        // when missing, because a migration test can replay history over a table that already has
+        // them.
+        let has_total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'total_play_ms'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_total == 0 {
+            conn.execute(
+                "ALTER TABLE game_instances ADD COLUMN total_play_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let has_played: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'last_played_at'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_played == 0 {
+            conn.execute(
+                "ALTER TABLE game_instances ADD COLUMN last_played_at TEXT",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (22)",
             [],
         )?;
     }

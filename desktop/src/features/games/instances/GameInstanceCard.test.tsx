@@ -28,6 +28,7 @@ const grounded: InstanceCard = {
   store: 'steam',
   version: '1.6.1170',
   pinned: true,
+  lastPlayedAt: null, playTimeMs: 0, capabilities: { launch: true, stop: true, rename: true, clone: true, trash: true, openFolder: true, playTime: true },
   deployment: null,
   lastLaunchedAt: '2026-10-30 18:30:00',
   createdAt: '2026-10-01 10:00:00',

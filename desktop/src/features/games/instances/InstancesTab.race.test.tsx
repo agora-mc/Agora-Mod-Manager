@@ -16,7 +16,18 @@ const card = (gameId: string) => ({
   pinned: true,
   deployment: null,
   lastLaunchedAt: null,
+  lastPlayedAt: null,
+  playTimeMs: 0,
   running: false,
+  capabilities: {
+    launch: true,
+    stop: true,
+    rename: true,
+    clone: true,
+    trash: true,
+    openFolder: true,
+    playTime: true,
+  },
 });
 
 describe('GameInstancesPage: out-of-order replies', () => {

@@ -310,6 +310,7 @@ fn converting_a_running_instance_is_refused() {
                 pid: std::process::id(),
                 start_time: 0,
                 expected_exe: None,
+                job: None,
             },
             snapshot_id: "snapshot".to_string(),
             start_time: SystemTime::now(),

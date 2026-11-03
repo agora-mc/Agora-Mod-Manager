@@ -7,17 +7,19 @@
 //! spawn, record). This file only turns the core's questions into replies the page can show, and
 //! watches the game so the user's files are put back when it closes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agora_core::game_base::{BaseProblem, BuildOptions, BuildOutcome, BuildProgress, ProblemKind};
 use agora_core::game_deploy::DeployMode;
 use agora_core::game_instance::{
     self, GameInstanceManifest, GameInstanceRecord, InstanceError, LaunchOptions, LaunchedInstance,
-    VfsFailure,
+    PlayStats, VfsFailure,
 };
 use agora_core::game_launch::{LaunchError, LaunchedGame};
 use agora_core::game_user_files::{self, SessionStatus};
+use agora_game_api::GameDefinition;
 use agora_game_api::{
     BaseMode, BaseReference, GameId, RuntimeFileFinding, RuntimeFileProblem, RuntimeIdentity,
     StoreId,
@@ -39,6 +41,12 @@ pub const INVALID_REQUEST: &str = "invalid_request";
 pub const MINECRAFT_INSTANCE: &str = "minecraft_instance";
 /// No install with that id was found on this machine.
 pub const INSTALL_NOT_FOUND: &str = "install_not_found";
+/// A deleted instance's id has been taken again, so restoring needs a new name.
+pub const INSTANCE_ID_TAKEN: &str = "instance_id_taken";
+/// Nothing is running for the instance, so there is nothing to stop.
+pub const INSTANCE_NOT_RUNNING: &str = "instance_not_running";
+/// The game is running but Agora did not start it, so it is not killed.
+pub const INSTANCE_NOT_AGORA_PROCESS: &str = "instance_not_agora_process";
 /// The install's game version is not one Agora recognises, so it cannot be pinned.
 pub const RUNTIME_UNKNOWN: &str = "runtime_unidentified";
 
@@ -61,6 +69,20 @@ pub struct InstanceList {
     pub instances: Vec<InstanceCard>,
 }
 
+/// What the page may offer for this game and instance. The UI shows only what works, rather than
+/// rendering an action that fails when pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceCapabilities {
+    pub launch: bool,
+    pub stop: bool,
+    pub rename: bool,
+    pub clone: bool,
+    pub trash: bool,
+    pub open_folder: bool,
+    pub play_time: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceCard {
@@ -75,7 +97,10 @@ pub struct InstanceCard {
     pub last_launched_at: Option<String>,
     /// When the instance was made (SQLite UTC, no zone), for the card's "Created" line.
     pub created_at: String,
+    pub last_played_at: Option<String>,
+    pub play_time_ms: i64,
     pub running: bool,
+    pub capabilities: InstanceCapabilities,
 }
 
 /// An instance's page header.
@@ -99,7 +124,10 @@ pub struct InstanceDetail {
     pub saves: String,
     pub created_at: String,
     pub last_launched_at: Option<String>,
+    pub last_played_at: Option<String>,
+    pub play_time_ms: i64,
     pub running: bool,
+    pub capabilities: InstanceCapabilities,
 }
 
 /// One thing a check or a launch found, in the words the page shows.
@@ -171,6 +199,67 @@ pub struct DeletedInstance {
     pub orphaned_base: Option<String>,
     /// A deployed game folder Agora could not prove was the instance's, left where it was.
     pub left_in_place: Option<String>,
+    /// The Recently deleted entry it can be restored from.
+    pub trash_entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamedInstance {
+    pub instance_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClonedInstance {
+    pub instance_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoppedInstance {
+    pub instance_id: String,
+    pub processes_ended: usize,
+    pub play_time_ms: i64,
+}
+
+/// One entry in Recently deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedEntry {
+    pub entry_id: String,
+    pub instance_id: String,
+    pub game_id: String,
+    pub name: String,
+    pub deleted_at: String,
+    pub expires_at: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedList {
+    pub entries: Vec<DeletedEntry>,
+    /// The player's retention window, in days.
+    pub retention_days: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredInstance {
+    pub instance_id: String,
+    pub original_instance_id: String,
+    pub renamed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgedDeleted {
+    pub purged: usize,
+    pub failed: usize,
+    pub kept: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -247,6 +336,69 @@ pub async fn games_instance_delete(
     blocking(move || delete_instance(&app, &instance_id, delete_anyway)).await
 }
 
+/// Give an instance a new display name. Its id and folder do not change.
+#[tauri::command]
+pub async fn games_instance_rename(
+    app: tauri::AppHandle,
+    instance_id: String,
+    name: String,
+) -> Result<RenamedInstance, GamesError> {
+    blocking(move || rename_instance(&app, &instance_id, &name)).await
+}
+
+/// Copy an instance's content, plugin order, INIs and settings into a new one. Saves are copied
+/// only when `copy_saves` is true.
+#[tauri::command]
+pub async fn games_instance_clone(
+    app: tauri::AppHandle,
+    instance_id: String,
+    name: String,
+    copy_saves: bool,
+) -> Result<ClonedInstance, GamesError> {
+    blocking(move || clone_instance(&app, &instance_id, &name, copy_saves)).await
+}
+
+/// Stop the game Agora started for an instance, then run the normal session end.
+#[tauri::command]
+pub async fn games_instance_stop(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<StoppedInstance, GamesError> {
+    blocking(move || stop_instance(&app, &instance_id)).await
+}
+
+/// The instances of one game in Recently deleted, newest first. Runs the retention pass first.
+#[tauri::command]
+pub async fn games_instance_deleted_list(
+    app: tauri::AppHandle,
+    game_id: String,
+) -> Result<DeletedList, GamesError> {
+    blocking(move || deleted_list(&app, &game_id)).await
+}
+
+/// Restore a deleted instance. Without a name its original id is used and a taken id is refused;
+/// with a name it comes back under a new id.
+#[tauri::command]
+pub async fn games_instance_restore_deleted(
+    app: tauri::AppHandle,
+    entry_id: String,
+    name: Option<String>,
+) -> Result<RestoredInstance, GamesError> {
+    blocking(move || restore_deleted(&app, &entry_id, name.as_deref())).await
+}
+
+/// Send one deleted entry to the OS trash, or every entry of `game_id` when no `entry_id` is
+/// given. "All" is scoped to the game whose page asked: another game's entries are not its to
+/// empty.
+#[tauri::command]
+pub async fn games_instance_purge_deleted(
+    app: tauri::AppHandle,
+    game_id: String,
+    entry_id: Option<String>,
+) -> Result<PurgedDeleted, GamesError> {
+    blocking(move || purge_deleted(&app, &game_id, entry_id.as_deref())).await
+}
+
 /// The launch checks for an instance, without starting anything.
 #[tauri::command]
 pub async fn games_instance_check(
@@ -299,15 +451,35 @@ where
 fn list_instances(app: &tauri::AppHandle, game_id: &str) -> Result<InstanceList, GamesError> {
     let game = parse_game_id(game_id)?;
     let ctx = crate::core_context(app)?;
+    // A delete or restore cut off by a crash is finished or called off before the list is read,
+    // so the page never shows an instance whose folder is in Recently deleted.
+    game_instance::trash::recover_interrupted(&ctx);
     let records = game_instance::list(&ctx).map_err(map_error)?;
     let mut instances = Vec::new();
     for record in records
         .iter()
         .filter(|record| record.game.as_str() == game.as_str())
     {
+        let definition = ctx
+            .games
+            .game(&record.game)
+            .ok_or_else(|| game_missing(record.game.as_str()))?;
         let manifest = game_instance::get_manifest(&ctx, &record.instance_id).map_err(map_error)?;
         let running = is_running(&ctx, record, &manifest)?;
-        instances.push(card_for(record, &manifest, running));
+        let stats = game_instance::play_stats(&ctx, &record.instance_id).map_err(map_error)?;
+        let folder_exists = ctx
+            .paths
+            .instance_dir(&record.instance_id)
+            .map(|dir| dir.is_dir())
+            .unwrap_or(false);
+        instances.push(card_for(
+            definition,
+            record,
+            &manifest,
+            &stats,
+            running,
+            folder_exists,
+        ));
     }
     Ok(InstanceList { instances })
 }
@@ -324,6 +496,12 @@ fn instance_detail(
         .game(&record.game)
         .ok_or_else(|| game_missing(record.game.as_str()))?;
     let running = is_running(&ctx, &record, &manifest)?;
+    let stats = game_instance::play_stats(&ctx, instance_id).map_err(map_error)?;
+    let folder_exists = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map(|dir| dir.is_dir())
+        .unwrap_or(false);
     let runtime = runtime_of(&record, &manifest);
     Ok(InstanceDetail {
         instance_id: record.instance_id.clone(),
@@ -350,7 +528,10 @@ fn instance_detail(
         saves: manifest.saves.as_str().to_string(),
         created_at: record.created_at.clone(),
         last_launched_at: record.last_launched_at.clone(),
+        last_played_at: stats.last_played_at,
+        play_time_ms: stats.total_play_ms,
         running,
+        capabilities: capabilities_for(definition, &record, &manifest, folder_exists),
     })
 }
 
@@ -428,7 +609,7 @@ fn create_instance(
         Ok(())
     })();
     if let Err(error) = preferences {
-        let _ = game_instance::delete(&ctx, &record.instance_id);
+        let _ = game_instance::delete_permanently(&ctx, &record.instance_id);
         return Err(error);
     }
 
@@ -455,6 +636,7 @@ fn delete_instance(
         instance_id,
         game_instance::DeleteOptions {
             force_unreadable_base: delete_anyway,
+            recoverable: true,
         },
     )
     .map_err(map_error)?;
@@ -464,6 +646,139 @@ fn delete_instance(
         left_in_place: outcome
             .left_in_place
             .map(|folder| folder.display().to_string()),
+        trash_entry_id: outcome.trash_entry_id,
+    })
+}
+
+fn rename_instance(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+    name: &str,
+) -> Result<RenamedInstance, GamesError> {
+    let name = clean_name(name)?;
+    let ctx = crate::core_context(app)?;
+    load_record(&ctx, instance_id)?;
+    game_instance::rename(&ctx, instance_id, &name).map_err(map_error)?;
+    Ok(RenamedInstance {
+        instance_id: instance_id.to_string(),
+        name,
+    })
+}
+
+fn clone_instance(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+    name: &str,
+    copy_saves: bool,
+) -> Result<ClonedInstance, GamesError> {
+    let name = clean_name(name)?;
+    let ctx = crate::core_context(app)?;
+    let record = load_record(&ctx, instance_id)?;
+    let definition = ctx
+        .games
+        .game(&record.game)
+        .ok_or_else(|| game_missing(record.game.as_str()))?;
+    let cloned = game_instance::clone_instance(
+        &ctx,
+        instance_id,
+        &name,
+        definition,
+        game_instance::CloneOptions { copy_saves },
+    )
+    .map_err(map_error)?;
+    Ok(ClonedInstance {
+        instance_id: cloned.instance_id,
+        name: cloned.name,
+    })
+}
+
+fn stop_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<StoppedInstance, GamesError> {
+    let ctx = crate::core_context(app)?;
+    let record = load_record(&ctx, instance_id)?;
+    let definition = ctx
+        .games
+        .game(&record.game)
+        .ok_or_else(|| game_missing(record.game.as_str()))?;
+    let stopped = game_instance::stop(&ctx, instance_id, definition).map_err(map_error)?;
+    Ok(StoppedInstance {
+        instance_id: stopped.instance_id,
+        processes_ended: stopped.processes_ended,
+        play_time_ms: stopped.play_time_ms,
+    })
+}
+
+fn trash_adapter() -> game_instance::TrashFn {
+    Arc::new(|path: &Path| {
+        trash::delete(path)
+            .map_err(|error| format!("Could not move it to the system trash: {error}"))
+    })
+}
+
+fn deleted_list(app: &tauri::AppHandle, game_id: &str) -> Result<DeletedList, GamesError> {
+    let game = parse_game_id(game_id)?;
+    let ctx = crate::core_context(app)?;
+    // The retention pass runs when someone looks, so a user who never deletes anything still has
+    // old entries cleaned up after the window they chose.
+    let _ = game_instance::trash::cleanup(
+        &ctx,
+        chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()),
+        &trash_adapter(),
+    );
+    let entries = game_instance::trash::list(&ctx, game.as_str())
+        .into_iter()
+        .map(|entry| DeletedEntry {
+            entry_id: entry.entry_id,
+            instance_id: entry.instance_id,
+            game_id: entry.game,
+            name: entry.name,
+            deleted_at: entry.deleted_at,
+            expires_at: entry.expires_at,
+            size_bytes: entry.size_bytes,
+        })
+        .collect();
+    Ok(DeletedList {
+        entries,
+        retention_days: game_instance::trash::retention_days(&ctx),
+    })
+}
+
+fn restore_deleted(
+    app: &tauri::AppHandle,
+    entry_id: &str,
+    name: Option<&str>,
+) -> Result<RestoredInstance, GamesError> {
+    let ctx = crate::core_context(app)?;
+    let restored = game_instance::trash::restore(&ctx, entry_id, name).map_err(map_error)?;
+    Ok(RestoredInstance {
+        instance_id: restored.instance_id,
+        original_instance_id: restored.original_instance_id,
+        renamed: restored.renamed,
+    })
+}
+
+fn purge_deleted(
+    app: &tauri::AppHandle,
+    game_id: &str,
+    entry_id: Option<&str>,
+) -> Result<PurgedDeleted, GamesError> {
+    let game = parse_game_id(game_id)?;
+    let ctx = crate::core_context(app)?;
+    let trash = trash_adapter();
+    let summary = match entry_id {
+        Some(entry_id) => {
+            game_instance::trash::purge(&ctx, entry_id, &trash).map_err(map_error)?;
+            game_instance::trash::PurgeSummary {
+                purged: 1,
+                failed: 0,
+                kept: 0,
+            }
+        }
+        None => game_instance::trash::purge_all(&ctx, game.as_str(), &trash),
+    };
+    Ok(PurgedDeleted {
+        purged: summary.purged,
+        failed: summary.failed,
+        kept: summary.kept,
     })
 }
 
@@ -623,8 +938,10 @@ fn spawn_exit_watch(
             Duration::from_millis(250),
             Duration::from_secs(5),
         );
+        // The same end a stop runs: put the player's files back and add this session to the
+        // instance's play time.
         let restore_error = match ctx.games.game(&game_id) {
-            Some(definition) => match game_user_files::restore(&ctx, definition, &store) {
+            Some(definition) => match game_instance::end_session(&ctx, definition, &store) {
                 Ok(_) => None,
                 Err(error) => Some(error.to_string()),
             },
@@ -687,10 +1004,33 @@ fn is_running(
     }
 }
 
-fn card_for(
+/// What this game and instance support. `launch` is the game's (a definition with no launch
+/// recipe cannot start); `stop` needs a store whose session Agora can find; `openFolder` needs a
+/// folder that exists.
+fn capabilities_for(
+    definition: &GameDefinition,
     record: &GameInstanceRecord,
     manifest: &GameInstanceManifest,
+    folder_exists: bool,
+) -> InstanceCapabilities {
+    InstanceCapabilities {
+        launch: definition.launch.is_some(),
+        stop: runtime_of(record, manifest).is_some(),
+        rename: true,
+        clone: true,
+        trash: true,
+        open_folder: folder_exists,
+        play_time: true,
+    }
+}
+
+fn card_for(
+    definition: &GameDefinition,
+    record: &GameInstanceRecord,
+    manifest: &GameInstanceManifest,
+    stats: &PlayStats,
     running: bool,
+    folder_exists: bool,
 ) -> InstanceCard {
     let runtime = runtime_of(record, manifest);
     InstanceCard {
@@ -703,7 +1043,10 @@ fn card_for(
         deployment: manifest.deployment.map(|mode| mode.as_str().to_string()),
         last_launched_at: record.last_launched_at.clone(),
         created_at: record.created_at.clone(),
+        last_played_at: stats.last_played_at.clone(),
+        play_time_ms: stats.total_play_ms,
         running,
+        capabilities: capabilities_for(definition, record, manifest, folder_exists),
     }
 }
 
@@ -924,6 +1267,25 @@ pub fn map_error(error: InstanceError) -> GamesError {
     match error {
         InstanceError::NotFound(id) => not_found(&id),
         InstanceError::Running(id) => running_error(&id),
+        InstanceError::NothingRunning(id) => GamesError::new(
+            INSTANCE_NOT_RUNNING,
+            format!("Nothing is running for '{id}'."),
+        ),
+        InstanceError::NotStartedByAgora(id) => GamesError::new(
+            INSTANCE_NOT_AGORA_PROCESS,
+            format!(
+                "'{id}' is running, but Agora did not start that process, so it will not stop it. Close the game yourself."
+            ),
+        ),
+        InstanceError::RestoreIdTaken(id) => GamesError::new(
+            INSTANCE_ID_TAKEN,
+            format!("An instance called '{id}' exists again. Choose a new name to restore it."),
+        ),
+        InstanceError::AlreadyExists(id) => GamesError::new(
+            "instance_exists",
+            format!("An instance called '{id}' already exists."),
+        ),
+        InstanceError::Trash { code, message } => GamesError::new(code, message),
         InstanceError::Deploy(agora_core::game_deploy::DeployError::UnreadableBaseManifest(
             detail,
         )) => GamesError::new(
@@ -1018,6 +1380,44 @@ mod tests {
         );
         manifest.deployment = deployment;
         manifest
+    }
+
+    fn definition_with_launch(has_launch: bool) -> GameDefinition {
+        let launch = if has_launch {
+            serde_json::json!({
+                "executable": { "root": "runtime", "path": "" },
+                "arguments": [],
+                "environment": {},
+                "working_directory": { "root": "runtime", "path": "" }
+            })
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": "skyrim-se",
+            "name": "Skyrim Special Edition",
+            "stores": [],
+            "version_sources": [],
+            "deployment": "virtual_file_system",
+            "content_rules": [],
+            "native_code_patterns": [],
+            "framework_ids": [],
+            "tool_ids": [],
+            "launch": launch,
+            "log_paths": [],
+            "crash_paths": [],
+            "user_files": [],
+            "save_paths": [],
+            "linked_archive_patterns": []
+        }))
+        .expect("a game definition the core reads")
+    }
+
+    fn stats() -> PlayStats {
+        PlayStats {
+            total_play_ms: 7_200_000,
+            last_played_at: Some("2026-10-02 09:00:00".into()),
+        }
     }
 
     fn blocking_finding() -> CheckFinding {
@@ -1277,20 +1677,54 @@ mod tests {
     fn a_card_shows_the_pinned_runtime_and_automatic_deployment() {
         let record = pinned_record("grounded-1", "1.6.1170");
         let manifest = manifest_for(&record, None);
-        let card = card_for(&record, &manifest, false);
+        let definition = definition_with_launch(true);
+        let card = card_for(&definition, &record, &manifest, &stats(), false, true);
         assert!(card.pinned);
         assert_eq!(card.store.as_deref(), Some("steam"));
         assert_eq!(card.version.as_deref(), Some("1.6.1170"));
         assert_eq!(card.deployment, None, "no choice recorded means automatic");
         assert!(!card.running);
+        assert_eq!(card.play_time_ms, 7_200_000);
+        assert_eq!(card.last_played_at.as_deref(), Some("2026-10-02 09:00:00"));
 
         let chosen = card_for(
+            &definition,
             &record,
             &manifest_for(&record, Some(DeployMode::Links)),
+            &stats(),
+            true,
             true,
         );
         assert_eq!(chosen.deployment.as_deref(), Some("links"));
         assert!(chosen.running);
+    }
+
+    #[test]
+    fn capabilities_follow_the_game_and_this_instance() {
+        let record = pinned_record("grounded-1", "1.6.1170");
+        let manifest = manifest_for(&record, None);
+
+        let full = capabilities_for(&definition_with_launch(true), &record, &manifest, true);
+        assert!(full.launch && full.stop && full.rename && full.clone && full.trash);
+        assert!(full.open_folder && full.play_time);
+
+        // A game with no launch recipe cannot be launched; a missing folder cannot be opened.
+        let no_launch = capabilities_for(&definition_with_launch(false), &record, &manifest, false);
+        assert!(!no_launch.launch);
+        assert!(!no_launch.open_folder);
+        assert!(no_launch.clone, "cloning does not need a launch recipe");
+
+        // No store is known, so there is no session to find and nothing to stop.
+        let mut bare = record.clone();
+        bare.base = BaseReference::Unpinned {
+            install: agora_game_api::InstallId::new("steam:489830").expect("an install id"),
+            reason: "test".into(),
+        };
+        let mut no_runtime = manifest.clone();
+        no_runtime.runtime_identity = None;
+        let unknown_store =
+            capabilities_for(&definition_with_launch(true), &bare, &no_runtime, true);
+        assert!(!unknown_store.stop);
     }
 
     #[test]
@@ -1333,8 +1767,16 @@ mod tests {
     #[test]
     fn the_replies_use_the_names_the_page_reads() {
         let record = pinned_record("grounded-1", "1.6.1170");
-        let card = serde_json::to_value(card_for(&record, &manifest_for(&record, None), false))
-            .expect("a card serializes");
+        let definition = definition_with_launch(true);
+        let card = serde_json::to_value(card_for(
+            &definition,
+            &record,
+            &manifest_for(&record, None),
+            &stats(),
+            false,
+            true,
+        ))
+        .expect("a card serializes");
         for key in [
             "instanceId",
             "gameId",
@@ -1345,9 +1787,26 @@ mod tests {
             "deployment",
             "lastLaunchedAt",
             "createdAt",
+            "lastPlayedAt",
+            "playTimeMs",
             "running",
+            "capabilities",
         ] {
             assert!(card.get(key).is_some(), "card is missing {key}");
+        }
+        for key in [
+            "launch",
+            "stop",
+            "rename",
+            "clone",
+            "trash",
+            "openFolder",
+            "playTime",
+        ] {
+            assert!(
+                card["capabilities"].get(key).is_some(),
+                "capabilities are missing {key}"
+            );
         }
 
         let finding = serde_json::to_value(framework_finding(&wrong_version(Vec::new())))

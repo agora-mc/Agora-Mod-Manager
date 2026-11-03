@@ -7,18 +7,34 @@ vi.mock('@tauri-apps/api/event', () => ({ listen: listenMock }));
 
 import {
   checkGameInstance,
+  cloneGameInstance,
   createGameInstance,
   gamesErrorCode,
   gamesErrorMessage,
   getGameInstance,
   getGameInstanceIcon,
   launchGameInstance,
+  listDeletedGameInstances,
   listGameInstances,
   onCreateProgress,
   onInstanceExited,
+  purgeDeletedGameInstances,
+  renameGameInstance,
+  restoreDeletedGameInstance,
   setGameInstanceDeployment,
   setGameInstanceIcon,
+  stopGameInstance,
 } from './api';
+
+const capabilities = {
+  launch: true,
+  stop: true,
+  rename: true,
+  clone: true,
+  trash: true,
+  openFolder: true,
+  playTime: true,
+};
 
 const card = {
   instanceId: 'grounded-1',
@@ -29,7 +45,10 @@ const card = {
   pinned: true,
   deployment: null,
   lastLaunchedAt: null,
+  lastPlayedAt: null,
+  playTimeMs: 0,
   running: false,
+  capabilities,
 };
 
 const framework = {
@@ -64,6 +83,9 @@ describe('listGameInstances', () => {
     ['a card without a name', { instances: [{ ...card, name: undefined }] }],
     ['a card whose deployment is not a mode', { instances: [{ ...card, deployment: 'everything' }] }],
     ['a card whose pinned flag is text', { instances: [{ ...card, pinned: 'yes' }] }],
+    ['a card with no capabilities', { instances: [{ ...card, capabilities: undefined }] }],
+    ['a card whose play time is text', { instances: [{ ...card, playTimeMs: '7h' }] }],
+    ['a card with a capability that is not a boolean', { instances: [{ ...card, capabilities: { ...capabilities, stop: 'yes' } }] }],
   ])('rejects %s rather than reading it as no instances', async (_label, reply) => {
     invokeMock.mockResolvedValueOnce(reply);
     await expect(listGameInstances('skyrim-se')).rejects.toThrow('games_instance_list did not return what the Instances page expects.');
@@ -102,7 +124,10 @@ describe('getGameInstance', () => {
       saves: 'shared',
       createdAt: '2026-10-01 10:00:00',
       lastLaunchedAt: null,
+      lastPlayedAt: '2026-10-02 09:00:00',
+      playTimeMs: 7_200_000,
       running: false,
+      capabilities,
     };
     invokeMock.mockResolvedValueOnce(detail);
     await expect(getGameInstance('grounded-1')).resolves.toEqual(detail);
@@ -221,6 +246,107 @@ describe('create, delete and deployment wrappers', () => {
     invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', deployment: null });
     await expect(setGameInstanceDeployment('grounded-1', 'auto')).resolves.toEqual({ instanceId: 'grounded-1', deployment: null });
     expect(invokeMock).toHaveBeenCalledWith('games_instance_set_deployment', { instanceId: 'grounded-1', mode: 'auto' });
+  });
+});
+
+describe('rename, clone, stop and Recently deleted wrappers', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('renames and clones with the fields the backend reads', async () => {
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', name: 'Grounded Again' });
+    await expect(renameGameInstance('grounded-1', 'Grounded Again')).resolves.toEqual({
+      instanceId: 'grounded-1',
+      name: 'Grounded Again',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_rename', {
+      instanceId: 'grounded-1',
+      name: 'Grounded Again',
+    });
+
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-2', name: 'Grounded Copy' });
+    await expect(cloneGameInstance('grounded-1', 'Grounded Copy')).resolves.toEqual({
+      instanceId: 'grounded-2',
+      name: 'Grounded Copy',
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_clone', {
+      instanceId: 'grounded-1',
+      name: 'Grounded Copy',
+      copySaves: false,
+    });
+
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-2', name: 'Grounded Copy' });
+    await cloneGameInstance('grounded-1', 'Grounded Copy', true);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_clone', {
+      instanceId: 'grounded-1',
+      name: 'Grounded Copy',
+      copySaves: true,
+    });
+  });
+
+  it('stops an instance and reads the play time it reports', async () => {
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', processesEnded: 2, playTimeMs: 7_200_000 });
+    await expect(stopGameInstance('grounded-1')).resolves.toEqual({
+      instanceId: 'grounded-1',
+      processesEnded: 2,
+      playTimeMs: 7_200_000,
+    });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_stop', { instanceId: 'grounded-1' });
+  });
+
+  it('lists Recently deleted for one game with the retention window', async () => {
+    const entry = {
+      entryId: 'entry-1',
+      instanceId: 'grounded-1',
+      gameId: 'skyrim-se',
+      name: 'Grounded',
+      deletedAt: '2026-10-01T10:00:00Z',
+      expiresAt: '2026-10-31T10:00:00Z',
+      sizeBytes: 1234,
+    };
+    invokeMock.mockResolvedValueOnce({ entries: [entry], retentionDays: 30 });
+    await expect(listDeletedGameInstances('skyrim-se')).resolves.toEqual({ entries: [entry], retentionDays: 30 });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_deleted_list', { gameId: 'skyrim-se' });
+  });
+
+  it('restores with a new name or null, and purges one or all', async () => {
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-1', originalInstanceId: 'grounded-1', renamed: false });
+    await restoreDeletedGameInstance('entry-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_restore_deleted', {
+      entryId: 'entry-1',
+      name: null,
+    });
+
+    invokeMock.mockResolvedValueOnce({ instanceId: 'grounded-2', originalInstanceId: 'grounded-1', renamed: true });
+    await restoreDeletedGameInstance('entry-1', 'Grounded Restored');
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_restore_deleted', {
+      entryId: 'entry-1',
+      name: 'Grounded Restored',
+    });
+
+    invokeMock.mockResolvedValueOnce({ purged: 1, failed: 0, kept: 0 });
+    await expect(purgeDeletedGameInstances('skyrim-se', 'entry-1')).resolves.toEqual({ purged: 1, failed: 0, kept: 0 });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_purge_deleted', { gameId: 'skyrim-se', entryId: 'entry-1' });
+
+    invokeMock.mockResolvedValueOnce({ purged: 2, failed: 1, kept: 0 });
+    await purgeDeletedGameInstances('skyrim-se');
+    expect(invokeMock).toHaveBeenLastCalledWith('games_instance_purge_deleted', { gameId: 'skyrim-se', entryId: null });
+  });
+
+  it.each([
+    ['a stop without its play time', 'games_instance_stop', { instanceId: 'grounded-1', processesEnded: 1 }],
+    ['a deleted list with no retention window', 'games_instance_deleted_list', { entries: [] }],
+    ['a deleted entry without a size', 'games_instance_deleted_list', { retentionDays: 30, entries: [{ entryId: 'e', instanceId: 'i', gameId: 'g', name: 'n', deletedAt: 'd', expiresAt: 'x' }] }],
+    ['a purge count that is text', 'games_instance_purge_deleted', { purged: 'all' }],
+  ])('rejects %s', async (_label, command, reply) => {
+    invokeMock.mockResolvedValueOnce(reply);
+    const call = command === 'games_instance_stop'
+      ? stopGameInstance('grounded-1')
+      : command === 'games_instance_deleted_list'
+        ? listDeletedGameInstances('skyrim-se')
+        : purgeDeletedGameInstances('skyrim-se');
+    await expect(call).rejects.toThrow(`${command} did not return`);
   });
 });
 

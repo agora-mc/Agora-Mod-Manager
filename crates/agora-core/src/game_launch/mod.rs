@@ -643,15 +643,19 @@ fn spawn(prepared: &PreparedLaunch, capture: bool) -> Result<LaunchedGame, Launc
         cmd.stderr(std::process::Stdio::null());
     }
 
-    let mut child = cmd.spawn().map_err(LaunchError::Io)?;
+    // The game and everything it starts join a job object Agora made, so Stop can end a game
+    // whose launcher has already exited and left only a child (`skse64_loader.exe` starting
+    // `SkyrimSE.exe`). See `process_job`.
+    let (mut child, job) = crate::process_job::spawn_in_job(&mut cmd).map_err(LaunchError::Io)?;
     let output = if capture {
         OutputCapture::start(&mut child)
     } else {
         None
     };
     let pid = child.id();
-    let identity =
+    let mut identity =
         process_identity::capture(pid).map_err(|e| LaunchError::ProcessCapture(format!("{e}")))?;
+    identity.job = job;
 
     Ok(LaunchedGame {
         child,

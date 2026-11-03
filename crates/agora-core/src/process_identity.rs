@@ -91,6 +91,7 @@ fn capture_once(pid: u32) -> LauncherResult<ProcessIdentity> {
         pid,
         start_time,
         expected_exe,
+        job: None,
     })
 }
 
@@ -209,6 +210,11 @@ pub struct ProcessIdentity {
     pub start_time: u64,
     /// Canonical path of the executable, when the OS provides it.
     pub expected_exe: Option<String>,
+    /// The name of the job object the launch put this process in (Windows), when it made one.
+    /// Everything the process starts belongs to the same job, so a later Stop can end the whole
+    /// group even after this process has exited. See [`crate::process_job`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +279,7 @@ mod tests {
             pid: u32::MAX,
             start_time: 12345,
             expected_exe: None,
+            job: None,
         };
         let result = verify(&identity);
         assert!(result.is_err(), "verify of nonexistent PID should fail");

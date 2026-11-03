@@ -45,7 +45,7 @@ beforeEach(() => {
   resetGameInstanceIconsForTests();
   vi.mocked(getGameInstance).mockResolvedValue({
     instanceId: 'grounded-1', gameId: 'skyrim-se', gameName: 'Skyrim Special Edition', name: 'Grounded',
-    pinned: true, store: 'steam', version: '1.6.1170', build: null, baseId: null, installId: null,
+    lastPlayedAt: null, playTimeMs: 0, capabilities: { launch: true, stop: true, rename: true, clone: true, trash: true, openFolder: true, playTime: true }, pinned: true, store: 'steam', version: '1.6.1170', build: null, baseId: null, installId: null,
     unpinnedReason: null, deployment: null, saves: 'shared', createdAt: '2026-10-01 10:00:00',
     lastLaunchedAt: null, running: false,
   });

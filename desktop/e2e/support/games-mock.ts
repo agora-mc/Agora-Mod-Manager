@@ -128,6 +128,30 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
                   : null,
               );
             }
+            // Instance actions answer from their arguments, so a spec that renames, clones,
+            // stops or restores sees the data it asked for instead of a fixed sample.
+            if (command === 'games_instance_rename') {
+              return Promise.resolve({ instanceId: args.instanceId, name: args.name });
+            }
+            if (command === 'games_instance_clone') {
+              return Promise.resolve({ instanceId: `${String(args.instanceId)}-copy`, name: args.name });
+            }
+            if (command === 'games_instance_stop') {
+              return Promise.resolve({ instanceId: args.instanceId, processesEnded: 1, playTimeMs: 0 });
+            }
+            if (command === 'games_instance_deleted_list') {
+              return Promise.resolve({ entries: [], retentionDays: 30 });
+            }
+            if (command === 'games_instance_restore_deleted') {
+              return Promise.resolve({
+                instanceId: 'restored-1',
+                originalInstanceId: 'grounded-1',
+                renamed: Boolean(args.name),
+              });
+            }
+            if (command === 'games_instance_purge_deleted') {
+              return Promise.resolve({ purged: 0, failed: 0, kept: 0 });
+            }
             if (command === 'games_support_set_enabled') {
               // The list a Settings toggle changes is the same one later reads get.
               const rows = replies.games_support_list;
@@ -227,7 +251,18 @@ export function instanceHeaderReplies(instanceId: string): Record<string, unknow
       saves: 'shared',
       createdAt: '2026-10-01 10:00:00',
       lastLaunchedAt: null,
+      lastPlayedAt: null,
+      playTimeMs: 0,
       running: false,
+      capabilities: {
+        launch: true,
+        stop: true,
+        rename: true,
+        clone: true,
+        trash: true,
+        openFolder: true,
+        playTime: true,
+      },
     },
     games_instance_check: { instanceId, checked: true, status: 'ok', findings: [], passed: [] },
   };

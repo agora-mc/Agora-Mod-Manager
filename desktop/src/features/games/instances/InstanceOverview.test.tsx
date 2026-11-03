@@ -49,7 +49,18 @@ function detail(instanceId: string): InstanceDetail {
     saves: 'shared',
     createdAt: '2026-10-01 10:00:00',
     lastLaunchedAt: null,
+    lastPlayedAt: null,
+    playTimeMs: 0,
     running: false,
+    capabilities: {
+      launch: true,
+      stop: true,
+      rename: true,
+      clone: true,
+      trash: true,
+      openFolder: true,
+      playTime: true,
+    },
   };
 }
 

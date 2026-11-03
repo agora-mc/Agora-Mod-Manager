@@ -1146,7 +1146,7 @@ pub struct RunOptions {
 /// when the instance is gone, and [`ImportError::CleanupFailed`] when it is not. An instance that
 /// stays in the list is renamed to say it is incomplete, so nobody launches it by mistake.
 pub fn abandon_half_made_instance(ctx: &Ctx, instance_id: &str, cause: ImportError) -> ImportError {
-    let cleanup = match game_instance::delete(ctx, instance_id) {
+    let cleanup = match game_instance::delete_permanently(ctx, instance_id) {
         Ok(_) => return cause,
         Err(e) => e.to_string(),
     };
