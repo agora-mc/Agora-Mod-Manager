@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest';
 import type { RunReport, SwapCosts, ToolRow } from './api';
 import {
   conflictLine,
+  emptyToolsBody,
   humanBytes,
+  joinNames,
   messageOf,
+  originLine,
   runDetailLines,
   runHeadline,
   shownPaths,
@@ -144,7 +147,7 @@ describe('shownPaths', () => {
 });
 
 describe('conflictLine', () => {
-  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true, outputKind: 'generated_layer', outputFolder: null };
+  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: null, fromMod: null, runOnly: false };
   const pandora: ToolRow = { ...nemesis, toolId: 'pandora', name: 'Pandora', conflicts: true };
   const bodyslide: ToolRow = { ...nemesis, toolId: 'bodyslide', name: 'BodySlide', conflicts: false };
 
@@ -164,5 +167,42 @@ describe('messageOf', () => {
     expect(messageOf(new Error('boom'))).toBe('boom');
     expect(messageOf(undefined)).toBe('Something went wrong. Try again.');
     expect(messageOf({ message: 'no code' })).toBe('Something went wrong. Try again.');
+  });
+});
+
+describe('the Tools tab wording', () => {
+  it('joins names the way a sentence does', () => {
+    expect(joinNames([])).toBe('');
+    expect(joinNames(['Nemesis'])).toBe('Nemesis');
+    expect(joinNames(['Nemesis', 'BodySlide'])).toBe('Nemesis and BodySlide');
+    expect(joinNames(['Nemesis', 'BodySlide', 'Pandora'])).toBe('Nemesis, BodySlide and Pandora');
+  });
+
+  it('names the tools the game recognises in the empty state, at most three', () => {
+    expect(emptyToolsBody(['Nemesis', 'BodySlide', 'Pandora', 'TexGen'])).toBe(
+      'Tools such as Nemesis, BodySlide, Pandora and others show up here by themselves when you install them as mods. You can also add any other program yourself.',
+    );
+    expect(emptyToolsBody([])).toBe('Tools show up here by themselves when you install them as mods. You can also add any other program yourself.');
+  });
+
+  it('says where a tool comes from', () => {
+    const base: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: null, previous: null, status: null, conflicts: false, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: 'Data/x.exe', fromMod: 'Nemesis Engine', runOnly: false };
+    expect(originLine(base)).toBe('From the mod “Nemesis Engine”');
+    expect(originLine({ ...base, fromMod: null })).toBe('From the game’s own files');
+    expect(originLine({ ...base, installed: false, fromMod: null })).toBe('Not installed in this instance');
+  });
+});
+
+describe('a run-only tool’s headline', () => {
+  const report = (written: string[]): RunReport => ({
+    toolId: 'sseedit', name: 'SSEEdit', run: 'r', capture: 'vfs', captureReason: null, promoted: true, current: written.length ? '1' : null,
+    previous: null, written, deleted: [], exitCode: 0, cancelled: false, failedFolder: null, failure: null, copiedLayer: null,
+    installChanges: { created: [], changed: [], deleted: [], mayBeIncomplete: false, unavailable: null }, swap: null, offers: [], unchangedDropped: 0,
+  });
+
+  it('says it finished, and says where its writes were kept when there were any', () => {
+    expect(runHeadline(report([]), true)).toBe('SSEEdit finished.');
+    expect(runHeadline(report(['Data/Patch.esp']), true)).toBe('SSEEdit finished. What it wrote is kept for this instance as generation 1.');
+    expect(runHeadline(report(['Data/Patch.esp']))).toContain('its output is now generation 1');
   });
 });

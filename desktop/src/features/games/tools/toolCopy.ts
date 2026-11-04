@@ -56,6 +56,9 @@ export function statusLabel(status: OutputStatus | null): string {
   }
 }
 
+/** What a run-only tool with no kept writes says under its name. */
+export const RUN_ONLY_LINE = 'Runs with this instance’s mods. Anything it writes is kept for this instance, so no edit is lost.';
+
 /** One sentence on what the status means for the player, under the badge. */
 export function statusExplanation(row: ToolRow): string {
   switch (row.status) {
@@ -121,10 +124,16 @@ export function captureName(capture: RunReport['capture']): string {
   }
 }
 
-/** The headline of a finished run: promoted, or discarded and why. */
-export function runHeadline(outcome: RunReport): string {
+/** The headline of a finished run: promoted, or discarded and why. A run-only tool that wrote nothing simply finished. */
+export function runHeadline(outcome: RunReport, runOnly = false): string {
   if (outcome.cancelled) {
     return `${outcome.name} was stopped before it finished. Nothing changed.`;
+  }
+  if (outcome.promoted && runOnly && outcome.written.length === 0 && outcome.deleted.length === 0) {
+    return `${outcome.name} finished.`;
+  }
+  if (outcome.promoted && runOnly) {
+    return `${outcome.name} finished. What it wrote is kept for this instance as generation ${outcome.current ?? '?'}.`;
   }
   if (outcome.promoted) {
     return `${outcome.name} finished, and its output is now generation ${outcome.current ?? '?'}. The game reads it on its next launch.`;
@@ -173,4 +182,37 @@ export function conflictLine(row: ToolRow, others: readonly ToolRow[]): string {
   const names = others.filter((other) => other.conflicts && other.toolId !== row.toolId).map((other) => other.name);
   const list = names.length > 0 ? names.join(', ') : 'another tool';
   return `${row.name} and ${list} both have output here, and both write the same behaviour files. Remove the one you do not want to use.`;
+}
+
+/** Names in a sentence: "A", "A and B", "A, B and C". */
+export function joinNames(names: readonly string[]): string {
+  if (names.length <= 1) return names[0] ?? '';
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/** The tools the game recognises, for a sentence: the first three, then "and others". */
+function knownExamples(known: readonly string[]): string {
+  if (known.length <= 3) return joinNames(known);
+  return `${known.slice(0, 3).join(', ')} and others`;
+}
+
+/** The line under the Tools heading. */
+export function toolsSummary(known: readonly string[]): string {
+  const found = known.length > 0
+    ? `Agora finds ${knownExamples(known)} in your mods by itself.`
+    : 'Tools come from your mods.';
+  return `Programs that work on your mods: patchers, editors and sorters. ${found} What a tool writes is kept for this instance, so you can roll back, compare or remove it without touching your mods.`;
+}
+
+/** The empty state's body: tools appear when they are installed as mods. */
+export function emptyToolsBody(known: readonly string[]): string {
+  const examples = known.length > 0 ? `Tools such as ${knownExamples(known)} show` : 'Tools show';
+  return `${examples} up here by themselves when you install them as mods. You can also add any other program yourself.`;
+}
+
+/** Where a tool the game recognises comes from, under its name. */
+export function originLine(row: ToolRow): string {
+  if (!row.installed) return 'Not installed in this instance';
+  if (row.fromMod) return `From the mod “${row.fromMod}”`;
+  return 'From the game’s own files';
 }

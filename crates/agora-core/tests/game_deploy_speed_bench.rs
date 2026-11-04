@@ -492,3 +492,204 @@ fn deploy_and_launch_timings() {
     );
     println!();
 }
+
+/// What opening an instance's Tools tab costs on a large instance (MASTER_SPEC §26.9): the two
+/// list commands the tab sends at once, `games_tools_list` (the tools with their detection and
+/// output state) and `games_user_tools_list` (the player's own tools, with whether each is there).
+///
+/// Run with `cargo test -p agora-core --test game_deploy_speed_bench tools_tab -- --ignored
+/// --nocapture`. Sizes: `AGORA_BENCH_ITEMS` (default 370) items of `AGORA_BENCH_FILES` (default
+/// 100) files.
+#[test]
+#[ignore = "benchmark: run with --ignored --nocapture"]
+fn tools_tab_timings() {
+    use agora_core::game_tools;
+    use agora_core::game_user_tools::{self, NewUserTool};
+    use agora_game_api::{ToolDefinition, ToolId, ToolOutput};
+
+    let items = env_usize("AGORA_BENCH_ITEMS", 370);
+    let files = env_usize("AGORA_BENCH_FILES", 100);
+    let root = std::env::var_os("AGORA_BENCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"D:\Agora-bench\perfdeploy-data"));
+    std::fs::create_dir_all(&root).unwrap();
+    let scratch = DataRoot::in_dir(&root, "tools-bench-");
+    let dir = scratch.path().to_path_buf();
+
+    let mut def = bench_definition();
+    def.plugin_list = Some(agora_game_api::PluginListRule {
+        user_file: RelPath::new("user/Plugins.txt").unwrap(),
+        plugin_folder: RelPath::new("Data").unwrap(),
+        patterns: vec!["*.esp".into(), "*.esm".into()],
+        active_prefix: String::new(),
+        header: vec![],
+        semantics: Some("creation_engine".into()),
+        implicit: vec![],
+        implicit_list_file: None,
+        loot: None,
+    });
+    def.user_files = vec![agora_game_api::UserFileMapping::new(
+        GamePath::UserData {
+            location: agora_game_api::UserDataLocation::LocalAppData,
+            path: RelPath::new("Bench Game/Plugins.txt").unwrap(),
+        },
+        RelPath::new("user/Plugins.txt").unwrap(),
+        agora_game_api::UserFileStrategy::JournaledSwap,
+    )
+    .with_stores(vec![StoreId::steam()])];
+    let tool = |id: &str, exe: &str| ToolDefinition {
+        id: ToolId::new(id).unwrap(),
+        game: def.id.clone(),
+        name: id.to_string(),
+        launch: LaunchRecipe {
+            executable: GamePath::Runtime {
+                path: RelPath::new(exe).unwrap(),
+            },
+            arguments: vec![],
+            environment: Default::default(),
+            working_directory: GamePath::Runtime {
+                path: RelPath::default(),
+            },
+        },
+        output: ToolOutput::GeneratedLayer,
+        output_arg: None,
+        relevant_settings: vec![],
+        after_tools: vec![],
+        conflicts_with: vec![],
+        uses_install_path: false,
+        output_patterns: vec![],
+        required_outputs: vec![],
+        failure_markers: vec![],
+        required_magic: vec![],
+        run_only: false,
+        executable_names: vec![],
+    };
+    let tools: Vec<ToolDefinition> = (0..9)
+        .map(|n| tool(&format!("tool{n}"), &format!("Data/tool{n}/Tool{n}.exe")))
+        .collect();
+    def.tool_ids = tools.iter().map(|t| t.id.clone()).collect();
+    let mut builder = GameRegistry::builder();
+    builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "bench".into(),
+            },
+            Arc::new(BenchPackage(PackageDefinition {
+                id: "bench.tools".into(),
+                version: semver::Version::new(0, 1, 0),
+                api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+                parents: vec![],
+                games: vec![def.clone()],
+                frameworks: vec![],
+                tools,
+            })),
+        )
+        .unwrap();
+    let ctx = CoreContext::for_testing(dir.join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(Arc::new(builder.build()));
+
+    let install_dir = dir.join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    write_install(&install_dir, 3000);
+    let install = make_install(&install_dir, &def);
+    let inst = create(
+        &ctx,
+        &install,
+        &def,
+        "Tools",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let id = inst.instance_id.clone();
+
+    let (_, t_content) = timed(|| {
+        for n in 0..items {
+            let item = add_item(&ctx, n, files);
+            add_content(&ctx, &id, &item, None, None).unwrap();
+        }
+    });
+    // Two of the known tools are installed by mods, and the player has two tools of their own.
+    for (n, exe) in [
+        (0usize, "Data/tool0/Tool0.exe"),
+        (1, "Data/deep/tool1/TOOL1.EXE"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(exe);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"MZ").unwrap();
+        let item =
+            agora_core::content_store::add_folder(&ctx, tmp.path(), Some(&format!("Tool mod {n}")))
+                .unwrap()
+                .item()
+                .item_id
+                .clone();
+        add_content(&ctx, &id, &item, None, None).unwrap();
+    }
+    let helper = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(helper.path().join("Data/helpers")).unwrap();
+    std::fs::write(helper.path().join("Data/helpers/Helper.exe"), b"MZ").unwrap();
+    let item = agora_core::content_store::add_folder(&ctx, helper.path(), Some("Helpers"))
+        .unwrap()
+        .item()
+        .item_id
+        .clone();
+    add_content(&ctx, &id, &item, None, None).unwrap();
+    game_user_tools::add(
+        &ctx,
+        &id,
+        NewUserTool {
+            name: "Helper".into(),
+            exe: "Data/helpers/Helper.exe".into(),
+            args: vec![],
+            output_is_mod: false,
+            output_folder: None,
+            keeps_output: false,
+        },
+    )
+    .unwrap();
+
+    let mut lists = Vec::new();
+    let mut users = Vec::new();
+    let mut both = Vec::new();
+    for _ in 0..5 {
+        let ((states, _), t) = timed(|| game_tools::list_and_findings(&ctx, &id, &def).unwrap());
+        assert_eq!(states.iter().filter(|s| s.is_present()).count(), 2);
+        lists.push(t);
+        let (own, t) = timed(|| game_user_tools::list_with_presence(&ctx, &id, &def).unwrap());
+        assert_eq!(own.len(), 1);
+        users.push(t);
+        let (_, t) = timed(|| {
+            std::thread::scope(|scope| {
+                let a = scope.spawn(|| game_tools::list_and_findings(&ctx, &id, &def).unwrap());
+                let b =
+                    scope.spawn(|| game_user_tools::list_with_presence(&ctx, &id, &def).unwrap());
+                (a.join().unwrap(), b.join().unwrap())
+            })
+        });
+        both.push(t);
+    }
+    let best = |v: &[Duration]| v.iter().min().copied().unwrap();
+    let planned = plan(&ctx, &id, &def, DeployMode::Links)
+        .unwrap()
+        .files
+        .len();
+    println!("tools tab bench: {items} items x {files} files, {planned} planned files (content import {})", secs(t_content));
+    println!(
+        "  games_tools_list      best {} (runs: {:?})",
+        secs(best(&lists)),
+        lists
+    );
+    println!(
+        "  games_user_tools_list best {} (runs: {:?})",
+        secs(best(&users)),
+        users
+    );
+    println!(
+        "  both at once (the tab) best {} (runs: {:?})",
+        secs(best(&both)),
+        both
+    );
+}

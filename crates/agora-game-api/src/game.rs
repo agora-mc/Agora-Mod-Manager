@@ -1694,6 +1694,16 @@ pub struct ToolDefinition {
     /// writes one without them is discarded, as for a missing required output (MASTER_SPEC §26.9).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_magic: Vec<RequiredMagic>,
+    /// The tool has nothing to build: a player runs it (an editor such as xEdit, a sorter such as
+    /// LOOT) rather than building output with it. Whatever it writes is still kept as its generated
+    /// layer, so no edit is lost, but a run that writes nothing makes no generation, and the screen
+    /// offers "Run" rather than a build (MASTER_SPEC §26.9).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub run_only: bool,
+    /// Other file names the tool's executable goes by (a 64-bit build, a renamed copy). An instance
+    /// lists the tool when a mod ships any of them; the match ignores case and folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executable_names: Vec<String>,
 }
 
 /// A file a tool writes to report a failure, and the text that says so.

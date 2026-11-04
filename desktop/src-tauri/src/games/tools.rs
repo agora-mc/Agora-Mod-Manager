@@ -33,12 +33,16 @@ pub const NOT_FOUND: &str = "not_found";
 /// A full-copy swap was asked for without its costs having been shown and accepted.
 pub const SWAP_NOT_CONFIRMED: &str = "swap_not_confirmed";
 
-/// Every tool the instance's game declares, with its output here.
+/// The tools present in the instance (MASTER_SPEC §26.9): each declared tool a mod (or the game)
+/// provides, and each one with output here. A declared tool nobody installed is not a row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolsView {
     pub instance_id: String,
     pub tools: Vec<ToolRow>,
+    /// The names of every tool the game recognises, for the screen to say which tools appear on
+    /// their own when they are installed as mods.
+    pub known: Vec<String>,
 }
 
 /// One declared tool and the output the instance has for it.
@@ -59,6 +63,15 @@ pub struct ToolRow {
     pub output_kind: OutputKind,
     /// The folder a mod-output tool writes, for the screen to say where it goes.
     pub output_folder: Option<String>,
+    /// The deployment provides the tool's executable. False for a tool listed only for its output:
+    /// the mod that had it was turned off or removed.
+    pub installed: bool,
+    /// Where the executable is in the game folder, when it is installed.
+    pub exe: Option<String>,
+    /// The mod that provides it. `None` for the game's own files, or when it is not installed.
+    pub from_mod: Option<String>,
+    /// The tool has nothing to build: the screen offers "Run", with no build status.
+    pub run_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -231,6 +244,11 @@ pub struct UserToolRow {
     pub known_tool_id: Option<String>,
     pub output_is_mod: bool,
     pub output_folder: Option<String>,
+    /// The executable is not there now: its mod was turned off or removed, or the file outside the
+    /// game was moved. The tool stays in the list until the person removes it.
+    pub missing: bool,
+    /// The person said it builds files the game reads, so its output is tracked as a build.
+    pub keeps_output: bool,
 }
 
 /// The instance's own tools.
@@ -253,7 +271,7 @@ pub struct ToolCandidateRow {
     pub already_added: bool,
 }
 
-fn user_tool_row(tool: UserTool) -> Result<UserToolRow, GamesError> {
+fn user_tool_row(tool: UserTool, present: bool) -> Result<UserToolRow, GamesError> {
     // A saved id Agora cannot read is a broken record, not a tool with no id: say so.
     let tool_id = game_tools::user_tool_id(&tool.id)
         .map(|id| id.to_string())
@@ -267,17 +285,29 @@ fn user_tool_row(tool: UserTool) -> Result<UserToolRow, GamesError> {
         known_tool_id: tool.known_tool_id,
         output_is_mod: tool.output_is_mod,
         output_folder: tool.output_folder,
+        missing: !present,
+        keeps_output: tool.keeps_output,
     })
 }
 
-fn user_tools_view(instance_id: &str, tools: Vec<UserTool>) -> Result<UserToolsView, GamesError> {
+fn user_tools_view(
+    instance_id: &str,
+    tools: Vec<(UserTool, bool)>,
+) -> Result<UserToolsView, GamesError> {
     Ok(UserToolsView {
         instance_id: instance_id.to_string(),
         tools: tools
             .into_iter()
-            .map(user_tool_row)
+            .map(|(tool, present)| user_tool_row(tool, present))
             .collect::<Result<Vec<_>, _>>()?,
     })
+}
+
+/// The instance's own tools, each saying whether its executable is there now.
+fn user_tools_of(ctx: &Ctx, instance_id: &str) -> Result<UserToolsView, GamesError> {
+    let game = definition_of(ctx, instance_id)?;
+    let tools = game_user_tools::list_with_presence(ctx, instance_id, &game).map_err(core_error)?;
+    user_tools_view(instance_id, tools)
 }
 
 fn candidate_row(candidate: ToolCandidate) -> ToolCandidateRow {
@@ -356,11 +386,13 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// The rows of a tool list, with the conflict flags the output findings carry.
+/// The rows of a tool list, with the conflict flags the output findings carry. Only the tools
+/// present in the instance are rows (see [`ToolState::is_present`]).
 pub fn tools_view(
     instance_id: String,
     states: Vec<ToolState>,
     findings: &[OutputFinding],
+    known: Vec<String>,
 ) -> ToolsView {
     let conflicting: HashSet<&str> = findings
         .iter()
@@ -369,6 +401,7 @@ pub fn tools_view(
         .collect();
     let tools = states
         .into_iter()
+        .filter(ToolState::is_present)
         .map(|state| {
             let (output_kind, output_folder) = match &state.output {
                 agora_game_api::ToolOutput::GeneratedLayer => (OutputKind::GeneratedLayer, None),
@@ -386,16 +419,38 @@ pub fn tools_view(
                 status: state.status,
                 output_kind,
                 output_folder,
+                installed: state.found.is_some(),
+                exe: state.found.as_ref().map(|found| found.exe.clone()),
+                from_mod: state
+                    .found
+                    .as_ref()
+                    .map(|found| found.mod_name.clone())
+                    .filter(|name| !name.is_empty()),
+                run_only: state.run_only,
             }
         })
         .collect();
-    ToolsView { instance_id, tools }
+    ToolsView {
+        instance_id,
+        tools,
+        known,
+    }
 }
 
 fn view_of(ctx: &Ctx, instance_id: &str, game: &GameDefinition) -> Result<ToolsView, GamesError> {
     let (states, findings) =
         game_tools::list_and_findings(ctx, instance_id, game).map_err(core_error)?;
-    Ok(tools_view(instance_id.to_string(), states, &findings))
+    let known = game
+        .tool_ids
+        .iter()
+        .filter_map(|id| ctx.games.tool(&game.id, id).map(|tool| tool.name.clone()))
+        .collect();
+    Ok(tools_view(
+        instance_id.to_string(),
+        states,
+        &findings,
+        known,
+    ))
 }
 
 impl From<&SwapCosts> for SwapCostsDto {
@@ -689,15 +744,12 @@ pub async fn games_user_tools_list(
     app: tauri::AppHandle,
     instance_id: String,
 ) -> Result<UserToolsView, GamesError> {
-    with_ctx(app, move |ctx| {
-        let tools = game_user_tools::list(&ctx, &instance_id).map_err(core_error)?;
-        user_tools_view(&instance_id, tools)
-    })
-    .await
+    with_ctx(app, move |ctx| user_tools_of(&ctx, &instance_id)).await
 }
 
 /// Add one executable to the instance's own tools. Nothing is added until the person confirms.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn games_user_tools_add(
     app: tauri::AppHandle,
     instance_id: String,
@@ -706,6 +758,7 @@ pub async fn games_user_tools_add(
     args: Vec<String>,
     output_is_mod: bool,
     output_folder: Option<String>,
+    keeps_output: bool,
 ) -> Result<UserToolRow, GamesError> {
     with_ctx(app, move |ctx| {
         let tool = game_user_tools::add(
@@ -717,10 +770,12 @@ pub async fn games_user_tools_add(
                 args,
                 output_is_mod,
                 output_folder,
+                keeps_output,
             },
         )
         .map_err(core_error)?;
-        user_tool_row(tool)
+        // `add` accepts only an executable that is there, so a new tool is never missing.
+        user_tool_row(tool, true)
     })
     .await
 }
@@ -733,8 +788,8 @@ pub async fn games_user_tools_remove(
     id: String,
 ) -> Result<UserToolsView, GamesError> {
     with_ctx(app, move |ctx| {
-        let tools = game_user_tools::remove(&ctx, &instance_id, &id).map_err(core_error)?;
-        user_tools_view(&instance_id, tools)
+        game_user_tools::remove(&ctx, &instance_id, &id).map_err(core_error)?;
+        user_tools_of(&ctx, &instance_id)
     })
     .await
 }
@@ -967,6 +1022,13 @@ mod tests {
             current: status.map(|_| "1".to_string()),
             previous: None,
             status,
+            found: Some(agora_core::game_user_tools::FoundTool {
+                exe: "Data/Nemesis_Engine/nemesis.exe".into(),
+                mod_id: "item-1".into(),
+                mod_name: "Nemesis".into(),
+                at_declared_path: true,
+            }),
+            run_only: false,
         }
     }
 
@@ -1120,7 +1182,7 @@ mod tests {
             finding("pandora", OutputStatus::Conflict),
             finding("bodyslide", OutputStatus::Stale),
         ];
-        let view = tools_view("sk-1".into(), states, &findings);
+        let view = tools_view("sk-1".into(), states, &findings, Vec::new());
         let by_id = |id: &str| {
             view.tools
                 .iter()
@@ -1136,10 +1198,39 @@ mod tests {
 
     #[test]
     fn a_tool_with_no_output_is_listed_as_not_built() {
-        let view = tools_view("sk-1".into(), vec![state("nemesis", None)], &[]);
+        let view = tools_view("sk-1".into(), vec![state("nemesis", None)], &[], Vec::new());
         assert_eq!(view.tools[0].status, None);
         assert_eq!(view.tools[0].current, None);
         assert!(!view.tools[0].conflicts);
+        assert!(view.tools[0].installed);
+        assert_eq!(view.tools[0].from_mod.as_deref(), Some("Nemesis"));
+    }
+
+    #[test]
+    fn a_declared_tool_nobody_installed_is_not_a_row_and_one_with_output_says_it_is_missing() {
+        let not_installed = ToolState {
+            found: None,
+            ..state("bodyslide", None)
+        };
+        let orphaned = ToolState {
+            found: None,
+            current: Some("2".into()),
+            ..state("pandora", Some(OutputStatus::Stale))
+        };
+        let view = tools_view(
+            "sk-1".into(),
+            vec![state("nemesis", None), not_installed, orphaned],
+            &[],
+            vec!["Nemesis".into(), "BodySlide".into(), "Pandora".into()],
+        );
+        let ids: Vec<&str> = view.tools.iter().map(|row| row.tool_id.as_str()).collect();
+        assert_eq!(ids, vec!["nemesis", "pandora"]);
+        assert!(!view.tools[1].installed);
+        assert_eq!(view.tools[1].exe, None);
+        assert_eq!(view.known.len(), 3);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["tools"][0]["fromMod"], "Nemesis");
+        assert_eq!(json["tools"][0]["exe"], "Data/Nemesis_Engine/nemesis.exe");
     }
 
     fn journal(instance_id: &str, tool: &str) -> SwapJournal {
@@ -1190,9 +1281,10 @@ mod tests {
             known_tool_id: None,
             output_is_mod: false,
             output_folder: None,
+            keeps_output: false,
         };
 
-        let error = user_tool_row(broken).expect_err("an unreadable tool id is an error");
+        let error = user_tool_row(broken, true).expect_err("an unreadable tool id is an error");
         assert_eq!(error.code, CORE_FAILED);
         assert!(
             error.message.contains("not a valid tool id"),
@@ -1211,10 +1303,12 @@ mod tests {
             known_tool_id: None,
             output_is_mod: false,
             output_folder: None,
+            keeps_output: false,
         };
 
-        let view = user_tools_view("sk-1", vec![tool]).expect("a readable tool lists");
+        let view = user_tools_view("sk-1", vec![(tool, false)]).expect("a readable tool lists");
         assert_eq!(view.tools[0].tool_id, "user-tool-1");
+        assert!(view.tools[0].missing);
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::game_plugins::{self, PluginListError};
 use crate::game_registry::{GameInventory, IdentifiedInstall, RuntimeResolution};
 use crate::game_saves::{self, SavesError};
 use crate::game_tools::{self, ToolError};
+use crate::game_user_tools;
 use crate::lock_manager::LockResource;
 
 /// The `overwrite` files that no tool claims become one content layer with this name.
@@ -1187,6 +1188,9 @@ pub struct Mo2RunReport {
     pub saves_copied: usize,
     pub saves_skipped_existing: usize,
     pub saves_folder: Option<PathBuf>,
+    /// Programs from MO2's executables list added to the instance's own tools, by name. A tool the
+    /// game declares is found in its mod by itself and is not repeated here.
+    pub tools_added: Vec<String>,
     /// What still has to be done by hand, if anything.
     pub next_steps: Vec<String>,
 }
@@ -1280,6 +1284,7 @@ pub fn run(
         saves_copied: 0,
         saves_skipped_existing: 0,
         saves_folder: None,
+        tools_added: Vec::new(),
         next_steps: Vec::new(),
     };
 
@@ -1523,6 +1528,10 @@ pub fn run(
         return Err(abandon_half_made_instance(ctx, &instance_id, error));
     }
 
+    // 8. MO2's executables become the instance's own tools. A tool that cannot be added is a note,
+    // never a failed import: the instance is complete without it.
+    import_executables(ctx, &def, &plan, &instance_id, &mut report);
+
     report.next_steps.extend(plan.problems.iter().map(|p| {
         format!(
             "line {}: {} was not imported: {}",
@@ -1532,6 +1541,147 @@ pub fn run(
         )
     }));
     Ok(report)
+}
+
+/// The folders of `path` below `folder`, compared without case and without caring whether the
+/// separators are `/` or `\`. `None` when `path` is not inside `folder`.
+fn components_below(path: &str, folder: &Path) -> Option<Vec<String>> {
+    let split = |text: &str| -> Vec<String> {
+        text.split(['/', '\\'])
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let path = split(path);
+    let folder = split(&folder.to_string_lossy());
+    if folder.is_empty() || path.len() <= folder.len() {
+        return None;
+    }
+    let inside = folder
+        .iter()
+        .zip(&path)
+        .all(|(a, b)| fold_path_case(a) == fold_path_case(b));
+    inside.then(|| path[folder.len()..].to_vec())
+}
+
+/// What one of MO2's executables becomes: a tool for the instance, a note saying why it is not
+/// one, or nothing for the programs Agora runs itself (the game and its launchers, MO2's own
+/// helpers) and the ones hidden in MO2.
+fn executable_to_tool(
+    exe: &mo2::Mo2Executable,
+    ini: &Mo2Ini,
+    ini_dir: &Path,
+    plan: &Mo2Plan,
+    mount: &str,
+) -> Option<Result<game_user_tools::NewUserTool, String>> {
+    if exe.hide {
+        return None;
+    }
+    let binary = exe.binary.trim();
+    let title = if exe.title.trim().is_empty() {
+        binary.to_string()
+    } else {
+        exe.title.trim().to_string()
+    };
+    let tool = |path: String| game_user_tools::NewUserTool {
+        name: exe.title.trim().to_string(),
+        exe: path,
+        args: mo2::split_arguments(&exe.arguments),
+        output_is_mod: false,
+        output_folder: None,
+        keeps_output: false,
+    };
+    if let Some(rest) = components_below(binary, &ini.mods) {
+        let (folder, inner) = rest.split_first()?;
+        let planned = plan
+            .mods
+            .iter()
+            .find(|m| fold_path_case(&m.folder) == fold_path_case(folder));
+        if planned.is_none() || inner.is_empty() {
+            return Some(Err(format!(
+                "{title} is in the mod folder '{folder}', which this import did not bring over"
+            )));
+        }
+        let inner = inner.join("/");
+        let path = if mount.is_empty() {
+            inner
+        } else {
+            format!("{}/{inner}", mount.trim_end_matches('/'))
+        };
+        return Some(Ok(tool(path)));
+    }
+    if components_below(binary, &ini.overwrite).is_some() {
+        return Some(Err(format!(
+            "{title} is in MO2's overwrite folder; add it by hand from the Tools tab if you need it"
+        )));
+    }
+    if components_below(binary, &plan.install_location).is_some()
+        || components_below(binary, &ini.base).is_some()
+        || components_below(binary, ini_dir).is_some()
+    {
+        return None;
+    }
+    if !Path::new(binary).is_absolute() {
+        return Some(Err(format!(
+            "{title} names '{binary}', which is not a full path"
+        )));
+    }
+    Some(Ok(tool(binary.to_string())))
+}
+
+/// Step 8 of an import: add the setup's executables to the instance's own tools, and say in the
+/// report what was added and what was not.
+fn import_executables(
+    ctx: &Ctx,
+    def: &GameDefinition,
+    plan: &Mo2Plan,
+    instance_id: &str,
+    report: &mut Mo2RunReport,
+) {
+    let text = match read_text_optional(&plan.setup) {
+        Ok(Some(text)) => text,
+        Ok(None) => return,
+        Err(error) => {
+            report.next_steps.push(format!(
+                "MO2's executables were not read, so none were added as tools: {error}"
+            ));
+            return;
+        }
+    };
+    let ini_dir = plan
+        .setup
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let ini = mo2::parse_ini(&text, ini_dir.clone());
+    let mount = mount_point(def);
+    let mut entries = Vec::new();
+    for exe in mo2::parse_executables(&text) {
+        match executable_to_tool(&exe, &ini, &ini_dir, plan, &mount) {
+            Some(Ok(entry)) => entries.push(entry),
+            Some(Err(note)) => report.next_steps.push(format!("tool not added: {note}")),
+            None => {}
+        }
+    }
+    match game_user_tools::import_tools(ctx, instance_id, entries) {
+        Ok(answers) => {
+            for answer in answers {
+                match answer {
+                    game_user_tools::ImportedTool::Added(tool) => {
+                        report.tools_added.push(tool.name)
+                    }
+                    game_user_tools::ImportedTool::Skipped { name, reason } => report
+                        .next_steps
+                        .push(format!("tool not added: {name}: {reason}")),
+                    game_user_tools::ImportedTool::AlreadyDetected { .. }
+                    | game_user_tools::ImportedTool::AlreadyListed { .. } => {}
+                }
+            }
+        }
+        Err(error) => report.next_steps.push(format!(
+            "MO2's executables were not added as tools: {error}"
+        )),
+    }
 }
 
 #[cfg(test)]

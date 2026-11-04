@@ -80,7 +80,10 @@
         "pandora",
         "texgen",
         "dyndolod",
-        "pgpatcher"
+        "pgpatcher",
+        "sseedit",
+        "loot",
+        "synthesis"
       ],
       "launch": {
         "executable": {
@@ -547,6 +550,70 @@
         "folder": "",
         "user_configured": true
       }
+    },
+    {
+      "id": "sseedit",
+      "game": "skyrim-se",
+      "name": "SSEEdit",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/SSEEdit/SSEEdit.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/SSEEdit"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": true,
+      "run_only": true,
+      "executable_names": ["SSEEdit64.exe"]
+    },
+    {
+      "id": "loot",
+      "game": "skyrim-se",
+      "name": "LOOT",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/LOOT/LOOT.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/LOOT"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": true,
+      "run_only": true
+    },
+    {
+      "id": "synthesis",
+      "game": "skyrim-se",
+      "name": "Synthesis",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "Data/Synthesis/Synthesis.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": "Data/Synthesis"
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": true,
+      "output_patterns": ["Data/Synthesis.esp"]
     }
   ]
 }

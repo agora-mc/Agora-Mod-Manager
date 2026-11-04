@@ -2,7 +2,7 @@ import { test, expect, type Page } from '@playwright/test';
 import { expectNoUnmockedCommands, instanceHeaderReplies, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
 
 /**
- * The Tools page of an instance of a non-Minecraft game (MASTER_SPEC §26.9): the declared tools, their
+ * The Tools page of an instance of a non-Minecraft game (MASTER_SPEC §26.9): the tools installed in it, their
  * output, runs with the capture choice, the fallbacks that are asked about, and the swap banner. Every
  * command these tests reach is answered from the table in `support/games-mock.ts`; anything else fails.
  *
@@ -44,6 +44,10 @@ const nemesisRow = {
   conflicts: true,
   outputKind: 'generated_layer',
   outputFolder: null,
+  installed: true,
+  exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
+  fromMod: 'Nemesis Unlimited Behavior Engine',
+  runOnly: false,
 };
 const pandoraRow = {
   toolId: 'pandora',
@@ -55,6 +59,10 @@ const pandoraRow = {
   conflicts: true,
   outputKind: 'generated_layer',
   outputFolder: null,
+  installed: true,
+  exe: 'Data/Pandora Behaviour Engine+/Pandora Behaviour Engine+.exe',
+  fromMod: 'Pandora Behaviour Engine+',
+  runOnly: false,
 };
 const bodyslideRow = {
   toolId: 'bodyslide',
@@ -66,9 +74,15 @@ const bodyslideRow = {
   conflicts: false,
   outputKind: 'generated_layer',
   outputFolder: null,
+  installed: true,
+  exe: 'Data/CalienteTools/BodySlide/BodySlide x64.exe',
+  fromMod: 'BodySlide and Outfit Studio',
+  runOnly: false,
 };
 
-const toolsView = { instanceId: INSTANCE_ID, tools: [nemesisRow, pandoraRow, bodyslideRow] };
+const KNOWN_TOOLS = ['Nemesis', 'BodySlide', 'Pandora Behaviour Engine', 'TexGen', 'DynDOLOD', 'PGPatcher'];
+
+const toolsView = { instanceId: INSTANCE_ID, tools: [nemesisRow, pandoraRow, bodyslideRow], known: KNOWN_TOOLS };
 
 const swapCosts = {
   installDir: 'D:/Games/Skyrim Special Edition',
@@ -158,7 +172,7 @@ async function boot(page: Page, tools: ToolsTable = {}) {
         changed: ['Data/meshes/actors/character/a.hkx'],
         removed: [],
       },
-      games_tools_remove: tools.remove ?? { removedGenerations: ['1', '2'], view: { instanceId: INSTANCE_ID, tools: [{ ...nemesisRow, current: null, previous: null, status: null, conflicts: false }, pandoraRow, bodyslideRow] } },
+      games_tools_remove: tools.remove ?? { removedGenerations: ['1', '2'], view: { instanceId: INSTANCE_ID, known: KNOWN_TOOLS, tools: [{ ...nemesisRow, current: null, previous: null, status: null, conflicts: false }, pandoraRow, bodyslideRow] } },
       games_tools_swap_restore: tools.restore ?? { restoredTools: ['bodyslide'] },
       games_tools_rollback: toolsView,
     },
@@ -205,9 +219,12 @@ test.afterEach(async ({ page }) => {
   await expectNoUnmockedCommands(page);
 });
 
-test('the declared tools show their output, a stale badge and the conflict warning', async ({ page }) => {
+test('the installed tools show where they came from, their output, a stale badge and the conflict warning', async ({ page }) => {
   await boot(page);
   await openToolsPage(page);
+
+  await expect(page.getByRole('heading', { name: 'Tools (3)' })).toBeVisible();
+  await expect(card(page, 'Nemesis').getByTestId('tool-origin')).toHaveText('From the mod “Nemesis Unlimited Behavior Engine”');
 
   await expect(card(page, 'Nemesis').getByTestId('tool-status')).toHaveText('Up to date');
   await expect(card(page, 'Nemesis')).toContainText('Output: generation 2, with generation 1 kept to roll back to.');
@@ -367,12 +384,27 @@ test('a swap that is still running cannot be put back yet, and the page says so'
   await expect(banner.getByRole('button', { name: 'Put the Data folder back' })).toHaveCount(0);
 });
 
-test('a game that declares no tools says so, and says nothing is to be built', async ({ page }) => {
-  await boot(page, { list: { instanceId: INSTANCE_ID, tools: [] } });
+test('an instance with no tools installed says how tools appear, and offers to add one', async ({ page }) => {
+  await boot(page, { list: { instanceId: INSTANCE_ID, tools: [], known: KNOWN_TOOLS } });
   await openToolsPage(page);
 
-  await expect(page.getByTestId('tools-empty')).toContainText('This game declares no tools');
+  const empty = page.getByTestId('tools-empty');
+  await expect(empty).toContainText('No tools yet');
+  await expect(empty).toContainText('show up here by themselves when you install them as mods');
   await expect(page.getByTestId('tool-card')).toHaveCount(0);
+  await expect(empty.getByRole('button', { name: 'Add a tool…' })).toBeVisible();
+});
+
+test('a tool whose mod is off keeps its output but cannot run', async ({ page }) => {
+  await boot(page, {
+    list: { instanceId: INSTANCE_ID, known: KNOWN_TOOLS, tools: [{ ...pandoraRow, conflicts: false, installed: false, exe: null, fromMod: null }] },
+  });
+  await openToolsPage(page);
+
+  const pandora = card(page, 'Pandora');
+  await expect(pandora.getByTestId('tool-missing')).toHaveText('Not installed');
+  await expect(pandora.getByRole('button', { name: /Rebuild Pandora/ })).toHaveCount(0);
+  await expect(pandora.getByRole('button', { name: 'Remove output' })).toBeVisible();
 });
 
 test('a tools list that fails shows the error, with a way to try again', async ({ page }) => {
