@@ -39,6 +39,8 @@ export interface ToolRow {
   exe: string | null;
   /** The mod that provides it; `null` for the game's own files or when it is not installed. */
   fromMod: string | null;
+  /** The tool has nothing to build (an editor, a sorter): the screen offers "Run", with no build status. */
+  runOnly: boolean;
 }
 
 /** The tools present in an instance: the ones installed here, and the ones with output here. */
@@ -156,6 +158,8 @@ export interface UserToolRow {
   outputFolder: string | null;
   /** Its executable is not there now (its mod is off or gone). It stays listed until removed. */
   missing: boolean;
+  /** The player said it builds files the game reads, so its output is tracked as a build. */
+  keepsOutput: boolean;
 }
 
 /** One earlier output of a mod-output tool. */
@@ -203,7 +207,8 @@ function isToolRow(value: unknown): value is ToolRow {
     && isNullableString(value.outputFolder)
     && typeof value.installed === 'boolean'
     && isNullableString(value.exe)
-    && isNullableString(value.fromMod);
+    && isNullableString(value.fromMod)
+    && typeof value.runOnly === 'boolean';
 }
 
 export function isToolsView(value: unknown): value is ToolsView {
@@ -317,7 +322,8 @@ function isUserToolRow(value: unknown): value is UserToolRow {
     && isString(value.toolId)
     && typeof value.outputIsMod === 'boolean'
     && isNullableString(value.outputFolder)
-    && typeof value.missing === 'boolean';
+    && typeof value.missing === 'boolean'
+    && typeof value.keepsOutput === 'boolean';
 }
 
 function isToolOutput(value: unknown): value is ToolOutput {
@@ -422,7 +428,7 @@ export async function listUserTools(instanceId: string): Promise<UserToolsView> 
 /** Add one executable to the instance's own list. */
 export async function addUserTool(
   instanceId: string,
-  tool: { name: string; exe: string; args: string[]; outputIsMod?: boolean; outputFolder?: string | null },
+  tool: { name: string; exe: string; args: string[]; outputIsMod?: boolean; outputFolder?: string | null; keepsOutput?: boolean },
 ): Promise<UserToolRow> {
   const reply = await invoke<unknown>('games_user_tools_add', {
     instanceId,
@@ -431,6 +437,7 @@ export async function addUserTool(
     args: tool.args,
     outputIsMod: tool.outputIsMod ?? false,
     outputFolder: tool.outputFolder ?? null,
+    keepsOutput: tool.keepsOutput ?? false,
   });
   return expectReply('games_user_tools_add', reply, isUserToolRow);
 }

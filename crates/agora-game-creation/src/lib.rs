@@ -191,9 +191,12 @@ mod tests {
                 agora_game_api::ToolId::new("texgen").unwrap(),
                 agora_game_api::ToolId::new("dyndolod").unwrap(),
                 agora_game_api::ToolId::new("pgpatcher").unwrap(),
+                agora_game_api::ToolId::new("sseedit").unwrap(),
+                agora_game_api::ToolId::new("loot").unwrap(),
+                agora_game_api::ToolId::new("synthesis").unwrap(),
             ]
         );
-        assert_eq!(def.tools.len(), 6);
+        assert_eq!(def.tools.len(), 9);
         let nemesis = &def.tools[0];
         assert!(nemesis.uses_install_path);
         let bodyslide = &def.tools[1];
@@ -417,6 +420,58 @@ mod tests {
         }
         let ids: Vec<&str> = at_1_6_1179.iter().map(|f| f.rule_id.as_str()).collect();
         assert_eq!(ids, vec!["skse", "address-library"]);
+    }
+
+    /// The tools a player runs rather than builds with, and the names their executables go by. The
+    /// sources for each name:
+    /// - SSEEdit: <https://github.com/TES5Edit/TES5Edit> ("xEdit versions": rename the executable to
+    ///   include the game mode; Skyrim SE is `SSEEdit.exe`). `SSEEdit64.exe` is the 64-bit build
+    ///   renamed by the same rule.
+    /// - LOOT: <https://github.com/loot/loot> (its build produces `LOOT.exe`).
+    /// - Synthesis: <https://mutagen-modding.github.io/Synthesis/Installation/> (`Synthesis.exe`). It
+    ///   builds a patch (`Synthesis.esp`), so it is not run-only.
+    #[test]
+    fn the_run_only_tools_are_declared_with_their_executable_names() {
+        let package = game_package();
+        let tool = |id: &str| {
+            package
+                .definition()
+                .tools
+                .iter()
+                .find(|t| t.id.as_str() == id)
+                .unwrap_or_else(|| panic!("the package declares {id}"))
+                .clone()
+        };
+        let exe = |t: &agora_game_api::ToolDefinition| match &t.launch.executable {
+            GamePath::Runtime { path } => path.as_str().to_string(),
+            other => panic!("{other:?}"),
+        };
+
+        let sseedit = tool("sseedit");
+        assert!(sseedit.run_only);
+        assert!(exe(&sseedit).ends_with("/SSEEdit.exe"));
+        assert_eq!(sseedit.executable_names, vec!["SSEEdit64.exe".to_string()]);
+        assert!(sseedit.output_patterns.is_empty());
+
+        let loot = tool("loot");
+        assert!(loot.run_only);
+        assert!(exe(&loot).ends_with("/LOOT.exe"));
+
+        let synthesis = tool("synthesis");
+        assert!(!synthesis.run_only);
+        assert!(exe(&synthesis).ends_with("/Synthesis.exe"));
+
+        // The tools that build output are not run-only.
+        for id in [
+            "nemesis",
+            "bodyslide",
+            "pandora",
+            "texgen",
+            "dyndolod",
+            "pgpatcher",
+        ] {
+            assert!(!tool(id).run_only, "{id}");
+        }
     }
 
     /// Read-only check of the Nemesis run that failed on 2026-10-09 (MASTER_SPEC §26.9, slice 4d). The

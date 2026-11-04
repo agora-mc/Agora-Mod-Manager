@@ -90,6 +90,18 @@ pub struct UserTool {
     /// The folder the tool writes its mod into. A relative folder is next to the executable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_folder: Option<String>,
+    /// The person said the tool builds files the game reads, so its output is tracked as a build
+    /// ("Not built yet", "Rebuild"). Without it the tool is run-only: it simply runs, and anything
+    /// it writes is still kept (MASTER_SPEC §26.9).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_output: bool,
+}
+
+impl UserTool {
+    /// Whether the tool is run-only: neither a build the person tracks nor a mod-output tool.
+    pub fn is_run_only(&self) -> bool {
+        !self.keeps_output && !self.output_is_mod
+    }
 }
 
 /// What `add` is given: the user chose the name, path and arguments.
@@ -100,6 +112,7 @@ pub struct NewUserTool {
     pub args: Vec<String>,
     pub output_is_mod: bool,
     pub output_folder: Option<String>,
+    pub keeps_output: bool,
 }
 
 /// One executable `find_candidates` found, for the person to confirm.
@@ -204,6 +217,7 @@ pub fn add(ctx: &Ctx, instance_id: &str, new: NewUserTool) -> Result<UserTool, U
         known_tool_id,
         output_is_mod,
         output_folder,
+        keeps_output: new.keeps_output,
     };
     tools.push(tool.clone());
     write_file(
@@ -378,9 +392,6 @@ pub fn detect_known_tools(
     let mut names: BTreeMap<String, String> = BTreeMap::new();
     for tool in &known {
         let declared_folded = fold_path_case(&tool.exe);
-        let Some(declared_base) = file_name(&tool.exe).map(fold_path_case) else {
-            continue;
-        };
         let mut best: Option<(usize, bool, &game_deploy::PlannedFile)> = None;
         for file in &plan.files {
             if matches!(
@@ -390,7 +401,7 @@ pub fn detect_known_tools(
                 continue;
             }
             let path = file.path.as_str();
-            if file_name(path).map(fold_path_case).as_deref() != Some(declared_base.as_str()) {
+            if !file_name(path).is_some_and(|name| tool.answers_to(name)) {
                 continue;
             }
             let rank = rank_of(&file.layer_id);
@@ -599,6 +610,7 @@ pub fn import_tools(
             known_tool_id: matched.and_then(|m| m.known_tool_id.clone()),
             output_is_mod,
             output_folder,
+            keeps_output: entry.keeps_output,
         };
         tools.push(tool.clone());
         answers.push(ImportedTool::Added(tool));
@@ -650,6 +662,16 @@ struct KnownTool {
     name: String,
     /// The executable's game-relative path, with forward slashes.
     exe: String,
+    /// Every file name the executable goes by, folded: the declared path's own, then the
+    /// package's `executable_names`.
+    names: Vec<String>,
+}
+
+impl KnownTool {
+    fn answers_to(&self, file_name: &str) -> bool {
+        let folded = fold_path_case(file_name);
+        self.names.contains(&folded)
+    }
 }
 
 fn known_tools(ctx: &Ctx, definition: &GameDefinition) -> Vec<KnownTool> {
@@ -661,10 +683,19 @@ fn known_tools(ctx: &Ctx, definition: &GameDefinition) -> Vec<KnownTool> {
             let GamePath::Runtime { path } = &tool.launch.executable else {
                 return None;
             };
+            let exe = path.as_str().to_string();
+            let names = file_name(&exe)
+                .into_iter()
+                .map(str::to_string)
+                .chain(tool.executable_names.iter().cloned())
+                .map(|name| fold_path_case(name.trim()))
+                .filter(|name| !name.is_empty())
+                .collect();
             Some(KnownTool {
                 id: id.to_string(),
                 name: tool.name,
-                exe: path.as_str().to_string(),
+                exe,
+                names,
             })
         })
         .collect()
@@ -678,11 +709,9 @@ fn candidate_row(
     known: &[KnownTool],
     already_added: bool,
 ) -> ToolCandidate {
-    let base_folded = fold_path_case(base);
-    let known_tool = known.iter().find(|tool| {
-        fold_path_case(&tool.exe) == fold_path_case(exe)
-            || file_name(&tool.exe).is_some_and(|name| fold_path_case(name) == base_folded)
-    });
+    let known_tool = known
+        .iter()
+        .find(|tool| fold_path_case(&tool.exe) == fold_path_case(exe) || tool.answers_to(base));
     ToolCandidate {
         exe: exe.to_string(),
         mod_id,

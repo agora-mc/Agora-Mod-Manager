@@ -189,6 +189,8 @@ fn tool(id: &str, name: &str, args: &[&str]) -> ToolDefinition {
         required_outputs: Vec::new(),
         failure_markers: Vec::new(),
         required_magic: Vec::new(),
+        run_only: false,
+        executable_names: Vec::new(),
     }
 }
 
@@ -4266,6 +4268,7 @@ fn add_user_tool(
             args: Vec::new(),
             output_is_mod: false,
             output_folder: None,
+            keeps_output: false,
         },
     )
 }
@@ -4593,6 +4596,7 @@ fn the_list_is_written_atomically_and_reads_back_with_its_arguments() {
             args: vec!["-a".into(), "x".into()],
             output_is_mod: false,
             output_folder: None,
+            keeps_output: false,
         },
     )
     .unwrap();
@@ -5241,6 +5245,7 @@ fn add_user_tool_full(
             args: args.iter().map(|a| a.to_string()).collect(),
             output_is_mod,
             output_folder: output_folder.map(|s| s.to_string()),
+            keeps_output: false,
         },
     )
     .unwrap()
@@ -5743,6 +5748,7 @@ fn an_absolute_user_exe_must_be_an_existing_exe_without_control_characters() {
                 args: Vec::new(),
                 output_is_mod: false,
                 output_folder: None,
+                keeps_output: false,
             },
         );
         assert!(result.is_err(), "an absolute bad exe was accepted");
@@ -6432,6 +6438,7 @@ fn an_import_adds_each_new_tool_once_and_refuses_paths_that_leave_the_game() {
         args: vec!["-a".into()],
         output_is_mod: false,
         output_folder: None,
+        keeps_output: false,
     };
     let entries = || {
         vec![
@@ -6496,4 +6503,100 @@ fn an_import_with_nothing_to_add_writes_no_list() {
         .unwrap()
         .is_empty());
     assert!(!f.instance_dir().join("user_tools.json").exists());
+}
+
+#[test]
+fn a_run_only_tool_that_writes_nothing_simply_runs_and_makes_no_generation() {
+    let mut editor = tool("editor", "Editor", &["/c", "echo", "looked"]);
+    editor.run_only = true;
+    let f = fixture(vec![editor]);
+
+    let out = f.run_ok("editor", &StagingLauncher::new());
+
+    assert!(out.written.is_empty(), "{:?}", out.written);
+    assert_eq!(out.current, None);
+    assert_eq!(
+        f.generated("editor"),
+        None,
+        "no generated layer for a run that wrote nothing"
+    );
+    assert!(names(&f.tool_dir("editor"))
+        .iter()
+        .all(|name| name.parse::<u64>().is_err()));
+}
+
+#[test]
+fn a_run_only_tool_that_writes_keeps_what_it_wrote() {
+    let mut editor = tool(
+        "editor",
+        "Editor",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "patch",
+            ">",
+            r"Data\Patch.esp",
+        ],
+    );
+    editor.run_only = true;
+    let f = fixture(vec![editor]);
+
+    let out = f.run_ok("editor", &StagingLauncher::new());
+
+    assert!(
+        out.written.contains(&"Data/Patch.esp".to_string()),
+        "{:?}",
+        out.written
+    );
+    assert_eq!(out.current.as_deref(), Some("1"));
+    assert!(f.generated("editor").is_some(), "an edit is never lost");
+}
+
+#[test]
+fn a_declared_tool_is_found_by_another_name_its_executable_goes_by() {
+    let mut editor = known_tool("sseedit", "SSEEdit", "Data/SSEEdit/SSEEdit.exe");
+    editor.executable_names = vec!["SSEEdit64.exe".into()];
+    let f = fixture(vec![editor]);
+    f.add_mod("xEdit", &[("Data/Tools/xEdit/sseedit64.EXE", b"MZ")]);
+
+    let found = state_of(&f, "sseedit")
+        .found
+        .expect("found by its 64-bit name");
+    assert_eq!(found.exe, "Data/Tools/xEdit/sseedit64.EXE");
+    // The candidate list recognises it too.
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates[0].known_tool_id.as_deref(), Some("sseedit"));
+}
+
+#[test]
+fn a_user_tool_is_run_only_unless_it_keeps_output_or_writes_a_mod() {
+    let f = fixture(Vec::new());
+    let user = |keeps_output: bool, output_is_mod: bool| game_user_tools::UserTool {
+        id: "abc".into(),
+        name: "Mine".into(),
+        exe: "Data/tools/My.exe".into(),
+        args: Vec::new(),
+        known_tool_id: None,
+        output_is_mod,
+        output_folder: output_is_mod.then(|| "Out".to_string()),
+        keeps_output,
+    };
+    assert!(
+        game_tools::user_tool_definition(&f.def, &user(false, false))
+            .unwrap()
+            .run_only
+    );
+    assert!(
+        !game_tools::user_tool_definition(&f.def, &user(true, false))
+            .unwrap()
+            .run_only
+    );
+    assert!(
+        !game_tools::user_tool_definition(&f.def, &user(false, true))
+            .unwrap()
+            .run_only
+    );
 }

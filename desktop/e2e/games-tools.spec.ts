@@ -47,6 +47,7 @@ const nemesisRow = {
   installed: true,
   exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
   fromMod: 'Nemesis Unlimited Behavior Engine',
+  runOnly: false,
 };
 const pandoraRow = {
   toolId: 'pandora',
@@ -61,6 +62,7 @@ const pandoraRow = {
   installed: true,
   exe: 'Data/Pandora Behaviour Engine+/Pandora Behaviour Engine+.exe',
   fromMod: 'Pandora Behaviour Engine+',
+  runOnly: false,
 };
 const bodyslideRow = {
   toolId: 'bodyslide',
@@ -75,6 +77,7 @@ const bodyslideRow = {
   installed: true,
   exe: 'Data/CalienteTools/BodySlide/BodySlide x64.exe',
   fromMod: 'BodySlide and Outfit Studio',
+  runOnly: false,
 };
 
 const KNOWN_TOOLS = ['Nemesis', 'BodySlide', 'Pandora Behaviour Engine', 'TexGen', 'DynDOLOD', 'PGPatcher'];

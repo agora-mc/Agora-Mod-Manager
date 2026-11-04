@@ -34,6 +34,7 @@ const row = {
   installed: true,
   exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
   fromMod: 'Nemesis Unlimited Behavior Engine',
+  runOnly: false,
 };
 
 const costs = {
@@ -227,6 +228,7 @@ const userTool = {
   outputIsMod: false,
   outputFolder: null,
   missing: false,
+  keepsOutput: false,
 };
 
 const candidate = {
@@ -267,6 +269,7 @@ describe('the user tool commands', () => {
       args: ['-a'],
       outputIsMod: false,
       outputFolder: null,
+      keepsOutput: false,
     });
   });
 

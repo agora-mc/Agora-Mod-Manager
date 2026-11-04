@@ -55,6 +55,7 @@ const nemesis: ToolRow = {
   installed: true,
   exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
   fromMod: 'Nemesis Unlimited Behavior Engine',
+  runOnly: false,
 };
 
 const fnis: UserToolRow = {
@@ -67,6 +68,7 @@ const fnis: UserToolRow = {
   outputIsMod: false,
   outputFolder: null,
   missing: false,
+  keepsOutput: false,
 };
 
 const unknown: ToolCandidate = {
@@ -112,6 +114,7 @@ beforeEach(() => {
     outputIsMod: tool.outputIsMod ?? false,
     outputFolder: tool.outputFolder ?? null,
     missing: false,
+    keepsOutput: tool.keepsOutput ?? false,
   }));
   vi.mocked(removeUserTool).mockReset();
   vi.mocked(runUserTool).mockReset();
@@ -158,6 +161,8 @@ describe('the list', () => {
     mount();
     const card = await screen.findByRole('article', { name: 'Nemesis' });
     expect(within(card).getByTestId('tool-missing')).toHaveTextContent('Not installed');
+    expect(within(card).queryByTestId('tool-status')).toBeNull();
+    expect(within(card).queryByText(/A mod, the load order or a setting changed/)).toBeNull();
     expect(within(card).getByTestId('tool-unavailable')).toHaveTextContent('the mod that had it is off or was removed');
     expect(within(card).queryByRole('button', { name: /Rebuild Nemesis|Build Nemesis|Run Nemesis/ })).toBeNull();
     expect(within(card).getByRole('button', { name: 'Remove output' })).toBeInTheDocument();
@@ -185,6 +190,47 @@ describe('the list', () => {
   });
 });
 
+describe('run-only tools', () => {
+  it('offer a plain Run, with no build status and no capture choice', async () => {
+    vi.mocked(listGameTools).mockResolvedValue({
+      instanceId: 'inst-1',
+      known: KNOWN,
+      tools: [{ ...nemesis, toolId: 'sseedit', name: 'SSEEdit', runOnly: true, exe: 'Data/SSEEdit/SSEEdit.exe', fromMod: 'SSEEdit' }],
+    });
+    vi.mocked(listUserTools).mockResolvedValue({ instanceId: 'inst-1', tools: [fnis] });
+    mount();
+    const sseedit = await screen.findByRole('article', { name: 'SSEEdit' });
+    expect(within(sseedit).getByRole('button', { name: 'Run SSEEdit' })).toBeInTheDocument();
+    expect(within(sseedit).queryByTestId('tool-status')).toBeNull();
+    expect(within(sseedit).queryByRole('combobox')).toBeNull();
+    expect(within(sseedit).getByTestId('tool-run-only')).toHaveTextContent('Anything it writes is kept for this instance');
+
+    const own = within(screen.getByTestId('user-tool-card')).getByRole('article', { name: 'FNIS' });
+    expect(within(own).getByRole('button', { name: 'Run FNIS' })).toBeInTheDocument();
+    expect(within(own).queryByTestId('tool-status')).toBeNull();
+  });
+
+  it('a tool the player said builds output is tracked as a build', async () => {
+    vi.mocked(listUserTools).mockResolvedValue({ instanceId: 'inst-1', tools: [{ ...fnis, keepsOutput: true }] });
+    mount();
+    const card = await screen.findByTestId('user-tool-card');
+    expect(within(card).getByRole('button', { name: 'Build FNIS' })).toBeInTheDocument();
+    expect(within(card).getByTestId('tool-status')).toHaveTextContent('Not built yet');
+    expect(within(card).getByRole('combobox')).toBeInTheDocument();
+  });
+
+  it('the add panel passes the choice to track output', async () => {
+    mount();
+    fireEvent.click(within(await screen.findByTestId('tools-empty')).getByRole('button', { name: 'Add a tool…' }));
+    const panel = await screen.findByTestId('tool-add');
+    fireEvent.change(within(panel).getByLabelText('Program'), { target: { value: 'Data/tools/FNIS.exe' } });
+    fireEvent.change(within(panel).getByLabelText('Name'), { target: { value: 'FNIS' } });
+    fireEvent.click(within(panel).getByLabelText('It builds files the game reads'));
+    fireEvent.click(within(panel).getByRole('button', { name: 'Add tool' }));
+    await waitFor(() => expect(addUserTool).toHaveBeenCalledWith('inst-1', expect.objectContaining({ keepsOutput: true, outputIsMod: false })));
+  });
+});
+
 describe('the player’s own tools', () => {
   it('lists a tool with its program and arguments, and removes it from the list', async () => {
     vi.mocked(listUserTools).mockResolvedValue({ instanceId: 'inst-1', tools: [fnis] });
@@ -204,7 +250,7 @@ describe('the player’s own tools', () => {
     const card = await screen.findByTestId('user-tool-card');
     expect(within(card).getByTestId('tool-missing')).toBeInTheDocument();
     expect(within(card).getByTestId('tool-unavailable')).toHaveTextContent('Turn the mod back on, or remove the tool from the list.');
-    expect(within(card).queryByRole('button', { name: 'Build FNIS' })).toBeNull();
+    expect(within(card).queryByRole('button', { name: /FNIS/ })).toBeNull();
     expect(within(card).getByRole('button', { name: 'Remove from list' })).toBeInTheDocument();
   });
 
@@ -236,7 +282,7 @@ describe('the player’s own tools', () => {
     });
     mount();
     await screen.findByTestId('user-tool-card');
-    fireEvent.click(screen.getByRole('button', { name: 'Build FNIS' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Run FNIS' }));
     await waitFor(() => expect(runUserTool).toHaveBeenCalledWith('inst-1', 'tool-1', 'auto', {}));
     expect(await screen.findByTestId('tool-outcome')).toBeInTheDocument();
   });
@@ -291,6 +337,7 @@ describe('Add a tool…', () => {
       args: ['-o', 'C:/My Output'],
       outputIsMod: false,
       outputFolder: null,
+      keepsOutput: false,
     }));
     expect(await screen.findByText('Added FNIS.')).toBeInTheDocument();
     expect(screen.queryByTestId('tool-add')).toBeNull();
@@ -327,6 +374,7 @@ describe('Add a tool…', () => {
       args: [],
       outputIsMod: true,
       outputFolder: 'DynDOLOD_Output',
+      keepsOutput: false,
     }));
   });
 

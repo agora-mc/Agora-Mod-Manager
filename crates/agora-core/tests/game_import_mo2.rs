@@ -142,6 +142,8 @@ fn nemesis() -> ToolDefinition {
         required_outputs: Vec::new(),
         failure_markers: Vec::new(),
         required_magic: Vec::new(),
+        run_only: false,
+        executable_names: Vec::new(),
     }
 }
 

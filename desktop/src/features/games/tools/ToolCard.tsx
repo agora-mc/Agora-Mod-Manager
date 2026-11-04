@@ -32,6 +32,7 @@ import {
 import {
   CAPTURE_CHOICES,
   messageOf,
+  RUN_ONLY_LINE,
   runDetailLines,
   runHeadline,
   shownPaths,
@@ -116,7 +117,12 @@ export function ToolCard({
   const [outputs, setOutputs] = useState<ToolOutput[] | null>(null);
   const [outputsError, setOutputsError] = useState<string | null>(null);
 
-  const runLabel = row.status === null ? `Build ${row.name}` : row.status === 'current' ? `Run ${row.name} again` : `Rebuild ${row.name}`;
+  const runOnly = row.runOnly;
+  const runLabel = runOnly
+    ? `Run ${row.name}`
+    : row.status === null ? `Build ${row.name}` : row.status === 'current' ? `Run ${row.name} again` : `Rebuild ${row.name}`;
+  // A run-only tool and a tool that is not installed show no build status: there is nothing to build.
+  const showStatus = !runOnly && !unavailable;
   const helpText = CAPTURE_CHOICES.find((choice) => choice.value === capture)?.help ?? '';
 
   const openSwap = (refusal: string | null, why: string, costs: SwapCosts | null = null) => {
@@ -290,9 +296,11 @@ export function ToolCard({
           <div className="min-w-0 space-y-0.5">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="text-base font-semibold">{row.name}</h3>
-              <span className={cn('rounded-full border px-2.5 py-0.5 text-xs font-semibold', statusTone(row.status))} data-testid="tool-status">
-                {statusLabel(row.status)}
-              </span>
+              {showStatus && (
+                <span className={cn('rounded-full border px-2.5 py-0.5 text-xs font-semibold', statusTone(row.status))} data-testid="tool-status">
+                  {statusLabel(row.status)}
+                </span>
+              )}
               {unavailable && (
                 <span className="rounded-full border border-amber-500/50 bg-amber-500/10 px-2.5 py-0.5 text-xs font-semibold text-amber-800 dark:text-amber-300" data-testid="tool-missing">
                   Not installed
@@ -310,9 +318,18 @@ export function ToolCard({
         </div>
         {headerActions && <div className="flex flex-wrap gap-2">{headerActions}</div>}
       </header>
-      <p className="text-sm">
-        <span className="text-muted-foreground">{statusExplanation(row)}</span> {generationLine}
-      </p>
+      {unavailable ? (
+        row.current !== null && <p className="text-sm">{generationLine}</p>
+      ) : runOnly ? (
+        <p className="text-sm text-muted-foreground" data-testid="tool-run-only">
+          {RUN_ONLY_LINE}
+          {row.current !== null && ` What it wrote is kept as generation ${row.current}.`}
+        </p>
+      ) : (
+        <p className="text-sm">
+          <span className="text-muted-foreground">{statusExplanation(row)}</span> {generationLine}
+        </p>
+      )}
       {unavailable && (
         <p className="rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 text-sm" data-testid="tool-unavailable">{unavailable}</p>
       )}
@@ -320,21 +337,23 @@ export function ToolCard({
       <div className="flex flex-wrap items-end gap-3">
         {!unavailable && (
           <>
-            <label className="flex flex-col gap-1 text-sm">
-              <span className="font-medium">How to capture the output</span>
-              <select
-                value={capture}
-                disabled={busy}
-                onChange={(event) => setCapture(event.target.value as CaptureChoice)}
-                className="rounded-lg border border-border bg-background px-2 py-1.5"
-                aria-describedby={`tool-capture-help-${row.toolId}`}
-              >
-                {CAPTURE_CHOICES.map((choice) => (
-                  <option key={choice.value} value={choice.value}>{choice.label}</option>
-                ))}
-              </select>
-              <span id={`tool-capture-help-${row.toolId}`} className="max-w-md text-xs text-muted-foreground">{helpText}</span>
-            </label>
+            {!runOnly && (
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="font-medium">How to capture the output</span>
+                <select
+                  value={capture}
+                  disabled={busy}
+                  onChange={(event) => setCapture(event.target.value as CaptureChoice)}
+                  className="rounded-lg border border-border bg-background px-2 py-1.5"
+                  aria-describedby={`tool-capture-help-${row.toolId}`}
+                >
+                  {CAPTURE_CHOICES.map((choice) => (
+                    <option key={choice.value} value={choice.value}>{choice.label}</option>
+                  ))}
+                </select>
+                <span id={`tool-capture-help-${row.toolId}`} className="max-w-md text-xs text-muted-foreground">{helpText}</span>
+              </label>
+            )}
             <button
               type="button"
               disabled={busy}
@@ -460,7 +479,7 @@ export function ToolCard({
 
       {outcome && (
         <section role="status" aria-label="Last run" className="space-y-2 rounded-lg border border-border p-4 text-sm" data-testid="tool-outcome">
-          <p className="font-medium">{runHeadline(outcome)}</p>
+          <p className="font-medium">{runHeadline(outcome, runOnly)}</p>
           <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
             {runDetailLines(outcome).map((line) => <li key={line}>{line}</li>)}
           </ul>

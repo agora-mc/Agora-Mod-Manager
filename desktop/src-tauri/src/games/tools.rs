@@ -70,6 +70,8 @@ pub struct ToolRow {
     pub exe: Option<String>,
     /// The mod that provides it. `None` for the game's own files, or when it is not installed.
     pub from_mod: Option<String>,
+    /// The tool has nothing to build: the screen offers "Run", with no build status.
+    pub run_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -245,6 +247,8 @@ pub struct UserToolRow {
     /// The executable is not there now: its mod was turned off or removed, or the file outside the
     /// game was moved. The tool stays in the list until the person removes it.
     pub missing: bool,
+    /// The person said it builds files the game reads, so its output is tracked as a build.
+    pub keeps_output: bool,
 }
 
 /// The instance's own tools.
@@ -282,6 +286,7 @@ fn user_tool_row(tool: UserTool, present: bool) -> Result<UserToolRow, GamesErro
         output_is_mod: tool.output_is_mod,
         output_folder: tool.output_folder,
         missing: !present,
+        keeps_output: tool.keeps_output,
     })
 }
 
@@ -421,6 +426,7 @@ pub fn tools_view(
                     .as_ref()
                     .map(|found| found.mod_name.clone())
                     .filter(|name| !name.is_empty()),
+                run_only: state.run_only,
             }
         })
         .collect();
@@ -743,6 +749,7 @@ pub async fn games_user_tools_list(
 
 /// Add one executable to the instance's own tools. Nothing is added until the person confirms.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn games_user_tools_add(
     app: tauri::AppHandle,
     instance_id: String,
@@ -751,6 +758,7 @@ pub async fn games_user_tools_add(
     args: Vec<String>,
     output_is_mod: bool,
     output_folder: Option<String>,
+    keeps_output: bool,
 ) -> Result<UserToolRow, GamesError> {
     with_ctx(app, move |ctx| {
         let tool = game_user_tools::add(
@@ -762,6 +770,7 @@ pub async fn games_user_tools_add(
                 args,
                 output_is_mod,
                 output_folder,
+                keeps_output,
             },
         )
         .map_err(core_error)?;
@@ -1019,6 +1028,7 @@ mod tests {
                 mod_name: "Nemesis".into(),
                 at_declared_path: true,
             }),
+            run_only: false,
         }
     }
 
@@ -1271,6 +1281,7 @@ mod tests {
             known_tool_id: None,
             output_is_mod: false,
             output_folder: None,
+            keeps_output: false,
         };
 
         let error = user_tool_row(broken, true).expect_err("an unreadable tool id is an error");
@@ -1292,6 +1303,7 @@ mod tests {
             known_tool_id: None,
             output_is_mod: false,
             output_folder: None,
+            keeps_output: false,
         };
 
         let view = user_tools_view("sk-1", vec![(tool, false)]).expect("a readable tool lists");

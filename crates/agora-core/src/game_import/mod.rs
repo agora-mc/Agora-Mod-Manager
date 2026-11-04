@@ -1525,6 +1525,7 @@ fn executable_to_tool(
         args: mo2::split_arguments(&exe.arguments),
         output_is_mod: false,
         output_folder: None,
+        keeps_output: false,
     };
     if let Some(rest) = components_below(binary, &ini.mods) {
         let (folder, inner) = rest.split_first()?;

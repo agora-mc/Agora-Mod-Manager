@@ -147,7 +147,7 @@ describe('shownPaths', () => {
 });
 
 describe('conflictLine', () => {
-  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: null, fromMod: null };
+  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: null, fromMod: null, runOnly: false };
   const pandora: ToolRow = { ...nemesis, toolId: 'pandora', name: 'Pandora', conflicts: true };
   const bodyslide: ToolRow = { ...nemesis, toolId: 'bodyslide', name: 'BodySlide', conflicts: false };
 
@@ -186,9 +186,23 @@ describe('the Tools tab wording', () => {
   });
 
   it('says where a tool comes from', () => {
-    const base: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: null, previous: null, status: null, conflicts: false, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: 'Data/x.exe', fromMod: 'Nemesis Engine' };
+    const base: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: null, previous: null, status: null, conflicts: false, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: 'Data/x.exe', fromMod: 'Nemesis Engine', runOnly: false };
     expect(originLine(base)).toBe('From the mod “Nemesis Engine”');
     expect(originLine({ ...base, fromMod: null })).toBe('From the game’s own files');
     expect(originLine({ ...base, installed: false, fromMod: null })).toBe('Not installed in this instance');
+  });
+});
+
+describe('a run-only tool’s headline', () => {
+  const report = (written: string[]): RunReport => ({
+    toolId: 'sseedit', name: 'SSEEdit', run: 'r', capture: 'vfs', captureReason: null, promoted: true, current: written.length ? '1' : null,
+    previous: null, written, deleted: [], exitCode: 0, cancelled: false, failedFolder: null, failure: null, copiedLayer: null,
+    installChanges: { created: [], changed: [], deleted: [], mayBeIncomplete: false, unavailable: null }, swap: null, offers: [], unchangedDropped: 0,
+  });
+
+  it('says it finished, and says where its writes were kept when there were any', () => {
+    expect(runHeadline(report([]), true)).toBe('SSEEdit finished.');
+    expect(runHeadline(report(['Data/Patch.esp']), true)).toBe('SSEEdit finished. What it wrote is kept for this instance as generation 1.');
+    expect(runHeadline(report(['Data/Patch.esp']))).toContain('its output is now generation 1');
   });
 });

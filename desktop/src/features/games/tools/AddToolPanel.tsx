@@ -58,6 +58,7 @@ export function AddToolPanel({ instanceId, listedToolIds, onAdded, onClose }: Ad
   const [nameTyped, setNameTyped] = useState(false);
   const [args, setArgs] = useState('');
   const [isMod, setIsMod] = useState(false);
+  const [keepsOutput, setKeepsOutput] = useState(false);
   const [folder, setFolder] = useState('');
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -113,6 +114,7 @@ export function AddToolPanel({ instanceId, listedToolIds, onAdded, onClose }: Ad
         args: splitArguments(args),
         outputIsMod: isMod,
         outputFolder: isMod ? folder.trim() : null,
+        keepsOutput: !isMod && keepsOutput,
       });
       onAdded(added.name);
     } catch (reason) {
@@ -206,9 +208,21 @@ export function AddToolPanel({ instanceId, listedToolIds, onAdded, onClose }: Ad
             <input {...control} type="text" value={args} onChange={(event) => setArgs(event.target.value)} className={FORM_CONTROL_CLASS} />
           )}
         </FormField>
-        <div className="flex items-center gap-2 text-sm sm:col-span-2">
-          <Switch aria-label="Its output is a mod" checked={isMod} onCheckedChange={setIsMod} />
-          Its output is a mod
+        <div className="space-y-2 sm:col-span-2">
+          <p className="text-xs text-muted-foreground">
+            Most programs simply run, and anything they write is kept for this instance. Turn one of these on for a
+            program that builds files the game reads.
+          </p>
+          {!isMod && (
+            <div className="flex items-center gap-2 text-sm">
+              <Switch aria-label="It builds files the game reads" checked={keepsOutput} onCheckedChange={setKeepsOutput} />
+              It builds files the game reads (track them as its output)
+            </div>
+          )}
+          <div className="flex items-center gap-2 text-sm">
+            <Switch aria-label="Its output is a mod" checked={isMod} onCheckedChange={setIsMod} />
+            Its output is a whole mod, written to a folder
+          </div>
         </div>
         {isMod && (
           <FormField

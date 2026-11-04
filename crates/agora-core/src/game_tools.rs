@@ -199,6 +199,9 @@ pub struct ToolState {
     /// (nor the game) has it: the tool is not installed here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub found: Option<crate::game_user_tools::FoundTool>,
+    /// The tool has nothing to build; a player simply runs it (see `ToolDefinition::run_only`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub run_only: bool,
 }
 
 impl ToolState {
@@ -532,6 +535,8 @@ pub fn user_tool_definition(
         required_outputs: Vec::new(),
         failure_markers: Vec::new(),
         required_magic: Vec::new(),
+        run_only: user.is_run_only(),
+        executable_names: Vec::new(),
     })
 }
 
@@ -1275,6 +1280,7 @@ fn list_with_manifest(
                 previous: None,
                 status: None,
                 found: found.remove(tool_id.as_str()),
+                run_only: declared_tool.is_some_and(|t| t.run_only),
             },
         );
     }
@@ -1317,6 +1323,7 @@ fn list_with_manifest(
                     links,
                 )),
                 found,
+                run_only: declared.is_some_and(|t| t.run_only),
             },
         );
     }
@@ -3423,6 +3430,20 @@ fn settle_run(
             .map(|failure| exit.with_output(failure))
     };
     let promoted = failure.is_none();
+    if promoted && tool.run_only && written.is_empty() && read_markers(staging)?.is_empty() {
+        // A run-only tool that wrote nothing simply ran: there is no new generation, and the
+        // output the instance had (if any) stays as it was.
+        std::fs::remove_dir_all(staging)?;
+        return Ok(Settled {
+            written,
+            promoted,
+            current: read_current_generation(ctx, instance_id, &tool.id)?,
+            previous: read_record(dir)?.previous.map(|g| g.generation),
+            deleted: Vec::new(),
+            failed_folder: None,
+            failure: None,
+        });
+    }
     if promoted {
         let (current, previous, deleted) = promote(
             ctx,
