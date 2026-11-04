@@ -285,14 +285,8 @@ describe('LibraryPage', () => {
     expect(screen.getByText(/Nothing says which game these are for/)).toBeInTheDocument();
   });
 
-  it('is the same page for another game, with its plugins, installer and own section', async () => {
-    render(
-      <LibraryPage
-        gameId="skyrim-se"
-        gameName="Skyrim SE"
-        gameSection={<p>Curated items for Skyrim</p>}
-      />,
-    );
+  it('is the same page for another game, with its plugins and installer, in its own words', async () => {
+    render(<LibraryPage gameId="skyrim-se" gameName="Skyrim SE" />);
     await screen.findByText('A lighting overhaul.');
     expect(screen.getByRole('heading', { name: 'Library' })).toBeInTheDocument();
     expect(screen.queryByText('First item')).not.toBeInTheDocument();
@@ -300,7 +294,11 @@ describe('LibraryPage', () => {
     expect(within(card).getByText('2 plugins')).toBeInTheDocument();
     expect(within(card).getByText('Lux - Orbis.esp')).toBeInTheDocument();
     expect(within(card).getByText('Installer')).toBeInTheDocument();
-    expect(screen.getByText('Curated items for Skyrim')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        'Mods saved for Skyrim SE, each is stored once and shared by your instances. Mods on this list can be reinstalled without internet.',
+      ),
+    ).toBeInTheDocument();
     // Fill in details is a Modrinth lookup: Minecraft's part, not this game's.
     expect(screen.queryByRole('button', { name: 'Fill in missing details' })).not.toBeInTheDocument();
   });

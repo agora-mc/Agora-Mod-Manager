@@ -3,16 +3,16 @@ import { requestGameImport } from './gameImportRequest';
 import { requestSettingsSection } from './settingsSection';
 
 // A non-Minecraft game's pages are `game-tab` destinations, which carry the game they belong to;
-// in the sidebar they sit under the shared `instances` and `library` entries (MASTER_SPEC §26.14).
+// in the sidebar they sit under the shared entries of the same name (MASTER_SPEC §26.14).
 export type Tab = 'home' | 'browse' | 'library' | 'instances' | 'governance' | 'ai' | 'guide' | 'field-guide' | 'living-background' | 'lab' | 'about' | 'settings';
 
 /** A non-Minecraft game's own pages, by the name a `game-tab` destination uses. */
-export type GameTabId = 'instances' | 'library';
+export type GameTabId = 'home' | 'browse' | 'instances' | 'library';
 
 /** The pages of one instance of a non-Minecraft game. */
 export type GameInstancePage = 'overview' | 'content' | 'plugins' | 'ini-saves' | 'tools';
 
-export const GAME_TAB_IDS: readonly GameTabId[] = ['instances', 'library'];
+export const GAME_TAB_IDS: readonly GameTabId[] = ['home', 'browse', 'instances', 'library'];
 export const GAME_INSTANCE_PAGE_IDS: readonly GameInstancePage[] = ['overview', 'content', 'plugins', 'ini-saves', 'tools'];
 
 /**
@@ -23,7 +23,7 @@ export const GAME_INSTANCE_PAGE_IDS: readonly GameInstancePage[] = ['overview', 
  * - `tab` — one of the sidebar tabs (home, browse, instances, governance, ai, guide, settings).
  * - `mod-detail` — browsing a specific curated item.
  * - `instance-detail` — editing a specific instance.
- * - `game-tab` — one of a non-Minecraft game's own pages (Instances, Library).
+ * - `game-tab` — one of a non-Minecraft game's own pages (Home, Browse, Instances, Library).
  * - `game-instance` — an instance page of a non-Minecraft game.
  * - `plugin-page` — a page contributed by a community plugin, identified by its
  *   namespaced contribution id (`publisher.plugin/local`). Namespaced rather
@@ -36,7 +36,7 @@ export type Destination =
   | { type: 'mod-detail'; itemId: string; browseInstanceId?: string; browseContentType?: string }
   | { type: 'instance-detail'; instanceId: string }
   | { type: 'plugin-page'; contributionId: string }
-  // A game's own page (Instances, Library) and an instance page of that game.
+  // A game's own page (Home, Browse, Instances, Library) and an instance page of that game.
   | { type: 'game-tab'; gameId: string; tab: GameTabId }
   | { type: 'game-instance'; gameId: string; instanceId: string; page: GameInstancePage };
 

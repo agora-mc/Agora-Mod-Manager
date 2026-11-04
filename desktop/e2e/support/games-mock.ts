@@ -45,6 +45,9 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
         games_icon: null,
         // A game instance's own image; null means it has none and shows its generated tile.
         games_instance_icon: null,
+        // A game's Home (where a game opens) shows a strip of its catalog. Empty unless a spec
+        // passes entries.
+        games_catalog_list: { entries: [], instances: [] },
         // A verified registry that lists no official plugins. Specs that need a
         // card pass their own entry; an unanswered command would fail the test.
         list_official_plugins: { plugins: [], unavailableReason: null },

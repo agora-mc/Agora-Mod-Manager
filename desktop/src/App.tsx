@@ -579,7 +579,7 @@ function AppContent() {
       const onFirstPage = destination.type === 'tab' && destination.tab === 'home' && !canGoBack;
       if (onFirstPage && shownGame !== MINECRAFT_GAME_ID) {
         // In place of Home, not after it: the saved game is where the app starts.
-        replaceWithGameTab(shownGame, 'instances' satisfies GameTabId);
+        replaceWithGameTab(shownGame, 'home' satisfies GameTabId);
       }
       return;
     }
@@ -672,8 +672,10 @@ function AppContent() {
 
   const showModDetail = destination.type === 'mod-detail';
   const previousDestination = previousDestinationRef.current;
+  // A game's Browse is its own page (`game-tab`), highlighted under the same sidebar entry: only
+  // Minecraft's Browse mounts Minecraft's Browse.
   const shouldRenderBrowse =
-    effectiveTab === 'browse'
+    (effectiveTab === 'browse' && destination.type === 'tab')
     || (browseVisited
       && showModDetail
       && previousDestination.type === 'tab'
@@ -1130,6 +1132,8 @@ function AppContent() {
                 tab={destination.tab}
                 gameNames={gameNames}
                 onOpenInstance={(instanceId) => navigateToGameInstance(destination.gameId, instanceId)}
+                onOpenTab={(tab) => navigateToGameTab(destination.gameId, tab)}
+                onOpenGuide={() => navigateToTab('guide')}
               />
             ) : destination.type === 'game-instance' ? (
               <GameInstancePage

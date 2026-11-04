@@ -3,11 +3,11 @@ import type { Tab } from '@/lib/useDestination';
 import { gameTabForSidebarTab, sidebarTabForGameTab } from './gameNav';
 
 describe('one sidebar for every game', () => {
-  it("opens the game's own page for each shared entry, and the closest page where it has none", () => {
+  it("opens the game's own page of the same name for each shared entry", () => {
     expect(gameTabForSidebarTab('instances')).toBe('instances');
     expect(gameTabForSidebarTab('library')).toBe('library');
-    expect(gameTabForSidebarTab('home')).toBe('instances');
-    expect(gameTabForSidebarTab('browse')).toBe('library');
+    expect(gameTabForSidebarTab('home')).toBe('home');
+    expect(gameTabForSidebarTab('browse')).toBe('browse');
   });
 
   it('leaves the app-wide entries to the app', () => {
@@ -19,5 +19,7 @@ describe('one sidebar for every game', () => {
   it("highlights a game's page under the entry Minecraft uses for the same idea", () => {
     expect(sidebarTabForGameTab('instances')).toBe('instances');
     expect(sidebarTabForGameTab('library')).toBe('library');
+    expect(sidebarTabForGameTab('home')).toBe('home');
+    expect(sidebarTabForGameTab('browse')).toBe('browse');
   });
 });

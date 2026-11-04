@@ -135,13 +135,15 @@ const BOOT_REPLIES = {
   list_recent_play: [],
 };
 
-/** Starts the app on Skyrim's Instances tab with the given command answers. */
+/** Starts the app on Skyrim (its Home), then opens its Instances tab, with the given command answers. */
 async function boot(page: Page, replies: Record<string, unknown>) {
   await installGamesMock(page, {
     replies: { ...BOOT_REPLIES, games_list: { games: [skyrim] }, ...replies },
     settings: { active_game: 'skyrim-se' },
   });
   await page.goto('/');
+  await expect(page.getByTestId('game-home-page')).toBeVisible();
+  await page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name: 'My Instances' }).click();
   await expect(page.getByTestId('game-instances-tab')).toBeVisible();
 }
 

@@ -385,7 +385,7 @@ test('a stored record the store cannot read is listed with its reason and can be
   await openLibrary(page);
 
   const damaged = page.getByTestId('library-damaged');
-  await expect(damaged).toContainText('A stored record cannot be read');
+  await expect(damaged).toContainText('A saved mod cannot be read');
   await expect(damaged).toContainText('not a valid item record');
   await damaged.getByRole('button', { name: 'Remove' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Remove' }).click();
