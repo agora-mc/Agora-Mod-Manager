@@ -483,6 +483,10 @@ enum ImportCmd {
         /// Copy the profile's saves into the instance's own save folder under Documents.
         #[arg(long)]
         copy_saves: bool,
+        /// Import onto this install (an id from `agora games list`) instead of the one at the
+        /// setup's gamePath. For a setup whose game folder moved, or a game installed elsewhere.
+        #[arg(long, value_name = "INSTALL_ID")]
+        install: Option<String>,
     },
 }
 
@@ -8940,6 +8944,7 @@ fn run_games_import(
             name,
             dry_run,
             copy_saves,
+            install,
         } => {
             let Some(profile) = profile else {
                 anyhow::bail!(
@@ -8951,6 +8956,7 @@ fn run_games_import(
                 profile,
                 name,
                 copy_saves,
+                install,
             };
             let inventory = agora_core::game_registry::installed_games(ctx);
             if dry_run {
@@ -9023,6 +9029,12 @@ fn print_mo2_plan(plan: &agora_core::game_import::Mo2Plan) {
         plan.install_id,
         plan.install_location.display()
     );
+    if plan.setup_game_path != plan.install_location {
+        println!(
+            "  the setup's own game folder is {}; importing onto the install above",
+            plan.setup_game_path.display()
+        );
+    }
     println!("  store: {}   instance: {}", plan.store, plan.instance_name);
     println!(
         "  mods: {} enabled, {} disabled, {} files, {}",

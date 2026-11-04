@@ -94,6 +94,16 @@ describe('Launch anyway', () => {
   });
 });
 
+describe('how this instance runs', () => {
+  it('marks Automatic as the recommended way, as the create form does', async () => {
+    vi.mocked(getGameInstance).mockImplementation(async (id) => detail(id));
+    render(<InstanceOverviewTab gameId="skyrim-se" instanceId="grounded-1" />);
+    await screen.findByTestId('instance-overview');
+    expect(screen.getByRole('button', { name: 'Automatic (recommended)' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Linked files' })).toBeInTheDocument();
+  });
+});
+
 describe('checks that passed', () => {
   it('lists each passed check and summarises the count', async () => {
     vi.mocked(getGameInstance).mockImplementation(async (id) => detail(id));

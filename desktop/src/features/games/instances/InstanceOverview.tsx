@@ -1,7 +1,9 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { ArrowRight, CheckCircle2, Loader2, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { openGameSettings } from '@/lib/settingsSection';
+import { RECOMMENDED_GAME_SETTINGS } from '../settings/gameSettings';
+import { storeName } from '../shared/stores';
 import type { CheckFinding } from './api';
 import {
   checkHeadline,
@@ -30,8 +32,8 @@ function checkedAgo(at: number | null, now: number): string | null {
 }
 
 /**
- * An instance's Overview: its launch checks on the left; how it runs and what it is built from on
- * the right. Launch itself is in the header every page shares. The last checks show at once and are
+ * An instance's Overview: its launch checks and how it runs side by side, and what it is built from
+ * across the whole width below them, where long ids have the room to wrap. Launch itself is in the header every page shares. The last checks show at once and are
  * refreshed in the background.
  */
 export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
@@ -54,86 +56,86 @@ export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
   const ago = refreshing ? checkedAgo(checkedAt, Date.now()) : null;
 
   return (
-    <section className="grid items-start gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]" data-testid="instance-overview">
-      <section aria-labelledby="checks-heading" className="space-y-4 rounded-xl border border-border bg-card p-5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="min-w-0">
-            <h3 id="checks-heading" className="text-lg font-semibold">Launch checks</h3>
-            {checkError === null && (
-              <p className="text-sm text-muted-foreground" data-testid="checks-headline">
-                {checkHeadline(check)}
-              </p>
+    <div className="@container">
+      <section className="grid items-start gap-6 @2xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]" data-testid="instance-overview">
+        <section aria-labelledby="checks-heading" className="space-y-4 rounded-xl border border-border bg-card p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0">
+              <h3 id="checks-heading" className="text-lg font-semibold">Launch checks</h3>
+              {checkError === null && (
+                <p className="text-sm text-muted-foreground" data-testid="checks-headline">
+                  {checkHeadline(check)}
+                </p>
+              )}
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={session.reload} disabled={refreshing}>
+              {refreshing ? <Loader2 className="animate-spin" aria-hidden="true" /> : <RefreshCw aria-hidden="true" />}
+              {refreshing ? 'Checking…' : 'Check again'}
+            </Button>
+          </div>
+          {refreshing && check !== null && (
+            <p role="status" className="text-xs text-muted-foreground">
+              Showing the last answer{ago === null ? '' : ` (${ago})`} while Agora checks again.
+            </p>
+          )}
+          {refreshError !== null && (
+            <p role="alert" className="text-sm text-destructive">This instance could not be read again. Showing what Agora last saw. {refreshError}</p>
+          )}
+          {checkError !== null && (
+            <p role="alert" className="text-sm text-destructive">The checks could not run. {checkError}</p>
+          )}
+          {check !== null && check.findings.length > 0 && (
+            <ul className="space-y-3" aria-label="Launch check findings">
+              {orderFindings(check.findings).map((finding, index) => (
+                <FindingCard key={`${finding.kind}-${index}`} finding={finding} />
+              ))}
+            </ul>
+          )}
+          {check !== null && check.passed.length > 0 && (
+            <ul className="divide-y divide-border rounded-lg border border-border" aria-label="Launch checks that passed">
+              {check.passed.map((passed, index) => (
+                <li key={`${passed.kind}-${index}`} className="flex items-start gap-3 px-3 py-2.5" data-testid="check-passed">
+                  <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-green-600 dark:text-green-400" aria-label="Passed" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium">{passed.title}</p>
+                    <p className="text-xs text-muted-foreground">{passed.detail}</p>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="border-t border-border pt-3">
+            <button
+              type="button"
+              aria-expanded={advancedOpen}
+              onClick={() => setAdvancedOpen((open) => !open)}
+              className="text-sm font-medium text-muted-foreground underline-offset-4 hover:underline"
+            >
+              {advancedOpen ? 'Hide advanced options' : 'Advanced options'}
+            </button>
+            {advancedOpen && (
+              <div className="mt-3 space-y-2 rounded-lg border border-destructive/40 p-3">
+                <label className="flex items-start gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="mt-1"
+                    checked={session.launchAnyway}
+                    onChange={(event) => session.setLaunchAnyway(event.target.checked)}
+                  />
+                  <span>
+                    <span className="font-medium">Launch anyway</span>:{' '}
+                    {skippedText ?? 'start the game past the checks above, even when they would stop it.'}
+                  </span>
+                </label>
+                <p className="text-xs text-destructive">
+                  The game may crash or behave in the ways these checks exist to prevent. Use this only when you know why a check is wrong. Agora does not undo a session that goes badly.
+                </p>
+              </div>
             )}
           </div>
-          <Button type="button" variant="outline" size="sm" onClick={session.reload} disabled={refreshing}>
-            {refreshing ? <Loader2 className="animate-spin" aria-hidden="true" /> : <RefreshCw aria-hidden="true" />}
-            {refreshing ? 'Checking…' : 'Check again'}
-          </Button>
-        </div>
-        {refreshing && check !== null && (
-          <p role="status" className="text-xs text-muted-foreground">
-            Showing the last answer{ago === null ? '' : ` (${ago})`} while Agora checks again.
-          </p>
-        )}
-        {refreshError !== null && (
-          <p role="alert" className="text-sm text-destructive">This instance could not be read again. Showing what Agora last saw. {refreshError}</p>
-        )}
-        {checkError !== null && (
-          <p role="alert" className="text-sm text-destructive">The checks could not run. {checkError}</p>
-        )}
-        {check !== null && check.findings.length > 0 && (
-          <ul className="space-y-3" aria-label="Launch check findings">
-            {orderFindings(check.findings).map((finding, index) => (
-              <FindingCard key={`${finding.kind}-${index}`} finding={finding} />
-            ))}
-          </ul>
-        )}
-        {check !== null && check.passed.length > 0 && (
-          <ul className="divide-y divide-border rounded-lg border border-border" aria-label="Launch checks that passed">
-            {check.passed.map((passed, index) => (
-              <li key={`${passed.kind}-${index}`} className="flex items-start gap-3 px-3 py-2.5" data-testid="check-passed">
-                <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-green-600 dark:text-green-400" aria-label="Passed" />
-                <div className="min-w-0">
-                  <p className="text-sm font-medium">{passed.title}</p>
-                  <p className="text-xs text-muted-foreground">{passed.detail}</p>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
+        </section>
 
-        <div className="border-t border-border pt-3">
-          <button
-            type="button"
-            aria-expanded={advancedOpen}
-            onClick={() => setAdvancedOpen((open) => !open)}
-            className="text-sm font-medium text-muted-foreground underline-offset-4 hover:underline"
-          >
-            {advancedOpen ? 'Hide advanced options' : 'Advanced options'}
-          </button>
-          {advancedOpen && (
-            <div className="mt-3 space-y-2 rounded-lg border border-destructive/40 p-3">
-              <label className="flex items-start gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="mt-1"
-                  checked={session.launchAnyway}
-                  onChange={(event) => session.setLaunchAnyway(event.target.checked)}
-                />
-                <span>
-                  <span className="font-medium">Launch anyway</span>:{' '}
-                  {skippedText ?? 'start the game past the checks above, even when they would stop it.'}
-                </span>
-              </label>
-              <p className="text-xs text-destructive">
-                The game may crash or behave in the ways these checks exist to prevent. Use this only when you know why a check is wrong. Agora does not undo a session that goes badly.
-              </p>
-            </div>
-          )}
-        </div>
-      </section>
-
-      <div className="space-y-6">
         <section aria-labelledby="deployment-heading-overview" className="space-y-3 rounded-xl border border-border bg-card p-5">
           <h3 id="deployment-heading-overview" className="text-lg font-semibold">How this instance runs</h3>
           <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1" role="group" aria-label="Deployment">
@@ -152,6 +154,9 @@ export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
                   ].join(' ')}
                 >
                   {option.label}
+                  {option.id === RECOMMENDED_GAME_SETTINGS.deployment && (
+                    <span className="text-xs font-normal"> (recommended)</span>
+                  )}
                 </button>
               );
             })}
@@ -165,33 +170,39 @@ export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
           )}
         </section>
 
-        <section aria-labelledby="about-heading" className="space-y-3 rounded-xl border border-border bg-card p-5">
+        <section aria-labelledby="about-heading" className="space-y-3 rounded-xl border border-border bg-card p-5 @2xl:col-span-2">
           <h3 id="about-heading" className="text-lg font-semibold">About this instance</h3>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
-            <dt className="text-muted-foreground">Game</dt>
-            <dd>{detail.gameName}</dd>
-            <dt className="text-muted-foreground">Runtime</dt>
-            <dd>{[detail.store, detail.version, detail.build].filter(Boolean).join(' ') || 'Not recorded'}</dd>
-            <dt className="text-muted-foreground">Base</dt>
-            <dd className="wrap-break-word">
+          <dl className="grid gap-x-6 gap-y-3 text-sm @md:grid-cols-2 @4xl:grid-cols-3">
+            <AboutItem term="Game">{detail.gameName}</AboutItem>
+            <AboutItem term="Runtime">
+              {[detail.store === null ? null : storeName(detail.store), detail.version, detail.build].filter(Boolean).join(' ') || 'Not recorded'}
+            </AboutItem>
+            <AboutItem term="Base">
               {detail.pinned
                 ? `Pinned${detail.baseId ? ` (${detail.baseId})` : ''}`
                 : `Not pinned: runs from the install folder${detail.unpinnedReason ? `. ${detail.unpinnedReason}` : ''}`}
-            </dd>
-            <dt className="text-muted-foreground">Frameworks</dt>
-            <dd data-testid="frameworks-status">
+            </AboutItem>
+            <AboutItem term="Frameworks" testId="frameworks-status">
               {matches === null && 'Not checked'}
               {matches === true && 'Match this game version'}
               {matches === false && 'Do not match this game version'}
-            </dd>
-            <dt className="text-muted-foreground">Saves</dt>
-            <dd>{detail.saves === 'own' ? "This instance's own" : 'Shared with the game'}</dd>
-            <dt className="text-muted-foreground">Last played</dt>
-            <dd>{formatWhen(detail.lastLaunchedAt)}</dd>
+            </AboutItem>
+            <AboutItem term="Saves">{detail.saves === 'own' ? "This instance's own" : 'Shared with the game'}</AboutItem>
+            <AboutItem term="Last played">{formatWhen(detail.lastLaunchedAt)}</AboutItem>
           </dl>
         </section>
-      </div>
-    </section>
+      </section>
+    </div>
+  );
+}
+
+/** One fact about the instance. A long value (a base id, a path) wraps rather than run off the card. */
+function AboutItem({ term, testId, children }: { term: string; testId?: string; children: ReactNode }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{term}</dt>
+      <dd className="mt-0.5 wrap-anywhere" data-testid={testId}>{children}</dd>
+    </div>
   );
 }
 

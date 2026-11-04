@@ -53,7 +53,10 @@ export function ChoiceCards<Value extends string>({
   className,
 }: ChoiceCardsProps<Value>) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
-  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value));
+  // A value that is none of the options (nothing chosen yet) checks no card; the first is then
+  // the group's tab stop.
+  const selectedIndex = options.findIndex((option) => option.value === value);
+  const tabStop = Math.max(0, selectedIndex);
 
   const move = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
     const step = event.key === 'ArrowRight' || event.key === 'ArrowDown'
@@ -87,7 +90,7 @@ export function ChoiceCards<Value extends string>({
             type="button"
             role="radio"
             aria-checked={chosen}
-            tabIndex={chosen ? 0 : -1}
+            tabIndex={index === tabStop ? 0 : -1}
             disabled={disabled}
             onClick={() => onChange(option.value)}
             onKeyDown={(event) => move(event, index)}

@@ -7,13 +7,15 @@ use std::path::{Path, PathBuf};
 use agora_core::content_store::Mo2Provenance;
 
 use agora_core::game_import::{
-    self, ImportProgress, Mo2Plan, Mo2Request, Mo2RunReport, RunOptions, ScanReport, SetupFound,
+    self, ImportError, ImportProgress, Mo2Plan, Mo2Request, Mo2RunReport, RunOptions, ScanReport,
+    SetupFound,
 };
-use agora_core::game_registry::installed_games;
+use agora_core::game_registry::{installed_games, GameInventory};
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-use super::error::{GamesError, CORE_FAILED, TASK_FAILED};
+use super::dto::InstallSummary;
+use super::error::{GamesError, CORE_FAILED, NO_INSTALL, TASK_FAILED};
 
 /// The event each progress report is sent on while a run stores mods.
 pub const IMPORT_PROGRESS_EVENT: &str = "games-import-progress";
@@ -147,6 +149,10 @@ pub struct Mo2ImportRequest {
     pub name: Option<String>,
     pub copy_saves: bool,
     pub dry_run: bool,
+    /// The install to import onto, by id, when the setup's own game folder is not one Agora
+    /// found. `None` uses the install at the setup's gamePath.
+    #[serde(default)]
+    pub install: Option<String>,
 }
 
 /// What `games_import_mo2` answered: the plan for a dry run, or the report of an import.
@@ -155,6 +161,68 @@ pub struct Mo2ImportRequest {
 pub enum Mo2ImportReply {
     Plan(Box<PlanDto>),
     Run(Box<RunDto>),
+    /// A dry run whose setup names a game folder Agora did not find, while the game is installed
+    /// elsewhere: the user picks which install to import onto, then previews again.
+    ChooseInstall(Box<ChooseInstallDto>),
+}
+
+/// The installs a setup could be imported onto instead of its own (missing) game folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChooseInstallDto {
+    pub game_id: String,
+    pub game_name: String,
+    /// The game folder the setup itself names.
+    pub setup_game_path: String,
+    pub installs: Vec<InstallSummary>,
+}
+
+/// A refusal from core in the desktop's words. The CLI's message tells the user to run commands;
+/// the app instead says what is wrong and offers Settings (code `no_install`).
+fn import_failed(error: ImportError) -> GamesError {
+    match error {
+        ImportError::NoInstall { game, path, .. } => GamesError::new(
+            NO_INSTALL,
+            format!(
+                "Agora has not found {game} on this computer. The setup expects it in {}. Install the game, or add the folder it is in under Installs in Settings, then preview again.",
+                path.display()
+            ),
+        ),
+        ImportError::NoSuchInstall(_) => GamesError::new(
+            NO_INSTALL,
+            "The install you chose is no longer one Agora finds. Check Installs in Settings, then preview again.",
+        ),
+        other => core_failed(other),
+    }
+}
+
+/// The dry run's answer when the setup's game folder is not a found install: the installs to
+/// choose from, or the refusal when there are none.
+fn choose_install_or_fail(
+    error: ImportError,
+    inventory: &GameInventory,
+) -> Result<Mo2ImportReply, GamesError> {
+    match error {
+        ImportError::NoInstall {
+            game,
+            game_id,
+            path,
+            candidates,
+        } if !candidates.is_empty() => {
+            Ok(Mo2ImportReply::ChooseInstall(Box::new(ChooseInstallDto {
+                game_id: game_id.as_str().to_string(),
+                game_name: game,
+                setup_game_path: path.to_string_lossy().into_owned(),
+                installs: inventory
+                    .installs
+                    .iter()
+                    .filter(|i| i.game == game_id)
+                    .map(InstallSummary::from)
+                    .collect(),
+            })))
+        }
+        other => Err(import_failed(other)),
+    }
 }
 
 /// Progress of a long import, sent as the `games-import-progress` event.
@@ -186,11 +254,17 @@ pub async fn games_import_mo2(
             profile: request.profile,
             name,
             copy_saves: request.copy_saves,
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
         };
         let inventory = installed_games(&ctx);
         if request.dry_run {
-            let plan = game_import::plan(&ctx, &inventory, &core_request).map_err(core_failed)?;
-            return Ok(Mo2ImportReply::Plan(Box::new(PlanDto::from(&plan))));
+            return match game_import::plan(&ctx, &inventory, &core_request) {
+                Ok(plan) => Ok(Mo2ImportReply::Plan(Box::new(PlanDto::from(&plan)))),
+                Err(error) => choose_install_or_fail(error, &inventory),
+            };
         }
         let emitter = app.clone();
         let report = game_import::run(
@@ -209,7 +283,7 @@ pub async fn games_import_mo2(
                 let _ = emitter.emit(IMPORT_PROGRESS_EVENT, payload);
             },
         )
-        .map_err(core_failed)?;
+        .map_err(import_failed)?;
         Ok(Mo2ImportReply::Run(Box::new(RunDto::from(&report))))
     })
     .await
@@ -228,7 +302,11 @@ pub struct PlanDto {
     pub profile: String,
     pub mo2_game_name: String,
     pub game_id: String,
+    pub install_id: String,
     pub install_location: String,
+    /// The game folder the setup names; differs from `install_location` when the user chose
+    /// another install.
+    pub setup_game_path: String,
     pub store: String,
     pub instance_name: String,
     pub mods: Vec<PlannedModDto>,
@@ -321,7 +399,9 @@ impl From<&Mo2Plan> for PlanDto {
             profile: plan.profile.clone(),
             mo2_game_name: plan.mo2_game_name.clone(),
             game_id: plan.game.as_str().to_string(),
+            install_id: plan.install_id.clone(),
             install_location: plan.install_location.to_string_lossy().into_owned(),
+            setup_game_path: plan.setup_game_path.to_string_lossy().into_owned(),
             store: plan.store.clone(),
             instance_name: plan.instance_name.clone(),
             mods: plan
@@ -464,6 +544,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a temp folder can be made");
         dir
+    }
+
+    /// The app never tells a player to run a command: with no install of the game anywhere, the
+    /// preview fails with the Settings code and plain words, while core keeps its CLI wording.
+    #[test]
+    fn no_install_anywhere_is_told_in_the_apps_words() {
+        let error = ImportError::NoInstall {
+            game: "Skyrim Special Edition".into(),
+            game_id: agora_game_api::GameId::new("skyrim-se").unwrap(),
+            path: PathBuf::from(r"C:\Games\Skyrim"),
+            candidates: Vec::new(),
+        };
+        assert!(error.to_string().contains("agora games list"));
+        let inventory = GameInventory {
+            installs: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        let refused = choose_install_or_fail(error, &inventory).expect_err("nothing to choose");
+        assert_eq!(refused.code, NO_INSTALL);
+        assert!(refused.message.contains(r"C:\Games\Skyrim"));
+        assert!(!refused.message.contains("agora "), "{}", refused.message);
     }
 
     #[test]

@@ -12,7 +12,9 @@ const plan = {
   profile: 'Default',
   mo2GameName: 'Skyrim Special Edition',
   gameId: 'skyrim-se',
+  installId: 'steam:489830',
   installLocation: 'D:/Games/Skyrim',
+  setupGamePath: 'D:/Games/Skyrim',
   store: 'steam',
   instanceName: 'Default',
   mods: [

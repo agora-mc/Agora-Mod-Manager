@@ -70,6 +70,12 @@ function PlannedModRow({ mod }: { mod: PlannedMod }) {
   );
 }
 
+/** The same folder, written either way round (case, slashes, a trailing separator). */
+function samePath(a: string, b: string): boolean {
+  const fold = (path: string) => path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+  return fold(a) === fold(b);
+}
+
 /** Core's reason as a sentence: capitalised, without the "; skipped" the heading already says. */
 export function skipReasonText(reason: string): string {
   const trimmed = reason.trim().replace(/;\s*skipped\.?$/i, '').trim();
@@ -140,6 +146,11 @@ export function PlanView({ plan, blockReason, busy, onImport }: PlanViewProps) {
           <dt className="text-muted-foreground">Store and install</dt>
           <dd className="break-all">
             {plan.store}: {plan.installLocation}
+            {plan.setupGamePath && !samePath(plan.setupGamePath, plan.installLocation) && (
+              <span className="mt-0.5 block text-xs text-muted-foreground" data-testid="import-plan-setup-path">
+                Chosen instead of the setup’s own game folder, {plan.setupGamePath}
+              </span>
+            )}
           </dd>
         </div>
       </dl>
@@ -190,12 +201,12 @@ export function PlanView({ plan, blockReason, busy, onImport }: PlanViewProps) {
           </p>
           {plan.overwrite.generated.map((generated) => (
             <p key={generated.name} className="mt-1">
-              {generated.files} file(s) from {generated.name} become its generated layer. Agora cannot tell what they
+              {plural(generated.files, 'file')} from {generated.name} {generated.files === 1 ? 'becomes' : 'become'} its generated layer. Agora cannot tell what they
               were built from, so the launch check offers a rebuild instead of calling them current.
             </p>
           ))}
           {plan.overwrite.restFiles > 0 && (
-            <p className="mt-1">{plan.overwrite.restFiles} other file(s) become the “MO2 overwrite” layer.</p>
+            <p className="mt-1">{plural(plan.overwrite.restFiles, 'other file')} {plan.overwrite.restFiles === 1 ? 'becomes' : 'become'} the “MO2 overwrite” layer.</p>
           )}
         </div>
       )}
@@ -221,7 +232,7 @@ export function PlanView({ plan, blockReason, busy, onImport }: PlanViewProps) {
           </p>
           <p className="mt-1 text-muted-foreground">
             {plan.saves.local
-              ? `The profile keeps its own saves: ${plan.saves.files} file(s), ${formatBytes(plan.saves.bytes)}. ${plan.saves.note}`
+              ? `The profile keeps its own saves: ${plural(plan.saves.files, 'file')}, ${formatBytes(plan.saves.bytes)}. ${plan.saves.note}`
               : 'The profile shares the game’s saves.'}
           </p>
         </div>
