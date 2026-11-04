@@ -135,7 +135,8 @@ test('switching to Skyrim swaps the sidebar to its tabs and back again', async (
   await expect(page.getByTestId('game-switcher').getByRole('button', { name: /Game: Skyrim Special Edition/ })).toBeVisible();
   await expect.poll(() => navLabels(page))
     .toEqual(GAME_NAV);
-  await expect(page.getByTestId('instances-empty')).toContainText('No instances yet');
+  // A game opens on its own Home, as Minecraft does.
+  await expect(page.getByTestId('game-home-welcome')).toContainText('No instances yet');
 
   await page.getByTestId('game-switcher').getByRole('button', { name: /Game: Skyrim Special Edition/ }).click();
   await page.getByTestId('game-switcher').getByRole('button', { name: 'Minecraft', exact: true }).click();

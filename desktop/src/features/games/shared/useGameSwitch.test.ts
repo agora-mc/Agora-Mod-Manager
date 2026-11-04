@@ -30,11 +30,11 @@ describe('useGameSwitch', () => {
     expect(navigateToTab).toHaveBeenCalledWith('home');
   });
 
-  it('opens the other game\'s Instances tab when switching normally', () => {
+  it('opens the other game\'s Home when switching normally', () => {
     const { switchGame, navigateToGameTab } = setup();
 
     act(() => switchGame('skyrim-se'));
 
-    expect(navigateToGameTab).toHaveBeenCalledWith('skyrim-se', 'instances');
+    expect(navigateToGameTab).toHaveBeenCalledWith('skyrim-se', 'home');
   });
 });

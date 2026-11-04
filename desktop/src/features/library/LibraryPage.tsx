@@ -3,11 +3,11 @@
  * items. It reads no network. Each item says where it came from, which instances use it and, for a
  * game with a plugin list, which plugins it carries. "Add to instance…" places an item into an
  * instance of its game; items that nothing ties to a game sit under their own filter, so nothing
- * is hidden or filed under the wrong game. A game plugs its own parts in below (its curated
- * catalog); Minecraft adds "Fill in missing details" from Modrinth.
+ * is hidden or filed under the wrong game. A game's curated catalog is on its Browse page, as
+ * Minecraft's is; Minecraft adds "Fill in missing details" from Modrinth.
  */
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FileArchive, FolderPlus, Library as LibraryGlyph, RefreshCw, Search, Sparkles } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -70,15 +70,12 @@ export interface LibraryPageProps {
   gameName?: string;
   /** Names of other games, for an item that is tied to more than one. */
   gameNames?: Record<string, string>;
-  /** The game's own part of the page, below the items (its curated catalog). */
-  gameSection?: ReactNode;
 }
 
 export function LibraryPage({
   gameId = MINECRAFT_GAME_ID,
   gameName = 'Minecraft',
   gameNames = {},
-  gameSection,
 }: LibraryPageProps) {
   const { confirm } = useConfirm();
   const isMinecraft = gameId === MINECRAFT_GAME_ID;
@@ -230,7 +227,7 @@ export function LibraryPage({
   const remove = async (item: { itemId: string; name: string }) => {
     const confirmed = await confirm({
       title: `Remove ${item.name} from your library?`,
-      body: 'Its files are deleted from Agora’s store. Instances keep the files they already have. This cannot be undone.',
+      body: 'Its files are deleted from your library. Instances keep the files they already have. This cannot be undone.',
       confirmLabel: 'Remove',
       tone: 'danger',
     });
@@ -353,7 +350,7 @@ export function LibraryPage({
         description={
           isMinecraft
             ? 'Mods, packs and files you have installed or added for Minecraft, with their saved descriptions. This list works without the internet.'
-            : `Mods you have added for ${gameName}, each stored once and shared by every instance that uses it. This list works without the internet.`
+            : `Mods saved for ${gameName}, each is stored once and shared by your instances. Mods on this list can be reinstalled without internet.`
         }
         chips={[
           state.status === 'loaded' && gameItems.length > 0 && plural(gameItems.length, 'item'),
@@ -507,7 +504,7 @@ export function LibraryPage({
         <>
           {state.listing.warnings.length > 0 && (
             <div role="status" className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
-              <p className="font-medium">Some records could not be read.</p>
+              <p className="font-medium">Some saved mods could not be read.</p>
               <ul className="mt-1 space-y-0.5 text-xs text-muted-foreground">
                 {state.listing.warnings.map((warning) => <li key={warning}>{warning}</li>)}
               </ul>
@@ -515,7 +512,7 @@ export function LibraryPage({
           )}
 
           {state.listing.damaged.length > 0 && (
-            <ul className="space-y-2" aria-label="Damaged records">
+            <ul className="space-y-2" aria-label="Damaged mods">
               {state.listing.damaged.map((record) => (
                 <li
                   key={record.itemId}
@@ -523,7 +520,7 @@ export function LibraryPage({
                   data-testid="library-damaged"
                 >
                   <div className="min-w-0 space-y-0.5">
-                    <p className="font-medium">A stored record cannot be read</p>
+                    <p className="font-medium">A saved mod cannot be read</p>
                     <p className="text-sm">{record.message}</p>
                   </div>
                   <Button
@@ -546,7 +543,7 @@ export function LibraryPage({
               body={
                 isMinecraft
                   ? 'Mods and packs you install are kept here, ready to add to any instance, even offline.'
-                  : 'Add an archive or a folder you downloaded, and it is kept here, ready to add to any instance.'
+                  : 'Mods automatically show up here, you can add more manually with the buttons below.'
               }
               actions={addButtons || undefined}
               testId="library-empty"
@@ -579,12 +576,6 @@ export function LibraryPage({
             </ul>
           )}
         </>
-      )}
-
-      {gameSection && (
-        <div className="rounded-xl border border-border bg-card p-4" data-testid="library-game-section">
-          {gameSection}
-        </div>
       )}
 
       <Dialog open={addTarget !== null} onOpenChange={(open) => { if (!open) closeAdd(); }}>

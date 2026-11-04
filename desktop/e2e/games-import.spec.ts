@@ -3,7 +3,7 @@ import { expectNoUnmockedCommands, installGamesMock, OTHER_SLICES_REPLIES, SETTI
 
 /**
  * The import slice's screens on a non-Minecraft game: the Mod Organizer 2 import dialog on the
- * Instances page, the Library's curated items, and the Recovery page of the game's Settings. Every command is answered from
+ * Instances page, the curated items on the game's Browse page, and the Recovery page of the game's Settings. Every command is answered from
  * a table; anything else fails the test (see `support/games-mock.ts`).
  *
  * Commands whose reply depends on the request (a dry run and a real import share one command) are
@@ -246,8 +246,9 @@ function sidebarNav(page: Page) {
   return page.getByRole('navigation', { name: 'Main navigation' });
 }
 
-/** "Import instances" on the game's Instances page, where a game session starts. */
+/** "Import instances" on the game's Instances page. */
 async function openImport(page: Page) {
+  await sidebarNav(page).getByRole('button', { name: 'My Instances' }).click();
   await page.getByTestId('game-instances-tab').getByRole('button', { name: 'Import instances' }).click();
   await expect(page.getByTestId('game-import-dialog')).toBeVisible();
 }
@@ -357,7 +358,7 @@ test.describe('Import dialog', () => {
   });
 });
 
-test.describe('Library curated items', () => {
+test.describe('Browse curated items', () => {
   test('previews an entry, then installs it and says how its hash was checked', async ({ page }) => {
     await boot(
       page,
@@ -379,7 +380,7 @@ test.describe('Library curated items', () => {
       { games_catalog_list: catalogListing },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Library' }).click();
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
     const row = page.getByTestId('catalog-entry');
     await expect(row).toContainText('SKSE64');
 
@@ -412,7 +413,7 @@ test.describe('Library curated items', () => {
       { games_catalog_list: catalogListing },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Library' }).click();
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
     await page.getByTestId('catalog-entry').getByRole('button', { name: 'Install', exact: true }).click();
     await expect(page.getByTestId('catalog-hash')).toContainText('Not verified: no published hash');
     await expect(page.getByTestId('catalog-hash')).not.toContainText('Verified:');
@@ -456,19 +457,29 @@ test.describe('Library curated items', () => {
       },
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Library' }).click();
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
     await page.getByTestId('catalog-entry').getByRole('button', { name: 'Install', exact: true }).click();
     await expect(page.getByTestId('catalog-needs-installer')).toContainText('has an installer with questions');
     // The content slice's real wizard is mounted in place, in its own dialog.
     await expect(page.getByTestId('fomod-wizard')).toBeVisible();
   });
 
-  test('an empty catalog and an instance-less game each say what to do next', async ({ page }) => {
-    await boot(page, [], { games_catalog_list: { entries: [], instances: [] } });
+  test('an empty catalog points to Settings, where sources are added', async ({ page }) => {
+    // The Plugins page also reads which plugin surfaces exist: none here.
+    await boot(page, [], { games_catalog_list: { entries: [], instances: [] }, plugin_surfaces: [] });
 
-    await sidebarNav(page).getByRole('button', { name: 'Library' }).click();
-    await expect(page.getByTestId('catalog-empty')).toContainText('no curated items');
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
+    await expect(page.getByTestId('catalog-empty')).toContainText('Nothing to browse for Skyrim SE yet');
+    await page.getByTestId('catalog-empty').getByRole('button', { name: 'Open Settings > Plugins' }).click();
+    await expect(page.getByRole('tab', { name: 'Plugins', selected: true })).toBeVisible();
+  });
+
+  test('an instance-less game says to create an instance first', async ({ page }) => {
+    await boot(page, [], { games_catalog_list: { ...catalogListing, instances: [] } });
+
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
     await expect(page.getByTestId('catalog-no-instance')).toContainText('Create an instance');
+    await expect(page.getByTestId('catalog-entry').getByRole('button', { name: 'Install', exact: true })).toBeDisabled();
   });
 
   test('a catalog that fails to load says so and can be tried again', async ({ page }) => {
@@ -478,8 +489,8 @@ test.describe('Library curated items', () => {
       {},
     );
 
-    await sidebarNav(page).getByRole('button', { name: 'Library' }).click();
-    await expect(page.getByRole('alert')).toContainText('could not load the curated items');
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
+    await expect(page.getByRole('alert')).toContainText('could not load the mods for Skyrim SE');
     await expect(page.getByRole('alert')).toContainText('Agora does not support that game.');
     await expect(page.getByTestId('catalog-empty')).toHaveCount(0);
   });

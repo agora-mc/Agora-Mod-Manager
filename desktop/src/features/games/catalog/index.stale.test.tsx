@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
-import { LibraryCatalogSection } from './index';
+import { GameBrowsePage } from './index';
 
 const entry = (id: string) => ({
   id,
@@ -24,7 +24,7 @@ function listing(gameId: string) {
   };
 }
 
-describe('LibraryCatalogSection: stale selection when the game changes', () => {
+describe('GameBrowsePage: stale selection when the game changes', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockImplementation(async (command: string, args: Record<string, unknown>) => {
@@ -39,11 +39,11 @@ describe('LibraryCatalogSection: stale selection when the game changes', () => {
   // `gameId`. `load` keeps the previous game's instance (`current || first`), so the page shows the
   // new game's first instance in the select but sends the OLD game's instance id with Install.
   // Run: npx vitest run src/features/games/catalog/index.stale.test.tsx (un-skip first)
-  // proves bug: LibraryCatalogSection keeps the previous game's instanceId after a game switch
+  // proves bug: the catalog list kept the previous game's instanceId after a game switch
   it('installs into the instance the select shows after the game changes', async () => {
-    const { rerender } = render(<LibraryCatalogSection gameId="game-a" />);
+    const { rerender } = render(<GameBrowsePage gameId="game-a" gameName="Game A" />);
     await screen.findByText('Entry game-a-entry');
-    rerender(<LibraryCatalogSection gameId="game-b" />);
+    rerender(<GameBrowsePage gameId="game-b" gameName="Game B" />);
     await screen.findByText('Entry game-b-entry');
     expect(screen.getByRole('combobox')).toHaveDisplayValue('Instance of game-b');
 
