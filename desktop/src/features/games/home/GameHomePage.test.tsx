@@ -148,6 +148,14 @@ describe('GameHomePage', () => {
     expect(props.onOpenBrowse).toHaveBeenCalled();
   });
 
+  it('speaks about the game, not Minecraft, in the shared cards', async () => {
+    replies([]);
+    renderHome();
+    await screen.findByTestId('game-home-welcome');
+    expect(screen.getByText(/from your first mod to load order and recovery/)).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent(/Minecraft|JVM|Crash Doctor/);
+  });
+
   it('says the catalog has nothing for the game yet', async () => {
     replies([]);
     const props = renderHome();

@@ -24,11 +24,23 @@ export function HomeHero({ description, children }: { description: ReactNode; ch
   );
 }
 
+const MINECRAFT_GUIDE_BLURB =
+  'Follow beginner walkthroughs or open the advanced companion for every topic, from your first mod to JVM tuning and recovery.';
+
+/** The guide card's sentence on a game's Home: no Minecraft-only topics. */
+export const GAME_GUIDE_BLURB =
+  'Follow beginner walkthroughs or open the advanced companion for every topic, from your first mod to load order and recovery.';
+
 /**
  * Help & Guide, with the guided tour beside it. The tour walks Minecraft's pages, so a game's
  * Home leaves it out (`tour={false}`).
  */
-export function GuideCard({ onOpenGuide, tour = true }: { onOpenGuide: () => void; tour?: boolean }) {
+export function GuideCard({ onOpenGuide, tour = true, blurb = MINECRAFT_GUIDE_BLURB }: {
+  onOpenGuide: () => void;
+  tour?: boolean;
+  /** The sentence under the title. Minecraft's names Minecraft topics (JVM tuning). */
+  blurb?: string;
+}) {
   return (
     <div className="overflow-hidden rounded-xl border border-primary/20 bg-card">
       <div className="grid gap-4 p-5 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center">
@@ -44,9 +56,7 @@ export function GuideCard({ onOpenGuide, tour = true }: { onOpenGuide: () => voi
               {GUIDE_TOPICS.length * 2} guide pages
             </span>
           </div>
-          <p className="mt-1 text-sm leading-5 text-muted-foreground">
-            Follow beginner walkthroughs or open the advanced companion for every topic, from your first mod to JVM tuning and recovery.
-          </p>
+          <p className="mt-1 text-sm leading-5 text-muted-foreground">{blurb}</p>
         </div>
         <div className="flex flex-col gap-2">
           <button
@@ -63,8 +73,12 @@ export function GuideCard({ onOpenGuide, tour = true }: { onOpenGuide: () => voi
   );
 }
 
-/** "Get help from the community" and "Support Agora's future", side by side. */
-export function CommunityCards() {
+/**
+ * "Get help from the community" and "Support Agora's future", side by side. Minecraft's wording
+ * names Crash Doctor and the Minecraft community; `game` is the same pair without them.
+ */
+export function CommunityCards({ variant = 'minecraft' }: { variant?: 'minecraft' | 'game' }) {
+  const game = variant === 'game';
   return (
     <div className="grid gap-4 md:grid-cols-2">
       {/* Community */}
@@ -74,10 +88,9 @@ export function CommunityCards() {
           <h3 className="text-lg font-semibold">Get help from the community</h3>
         </div>
         <p className="text-sm leading-6 text-muted-foreground mb-4">
-          Stuck on a crash, hunting for a mod, or want to help curate the
-          catalog? The Discord is where Agora players and curators hang
-          out. Crash Doctor can copy a ready-to-share report for you —
-          paths and usernames removed.
+          {game
+            ? 'Stuck on a crash, hunting for a mod, or want to help curate the catalog? The Discord is where Agora players and curators hang out.'
+            : 'Stuck on a crash, hunting for a mod, or want to help curate the catalog? The Discord is where Agora players and curators hang out. Crash Doctor can copy a ready-to-share report for you — paths and usernames removed.'}
         </p>
         <a
           href={agoraDiscordUrl}
@@ -97,7 +110,7 @@ export function CommunityCards() {
           <h3 className="text-lg font-semibold">Support Agora’s future</h3>
         </div>
         <p className="text-sm leading-6 text-muted-foreground mb-4">
-          Agora is free, open source, and ad-free — built by a solo developer who loves the Minecraft community. If Agora has made modding easier or more enjoyable for you, please consider sponsoring its development. Your donation keeps Agora improving and helps fund awesome new projects for the community. Every contribution means a lot — thank you!
+          Agora is free, open source, and ad-free — built by a solo developer who loves {game ? 'modding communities' : 'the Minecraft community'}. If Agora has made modding easier or more enjoyable for you, please consider sponsoring its development. Your donation keeps Agora improving and helps fund awesome new projects for the community. Every contribution means a lot — thank you!
         </p>
         <a
           href={agoraSponsorsUrl}

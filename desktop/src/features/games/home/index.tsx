@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowRight, Boxes, Download, Play, Plus, Square } from 'lucide-react';
-import { CommunityCards, GuideCard, HomeHero, timeSince } from '@/components/home/HomeCards';
+import { CommunityCards, GAME_GUIDE_BLURB, GuideCard, HomeHero, timeSince } from '@/components/home/HomeCards';
 import { InstanceCardBanner, PageHeroAction, RunningIndicator } from '@/components/instance-kit';
 import { requestGameImport } from '@/lib/gameImportRequest';
 import { listCatalogEntries, type CatalogEntry } from '../catalog/api';
@@ -180,9 +180,9 @@ export function GameHomePage({ gameId, gameName, onOpenInstance, onOpenInstances
         </section>
       )}
 
-      <GuideCard onOpenGuide={onOpenGuide} tour={false} />
+      <GuideCard onOpenGuide={onOpenGuide} tour={false} blurb={GAME_GUIDE_BLURB} />
 
-      <CommunityCards />
+      <CommunityCards variant="game" />
 
       <CatalogStrip gameName={gameName} catalog={catalog} onOpenBrowse={onOpenBrowse} />
     </div>
