@@ -76,6 +76,7 @@ fn real_setup_plan_is_read_only_and_prints_the_plan() {
         profile: REAL_PROFILE.to_string(),
         name: None,
         copy_saves: false,
+        install: None,
     };
     let plan = game_import::plan(&ctx, &inventory, &request).expect("the real setup plans");
     let after = small_file_bytes(&setup);

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useState, type ReactNode } from 'react';
 import { Boxes } from 'lucide-react';
 import { formatError } from '../../../lib/tauri';
 import {
@@ -42,8 +42,11 @@ function optionLabel<Value extends string>(choice: Choice<Value>, recommended: V
 }
 
 /**
- * One per-game choice: its name and explanation on the left, the dropdown on the right (stacked
- * in a narrow window). When the saved choice is not the recommended one, a quiet line says what
+ * One per-game choice. Like Minecraft's settings, the name and explanation sit above the dropdown;
+ * only a list wide enough to give the explanation real room puts the dropdown beside it. The list
+ * is a size container, so this follows the card's width (a compact window, the Settings rail, the
+ * text size), never squeezing the explanation to a word a line.
+ * Put rows in `GameSettingList`. When the saved choice is not the recommended one, a quiet line says what
  * Agora recommends, so the advice is visible without opening the list.
  */
 export function GameSettingRow<Value extends string>({
@@ -67,12 +70,12 @@ export function GameSettingRow<Value extends string>({
   const descriptionId = useId();
   const recommendedChoice = choices.find((choice) => choice.value === recommended);
   return (
-    <li className="grid gap-x-6 gap-y-2 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(calc(12rem*var(--font-scale)),calc(18rem*var(--font-scale)))] sm:items-center">
+    <li className="grid gap-x-6 gap-y-2 px-3 py-3 @4xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] @4xl:items-center">
       <div className="min-w-0">
         <label htmlFor={id} className="block text-sm font-medium">{label}</label>
         <p id={descriptionId} className="mt-0.5 text-xs text-muted-foreground">{description}</p>
       </div>
-      <div className="min-w-0 space-y-1">
+      <div className="min-w-0 max-w-[calc(20rem*var(--font-scale))] space-y-1 @4xl:max-w-none">
         <select
           id={id}
           aria-describedby={descriptionId}
@@ -93,6 +96,11 @@ export function GameSettingRow<Value extends string>({
       </div>
     </li>
   );
+}
+
+/** The bordered list `GameSettingRow`s go in; it is what the rows measure their width against. */
+export function GameSettingList({ children }: { children: ReactNode }) {
+  return <ul className="@container divide-y divide-border rounded-lg border border-border">{children}</ul>;
 }
 
 /**
@@ -152,7 +160,7 @@ export function NewInstancesSettings({ gameId, gameName }: { gameId: string; gam
         </p>
       )}
       {choices !== null && (
-        <ul className="divide-y divide-border rounded-lg border border-border">
+        <GameSettingList>
           <GameSettingRow
             label="Base type"
             description="Linked shares most game files with the install and takes little space. Copied keeps its own copy of the game files. “Build a base” on the Bases page starts with this choice too."
@@ -180,7 +188,7 @@ export function NewInstancesSettings({ gameId, gameName }: { gameId: string; gam
             disabled={saving !== null}
             onChange={(value) => void change('importCopySaves', value)}
           />
-        </ul>
+        </GameSettingList>
       )}
       {saveError !== null && (
         <p role="alert" className="text-xs text-destructive">{saveError}</p>

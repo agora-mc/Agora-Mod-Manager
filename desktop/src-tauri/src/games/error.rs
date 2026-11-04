@@ -11,6 +11,8 @@ pub const NOT_IMPLEMENTED: &str = "not_implemented";
 pub const CORE_FAILED: &str = "core_failed";
 /// The blocking worker that did the work panicked or was cancelled.
 pub const TASK_FAILED: &str = "task_failed";
+/// An MO2 import found no install of the setup's game anywhere; the user adds one in Settings.
+pub const NO_INSTALL: &str = "no_install";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

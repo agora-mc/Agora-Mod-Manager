@@ -81,7 +81,9 @@ const plan = {
   profile: 'Default',
   mo2GameName: 'Skyrim Special Edition',
   gameId: 'skyrim-se',
+  installId: 'steam:489830',
   installLocation: 'D:/Games/Skyrim Special Edition',
+  setupGamePath: 'D:/Games/Skyrim Special Edition',
   store: 'steam',
   instanceName: 'Default (MO2 import)',
   mods: [
@@ -295,7 +297,7 @@ test.describe('Import dialog', () => {
 
     const done = page.getByTestId('import-done');
     await expect(done).toContainText('Imported as “Default (MO2 import)”');
-    await expect(done).toContainText('2 mod(s) stored');
+    await expect(done).toContainText('2 mods stored');
     await expect(done).toContainText('Still to do');
     // The new instance is one step away, as a created one is.
     await expect(page.getByRole('button', { name: 'Open “Default (MO2 import)”' })).toBeVisible();
@@ -340,7 +342,9 @@ test.describe('Import dialog', () => {
       ...plan,
       gameId: 'fallout-4',
       mo2GameName: 'Fallout 4',
+      installId: 'steam:489830',
       installLocation: 'D:/Games/Fallout 4',
+      setupGamePath: 'D:/Games/Fallout 4',
       instanceName: 'Default (MO2 import)',
     };
     await boot(

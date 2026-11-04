@@ -7,7 +7,7 @@ import {
   parseRetentionDays,
 } from '../../lib/recentlyDeletedDays';
 import { SettingsSection } from './SettingsSection';
-import { GameSettingRow, type Choice } from './game/NewInstancesSettings';
+import { GameSettingList, GameSettingRow, type Choice } from './game/NewInstancesSettings';
 
 const PRESETS = [7, 14, 30, 60, 90];
 
@@ -71,7 +71,7 @@ export function RecentlyDeletedSettings() {
         <p role="alert" className="text-xs text-destructive">Agora could not read this setting. {loadError}</p>
       )}
       {days !== null && (
-        <ul className="divide-y divide-border rounded-lg border border-border">
+        <GameSettingList>
           <GameSettingRow
             label="Keep deleted instances for"
             description="After this, Agora moves them to your Recycle Bin. The same time applies to every game, and to instances already there."
@@ -81,7 +81,7 @@ export function RecentlyDeletedSettings() {
             disabled={saving}
             onChange={(value) => void change(value)}
           />
-        </ul>
+        </GameSettingList>
       )}
       {saveError !== null && <p role="alert" className="text-xs text-destructive">{saveError}</p>}
     </SettingsSection>

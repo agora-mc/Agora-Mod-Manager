@@ -8,7 +8,9 @@ function plan(overrides: Partial<Mo2PlanDto> = {}): Mo2PlanDto {
     profile: 'Default',
     mo2GameName: 'Skyrim Special Edition',
     gameId: 'skyrim-se',
+    installId: 'steam:489830',
     installLocation: 'D:/Games/Skyrim Special Edition',
+    setupGamePath: 'D:/Games/Skyrim Special Edition',
     store: 'steam',
     instanceName: 'Default (MO2 import)',
     mods: [

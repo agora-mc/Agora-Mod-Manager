@@ -51,8 +51,25 @@ pub enum ImportError {
     UnknownGame(String),
     #[error("the setup names no game folder (gamePath is missing from ModOrganizer.ini)")]
     NoGamePath,
-    #[error("no discovered install of {game} is at {path}. Install the game, or point the setup at the folder the game is in; `agora games list` shows what Agora found")]
-    NoInstall { game: String, path: PathBuf },
+    /// The setup's gamePath is not a discovered install. `candidates` are the game's installs
+    /// Agora did find (by install id), any of which an import can be pointed at instead.
+    #[error("no discovered install of {game} is at {path}{}", no_install_hint(.candidates))]
+    NoInstall {
+        game: String,
+        game_id: GameId,
+        path: PathBuf,
+        candidates: Vec<String>,
+    },
+    #[error(
+        "no discovered install has the id '{0}'; `agora games list` shows the installs Agora found"
+    )]
+    NoSuchInstall(String),
+    #[error("the install '{install}' is {install_game}, not {game}, so this setup cannot be imported onto it")]
+    InstallOfAnotherGame {
+        install: String,
+        install_game: String,
+        game: String,
+    },
     #[error(
         "the install at {path} is not identified ({reasons}), so it cannot be pinned to a base"
     )]
@@ -100,6 +117,17 @@ pub enum ImportError {
         /// Why it could not be labelled incomplete, if it is listed and the label failed.
         labelled: Result<(), String>,
     },
+}
+
+fn no_install_hint(candidates: &[String]) -> String {
+    if candidates.is_empty() {
+        ". Install the game, or point the setup at the folder the game is in; `agora games list` shows what Agora found".into()
+    } else {
+        format!(
+            ". Agora found it at another place: give --install with one of {} to import onto that install",
+            candidates.join(", ")
+        )
+    }
 }
 
 fn left_behind_note(listed: &bool, labelled: &Result<(), String>) -> String {
@@ -300,6 +328,9 @@ pub struct Mo2Request {
     pub name: Option<String>,
     /// Copy the profile's saves into the instance's own save folder (under Documents).
     pub copy_saves: bool,
+    /// The install to import onto, by install id. `None` uses the install at the setup's
+    /// gamePath, which must be one Agora discovered.
+    pub install: Option<String>,
 }
 
 /// A mod folder the profile lists, and what reading it found.
@@ -417,6 +448,9 @@ pub struct Mo2Plan {
     pub game: GameId,
     pub install_id: String,
     pub install_location: PathBuf,
+    /// The game folder the setup itself names (its gamePath). Differs from `install_location`
+    /// when the import was pointed at another install.
+    pub setup_game_path: PathBuf,
     pub store: String,
     pub instance_name: String,
     /// Enabled and disabled mods, highest priority first (the order of `modlist.txt`).
@@ -494,20 +528,49 @@ pub fn plan(
         .ok_or_else(|| ImportError::UnknownGame(mo2_game.clone()))?;
     let game_path = ini.game_path.clone().ok_or(ImportError::NoGamePath)?;
     let game_path_buf = PathBuf::from(&game_path);
-    let install: &IdentifiedInstall = inventory
-        .installs
-        .iter()
-        .find(|i| {
-            i.game == def.id
-                && normalise_path(&i.discovered.location) == normalise_path(&game_path_buf)
-        })
-        .ok_or_else(|| ImportError::NoInstall {
-            game: def.name.clone(),
-            path: game_path_buf.clone(),
-        })?;
+    let install: &IdentifiedInstall = match request.install.as_deref() {
+        Some(wanted) => {
+            let found = inventory
+                .installs
+                .iter()
+                .find(|i| i.install_id.as_str() == wanted)
+                .ok_or_else(|| ImportError::NoSuchInstall(wanted.to_string()))?;
+            if found.game != def.id {
+                let install_game = ctx
+                    .games
+                    .game(&found.game)
+                    .map(|g| g.name.clone())
+                    .unwrap_or_else(|| found.game.as_str().to_string());
+                return Err(ImportError::InstallOfAnotherGame {
+                    install: wanted.to_string(),
+                    install_game,
+                    game: def.name.clone(),
+                });
+            }
+            found
+        }
+        None => inventory
+            .installs
+            .iter()
+            .find(|i| {
+                i.game == def.id
+                    && normalise_path(&i.discovered.location) == normalise_path(&game_path_buf)
+            })
+            .ok_or_else(|| ImportError::NoInstall {
+                game: def.name.clone(),
+                game_id: def.id.clone(),
+                path: game_path_buf.clone(),
+                candidates: inventory
+                    .installs
+                    .iter()
+                    .filter(|i| i.game == def.id)
+                    .map(|i| i.install_id.as_str().to_string())
+                    .collect(),
+            })?,
+    };
     if let RuntimeResolution::Unidentified { reasons } = &install.runtime {
         return Err(ImportError::Unidentified {
-            path: game_path_buf,
+            path: install.discovered.location.clone(),
             reasons: reasons.join("; "),
         });
     }
@@ -746,6 +809,7 @@ pub fn plan(
         game: def.id.clone(),
         install_id: install.install_id.as_str().to_string(),
         install_location: install.discovered.location.clone(),
+        setup_game_path: game_path_buf,
         store: store.as_str().to_string(),
         instance_name: request
             .name

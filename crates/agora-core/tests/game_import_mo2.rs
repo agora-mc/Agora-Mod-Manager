@@ -339,6 +339,7 @@ fn request(f: &Fixture, name: Option<&str>, copy_saves: bool) -> Mo2Request {
         profile: "Test Profile".into(),
         name: name.map(str::to_string),
         copy_saves,
+        install: None,
     }
 }
 
@@ -726,6 +727,91 @@ fn a_gamepath_with_no_install_stops_with_a_message() {
         Err(e @ ImportError::NoInstall { .. }) => {
             let text = e.to_string();
             assert!(text.contains("not-installed"), "{text}");
+            assert!(
+                text.contains("--install"),
+                "the CLI is told how to choose: {text}"
+            );
+            let ImportError::NoInstall {
+                candidates,
+                game_id,
+                ..
+            } = e
+            else {
+                unreachable!()
+            };
+            assert_eq!(candidates, vec!["steam:489830".to_string()]);
+            assert_eq!(game_id.as_str(), GAME);
+        }
+        other => panic!("expected NoInstall, got {:?}", other.map(|p| p.profile)),
+    }
+}
+
+/// The owner's case: the setup names a Steam folder the game is no longer in, while Agora found
+/// the game somewhere else. Naming that install imports onto it.
+#[test]
+fn a_gamepath_with_no_install_imports_onto_the_install_that_is_named() {
+    let f = fixture();
+    let elsewhere = f._tmp.path().join("not-installed");
+    build_setup(&f.setup, &elsewhere);
+    let mut req = request(&f, None, false);
+    req.install = Some("steam:489830".into());
+    let plan = game_import::plan(&f.ctx, &f.inventory, &req).unwrap();
+    assert_eq!(plan.install_id, "steam:489830");
+    assert_eq!(
+        plan.install_location,
+        f.inventory.installs[0].discovered.location
+    );
+    assert_eq!(plan.setup_game_path, elsewhere);
+    assert_eq!(plan.mods.len(), 3);
+
+    let report = game_import::run(&f.ctx, &f.inventory, &req, RunOptions::default(), &|_| {})
+        .expect("the import runs onto the named install");
+    assert!(report.instance_id.is_some());
+}
+
+#[test]
+fn an_install_of_another_game_is_refused() {
+    let mut f = fixture();
+    let mut other = install_of(&f._tmp.path().join("game"));
+    other.game = GameId::new("other-game").unwrap();
+    other.install_id = InstallId::new("steam:377160").unwrap();
+    f.inventory.installs.push(other);
+    let mut req = request(&f, None, false);
+    req.install = Some("steam:377160".into());
+    match game_import::plan(&f.ctx, &f.inventory, &req) {
+        Err(ImportError::InstallOfAnotherGame { install, .. }) => {
+            assert_eq!(install, "steam:377160")
+        }
+        other => panic!(
+            "expected InstallOfAnotherGame, got {:?}",
+            other.map(|p| p.profile)
+        ),
+    }
+}
+
+#[test]
+fn an_install_id_agora_did_not_find_is_refused() {
+    let f = fixture();
+    let mut req = request(&f, None, false);
+    req.install = Some("gog:nope".into());
+    match game_import::plan(&f.ctx, &f.inventory, &req) {
+        Err(ImportError::NoSuchInstall(id)) => assert_eq!(id, "gog:nope"),
+        other => panic!("expected NoSuchInstall, got {:?}", other.map(|p| p.profile)),
+    }
+}
+
+#[test]
+fn no_installs_at_all_still_stops_with_a_message() {
+    let mut f = fixture();
+    f.inventory.installs.clear();
+    match game_import::plan(&f.ctx, &f.inventory, &request(&f, None, false)) {
+        Err(e @ ImportError::NoInstall { .. }) => {
+            let text = e.to_string();
+            assert!(text.contains("Install the game"), "{text}");
+            let ImportError::NoInstall { candidates, .. } = e else {
+                unreachable!()
+            };
+            assert!(candidates.is_empty());
         }
         other => panic!("expected NoInstall, got {:?}", other.map(|p| p.profile)),
     }
