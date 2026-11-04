@@ -33,11 +33,20 @@ export interface ToolRow {
   outputKind: 'generated_layer' | 'mod';
   /** The folder a mod-output tool writes. */
   outputFolder: string | null;
+  /** A mod (or the game) provides the tool here. False for a tool listed only for its output. */
+  installed: boolean;
+  /** Where the executable is in the game folder, when it is installed. */
+  exe: string | null;
+  /** The mod that provides it; `null` for the game's own files or when it is not installed. */
+  fromMod: string | null;
 }
 
+/** The tools present in an instance: the ones installed here, and the ones with output here. */
 export interface ToolsView {
   instanceId: string;
   tools: ToolRow[];
+  /** Every tool the game recognises by name, installed or not. */
+  known: string[];
 }
 
 export interface SwapCosts {
@@ -145,6 +154,8 @@ export interface UserToolRow {
   knownToolId: string | null;
   outputIsMod: boolean;
   outputFolder: string | null;
+  /** Its executable is not there now (its mod is off or gone). It stays listed until removed. */
+  missing: boolean;
 }
 
 /** One earlier output of a mod-output tool. */
@@ -189,14 +200,18 @@ function isToolRow(value: unknown): value is ToolRow {
     && (value.status === null || (isString(value.status) && OUTPUT_STATUSES.includes(value.status)))
     && typeof value.conflicts === 'boolean'
     && (value.outputKind === 'generated_layer' || value.outputKind === 'mod')
-    && isNullableString(value.outputFolder);
+    && isNullableString(value.outputFolder)
+    && typeof value.installed === 'boolean'
+    && isNullableString(value.exe)
+    && isNullableString(value.fromMod);
 }
 
 export function isToolsView(value: unknown): value is ToolsView {
   return isObject(value)
     && isString(value.instanceId)
     && Array.isArray(value.tools)
-    && value.tools.every(isToolRow);
+    && value.tools.every(isToolRow)
+    && isStringArray(value.known);
 }
 
 export function isSwapCosts(value: unknown): value is SwapCosts {
@@ -301,7 +316,8 @@ function isUserToolRow(value: unknown): value is UserToolRow {
     && isNullableString(value.knownToolId)
     && isString(value.toolId)
     && typeof value.outputIsMod === 'boolean'
-    && isNullableString(value.outputFolder);
+    && isNullableString(value.outputFolder)
+    && typeof value.missing === 'boolean';
 }
 
 function isToolOutput(value: unknown): value is ToolOutput {
@@ -477,6 +493,12 @@ export async function useUserToolOutput(instanceId: string, id: string, itemId: 
 export async function removeUserTool(instanceId: string, id: string): Promise<UserToolsView> {
   const reply = await invoke<unknown>('games_user_tools_remove', { instanceId, id });
   return expectReply('games_user_tools_remove', reply, isUserToolsView);
+}
+
+/** Ask the person for a program anywhere on this PC (null if they cancel). Uses the app's picker. */
+export async function pickProgram(): Promise<string | null> {
+  const picked = await invoke<unknown>('pick_open_file', { title: 'Choose a program', extensions: ['exe'] });
+  return typeof picked === 'string' && picked.trim() !== '' ? picked : null;
 }
 
 /** Look through the instance's enabled mods for executables. Adds nothing. */

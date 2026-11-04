@@ -6224,3 +6224,276 @@ fn a_verbatim_unc_spelling_of_the_game_path_is_refused() {
     );
     assert!(install.join("Game.exe").is_file());
 }
+
+// ---------------------------------------------------------------------------
+// Tools found in the instance's mods, and the list an import adds to (MASTER_SPEC §26.9).
+// ---------------------------------------------------------------------------
+
+/// A declared tool whose executable is at `exe`, which no base file provides.
+fn known_tool(id: &str, name: &str, exe: &str) -> ToolDefinition {
+    at_exe(tool(id, name, &[]), exe)
+}
+
+fn state_of(f: &Fixture, tool: &str) -> game_tools::ToolState {
+    game_tools::list(&f.ctx, f.id(), &f.def)
+        .unwrap()
+        .into_iter()
+        .find(|state| state.tool == tool)
+        .unwrap_or_else(|| panic!("no state for {tool}"))
+}
+
+fn presence(f: &Fixture) -> Vec<(String, bool)> {
+    game_user_tools::list_with_presence(&f.ctx, f.id(), &f.def)
+        .unwrap()
+        .into_iter()
+        .map(|(tool, present)| (tool.name, present))
+        .collect()
+}
+
+#[test]
+fn a_declared_tool_nobody_installed_is_not_present_and_a_mod_without_an_exe_adds_nothing() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    assert!(!state_of(&f, "mytool").is_present());
+
+    f.add_mod(
+        "Textures",
+        &[
+            ("Data/textures/a.dds", b"DDS"),
+            ("Data/MyTool/readme.txt", b"not the tool"),
+            ("Data/MyTool/My Tool.exe.bak", b"not the tool either"),
+        ],
+    );
+
+    let state = state_of(&f, "mytool");
+    assert_eq!(state.found, None);
+    assert!(!state.is_present());
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn installing_a_tools_mod_lists_the_tool_and_turning_the_mod_off_unlists_it() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    let item = f.add_mod("My Tool mod", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+
+    let state = state_of(&f, "mytool");
+    let found = state.found.clone().expect("the mod installs the tool");
+    assert_eq!(found.exe, "Data/MyTool/My Tool.exe");
+    assert_eq!(found.mod_id, item);
+    assert_eq!(found.mod_name, "My Tool mod");
+    assert!(found.at_declared_path);
+    assert!(state.is_present());
+
+    set_content_enabled(&f.ctx, f.id(), &item, false).unwrap();
+    assert!(
+        !state_of(&f, "mytool").is_present(),
+        "a mod that is off provides nothing"
+    );
+    set_content_enabled(&f.ctx, f.id(), &item, true).unwrap();
+    assert!(state_of(&f, "mytool").is_present());
+}
+
+#[test]
+fn a_tool_nested_deeper_and_in_another_case_is_still_found_where_it_is() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod(
+        "Packed one folder too deep",
+        &[("Data/Downloads/v2/MYTOOL/my tool.EXE", b"MZ")],
+    );
+
+    let found = state_of(&f, "mytool").found.expect("matched by file name");
+    assert_eq!(found.exe, "Data/Downloads/v2/MYTOOL/my tool.EXE");
+    assert!(!found.at_declared_path);
+}
+
+#[test]
+fn the_same_tool_in_two_mods_is_one_row_for_the_mod_that_wins_by_order() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod("Lower", &[("Data/MyTool/My Tool.exe", b"lower")]);
+    let upper = f.add_mod("Upper", &[("Data/Elsewhere/My Tool.exe", b"upper")]);
+
+    let states = game_tools::list(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(states.iter().filter(|s| s.tool == "mytool").count(), 1);
+    let found = state_of(&f, "mytool").found.unwrap();
+    assert_eq!(found.mod_name, "Upper");
+    assert_eq!(found.exe, "Data/Elsewhere/My Tool.exe");
+
+    // Move Upper below Lower: Lower now wins.
+    move_content(&f.ctx, f.id(), &upper, 0).unwrap();
+    let found = state_of(&f, "mytool").found.unwrap();
+    assert_eq!(found.mod_name, "Lower");
+    assert!(found.at_declared_path);
+}
+
+#[test]
+fn a_tool_with_output_stays_listed_when_its_mod_is_turned_off() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    let item = f.add_mod("My Tool mod", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    let output = TempDir::new().unwrap();
+    let file = output.path().join("out.txt");
+    std::fs::write(&file, b"built").unwrap();
+    game_tools::import_output(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("mytool").unwrap(),
+        &[("Data/out.txt".to_string(), file)],
+    )
+    .unwrap();
+
+    set_content_enabled(&f.ctx, f.id(), &item, false).unwrap();
+    let state = state_of(&f, "mytool");
+    assert_eq!(state.found, None, "the tool is not installed any more");
+    assert!(state.current.is_some());
+    assert!(state.is_present(), "its output is still there to manage");
+}
+
+#[test]
+fn a_tool_a_mod_ships_in_another_folder_runs_from_there() {
+    let cmd = cmd_exe();
+    let f = fixture(vec![at_exe(
+        tool(
+            "mytool",
+            "My Tool",
+            &["/c", "echo", "ran", ">", r"Data\ran.txt"],
+        ),
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod(
+        "Packed one folder too deep",
+        &[("Data/Extra/MyTool/MY TOOL.exe", cmd.as_slice())],
+    );
+
+    let out = f
+        .run_as("mytool", &StagingLauncher::new(), CaptureMode::Links)
+        .expect("the tool runs from where its mod put it");
+
+    assert!(out.promoted, "{out:?}");
+    assert!(
+        out.written.contains(&"Data/ran.txt".to_string()),
+        "{:?}",
+        out.written
+    );
+}
+
+#[test]
+fn a_user_added_tool_survives_its_mod_being_turned_off_and_says_it_is_missing() {
+    let f = fixture(Vec::new());
+    let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "Mine", "Data/tools/My.exe").unwrap();
+    assert_eq!(presence(&f), vec![("Mine".to_string(), true)]);
+
+    set_content_enabled(&f.ctx, f.id(), &item, false).unwrap();
+    assert_eq!(presence(&f), vec![("Mine".to_string(), false)]);
+
+    // Another mod coming and going changes nothing for it.
+    let other = f.add_mod("Other", &[("Data/other.txt", b"x")]);
+    set_content_enabled(&f.ctx, f.id(), &other, false).unwrap();
+    set_content_enabled(&f.ctx, f.id(), &item, true).unwrap();
+    assert_eq!(presence(&f), vec![("Mine".to_string(), true)]);
+}
+
+#[test]
+fn an_import_adds_each_new_tool_once_and_refuses_paths_that_leave_the_game() {
+    use game_user_tools::ImportedTool;
+
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod("My Tool mod", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    f.add_mod("Extras", &[("Data/Extras/Helper.exe", b"MZ")]);
+    let outside = TempDir::new().unwrap();
+    let external = outside.path().join("SSEEdit.exe");
+    std::fs::write(&external, b"MZ").unwrap();
+    let entry = |name: &str, exe: &str| NewUserTool {
+        name: name.into(),
+        exe: exe.into(),
+        args: vec!["-a".into()],
+        output_is_mod: false,
+        output_folder: None,
+    };
+    let entries = || {
+        vec![
+            entry("My Tool", "Data/MyTool/My Tool.exe"),
+            entry("Helper", "data/extras/helper.exe"),
+            entry("Helper again", "Data/Extras/Helper.exe"),
+            entry("", &external.to_string_lossy()),
+            entry("Climber", "Data/../../Windows/System32/cmd.exe"),
+            entry("Gone", &outside.path().join("Gone.exe").to_string_lossy()),
+            entry("Off", "Data/NotHere/Off.exe"),
+        ]
+    };
+
+    let answers = game_user_tools::import_tools(&f.ctx, f.id(), entries()).unwrap();
+    assert!(
+        matches!(&answers[0], ImportedTool::AlreadyDetected { name } if name == "My Tool"),
+        "{answers:?}"
+    );
+    let ImportedTool::Added(helper) = &answers[1] else {
+        panic!("{answers:?}");
+    };
+    assert_eq!(
+        helper.exe, "Data/Extras/Helper.exe",
+        "the deployment's spelling"
+    );
+    assert_eq!(helper.args, vec!["-a".to_string()]);
+    assert!(
+        matches!(&answers[2], ImportedTool::AlreadyListed { .. }),
+        "{answers:?}"
+    );
+    let ImportedTool::Added(sseedit) = &answers[3] else {
+        panic!("{answers:?}");
+    };
+    assert_eq!(
+        sseedit.name, "SSEEdit",
+        "an empty name falls back to the file's stem"
+    );
+    for answer in &answers[4..] {
+        assert!(
+            matches!(answer, ImportedTool::Skipped { .. }),
+            "{answers:?}"
+        );
+    }
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 2);
+
+    // Importing again adds nothing.
+    let again = game_user_tools::import_tools(&f.ctx, f.id(), entries()).unwrap();
+    assert!(
+        !again.iter().any(|a| matches!(a, ImportedTool::Added(_))),
+        "{again:?}"
+    );
+    let listed = game_user_tools::list(&f.ctx, f.id()).unwrap();
+    assert_eq!(listed.len(), 2);
+    // Nothing in the list leaves the game folder by a relative path.
+    assert!(listed.iter().all(|tool| !tool.exe.contains("..")));
+}
+
+#[test]
+fn an_import_with_nothing_to_add_writes_no_list() {
+    let f = fixture(Vec::new());
+    assert!(game_user_tools::import_tools(&f.ctx, f.id(), Vec::new())
+        .unwrap()
+        .is_empty());
+    assert!(!f.instance_dir().join("user_tools.json").exists());
+}

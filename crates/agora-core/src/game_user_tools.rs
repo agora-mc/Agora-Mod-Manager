@@ -10,6 +10,11 @@
 //!
 //! `find_candidates` looks through the instance's enabled mods for `.exe` files and recognises the
 //! tools the game declares. It suggests; nothing is added until the person confirms.
+//!
+//! A tool the game declares needs no entry here: [`detect_known_tools`] finds it in the instance's
+//! deployment whenever a mod (or the game) provides its executable, so installing the mod lists the
+//! tool and turning the mod off unlists it. [`import_tools`] adds another manager's executables
+//! (Mod Organizer 2's list) when an instance is imported.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -321,6 +326,323 @@ pub fn find_candidates(
     }
 
     Ok(rows.into_values().collect())
+}
+
+/// Where a tool the game declares was found in an instance's deployment (MASTER_SPEC §26.9).
+///
+/// A declared tool is installed when a file of the deployment has its executable's file name. The
+/// match ignores case and folder depth, so a tool a mod ships one folder deeper than the package
+/// expects is still found, and runs from where it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundTool {
+    /// The executable's game-relative path, with forward slashes, as the deployment has it.
+    pub exe: String,
+    /// The mod that provides it. Empty when it is one of the game's own files.
+    pub mod_id: String,
+    pub mod_name: String,
+    /// The executable is where the game's package declares it.
+    pub at_declared_path: bool,
+}
+
+/// The tools the game declares that the instance's deployment provides, by tool id.
+///
+/// Every file the deployment shows counts except a tool's own generated output and the game's own
+/// writes: a mod, the game's files and the instance's overrides. When the file name is found in
+/// several places, the copy from the highest-priority layer is the one the tool runs from; between
+/// two copies in the same layer, the one at the declared path wins.
+pub fn detect_known_tools(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    manifest: &GameInstanceManifest,
+    plan: &game_deploy::DeploymentPlan,
+) -> Result<BTreeMap<String, FoundTool>, UserToolError> {
+    let known = known_tools(ctx, definition);
+    if known.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    // The stack's order is lowest priority first; the base sits below every layer and the
+    // instance's overrides above them.
+    let rank_of = |layer_id: &str| -> usize {
+        match layer_id {
+            "base" => 0,
+            "overrides" => usize::MAX,
+            other => manifest
+                .layers
+                .layers()
+                .iter()
+                .position(|layer| layer.id.as_str() == other)
+                .map_or(0, |index| index + 1),
+        }
+    };
+    let mut found: BTreeMap<String, FoundTool> = BTreeMap::new();
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    for tool in &known {
+        let declared_folded = fold_path_case(&tool.exe);
+        let Some(declared_base) = file_name(&tool.exe).map(fold_path_case) else {
+            continue;
+        };
+        let mut best: Option<(usize, bool, &game_deploy::PlannedFile)> = None;
+        for file in &plan.files {
+            if matches!(
+                file.source,
+                FileSource::Generated { .. } | FileSource::Writable { .. }
+            ) {
+                continue;
+            }
+            let path = file.path.as_str();
+            if file_name(path).map(fold_path_case).as_deref() != Some(declared_base.as_str()) {
+                continue;
+            }
+            let rank = rank_of(&file.layer_id);
+            let exact = fold_path_case(path) == declared_folded;
+            let better = match &best {
+                None => true,
+                Some((best_rank, best_exact, best_file)) => {
+                    (rank, exact) > (*best_rank, *best_exact)
+                        || ((rank, exact) == (*best_rank, *best_exact)
+                            && fold_path_case(path) < fold_path_case(best_file.path.as_str()))
+                }
+            };
+            if better {
+                best = Some((rank, exact, file));
+            }
+        }
+        let Some((_, exact, file)) = best else {
+            continue;
+        };
+        let (mod_id, mod_name) = match &file.source {
+            FileSource::Content { item_id, .. } => {
+                let name = match names.get(item_id) {
+                    Some(name) => name.clone(),
+                    None => {
+                        let name = crate::content_store::get_item(ctx, item_id)?.name;
+                        names.insert(item_id.clone(), name.clone());
+                        name
+                    }
+                };
+                (item_id.clone(), name)
+            }
+            _ => (String::new(), String::new()),
+        };
+        found.insert(
+            tool.id.clone(),
+            FoundTool {
+                exe: file.path.as_str().to_string(),
+                mod_id,
+                mod_name,
+                at_declared_path: exact,
+            },
+        );
+    }
+    Ok(found)
+}
+
+/// [`detect_known_tools`] for an instance, planning its deployment. An instance that is not pinned
+/// to a base has no deployment, so nothing is installed in it.
+pub fn installed_known_tools(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<BTreeMap<String, FoundTool>, UserToolError> {
+    let manifest = get_manifest(ctx, instance_id)?;
+    let plan = match game_deploy::plan(ctx, instance_id, definition, DeployMode::Links) {
+        Ok(plan) => plan,
+        Err(game_deploy::DeployError::UnpinnedInstance(_)) => return Ok(BTreeMap::new()),
+        Err(other) => return Err(other.into()),
+    };
+    detect_known_tools(ctx, definition, &manifest, &plan)
+}
+
+/// The instance's own tools, each with whether its executable is there now: a game-relative one
+/// must be in the deployment (its mod may have been turned off or removed), an absolute one must
+/// exist. The deployment is planned only when a tool needs it. A tool is never dropped from the
+/// list for being missing; the person removes it.
+pub fn list_with_presence(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<Vec<(UserTool, bool)>, UserToolError> {
+    let tools = list(ctx, instance_id)?;
+    let needs_plan = tools.iter().any(|tool| !is_absolute_path(&tool.exe));
+    let provided: Option<Vec<String>> = if needs_plan {
+        match game_deploy::plan(ctx, instance_id, definition, DeployMode::Links) {
+            Ok(plan) => {
+                let mut paths: Vec<String> = plan
+                    .files
+                    .iter()
+                    .map(|file| fold_path_case(file.path.as_str()))
+                    .collect();
+                paths.sort();
+                Some(paths)
+            }
+            // No deployment to look in: say nothing is missing rather than everything.
+            Err(game_deploy::DeployError::UnpinnedInstance(_)) => None,
+            Err(other) => return Err(other.into()),
+        }
+    } else {
+        None
+    };
+    Ok(tools
+        .into_iter()
+        .map(|tool| {
+            let present = if is_absolute_path(&tool.exe) {
+                Path::new(&tool.exe).is_file()
+            } else {
+                provided
+                    .as_ref()
+                    .is_none_or(|paths| paths.binary_search(&fold_path_case(&tool.exe)).is_ok())
+            };
+            (tool, present)
+        })
+        .collect())
+}
+
+/// One tool an import offers the list, with the reason it was left out when it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportedTool {
+    Added(UserTool),
+    /// The game declares this tool and the deployment provides it, so it is listed already.
+    AlreadyDetected {
+        name: String,
+    },
+    /// The same executable is in the list already.
+    AlreadyListed {
+        name: String,
+    },
+    Skipped {
+        name: String,
+        reason: String,
+    },
+}
+
+/// Add tools another manager listed (Mod Organizer 2's executables) to the instance's list, under
+/// the same rules as [`add`]: a game-relative executable must be provided by an enabled mod or the
+/// game's files, and an absolute one must be an existing `.exe`. A tool the game declares and the
+/// deployment provides is already listed, so it is not added twice; neither is an executable the
+/// list has. Each entry gets its own answer; one that cannot be added does not stop the rest.
+pub fn import_tools(
+    ctx: &Ctx,
+    instance_id: &str,
+    entries: Vec<NewUserTool>,
+) -> Result<Vec<ImportedTool>, UserToolError> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let _lock = ctx
+        .lock_manager
+        .acquire(
+            LockResource::Instance(instance_id.to_string()),
+            "user-tool-import",
+        )
+        .map_err(|e| UserToolError::Other(e.to_string()))?;
+    let definition = definition_of(ctx, instance_id)?;
+    let path = instance_dir(ctx, instance_id)?.join(USER_TOOLS_FILE);
+    let mut tools = read_file(&path)?;
+    let candidates = find_candidates(ctx, instance_id, &definition)?;
+    let detected = installed_known_tools(ctx, instance_id, &definition)?;
+
+    let mut answers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = clean_name(&entry.name, &entry.exe);
+        let exe = match normalise_any_exe(&entry.exe) {
+            Ok(exe) => exe,
+            Err(error) => {
+                answers.push(ImportedTool::Skipped {
+                    name,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let matched = candidates
+            .iter()
+            .find(|candidate| fold_path_case(&candidate.exe) == fold_path_case(&exe));
+        if let Some(known) = matched.and_then(|m| m.known_tool_id.as_deref()) {
+            if detected.contains_key(known) {
+                answers.push(ImportedTool::AlreadyDetected { name });
+                continue;
+            }
+        }
+        if matched.is_none() && !is_absolute_path(&exe) {
+            answers.push(ImportedTool::Skipped {
+                name,
+                reason: format!(
+                    "'{exe}' is not in this instance: the mod that has it is off or was not imported"
+                ),
+            });
+            continue;
+        }
+        let canonical = matched.map(|m| m.exe.clone()).unwrap_or(exe);
+        if tools
+            .iter()
+            .any(|tool| fold_path_case(&tool.exe) == fold_path_case(&canonical))
+        {
+            answers.push(ImportedTool::AlreadyListed { name });
+            continue;
+        }
+        let (output_is_mod, output_folder) =
+            match normalise_output(entry.output_is_mod, entry.output_folder) {
+                Ok(output) => output,
+                Err(error) => {
+                    answers.push(ImportedTool::Skipped {
+                        name,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+        let tool = UserTool {
+            id: new_user_tool_id(),
+            name,
+            exe: canonical,
+            args: entry.args,
+            known_tool_id: matched.and_then(|m| m.known_tool_id.clone()),
+            output_is_mod,
+            output_folder,
+        };
+        tools.push(tool.clone());
+        answers.push(ImportedTool::Added(tool));
+    }
+    if answers
+        .iter()
+        .any(|answer| matches!(answer, ImportedTool::Added(_)))
+    {
+        write_file(
+            &path,
+            &UserToolsFile {
+                version: USER_TOOLS_VERSION,
+                tools,
+            },
+        )?;
+    }
+    Ok(answers)
+}
+
+/// A name an import can use: without control characters, trimmed, at most [`NAME_MAX_CHARS`], and
+/// the executable's stem when the other manager gave none.
+fn clean_name(raw: &str, exe: &str) -> String {
+    let name: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(NAME_MAX_CHARS)
+        .collect();
+    if !name.trim().is_empty() {
+        return name.trim().to_string();
+    }
+    let path = exe.replace('\\', "/");
+    let stem: String = exe_stem(file_name(&path).unwrap_or("Tool"))
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(NAME_MAX_CHARS)
+        .collect();
+    if stem.trim().is_empty() {
+        "Tool".to_string()
+    } else {
+        stem.trim().to_string()
+    }
 }
 
 struct KnownTool {

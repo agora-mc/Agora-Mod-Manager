@@ -174,3 +174,36 @@ export function conflictLine(row: ToolRow, others: readonly ToolRow[]): string {
   const list = names.length > 0 ? names.join(', ') : 'another tool';
   return `${row.name} and ${list} both have output here, and both write the same behaviour files. Remove the one you do not want to use.`;
 }
+
+/** Names in a sentence: "A", "A and B", "A, B and C". */
+export function joinNames(names: readonly string[]): string {
+  if (names.length <= 1) return names[0] ?? '';
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/** The tools the game recognises, for a sentence: the first three, then "and others". */
+function knownExamples(known: readonly string[]): string {
+  if (known.length <= 3) return joinNames(known);
+  return `${known.slice(0, 3).join(', ')} and others`;
+}
+
+/** The line under the Tools heading. */
+export function toolsSummary(known: readonly string[]): string {
+  const found = known.length > 0
+    ? `Agora finds ${knownExamples(known)} in your mods by itself.`
+    : 'Tools come from your mods.';
+  return `Programs that build files the game reads. ${found} Each run’s output is kept, so you can roll back, compare or remove it without touching your mods.`;
+}
+
+/** The empty state's body: tools appear when they are installed as mods. */
+export function emptyToolsBody(known: readonly string[]): string {
+  const examples = known.length > 0 ? `Tools such as ${knownExamples(known)} show` : 'Tools show';
+  return `${examples} up here by themselves when you install them as mods. You can also add any other program yourself.`;
+}
+
+/** Where a tool the game recognises comes from, under its name. */
+export function originLine(row: ToolRow): string {
+  if (!row.installed) return 'Not installed in this instance';
+  if (row.fromMod) return `From the mod “${row.fromMod}”`;
+  return 'From the game’s own files';
+}

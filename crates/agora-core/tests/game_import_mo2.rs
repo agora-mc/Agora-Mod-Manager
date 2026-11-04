@@ -1275,3 +1275,57 @@ fn a_half_made_instance_that_cannot_be_removed_is_reported_and_labelled_incomple
         record.name
     );
 }
+
+#[test]
+fn mo2_executables_become_the_instances_tools_except_the_games_own_and_mo2s() {
+    let f = fixture();
+    let root = f._tmp.path();
+    let setup = f.setup.clone();
+    let slash = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    write(&setup.join("mods/Alpha/tools/AlphaTool.exe"), b"MZ");
+    write(&setup.join("mods/Beta/BetaTool.exe"), b"MZ");
+    write(&setup.join("explorer++/Explorer++.exe"), b"MZ");
+    write(&root.join("tools/SSEEdit/SSEEdit.exe"), b"MZ");
+    let ini_path = setup.join("ModOrganizer.ini");
+    let mut ini = std::fs::read_to_string(&ini_path).unwrap();
+    ini.push_str(&format!(
+        "[customExecutables]\r\nsize=7\r\n\
+1\\title=Alpha Tool\r\n1\\binary={alpha}\r\n1\\arguments=-x \\\"a b\\\"\r\n\
+2\\title=Beta Tool\r\n2\\binary={beta}\r\n\
+3\\title=SKSE\r\n3\\binary={skse}\r\n\
+4\\title=Explore VFS\r\n4\\binary={explorer}\r\n\
+5\\title=SSEEdit\r\n5\\binary={sseedit}\r\n\
+6\\title=Hidden\r\n6\\binary={sseedit}\r\n6\\hide=true\r\n\
+7\\title=Escape\r\n7\\binary={escape}\r\n",
+        alpha = slash(&setup.join("mods/Alpha/tools/AlphaTool.exe")),
+        beta = slash(&setup.join("mods/Beta/BetaTool.exe")),
+        skse = slash(&root.join("game/skse64_loader.exe")),
+        explorer = slash(&setup.join("explorer++/Explorer++.exe")),
+        sseedit = slash(&root.join("tools/SSEEdit/SSEEdit.exe")),
+        escape = slash(&setup.join("mods/../outside/evil.exe")),
+    ));
+    std::fs::write(&ini_path, ini).unwrap();
+
+    let report = game_import::run(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None, false),
+        RunOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+
+    assert_eq!(report.tools_added, vec!["Alpha Tool", "SSEEdit"]);
+    let id = report.instance_id.clone().unwrap();
+    let tools = agora_core::game_user_tools::list(&f.ctx, &id).unwrap();
+    assert_eq!(tools.len(), 2, "{tools:?}");
+    assert_eq!(tools[0].exe, "Data/tools/AlphaTool.exe");
+    assert_eq!(tools[0].args, vec!["-x".to_string(), "a b".to_string()]);
+    assert_eq!(tools[1].exe, slash(&root.join("tools/SSEEdit/SSEEdit.exe")));
+    let notes = report.next_steps.join("\n");
+    assert!(notes.contains("Beta Tool"), "{notes}");
+    assert!(notes.contains("Escape"), "{notes}");
+    assert!(!notes.contains("SKSE"), "{notes}");
+    assert!(!notes.contains("Explore VFS"), "{notes}");
+    assert!(!notes.contains("Hidden"), "{notes}");
+}

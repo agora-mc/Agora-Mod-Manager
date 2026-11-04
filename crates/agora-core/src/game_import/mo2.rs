@@ -339,9 +339,156 @@ pub fn is_plugin_file(name: &str) -> bool {
     folded.ends_with(".esp") || folded.ends_with(".esm") || folded.ends_with(".esl")
 }
 
+/// One program in MO2's executables list (`[customExecutables]` in `ModOrganizer.ini`). Every
+/// field is as MO2 wrote it; nothing here is checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mo2Executable {
+    pub title: String,
+    /// The program's path, as written: usually absolute, with forward slashes.
+    pub binary: String,
+    /// The arguments, as one string.
+    pub arguments: String,
+    /// Hidden from MO2's own list.
+    pub hide: bool,
+}
+
+/// Parse the `[customExecutables]` section of `ModOrganizer.ini`, in MO2's own order. An entry with
+/// no binary is left out.
+pub fn parse_executables(text: &str) -> Vec<Mo2Executable> {
+    let mut in_section = false;
+    let mut entries: std::collections::BTreeMap<usize, Mo2Executable> =
+        std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_section = name.eq_ignore_ascii_case("customExecutables");
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some((index, field)) = key.trim().split_once('\\') else {
+            continue;
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            continue;
+        };
+        let value = decode_quoted(value.trim());
+        let entry = entries.entry(index).or_insert_with(|| Mo2Executable {
+            title: String::new(),
+            binary: String::new(),
+            arguments: String::new(),
+            hide: false,
+        });
+        match field {
+            "title" => entry.title = value,
+            "binary" => entry.binary = value,
+            "arguments" => entry.arguments = value,
+            "hide" => entry.hide = value.eq_ignore_ascii_case("true"),
+            _ => {}
+        }
+    }
+    entries
+        .into_values()
+        .filter(|entry| !entry.binary.trim().is_empty())
+        .collect()
+}
+
+/// A settings value that may be wrapped in double quotes, as Qt writes a value with a comma or
+/// surrounding spaces in it.
+fn decode_quoted(raw: &str) -> String {
+    let inner = match raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(inner) => inner,
+        None => raw,
+    };
+    decode_value(inner)
+}
+
+/// Split an argument string the way a Windows program reads its command line, for the common
+/// cases: spaces separate arguments, and double quotes keep spaces inside one.
+pub fn split_arguments(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut any = false;
+    for c in text.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut current));
+                    any = false;
+                }
+            }
+            c => {
+                current.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(current);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executables_are_read_in_order_with_quotes_and_escapes_undone() {
+        let ini = "[General]\r\ngameName=Skyrim Special Edition\r\n\
+[customExecutables]\r\n\
+size=3\r\n\
+2\\title=SSEEdit\r\n\
+2\\binary=D:/Modding/SSEEdit/SSEEdit.exe\r\n\
+2\\arguments=\"-D:\\\"D:/Games/Skyrim Special Edition/Data\\\"\"\r\n\
+1\\title=Nemesis\r\n\
+1\\binary=D:/MO2/mods/Nemesis/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe\r\n\
+1\\hide=false\r\n\
+3\\title=Explorer++\r\n\
+3\\binary=\r\n\
+[Settings]\r\n4\\binary=C:/not/an/executable.exe\r\n";
+        let entries = parse_executables(ini);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].title, "Nemesis");
+        assert_eq!(
+            entries[0].binary,
+            "D:/MO2/mods/Nemesis/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe"
+        );
+        assert!(!entries[0].hide);
+        assert_eq!(entries[1].title, "SSEEdit");
+        assert_eq!(
+            entries[1].arguments,
+            "-D:\"D:/Games/Skyrim Special Edition/Data\""
+        );
+        assert_eq!(
+            split_arguments(&entries[1].arguments),
+            vec!["-D:D:/Games/Skyrim Special Edition/Data".to_string()]
+        );
+    }
+
+    #[test]
+    fn arguments_split_on_spaces_outside_quotes() {
+        assert_eq!(
+            split_arguments("  -sse   -o \"C:/My Output\" \"\" "),
+            vec!["-sse", "-o", "C:/My Output", ""]
+        );
+        assert!(split_arguments("   ").is_empty());
+    }
 
     const INI: &str = "[General]\r\ngameName=Skyrim Special Edition\r\n\
 selected_profile=@ByteArray(Grounded Apocalypse)\r\n\

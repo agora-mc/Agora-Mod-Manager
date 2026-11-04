@@ -9167,6 +9167,12 @@ fn print_mo2_run(report: &agora_core::game_import::Mo2RunReport) {
             report.saves_copied, report.saves_skipped_existing
         );
     }
+    if !report.tools_added.is_empty() {
+        println!(
+            "  tools added from MO2's executables: {}",
+            report.tools_added.join(", ")
+        );
+    }
     for step in &report.next_steps {
         println!("  next: {step}");
     }

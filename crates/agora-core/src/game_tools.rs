@@ -195,6 +195,19 @@ pub struct ToolState {
     pub previous: Option<String>,
     /// `None` when the instance has no output for the tool.
     pub status: Option<OutputStatus>,
+    /// Where the instance's deployment provides the tool's executable. `None` when no enabled mod
+    /// (nor the game) has it: the tool is not installed here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found: Option<crate::game_user_tools::FoundTool>,
+}
+
+impl ToolState {
+    /// Whether the instance's Tools list shows the tool: it is installed here, or it has output
+    /// here that the person may want to roll back or remove. A tool the game declares but nobody
+    /// installed is not listed.
+    pub fn is_present(&self) -> bool {
+        self.found.is_some() || self.current.is_some()
+    }
 }
 
 /// How a tool run captures what it writes (MASTER_SPEC §26.9).
@@ -1221,6 +1234,28 @@ fn list_with_manifest(
         .paths
         .instance_dir(instance_id)
         .map_err(|e| ToolError::Other(e.to_string()))?;
+    // Where the deployment provides each declared tool. The staleness checks' Links plan is used
+    // when there is one, so the list still plans once.
+    let planned;
+    let detect_in = match links {
+        Some(plan) => Some(plan),
+        None if matches!(manifest.base, BaseReference::Pinned { .. }) => {
+            planned = crate::game_deploy::plan(
+                ctx,
+                instance_id,
+                definition,
+                crate::game_deploy::DeployMode::Links,
+            )
+            .map_err(|e| ToolError::Other(format!("cannot plan the instance's links: {e}")))?;
+            Some(&planned)
+        }
+        None => None,
+    };
+    let mut found = match detect_in {
+        Some(plan) => crate::game_user_tools::detect_known_tools(ctx, definition, manifest, plan)
+            .map_err(|e| ToolError::Other(e.to_string()))?,
+        None => BTreeMap::new(),
+    };
     let mut states: BTreeMap<String, ToolState> = BTreeMap::new();
     for tool_id in &definition.tool_ids {
         let declared_tool = ctx.games.tool(&definition.id, tool_id);
@@ -1239,6 +1274,7 @@ fn list_with_manifest(
                 current: None,
                 previous: None,
                 status: None,
+                found: found.remove(tool_id.as_str()),
             },
         );
     }
@@ -1258,6 +1294,9 @@ fn list_with_manifest(
         let previous = read_record(&tool_dir(&instance_dir, tool.as_str()))?
             .previous
             .map(|g| g.generation);
+        let found = states
+            .get_mut(tool.as_str())
+            .and_then(|state| state.found.take());
         states.insert(
             tool.to_string(),
             ToolState {
@@ -1277,6 +1316,7 @@ fn list_with_manifest(
                     inputs,
                     links,
                 )),
+                found,
             },
         );
     }
@@ -1848,7 +1888,12 @@ pub fn run(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
-    let tool = declared_tool(ctx, definition, tool_id)?;
+    let tool = as_installed(
+        ctx,
+        instance_id,
+        definition,
+        declared_tool(ctx, definition, tool_id)?,
+    );
     run_inner(
         ctx,
         instance_id,
@@ -1863,6 +1908,49 @@ pub fn run(
         None,
         false,
     )
+}
+
+/// A declared tool as it runs in this instance: from where the deployment provides its executable
+/// (MASTER_SPEC §26.9). A mod may ship the tool in another folder than the package declares; it runs
+/// from there, and so does its working folder when the package's is the executable's own folder.
+/// When the deployment cannot be read here, the declared recipe is kept and the run reports what
+/// is wrong with it.
+fn as_installed(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    mut tool: ToolDefinition,
+) -> ToolDefinition {
+    let Ok(found) = crate::game_user_tools::installed_known_tools(ctx, instance_id, definition)
+    else {
+        return tool;
+    };
+    let Some(found) = found.get(tool.id.as_str()) else {
+        return tool;
+    };
+    if found.at_declared_path {
+        return tool;
+    }
+    let Ok(exe) = RelPath::new(found.exe.as_str()) else {
+        return tool;
+    };
+    let parent_of = |path: &str| {
+        path.rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_default()
+    };
+    if let GamePath::Runtime { path: declared } = &tool.launch.executable {
+        let declared_parent = parent_of(declared.as_str());
+        if let GamePath::Runtime { path: working } = &tool.launch.working_directory {
+            if fold_path_case(working.as_str()) == fold_path_case(&declared_parent) {
+                if let Ok(folder) = RelPath::new(parent_of(found.exe.as_str())) {
+                    tool.launch.working_directory = GamePath::Runtime { path: folder };
+                }
+            }
+        }
+    }
+    tool.launch.executable = GamePath::Runtime { path: exe };
+    tool
 }
 
 /// Run a tool by the tier the user chose after the virtual file system refused it (MASTER_SPEC §26.9): link
@@ -1881,7 +1969,12 @@ pub fn run_after_vfs_refusal(
     launcher: &dyn Launcher,
     cancel: &CancellationToken,
 ) -> Result<RunOutcome, ToolError> {
-    let tool = declared_tool(ctx, definition, tool_id)?;
+    let tool = as_installed(
+        ctx,
+        instance_id,
+        definition,
+        declared_tool(ctx, definition, tool_id)?,
+    );
     match next {
         CaptureMode::Links | CaptureMode::Swap => run_inner(
             ctx,
@@ -1993,6 +2086,7 @@ fn run_user_inner(
     if let Some(known) = user.known_tool_id.as_deref() {
         if let Ok(id) = ToolId::new(known) {
             if let Some(declared) = ctx.games.tool(&definition.id, &id).cloned() {
+                let declared = as_installed(ctx, instance_id, definition, declared);
                 return run_inner(
                     ctx,
                     instance_id,

@@ -31,6 +31,9 @@ const row = {
   conflicts: false,
   outputKind: 'generated_layer',
   outputFolder: null,
+  installed: true,
+  exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
+  fromMod: 'Nemesis Unlimited Behavior Engine',
 };
 
 const costs = {
@@ -75,24 +78,27 @@ describe('listGameTools', () => {
   });
 
   it('returns the tools the backend lists, for the instance asked about', async () => {
-    const view = { instanceId: 'sk-1', tools: [row] };
+    const view = { instanceId: 'sk-1', tools: [row], known: ['Nemesis', 'BodySlide'] };
     invokeMock.mockResolvedValueOnce(view);
     await expect(listGameTools('sk-1')).resolves.toEqual(view);
     expect(invokeMock).toHaveBeenCalledWith('games_tools_list', { instanceId: 'sk-1' });
   });
 
-  it('accepts an empty tool list: a game that declares no tools', async () => {
-    invokeMock.mockResolvedValueOnce({ instanceId: 'sk-1', tools: [] });
-    await expect(listGameTools('sk-1')).resolves.toEqual({ instanceId: 'sk-1', tools: [] });
+  it('accepts an empty tool list: an instance with no tools installed', async () => {
+    invokeMock.mockResolvedValueOnce({ instanceId: 'sk-1', tools: [], known: [] });
+    await expect(listGameTools('sk-1')).resolves.toEqual({ instanceId: 'sk-1', tools: [], known: [] });
   });
 
   it.each([
     ['null (an unmocked command answers this)', null],
     ['a bare array', []],
-    ['a view without tools', { instanceId: 'sk-1' }],
-    ['a row without a tool id', { instanceId: 'sk-1', tools: [{ ...row, toolId: undefined }] }],
-    ['a row with a status it does not know', { instanceId: 'sk-1', tools: [{ ...row, status: 'maybe' }] }],
-    ['a row whose conflict flag is missing', { instanceId: 'sk-1', tools: [{ ...row, conflicts: undefined }] }],
+    ['a view without tools', { instanceId: 'sk-1', known: [] }],
+    ['a view without the known tools', { instanceId: 'sk-1', tools: [] }],
+    ['a row that does not say whether it is installed', { instanceId: 'sk-1', known: [], tools: [{ ...row, installed: undefined }] }],
+    ['a row whose mod is not text', { instanceId: 'sk-1', known: [], tools: [{ ...row, fromMod: 3 }] }],
+    ['a row without a tool id', { instanceId: 'sk-1', known: [], tools: [{ ...row, toolId: undefined }] }],
+    ['a row with a status it does not know', { instanceId: 'sk-1', known: [], tools: [{ ...row, status: 'maybe' }] }],
+    ['a row whose conflict flag is missing', { instanceId: 'sk-1', known: [], tools: [{ ...row, conflicts: undefined }] }],
   ])('rejects %s rather than showing no tools', async (_label, reply) => {
     invokeMock.mockResolvedValueOnce(reply);
     await expect(listGameTools('sk-1')).rejects.toThrow('games_tools_list did not return the reply the screen expects.');
@@ -168,7 +174,7 @@ describe('the other tool commands', () => {
   });
 
   it('removes a tool and returns the view that results', async () => {
-    const reply = { removedGenerations: ['1', '2'], view: { instanceId: 'sk-1', tools: [] } };
+    const reply = { removedGenerations: ['1', '2'], view: { instanceId: 'sk-1', tools: [], known: [] } };
     invokeMock.mockResolvedValueOnce(reply);
     await expect(removeGameTool('sk-1', 'nemesis')).resolves.toEqual(reply);
   });
@@ -220,6 +226,7 @@ const userTool = {
   knownToolId: null,
   outputIsMod: false,
   outputFolder: null,
+  missing: false,
 };
 
 const candidate = {
@@ -299,5 +306,6 @@ describe('the reply guards', () => {  it('accept the offers a run can carry, and
     expect(isToolsView({ instanceId: 'sk-1', tools: 'nemesis' })).toBe(false);
     expect(isUserToolsView({ instanceId: 'sk-1', tools: 'nemesis' })).toBe(false);
     expect(isUserToolsView({ instanceId: 'sk-1', tools: [userTool] })).toBe(true);
+    expect(isUserToolsView({ instanceId: 'sk-1', tools: [{ ...userTool, missing: 'no' }] })).toBe(false);
   });
 });
