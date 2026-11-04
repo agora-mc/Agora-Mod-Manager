@@ -2627,7 +2627,9 @@ export function Settings({
           <span className="settings-hero-badge" aria-hidden="true">
             <SettingsIcon className="h-6 w-6" />
           </span>
-          <div className="min-w-0 flex-1">
+          {/* The text keeps a real width; in a narrow window the chips wrap below it instead of
+              squeezing the sentence to a word a line. */}
+          <div className="min-w-0 flex-[1_1_min(100%,calc(14rem*var(--font-scale)))]">
             <h2 className="text-2xl font-bold">Settings</h2>
             <p className="text-sm text-muted-foreground">{activeTab.blurb}</p>
           </div>
