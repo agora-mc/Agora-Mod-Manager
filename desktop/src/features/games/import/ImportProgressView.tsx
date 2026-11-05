@@ -106,9 +106,9 @@ export function ImportProgressView({ title, sourceName, progress, startedAt, err
           data-testid="import-bar"
         >
           {percent === null ? (
-            <div className="agora-progress-indeterminate h-full w-full" data-testid="import-bar-indeterminate" />
+            <div key="indeterminate" className="agora-progress-indeterminate h-full w-full" data-testid="import-bar-indeterminate" />
           ) : (
-            <div className="h-full rounded-full bg-primary transition-[width] duration-500" style={{ width: `${percent}%` }} />
+            <div key="measured" data-testid="import-bar-fill" className="h-full rounded-full bg-primary transition-[width] duration-500" style={{ width: `${percent}%` }} />
           )}
         </div>
 
