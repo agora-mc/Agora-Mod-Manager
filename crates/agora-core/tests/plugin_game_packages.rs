@@ -18,6 +18,7 @@ fn dummy_package_def(game_id: &str) -> PackageDefinition {
         parents: vec![],
         games: vec![GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new(game_id).unwrap(),
             name: game_id.to_string(),
             stores: vec![],

@@ -152,6 +152,7 @@ pub fn game_package() -> Arc<dyn GamePackage> {
                 parents: Vec::new(),
                 games: vec![GameDefinition {
                     mo2_game_name: None,
+                    session: Default::default(),
                     id: GameId::minecraft(),
                     name: "Minecraft: Java Edition".to_string(),
                     stores: Vec::new(),

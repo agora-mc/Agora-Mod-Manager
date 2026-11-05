@@ -3859,6 +3859,9 @@ $#
                 "instance_pack_gaps",
                 "instance_update_cache",
                 "launch_history",
+                // Stored manifests of what each launch ran with; deleted and restored with the
+                // instance like its history rows.
+                "launch_manifests",
                 "mcp_approval_grants",
                 "plugin_storage",
                 "user_instances",

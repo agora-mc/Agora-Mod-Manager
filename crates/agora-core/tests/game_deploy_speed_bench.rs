@@ -70,6 +70,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn bench_definition() -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("bench-game").unwrap(),
         name: "Bench Game".into(),
         stores: vec![StoreIdentifier {

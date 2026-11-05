@@ -16,6 +16,13 @@ path = "src/lib.rs"
 name = "agora-tool-test-helper"
 path = "src/bin/agora-tool-test-helper.rs"
 
+# A stand-in for a game that exits with a chosen code, crashes, or starts a child and exits first
+# (the shape of `skse64_loader.exe`). It lets the session ledger be tested with no game. Tests
+# reach it through `CARGO_BIN_EXE_agora-session-crasher`; nothing ships or starts it.
+[[bin]]
+name = "agora-session-crasher"
+path = "src/bin/agora-session-crasher.rs"
+
 [features]
 test-support = []
 

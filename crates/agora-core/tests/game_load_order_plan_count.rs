@@ -36,6 +36,7 @@ fn definition() -> GameDefinition {
     let plugin_list = 2u8;
     let mut def = GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("count-game").unwrap(),
         name: "Count Game".into(),
         stores: vec![StoreIdentifier {

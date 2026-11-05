@@ -30,6 +30,7 @@ impl GamePackage for ValheimPackage {
 fn valheim_definition() -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("valheim").unwrap(),
         name: "Valheim".into(),
         stores: vec![StoreIdentifier {

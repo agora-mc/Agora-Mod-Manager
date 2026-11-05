@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 22;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 23;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -833,6 +833,76 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         }
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (22)",
+            [],
+        )?;
+    }
+
+    if current < 23 {
+        // The session ledger (MASTER_SPEC section 30.4). `launch_history` was Minecraft-only, tied
+        // to `user_instances` by a foreign key, so a game instance could not have a row. The table
+        // is rebuilt without that key and gains the ledger columns; two triggers keep the old
+        // promise that history cannot outlive the instance (deleting either kind of instance
+        // deletes its rows and manifests). Manifests are stored once per distinct manifest.
+        // The triggers go first: replaying this step over a database that already has them would
+        // otherwise fail when the table they name is dropped.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+             DROP TABLE IF EXISTS launch_history_v23;
+             CREATE TABLE launch_history_v23 (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 instance_id TEXT NOT NULL,
+                 started_at TEXT NOT NULL,
+                 prep_ms INTEGER,
+                 duration_ms INTEGER,
+                 outcome TEXT,
+                 enabled_mod_count INTEGER NOT NULL DEFAULT 0,
+                 minecraft_version TEXT NOT NULL DEFAULT '',
+                 loader TEXT NOT NULL DEFAULT '',
+                 peak_memory_mb INTEGER,
+                 session_id TEXT,
+                 ended_at TEXT,
+                 exit_json TEXT,
+                 stop_requested INTEGER NOT NULL DEFAULT 0,
+                 verdict TEXT,
+                 manifest_hash TEXT,
+                 owner_pid INTEGER,
+                 owner_start INTEGER
+             );
+             INSERT INTO launch_history_v23
+                 (id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
+                  minecraft_version, loader, peak_memory_mb)
+             SELECT id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
+                    minecraft_version, loader, peak_memory_mb
+               FROM launch_history;
+             DROP TABLE launch_history;
+             ALTER TABLE launch_history_v23 RENAME TO launch_history;
+             CREATE INDEX IF NOT EXISTS idx_launch_history_instance
+                 ON launch_history (instance_id, started_at DESC);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_launch_history_session
+                 ON launch_history (session_id) WHERE session_id IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS launch_manifests (
+                 instance_id TEXT NOT NULL,
+                 hash TEXT NOT NULL,
+                 data BLOB NOT NULL,
+                 raw_len INTEGER NOT NULL,
+                 PRIMARY KEY (instance_id, hash)
+             ) WITHOUT ROWID;
+             CREATE TRIGGER IF NOT EXISTS launch_history_minecraft_instance_gone
+                 AFTER DELETE ON user_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS launch_history_game_instance_gone
+                 AFTER DELETE ON game_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             END;",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (23)",
             [],
         )?;
     }

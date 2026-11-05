@@ -486,6 +486,7 @@ mod tests {
     fn game(id: &str, name: &str, executable: &str) -> GameDefinition {
         GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new(id).expect("valid game id"),
             name: name.to_string(),
             stores: Vec::new(),

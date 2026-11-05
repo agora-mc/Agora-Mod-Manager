@@ -785,6 +785,7 @@ pub mod test_support {
             parents: Vec::new(),
             games: vec![GameDefinition {
                 mo2_game_name: None,
+                session: Default::default(),
                 id: GameId::new(game_id).expect("valid game id"),
                 name: game_id.to_string(),
                 stores: Vec::new(),

@@ -83,6 +83,7 @@ fn write_plugin_list(s: &Setup, plugins: &[&str]) {
 fn make_test_definition() -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("skyrim-se").unwrap(),
         name: "Skyrim Special Edition".into(),
         stores: vec![StoreIdentifier {

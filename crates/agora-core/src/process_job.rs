@@ -17,6 +17,98 @@
 
 use std::process::{Child, Command};
 
+/// The exit code Agora's own Stop ends a game with (`TerminateJobObject`, or the fallback
+/// `TerminateProcess`). Exit code 1 is what a Crash Logger crash exits with, so a Stop must not
+/// share it. The code follows the virtual file system's `0xA6F50001` (a refusal to run
+/// unprotected): same family, next number. The `stop_requested` flag on the session is the
+/// primary record of a Stop; this code is the second witness, and what tells an Agora Stop from a
+/// kill in Task Manager (which exits 1).
+pub const STOP_EXIT_CODE: u32 = 0xA6F5_0002;
+
+/// A game process Agora holds open: its handle keeps the process object alive, so the pid cannot
+/// be reused by a stranger while Agora waits, and the exit code can be read when it ends.
+/// Only a process proven to be in the launch's own job is ever held.
+#[cfg(windows)]
+pub struct HeldProcess {
+    handle: windows::Handle,
+    pid: u32,
+    image: String,
+}
+
+/// Holding a process by handle is Windows-only; elsewhere none is ever held.
+#[cfg(not(windows))]
+pub struct HeldProcess(std::convert::Infallible);
+
+impl HeldProcess {
+    /// The process id, valid for as long as this value is held.
+    pub fn pid(&self) -> u32 {
+        #[cfg(windows)]
+        {
+            self.pid
+        }
+        #[cfg(not(windows))]
+        {
+            match self.0 {}
+        }
+    }
+
+    /// The process's image file name, such as `SkyrimSE.exe`.
+    pub fn image(&self) -> &str {
+        #[cfg(windows)]
+        {
+            &self.image
+        }
+        #[cfg(not(windows))]
+        {
+            match self.0 {}
+        }
+    }
+
+    /// The exit code once the process has ended; `None` while it still runs. A process that
+    /// really exits with code 259 (`STILL_ACTIVE`) is told apart by waiting on the handle.
+    pub fn exit_code(&self) -> Option<u32> {
+        #[cfg(windows)]
+        {
+            windows::exit_code(&self.handle)
+        }
+        #[cfg(not(windows))]
+        {
+            match self.0 {}
+        }
+    }
+}
+
+/// Hold every process in the named job whose image name is one of `images` (compared without
+/// regard to case) and whose pid is not in `already`. A process is held only if it is proven to
+/// be in the job at the moment it is opened, so a pid that was recycled between listing and
+/// opening is refused. Returns nothing when the job is gone or the platform has no jobs.
+pub fn hold_game_processes(job: &str, images: &[String], already: &[u32]) -> Vec<HeldProcess> {
+    #[cfg(windows)]
+    {
+        windows::hold_game_processes(job, images, already)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (job, images, already);
+        Vec::new()
+    }
+}
+
+/// End one process by pid with [`STOP_EXIT_CODE`], for a Stop that has no job to end. Returns
+/// whether the process was signalled. Elsewhere there is no such code, so it returns `false` and
+/// the caller kills the process its own way.
+pub fn terminate_process_for_stop(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        windows::terminate_process(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Spawn `command` so that the process and everything it starts belong to a fresh job, returning
 /// the job's name. The job is `None` when the platform has none or the job could not be made;
 /// the process runs either way.
@@ -85,14 +177,21 @@ mod windows {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE,
     };
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, WAIT_OBJECT_0};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
         JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
         SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     };
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        WaitForSingleObject, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
 
     // Access rights for a job handle (winnt.h); windows-sys does not export them here.
     const JOB_OBJECT_TERMINATE: u32 = 0x0008;
@@ -106,7 +205,7 @@ mod windows {
     }
 
     /// A Win32 handle closed on drop.
-    struct Handle(HANDLE);
+    pub(super) struct Handle(HANDLE);
 
     // SAFETY: a kernel handle is a process-wide token, usable from any thread.
     unsafe impl Send for Handle {}
@@ -194,7 +293,7 @@ mod windows {
             return Ok(0);
         }
         // SAFETY: `job` is a live job handle opened with terminate access.
-        if unsafe { TerminateJobObject(job.0, 1) } == 0 {
+        if unsafe { TerminateJobObject(job.0, super::STOP_EXIT_CODE) } == 0 {
             // SAFETY: reads the calling thread's last error.
             let code = unsafe { GetLastError() };
             return Err(format!(
@@ -204,6 +303,125 @@ mod windows {
         // The handle stays registered until `active` sees the job empty, so a stop that is still
         // waiting for the processes to go can keep asking.
         Ok(count)
+    }
+
+    /// The pids currently in the job.
+    fn job_pids(job: &Handle) -> Vec<u32> {
+        let mut capacity = 64usize;
+        loop {
+            // The header is two u32s; the ids that follow are pointer-sized. A u64 buffer is
+            // aligned for both and at least as large as needed.
+            let mut buffer = vec![0u64; 2 + capacity];
+            // SAFETY: `buffer` is writable for the stated number of bytes.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    job.0,
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * std::mem::size_of::<u64>()) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            let list = buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+            if ok == 0 {
+                // SAFETY: reads the calling thread's last error.
+                let code = unsafe { GetLastError() };
+                if code == ERROR_MORE_DATA && capacity < 1 << 16 {
+                    // SAFETY: the call wrote the header before failing for size.
+                    let needed = unsafe { (*list).NumberOfAssignedProcesses } as usize;
+                    capacity = needed.max(capacity * 2);
+                    continue;
+                }
+                return Vec::new();
+            }
+            // SAFETY: the call succeeded, so the header and `NumberOfProcessIdsInList` ids that
+            // follow it are initialised and inside `buffer`.
+            return unsafe {
+                let count = (*list).NumberOfProcessIdsInList as usize;
+                let first = std::ptr::addr_of!((*list).ProcessIdList).cast::<usize>();
+                (0..count).map(|i| *first.add(i) as u32).collect()
+            };
+        }
+    }
+
+    /// The image file name of an open process.
+    fn image_name(process: &Handle) -> Option<String> {
+        let mut buffer = vec![0u16; 1024];
+        let mut len = buffer.len() as u32;
+        // SAFETY: `buffer` holds `len` u16s; the call writes at most that many and sets `len`.
+        let ok = unsafe { QueryFullProcessImageNameW(process.0, 0, buffer.as_mut_ptr(), &mut len) };
+        if ok == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buffer[..len as usize]);
+        path.rsplit(['\\', '/']).next().map(str::to_string)
+    }
+
+    pub(super) fn hold_game_processes(
+        job: &str,
+        images: &[String],
+        already: &[u32],
+    ) -> Vec<super::HeldProcess> {
+        let Ok(Some(job)) = open(job) else {
+            return Vec::new();
+        };
+        let wanted: Vec<String> = images.iter().map(|i| i.to_lowercase()).collect();
+        let mut held = Vec::new();
+        for pid in job_pids(&job) {
+            if already.contains(&pid) {
+                continue;
+            }
+            // SAFETY: a plain open by pid; a failure (the process just ended) returns null.
+            let raw = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                    0,
+                    pid,
+                )
+            };
+            if raw.is_null() {
+                continue;
+            }
+            let handle = Handle(raw);
+            // The pid came from the job's list a moment ago, but a process can end and its pid be
+            // reused in between. Ask the kernel whether this handle's process is in the job.
+            let mut inside = 0;
+            // SAFETY: both handles are live; `inside` receives a BOOL.
+            if unsafe { IsProcessInJob(handle.0, job.0, &mut inside) } == 0 || inside == 0 {
+                continue;
+            }
+            let Some(image) = image_name(&handle) else {
+                continue;
+            };
+            if wanted.contains(&image.to_lowercase()) {
+                held.push(super::HeldProcess { handle, pid, image });
+            }
+        }
+        held
+    }
+
+    pub(super) fn exit_code(process: &Handle) -> Option<u32> {
+        // SAFETY: a live process handle opened with SYNCHRONIZE; a zero wait only polls.
+        if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_OBJECT_0 {
+            return None;
+        }
+        let mut code = 0u32;
+        // SAFETY: a live process handle opened with query access; `code` receives the value.
+        if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
+            return None;
+        }
+        Some(code)
+    }
+
+    pub(super) fn terminate_process(pid: u32) -> bool {
+        // SAFETY: a plain open by pid with terminate access.
+        let raw = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if raw.is_null() {
+            return false;
+        }
+        let handle = Handle(raw);
+        // SAFETY: a live process handle with terminate access.
+        unsafe { TerminateProcess(handle.0, super::STOP_EXIT_CODE) != 0 }
     }
 
     pub(super) fn attach(child: &Child) -> Option<String> {

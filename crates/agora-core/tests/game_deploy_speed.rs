@@ -34,6 +34,7 @@ impl GamePackage for TestPackage {
 fn definition() -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("speed-game").unwrap(),
         name: "Speed Game".into(),
         stores: vec![StoreIdentifier {

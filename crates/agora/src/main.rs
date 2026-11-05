@@ -7211,6 +7211,14 @@ async fn run_command(
                         );
 
                         let _ = agora_core::game_instance::record_launch(ctx, &instance_id);
+                        // What this launch ran with. Without `--wait` nothing watches the game to
+                        // its end, so the session stays open and is closed as unknown later.
+                        let session_id = agora_core::session_ledger::record_launch(
+                            ctx,
+                            &instance_id,
+                            game_def,
+                            &store,
+                        );
 
                         if !json && !prepared.generated_findings.is_empty() {
                             for finding in &prepared.generated_findings {
@@ -7315,7 +7323,10 @@ async fn run_command(
                             // process is not what to wait for.
                             let watch_dir = running_from.clone();
 
-                            let exit_report = agora_core::game_launch::wait_for_exit(
+                            let exit_report = agora_core::game_instance::watch_session(
+                                ctx,
+                                game_def,
+                                session_id.as_deref(),
                                 &watch_dir,
                                 &mut launched,
                                 std::time::Duration::from_millis(250),

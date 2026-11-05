@@ -23,7 +23,7 @@ mod session;
 pub mod trash;
 
 pub use clone::{clone_instance, CloneOptions, ClonedInstance};
-pub use session::{end_session, stop, SessionEnd, StopOutcome};
+pub use session::{end_session, stop, watch_session, SessionEnd, StopOutcome};
 pub use trash::{DeletedEntry, PurgeSummary, RestoreOutcome, TrashFn};
 
 /// A generic instance manifest stored at `<instances_root>/<id>/instance_manifest.json`.
@@ -1617,6 +1617,9 @@ pub struct LaunchedInstance {
     pub prepared: PreparedLaunch,
     pub store: StoreId,
     pub running_from: PathBuf,
+    /// The session ledger row this launch opened (`session_ledger`), when one could be written.
+    /// Pass it to [`session::watch_session`] so the end of the session is recorded against it.
+    pub session_id: Option<String>,
 }
 
 /// Launch a generic game instance: deploy -> swap_in -> spawn.
@@ -1738,11 +1741,16 @@ pub fn launch_with(
     // 6. Record launch
     let _ = record_launch(ctx, id);
 
+    // 7. Open the session ledger row: what this launch ran with. Best effort by construction;
+    //    a launch is never blocked or failed by its own bookkeeping.
+    let session_id = crate::session_ledger::record_launch(ctx, id, definition, &store);
+
     Ok(LaunchedInstance {
         launched,
         prepared,
         store,
         running_from,
+        session_id,
     })
 }
 

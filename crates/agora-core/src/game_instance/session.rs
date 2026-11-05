@@ -37,6 +37,32 @@ pub struct StopOutcome {
     pub play_time_ms: i64,
 }
 
+/// Wait for a launched game to close and record how it ended in the session ledger.
+///
+/// The game is the process named by the definition's `session.processes` (else the recipe's own
+/// executable), which is not the launched program when a framework loader starts the game and
+/// exits. `session_id` is [`LaunchedInstance::session_id`](super::LaunchedInstance). Recording is
+/// best effort: the report comes back whether or not it could be written.
+pub fn watch_session(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    session_id: Option<&str>,
+    running_from: &std::path::Path,
+    launched: &mut crate::game_launch::LaunchedGame,
+    poll: Duration,
+    grace: Duration,
+) -> crate::game_launch::SessionExitReport {
+    let started = Instant::now();
+    let images = crate::game_launch::session_images(definition, &launched.program);
+    let report =
+        crate::game_launch::wait_for_exit_watching(running_from, launched, &images, poll, grace);
+    if let Some(session_id) = session_id {
+        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        crate::session_ledger::record_end(ctx, session_id, definition, &report, duration_ms);
+    }
+    report
+}
+
 /// End the game's session the way a normal exit does: put the player's files back and add the
 /// session to the instance's play time. No session means nothing to end (`Ok(None)`), so a stop
 /// and the exit watcher can both call this and only one records the time.
@@ -114,6 +140,10 @@ pub fn stop(
         return Err(InstanceError::NotStartedByAgora(instance_id.to_string()));
     }
 
+    // The player asked for this. Recorded before anything is ended, so the watcher that sees the
+    // game go finds the flag already set, whatever exit code the game appears to have.
+    crate::session_ledger::record_stop(ctx, instance_id);
+
     let mut processes_ended = 0;
     for job in &jobs {
         processes_ended += process_job::terminate(job).map_err(InstanceError::Other)?;
@@ -182,7 +212,11 @@ fn terminate_tree(roots: &[&ProcessIdentity]) -> usize {
         // Refresh right before the kill: a pid that was reused by another process is left alone.
         system.refresh_process(pid);
         if let Some(process) = system.process(pid) {
-            if process.start_time() == start_time && process.kill() {
+            if process.start_time() == start_time
+                // Ended with Agora's stop code where the platform has one, so a Stop never looks
+                // like a crash's exit code 1.
+                && (process_job::terminate_process_for_stop(pid.as_u32()) || process.kill())
+            {
                 ended += 1;
             }
         }
