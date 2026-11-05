@@ -555,6 +555,8 @@ pub async fn launch_instance(
             launched_at,
         )
         .await;
+        // The delegated game has ended; only a clean end counts as a survival.
+        record_clean_survival(&app_for_monitor, &id_for_monitor, &outcome);
         // The delegated session ended: release the launch marker so an install
         // for this instance is permitted again (SOL-2 §19.3).
         state_for_monitor
@@ -1124,6 +1126,9 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
 
     fn finished(&self, result: &agora_game_minecraft::launch_service::LaunchResult) {
         use tauri::Emitter;
+
+        // The direct game process has ended; only a clean end counts as a survival.
+        record_clean_survival(&self.app, &self.instance_id, &result.outcome);
 
         // Close out the local history row, then trim. Best-effort: a lost row
         // is a lost row, not a failed launch.
@@ -3260,6 +3265,40 @@ fn load_manifest<R: tauri::Runtime>(
     agora_core::helpers::read_manifest(&manifest_path)
 }
 
+/// Mod ids that were installed during a launch, for survival telemetry.
+fn manifest_mod_ids(manifest: &InstanceManifest) -> Vec<String> {
+    manifest
+        .mods
+        .iter()
+        .map(|entry| {
+            entry
+                .registry_id
+                .clone()
+                .unwrap_or_else(|| entry.filename.clone())
+        })
+        .collect()
+}
+
+/// Record a survival only after the launch ended cleanly. Called at the two
+/// places that already observe the end of a Minecraft launch.
+fn record_clean_survival<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    instance_id: &str,
+    outcome: &agora_core::lkg::LaunchOutcome,
+) {
+    if *outcome != agora_core::lkg::LaunchOutcome::Success {
+        return;
+    }
+    let Ok(manifest) = load_manifest(app, instance_id) else {
+        return;
+    };
+    let mod_ids = manifest_mod_ids(&manifest);
+    if mod_ids.is_empty() {
+        return;
+    }
+    let _ = crash_investigator::record_survival_if_clean(app, instance_id, &mod_ids, outcome);
+}
+
 /// Investigate a crash for an instance using the auto-detected or provided
 /// crash log filename. Runs the full guided-isolation pipeline.
 #[tauri::command]
@@ -3323,12 +3362,11 @@ pub async fn investigate_crash(
         // local crash telemetry (local_crash_telemetry) so the Crash Matrix signal
         // B/C data populates for future diagnostics. Skip if no suspects to avoid noise.
         if !result.suspects.is_empty() {
-            let mod_ids: Vec<String> = result.suspects.iter().map(|s| s.mod_id.clone()).collect();
             let _ = crash_investigator::record_crash_event(
                 &app,
                 &instance_id,
                 &fingerprint,
-                &mod_ids,
+                &result.suspects,
                 None, // signature_name -- callers pass curated-regex match separately when known
             );
         }
