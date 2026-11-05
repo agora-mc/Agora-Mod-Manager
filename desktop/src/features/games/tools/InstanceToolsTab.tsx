@@ -2,12 +2,12 @@
  * An instance's Tools page (MASTER_SPEC §26.9): the tools present in this instance, and nothing
  * else. A tool the game recognises (Nemesis, BodySlide…) is listed when a mod installs it, by the
  * core's detection; a Mod Organizer 2 import brings its executables list; and the player adds any
- * other program with "Add a tool…". Each tool's own actions live in ToolCard. The swap banner shows
+ * other program with "Add a tool…", or picks from what "Scan for programs" finds. Each tool's own actions live in ToolCard. The swap banner shows
  * when a swap was interrupted.
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Wrench } from 'lucide-react';
+import { Plus, ScanSearch, Wrench } from 'lucide-react';
 import { EmptyState, PageHeroAction } from '@/components/instance-kit';
 import {
   gameToolSwapStatus,
@@ -22,7 +22,8 @@ import {
 } from './api';
 import { AddToolPanel } from './AddToolPanel';
 import { ToolCard } from './ToolCard';
-import { conflictLine, emptyToolsBody, messageOf, originLine, toolsSummary } from './toolCopy';
+import { ToolScanPanel } from './ToolScanPanel';
+import { addedNote, conflictLine, emptyToolsBody, messageOf, originLine, toolsSummary } from './toolCopy';
 
 export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: string }) {
   const [view, setView] = useState<ToolsView | null>(null);
@@ -36,6 +37,7 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
   const [userToolsError, setUserToolsError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [scanning, setScanning] = useState(false);
 
   const loadTools = useCallback(async (isCurrent: () => boolean) => {
     setLoadError(null);
@@ -103,7 +105,14 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
 
   const openAdd = () => {
     setNote(null);
+    setScanning(false);
     setAdding(true);
+  };
+
+  const openScan = () => {
+    setNote(null);
+    setAdding(false);
+    setScanning(true);
   };
 
   const interrupted = swap?.interrupted ?? null;
@@ -125,15 +134,25 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
           </h2>
           <p className="mt-1 max-w-2xl text-xs text-muted-foreground">{toolsSummary(view?.known ?? [])}</p>
         </div>
-        {!empty && !adding && (
-          <button
-            type="button"
-            onClick={openAdd}
-            className="inline-flex shrink-0 items-center gap-1.5 self-start rounded-lg border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent sm:self-auto"
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            Add a tool…
-          </button>
+        {!empty && !adding && !scanning && (
+          <div className="flex shrink-0 flex-wrap gap-2 self-start sm:self-auto">
+            <button
+              type="button"
+              onClick={openScan}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
+            >
+              <ScanSearch className="h-4 w-4" aria-hidden="true" />
+              Scan for programs
+            </button>
+            <button
+              type="button"
+              onClick={openAdd}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              Add a tool…
+            </button>
+          </div>
         )}
       </div>
 
@@ -185,6 +204,18 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
           onClose={() => setAdding(false)}
         />
       )}
+      {scanning && (
+        <ToolScanPanel
+          instanceId={instanceId}
+          listedToolIds={listedToolIds}
+          onAdded={(names, keepOpen) => {
+            if (!keepOpen) setScanning(false);
+            setNote(addedNote(names));
+            void loadTools(() => true);
+          }}
+          onClose={() => setScanning(false)}
+        />
+      )}
       {note && <p role="status" className="text-sm text-muted-foreground">{note}</p>}
 
       {!loaded && !loadError && !userToolsError && (
@@ -216,13 +247,18 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
         </div>
       )}
 
-      {empty && !adding && (
+      {empty && !adding && !scanning && (
         <EmptyState
           testId="tools-empty"
           icon={Wrench}
           title="No tools yet"
           body={emptyToolsBody(view?.known ?? [])}
-          actions={<PageHeroAction primary icon={Plus} onClick={openAdd}>Add a tool…</PageHeroAction>}
+          actions={(
+            <>
+              <PageHeroAction primary icon={ScanSearch} onClick={openScan}>Scan for programs</PageHeroAction>
+              <PageHeroAction icon={Plus} onClick={openAdd}>Add a tool…</PageHeroAction>
+            </>
+          )}
         />
       )}
 

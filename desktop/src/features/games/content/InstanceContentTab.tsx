@@ -7,19 +7,18 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
+import { itemsForInstanceOf, listLibrary, type LibraryItem } from '@/features/library/api';
 import { FomodWizard } from '../fomod';
 import { isGamesError } from '../shared/types';
 import {
   addInstanceContent,
   listInstanceContent,
-  listStore,
   moveInstanceContent,
   removeInstanceContent,
   setInstanceContentEnabled,
   type InstanceContentList,
   type InstanceContentRow,
   type InstanceAddOutcome,
-  type StoreItem,
 } from './api';
 
 export interface InstanceContentTabProps {
@@ -52,11 +51,11 @@ function addedNotice(outcome: Extract<InstanceAddOutcome, { status: 'added' }>, 
     : `Added ${name}.`;
 }
 
-export function InstanceContentTab({ instanceId }: InstanceContentTabProps) {
+export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabProps) {
   const { confirm } = useConfirm();
   const [content, setContent] = useState<InstanceContentList | null>(null);
   const [contentError, setContentError] = useState<string | null>(null);
-  const [store, setStore] = useState<StoreItem[] | null>(null);
+  const [store, setStore] = useState<LibraryItem[] | null>(null);
   const [storeError, setStoreError] = useState<string | null>(null);
   const [pickedId, setPickedId] = useState('');
   const [notice, setNotice] = useState<string | null>(null);
@@ -66,31 +65,34 @@ export function InstanceContentTab({ instanceId }: InstanceContentTabProps) {
 
   const refresh = useCallback(async () => {
     setContentError(null);
-    setStoreError(null);
-    const [contentResult, storeResult] = await Promise.allSettled([
-      listInstanceContent(instanceId),
-      listStore(),
-    ]);
-    if (contentResult.status === 'fulfilled') {
-      setContent(contentResult.value);
-    } else {
+    try {
+      setContent(await listInstanceContent(instanceId));
+    } catch (error) {
       setContent(null);
-      setContentError(errorMessage(contentResult.reason));
-    }
-    if (storeResult.status === 'fulfilled') {
-      setStore(storeResult.value.items);
-    } else {
-      setStore(null);
-      setStoreError(errorMessage(storeResult.reason));
+      setContentError(errorMessage(error));
     }
   }, [instanceId]);
+
+  // The Library's own listing, because it alone knows every game an item is tied to: it counts the
+  // instances that use an item, which is what ties most Minecraft mods to Minecraft. Moving or
+  // switching a row does not change the library, so this is read only when it can have changed.
+  const refreshLibrary = useCallback(async () => {
+    setStoreError(null);
+    try {
+      setStore((await listLibrary()).items);
+    } catch (error) {
+      setStore(null);
+      setStoreError(errorMessage(error));
+    }
+  }, []);
 
   useEffect(() => {
     setNotice(null);
     setActionError(null);
     setPickedId('');
     void refresh();
-  }, [refresh]);
+    void refreshLibrary();
+  }, [refresh, refreshLibrary]);
 
   /** Run one change, then reread the tab so it shows what the core now holds. */
   const change = async (key: string, action: () => Promise<unknown>, failure: string) => {
@@ -143,7 +145,8 @@ export function InstanceContentTab({ instanceId }: InstanceContentTabProps) {
 
   const rows = content?.items ?? [];
   const inInstance = new Set(rows.map((row) => row.itemId));
-  const addable = (store ?? []).filter((item) => !inInstance.has(item.itemId));
+  const forThisGame = itemsForInstanceOf(store ?? [], gameId);
+  const addable = forThisGame.filter((item) => !inInstance.has(item.itemId));
 
   return (
     <section aria-labelledby="instance-content-heading" className="space-y-4" data-testid="instance-content">
@@ -235,14 +238,15 @@ export function InstanceContentTab({ instanceId }: InstanceContentTabProps) {
 
       <div className="space-y-2 rounded-xl border border-border p-4">
         <h3 className="text-sm font-medium">Add from your library</h3>
+        <p className="text-xs text-muted-foreground">Items for this game, and items not tied to any game.</p>
         {storeError && (
           <p role="alert" className="text-sm">Your library could not be read, so nothing can be added: {storeError}</p>
         )}
         {!storeError && store !== null && addable.length === 0 && (
           <p className="text-sm text-muted-foreground">
-            {store.length === 0
-              ? 'Your library is empty. Add an archive or folder on the Library tab first.'
-              : 'Everything in your library is already in this instance.'}
+            {forThisGame.length === 0
+              ? 'Your library has nothing for this game yet. Add an archive or folder on the Library tab first.'
+              : 'Everything in your library for this game is already in this instance.'}
           </p>
         )}
         {addable.length > 0 && (
@@ -273,6 +277,7 @@ export function InstanceContentTab({ instanceId }: InstanceContentTabProps) {
           onClose={() => {
             setWizardFor(null);
             void refresh();
+            void refreshLibrary();
           }}
         />
       )}

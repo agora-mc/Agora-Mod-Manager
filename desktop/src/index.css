@@ -1645,3 +1645,20 @@ main [data-skip-landing][tabindex="-1"]:focus {
 .agora-switch--sm .agora-switch__check {
   stroke-width: 2.2;
 }
+
+/* A progress bar with nothing to measure: stripes across the whole track, so it can never be read
+   as a percentage. They drift when motion is allowed; the reduced-motion rules leave them still. */
+.agora-progress-indeterminate {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    hsl(var(--primary) / 0.75) 0 10px,
+    hsl(var(--primary) / 0.3) 10px 20px
+  );
+  background-size: 200% 100%;
+  animation: agora-progress-drift 18s linear infinite;
+}
+
+@keyframes agora-progress-drift {
+  from { background-position: 0 0; }
+  to { background-position: -565px 0; }
+}

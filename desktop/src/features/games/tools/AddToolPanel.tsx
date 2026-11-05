@@ -10,7 +10,7 @@ import { FormField, FORM_CONTROL_CLASS } from '@/components/instance-kit';
 import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import { addUserTool, findUserTools, pickProgram, type ToolCandidate } from './api';
-import { messageOf } from './toolCopy';
+import { candidateOrigin, messageOf, offeredCandidates } from './toolCopy';
 
 interface AddToolPanelProps {
   instanceId: string;
@@ -71,10 +71,7 @@ export function AddToolPanel({ instanceId, listedToolIds, onAdded, onClose }: Ad
     return () => { current = false; };
   }, [instanceId]);
 
-  // A program already on the list is not offered: neither one added before, nor a copy of a tool
-  // the game recognises that the list already shows.
-  const offered = (found ?? []).filter((candidate) => !candidate.alreadyAdded
-    && !(candidate.knownToolId && listedToolIds.includes(candidate.knownToolId)));
+  const offered = offeredCandidates(found ?? [], listedToolIds);
 
   const choose = (path: string, suggested: string) => {
     setExe(path);
@@ -148,6 +145,7 @@ export function AddToolPanel({ instanceId, listedToolIds, onAdded, onClose }: Ad
           <div className="flex flex-wrap gap-2" data-testid="tool-add-found">
             {offered.map((candidate) => {
               const chosen = exe === candidate.exe;
+              const origin = candidateOrigin(candidate);
               return (
                 <button
                   key={candidate.exe}
@@ -161,7 +159,7 @@ export function AddToolPanel({ instanceId, listedToolIds, onAdded, onClose }: Ad
                   )}
                 >
                   <span className="block">{candidate.suggestedName}</span>
-                  {candidate.modName && <span className="block text-xs text-muted-foreground">from {candidate.modName}</span>}
+                  {origin && <span className="block text-xs text-muted-foreground">{origin}</span>}
                 </button>
               );
             })}

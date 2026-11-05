@@ -1195,9 +1195,28 @@ pub struct Mo2RunReport {
     pub next_steps: Vec<String>,
 }
 
-/// Progress for a long import: mods stored so far, and bytes.
+/// The stage a long import is at. Only [`ImportPhase::Storing`] can be measured, by bytes; the
+/// others report that they have started and nothing more, so a screen must not show a percentage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportPhase {
+    /// Copying the listed mods into the content store.
+    Storing,
+    /// Copying the setup's `overwrite` folder.
+    Overwrite,
+    /// Making the new instance, which may build its base.
+    Instance,
+    /// Putting the stored mods on the instance, in order.
+    Layers,
+    /// The plugin list, INI files, saves and tools.
+    Finishing,
+}
+
+/// Progress for a long import: the stage, the mod being stored, mods stored so far, and bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportProgress {
+    pub phase: ImportPhase,
+    /// The folder of the mod being stored now. `None` between mods and after them.
+    pub current_mod: Option<String>,
     pub mods_done: usize,
     pub mods_total: usize,
     pub bytes_done: u64,
@@ -1288,11 +1307,22 @@ pub fn run(
         next_steps: Vec::new(),
     };
 
-    // 1. Bytes first: every listed mod, as it is on disk.
+    // 1. Bytes first: every listed mod, as it is on disk. The bar measures the mods alone: the
+    // overwrite folder is copied later and cannot be measured, so adding its bytes here would stop
+    // the bar short of its end.
     let mods_total = plan.mods.len();
+    let mods_bytes: u64 = plan.mods.iter().map(|m| m.bytes).sum();
     let mut stored: Vec<(usize, String)> = Vec::new();
     let mut bytes_done = 0u64;
     for (index, planned) in plan.mods.iter().enumerate() {
+        progress(ImportProgress {
+            phase: ImportPhase::Storing,
+            current_mod: Some(planned.folder.clone()),
+            mods_done: index,
+            mods_total,
+            bytes_done,
+            bytes_total: mods_bytes,
+        });
         let source = ContentSource::Mo2Import {
             setup: plan.setup.to_string_lossy().to_string(),
             mo2_folder: planned.folder.clone(),
@@ -1310,10 +1340,12 @@ pub fn run(
         bytes_done += planned.bytes;
         report.stored_mods += 1;
         progress(ImportProgress {
+            phase: ImportPhase::Storing,
+            current_mod: None,
             mods_done: index + 1,
             mods_total,
             bytes_done,
-            bytes_total: plan.bytes,
+            bytes_total: mods_bytes,
         });
         if options
             .stop_after_mods
@@ -1325,7 +1357,21 @@ pub fn run(
         }
     }
 
+    let phase = |phase: ImportPhase| {
+        progress(ImportProgress {
+            phase,
+            current_mod: None,
+            mods_done: mods_total,
+            mods_total,
+            bytes_done,
+            bytes_total: mods_bytes,
+        })
+    };
+
     // `overwrite`: the rest becomes one content layer; the tools' files were split off below.
+    if plan.overwrite.present {
+        phase(ImportPhase::Overwrite);
+    }
     let overwrite_split = if plan.overwrite.present {
         let files = content_store::collect_folder_files(&plan.overwrite.folder)
             .map_err(|e| ImportError::OverwriteUnreadable(e.to_string()))?;
@@ -1349,6 +1395,7 @@ pub fn run(
     };
 
     // 2. The instance, made only now that everything is stored.
+    phase(ImportPhase::Instance);
     let outcome = game_instance::create_with_options(
         ctx,
         &install,
@@ -1383,6 +1430,7 @@ pub fn run(
         game_deploy::write_instance_manifest_atomic(ctx, &instance_id, &manifest)?;
 
         // 3. Content layers, lowest priority first: the last line of modlist.txt is the lowest layer.
+        phase(ImportPhase::Layers);
         let mount = mount_point(&def);
         let mount_arg = if mount.is_empty() {
             None
@@ -1433,6 +1481,7 @@ pub fn run(
         }
 
         // 5. The plugin list: MO2's order and activation, and its locks.
+        phase(ImportPhase::Finishing);
         if plan.plugins.kept {
             let lines: Vec<(String, bool)> = plan
                 .plugins

@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { ArrowRight, Check, Download } from 'lucide-react';
+import { ArrowRight, Check, Download, Hourglass } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
 import { Mo2ImportFlow, type ImportFlowState, type ImportStep } from './Mo2ImportFlow';
@@ -16,6 +16,7 @@ const STEPS: { id: ImportStep; label: string }[] = [
   { id: 'setup', label: 'Choose a setup' },
   { id: 'profile', label: 'Choose a profile' },
   { id: 'preview', label: 'Preview' },
+  { id: 'importing', label: 'Importing' },
   { id: 'done', label: 'Imported' },
 ];
 
@@ -33,6 +34,8 @@ interface GameImportDialogProps {
 
 export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpenInstance }: GameImportDialogProps) {
   const [state, setState] = useState<ImportFlowState>(INITIAL);
+  // Someone tried to close the dialog during an import: say why it stayed, instead of ignoring them.
+  const [closeRefused, setCloseRefused] = useState(false);
   const importedRef = useRef(onImported);
   importedRef.current = onImported;
 
@@ -41,13 +44,21 @@ export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpe
     if (state.report !== null) importedRef.current();
   }, [state.report]);
 
+  useEffect(() => {
+    if (!state.running) setCloseRefused(false);
+  }, [state.running]);
+
   const close = (next: boolean) => {
     if (next) {
       onOpenChange(true);
       return;
     }
-    // Copying cannot be stopped half way, so the dialog stays until it finishes.
-    if (state.running) return;
+    // A running import cannot be stopped (the core has no way to), so the dialog stays until it
+    // finishes, and says so.
+    if (state.running) {
+      setCloseRefused(true);
+      return;
+    }
     setState(INITIAL);
     onOpenChange(false);
   };
@@ -60,8 +71,8 @@ export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpe
       <DialogContent
         className="flex max-h-[85vh] max-w-4xl flex-col gap-0 p-0"
         data-testid="game-import-dialog"
-        onEscapeKeyDown={state.running ? (event) => event.preventDefault() : undefined}
-        onInteractOutside={state.running ? (event) => event.preventDefault() : undefined}
+        onEscapeKeyDown={state.running ? (event) => { event.preventDefault(); setCloseRefused(true); } : undefined}
+        onInteractOutside={state.running ? (event) => { event.preventDefault(); setCloseRefused(true); } : undefined}
       >
         <div className="shrink-0 space-y-3 border-b border-border px-6 pb-4 pt-6">
           <div className="flex items-start gap-3 pr-8">
@@ -107,7 +118,19 @@ export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpe
 
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-6 py-3">
           {state.running && (
-            <p className="mr-auto text-xs text-muted-foreground">Keep Agora open until the import finishes.</p>
+            <p
+              role={closeRefused ? 'alert' : undefined}
+              data-testid="import-close-note"
+              className={[
+                'mr-auto flex min-w-0 flex-1 items-center gap-2 text-xs',
+                closeRefused ? 'font-medium text-foreground' : 'text-muted-foreground',
+              ].join(' ')}
+            >
+              <Hourglass className={`h-3.5 w-3.5 shrink-0 ${closeRefused ? 'text-primary' : ''}`} aria-hidden="true" />
+              {closeRefused
+                ? 'This window stays open until the import finishes, because an import can’t be stopped once it has started.'
+                : 'An import can’t be stopped once it has started. Keep Agora open until it finishes.'}
+            </p>
           )}
           <Button type="button" variant="outline" size="sm" onClick={() => close(false)} disabled={state.running}>
             {state.report ? 'Done' : 'Cancel'}

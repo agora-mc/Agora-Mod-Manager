@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use agora_core::content_store::Mo2Provenance;
 
 use agora_core::game_import::{
-    self, ImportError, ImportProgress, Mo2Plan, Mo2Request, Mo2RunReport, RunOptions, ScanReport,
-    SetupFound,
+    self, ImportError, ImportPhase, ImportProgress, Mo2Plan, Mo2Request, Mo2RunReport, RunOptions,
+    ScanReport, SetupFound,
 };
 use agora_core::game_registry::{installed_games, GameInventory};
 use serde::{Deserialize, Serialize};
@@ -225,10 +225,23 @@ fn choose_install_or_fail(
     }
 }
 
+/// The word the screen reads for a stage of the import.
+fn phase_name(phase: ImportPhase) -> &'static str {
+    match phase {
+        ImportPhase::Storing => "storing",
+        ImportPhase::Overwrite => "overwrite",
+        ImportPhase::Instance => "instance",
+        ImportPhase::Layers => "layers",
+        ImportPhase::Finishing => "finishing",
+    }
+}
+
 /// Progress of a long import, sent as the `games-import-progress` event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportProgressDto {
+    pub phase: &'static str,
+    pub current_mod: Option<String>,
     pub mods_done: usize,
     pub mods_total: usize,
     pub bytes_done: u64,
@@ -274,6 +287,8 @@ pub async fn games_import_mo2(
             RunOptions::default(),
             &|progress: ImportProgress| {
                 let payload = ImportProgressDto {
+                    phase: phase_name(progress.phase),
+                    current_mod: progress.current_mod,
                     mods_done: progress.mods_done,
                     mods_total: progress.mods_total,
                     bytes_done: progress.bytes_done,

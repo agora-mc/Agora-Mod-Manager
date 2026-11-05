@@ -16,7 +16,7 @@
 //! tool and turning the mod off unlists it. [`import_tools`] adds another manager's executables
 //! (Mod Organizer 2's list) when an instance is imported.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use agora_game_api::{fold_path_case, GameDefinition, GamePath, ToolDefinition};
@@ -115,14 +115,28 @@ pub struct NewUserTool {
     pub keeps_output: bool,
 }
 
+/// Where a candidate's executable comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CandidateSource {
+    /// An enabled mod.
+    Mod,
+    /// The instance's own files: its writable layer.
+    InstanceFiles,
+    /// The game: its own files, or the path of a program that launches it (a mod may supply that
+    /// file, as a script extender's loader does; it is still how the game starts, not a tool).
+    Game,
+}
+
 /// One executable `find_candidates` found, for the person to confirm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolCandidate {
     /// Game-relative path, with forward slashes.
     pub exe: String,
-    /// The mod that wins this path. Empty for a game-defined tool not shipped by an enabled mod.
+    /// The mod that wins this path. Empty when no enabled mod ships it.
     pub mod_id: String,
     pub mod_name: String,
+    pub source: CandidateSource,
     pub known_tool_id: Option<String>,
     pub suggested_name: String,
     pub already_added: bool,
@@ -264,8 +278,8 @@ pub fn remove(ctx: &Ctx, instance_id: &str, id: &str) -> Result<Vec<UserTool>, U
     Ok(tools)
 }
 
-/// Every `.exe` in the files of the instance's enabled mods, plus the game-declared tools whose
-/// executable the deployment provides.
+/// Every `.exe` in the files of the instance's enabled mods and its writable layer, plus the
+/// game-declared tools whose executable the deployment provides.
 ///
 /// A path held by several enabled mods is one row, for the mod the deployment lets win it. A tool
 /// the game declares is recognised by the file name of its executable (the last path segment),
@@ -284,11 +298,11 @@ pub fn find_candidates(
     added.sort();
     let is_added = |exe: &str| added.binary_search(&fold_path_case(exe)).is_ok();
 
+    let game_programs = game_program_paths(definition);
     let mut rows: BTreeMap<String, ToolCandidate> = BTreeMap::new();
+    // A mod can ship many programs, and reading its record is the slow part of this.
+    let mut mod_names: HashMap<&str, String> = HashMap::new();
     for file in &plan.files {
-        let FileSource::Content { item_id, .. } = &file.source else {
-            continue;
-        };
         let path = file.path.as_str();
         let Some(base) = file_name(path) else {
             continue;
@@ -303,10 +317,32 @@ pub fn find_candidates(
         if rows.contains_key(&lower) {
             continue;
         }
-        let item = crate::content_store::get_item(ctx, item_id)?;
+        let (mod_id, mod_name, source) = match &file.source {
+            FileSource::Content { item_id, .. } => {
+                let name = match mod_names.get(item_id.as_str()) {
+                    Some(name) => name.clone(),
+                    None => {
+                        let name = crate::content_store::get_item(ctx, item_id)?.name;
+                        mod_names.insert(item_id, name.clone());
+                        name
+                    }
+                };
+                (item_id.clone(), name, CandidateSource::Mod)
+            }
+            FileSource::Writable { .. } | FileSource::Override { .. } => {
+                (String::new(), String::new(), CandidateSource::InstanceFiles)
+            }
+            FileSource::Base { .. } | FileSource::Generated { .. } => continue,
+        };
+        let source = if game_programs.contains(&lower) {
+            CandidateSource::Game
+        } else {
+            source
+        };
+        let added = is_added(path);
         rows.insert(
             lower,
-            candidate_row(path, base, item.item_id, item.name, &known, is_added(path)),
+            candidate_row(path, base, mod_id, mod_name, source, &known, added),
         );
     }
 
@@ -333,6 +369,7 @@ pub fn find_candidates(
                 file_name(&tool.exe).unwrap_or(tool.exe.as_str()),
                 String::new(),
                 String::new(),
+                CandidateSource::Game,
                 &known,
                 is_added(&tool.exe),
             ),
@@ -701,11 +738,31 @@ fn known_tools(ctx: &Ctx, definition: &GameDefinition) -> Vec<KnownTool> {
         .collect()
 }
 
+/// The folded game-relative paths of the programs that launch the game.
+fn game_program_paths(definition: &GameDefinition) -> HashSet<String> {
+    definition
+        .launch
+        .iter()
+        .map(|recipe| &recipe.executable)
+        .chain(
+            definition
+                .launch_alternatives
+                .iter()
+                .map(|alternative| &alternative.executable),
+        )
+        .filter_map(|executable| match executable {
+            GamePath::Runtime { path } => Some(fold_path_case(path.as_str())),
+            _ => None,
+        })
+        .collect()
+}
+
 fn candidate_row(
     exe: &str,
     base: &str,
     mod_id: String,
     mod_name: String,
+    source: CandidateSource,
     known: &[KnownTool],
     already_added: bool,
 ) -> ToolCandidate {
@@ -716,6 +773,7 @@ fn candidate_row(
         exe: exe.to_string(),
         mod_id,
         mod_name,
+        source,
         known_tool_id: known_tool.map(|tool| tool.id.clone()),
         suggested_name: known_tool
             .map(|tool| tool.name.clone())

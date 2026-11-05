@@ -20,7 +20,7 @@ use agora_core::game_tools::{
     self, CaptureMethod, CaptureMode, OutputFinding, OutputStatus, RunOutcome, ToolError,
     ToolOffer, ToolOutputRecord, ToolState,
 };
-use agora_core::game_user_tools::{self, NewUserTool, ToolCandidate, UserTool};
+use agora_core::game_user_tools::{self, CandidateSource, NewUserTool, ToolCandidate, UserTool};
 use agora_game_api::{GameDefinition, ToolId};
 use serde::Serialize;
 
@@ -266,6 +266,7 @@ pub struct ToolCandidateRow {
     pub exe: String,
     pub mod_id: String,
     pub mod_name: String,
+    pub source: CandidateSource,
     pub known_tool_id: Option<String>,
     pub suggested_name: String,
     pub already_added: bool,
@@ -315,6 +316,7 @@ fn candidate_row(candidate: ToolCandidate) -> ToolCandidateRow {
         exe: candidate.exe,
         mod_id: candidate.mod_id,
         mod_name: candidate.mod_name,
+        source: candidate.source,
         known_tool_id: candidate.known_tool_id,
         suggested_name: candidate.suggested_name,
         already_added: candidate.already_added,

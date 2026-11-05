@@ -967,7 +967,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
             'How to capture the output decides how the tool\'s files are collected while it runs. We recommend Let Agora choose: it asks before using anything slower.',
             'For tools whose result is a mod, including DynDOLOD, PGPatcher and tools you add yourself with an output folder, Agora keeps the output as a mod in the instance. Use an earlier output switches back to an older run.',
             'Where a tool offers them, Show changes, Roll back and Remove output let you compare, undo or remove the last run.',
-            'Find tools looks through the instance\'s mods for tools to add, and Add a tool of your own lets you point at an .exe.',
+            'Scan for programs looks through the instance\'s enabled mods and its own files and lets you pick which programs to add, and Add a tool lets you point at any .exe.',
           ],
           callout: {
             tone: 'tip',

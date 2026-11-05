@@ -3,7 +3,7 @@
  * the wording that matters (what a swap costs, why a run was discarded) is tested directly.
  */
 
-import type { CaptureChoice, OutputStatus, RunReport, SwapCosts, ToolRow } from './api';
+import type { CaptureChoice, OutputStatus, RunReport, SwapCosts, ToolCandidate, ToolRow } from './api';
 import { isGamesError } from '../shared/types';
 
 /** How many paths a list shows before it says "and N more" (the core reports the same 20). */
@@ -208,6 +208,27 @@ export function toolsSummary(known: readonly string[]): string {
 export function emptyToolsBody(known: readonly string[]): string {
   const examples = known.length > 0 ? `Tools such as ${knownExamples(known)} show` : 'Tools show';
   return `${examples} up here by themselves when you install them as mods. You can also add any other program yourself.`;
+}
+
+/**
+ * The programs worth offering: not one already added, and not a copy of a tool the game recognises
+ * that the list already shows.
+ */
+export function offeredCandidates(found: readonly ToolCandidate[], listedToolIds: readonly string[]): ToolCandidate[] {
+  return found.filter((candidate) => !candidate.alreadyAdded
+    && !(candidate.knownToolId && listedToolIds.includes(candidate.knownToolId)));
+}
+
+/** Where a found program comes from, under its name. `null` for the game's own, which says nothing. */
+export function candidateOrigin(candidate: ToolCandidate): string | null {
+  if (candidate.modName) return `from ${candidate.modName}`;
+  return candidate.source === 'instanceFiles' ? 'from this instance’s own files' : null;
+}
+
+/** "Added A.", "Added A and B.", "Added A, B and C." */
+export function addedNote(names: readonly string[]): string {
+  if (names.length <= 1) return `Added ${names[0] ?? 'nothing'}.`;
+  return `Added ${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}.`;
 }
 
 /** Where a tool the game recognises comes from, under its name. */

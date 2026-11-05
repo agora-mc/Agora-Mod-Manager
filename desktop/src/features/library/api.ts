@@ -242,6 +242,19 @@ export function itemsInView<T extends { gameIds: string[] }>(
     : items.filter((item) => item.gameIds.includes(gameId));
 }
 
+/**
+ * The items an instance of `gameId` can take, sorted by name: those tied to that game, and those
+ * tied to no game. An item tied only to other games is left out.
+ */
+export function itemsForInstanceOf<T extends { gameIds: string[]; name: string }>(
+  items: T[],
+  gameId: string,
+): T[] {
+  return items
+    .filter((item) => item.gameIds.length === 0 || item.gameIds.includes(gameId))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }));
+}
+
 /** Search names, descriptions, versions, sources and instances. Empty means everything. */
 export function searchLibrary(items: LibraryItem[], query: string): LibraryItem[] {
   const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);

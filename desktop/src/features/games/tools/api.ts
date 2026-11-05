@@ -178,7 +178,10 @@ export interface UserToolsView {
 export interface ToolCandidate {
   exe: string;
   modId: string;
+  /** Empty when no enabled mod ships it. */
   modName: string;
+  /** A mod, the instance's own files (its writable layer), or the game. */
+  source: 'mod' | 'instanceFiles' | 'game';
   knownToolId: string | null;
   suggestedName: string;
   alreadyAdded: boolean;

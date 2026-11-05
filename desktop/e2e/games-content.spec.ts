@@ -243,7 +243,7 @@ test('a library that cannot be read says so and offers a retry, rather than look
 test('an instance’s content lists its load order and says where each item goes', async ({ page }) => {
   await boot(page, {
     games_instance_content_list: { instanceId: 'inst-1', items: [oneRow] },
-    games_content_list: { items: [], damaged: [] },
+    games_library_list: { items: [], damaged: [], warnings: [] },
   });
   await openInstanceContent(page);
   await page.goto('/');
@@ -256,7 +256,7 @@ test('an instance’s content lists its load order and says where each item goes
 });
 
 test('an instance whose content cannot be read says so, and does not show an empty tab', async ({ page }) => {
-  await boot(page, { games_content_list: { items: [], damaged: [] } }, {
+  await boot(page, { games_library_list: { items: [], damaged: [], warnings: [] } }, {
     failures: { games_instance_content_list: { code: 'core_failed', message: 'The instance manifest is damaged.' } },
   });
   await openInstanceContent(page);
@@ -272,7 +272,7 @@ test('an archive with an installer asks its questions, previews the files, then 
     page,
     {
       games_instance_content_list: { instanceId: 'inst-1', items: [] },
-      games_content_list: { items: [sky], damaged: [] },
+      games_library_list: { items: [libraryRow(sky)], damaged: [], warnings: [] },
       games_instance_content_add: {
         status: 'needs_installer',
         itemId: sky.itemId,
