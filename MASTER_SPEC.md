@@ -4934,7 +4934,7 @@ Launch record, then verdict (crashed, failed to start, froze, stopped, normal, c
 
 ### 30.5 How answers speak
 
-Agora never says a mod is definitely the cause, because false positives are always possible. Wording stays at levels like "very likely", "likely" and "possible", and Agora says "not sure" when it isn't. There is no review system or confidence cap for plugin rules: it would confuse users more than it protects them.
+Agora never says a mod is definitely the cause, because false positives are always possible. Wording stays at levels like "very likely", "likely" and "possible", and Agora says "not sure" when it isn't. **Every finding names its source** (the game's plugin, or a mod's own plugin), so a user can spot a plugin being annoying. There is no review system or confidence cap for plugin rules: it would confuse users more than it protects them.
 
 ### 30.6 Exit codes
 
