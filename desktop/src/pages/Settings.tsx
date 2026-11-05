@@ -68,6 +68,7 @@ import {
 } from '../lib/tauri';
 import { WindowSizeEditor } from '../components/WindowSizeEditor';
 import { SkinSettings } from '../components/SkinSettings';
+import { PageHero } from '../components/PageHero';
 import type { CredentialStorageStatus, DeviceFlowResponse, GithubProfile, InstanceRow, JavaRuntimeProgressEvent, JavaRuntimeSummary, McpStatus, McpTokenData, MsaAccountStatus, MsaLoginPrompt } from '../lib/tauri';
 import { Privacy } from './Privacy';
 import { useAdvancedMode } from '../components/AdvancedModeContext';
@@ -2488,18 +2489,12 @@ export function Settings({
 
   return (
     <div className="settings-page space-y-5" data-testid="settings-page">
-      <section className="agora-hero compact">
-        <div className="flex flex-wrap items-center gap-4">
-          <span className="settings-hero-badge" aria-hidden="true">
-            <SettingsIcon className="h-6 w-6" />
-          </span>
-          <div className="min-w-0 flex-1">
-            <h2 className="text-2xl font-bold">Settings</h2>
-            <p className="text-sm text-muted-foreground">{activeTab.blurb}</p>
-          </div>
-          {appVersion && <span className="settings-hero-chip">Agora {appVersion}</span>}
-        </div>
-      </section>
+      <PageHero
+        icon={SettingsIcon}
+        title="Settings"
+        subtitle={activeTab.blurb}
+        actions={appVersion ? <span className="hero-chip">Agora {appVersion}</span> : null}
+      />
 
       {/* Inline error banner for any setting that failed to load. Page-level:
           a failed key can belong to any tab, and hiding the warning behind the

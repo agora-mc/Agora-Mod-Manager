@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Mountain, Music, Volume2, CloudRain, CloudSnow, Sun, ZoomIn, ZoomOut, Sparkles, Rainbow, ChevronDown, ChevronRight, Lock, LockOpen, RotateCcw } from 'lucide-react';
 import { MUSIC_TRACK_CHOICES, INSTRUMENT_CHOICES } from '../features/ambience/engine/audio/trackChoices';
 import { useAmbience } from '../features/ambience/AmbienceProvider';
+import { PageHero } from '../components/PageHero';
 
 /**
  * "Leave this alone" for one of the world's own clocks. Pressed, the day stops
@@ -212,15 +213,11 @@ export function LivingBackground() {
           description, no panel chrome — because the whole point of this screen is
           to look at the world. Only the reopen button stays. */}
       {panelOpen ? (
-        <header className="flex flex-wrap items-end justify-between gap-4">
-          <div className="agora-hero compact">
-            <h2 className="text-2xl font-bold">Living Background</h2>
-            <p className="mt-1 text-sm text-muted-foreground">
-              The full world, unobstructed. Poke the hills, wait for night, change the weather — everything here
-              is decorative and never touches your game.
-            </p>
-          </div>
-        </header>
+        <PageHero
+          icon={Mountain}
+          title="Living Background"
+          subtitle="The full world, unobstructed. Poke the hills, wait for night, change the weather — everything here is decorative and never touches your game."
+        />
       ) : (
         <button
           type="button"

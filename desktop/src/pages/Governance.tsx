@@ -12,6 +12,7 @@ import {
   ArrowDown,
 } from 'lucide-react';
 import { agoraRepositoryUrl, agoraDiscordUrl, agoraSponsorsUrl } from '../lib/brandConfig';
+import { PageHero } from '../components/PageHero';
 
 const RULES = [
   {
@@ -53,30 +54,20 @@ export function Governance() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <section className="relative overflow-hidden agora-hero">
-        <div className="absolute -right-16 -top-20 h-56 w-56 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="absolute -bottom-28 right-20 h-64 w-64 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="relative">
-          <div className="mb-3 flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 ring-1 ring-white/20">
-              <Landmark className="h-6 w-6" aria-hidden="true" />
-            </div>
-            <div>
-              <h2 className="text-2xl font-bold sm:text-3xl">Community Governance</h2>
-              <p className="text-white/65">
-                Your votes shape the curated list — by quality, not by download count.
-              </p>
-            </div>
-          </div>
-          <p className="max-w-3xl text-sm leading-6 text-white/80 sm:text-base">
+      <PageHero
+        icon={Landmark}
+        title="Community Governance"
+        subtitle="Your votes shape the curated list — by quality, not by download count."
+        panel={
+          <div className="max-w-3xl rounded-xl border border-white/15 bg-black/15 p-4 text-sm leading-6 text-white/80 backdrop-blur-xs sm:text-base">
             Agora is a <strong className="text-white">community-curated</strong> platform. Every
             entry in the catalog is reviewed and voted on by people like you, and the community’s
             scores decide what stays, what is promoted, and what is removed. Voting is how we keep
             the catalog a boutique selection of genuinely good content instead of a warehouse of
             whatever happens to be popular.
-          </p>
-        </div>
-      </section>
+          </div>
+        }
+      />
 
       {/* Why vote */}
       <section className="rounded-xl border border-border bg-card p-6">
