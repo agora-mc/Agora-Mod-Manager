@@ -7,6 +7,7 @@
 import type { ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { PageHero as BasePageHero } from '@/components/PageHero';
 
 interface PageHeroProps {
   icon: LucideIcon;
@@ -20,31 +21,25 @@ interface PageHeroProps {
   testId?: string;
 }
 
-export function PageHero({ icon: Icon, title, description, chips = [], actions, className, testId }: PageHeroProps) {
-  const shownChips = chips.filter((chip) => chip !== null && chip !== undefined && chip !== false && chip !== '');
+export function PageHero({ icon, title, description, chips = [], actions, className, testId }: PageHeroProps) {
+  const shownChips = chips.filter((chip) => chip !== null && chip !== undefined && chip !== false);
   return (
-    <section
-      className={cn('agora-hero compact flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between', className)}
-      data-testid={testId}
+    <BasePageHero
+      icon={icon}
+      title={title}
+      subtitle={description}
+      actions={actions}
+      className={className}
+      testId={testId}
     >
-      <div className="flex items-start gap-3">
-        <span className="settings-hero-badge" aria-hidden="true">
-          <Icon className="h-5 w-5" />
-        </span>
-        <div className="min-w-0">
-          <h2 className="mb-2 text-2xl font-bold">{title}</h2>
-          {description && <p className="text-muted-foreground">{description}</p>}
-          {shownChips.length > 0 && (
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              {shownChips.map((chip, index) => (
-                <span key={index} className="settings-hero-chip">{chip}</span>
-              ))}
-            </div>
-          )}
+      {shownChips.length > 0 && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {shownChips.map((chip, index) => (
+            <span key={index} className="hero-chip">{chip}</span>
+          ))}
         </div>
-      </div>
-      {actions && <div className="flex flex-wrap gap-2">{actions}</div>}
-    </section>
+      )}
+    </BasePageHero>
   );
 }
 

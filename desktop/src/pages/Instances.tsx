@@ -37,6 +37,7 @@ import {
   type RecoverableProfileIssue,
 } from '../lib/tauri';
 import { sortLoaderVersionsLatestFirst } from '../lib/utils';
+import { PageHero } from '../components/PageHero';
 import { emitTourSignal } from '../features/tour/tourSignals';
 import { offerBrowseContext } from '../lib/browseContextHandoff';
 import { type ProcessState } from '../lib/useProcessController';
@@ -309,53 +310,48 @@ export function Instances({
 
   return (
     <div className="space-y-6" data-tour="page-instances">
-      <section className="agora-hero compact flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-start gap-3">
-          <span className="settings-hero-badge" aria-hidden="true">
-            <Boxes className="h-5 w-5" />
-          </span>
-          <div className="min-w-0">
-            <h2 className="text-2xl font-bold mb-2">My Instances</h2>
-            <p className="text-muted-foreground">
-              Isolated modpack profiles, custom instances, and launch history.
-            </p>
-            {!loading && instances.length > 0 && (
-              <div className="mt-2 flex flex-wrap items-center gap-2">
-                <span className="settings-hero-chip">
-                  {instances.length} instance{instances.length === 1 ? '' : 's'}
-                </span>
-                {runningInstance && (
-                  <span className="settings-hero-chip">● {runningInstance.name} running</span>
-                )}
-              </div>
+      <PageHero
+        icon={Boxes}
+        title="My Instances"
+        subtitle="Isolated modpack profiles, custom instances, and launch history."
+        actions={
+          <>
+            <button
+              onClick={() => void handleImportPackFile()}
+              className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-accent"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              Import pack file
+            </button>
+            <button
+              onClick={() => setShowImport(true)}
+              className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-accent"
+            >
+              <Download className="h-4 w-4" aria-hidden="true" />
+              Import Instances
+            </button>
+            <button
+              onClick={() => setShowCreate(true)}
+              data-tour="create-instance"
+              className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              Create Instance
+            </button>
+          </>
+        }
+      >
+        {!loading && instances.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <span className="hero-chip">
+              {instances.length} instance{instances.length === 1 ? '' : 's'}
+            </span>
+            {runningInstance && (
+              <span className="hero-chip">● {runningInstance.name} running</span>
             )}
           </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={() => void handleImportPackFile()}
-            className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-accent"
-          >
-            <Download className="h-4 w-4" aria-hidden="true" />
-            Import pack file
-          </button>
-          <button
-            onClick={() => setShowImport(true)}
-            className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-accent"
-          >
-            <Download className="h-4 w-4" aria-hidden="true" />
-            Import Instances
-          </button>
-          <button
-            onClick={() => setShowCreate(true)}
-            data-tour="create-instance"
-            className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            Create Instance
-          </button>
-        </div>
-      </section>
+        )}
+      </PageHero>
 
       {error && (
         <div className="rounded-lg bg-destructive p-3 text-sm text-destructive-foreground">
@@ -390,7 +386,7 @@ export function Instances({
         </ul>
       ) : instances.length === 0 ? (
         <div className="rounded-xl border border-dashed border-border bg-card p-8 text-center">
-          <span className="settings-hero-badge mx-auto" aria-hidden="true">
+          <span className="hero-badge mx-auto" aria-hidden="true">
             <Boxes className="h-5 w-5" />
           </span>
           <p className="mt-4 font-semibold text-foreground">No instances yet.</p>

@@ -16,7 +16,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Boxes, Compass, ExternalLink, Library as LibraryGlyph, Puzzle } from 'lucide-react';
-import { EmptyState, PageHeroAction } from '@/components/instance-kit';
+import { EmptyState, PageHero, PageHeroAction } from '@/components/instance-kit';
 import { BrowseIcon } from '@/components/browse/BrowseIcon';
 import { CuratedBadge } from '@/components/browse/BrowseContextLabels';
 import '@/components/browse/browse-cards.css';
@@ -198,24 +198,16 @@ export function GameBrowsePage({ gameId, gameName, onOpenLibrary, onOpenInstance
 
   return (
     <div className="space-y-6" data-testid="game-browse-page">
-      <section className="agora-hero compact">
-        <div className="flex items-center gap-3 mb-2">
-          <h2 className="text-2xl font-bold">Browse</h2>
-          {onOpenLibrary && (
-            <button
-              type="button"
-              onClick={onOpenLibrary}
-              className="ml-auto rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-accent"
-              data-testid="open-library"
-            >
-              Your Library
-            </button>
-          )}
-        </div>
-        <p className="text-muted-foreground">
-          Mods the Agora team have personally reviewed and selected for the catalog.
-        </p>
-      </section>
+      <PageHero
+        icon={Compass}
+        title="Browse"
+        description="Mods the Agora team have personally reviewed and selected for the catalog."
+        actions={onOpenLibrary && (
+          <PageHeroAction icon={LibraryGlyph} onClick={onOpenLibrary} testId="open-library">
+            Your Library
+          </PageHeroAction>
+        )}
+      />
 
       {list.status === 'loaded' && entries.length > 0 && (
         <section className="rounded-xl border border-border bg-card p-4" data-testid="catalog-target">

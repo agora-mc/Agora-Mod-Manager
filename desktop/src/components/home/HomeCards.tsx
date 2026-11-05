@@ -5,7 +5,8 @@
  */
 
 import type { ReactNode } from 'react';
-import { ArrowRight, BookOpen, GraduationCap, HeartHandshake, MessagesSquare } from 'lucide-react';
+import { ArrowRight, BookOpen, GraduationCap, HeartHandshake, House, MessagesSquare } from 'lucide-react';
+import { PageHero } from '@/components/PageHero';
 import { agoraDiscordUrl, agoraSponsorsUrl } from '@/lib/brandConfig';
 import { GUIDE_TOPICS } from '@/data/guideContent';
 import { TourStartButton } from '@/features/tour';
@@ -13,14 +14,12 @@ import { TourStartButton } from '@/features/tour';
 /** Home's header: the title, one sentence, and the Ctrl K hint. */
 export function HomeHero({ description, children }: { description: ReactNode; children?: ReactNode }) {
   return (
-    <section className="agora-hero compact">
-      <h2 className="text-2xl font-bold mb-2">Home</h2>
-      <p className="text-muted-foreground">{description}</p>
-      <p className="mt-1 text-sm text-muted-foreground">
+    <PageHero icon={House} title="Home" subtitle={description}>
+      <p className="mt-2 text-sm text-muted-foreground">
         Press <kbd className="rounded-sm border border-border bg-background px-1.5 py-0.5 font-mono text-[10px]">Ctrl K</kbd> to search and jump anywhere.
       </p>
       {children}
-    </section>
+    </PageHero>
   );
 }
 

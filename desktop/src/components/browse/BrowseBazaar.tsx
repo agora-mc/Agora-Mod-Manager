@@ -32,6 +32,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { Store } from 'lucide-react';
+import { PageHero } from '../PageHero';
 import { getSetting } from '../../lib/tauri';
 import {
   STALL_ICONS,
@@ -527,10 +529,12 @@ export function BrowseBazaar({ items, instanceVersion, ownedIds, onOpenMod, onEx
     <div className="bazaar" data-testid="browse-bazaar">
 
       <div className="bazaar-scroll">
-        <header className="agora-hero compact">
-          <div className="flex items-center gap-3 mb-2 flex-wrap">
-            <h2 className="text-2xl font-bold">The Bazaar</h2>
-            <div className="bazaar-header-right">
+        <PageHero
+          icon={Store}
+          title="The Bazaar"
+          subtitle="Wander. Poke things. Take what you like."
+          actions={
+            <>
               <button type="button" className="bazaar-back" onClick={onExit} data-testid="bazaar-exit">
                 ← Back to Browse
               </button>
@@ -545,10 +549,9 @@ export function BrowseBazaar({ items, instanceVersion, ownedIds, onOpenMod, onEx
                 <b>{bagCount}</b>
                 <span className="bazaar-sub">in your bag</span>
               </button>
-            </div>
-          </div>
-          <p className="text-muted-foreground">Wander. Poke things. Take what you like.</p>
-        </header>
+            </>
+          }
+        />
 
         <div className="bazaar-stalls" role="tablist" aria-label="Market stalls">
           {STALLS.map((s) => (

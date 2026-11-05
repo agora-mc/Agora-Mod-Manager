@@ -1,6 +1,7 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CategoryChips } from '@/components/browse/CategoryChips';
-import { Check, ChevronDown, Download, Leaf, List, LayoutGrid, Search } from 'lucide-react';
+import { Check, ChevronDown, Compass, Download, Leaf, List, LayoutGrid, Search } from 'lucide-react';
+import { PageHero } from '@/components/PageHero';
 import {
   browseSearch,
   browseLoadMore,
@@ -374,12 +375,11 @@ function RegistryRecoveryShell({
 }) {
   return (
     <div className="space-y-6">
-      <section className="agora-hero compact">
-        <h2 className="text-2xl font-bold mb-2">Browse</h2>
-        <p className="text-muted-foreground">
-          Curated mods, packs, shaders, resource packs, and more.
-        </p>
-      </section>
+      <PageHero
+        icon={Compass}
+        title="Browse"
+        subtitle="Curated mods, packs, shaders, resource packs, and more."
+      />
       <RegistryStatusView
         variant="fullscreen"
         state={state}
@@ -1450,45 +1450,39 @@ function BrowseContent({
 
   return (
     <div className="space-y-6" data-tour="page-browse">
-      <section className="agora-hero compact">
-        <div className="flex items-center gap-3 mb-2">
-          <h2 className="text-2xl font-bold">Browse</h2>
-          {onOpenLibrary && (
-            <button
-              type="button"
-              onClick={onOpenLibrary}
-              className={`${simpleBrowse ? 'ml-auto ' : ''}rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-accent`}
-              data-testid="open-library"
-            >
-              Your Library
-            </button>
-          )}
-          {/* Simple mode has exactly one Browse. Offering a door to the Bazaar
-              from it would put the thing the mode exists to avoid one click
-              away — the interaction mode is changed in Settings, not here. */}
-          {simpleBrowse ? null : (
+      <PageHero
+        icon={Compass}
+        title="Browse"
+        subtitle="Curated mods, packs, shaders, resource packs, and more."
+        note={simpleBrowse ? null : 'The Bazaar is a playful, browse-by-stalls view of the same catalog.'}
+        actions={
+          <>
+            {onOpenLibrary && (
+              <button
+                type="button"
+                onClick={onOpenLibrary}
+                className="rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-accent"
+                data-testid="open-library"
+              >
+                Your Library
+              </button>
+            )}
+            {/* Simple mode has exactly one Browse. Offering a door to the Bazaar
+               from it would put the thing the mode exists to avoid one click
+               away - the interaction mode is changed in Settings, not here. */}
+            {simpleBrowse ? null : (
             <button
               type="button"
               onClick={() => setBazaarMode(true)}
-              className="ml-auto rounded-lg border border-primary bg-primary px-4 py-2 text-sm font-bold text-primary-foreground shadow-xs hover:bg-primary/90"
+              className="rounded-lg border border-primary bg-primary px-4 py-2 text-sm font-bold text-primary-foreground shadow-xs hover:bg-primary/90"
               data-testid="open-bazaar"
             >
               The Bazaar 🎡
             </button>
           )}
-          {/* <span className="rounded-full bg-muted text-muted-foreground px-2 py-0.5 text-xs font-medium uppercase tracking-wide">
-            Preview
-          </span> */}
-        </div>
-        <p className="text-muted-foreground">
-          Curated mods, packs, shaders, resource packs, and more.
-        </p>
-        {simpleBrowse ? null : (
-          <p className="text-sm text-muted-foreground mt-1">
-            The Bazaar is a playful, browse-by-stalls view of the same catalog.
-          </p>
-        )}
-      </section>
+          </>
+        }
+      />
 
       {/* Keyboard users skip the instance context, community pitch, search and
           filters, which is a dozen or more Tab stops before the first result. */}

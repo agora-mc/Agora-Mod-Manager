@@ -17,6 +17,7 @@ import {
   Layers,
 } from 'lucide-react';
 import { agoraRepositoryUrl, agoraDiscordUrl, agoraSponsorsUrl } from '../lib/brandConfig';
+import { PageHero } from '../components/PageHero';
 
 const PILLARS = [
   {
@@ -80,23 +81,11 @@ export function About() {
   return (
     <div className="space-y-6">
       {/* Header */}
-      <section className="relative overflow-hidden agora-hero">
-        <div className="absolute -right-16 -top-20 h-56 w-56 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="absolute -bottom-28 right-20 h-64 w-64 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="relative">
-          <div className="mb-3 flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-white/10 ring-1 ring-white/20">
-              <Info className="h-6 w-6" aria-hidden="true" />
-            </div>
-            <h2 className="text-2xl font-bold sm:text-3xl">The Agora Difference</h2>
-          </div>
-          <p className="max-w-2xl text-sm leading-6 text-white/80 sm:text-base">
-            Agora is a bespoke boutique, not a warehouse. Every entry in the catalog is curated,
-            tailored, and made accessible for you — a hand-picked selection of the best Minecraft
-            mods today, free of ads, tracking, and bloat.
-          </p>
-        </div>
-      </section>
+      <PageHero
+        icon={Info}
+        title="The Agora Difference"
+        subtitle="Agora is a bespoke boutique, not a warehouse. Every entry in the catalog is curated, tailored, and made accessible for you — a hand-picked selection of the best Minecraft has to offer, free of ads, tracking, and bloat."
+      />
 
       <section className="rounded-xl border border-border bg-card p-6">
         <div className="flex items-center gap-2 mb-3">

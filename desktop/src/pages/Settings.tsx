@@ -72,6 +72,7 @@ import {
 } from '../lib/tauri';
 import { WindowSizeEditor } from '../components/WindowSizeEditor';
 import { SkinSettings } from '../components/SkinSettings';
+import { PageHero } from '../components/PageHero';
 import type { CredentialStorageStatus, DeviceFlowResponse, GithubProfile, InstanceRow, JavaRuntimeProgressEvent, JavaRuntimeSummary, McpStatus, McpTokenData, MsaAccountStatus, MsaLoginPrompt } from '../lib/tauri';
 import { Privacy } from './Privacy';
 import { useAdvancedMode } from '../components/AdvancedModeContext';
@@ -2622,44 +2623,40 @@ export function Settings({
 
   return (
     <div className="settings-page space-y-5" data-testid="settings-page">
-      <section className="agora-hero compact">
-        <div className="flex flex-wrap items-center gap-4">
-          <span className="settings-hero-badge" aria-hidden="true">
-            <SettingsIcon className="h-6 w-6" />
-          </span>
-          {/* The text keeps a real width; in a narrow window the chips wrap below it instead of
-              squeezing the sentence to a word a line. */}
-          <div className="min-w-0 flex-[1_1_min(100%,calc(14rem*var(--font-scale)))]">
-            <h2 className="text-2xl font-bold">Settings</h2>
-            <p className="text-sm text-muted-foreground">{activeTab.blurb}</p>
-          </div>
-          {!minecraftSelected && (
-            // Which game the page is for. Minecraft's own sections come back when Minecraft is
-            // selected, which this chip can do without leaving Settings.
-            <span
-              className="settings-hero-chip inline-flex items-center gap-1.5"
-              data-testid="settings-game-chip"
-              title={`Showing settings for ${selectedGameName}. Minecraft settings appear when Minecraft is selected.`}
-            >
-              <SelectedGameIcon className="h-3.5 w-3.5" />
-              <span>For {selectedGameShortName}</span>
-              {onSwitchToMinecraft && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <button
-                    type="button"
-                    onClick={onSwitchToMinecraft}
-                    className="rounded-sm underline decoration-1 underline-offset-2 hover:decoration-2 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    Switch to Minecraft
-                  </button>
-                </>
-              )}
-            </span>
-          )}
-          {appVersion && <span className="settings-hero-chip">Agora {appVersion}</span>}
-        </div>
-      </section>
+      <PageHero
+        icon={SettingsIcon}
+        title="Settings"
+        subtitle={activeTab.blurb}
+        actions={(
+          <>
+            {!minecraftSelected && (
+              // Which game the page is for. Minecraft's own sections come back when Minecraft is
+              // selected, which this chip can do without leaving Settings.
+              <span
+                className="hero-chip inline-flex items-center gap-1.5"
+                data-testid="settings-game-chip"
+                title={`Showing settings for ${selectedGameName}. Minecraft settings appear when Minecraft is selected.`}
+              >
+                <SelectedGameIcon className="h-3.5 w-3.5" />
+                <span>For {selectedGameShortName}</span>
+                {onSwitchToMinecraft && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={onSwitchToMinecraft}
+                      className="rounded-sm underline decoration-1 underline-offset-2 hover:decoration-2 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      Switch to Minecraft
+                    </button>
+                  </>
+                )}
+              </span>
+            )}
+            {appVersion && <span className="hero-chip">Agora {appVersion}</span>}
+          </>
+        )}
+      />
 
       {/* Inline error banner for any setting that failed to load. Page-level:
           a failed key can belong to any tab, and hiding the warning behind the

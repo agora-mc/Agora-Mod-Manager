@@ -958,6 +958,42 @@ html[data-input-modality="gamepad"] :is(
 .agora-hero [class*="text-white/"] { color: hsl(var(--card-foreground) / 0.78); }
 .agora-hero strong[class*="text-white"] { color: hsl(var(--card-foreground)); }
 
+.hero-badge,
+.settings-hero-badge {
+  display: grid;
+  place-items: center;
+  height: 2.75rem;
+  width: 2.75rem;
+  flex-shrink: 0;
+  border-radius: calc(var(--radius) * 1.1);
+  background-image: linear-gradient(150deg, hsl(var(--primary)), hsl(var(--primary) / 0.55));
+  color: hsl(var(--primary-foreground));
+  box-shadow: 0 12px 26px -16px hsl(var(--primary));
+}
+
+.hero-ring {
+  position: absolute;
+  border-radius: 999px;
+  border: 1px solid hsl(var(--card-foreground) / 0.1);
+  pointer-events: none;
+}
+
+.hero-copy {
+  min-width: min(calc(20rem * var(--font-scale)), 100%);
+}
+
+.hero-chip,
+.settings-hero-chip {
+  border-radius: 999px;
+  border: 1px solid hsl(var(--card-foreground) / 0.25);
+  background-color: hsl(var(--card-foreground) / 0.08);
+  padding: 0.2rem 0.65rem;
+  font-size: calc(0.6875rem * var(--font-scale));
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
 /* ── Settings shell ───────────────────────────────────────────────────
    The settings page is a two-level nav: a section rail (role="tablist")
    beside the panel, and sub-page pills inside it. Colours come from the
@@ -974,29 +1010,6 @@ html[data-input-modality="gamepad"] :is(
   /* The rail grows with the text-size setting (at a third of its rate) so a
      category name is never cut to "Appearan…" at large text. */
   .settings-layout { grid-template-columns: calc(15rem * (1 + (var(--font-scale) - 1) * 0.35)) minmax(0, 1fr); }
-}
-
-.settings-hero-badge {
-  display: grid;
-  place-items: center;
-  height: 2.75rem;
-  width: 2.75rem;
-  flex-shrink: 0;
-  border-radius: calc(var(--radius) * 1.1);
-  background-image: linear-gradient(150deg, hsl(var(--primary)), hsl(var(--primary) / 0.55));
-  color: hsl(var(--primary-foreground));
-  box-shadow: 0 12px 26px -16px hsl(var(--primary));
-}
-
-.settings-hero-chip {
-  border-radius: 999px;
-  border: 1px solid hsl(var(--card-foreground) / 0.25);
-  background-color: hsl(var(--card-foreground) / 0.08);
-  padding: 0.2rem 0.65rem;
-  font-size: calc(0.6875rem * var(--font-scale));
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  white-space: nowrap;
 }
 
 /* The rail follows the panel down long sections rather than scrolling away.
