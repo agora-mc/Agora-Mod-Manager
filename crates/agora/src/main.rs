@@ -1310,6 +1310,11 @@ enum ModsCmd {
         install_anyway: bool,
         #[arg(
             long,
+            help = "Install although a required dependency is missing or could not be checked. The mod may not start without it"
+        )]
+        allow_missing_dependencies: bool,
+        #[arg(
+            long,
             conflicts_with = "exclude_optional",
             help = "Include specific optional dependencies (comma-separated)"
         )]
@@ -3085,6 +3090,7 @@ async fn run_mods_command(
             allow_replace,
             skip_health_scan,
             install_anyway,
+            allow_missing_dependencies,
             include_optional,
             exclude_optional,
             replace_conflicts,
@@ -3114,6 +3120,7 @@ async fn run_mods_command(
                     allow_replace,
                     skip_health_scan,
                     accept_hash_confirmation: install_anyway,
+                    allow_missing_dependencies,
                     ..Default::default()
                 },
             };
@@ -3129,6 +3136,9 @@ async fn run_mods_command(
             // Dry-run: print the plan and exit
             if dry_run {
                 print_plan(&plan, json)?;
+                if !json && blocked_by_missing_dependency(&plan.blocking_errors) {
+                    eprintln!("{MISSING_DEPENDENCY_HINT}");
+                }
                 return Ok(());
             }
 
@@ -3140,6 +3150,9 @@ async fn run_mods_command(
                         .iter()
                         .any(|c| c.blocking && c.chosen.is_none());
                 report_unresolved_plan(&plan, json);
+                if !json && blocked_by_missing_dependency(&plan.blocking_errors) {
+                    eprintln!("{MISSING_DEPENDENCY_HINT}");
+                }
                 if has_choices {
                     return Err(agora_core::error::LauncherError::UserDecisionRequired.into());
                 }
@@ -3173,6 +3186,10 @@ async fn run_mods_command(
                             .map(|f| f.target_filename.clone())
                             .unwrap_or_else(|| project.clone());
                         println!("Installed {} ({})", filename, requested_version);
+                        // Names what --allow-missing-dependencies went past, among the rest.
+                        for warning in &warnings {
+                            eprintln!("Warning: {}", warning.message);
+                        }
                     }
                 }
                 agora_game_minecraft::install_pipeline::InstallOutcome::HealthRollback {
@@ -11238,6 +11255,23 @@ fn apply_conflict_overrides(
 }
 
 /// Print unresolved plan diagnostics to stderr.
+/// What `mod install` says when only `--allow-missing-dependencies` can get past a block. The plan's
+/// own messages say "Install Anyway", which is the desktop app's button.
+const MISSING_DEPENDENCY_HINT: &str = "Add what is missing, or pass --allow-missing-dependencies to install without it. The mod may not start until you add it.";
+
+/// Whether the plan is blocked by a required dependency `--allow-missing-dependencies` would accept.
+/// The same three codes that offer "Install Anyway" in the desktop app's review.
+fn blocked_by_missing_dependency(
+    errors: &[agora_game_minecraft::install_pipeline::PlanError],
+) -> bool {
+    errors.iter().any(|error| {
+        matches!(
+            error.code.as_str(),
+            "ERR_MISSING_DEPENDENCY" | "ERR_UNCHECKED_REQUIREMENTS" | "ERR_REQUIRED_DEPENDENCY"
+        )
+    })
+}
+
 fn report_unresolved_plan(
     plan: &agora_game_minecraft::install_pipeline::ResolvedInstallPlan,
     json: bool,
@@ -13910,6 +13944,63 @@ mod tests {
         let other =
             super::defaults_refusal_text(&agora_core::content_fomod::FomodError::NothingToInstall);
         assert_eq!(other, "the chosen options install no files");
+    }
+
+    #[test]
+    fn the_missing_dependency_override_is_its_own_flag_and_off_by_default() {
+        let parsed = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["agora", "mod", "install", "sodium", "inst"]
+                    .iter()
+                    .chain(args),
+            )
+            .expect("should parse");
+            let Commands::Mods {
+                action:
+                    crate::ModsCmd::Install {
+                        install_anyway,
+                        allow_missing_dependencies,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected mod install");
+            };
+            (install_anyway, allow_missing_dependencies)
+        };
+        assert_eq!(parsed(&[]), (false, false));
+        // The hash override does not imply this one, nor this one the hash override.
+        assert_eq!(parsed(&["--install-anyway"]), (true, false));
+        assert_eq!(parsed(&["--allow-missing-dependencies"]), (false, true));
+    }
+
+    #[test]
+    fn the_hint_names_the_flag_only_for_a_block_the_flag_can_pass() {
+        use crate::{blocked_by_missing_dependency, MISSING_DEPENDENCY_HINT};
+        use agora_game_minecraft::install_pipeline::PlanError;
+        let error = |code: &str| PlanError {
+            code: code.into(),
+            message: "blocked".into(),
+        };
+        for code in [
+            "ERR_MISSING_DEPENDENCY",
+            "ERR_UNCHECKED_REQUIREMENTS",
+            "ERR_REQUIRED_DEPENDENCY",
+        ] {
+            assert!(blocked_by_missing_dependency(&[
+                error("ERR_FILE_CONFLICT"),
+                error(code)
+            ]));
+        }
+        for code in [
+            "ERR_OPTIONAL_DEPENDENCY",
+            "ERR_FILE_CONFLICT",
+            "ERR_HASH_UNAVAILABLE",
+        ] {
+            assert!(!blocked_by_missing_dependency(&[error(code)]));
+        }
+        assert!(!blocked_by_missing_dependency(&[]));
+        assert!(MISSING_DEPENDENCY_HINT.contains("--allow-missing-dependencies"));
     }
 
     #[test]

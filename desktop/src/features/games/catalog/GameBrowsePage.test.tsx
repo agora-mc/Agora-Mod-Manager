@@ -1,7 +1,7 @@
 /**
  * A game's Browse page: the curated catalog as Minecraft's result cards, an empty catalog that
- * points to Settings > Plugins, search, the "Install into" choice, and "Install anyway" both as
- * the switch and as the answer to a file that changed since the Agora team checked it.
+ * points to Settings > Plugins, search, the "Install into" choice, the "Allow changed files" switch, and
+ * "Install anyway" as the answer to a changed file or an unmet framework.
  */
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,7 +14,7 @@ vi.mock('@/lib/settingsSection', async (importOriginal) => ({
   openSettingsSection,
 }));
 
-import { GameBrowsePage, INSTALL_ANYWAY_COPY } from './index';
+import { GameBrowsePage, ALLOW_CHANGED_FILES_COPY } from './index';
 
 const entry = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
   id,
@@ -32,7 +32,7 @@ const twoEntries = {
   entries: [
     entry('skse', 'SKSE64'),
     entry('ussep', 'Unofficial Patch', {
-      compatibility: [{ stores: ['steam'], gameVersions: ['1.6.1170'], requires: [{ framework: 'skse', minVersion: '2.2' }], asset: null }],
+      compatibility: [{ stores: ['steam'], gameVersions: ['1.6.1170'], requires: [{ framework: 'skse', name: 'Skyrim Script Extender', minVersion: '2.2' }], asset: null }],
     }),
   ],
   instances: [{ instanceId: 'inst-1', name: 'Grounded' }],
@@ -78,7 +78,8 @@ describe('GameBrowsePage', () => {
     expect(cards[0]).toHaveTextContent('Curated');
     expect(cards[0]).toHaveTextContent('by ianpatt · Downloads from GitHub');
     expect(cards[0]).toHaveTextContent('Steam 1.6.1170');
-    expect(cards[1]).toHaveTextContent('Needs skse 2.2 or newer');
+    expect(cards[1]).toHaveTextContent('Needs Skyrim Script Extender 2.2 or newer');
+    expect(cards[1]).not.toHaveTextContent('Needs skse');
     expect(screen.getByRole('heading', { name: 'Browse' })).toBeInTheDocument();
     expect(screen.getByText('Mods the Agora team have personally reviewed and selected for the catalog.')).toBeInTheDocument();
   });
@@ -117,9 +118,9 @@ describe('GameBrowsePage', () => {
     render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
     const [first] = await screen.findAllByTestId('catalog-entry');
 
-    const toggle = screen.getByRole('switch', { name: INSTALL_ANYWAY_COPY.label });
+    const toggle = screen.getByRole('switch', { name: ALLOW_CHANGED_FILES_COPY.label });
     expect(toggle).not.toBeChecked();
-    expect(toggle).toHaveAccessibleDescription(INSTALL_ANYWAY_COPY.description);
+    expect(toggle).toHaveAccessibleDescription(ALLOW_CHANGED_FILES_COPY.description);
 
     fireEvent.click(within(first).getByRole('button', { name: 'Install' }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_catalog_install', expect.anything()));
@@ -264,11 +265,20 @@ describe('GameBrowsePage', () => {
       expect(within(placedResult).queryByRole('button', { name: 'Install anyway' })).not.toBeInTheDocument();
     });
 
+    it('has one Install anyway: the switch has its own name', async () => {
+      core();
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      await patchCard();
+      expect(ALLOW_CHANGED_FILES_COPY.label).toBe('Allow changed files');
+      expect(screen.getByRole('switch', { name: 'Allow changed files' })).toBeInTheDocument();
+      expect(screen.queryByText('Install anyway')).not.toBeInTheDocument();
+    });
+
     it('the hash switch is not the framework override', async () => {
       core();
       render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
       const card = await patchCard();
-      fireEvent.click(screen.getByRole('switch', { name: INSTALL_ANYWAY_COPY.label }));
+      fireEvent.click(screen.getByRole('switch', { name: ALLOW_CHANGED_FILES_COPY.label }));
       fireEvent.click(within(card).getByRole('button', { name: 'Install' }));
       await within(card).findByTestId('catalog-unmet-frameworks');
       expect(requests()[0]).toMatchObject({ installAnyway: true, allowMissingFrameworks: false, dryRun: false });

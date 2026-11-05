@@ -139,6 +139,12 @@ agora mod install sodium <INSTANCE_ID> --install-anyway
 
 The same flag works on `agora mod update`.
 
+A required dependency that Agora cannot find, or a mod whose own requirements it cannot read, blocks the install with `ERR_MISSING_DEPENDENCY`, `ERR_REQUIRED_DEPENDENCY` or `ERR_UNCHECKED_REQUIREMENTS`. Add what is missing, or install without it. This is separate from `--install-anyway`, and the same choice as "Install Anyway" in the desktop app. The install names what it went past as a warning, and the mod may not start until you add it.
+
+```bash
+agora mod install sodium <INSTANCE_ID> --allow-missing-dependencies
+```
+
 Check health and launch:
 
 ```bash

@@ -413,7 +413,7 @@ test.describe('Browse curated items', () => {
       id: 'crash-logger',
       name: 'CrashLogger',
       compatibility: [
-        { stores: ['steam'], gameVersions: ['1.6.1170'], requires: [{ framework: 'skse', minVersion: '2.2.6' }], asset: 'CrashLogger-*.7z' },
+        { stores: ['steam'], gameVersions: ['1.6.1170'], requires: [{ framework: 'skse', name: 'Skyrim Script Extender', minVersion: '2.2.6' }], asset: 'CrashLogger-*.7z' },
       ],
     };
     const plan = { ...catalogPlan, itemId: 'crash-logger', itemName: 'CrashLogger', unmetFrameworks: [unmet] };

@@ -51,14 +51,14 @@ const FRAMEWORK_REFUSALS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * The "Install anyway" switch. What it does (agora-core `catalog_install`, `InstallRequest`):
+ * The "Allow changed files" switch. What it does (agora-core `catalog_install`, `InstallRequest`):
  * accept a file whose SHA-256 differs from the curator's pin for that release file, or from the
  * hash it had when this release was installed before. It never accepts a file that differs from
  * the hash its source published (GitHub's digest, or a direct download's manifest hash), and it
  * does not touch the required-framework check.
  */
-export const INSTALL_ANYWAY_COPY = {
-  label: 'Install anyway',
+export const ALLOW_CHANGED_FILES_COPY = {
+  label: 'Allow changed files',
   description:
     'Use the file even if it has changed since the Agora team checked it, or since you last installed it. '
     + 'Agora still stops if the download doesn’t match the checksum its source published, because that means it was damaged or changed.',
@@ -263,10 +263,10 @@ export function GameBrowsePage({ gameId, gameName, onOpenLibrary, onOpenInstance
                 />
                 <div className="min-w-0">
                   <label htmlFor="catalog-install-anyway" className="text-sm font-medium">
-                    {INSTALL_ANYWAY_COPY.label}
+                    {ALLOW_CHANGED_FILES_COPY.label}
                   </label>
                   <p id="catalog-install-anyway-help" className="mt-0.5 text-xs text-muted-foreground">
-                    {INSTALL_ANYWAY_COPY.description}
+                    {ALLOW_CHANGED_FILES_COPY.description}
                   </p>
                 </div>
               </div>
@@ -440,7 +440,7 @@ function CatalogCard({
   const installing = result?.status === 'busy' && !result.dryRun;
   const needs = entry.compatibility
     .flatMap((compat) => compat.requires)
-    .map((req) => (req.minVersion ? `${req.framework} ${req.minVersion} or newer` : req.framework));
+    .map((req) => (req.minVersion ? `${req.name} ${req.minVersion} or newer` : req.name));
   const fits = fitsText(entry);
   return (
     <li

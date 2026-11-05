@@ -10,6 +10,7 @@ use agora_core::catalog_install::{
 use agora_core::game_registry::GameRegistry;
 use agora_core::github_release::GitHubAuth;
 use agora_core::registry::{GameCatalogItem, GameCompatibility, RegistryService};
+use agora_game_api::{FrameworkId, GameId};
 use serde::{Deserialize, Serialize};
 
 use super::error::{GamesError, CORE_FAILED, TASK_FAILED};
@@ -61,6 +62,8 @@ pub struct CompatibilityDto {
 #[serde(rename_all = "camelCase")]
 pub struct RequirementDto {
     pub framework: String,
+    /// The game's name for it, or the id when the game does not declare it.
+    pub name: String,
     pub min_version: Option<String>,
 }
 
@@ -71,8 +74,8 @@ pub struct InstanceChoiceDto {
     pub name: String,
 }
 
-impl From<&GameCatalogItem> for CatalogEntryDto {
-    fn from(item: &GameCatalogItem) -> Self {
+impl CatalogEntryDto {
+    fn new(games: &GameRegistry, item: &GameCatalogItem) -> Self {
         Self {
             id: item.id.clone(),
             name: item.name.clone(),
@@ -84,14 +87,14 @@ impl From<&GameCatalogItem> for CatalogEntryDto {
             compatibility: item
                 .game_compatibility
                 .iter()
-                .map(CompatibilityDto::from)
+                .map(|compat| CompatibilityDto::new(games, &item.game, compat))
                 .collect(),
         }
     }
 }
 
-impl From<&GameCompatibility> for CompatibilityDto {
-    fn from(compat: &GameCompatibility) -> Self {
+impl CompatibilityDto {
+    fn new(games: &GameRegistry, game: &str, compat: &GameCompatibility) -> Self {
         Self {
             stores: compat.stores.clone(),
             game_versions: compat.game_versions.clone(),
@@ -100,12 +103,23 @@ impl From<&GameCompatibility> for CompatibilityDto {
                 .iter()
                 .map(|r| RequirementDto {
                     framework: r.framework.clone(),
+                    name: framework_name(games, game, &r.framework),
                     min_version: r.min_version.clone(),
                 })
                 .collect(),
             asset: compat.asset.clone(),
         }
     }
+}
+
+/// The game's name for a framework, or the id as the entry wrote it when the game does not declare
+/// it. The same name the install's warning uses.
+fn framework_name(games: &GameRegistry, game: &str, framework: &str) -> String {
+    GameId::new(game)
+        .ok()
+        .zip(FrameworkId::new(framework).ok())
+        .and_then(|(game, id)| games.framework(&game, &id).map(|f| f.name.clone()))
+        .unwrap_or_else(|| framework.to_string())
 }
 
 /// The curated entries for one game, with the game's instances to install them into. Errors
@@ -130,7 +144,10 @@ pub async fn games_catalog_list(
             })
             .collect();
         Ok(CatalogListing {
-            entries: items.iter().map(CatalogEntryDto::from).collect(),
+            entries: items
+                .iter()
+                .map(|item| CatalogEntryDto::new(&ctx.games, item))
+                .collect(),
             instances,
         })
     })
@@ -518,6 +535,21 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[test]
+    fn a_requirement_shows_the_name_the_game_gives_it_and_falls_back_to_its_id() {
+        let games = registry();
+        assert_eq!(
+            framework_name(&games, "skyrim-se", "skse"),
+            "Skyrim Script Extender"
+        );
+        assert_eq!(framework_name(&games, "skyrim-se", "no-such"), "no-such");
+        assert_eq!(framework_name(&games, "no-such-game", "skse"), "skse");
+        assert_eq!(
+            framework_name(&games, "skyrim-se", "Not A Valid Id!"),
+            "Not A Valid Id!"
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@ export type HashOrigin = 'curator_pin' | 'previous_install';
 
 export interface CatalogRequirement {
   framework: string;
+  /** The game's name for it, or the id when the game does not declare it. */
+  name: string;
   minVersion: string | null;
 }
 
