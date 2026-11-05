@@ -209,7 +209,7 @@ interface Rule {
   /** Matched against the request's fields (or the arguments, for commands without `request`). */
   match?: Record<string, unknown>;
   reply?: unknown;
-  error?: { code: string; message: string };
+  error?: { code: string; message: string; coreCode?: string };
 }
 
 /**
