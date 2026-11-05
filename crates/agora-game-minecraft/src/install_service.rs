@@ -621,8 +621,11 @@ impl InstallService {
                 filename,
             )?;
 
-            let metadata =
-                crate::jar_metadata::parse_jar_metadata_for_loader(&item_path, &manifest.loader);
+            let metadata = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+                &item_path,
+                &manifest.loader,
+                &manifest.minecraft_version,
+            );
 
             let installed_mod = InstalledMod {
                 provider: None,
@@ -822,8 +825,11 @@ impl InstallService {
             )?;
             crate::content_bridge::place_file(&self.ctx, &stored.sha256, &dir, "mod", file_name)?;
 
-            let metadata =
-                crate::jar_metadata::parse_jar_metadata_for_loader(&dest, &manifest.loader);
+            let metadata = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+                &dest,
+                &manifest.loader,
+                &manifest.minecraft_version,
+            );
             let installed_mod = InstalledMod {
                 hash_verified: false,
                 provider: None,

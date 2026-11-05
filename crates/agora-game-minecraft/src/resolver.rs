@@ -1004,6 +1004,7 @@ impl Resolver {
             &bytes,
             &manifest.loader,
             &manifest.loader_version,
+            &manifest.minecraft_version,
         ))
     }
 
@@ -1719,8 +1720,11 @@ impl Resolver {
             return None;
         }
 
-        let parsed =
-            crate::jar_metadata::parse_jar_metadata_bytes_for_loader(&bytes, &manifest.loader);
+        let parsed = crate::jar_metadata::parse_jar_metadata_bytes_for_loader_at_mc(
+            &bytes,
+            &manifest.loader,
+            &manifest.minecraft_version,
+        );
         parsed.has_native_metadata.then_some(parsed.metadata)
     }
 
@@ -3875,8 +3879,13 @@ pub(crate) fn declared_required_jar_ids(
     bytes: &[u8],
     loader: &str,
     loader_version: &str,
+    minecraft_version: &str,
 ) -> Result<Vec<String>, String> {
-    let parsed = crate::jar_metadata::parse_jar_metadata_bytes_for_loader(bytes, loader);
+    let parsed = crate::jar_metadata::parse_jar_metadata_bytes_for_loader_at_mc(
+        bytes,
+        loader,
+        minecraft_version,
+    );
     if parsed.status != crate::jar_metadata::ParseStatus::Complete {
         let detail = parsed
             .diagnostics
@@ -3907,8 +3916,9 @@ fn jar_requirements_from_bytes(
     bytes: &[u8],
     loader: &str,
     loader_version: &str,
+    minecraft_version: &str,
 ) -> JarRequirements {
-    match declared_required_jar_ids(bytes, loader, loader_version) {
+    match declared_required_jar_ids(bytes, loader, loader_version, minecraft_version) {
         Ok(ids) => JarRequirements::Declared(ids),
         Err(reason) => JarRequirements::Unreadable(reason),
     }
@@ -5931,7 +5941,7 @@ mod tests {
     fn a_fabric_jar_declares_its_required_mods_minus_the_platform() {
         let jar = jar_with_entries(&[("fabric.mod.json", XAERO_FABRIC_JSON)]);
         assert_eq!(
-            declared_required_jar_ids(&jar, "fabric", "0.20.1").unwrap(),
+            declared_required_jar_ids(&jar, "fabric", "0.20.1", "1.21.1").unwrap(),
             vec!["fabric-api".to_string()]
         );
     }
@@ -5940,7 +5950,7 @@ mod tests {
     fn a_modern_fabric_loader_meets_a_mixinextras_requirement_without_a_jar() {
         let jar = jar_with_entries(&[("fabric.mod.json", MIXINEXTRAS_FABRIC_JSON)]);
         assert_eq!(
-            declared_required_jar_ids(&jar, "fabric", "0.20.1").unwrap(),
+            declared_required_jar_ids(&jar, "fabric", "0.20.1", "1.21.1").unwrap(),
             vec!["fabric-api".to_string()]
         );
     }
@@ -5948,7 +5958,7 @@ mod tests {
     #[test]
     fn an_old_fabric_loader_still_declares_mixinextras_as_a_jar_requirement() {
         let jar = jar_with_entries(&[("fabric.mod.json", MIXINEXTRAS_FABRIC_JSON)]);
-        let mut ids = declared_required_jar_ids(&jar, "fabric", "0.14.22").unwrap();
+        let mut ids = declared_required_jar_ids(&jar, "fabric", "0.14.22", "1.21.1").unwrap();
         ids.sort();
         assert_eq!(
             ids,
@@ -5963,14 +5973,18 @@ mod tests {
             "Manifest-Version: 1.0
 ",
         )]);
-        assert!(declared_required_jar_ids(&jar, "fabric", "0.20.1")
-            .unwrap()
-            .is_empty());
+        assert!(
+            declared_required_jar_ids(&jar, "fabric", "0.20.1", "1.21.1")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn an_unreadable_jar_is_an_error_not_an_empty_requirement_list() {
-        assert!(declared_required_jar_ids(b"not a zip archive", "fabric", "0.20.1").is_err());
+        assert!(
+            declared_required_jar_ids(b"not a zip archive", "fabric", "0.20.1", "1.21.1").is_err()
+        );
     }
 
     #[test]
@@ -5982,9 +5996,11 @@ mod tests {
 modId=\"xaerominimap\"
 ",
         )]);
-        assert!(declared_required_jar_ids(&jar, "fabric", "0.20.1")
-            .unwrap()
-            .is_empty());
+        assert!(
+            declared_required_jar_ids(&jar, "fabric", "0.20.1", "1.21.1")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn installed_named(registry_id: &str) -> InstalledMod {
@@ -6063,7 +6079,7 @@ modId=\"xaerominimap\"
     #[test]
     fn a_jar_that_cannot_be_read_is_unreadable_not_requirement_free() {
         assert!(matches!(
-            jar_requirements_from_bytes(b"not a zip archive", "fabric", "0.20.1"),
+            jar_requirements_from_bytes(b"not a zip archive", "fabric", "0.20.1", "1.21.1"),
             JarRequirements::Unreadable(_)
         ));
     }
@@ -6072,7 +6088,7 @@ modId=\"xaerominimap\"
     fn a_readable_jar_reports_its_requirements() {
         let jar = jar_with_entries(&[("fabric.mod.json", XAERO_FABRIC_JSON)]);
         assert!(matches!(
-            jar_requirements_from_bytes(&jar, "fabric", "0.20.1"),
+            jar_requirements_from_bytes(&jar, "fabric", "0.20.1", "1.21.1"),
             JarRequirements::Declared(ids) if ids == ["fabric-api".to_string()]
         ));
     }

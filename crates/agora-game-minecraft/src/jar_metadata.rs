@@ -190,7 +190,7 @@ pub fn parse_jar_metadata_result(jar_path: &Path) -> JarInventoryResult {
         }
     };
     let mut budget = NestedJarBudget::default();
-    let parsed = parse_from_archive(&mut archive, 0, &mut budget, MetadataScope::Any);
+    let parsed = parse_from_archive(&mut archive, 0, &mut budget, MetadataScope::Any, false);
     JarInventoryResult {
         metadata: parsed.metadata,
         status: parsed.status,
@@ -249,7 +249,99 @@ pub fn parse_jar_metadata_for_loader_with_status(
         0,
         &mut budget,
         MetadataScope::from_loader(loader),
+        false,
     )
+}
+
+/// Parse a JAR using only metadata for the active loader and Minecraft version.
+///
+/// NeoForge required `META-INF/neoforge.mods.toml` from Minecraft 1.20.5
+/// onward (https://neoforged.net/news/20.5release/); before that, a mod could
+/// still ship the Forge file `META-INF/mods.toml`. For those versions it is
+/// read under NeoForge scope when `neoforge.mods.toml` is absent, so its
+/// dependencies are not silently skipped.
+pub fn parse_jar_metadata_for_loader_at_mc(
+    jar_path: &Path,
+    loader: &str,
+    minecraft_version: &str,
+) -> JarDeps {
+    parse_jar_metadata_for_loader_with_status_at_mc(jar_path, loader, minecraft_version).metadata
+}
+
+/// Parse loader-specific metadata for a Minecraft version and report whether
+/// the JAR contains native metadata for the requested loader.
+pub fn parse_jar_metadata_for_loader_with_status_at_mc(
+    jar_path: &Path,
+    loader: &str,
+    minecraft_version: &str,
+) -> LoaderJarMetadata {
+    let file = match std::fs::File::open(jar_path) {
+        Ok(f) => f,
+        Err(_) => {
+            return LoaderJarMetadata {
+                metadata: JarDeps::default(),
+                has_native_metadata: false,
+                status: ParseStatus::Failed,
+                diagnostics: vec![ParseDiagnostic {
+                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
+                    entry_path: None,
+                    message: "The JAR could not be opened.".into(),
+                }],
+            }
+        }
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => {
+            return LoaderJarMetadata {
+                metadata: JarDeps::default(),
+                has_native_metadata: false,
+                status: ParseStatus::Failed,
+                diagnostics: vec![ParseDiagnostic {
+                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
+                    entry_path: None,
+                    message: "The JAR archive is malformed.".into(),
+                }],
+            }
+        }
+    };
+    let scope = MetadataScope::from_loader(loader);
+    let mut budget = NestedJarBudget::default();
+    parse_from_archive(
+        &mut archive,
+        0,
+        &mut budget,
+        scope,
+        neoforge_reads_forge_toml(scope, minecraft_version),
+    )
+}
+
+/// Whether NeoForge should read the Forge TOML for this Minecraft version.
+fn neoforge_reads_forge_toml(scope: MetadataScope, minecraft_version: &str) -> bool {
+    matches!(scope, MetadataScope::NeoForge) && minecraft_before_1_20_5(minecraft_version)
+}
+
+/// Whether a Minecraft version is older than 1.20.5.
+///
+/// Only the leading numeric components matter here, so this stays local to the
+/// package rather than reaching into a general-purpose comparator. A snapshot
+/// or otherwise unrecognizable version is never treated as old, so the legacy
+/// Forge file is not read on a version we cannot place.
+fn minecraft_before_1_20_5(version: &str) -> bool {
+    let mut parts = version.split('.').take(3).map(|part| {
+        part.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    if (major, minor, patch) == (0, 0, 0) {
+        return false;
+    }
+    (major, minor, patch) < (1, 20, 5)
 }
 
 /// Parse loader-specific metadata directly from verified JAR bytes.
@@ -276,6 +368,41 @@ pub fn parse_jar_metadata_bytes_for_loader(bytes: &[u8], loader: &str) -> Loader
         0,
         &mut budget,
         MetadataScope::from_loader(loader),
+        false,
+    )
+}
+
+/// Parse loader-specific metadata directly from verified JAR bytes for a
+/// specific Minecraft version.
+pub fn parse_jar_metadata_bytes_for_loader_at_mc(
+    bytes: &[u8],
+    loader: &str,
+    minecraft_version: &str,
+) -> LoaderJarMetadata {
+    let cursor = Cursor::new(bytes);
+    let mut archive = match zip::ZipArchive::new(cursor) {
+        Ok(a) => a,
+        Err(_) => {
+            return LoaderJarMetadata {
+                metadata: JarDeps::default(),
+                has_native_metadata: false,
+                status: ParseStatus::Failed,
+                diagnostics: vec![ParseDiagnostic {
+                    kind: ParseDiagnosticKind::ArchiveOpenFailed,
+                    entry_path: None,
+                    message: "The JAR archive is malformed.".into(),
+                }],
+            }
+        }
+    };
+    let scope = MetadataScope::from_loader(loader);
+    let mut budget = NestedJarBudget::default();
+    parse_from_archive(
+        &mut archive,
+        0,
+        &mut budget,
+        scope,
+        neoforge_reads_forge_toml(scope, minecraft_version),
     )
 }
 
@@ -555,6 +682,7 @@ fn parse_from_archive<R: Read + Seek>(
     depth: u32,
     budget: &mut NestedJarBudget,
     scope: MetadataScope,
+    read_forge_toml_for_neoforge: bool,
 ) -> LoaderJarMetadata {
     if depth > MAX_NESTING_DEPTH {
         return LoaderJarMetadata {
@@ -587,6 +715,14 @@ fn parse_from_archive<R: Read + Seek>(
     let include_quilt = scope.includes_quilt();
     let include_forge = scope.includes_forge();
     let include_neoforge = scope.includes_neoforge();
+    // NeoForge before Minecraft 1.20.5 still loads Forge's `mods.toml` when
+    // the renamed `neoforge.mods.toml` is absent.
+    let include_forge_toml = include_forge || (read_forge_toml_for_neoforge && include_neoforge);
+    let forge_toml_source = if include_forge {
+        DependencySource::ForgeDependency
+    } else {
+        DependencySource::NeoForgeDependency
+    };
     let mut packages: BTreeSet<String> = BTreeSet::new();
     let mut mod_jar_id: Option<String> = None;
     let mut mod_version: Option<String> = None;
@@ -773,8 +909,9 @@ fn parse_from_archive<R: Read + Seek>(
             continue;
         }
         if name == "META-INF/mods.toml"
-            && include_forge
-            && !(matches!(scope, MetadataScope::Any) && has_neoforge_metadata)
+            && include_forge_toml
+            && !(matches!(scope, MetadataScope::Any | MetadataScope::NeoForge)
+                && has_neoforge_metadata)
             && !saw_neoforge_toml
         {
             match read_entry_utf8_bounded(archive, i, MAX_METADATA_TEXT_BYTES) {
@@ -791,7 +928,7 @@ fn parse_from_archive<R: Read + Seek>(
                             &mut dependency_decls,
                             &mut forge_mod_id,
                             &mut forge_version,
-                            DependencySource::ForgeDependency,
+                            forge_toml_source,
                             &mut status,
                         );
                     }
@@ -996,7 +1133,13 @@ fn parse_from_archive<R: Read + Seek>(
                 continue;
             }
         };
-        let nested = parse_from_archive(&mut nested_archive, depth + 1, budget, scope);
+        let nested = parse_from_archive(
+            &mut nested_archive,
+            depth + 1,
+            budget,
+            scope,
+            read_forge_toml_for_neoforge,
+        );
         let nested_metadata = nested.metadata;
         if nested.status != ParseStatus::Complete {
             status.record_partial();
@@ -2803,6 +2946,108 @@ versionRange="(,2.0]"
         let meta = parse_jar_metadata(&jar);
         let _ = std::fs::remove_file(&jar);
         assert_eq!(meta.mod_version.as_deref(), Some("0.4.1"));
+    }
+
+    // --- NeoForge reads Forge's mods.toml before 1.20.5 -------------------
+
+    const FORGE_ONLY_TOML: &str = "modLoader=\"javafml\"\nloaderVersion=\"[47,)\"\n[[mods]]\nmodId=\"forgeonly\"\nversion=\"1.0\"\n[[dependencies.forgeonly]]\nmodId=\"ferritecore\"\ntype=\"required\"\n";
+
+    #[test]
+    fn neoforge_before_1_20_5_reads_forge_mods_toml() {
+        let jar = build_test_jar(&[("META-INF/mods.toml", FORGE_ONLY_TOML)]);
+        let parsed = parse_jar_metadata_for_loader_with_status_at_mc(&jar, "neoforge", "1.20.4");
+        let _ = std::fs::remove_file(&jar);
+
+        assert_eq!(parsed.status, ParseStatus::Complete);
+        assert!(parsed.has_native_metadata);
+        assert_eq!(parsed.metadata.mod_jar_id.as_deref(), Some("forgeonly"));
+        assert!(parsed
+            .metadata
+            .depends_on
+            .contains(&"ferritecore".to_string()));
+        let decl = parsed
+            .metadata
+            .dependency_decls
+            .iter()
+            .find(|decl| decl.target_id == "ferritecore")
+            .expect("ferritecore declaration");
+        assert_eq!(decl.source, DependencySource::NeoForgeDependency);
+    }
+
+    #[test]
+    fn neoforge_from_1_20_5_ignores_forge_mods_toml() {
+        for minecraft_version in ["1.20.5", "1.21", "1.21.1"] {
+            let jar = build_test_jar(&[("META-INF/mods.toml", FORGE_ONLY_TOML)]);
+            let parsed = parse_jar_metadata_for_loader_with_status_at_mc(
+                &jar,
+                "neoforge",
+                minecraft_version,
+            );
+            let _ = std::fs::remove_file(&jar);
+
+            assert_eq!(parsed.status, ParseStatus::Complete);
+            assert!(!parsed.has_native_metadata, "{minecraft_version}");
+            assert!(parsed.metadata.depends_on.is_empty(), "{minecraft_version}");
+        }
+    }
+
+    #[test]
+    fn neoforge_prefers_neoforge_mods_toml_when_both_exist_before_1_20_5() {
+        let jar = build_test_jar(&[
+            ("META-INF/mods.toml", FORGE_ONLY_TOML),
+            (
+                "META-INF/neoforge.mods.toml",
+                "modLoader=\"javafml\"\nloaderVersion=\"[1,)\"\n[[mods]]\nmodId=\"neomod\"\nversion=\"2.0\"\n[[dependencies.neomod]]\nmodId=\"neodep\"\ntype=\"required\"\n",
+            ),
+        ]);
+        let parsed = parse_jar_metadata_for_loader_with_status_at_mc(&jar, "neoforge", "1.20.4");
+        let _ = std::fs::remove_file(&jar);
+
+        assert_eq!(parsed.status, ParseStatus::Complete);
+        assert_eq!(parsed.metadata.mod_jar_id.as_deref(), Some("neomod"));
+        assert!(parsed.metadata.depends_on.contains(&"neodep".to_string()));
+        assert!(!parsed
+            .metadata
+            .depends_on
+            .contains(&"ferritecore".to_string()));
+    }
+
+    #[test]
+    fn forge_still_reads_mods_toml_at_any_version() {
+        let jar = build_test_jar(&[("META-INF/mods.toml", FORGE_ONLY_TOML)]);
+        let parsed = parse_jar_metadata_for_loader_with_status_at_mc(&jar, "forge", "1.21");
+        let _ = std::fs::remove_file(&jar);
+
+        assert_eq!(parsed.status, ParseStatus::Complete);
+        assert!(parsed.has_native_metadata);
+        assert!(parsed
+            .metadata
+            .depends_on
+            .contains(&"ferritecore".to_string()));
+    }
+
+    #[test]
+    fn neoforge_before_1_20_5_without_either_toml_is_unchanged() {
+        let jar = build_test_jar(&[("assets/example/test.txt", "content")]);
+        let parsed = parse_jar_metadata_for_loader_with_status_at_mc(&jar, "neoforge", "1.20.4");
+        let _ = std::fs::remove_file(&jar);
+
+        assert_eq!(parsed.status, ParseStatus::Complete);
+        assert!(!parsed.has_native_metadata);
+        assert!(parsed.metadata.depends_on.is_empty());
+    }
+
+    #[test]
+    fn neoforge_before_1_20_5_reports_malformed_forge_mods_toml() {
+        let jar = build_test_jar(&[("META-INF/mods.toml", "modId = [this is not toml")]);
+        let parsed = parse_jar_metadata_for_loader_with_status_at_mc(&jar, "neoforge", "1.20.4");
+        let _ = std::fs::remove_file(&jar);
+
+        assert_eq!(parsed.status, ParseStatus::Partial);
+        assert!(parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == ParseDiagnosticKind::MetadataMalformed));
     }
 
     #[test]

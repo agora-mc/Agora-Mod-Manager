@@ -1093,7 +1093,11 @@ fn build_pack_entry(
     let source_url = theirs.download_urls.get(logical_path).cloned();
     let staged_path = safe_join(staged_dir, logical_path)?;
     let jar = if ct == "mod" && staged_path.is_file() {
-        crate::jar_metadata::parse_jar_metadata_for_loader(&staged_path, &old.loader)
+        crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+            &staged_path,
+            &old.loader,
+            &old.minecraft_version,
+        )
     } else {
         agora_core::dependency_ops::JarDeps::default()
     };
@@ -1360,9 +1364,10 @@ pub fn reconcile_manifest(
                     let staged_path = safe_join(staged_dir, theirs_path_str)?;
                     let jar = if ct == "mod" {
                         if staged_path.is_file() {
-                            crate::jar_metadata::parse_jar_metadata_for_loader(
+                            crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
                                 &staged_path,
                                 &old.loader,
+                                &old.minecraft_version,
                             )
                         } else {
                             agora_core::dependency_ops::JarDeps::default()

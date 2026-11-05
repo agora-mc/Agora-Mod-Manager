@@ -1,5 +1,6 @@
 use crate::jar_metadata::{
-    is_platform_dependency, parse_jar_metadata_for_loader_with_status, ParseDiagnostic, ParseStatus,
+    is_platform_dependency, parse_jar_metadata_for_loader_with_status_at_mc, ParseDiagnostic,
+    ParseStatus,
 };
 use crate::loader_compatibility::{
     evaluate_loader_compatibility, CurrentLoaderStatus, LoaderCompatibilityReport,
@@ -882,7 +883,11 @@ fn inventory_with_parser_result(
                         cached.diagnostics.clone(),
                     )
                 } else {
-                    let parsed = parse_jar_metadata_for_loader_with_status(&path, &manifest.loader);
+                    let parsed = parse_jar_metadata_for_loader_with_status_at_mc(
+                        &path,
+                        &manifest.loader,
+                        &manifest.minecraft_version,
+                    );
                     if use_cache {
                         if let Some((file_size, modified_ns, file_identity)) = file_state {
                             refreshed_cache.push(PersistentJarMetadataEntry {
