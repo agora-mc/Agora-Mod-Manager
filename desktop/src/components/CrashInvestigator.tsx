@@ -54,7 +54,8 @@ interface CrashInvestigatorProps {
 }
 
 function investigationResultFromEvidence(investigation: CrashInvestigation): InvestigationResult {
-  const top = investigation.suspects[0];
+  // A zero score means the mod is installed, not that it is suspicious.
+  const top = investigation.suspects.find((suspect) => suspect.total_score > 0);
   return {
     fingerprint: investigation.fingerprint,
     signature_name: investigation.triage.signature_name,

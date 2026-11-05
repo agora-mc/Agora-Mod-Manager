@@ -35,14 +35,14 @@ pub fn record_crash_event<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     instance_id: &str,
     fingerprint: &CrashFingerprint,
-    mod_ids: &[String],
+    suspects: &[SuspectScore],
     signature_name: Option<&str>,
 ) -> LauncherResult<i64> {
     let ctx = crate::core_context(app)?;
     agora_core::crash_service::CrashService::new(ctx).record_crash_event(
         instance_id,
         fingerprint,
-        mod_ids,
+        suspects,
         signature_name,
     )
 }
@@ -55,6 +55,21 @@ pub fn record_survival<R: tauri::Runtime>(
 ) -> LauncherResult<()> {
     let ctx = crate::core_context(app)?;
     agora_core::crash_service::CrashService::new(ctx).record_survival(instance_id, mod_ids)
+}
+
+/// Record a survival only when the observed launch outcome was clean.
+pub fn record_survival_if_clean<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    instance_id: &str,
+    mod_ids: &[String],
+    outcome: &agora_core::lkg::LaunchOutcome,
+) -> LauncherResult<bool> {
+    let ctx = crate::core_context(app)?;
+    agora_core::crash_service::CrashService::new(ctx).record_survival_if_clean(
+        instance_id,
+        mod_ids,
+        outcome,
+    )
 }
 
 /// Increment the confirmation count for a mod_id matching a fingerprint.

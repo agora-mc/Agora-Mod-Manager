@@ -1,8 +1,6 @@
-use crate::crash_investigator;
 use crate::error::{LauncherError, LauncherResult};
 use crate::models::InstanceRow;
 use crate::mojang;
-use crate::paths;
 use std::path::Path;
 
 pub use agora_game_minecraft::instance_service::{CreateInstanceRequest, InstanceDetail};
@@ -291,9 +289,7 @@ pub fn launch_instance<R: tauri::Runtime>(
         .spawn()
         .map_err(|_| LauncherError::LaunchFailed)?;
 
-    // Signal D: record which mods survived this launch for survival baseline learning.
-    let sanitized = paths::sanitize_id(instance_id);
-    let _ = crash_investigator::record_survival(app, &sanitized, &preparation.mod_ids);
-
+    // Survival is recorded when the launch ends cleanly, not when it starts:
+    // see the delegated monitor and the direct launch's `finished` callback.
     Ok(())
 }
