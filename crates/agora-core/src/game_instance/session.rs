@@ -151,7 +151,8 @@ pub fn stop(
     processes_ended += terminate_tree(&alive);
     wait_until_gone(&alive, &jobs, STOP_TIMEOUT)?;
 
-    let play_time_ms = match end_session(ctx, definition, &store)? {
+    let ended = end_session_once_gone(STOP_TIMEOUT, || end_session(ctx, definition, &store))?;
+    let play_time_ms = match ended {
         Some(end) => {
             if end.instance_id != instance_id {
                 return Err(InstanceError::Other(format!(
@@ -170,6 +171,25 @@ pub fn stop(
         processes_ended,
         play_time_ms,
     })
+}
+
+/// Run the session end, retrying while the ended game is still leaving the process table. A job
+/// counts as empty a moment before Windows stops listing its processes, and restoring refuses
+/// while any process runs from the game folder, so a successful Stop could otherwise report that
+/// it failed. A process that really stays still gets the refusal once the time is up.
+fn end_session_once_gone<T>(
+    timeout: Duration,
+    mut end: impl FnMut() -> Result<T, InstanceError>,
+) -> Result<T, InstanceError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match end() {
+            Err(InstanceError::UserFiles(
+                game_user_files::UserFilesError::CannotRestoreRunning { .. },
+            )) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            other => return other,
+        }
+    }
 }
 
 /// A process to end: its pid and the start time that proves it is the same process.
@@ -246,5 +266,53 @@ fn wait_until_gone(
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    fn still_running() -> InstanceError {
+        InstanceError::UserFiles(game_user_files::UserFilesError::CannotRestoreRunning {
+            instance: "test".into(),
+        })
+    }
+
+    #[test]
+    fn a_stop_waits_for_the_ended_game_to_leave_the_process_table() {
+        let mut attempts = 0;
+        let result = end_session_once_gone(Duration::from_secs(5), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(still_running())
+            } else {
+                Ok(attempts)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn a_process_that_stays_still_gets_the_refusal() {
+        let result: Result<(), _> =
+            end_session_once_gone(Duration::from_millis(120), || Err(still_running()));
+        assert!(matches!(
+            result,
+            Err(InstanceError::UserFiles(
+                game_user_files::UserFilesError::CannotRestoreRunning { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn any_other_failure_is_not_retried() {
+        let mut attempts = 0;
+        let result: Result<(), _> = end_session_once_gone(Duration::from_secs(5), || {
+            attempts += 1;
+            Err(InstanceError::Other("broken".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
     }
 }

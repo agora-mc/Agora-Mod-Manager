@@ -453,3 +453,33 @@ fn two_games_with_one_image_name_each_report_their_own_exit() {
         assert_eq!(*seen, pid);
     }
 }
+
+/// Agora's Stop ended the game, but the exit watcher still held a handle to it, so the process
+/// table kept listing it and restoring the session refused: "cannot restore while session is
+/// running". An ended process is not running, whoever still holds its handle.
+#[test]
+fn an_ended_process_someone_still_holds_is_not_running() {
+    let dir = TempDir::new().unwrap();
+    let exe = dir.path().join(crasher().file_name().unwrap());
+    std::fs::copy(crasher(), &exe).unwrap();
+
+    let mut held = Command::new(&exe)
+        .args(["exit", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    // `try_wait` sees the exit and keeps the handle open, as the watcher does.
+    while held.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the test program did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        agora_core::game_launch::processes_running_from(dir.path()),
+        Vec::new(),
+        "an ended process counted as running"
+    );
+    drop(held);
+}
