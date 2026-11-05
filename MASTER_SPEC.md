@@ -4054,8 +4054,8 @@ Most people who will try this already have a setup. Import has to be good.
   - Profiles become instances with their local saves and local INIs.
   The MO2 setup is left untouched and working.
 - **Vortex**: deployment manifests (`vortex.deployment*.json`) list every deployed file and its
-  staging source; the staging folder holds the mods. Import copies from staging and offers to purge
-  Vortex's deployment and verify the store install, since Vortex leaves the game folder modified.
+  staging source; the staging folder holds the mods. Import copies from staging. Vortex leaves the game folder
+  modified; §30.10 replaces the earlier offer to purge during import with a separate, explicit cleanup option.
   Not measured yet: no Vortex-managed Skyrim was available (FINDINGS, *Not measured*).
 - **Wabbajack** lists are MO2 setups with a stock-game folder and import as MO2, with the stock game
   recognised as a base.
@@ -4878,3 +4878,88 @@ runs. Minecraft is the reference; another game must look like the same app, not 
 - **§26.14's "a slice never edits the shell" is retired.** It kept anyone from owning the
   experience across slots and caused the duplication this section removes. Slices may change the
   shell and the kit when their work needs it; the kit's owner reviews kit changes.
+
+---
+
+## 30. OPEN GAME PLATFORM AND UNIVERSAL CRASH DOCTOR
+
+*(Decided 2026-11-05. Research reports were kept outside the repository. Corrects §26.10 and §26.11.)*
+
+### 30.1 Goals
+
+1. A community author can add a game as well as we can. Roughly 99% of what game support needs must be possible in a plugin, **with no fork of Agora**, including file formats Agora has never heard of.
+2. One crash doctor serves every game, and aims to beat every existing Skyrim analyzer on a benchmark we can show.
+3. Cyberpunk 2077, with a Vortex importer, proves both, because it is nothing like Skyrim.
+
+§26.11 claimed community parity was structural. It was not: `semantics` accepted only `creation_engine`, the `GamePackage` behaviour hooks had no callers, and plugin scripts could reach only Minecraft instances. A JSON Cyberpunk package loaded and identified a real install, but could not give a working modded game.
+
+### 30.2 Where game knowledge lives
+
+| Tier | Holds | Status |
+|---|---|---|
+| Data (JSON) | Game definitions, rules, signatures | Exists; gets more general (§30.3) |
+| Scripts (QuickJS) | Parsers, including binary formats through scoped byte-level reads; anything data can't say | Exists; needs game instance access |
+| WebAssembly | The same, when a script is too slow, or a library is written in another language. One build runs everywhere, in a sandbox | Trial slice, as a second `ScriptHost` |
+| Helper program | Last resort: a separate process with full access, behind a warning-walled Settings toggle, off by default | Not built until a named plugin needs it. Never an in-process DLL |
+
+- **Official code plugs into the same slots.** It gets no special access, as *Official providers are not privileged* already says for content providers.
+- **No compiled Bethesda crate.** Parsers for Creation Engine formats are scripts inside the Creation Engine plugin, so people who don't install it carry nothing, and they update without an app release. **Official plugins therefore stop being data-only.** Measured on QuickJS: a real crash log parsed in 16 ms, 2 MB of binary records in 29 ms.
+- **LOOT moves out of core.** The owner wants `libloot` in the Creation Engine plugin, and the same goes for core's Creation Engine load-order rules. A WebAssembly build of `libloot` is the candidate, and it gives the WebAssembly trial a real job. Feasibility is unverified; if it fails, it comes back to the owner rather than quietly staying.
+- `agora-game-creation` stays a test helper and never ships.
+
+### 30.3 Platform changes
+
+- `load_orders: []` replaces the single `plugin_list`: any number, any location, open rule sets.
+- One small condition language used everywhere (`present`, `framework`, `version`), first for launch arguments.
+- Tools get declared inputs, a scope, and "must run before launch".
+- `content_rules` go live: place a file by its type or marker file.
+- `parents` becomes real package inheritance.
+- Plugin scripts reach game instances. Unused `GamePackage` hooks get wired up or deleted.
+- A game-author guide, plus a check that official plugins use only what is documented.
+- The Skyrim package splits into a Creation Engine base and Skyrim; installing Skyrim brings the base along.
+
+This must land before the first public release of the plugin format. Merging to master does not depend on it.
+
+### 30.4 The crash doctor pipeline
+
+Launch record, then verdict (crashed, failed to start, froze, stopped, normal, can't tell), evidence collection, parsing to typed facts, attribution of each fact to the mod that provides it, rules over facts, consensus or abstention, an answer, and repairs or bisect. Core holds the pipeline and no game knowledge. Each game supplies its sources, parsers and rules through the §30.2 tiers.
+
+- **Launch records come first.** History can't be recorded backwards. Each launch records what it ran with, so a crash can be compared with the last good launch.
+- **Evidence sweep.** Agora's real advantage over a web page is the file system. After a crash it gathers every text or log file changed during the session, compares them with the last clean session, and attributes each to its mod. Keyword scanning alone is noise.
+- **Evidence is copied at once,** because loggers delete old logs. Agora keeps a retention limit on what it stores, and must not hoard logs.
+- **Agora asks before changing another tool's settings,** and shows the exact change.
+- **Rule keys survive updates.** Skyrim rules match Address Library IDs, not raw addresses. Function names are not shipped: the name database has no licence.
+- **Minidumps:** error, modules and stack scan only. Full analysis isn't worth the cost.
+- **Learning locally.** Agora may rank a suspect higher if a past fix on this PC confirms it, but memory alone never accuses a mod.
+
+### 30.5 How answers speak
+
+Agora never says a mod is definitely the cause, because false positives are always possible. Wording stays at levels like "very likely", "likely" and "possible", and Agora says "not sure" when it isn't. There is no review system or confidence cap for plugin rules: it would confuse users more than it protects them.
+
+### 30.6 Exit codes
+
+Measured on Skyrim through SKSE under the VFS: a normal quit exited 0 (one launch). A Crash Logger crash exits 1 and logs its process ID, so a log matches a launch exactly. Agora's Stop also exited 1, so Stop gets a distinct code and is recorded as requested. Exit codes are per-game data.
+
+### 30.7 Minecraft and the migration
+
+Minecraft moves onto the engine first, because that proves it with no game running; Skyrim follows directly. Abstractions come first and get refined as concrete games arrive, and the contract freezes only once Skyrim's parsers exist.
+
+The old tool is replaced by **comparison, not matching**: both run over real logs, every difference is explained, and the new tool may never be worse on a case with a known cause. Matching would preserve its bugs.
+
+### 30.8 Measuring it
+
+- **Corpus:** real public logs with confirmed fixes. **They stay on the developer's PC and never enter the repository or the product,** public or otherwise. Repository tests use logs we write ourselves.
+- **Benchmark:** Phostwood's analyzer, run unmodified and locally, is the baseline. Labels note when a thread's answer came from an analyzer, since that flatters it.
+- **Bar:** top-1 at least 55% and 10 points above Phostwood, top-3 at least 75%, plus false alarms and silence measured. 100 cases can prove only a 15-point lead; 10 points needs about 235.
+- **Expected** (a judgement, not a measurement): top-1 45-60%, top-3 65-80%. Roughly 20-30% of crashes can't be diagnosed from any log, so those go to bisect.
+- **Phostwood button:** a fallback, always started by the user, sending only the crash log and saying so. It goes away once our tool makes it unnecessary.
+
+### 30.9 Licences
+
+Reuse is allowed from Agora-compatible code only: Aternos's `codex-minecraft` (MIT), HMCL and Tullius CTD Logger (GPL). We write our own rules. CLASSIC (CC BY-NC) is ideas only. **Nobody on this project reads Crash Assistant's source:** its licence is a non-compete that reaches know-how, even for free tools.
+
+### 30.10 Vortex
+
+The importer reads a copy of Vortex's state (opening the original changes it). A clean base is built by subtraction from the store's file list, and files found only in the game folder are reported, never silently lost.
+
+**Cleaning up a game folder is a separate, explicit user option,** with a list of what it would remove and a backup first, for people who want to use their install directly, or whose Vortex refuses to work with it. Agora never does this on its own. This replaces §26.10's offer to purge during import.
