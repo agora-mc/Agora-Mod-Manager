@@ -184,7 +184,7 @@ describe('PageHero and EmptyState', () => {
       />,
     );
     expect(screen.getByRole('heading', { name: 'Instances' })).toBeInTheDocument();
-    expect(screen.getByTestId('hero').querySelectorAll('.settings-hero-chip')).toHaveLength(1);
+    expect(screen.getByTestId('hero').querySelectorAll('.hero-chip')).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'New instance' }));
     expect(onCreate).toHaveBeenCalled();
   });

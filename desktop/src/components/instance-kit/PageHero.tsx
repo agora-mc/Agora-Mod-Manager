@@ -22,7 +22,7 @@ interface PageHeroProps {
 }
 
 export function PageHero({ icon, title, description, chips = [], actions, className, testId }: PageHeroProps) {
-  const shownChips = chips.filter((chip) => chip !== null && chip !== undefined && chip !== false);
+  const shownChips = chips.filter((chip) => chip !== null && chip !== undefined && chip !== false && chip !== '');
   return (
     <BasePageHero
       icon={icon}
