@@ -130,6 +130,19 @@ export function frameworksMatch(check: InstanceCheck | null): boolean | null {
   return !check.findings.some((finding) => finding.kind === 'framework' && finding.blocks);
 }
 
+/**
+ * The Overview's one line about frameworks. A framework a mod needs and the instance lacks does not
+ * stop a launch, but the line must not read as all clear next to that warning.
+ */
+export function frameworksText(check: InstanceCheck | null): string {
+  const matches = frameworksMatch(check);
+  if (matches === null) return 'Not checked';
+  if (!matches) return 'Do not match this game version';
+  return check?.findings.some((finding) => finding.kind === 'framework')
+    ? 'Need a look: see the checks'
+    : 'Match this game version';
+}
+
 /** The findings that stop a launch, then the ones to review, in the order the page shows them. */
 export function orderFindings(findings: readonly CheckFinding[]): CheckFinding[] {
   return [...findings].sort((a, b) => Number(b.blocks) - Number(a.blocks));

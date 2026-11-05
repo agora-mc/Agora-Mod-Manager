@@ -881,7 +881,12 @@ enum CatalogCmd {
         /// overrides a published hash that differs, nor a framework refusal.
         #[arg(long)]
         install_anyway: bool,
-        /// Show the plan and stop before anything is downloaded or stored.
+        /// Install although a framework the entry requires is absent, too old, undetectable or
+        /// not declared by the game. The mod probably won't work until the framework is added.
+        #[arg(long)]
+        allow_missing_frameworks: bool,
+        /// Show the plan, naming any unmet framework, and stop before anything is downloaded or
+        /// stored.
         #[arg(long)]
         dry_run: bool,
     },
@@ -6196,6 +6201,7 @@ async fn run_command(
                     instance_id,
                     item_id,
                     install_anyway,
+                    allow_missing_frameworks,
                     dry_run,
                 } => {
                     let svc = RegistryService::new(ctx.clone());
@@ -6212,6 +6218,7 @@ async fn run_command(
                         instance_id: &instance_id,
                         item: &item,
                         install_anyway,
+                        allow_missing_frameworks,
                         dry_run,
                     };
                     let report = agora_core::catalog_install::install(
@@ -6229,7 +6236,16 @@ async fn run_command(
                             }
                         },
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|error| {
+                        if !json
+                            && agora_core::catalog_install::is_framework_refusal(&error.code())
+                        {
+                            eprintln!(
+                                "Add the framework, or pass --allow-missing-frameworks to install without it. The mod probably won't work until you add it."
+                            );
+                        }
+                    })?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
@@ -8189,6 +8205,7 @@ async fn run_command(
                         runtime: findings,
                         load_order,
                         outputs: generated,
+                        requirements,
                         passed: _,
                     } = match agora_core::game_instance::launch_checks(ctx, &record, game_def) {
                         Ok(checks) => checks,
@@ -8207,7 +8224,11 @@ async fn run_command(
                     // Tool output that is stale or unknown is a warning, never a refusal (§26.9).
                     let status = if refuses {
                         "findings"
-                    } else if findings.is_empty() && load_order.is_empty() && generated.is_empty() {
+                    } else if findings.is_empty()
+                        && load_order.is_empty()
+                        && generated.is_empty()
+                        && requirements.is_empty()
+                    {
                         "ok"
                     } else {
                         "warnings"
@@ -8220,6 +8241,7 @@ async fn run_command(
                             "findings": findings,
                             "load_order_findings": load_order,
                             "generated_findings": generated,
+                            "requirement_findings": requirements,
                             "exitCode": if refuses { 1 } else { 0 },
                         });
                         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -8228,15 +8250,18 @@ async fn run_command(
                             "Instance '{instance_id}' runs from its install folder, which has no framework check."
                         );
                     } else {
-                        if findings.is_empty() {
+                        if findings.is_empty() && requirements.is_empty() {
                             println!("No framework problems found in instance '{instance_id}'.");
                         } else {
                             println!(
                                 "Instance '{instance_id}' has {} framework problem(s):",
-                                findings.len()
+                                findings.len() + requirements.len()
                             );
                             for line in runtime_finding_lines(&findings) {
                                 println!("{line}");
+                            }
+                            for finding in &requirements {
+                                println!("- {}", finding.summary());
                             }
                         }
                         if game_def.plugin_list.is_some() {
@@ -10957,6 +10982,18 @@ fn print_catalog_report(report: &agora_core::catalog_install::InstallReport) {
     }
     for warning in &plan.warnings {
         eprintln!("Warning: {warning}");
+    }
+    for unmet in &plan.unmet_frameworks {
+        eprintln!("Warning: {}", unmet.message);
+        if let Some(entry) = &unmet.catalog_entry {
+            eprintln!(
+                "The catalog has it: agora games catalog install {} {}",
+                plan.instance_id, entry.id
+            );
+        }
+    }
+    if matches!(report.state, InstallState::DryRun) && !plan.unmet_frameworks.is_empty() {
+        eprintln!("Installing this needs --allow-missing-frameworks.");
     }
     match &plan.source {
         PlannedSource::GithubRelease {
@@ -13873,6 +13910,36 @@ mod tests {
         let other =
             super::defaults_refusal_text(&agora_core::content_fomod::FomodError::NothingToInstall);
         assert_eq!(other, "the chosen options install no files");
+    }
+
+    #[test]
+    fn the_framework_override_is_its_own_flag_and_off_by_default() {
+        let parsed = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["agora", "games", "catalog", "install", "inst", "item"]
+                    .iter()
+                    .chain(args),
+            )
+            .expect("should parse");
+            let Commands::Games {
+                action:
+                    crate::GamesCmd::Catalog {
+                        action:
+                            crate::CatalogCmd::Install {
+                                install_anyway,
+                                allow_missing_frameworks,
+                                ..
+                            },
+                    },
+            } = cli.command
+            else {
+                panic!("expected catalog install");
+            };
+            (install_anyway, allow_missing_frameworks)
+        };
+        assert_eq!(parsed(&[]), (false, false));
+        assert_eq!(parsed(&["--install-anyway"]), (true, false));
+        assert_eq!(parsed(&["--allow-missing-frameworks"]), (false, true));
     }
 
     #[test]

@@ -4,8 +4,8 @@
 
 use agora_core::artifact_hash::HashOrigin;
 use agora_core::catalog_install::{
-    self, CatalogPlan, FrameworkCheck, HashReport, HttpTransport, InstallReport, InstallRequest,
-    InstallState, PlannedSource,
+    self, CatalogPlan, FrameworkCheck, FrameworkProblem, HashReport, HttpTransport, InstallReport,
+    InstallRequest, InstallState, PlannedSource, UnmetFramework,
 };
 use agora_core::game_registry::GameRegistry;
 use agora_core::github_release::GitHubAuth;
@@ -152,7 +152,9 @@ pub struct CatalogInstallRequest {
     /// Accept a file that differs from a curator pin or an earlier install. Never accepts a
     /// published hash that differs, and never overrides a framework refusal.
     pub install_anyway: bool,
-    /// Plan only: nothing is downloaded or stored.
+    /// Install although a required framework is unmet, as the user chose.
+    pub allow_missing_frameworks: bool,
+    /// Plan only: nothing is downloaded or stored. An unmet framework is named, not refused.
     pub dry_run: bool,
 }
 
@@ -180,6 +182,8 @@ pub struct PlanDto {
     pub release: Option<String>,
     pub size: Option<u64>,
     pub frameworks: Vec<FrameworkDto>,
+    /// The required frameworks that are not met. Only a dry run or a chosen override gets this far.
+    pub unmet_frameworks: Vec<UnmetFrameworkDto>,
     pub warnings: Vec<String>,
 }
 
@@ -191,6 +195,29 @@ pub struct FrameworkDto {
     pub min_version: Option<String>,
     /// `None` when the framework is present but its version cannot be read.
     pub found_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnmetFrameworkDto {
+    pub framework: String,
+    pub name: String,
+    pub min_version: Option<String>,
+    /// `absent`, `too_old`, `undetectable` or `undeclared`.
+    pub problem: &'static str,
+    /// The version found, when it is `too_old`.
+    pub found_version: Option<String>,
+    /// The warning to show, as core words it.
+    pub message: String,
+    /// The catalog entry that provides it, when there is one.
+    pub catalog_entry: Option<CatalogEntryRefDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogEntryRefDto {
+    pub id: String,
+    pub name: String,
 }
 
 /// The hash outcome in words the screen can show: whether a source or a curator checked the file,
@@ -279,6 +306,7 @@ pub async fn games_catalog_install(
             instance_id: &request.instance_id,
             item: &item,
             install_anyway: request.install_anyway,
+            allow_missing_frameworks: request.allow_missing_frameworks,
             dry_run: request.dry_run,
         };
         // The install is async (it may download). It runs to completion on this blocking thread
@@ -354,6 +382,11 @@ impl From<&CatalogPlan> for PlanDto {
             release: plan.source.release().map(str::to_string),
             size: source_size(&plan.source),
             frameworks: plan.frameworks.iter().map(FrameworkDto::from).collect(),
+            unmet_frameworks: plan
+                .unmet_frameworks
+                .iter()
+                .map(UnmetFrameworkDto::from)
+                .collect(),
             warnings: plan.warnings.clone(),
         }
     }
@@ -366,6 +399,32 @@ impl From<&FrameworkCheck> for FrameworkDto {
             name: check.name.clone(),
             min_version: check.min_version.clone(),
             found_version: check.found_version.clone(),
+        }
+    }
+}
+
+impl From<&UnmetFramework> for UnmetFrameworkDto {
+    fn from(unmet: &UnmetFramework) -> Self {
+        let (problem, found_version) = match &unmet.problem {
+            FrameworkProblem::Absent => ("absent", None),
+            FrameworkProblem::TooOld { found } => ("too_old", Some(found.clone())),
+            FrameworkProblem::Undetectable => ("undetectable", None),
+            FrameworkProblem::Undeclared { .. } => ("undeclared", None),
+        };
+        Self {
+            framework: unmet.framework.clone(),
+            name: unmet.name.clone(),
+            min_version: unmet.min_version.clone(),
+            problem,
+            found_version,
+            message: unmet.message.clone(),
+            catalog_entry: unmet
+                .catalog_entry
+                .as_ref()
+                .map(|entry| CatalogEntryRefDto {
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                }),
         }
     }
 }
@@ -462,6 +521,54 @@ mod tests {
     }
 
     #[test]
+    fn an_unmet_framework_reaches_the_screen_with_its_kind_words_and_link() {
+        let unmet = |problem| UnmetFramework {
+            framework: "skse".into(),
+            name: "Skyrim Script Extender".into(),
+            min_version: Some("2.2.6".into()),
+            problem,
+            catalog_entry: Some(agora_core::catalog_install::CatalogEntryRef {
+                id: "skse64".into(),
+                name: "SKSE64".into(),
+            }),
+            message: "This mod needs it.".into(),
+        };
+        let value =
+            serde_json::to_value(UnmetFrameworkDto::from(&unmet(FrameworkProblem::TooOld {
+                found: "2.2.5".into(),
+            })))
+            .unwrap();
+        assert_eq!(value["problem"], "too_old");
+        assert_eq!(value["foundVersion"], "2.2.5");
+        assert_eq!(value["minVersion"], "2.2.6");
+        assert_eq!(value["message"], "This mod needs it.");
+        assert_eq!(value["catalogEntry"]["id"], "skse64");
+        for (problem, kind) in [
+            (FrameworkProblem::Absent, "absent"),
+            (FrameworkProblem::Undetectable, "undetectable"),
+            (
+                FrameworkProblem::Undeclared { malformed: None },
+                "undeclared",
+            ),
+        ] {
+            assert_eq!(UnmetFrameworkDto::from(&unmet(problem)).problem, kind);
+        }
+    }
+
+    #[test]
+    fn the_override_defaults_to_nothing_a_request_must_name_it() {
+        let request = serde_json::json!({
+            "gameId": "skyrim-se",
+            "instanceId": "i",
+            "entryId": "e",
+            "installAnyway": true,
+            "dryRun": false,
+        });
+        // A request that does not say is refused here, rather than read as either answer.
+        assert!(serde_json::from_value::<CatalogInstallRequest>(request).is_err());
+    }
+
+    #[test]
     fn a_placed_install_names_its_state_and_its_hash_basis() {
         let hash = HashDto {
             sha256: "ab".repeat(32),
@@ -479,6 +586,7 @@ mod tests {
                 release: None,
                 size: Some(10),
                 frameworks: vec![],
+                unmet_frameworks: vec![],
                 warnings: vec![],
             },
             content_item_id: "c-1".into(),

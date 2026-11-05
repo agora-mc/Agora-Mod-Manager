@@ -307,6 +307,35 @@ test('an instance opens to its Overview, where a framework that does not match b
   await expect(page.getByRole('button', { name: 'Linked files' })).toHaveAttribute('aria-pressed', 'false');
 });
 
+test('a framework a mod still needs is reported, and does not read as all clear or stop the launch', async ({ page }) => {
+  await boot(page, {
+    games_instance_list: { instances: [grounded] },
+    games_instance_get: groundedDetail,
+    games_instance_check: {
+      ...cleanCheck,
+      status: 'warnings',
+      findings: [
+        {
+          kind: 'framework',
+          blocks: false,
+          title: 'Skyrim Script Extender',
+          detail: "CrashLogger needs Skyrim Script Extender 2.2.6 or newer, and this instance doesn't have it. It probably won't work until you add it.",
+          why: 'A mod that is missing what it needs usually does nothing, or stops the game from starting.',
+          repair: 'Install SKSE64 from "Browse".',
+        },
+      ],
+    },
+  });
+
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Edit Grounded' }).click();
+
+  await expect(page.getByTestId('frameworks-status')).toHaveText('Need a look: see the checks');
+  await expect(page.getByTestId('check-finding')).toHaveAttribute('data-blocks', 'false');
+  await expect(page.getByTestId('check-finding')).toContainText('CrashLogger needs Skyrim Script Extender');
+  await expect(page.getByTestId('check-finding')).not.toContainText('Stops the launch');
+  await expect(page.getByRole('button', { name: 'Launch Grounded' })).toBeEnabled();
+});
+
 test('a clean check says so, and a launch the checks refused starts nothing and offers launch-anyway only under advanced options', async ({ page }) => {
   await boot(page, {
     games_instance_list: { instances: [grounded] },

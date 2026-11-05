@@ -176,6 +176,7 @@ const catalogPlan = {
   release: '2.2.6',
   size: 2097152,
   frameworks: [],
+  unmetFrameworks: [],
   warnings: [],
 };
 
@@ -395,6 +396,60 @@ test.describe('Browse curated items', () => {
     await expect(page.getByTestId('catalog-placed')).toContainText('Installed SKSE64 into Data.');
     await expect(page.getByTestId('catalog-hash')).toContainText('Verified: the file matches a hash on record.');
     await expect(page.getByTestId('catalog-hash')).toContainText('GitHub published this SHA-256');
+  });
+
+  test('a missing framework stops the install, names it, and goes on only when asked', async ({ page }) => {
+    const unmet = {
+      framework: 'skse',
+      name: 'Skyrim Script Extender',
+      minVersion: '2.2.6',
+      problem: 'absent',
+      foundVersion: null,
+      message: "This mod needs Skyrim Script Extender 2.2.6 or newer, and this instance doesn't have it. It probably won't work until you add it.",
+      catalogEntry: { id: 'skse64', name: 'SKSE64' },
+    };
+    const crashLogger = {
+      ...catalogEntry,
+      id: 'crash-logger',
+      name: 'CrashLogger',
+      compatibility: [
+        { stores: ['steam'], gameVersions: ['1.6.1170'], requires: [{ framework: 'skse', minVersion: '2.2.6' }], asset: 'CrashLogger-*.7z' },
+      ],
+    };
+    const plan = { ...catalogPlan, itemId: 'crash-logger', itemName: 'CrashLogger', unmetFrameworks: [unmet] };
+    await boot(
+      page,
+      [
+        { command: 'games_catalog_install', match: { dryRun: true }, reply: { state: 'dry_run', ...plan } },
+        {
+          command: 'games_catalog_install',
+          match: { dryRun: false, allowMissingFrameworks: true },
+          reply: { state: 'placed', ...plan, contentItemId: 'content-4', mountPath: 'Data', storedSize: 2097152, hash: verifiedHash },
+        },
+        {
+          command: 'games_catalog_install',
+          match: { dryRun: false },
+          error: { code: 'core_failed', message: 'CrashLogger needs SKSE.', coreCode: 'ERR_CATALOG_FRAMEWORK_MISSING' },
+        },
+      ],
+      { games_catalog_list: { ...catalogListing, entries: [catalogEntry, crashLogger] } },
+    );
+
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
+    const row = page.getByTestId('catalog-entry').filter({ hasText: 'CrashLogger' });
+    await row.getByRole('button', { name: 'Install', exact: true }).click();
+
+    const warning = row.getByTestId('catalog-unmet-frameworks');
+    await expect(warning).toContainText('This mod needs Skyrim Script Extender 2.2.6 or newer');
+    await expect(warning).toContainText("It probably won't work until you add it.");
+    await expect(row.getByTestId('catalog-placed')).toHaveCount(0);
+
+    await warning.getByRole('button', { name: 'Go to SKSE64' }).click();
+    await expect(page.getByTestId('catalog-entry').filter({ has: page.getByRole('heading', { name: 'SKSE64' }) }).getByRole('button', { name: 'Install', exact: true })).toBeFocused();
+
+    await warning.getByRole('button', { name: 'Install anyway' }).click();
+    await expect(row.getByTestId('catalog-placed')).toContainText('Installed CrashLogger into Data.');
+    await expect(row.getByTestId('catalog-unmet-frameworks')).toContainText('Installed anyway, as you chose.');
   });
 
   test('an unverified file is never shown as verified', async ({ page }) => {

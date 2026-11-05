@@ -807,6 +807,9 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
     for output in &checks.outputs {
         findings.push(tool_finding(output));
     }
+    for requirement in &checks.requirements {
+        findings.push(requirement_finding(requirement));
+    }
     Ok(InstanceCheck {
         instance_id: instance_id.to_string(),
         checked: pinned,
@@ -1112,6 +1115,35 @@ fn refused(findings: Vec<CheckFinding>) -> LaunchReply {
     }
 }
 
+/// A framework a catalog mod in the instance needs. It never stops a launch: the user may have
+/// installed the mod past exactly this, so the page keeps saying so instead of asking again.
+pub fn requirement_finding(
+    finding: &agora_core::catalog_install::RequirementFinding,
+) -> CheckFinding {
+    use agora_core::catalog_install::RequirementFinding;
+    match finding {
+        RequirementFinding::Unmet { unmet, .. } => CheckFinding {
+            kind: "framework",
+            blocks: false,
+            title: unmet.name.clone(),
+            detail: finding.summary(),
+            why: "A mod that is missing what it needs usually does nothing, or stops the game from starting.".to_string(),
+            repair: Some(match &unmet.catalog_entry {
+                Some(entry) => format!("Install {} from \"Browse\".", entry.name),
+                None => format!("Add {} to this instance.", unmet.name),
+            }),
+        },
+        RequirementFinding::NotChecked { .. } => CheckFinding {
+            kind: "framework",
+            blocks: false,
+            title: "Frameworks your mods need".to_string(),
+            detail: finding.summary(),
+            why: "Agora cannot say whether these mods have what they need.".to_string(),
+            repair: None,
+        },
+    }
+}
+
 pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
     let blocks = finding.refuses_launch();
     let (detail, why) = match &finding.problem {
@@ -1340,6 +1372,45 @@ fn game_missing(game_id: &str) -> GamesError {
 mod tests {
     use super::*;
     use agora_core::game_load_order::Finding;
+
+    #[test]
+    fn an_unmet_mod_framework_is_reported_and_does_not_stop_a_launch() {
+        use agora_core::catalog_install::{
+            CatalogEntryRef, FrameworkProblem, RequirementFinding, UnmetFramework,
+        };
+        let unmet = RequirementFinding::Unmet {
+            needed_by: vec!["CrashLogger".into()],
+            unmet: UnmetFramework {
+                framework: "skse".into(),
+                name: "Skyrim Script Extender".into(),
+                min_version: None,
+                problem: FrameworkProblem::Absent,
+                catalog_entry: Some(CatalogEntryRef {
+                    id: "skse64".into(),
+                    name: "SKSE64".into(),
+                }),
+                message: String::new(),
+            },
+        };
+        let finding = requirement_finding(&unmet);
+        assert_eq!(finding.kind, "framework");
+        assert!(!finding.blocks);
+        assert_eq!(finding.title, "Skyrim Script Extender");
+        assert!(finding
+            .detail
+            .starts_with("CrashLogger needs Skyrim Script Extender"));
+        assert_eq!(
+            finding.repair.as_deref(),
+            Some("Install SKSE64 from \"Browse\".")
+        );
+
+        let unchecked = requirement_finding(&RequirementFinding::NotChecked {
+            needed_by: vec!["CrashLogger".into()],
+            reason: "the catalog is missing".into(),
+        });
+        assert!(!unchecked.blocks);
+        assert!(unchecked.detail.contains("could not check"));
+    }
     use agora_core::game_tools::{OutputFinding, OutputStatus};
 
     fn runtime(version: &str) -> RuntimeIdentity {

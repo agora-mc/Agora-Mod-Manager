@@ -3865,6 +3865,12 @@ What changes, all additive so existing manifests keep compiling unchanged:
   `github_release` entry for another game names the asset pattern it wants per compatibility entry.
 - **Hashes as today** (`REGISTRY_CURATION_REFERENCE.md` §8): mandatory for `direct_hash`, hydrated
   by the compiler for `github_release`, verified at install.
+- **A required framework is a warning the user can go past, not a wall.** One that is absent, too
+  old, undetectable or undeclared refuses the install until the user opts in, separately from the
+  hash override (`allow_missing_frameworks`, `--allow-missing-frameworks`, "Install anyway"). A dry
+  run names every unmet requirement instead of refusing, so a preview can show it. A published hash
+  that differs still has no override. The instance's launch check goes on reporting the requirement,
+  as a warning that does not stop the launch, for as long as it is unmet.
 
 Governance (known conflicts, quarantine, crash signatures) gains a game scope. A catalog for a game
 is created when that game's support is, not before.
