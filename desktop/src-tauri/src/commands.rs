@@ -1067,7 +1067,7 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
                         ),
                         None => (0, String::new(), String::new()),
                     };
-                    agora_core::launch_history::begin_launch(
+                    let row = agora_core::launch_history::begin_launch(
                         &conn,
                         &self.instance_id,
                         &chrono::Utc::now().to_rfc3339(),
@@ -1075,7 +1075,17 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
                         &mc,
                         &loader,
                     )
-                    .ok()
+                    .ok()?;
+                    // What this launch ran with. Losing it loses a record, never the launch.
+                    if let Some(m) = manifest.as_ref() {
+                        let _ = agora_core::session_ledger::attach_manifest(
+                            &conn,
+                            row,
+                            &self.instance_id,
+                            &agora_core::session_ledger::minecraft_manifest(m),
+                        );
+                    }
+                    Some(row)
                 });
             if let (Some(id), Ok(mut slot)) = (opened, self.history.lock()) {
                 *slot = Some((id, std::time::Instant::now()));
@@ -1153,6 +1163,14 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
                     i64::try_from(since.elapsed().as_millis()).ok(),
                     outcome,
                     None,
+                );
+                // The launch service reports an outcome, not the game's exit code.
+                let _ = agora_core::session_ledger::note_exit(
+                    &conn,
+                    id,
+                    &agora_core::session_ledger::ExitObservation::unavailable(
+                        "Minecraft's launch service reports an outcome, not the game's exit code",
+                    ),
                 );
                 let _ = agora_core::launch_history::prune_history(&conn, &self.instance_id);
             }

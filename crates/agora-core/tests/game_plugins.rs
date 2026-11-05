@@ -86,6 +86,7 @@ fn plugin_rule() -> PluginListRule {
 fn definition() -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("test-game").unwrap(),
         name: "Test Game".into(),
         stores: vec![StoreIdentifier {

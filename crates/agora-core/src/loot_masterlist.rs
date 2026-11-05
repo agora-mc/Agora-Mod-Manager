@@ -813,6 +813,7 @@ mod tests {
         use agora_game_api::{DeploymentStrategy, GameId, PluginListRule, RelPath};
         GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new("loot-test-game").unwrap(),
             name: "LOOT Test Game".into(),
             stores: vec![],

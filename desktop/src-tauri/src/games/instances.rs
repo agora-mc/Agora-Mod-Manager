@@ -893,6 +893,7 @@ fn launch_instance(
         prepared,
         store,
         running_from,
+        session_id,
     } = launched;
     let mut findings: Vec<CheckFinding> = Vec::new();
     findings.extend(prepared.warnings.iter().map(|p| base_finding(p, false)));
@@ -916,11 +917,23 @@ fn launch_instance(
         ctx,
         instance_id.to_string(),
         game,
-        running_from,
-        store,
-        record.game.clone(),
+        SessionWatch {
+            running_from,
+            store,
+            game_id: record.game.clone(),
+            session_id,
+        },
     );
     Ok(reply)
+}
+
+/// What the exit watcher needs to know about the session it watches.
+struct SessionWatch {
+    running_from: PathBuf,
+    store: StoreId,
+    game_id: GameId,
+    /// The session ledger row the launch opened, when one could be written.
+    session_id: Option<String>,
 }
 
 /// Waits for the launched game to close, then puts the user's files back and tells the page.
@@ -930,17 +943,39 @@ fn spawn_exit_watch(
     ctx: agora_core::ctx::Ctx,
     instance_id: String,
     mut game: LaunchedGame,
-    running_from: PathBuf,
-    store: StoreId,
-    game_id: GameId,
+    watch: SessionWatch,
 ) {
+    let SessionWatch {
+        running_from,
+        store,
+        game_id,
+        session_id,
+    } = watch;
     std::thread::spawn(move || {
-        let _ = agora_core::game_launch::wait_for_exit(
-            &running_from,
-            &mut game,
-            Duration::from_millis(250),
-            Duration::from_secs(5),
-        );
+        // Waits for the game's own process (not the loader that started it) and records how it
+        // ended in the session ledger.
+        match ctx.games.game(&game_id) {
+            Some(definition) => {
+                let _ = game_instance::watch_session(
+                    &ctx,
+                    definition,
+                    session_id.as_deref(),
+                    &running_from,
+                    &mut game,
+                    Duration::from_millis(250),
+                    Duration::from_secs(5),
+                );
+            }
+            // No definition to read the game's process from: wait for the launched program alone.
+            None => {
+                let _ = agora_core::game_launch::wait_for_exit(
+                    &running_from,
+                    &mut game,
+                    Duration::from_millis(250),
+                    Duration::from_secs(5),
+                );
+            }
+        }
         // The same end a stop runs: put the player's files back and add this session to the
         // instance's play time.
         let restore_error = match ctx.games.game(&game_id) {

@@ -53,6 +53,7 @@ impl Launcher for Launches {
 fn definition(plugin_list: u8) -> GameDefinition {
     let mut def = GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("count-game").unwrap(),
         name: "Count Game".into(),
         stores: vec![StoreIdentifier {

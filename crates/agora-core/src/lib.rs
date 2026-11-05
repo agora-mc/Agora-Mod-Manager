@@ -89,6 +89,7 @@ pub mod providers;
 pub mod ranking;
 pub mod registry;
 pub mod registry_sync;
+pub mod session_ledger;
 pub mod settings;
 pub mod shared_folder;
 pub mod shared_settings;

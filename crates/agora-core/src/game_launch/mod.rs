@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::game_base::{verify_base, BaseManifest, BaseProblem, VerifyDepth};
 use crate::game_load_order::{describe_findings, Finding};
 use crate::process_identity::{self, ProcessIdentity};
+use crate::session_ledger::ExitObservation;
 
 mod vfs;
 pub use vfs::{
@@ -355,6 +356,12 @@ pub struct RunningGameProcess {
 pub struct SessionExitReport {
     pub processes: Vec<RunningGameProcess>,
     pub relaunched_outside: bool,
+    /// How the game's own process ended, or why that could not be seen. Never a guess.
+    #[serde(default)]
+    pub exit: ExitObservation,
+    /// How long after the watch began the game's process was seen to end.
+    #[serde(default)]
+    pub game_runtime_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -716,10 +723,238 @@ pub fn processes_running_from(dir: &Path) -> Vec<RunningGameProcess> {
     running
 }
 
+/// The image names whose exit decides a session: the game's declared `session.processes`, else
+/// the recipe's own executable. A framework loader (`skse64_loader.exe`) replaces the recipe's
+/// executable at launch and exits at once, so it is never the right thing to watch.
+pub fn session_images(definition: &GameDefinition, launched_program: &Path) -> Vec<String> {
+    if !definition.session.processes.is_empty() {
+        return definition.session.processes.clone();
+    }
+    let recipe_exe = definition
+        .launch
+        .as_ref()
+        .and_then(|recipe| match &recipe.executable {
+            GamePath::Runtime { path }
+            | GamePath::Install { path, .. }
+            | GamePath::Base { path, .. }
+            | GamePath::Instance { path }
+            | GamePath::Layer { path, .. }
+            | GamePath::RuntimeComponent { path, .. } => {
+                path.as_str().rsplit('/').next().map(str::to_string)
+            }
+            _ => None,
+        })
+        .filter(|name| !name.is_empty());
+    recipe_exe
+        .or_else(|| {
+            launched_program
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .into_iter()
+        .collect()
+}
+
+fn image_matches(a: &str, b: &str) -> bool {
+    agora_game_api::fold_path_case(a) == agora_game_api::fold_path_case(b)
+}
+
+/// A process of the game that was seen to end.
+struct EndedGame {
+    pid: u32,
+    image: String,
+    code: u32,
+    at_ms: u64,
+}
+
+/// How the process Agora spawned ended.
+struct DirectEnd {
+    description: String,
+}
+
+/// Watches for the game's own process and keeps its exit code.
+///
+/// The process Agora spawns is not always the game: a framework loader starts the game and exits.
+/// The game is found by image name among the processes of the launch's own job (Windows), held by
+/// handle (which also protects against a recycled pid), and its exit code is read when it ends.
+/// Where the spawned process itself is the game, its own status is the observation.
+struct GameWatch {
+    images: Vec<String>,
+    direct_is_game: bool,
+    direct: Option<DirectEnd>,
+    held: Vec<crate::process_job::HeldProcess>,
+    ended: Vec<EndedGame>,
+    /// Pids already held or ended, never held again (a recycled pid is a stranger).
+    seen_pids: Vec<u32>,
+    started: std::time::Instant,
+}
+
+impl GameWatch {
+    fn new(images: Vec<String>, launched: &LaunchedGame) -> Self {
+        let program_name = launched
+            .program
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let direct_is_game = images
+            .iter()
+            .any(|image| image_matches(image, program_name));
+        Self {
+            images,
+            direct_is_game,
+            direct: None,
+            held: Vec::new(),
+            ended: Vec::new(),
+            seen_pids: vec![launched.pid()],
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// The spawned process's end, once it has one.
+    fn note_direct(
+        &mut self,
+        launched: &LaunchedGame,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) {
+        let (code, description) = match status {
+            Ok(status) => match status.code() {
+                // Windows hands back the exit code as an i32; the bits are the NTSTATUS.
+                Some(code) => (Some(code as u32), format!("with exit code {}", code as u32)),
+                None => (None, describe_signal(&status)),
+            },
+            Err(e) => (None, format!("and its status could not be read ({e})")),
+        };
+        if self.direct_is_game {
+            if let Some(code) = code {
+                let image = launched
+                    .program
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.ended.push(EndedGame {
+                    pid: launched.pid(),
+                    image,
+                    code,
+                    at_ms: self.elapsed_ms(),
+                });
+            }
+        }
+        self.direct = Some(DirectEnd { description });
+    }
+
+    /// One poll: find new game processes in the job, and note the ones that have ended.
+    fn poll_job(&mut self, job: Option<&str>) {
+        if let Some(job) = job {
+            for process in
+                crate::process_job::hold_game_processes(job, &self.images, &self.seen_pids)
+            {
+                self.seen_pids.push(process.pid());
+                self.held.push(process);
+            }
+        }
+        let at_ms = self.elapsed_ms();
+        let mut still = Vec::new();
+        for process in std::mem::take(&mut self.held) {
+            match process.exit_code() {
+                Some(code) => self.ended.push(EndedGame {
+                    pid: process.pid(),
+                    image: process.image().to_string(),
+                    code,
+                    at_ms,
+                }),
+                None => still.push(process),
+            }
+        }
+        self.held = still;
+    }
+
+    /// Whether a game process Agora holds is still running.
+    fn game_running(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The observation: the game process that ended last, or why none could be read.
+    fn finish(self, job: Option<&str>, relaunched_outside: bool) -> (ExitObservation, Option<u64>) {
+        if let Some(last) = self.ended.iter().max_by_key(|ended| ended.at_ms) {
+            return (
+                ExitObservation::Code {
+                    pid: last.pid,
+                    image: last.image.clone(),
+                    code: last.code,
+                },
+                Some(last.at_ms),
+            );
+        }
+        let names = self.images.join(" or ");
+        let loader = self
+            .direct
+            .as_ref()
+            .map(|end| format!("the launched program ended {}", end.description))
+            .unwrap_or_else(|| "the launched program's end was not seen".to_string());
+        let mut reason = if self.direct_is_game {
+            // The spawned process is the game, and it ended without a code.
+            format!("the game ended without a readable exit code ({loader})")
+        } else if job.is_some() {
+            format!(
+                "no process named {names} was seen running in the launch's job ({loader}), so the game's exit code could not be read"
+            )
+        } else {
+            format!(
+                "this launch has no job object, so the exit code of {names} could not be read ({loader})"
+            )
+        };
+        if relaunched_outside {
+            reason.push_str("; a process with the game's name also ran outside Agora's job (a store relaunch), and its exit is not observed");
+        }
+        (ExitObservation::unavailable(reason), None)
+    }
+}
+
+#[cfg(unix)]
+fn describe_signal(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal() {
+        Some(signal) => format!("by signal {signal}, which has no exit code"),
+        None => "without an exit code".to_string(),
+    }
+}
+
+#[cfg(not(unix))]
+fn describe_signal(_status: &std::process::ExitStatus) -> String {
+    "without an exit code".to_string()
+}
+
 /// Wait for a launched game to exit and ensure no processes are running from `dir` for `grace`.
+/// The game is taken to be the executable that was launched; see [`wait_for_exit_watching`] for a
+/// game whose launcher exits first.
 pub fn wait_for_exit(
     dir: &Path,
     launched: &mut LaunchedGame,
+    poll: Duration,
+    grace: Duration,
+) -> SessionExitReport {
+    let images: Vec<String> = launched
+        .program
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    wait_for_exit_watching(dir, launched, &images, poll, grace)
+}
+
+/// [`wait_for_exit`], also keeping the exit code of the game's own process: the process named by
+/// one of `game_images` that is the launched process itself or runs in its job. The session ends
+/// only when the launched process is gone, nothing runs from `dir` and no game process Agora holds
+/// is still running, all for `grace`.
+pub fn wait_for_exit_watching(
+    dir: &Path,
+    launched: &mut LaunchedGame,
+    game_images: &[String],
     poll: Duration,
     grace: Duration,
 ) -> SessionExitReport {
@@ -729,6 +964,9 @@ pub fn wait_for_exit(
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string();
+
+    let mut watch = GameWatch::new(game_images.to_vec(), launched);
+    let job = launched.identity.job.clone();
 
     let mut seen_processes: Vec<RunningGameProcess> = Vec::new();
     if is_subpath(&launched.program, dir) {
@@ -746,17 +984,22 @@ pub fn wait_for_exit(
         // 1. Check child status
         if !child_exited {
             match launched.child.try_wait() {
-                Ok(Some(_status)) => {
+                Ok(Some(status)) => {
                     child_exited = true;
+                    watch.note_direct(launched, Ok(status));
                     last_activity = std::time::Instant::now();
                 }
                 Ok(None) => {}
-                Err(_) => {
+                Err(e) => {
                     child_exited = true;
+                    watch.note_direct(launched, Err(e));
                     last_activity = std::time::Instant::now();
                 }
             }
         }
+
+        // 1b. Hold the game's own process once it appears, and read the ones that have ended.
+        watch.poll_job(job.as_deref());
 
         // 2. Poll processes on system
         let mut sys = sysinfo::System::new();
@@ -793,7 +1036,7 @@ pub fn wait_for_exit(
             }
         }
 
-        if current_in_dir_count > 0 || !child_exited {
+        if current_in_dir_count > 0 || !child_exited || watch.game_running() {
             last_activity = std::time::Instant::now();
         }
 
@@ -807,8 +1050,11 @@ pub fn wait_for_exit(
 
     seen_processes.sort_by_key(|p| p.pid);
 
+    let (exit, game_runtime_ms) = watch.finish(job.as_deref(), relaunched_outside);
     SessionExitReport {
         processes: seen_processes,
         relaunched_outside,
+        exit,
+        game_runtime_ms,
     }
 }

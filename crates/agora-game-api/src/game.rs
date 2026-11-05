@@ -426,6 +426,40 @@ pub struct GameDefinition {
     /// §26.10). Absent when no MO2 setup can be matched to this game.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mo2_game_name: Option<String>,
+    /// How a session of this game is watched and judged (MASTER_SPEC §30.6). Absent means the
+    /// recipe's executable is the game and only exit code 0 is a normal quit.
+    #[serde(default, skip_serializing_if = "SessionRules::is_default")]
+    pub session: SessionRules,
+}
+
+/// What Agora watches in a session, and which exit codes mean "the game was closed normally".
+/// Both are data because they are measured per game: Skyrim's normal quit exits 0, and that rests
+/// on one launch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRules {
+    /// Image names (`SkyrimSE.exe`) of the process whose exit ends the session. A launcher such as
+    /// `skse64_loader.exe` exits at once, so the recipe's own executable is not always what runs.
+    /// Empty means the recipe's executable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<String>,
+    /// Exit codes that mean a normal quit. Empty means `[0]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normal_exit_codes: Vec<u32>,
+}
+
+impl SessionRules {
+    pub fn is_default(&self) -> bool {
+        self.processes.is_empty() && self.normal_exit_codes.is_empty()
+    }
+
+    /// The exit codes that count as a normal quit: the declared ones, else just 0.
+    pub fn normal_codes(&self) -> Vec<u32> {
+        if self.normal_exit_codes.is_empty() {
+            vec![0]
+        } else {
+            self.normal_exit_codes.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2020,6 +2054,7 @@ mod tests {
     fn native_code_checks_reject_path_traversal() {
         let def = GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new("skyrim").unwrap(),
             name: "Skyrim".into(),
             stores: vec![],
@@ -2074,6 +2109,7 @@ mod tests {
     fn linked_archive_matching_is_case_insensitive() {
         let def = GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
             name: "Skyrim SE".into(),
             stores: vec![],
@@ -2124,6 +2160,7 @@ mod tests {
     fn declared_write_matching_is_case_insensitive() {
         let def = GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
             name: "Skyrim SE".into(),
             stores: vec![],
@@ -2164,6 +2201,7 @@ mod tests {
     fn excluded_paths_matching_is_case_insensitive() {
         let def = GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
             name: "Skyrim SE".into(),
             stores: vec![],
@@ -2200,6 +2238,7 @@ mod tests {
     fn copy_patterns_match_defaults_and_custom_case_insensitively() {
         let def = GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new("valheim").unwrap(),
             name: "Valheim".into(),
             stores: vec![],

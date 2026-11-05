@@ -55,6 +55,7 @@ fn game_package(plugin_game: &str) -> PackageDefinition {
         parents: vec![],
         games: vec![GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: GameId::new(plugin_game).unwrap(),
             name: plugin_game.to_string(),
             stores: vec![],

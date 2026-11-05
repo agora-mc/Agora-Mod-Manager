@@ -2223,6 +2223,16 @@ fn walk_farm(
     Ok(())
 }
 
+/// The fingerprint of the deployment an instance's game runs from, read from its record without
+/// planning again. `None` when the instance is not deployed or the record cannot be read: the
+/// launch manifest says nothing rather than guessing.
+pub fn deployed_fingerprint(ctx: &Ctx, instance_id: &str) -> Option<String> {
+    let game_dir = deployment_dir(ctx, instance_id).ok()??;
+    read_deployment_record(game_dir.parent()?)
+        .ok()
+        .map(|record| record.fingerprint)
+}
+
 /// The record of what a deployment put in its game folder.
 pub(crate) fn read_deployment_record(
     deployment_dir: &Path,
@@ -3569,6 +3579,7 @@ mod placement_tests {
     fn precompiled_path_rules_answer_as_the_definition_does() {
         let definition = GameDefinition {
             mo2_game_name: None,
+            session: Default::default(),
             id: agora_game_api::GameId::new("rules-game").unwrap(),
             name: "Rules Game".into(),
             stores: vec![],

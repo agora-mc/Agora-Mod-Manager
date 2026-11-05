@@ -40,6 +40,7 @@ fn make_package(
 fn dummy_game(id: &str, stores: Vec<(&str, &str)>) -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new(id).unwrap(),
         name: id.to_string(),
         stores: stores
@@ -407,6 +408,7 @@ fn spike_machine_skyrim_steam_and_gog_identification() {
     let mut builder = GameRegistry::builder();
     let skyrim_def = GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("skyrim-se").unwrap(),
         name: "The Elder Scrolls V: Skyrim Special Edition".into(),
         stores: vec![
@@ -569,6 +571,7 @@ fn unreadable_executable_falls_back_to_store_record_and_nothing_usable_gives_uni
     let mut builder = GameRegistry::builder();
     let game = GameDefinition {
         mo2_game_name: None,
+        session: Default::default(),
         id: GameId::new("test-game").unwrap(),
         name: "Test Game".into(),
         stores: vec![StoreIdentifier {
