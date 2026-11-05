@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use agora_core::artifact_hash::HashOrigin;
 use agora_core::catalog_install::{
-    install, CatalogPlan, CatalogTransport, InstallReport, InstallRequest, InstallState,
+    install, is_framework_refusal, requirement_findings, CatalogEntryRef, CatalogPlan,
+    CatalogTransport, FrameworkProblem, InstallReport, InstallRequest, InstallState,
+    RequirementFinding,
 };
 use agora_core::content_store::{self, ContentSource};
 use agora_core::ctx::Ctx;
@@ -330,13 +332,19 @@ struct Fixture {
 
 /// `loader` is the bytes of `skse64_loader.exe` in the install, or `None` for no framework.
 fn fixture(loader: Option<Vec<u8>>, frameworks: bool) -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let definition = test_definition();
     let declared = if frameworks {
-        vec![skse(&definition.id)]
+        vec![skse(&test_definition().id)]
     } else {
         vec![]
     };
+    fixture_declaring(loader, declared)
+}
+
+/// [`fixture`], with the game declaring exactly `declared`.
+fn fixture_declaring(loader: Option<Vec<u8>>, declared: Vec<FrameworkDefinition>) -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let mut definition = test_definition();
+    definition.framework_ids = declared.iter().map(|f| f.id.clone()).collect();
     let registry = register(definition.clone(), declared);
     let ctx = Ctx::for_testing(tmp.path().join("app_data")).with_games(registry);
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
@@ -519,6 +527,31 @@ async fn run(
             instance_id,
             item,
             install_anyway,
+            allow_missing_frameworks: false,
+            dry_run,
+        },
+        &mut |_: &CatalogPlan| {},
+    )
+    .await
+}
+
+/// [`run`] with `allow_missing_frameworks` set.
+async fn run_past_frameworks(
+    fixture: &Fixture,
+    transport: &dyn CatalogTransport,
+    item: &GameCatalogItem,
+    instance_id: &str,
+    install_anyway: bool,
+    dry_run: bool,
+) -> LauncherResult<InstallReport> {
+    install(
+        &fixture.ctx,
+        transport,
+        InstallRequest {
+            instance_id,
+            item,
+            install_anyway,
+            allow_missing_frameworks: true,
             dry_run,
         },
         &mut |_: &CatalogPlan| {},
@@ -705,7 +738,7 @@ async fn a_missing_framework_is_refused_and_names_what_to_install() {
         )],
     );
     let transport = FakeTransport::silent();
-    let message = run(&f, &transport, &item, &instance.instance_id, true, true)
+    let message = run(&f, &transport, &item, &instance.instance_id, true, false)
         .await
         .unwrap_err()
         .to_string();
@@ -824,6 +857,688 @@ async fn an_unreadable_framework_version_warns_and_proceeds() {
     assert_eq!(report.plan.frameworks[0].found_version, None);
     assert_eq!(report.plan.warnings.len(), 1, "{:?}", report.plan.warnings);
     assert!(report.plan.warnings[0].contains("Script Extender"));
+}
+
+// ---------------------------------------------------------------------------
+// Installing past an unmet framework
+// ---------------------------------------------------------------------------
+
+/// A declared framework with no way to detect it.
+fn undetectable_skse() -> FrameworkDefinition {
+    FrameworkDefinition {
+        detection: None,
+        ..skse(&test_definition().id)
+    }
+}
+
+/// A second framework the game declares, found by its own marker.
+fn second_framework() -> FrameworkDefinition {
+    FrameworkDefinition {
+        id: FrameworkId::new("address-library").unwrap(),
+        name: "Address Library".into(),
+        detection: Some(FrameworkDetection {
+            marker: RelPath::new("Data/versionlib.bin").unwrap(),
+            version: None,
+        }),
+        ..skse(&test_definition().id)
+    }
+}
+
+/// Each way a requirement goes unmet: the fixture, the core's refusal code, and what the plan says.
+fn unmet_cases() -> Vec<(&'static str, Fixture, &'static str, FrameworkProblem)> {
+    vec![
+        (
+            "absent",
+            fixture(None, true),
+            "ERR_CATALOG_FRAMEWORK_MISSING",
+            FrameworkProblem::Absent,
+        ),
+        (
+            "too-old",
+            fixture(Some(pe_with_version([0, 2, 2, 5])), true),
+            "ERR_CATALOG_FRAMEWORK_TOO_OLD",
+            FrameworkProblem::TooOld {
+                found: "2.2.5".into(),
+            },
+        ),
+        (
+            "undetectable",
+            fixture_declaring(None, vec![undetectable_skse()]),
+            "ERR_CATALOG_FRAMEWORK_UNDETECTABLE",
+            FrameworkProblem::Undetectable,
+        ),
+        (
+            "undeclared",
+            fixture(None, false),
+            "ERR_CATALOG_UNKNOWN_FRAMEWORK",
+            FrameworkProblem::Undeclared { malformed: None },
+        ),
+    ]
+}
+
+fn item_requiring(requires: Vec<FrameworkRequirement>) -> GameCatalogItem {
+    entry(
+        "crash-logger",
+        "test-game",
+        vec![github_source(vec![])],
+        vec![compat(
+            &["steam"],
+            &["1.0.*"],
+            Some("CrashLogger-*.zip"),
+            requires,
+        )],
+    )
+}
+
+/// One release of the plain archive, with a digest as given.
+fn one_release(bytes: &[u8], digest: Digest) -> FakeTransport {
+    let assets = [Asset {
+        name: "CrashLogger-1.zip",
+        bytes,
+        digest,
+    }];
+    FakeTransport::new(
+        vec![vec![release(
+            "v1",
+            "2026-01-01T00:00:00Z",
+            false,
+            false,
+            &assets,
+        )]],
+        files_of(&[("v1", &assets)]),
+    )
+}
+
+#[tokio::test]
+async fn every_kind_of_unmet_framework_refuses_without_the_override() {
+    for (kind, f, code, _) in unmet_cases() {
+        let instance = f.instance(kind);
+        let item = item_requiring(skse_requirement(Some("2.2.6")));
+        // A file is on offer, so nothing but the framework can be what refused it.
+        let bytes = plain_archive();
+        let transport = one_release(&bytes, Digest::Matching);
+        // The hash override is not a framework override, on or off.
+        for anyway in [false, true] {
+            let error = run(&f, &transport, &item, &instance.instance_id, anyway, false)
+                .await
+                .expect_err(kind);
+            assert_eq!(error.code(), code, "{kind}");
+            assert!(is_framework_refusal(&error.code()), "{kind}");
+        }
+        assert_eq!(
+            transport.fetch_count(),
+            0,
+            "{kind}: refused before any fetch"
+        );
+        assert!(f.content_items().is_empty(), "{kind}: nothing stored");
+        assert_eq!(f.layer_count(&instance.instance_id), 0, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn every_kind_of_unmet_framework_installs_with_the_override_and_is_named() {
+    for (kind, f, _, problem) in unmet_cases() {
+        let instance = f.instance(kind);
+        let item = item_requiring(skse_requirement(Some("2.2.6")));
+        let bytes = plain_archive();
+        let transport = one_release(&bytes, Digest::Matching);
+
+        let report =
+            run_past_frameworks(&f, &transport, &item, &instance.instance_id, false, false)
+                .await
+                .expect(kind);
+
+        assert!(
+            matches!(report.state, InstallState::Placed { .. }),
+            "{kind}: {:?}",
+            report.state
+        );
+        let unmet = &report.plan.unmet_frameworks;
+        assert_eq!(unmet.len(), 1, "{kind}");
+        assert_eq!(unmet[0].problem, problem, "{kind}");
+        assert_eq!(unmet[0].framework, "skse", "{kind}");
+        assert_eq!(unmet[0].min_version.as_deref(), Some("2.2.6"), "{kind}");
+        assert!(
+            report.plan.frameworks.is_empty(),
+            "{kind}: not listed as met"
+        );
+        assert_eq!(f.layer_count(&instance.instance_id), 1, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn the_warning_says_what_is_needed_and_why_for_each_kind() {
+    let say = |f: &Fixture| f.instance("wording");
+    let expected = [
+        "This mod needs Script Extender 2.2.6 or newer, and this instance doesn't have it. It probably won't work until you add it.",
+        "This mod needs Script Extender 2.2.6 or newer, and this instance has 2.2.5. It probably won't work until you update it.",
+        "This mod needs Script Extender 2.2.6 or newer, and Agora can't tell whether this instance has it. It probably won't work unless you have it.",
+        "This mod needs skse 2.2.6 or newer, which this game doesn't list, so Agora can't check for it. It probably won't work until you add it.",
+    ];
+    for ((kind, f, _, _), expected) in unmet_cases().into_iter().zip(expected) {
+        let instance = say(&f);
+        let item = item_requiring(skse_requirement(Some("2.2.6")));
+        let bytes = plain_archive();
+        let transport = one_release(&bytes, Digest::Matching);
+        let report = run(&f, &transport, &item, &instance.instance_id, false, true)
+            .await
+            .expect(kind);
+        assert_eq!(report.plan.unmet_frameworks[0].message, expected, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_framework_id_refuses_and_the_override_passes_it_as_undeclared() {
+    let f = fixture(None, true);
+    let instance = f.instance("malformed");
+    let item = item_requiring(vec![FrameworkRequirement {
+        framework: "Not A Valid Id!".into(),
+        min_version: None,
+    }]);
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Matching);
+    let error = run(&f, &transport, &item, &instance.instance_id, true, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_CATALOG_BAD_REQUIREMENT");
+    assert!(is_framework_refusal(&error.code()));
+
+    let report = run_past_frameworks(&f, &transport, &item, &instance.instance_id, false, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        report.plan.unmet_frameworks[0].problem,
+        FrameworkProblem::Undeclared { malformed: Some(_) }
+    ));
+}
+
+#[tokio::test]
+async fn two_unmet_frameworks_are_both_named_refused_or_planned() {
+    let f = fixture_declaring(
+        Some(pe_with_version([0, 2, 2, 5])),
+        vec![skse(&test_definition().id), second_framework()],
+    );
+    let instance = f.instance("two");
+    let item = item_requiring(vec![
+        FrameworkRequirement {
+            framework: "skse".into(),
+            min_version: Some("2.2.6".into()),
+        },
+        FrameworkRequirement {
+            framework: "address-library".into(),
+            min_version: None,
+        },
+    ]);
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Matching);
+
+    let refusal = run(&f, &transport, &item, &instance.instance_id, false, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refusal.contains("Script Extender"), "{refusal}");
+    assert!(refusal.contains("2.2.5"), "{refusal}");
+    assert!(refusal.contains("Address Library"), "{refusal}");
+
+    for dry_run in [true, false] {
+        let report =
+            run_past_frameworks(&f, &transport, &item, &instance.instance_id, false, dry_run)
+                .await
+                .unwrap();
+        let names: Vec<&str> = report
+            .plan
+            .unmet_frameworks
+            .iter()
+            .map(|unmet| unmet.name.as_str())
+            .collect();
+        assert_eq!(names, ["Script Extender", "Address Library"]);
+    }
+}
+
+#[tokio::test]
+async fn a_met_requirement_beside_an_unmet_one_stays_listed_as_met() {
+    let f = fixture_declaring(
+        Some(pe_with_version([0, 2, 2, 6])),
+        vec![skse(&test_definition().id), second_framework()],
+    );
+    let instance = f.instance("mixed");
+    let item = item_requiring(vec![
+        FrameworkRequirement {
+            framework: "skse".into(),
+            min_version: Some("2.2.6".into()),
+        },
+        FrameworkRequirement {
+            framework: "address-library".into(),
+            min_version: None,
+        },
+    ]);
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Matching);
+    let report = run(&f, &transport, &item, &instance.instance_id, false, true)
+        .await
+        .unwrap();
+    assert_eq!(report.plan.frameworks.len(), 1);
+    assert_eq!(report.plan.frameworks[0].name, "Script Extender");
+    assert_eq!(report.plan.unmet_frameworks.len(), 1);
+    assert_eq!(report.plan.unmet_frameworks[0].name, "Address Library");
+}
+
+#[tokio::test]
+async fn the_framework_override_does_not_get_past_a_differing_published_hash() {
+    let f = fixture(None, true);
+    let instance = f.instance("published");
+    let item = item_requiring(skse_requirement(None));
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Other);
+    // Not with the hash override either: a published hash that differs has no override at all.
+    for anyway in [false, true] {
+        let error =
+            run_past_frameworks(&f, &transport, &item, &instance.instance_id, anyway, false)
+                .await
+                .expect_err("a differing published hash always stops");
+        assert!(
+            !is_framework_refusal(&error.code()),
+            "the stop is the hash's, not the framework's: {}",
+            error.code()
+        );
+        assert_ne!(error.code(), "ERR_HASH_CONFIRMATION_REQUIRED");
+    }
+    assert!(f.content_items().is_empty());
+    assert_eq!(f.layer_count(&instance.instance_id), 0);
+}
+
+#[tokio::test]
+async fn the_framework_override_does_not_get_past_a_differing_curator_pin() {
+    let f = fixture(None, true);
+    let instance = f.instance("pin");
+    let item = entry(
+        "crash-logger",
+        "test-game",
+        vec![github_source(vec![SourcePin {
+            tag: "v1".into(),
+            asset: "CrashLogger-1.zip".into(),
+            sha256: "f".repeat(64),
+        }])],
+        vec![compat(
+            &["steam"],
+            &["1.0.*"],
+            Some("CrashLogger-*.zip"),
+            skse_requirement(None),
+        )],
+    );
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Absent);
+    let error = run_past_frameworks(&f, &transport, &item, &instance.instance_id, false, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_HASH_CONFIRMATION_REQUIRED");
+    assert_eq!(f.layer_count(&instance.instance_id), 0);
+
+    // Both overrides, each answering its own stop.
+    let report = run_past_frameworks(&f, &transport, &item, &instance.instance_id, true, false)
+        .await
+        .unwrap();
+    assert!(matches!(report.state, InstallState::Placed { .. }));
+    assert_eq!(report.plan.unmet_frameworks.len(), 1);
+}
+
+#[tokio::test]
+async fn a_dry_run_names_what_is_unmet_and_writes_nothing() {
+    for (kind, f, _, problem) in unmet_cases() {
+        let instance = f.instance(kind);
+        let item = item_requiring(skse_requirement(Some("2.2.6")));
+        let bytes = plain_archive();
+        let transport = one_release(&bytes, Digest::Matching);
+        let plain = run(&f, &transport, &item, &instance.instance_id, false, true)
+            .await
+            .expect(kind);
+        let past = run_past_frameworks(&f, &transport, &item, &instance.instance_id, false, true)
+            .await
+            .expect(kind);
+        for report in [plain, past] {
+            assert_eq!(report.state, InstallState::DryRun, "{kind}");
+            assert_eq!(report.plan.unmet_frameworks[0].problem, problem, "{kind}");
+        }
+        assert_eq!(transport.fetch_count(), 0, "{kind}");
+        assert!(f.content_items().is_empty(), "{kind}");
+        assert_eq!(f.layer_count(&instance.instance_id), 0, "{kind}");
+        assert!(
+            !f.ctx
+                .paths
+                .content_root()
+                .join("catalog-downloads")
+                .exists(),
+            "{kind}: not even a scratch folder"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dry_run_with_another_obstacle_reports_that_one_so_no_override_is_offered() {
+    let f = fixture(None, true);
+    let instance = f.instance("no-asset");
+    let item = item_requiring(skse_requirement(None));
+    // No release has a file: installing anyway could not succeed either.
+    let transport = FakeTransport::silent();
+    let error = run(&f, &transport, &item, &instance.instance_id, false, true)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_CATALOG_NO_ASSET");
+}
+
+#[tokio::test]
+async fn the_refusal_comes_before_the_network_without_the_override() {
+    let f = fixture(None, true);
+    let instance = f.instance("order");
+    let item = item_requiring(skse_requirement(None));
+    // The same silent transport as above: the framework is what a real install reports.
+    let transport = FakeTransport::silent();
+    let error = run(&f, &transport, &item, &instance.instance_id, false, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "ERR_CATALOG_FRAMEWORK_MISSING");
+}
+
+#[tokio::test]
+async fn a_mod_already_installed_past_a_framework_still_names_it_and_changes_nothing() {
+    let f = fixture(None, true);
+    let instance = f.instance("again");
+    let item = item_requiring(skse_requirement(None));
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Matching);
+    run_past_frameworks(&f, &transport, &item, &instance.instance_id, false, false)
+        .await
+        .unwrap();
+
+    let preview = run(&f, &transport, &item, &instance.instance_id, false, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        preview.state,
+        InstallState::AlreadyInstalled { .. }
+    ));
+    assert_eq!(preview.plan.unmet_frameworks.len(), 1);
+    assert_eq!(f.layer_count(&instance.instance_id), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The catalog entry that provides a framework
+// ---------------------------------------------------------------------------
+
+/// A registry on disk holding exactly `items`.
+fn seed_registry(ctx: &Ctx, items: &[GameCatalogItem]) {
+    let conn = rusqlite::Connection::open(ctx.paths.registry_db()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE game_catalog_items (
+            id TEXT PRIMARY KEY,
+            game TEXT NOT NULL,
+            name TEXT NOT NULL,
+            author TEXT,
+            content_type TEXT NOT NULL,
+            download_strategy TEXT NOT NULL,
+            source_identifier TEXT NOT NULL,
+            sha256 TEXT,
+            download_sources_json TEXT NOT NULL DEFAULT '[]',
+            game_compatibility_json TEXT NOT NULL DEFAULT '[]',
+            description TEXT,
+            license_id TEXT,
+            page_url TEXT,
+            icon_url TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            date_added TEXT
+        );",
+    )
+    .unwrap();
+    for item in items {
+        conn.execute(
+            "INSERT INTO game_catalog_items
+                (id, game, name, content_type, download_strategy, source_identifier,
+                 game_compatibility_json, status)
+             VALUES (?1, ?2, ?3, 'mod', 'github_release', 'src', ?4, 'active')",
+            rusqlite::params![
+                item.id,
+                item.game,
+                item.name,
+                serde_json::to_string(&item.game_compatibility).unwrap()
+            ],
+        )
+        .unwrap();
+    }
+}
+
+fn named(id: &str, name: &str) -> GameCatalogItem {
+    GameCatalogItem {
+        name: name.into(),
+        ..entry(id, "test-game", vec![github_source(vec![])], vec![])
+    }
+}
+
+async fn catalog_link_with(items: &[GameCatalogItem]) -> Option<CatalogEntryRef> {
+    let f = fixture(None, true);
+    seed_registry(&f.ctx, items);
+    let instance = f.instance("link");
+    let item = item_requiring(skse_requirement(None));
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Matching);
+    run(&f, &transport, &item, &instance.instance_id, false, true)
+        .await
+        .unwrap()
+        .plan
+        .unmet_frameworks[0]
+        .catalog_entry
+        .clone()
+}
+
+#[tokio::test]
+async fn an_unmet_framework_links_to_the_catalog_entry_that_is_that_framework() {
+    for items in [
+        vec![named("skse", "SKSE")],
+        vec![named("skse64", "SKSE64")],
+        vec![named("some-id", "Script Extender")],
+    ] {
+        let link = catalog_link_with(&items).await.expect("a link");
+        assert_eq!(link.id, items[0].id);
+        assert_eq!(link.name, items[0].name);
+    }
+}
+
+#[tokio::test]
+async fn no_link_is_guessed_from_a_lookalike_or_a_choice_of_two() {
+    assert_eq!(catalog_link_with(&[]).await, None);
+    // A mod that is about the framework is not the framework.
+    assert_eq!(
+        catalog_link_with(&[named("skse-plugin-preloader", "Preloader")]).await,
+        None
+    );
+    // Another game's entry cannot be installed here.
+    let other_game = GameCatalogItem {
+        game: "other-game".into(),
+        ..named("skse", "SKSE")
+    };
+    assert_eq!(catalog_link_with(&[other_game]).await, None);
+    // Two candidates: no guess.
+    assert_eq!(
+        catalog_link_with(&[named("skse", "SKSE"), named("skse64", "SKSE64")]).await,
+        None
+    );
+    // The mod itself never answers its own requirement.
+    assert_eq!(
+        catalog_link_with(&[named("crash-logger", "Script Extender")]).await,
+        None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The launch check, afterwards
+// ---------------------------------------------------------------------------
+
+/// Install `item` past its frameworks into a new instance, with the catalog listing it.
+async fn installed_past_frameworks(f: &Fixture, item: &GameCatalogItem) -> GameInstanceRecord {
+    let instance = f.instance("after");
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Matching);
+    let report = run_past_frameworks(f, &transport, item, &instance.instance_id, false, false)
+        .await
+        .unwrap();
+    assert!(matches!(report.state, InstallState::Placed { .. }));
+    instance
+}
+
+#[tokio::test]
+async fn the_launch_check_still_reports_what_was_installed_past() {
+    for (kind, f, _, problem) in unmet_cases() {
+        let item = item_requiring(skse_requirement(Some("2.2.6")));
+        seed_registry(&f.ctx, std::slice::from_ref(&item));
+        let instance = installed_past_frameworks(&f, &item).await;
+
+        let checks = game_instance::launch_checks(&f.ctx, &instance, &f.definition).expect(kind);
+
+        assert_eq!(checks.requirements.len(), 1, "{kind}");
+        let RequirementFinding::Unmet { needed_by, unmet } = &checks.requirements[0] else {
+            panic!("{kind}: {:?}", checks.requirements[0]);
+        };
+        assert_eq!(unmet.problem, problem, "{kind}");
+        assert_eq!(needed_by, &["CrashLogger"], "{kind}");
+        let summary = checks.requirements[0].summary();
+        assert!(summary.starts_with("CrashLogger needs "), "{summary}");
+        assert!(summary.contains("2.2.6"), "{summary}");
+    }
+}
+
+#[tokio::test]
+async fn the_launch_check_follows_a_mod_through_its_fomod_installer() {
+    let f = fixture(None, true);
+    let item = item_requiring(skse_requirement(None));
+    seed_registry(&f.ctx, std::slice::from_ref(&item));
+    let instance = f.instance("fomod-after");
+    let bytes = zip_bytes(&[
+        (
+            "fomod/ModuleConfig.xml",
+            br#"<config><moduleName>Crash Logger</moduleName><requiredInstallFiles><file source="Data/CrashLogger.esp" destination="CrashLogger.esp"/></requiredInstallFiles></config>"#,
+        ),
+        ("Data/CrashLogger.esp", b"plugin"),
+    ]);
+    let transport = one_release(&bytes, Digest::Matching);
+    let report = run_past_frameworks(&f, &transport, &item, &instance.instance_id, false, false)
+        .await
+        .unwrap();
+    let InstallState::NeedsInstaller {
+        content_item_id, ..
+    } = &report.state
+    else {
+        panic!("expected an installer, got {:?}", report.state);
+    };
+    assert_eq!(
+        report.plan.unmet_frameworks.len(),
+        1,
+        "the installer outcome names it too"
+    );
+
+    let (_, _, outcome) =
+        agora_core::content_fomod::install(&f.ctx, content_item_id, &[], None).unwrap();
+    game_deploy::add_content(
+        &f.ctx,
+        &instance.instance_id,
+        &outcome.item().item_id,
+        Some("Data"),
+        None,
+    )
+    .unwrap();
+
+    let findings = requirement_findings(&f.ctx, &instance.instance_id, &f.definition);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(matches!(&findings[0], RequirementFinding::Unmet { .. }));
+}
+
+#[tokio::test]
+async fn the_launch_check_is_quiet_when_the_framework_is_there() {
+    let f = fixture(Some(pe_with_version([0, 2, 2, 6])), true);
+    let item = item_requiring(skse_requirement(Some("2.2.6")));
+    seed_registry(&f.ctx, std::slice::from_ref(&item));
+    let instance = f.instance("met");
+    let bytes = plain_archive();
+    let transport = one_release(&bytes, Digest::Matching);
+    run(&f, &transport, &item, &instance.instance_id, false, false)
+        .await
+        .unwrap();
+    let checks = game_instance::launch_checks(&f.ctx, &instance, &f.definition).unwrap();
+    assert_eq!(checks.requirements, vec![]);
+}
+
+#[tokio::test]
+async fn the_launch_check_does_not_blame_a_mod_that_is_turned_off() {
+    let f = fixture(None, true);
+    let item = item_requiring(skse_requirement(None));
+    seed_registry(&f.ctx, std::slice::from_ref(&item));
+    let instance = installed_past_frameworks(&f, &item).await;
+
+    let stored = f.content_items().remove(0).item_id;
+    game_deploy::set_content_enabled(&f.ctx, &instance.instance_id, &stored, false).unwrap();
+
+    assert_eq!(
+        requirement_findings(&f.ctx, &instance.instance_id, &f.definition),
+        vec![]
+    );
+}
+
+#[tokio::test]
+async fn two_mods_needing_one_framework_are_one_finding_naming_both() {
+    let f = fixture(None, true);
+    let first = item_requiring(skse_requirement(None));
+    let second = GameCatalogItem {
+        id: "second-mod".into(),
+        name: "Second Mod".into(),
+        ..first.clone()
+    };
+    seed_registry(&f.ctx, &[first.clone(), second.clone()]);
+    let instance = f.instance("both");
+    for item in [&first, &second] {
+        let bytes = if item.id == first.id {
+            plain_archive()
+        } else {
+            zip_bytes(&[("Second.esp", b"another plugin")])
+        };
+        let transport = one_release(&bytes, Digest::Matching);
+        run_past_frameworks(&f, &transport, item, &instance.instance_id, false, false)
+            .await
+            .unwrap();
+    }
+
+    let findings = requirement_findings(&f.ctx, &instance.instance_id, &f.definition);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let RequirementFinding::Unmet { needed_by, .. } = &findings[0] else {
+        panic!("{findings:?}");
+    };
+    assert_eq!(needed_by, &["CrashLogger", "Second Mod"]);
+    assert!(findings[0]
+        .summary()
+        .starts_with("CrashLogger, Second Mod need "));
+}
+
+#[tokio::test]
+async fn an_unreadable_catalog_says_it_could_not_check_rather_than_all_clear() {
+    let f = fixture(None, true);
+    let item = item_requiring(skse_requirement(None));
+    // No registry on disk at all.
+    let instance = installed_past_frameworks(&f, &item).await;
+    let findings = requirement_findings(&f.ctx, &instance.instance_id, &f.definition);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        matches!(&findings[0], RequirementFinding::NotChecked { .. }),
+        "{findings:?}"
+    );
+    assert!(findings[0].summary().contains("could not check"));
+}
+
+#[tokio::test]
+async fn an_instance_with_no_catalog_mods_has_no_requirements_to_check() {
+    let f = fixture(None, true);
+    // No registry either: nothing about this instance needs one.
+    let instance = f.instance("plain");
+    assert_eq!(
+        requirement_findings(&f.ctx, &instance.instance_id, &f.definition),
+        vec![]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2100,6 +2815,7 @@ async fn the_install_names_its_source_before_a_download_starts() {
             instance_id: &instance.instance_id,
             item: &github_fixture_item(),
             install_anyway: false,
+            allow_missing_frameworks: false,
             dry_run: false,
         },
         &mut |plan: &CatalogPlan| {

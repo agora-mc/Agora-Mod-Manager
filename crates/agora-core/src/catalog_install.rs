@@ -5,7 +5,11 @@
 //! 1. The entry must be for the instance's game. Its compatibility entry is the first one whose
 //!    `stores` include the instance's store and whose `game_versions` include its version.
 //! 2. Each framework the entry requires must be installed, and at least `min_version`. A framework
-//!    whose version cannot be read is a warning, and the launch check still guards it.
+//!    whose version cannot be read is a warning, and the launch check still guards it. An unmet
+//!    requirement refuses the install unless the caller opted in with
+//!    [`InstallRequest::allow_missing_frameworks`]. A dry run refuses nothing: it names what is
+//!    unmet in [`CatalogPlan::unmet_frameworks`], so a preview can show it. The launch check reports
+//!    the same requirements afterwards ([`requirement_findings`]).
 //! 3. The file is chosen. `github_release` takes the newest non-draft, non-prerelease release with
 //!    an asset matching the compatibility entry's `asset` glob. `direct_hash` is the entry's URL.
 //! 4. An entry this instance already has (any release) is reported and nothing changes.
@@ -19,11 +23,13 @@
 //!
 //! Network access goes through [`CatalogTransport`], so the steps above can be tested with a fake.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agora_game_api::{BaseReference, FrameworkId, GameDefinition, LayerSource, RuntimeIdentity};
+use agora_game_api::{
+    BaseReference, FrameworkId, GameDefinition, GameId, LayerSource, RuntimeIdentity,
+};
 use async_trait::async_trait;
 use serde::Serialize;
 
@@ -38,7 +44,9 @@ use crate::game_frameworks::{self, FrameworkStatus};
 use crate::game_instance::{self, GameInstanceManifest};
 use crate::github_release::{self, GitHubAuth, GitHubRelease};
 use crate::http_client::HttpClients;
-use crate::registry::{DownloadSource, GameCatalogItem, GameCompatibility};
+use crate::registry::{
+    self, DownloadSource, FrameworkRequirement, GameCatalogItem, GameCompatibility, RegistryService,
+};
 
 /// The network side of an install: a page of a repository's releases, and the bytes of a file.
 #[async_trait]
@@ -83,9 +91,14 @@ pub struct InstallRequest<'a> {
     pub instance_id: &'a str,
     pub item: &'a GameCatalogItem,
     /// Accept a hash that differs from a curator pin or an earlier install. Never accepts a
-    /// published hash that differs, and never overrides a framework refusal.
+    /// published hash that differs, and never overrides a framework refusal: that is
+    /// `allow_missing_frameworks`.
     pub install_anyway: bool,
-    /// Plan only: nothing is downloaded or stored.
+    /// Install although a framework the entry requires is unmet, as the user chose. The plan names
+    /// every such requirement. It changes nothing about how the file's hash is checked.
+    pub allow_missing_frameworks: bool,
+    /// Plan only: nothing is downloaded or stored. An unmet framework does not refuse a dry run; the
+    /// plan names it.
     pub dry_run: bool,
 }
 
@@ -98,7 +111,11 @@ pub struct CatalogPlan {
     /// Index of the chosen compatibility entry in the manifest's order.
     pub compatibility_index: usize,
     pub compatibility: GameCompatibility,
+    /// The requirements that are met.
     pub frameworks: Vec<FrameworkCheck>,
+    /// The requirements that are not. Empty unless this is a dry run, or the caller set
+    /// [`InstallRequest::allow_missing_frameworks`]; otherwise they refuse the install.
+    pub unmet_frameworks: Vec<UnmetFramework>,
     pub source: PlannedSource,
     pub warnings: Vec<String>,
 }
@@ -111,6 +128,148 @@ pub struct FrameworkCheck {
     pub min_version: Option<String>,
     /// The version found, or `None` when the framework is present but its version is unreadable.
     pub found_version: Option<String>,
+}
+
+/// Why a required framework is unmet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FrameworkProblem {
+    /// The game's files have no marker for it.
+    Absent,
+    /// It is installed, at a version below the one required.
+    TooOld { found: String },
+    /// The game definition declares no way to detect it, so nobody can tell.
+    Undetectable,
+    /// The game does not declare this framework. `malformed` says why, when the entry's id is not
+    /// even a valid framework id.
+    Undeclared { malformed: Option<String> },
+}
+
+/// A catalog entry for the same game that looks like the framework itself, so a person can add it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CatalogEntryRef {
+    pub id: String,
+    pub name: String,
+}
+
+/// One required framework the instance does not satisfy, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnmetFramework {
+    /// The id as the entry wrote it.
+    pub framework: String,
+    /// The game's name for it, or the id when the game does not declare it.
+    pub name: String,
+    pub min_version: Option<String>,
+    pub problem: FrameworkProblem,
+    /// Where the catalog can provide it, when it can.
+    pub catalog_entry: Option<CatalogEntryRef>,
+    /// The warning, in a player's words.
+    pub message: String,
+}
+
+impl UnmetFramework {
+    fn new(requirement: &FrameworkRequirement, name: String, problem: FrameworkProblem) -> Self {
+        let mut unmet = Self {
+            framework: requirement.framework.clone(),
+            name,
+            min_version: requirement.min_version.clone(),
+            problem,
+            catalog_entry: None,
+            message: String::new(),
+        };
+        unmet.message = format!(
+            "This mod needs {}{}. {}",
+            unmet.needs(),
+            unmet.reason(),
+            unmet.advice()
+        );
+        unmet
+    }
+
+    /// The framework and the version it must be: "SKSE 2.2.6 or newer".
+    pub fn needs(&self) -> String {
+        match &self.min_version {
+            Some(minimum) => format!("{} {minimum} or newer", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Why it is unmet, written to follow [`Self::needs`].
+    pub fn reason(&self) -> String {
+        match &self.problem {
+            FrameworkProblem::Absent => ", and this instance doesn't have it".to_string(),
+            FrameworkProblem::TooOld { found } => format!(", and this instance has {found}"),
+            FrameworkProblem::Undetectable => {
+                ", and Agora can't tell whether this instance has it".to_string()
+            }
+            FrameworkProblem::Undeclared { .. } => {
+                ", which this game doesn't list, so Agora can't check for it".to_string()
+            }
+        }
+    }
+
+    /// What it means for the mod.
+    pub fn advice(&self) -> &'static str {
+        match self.problem {
+            FrameworkProblem::Absent | FrameworkProblem::Undeclared { .. } => {
+                "It probably won't work until you add it."
+            }
+            FrameworkProblem::TooOld { .. } => "It probably won't work until you update it.",
+            FrameworkProblem::Undetectable => "It probably won't work unless you have it.",
+        }
+    }
+
+    /// The error that refuses the install when the user has not opted in.
+    fn refusal(&self, item_id: &str, instance_id: &str, game: &str) -> (&'static str, String) {
+        let name = &self.name;
+        match &self.problem {
+            FrameworkProblem::Absent => (
+                FRAMEWORK_MISSING,
+                format!(
+                    "'{item_id}' needs {}, and instance '{instance_id}' does not have it. Install {name} first.",
+                    self.needs()
+                ),
+            ),
+            FrameworkProblem::TooOld { found } => (
+                FRAMEWORK_TOO_OLD,
+                format!(
+                    "'{item_id}' needs {}, and instance '{instance_id}' has {name} {found}. Update {name} first.",
+                    self.needs()
+                ),
+            ),
+            FrameworkProblem::Undetectable => (
+                FRAMEWORK_UNDETECTABLE,
+                format!(
+                    "'{item_id}' needs {name}, and Agora cannot tell whether the instance has it: the game definition declares no way to detect it."
+                ),
+            ),
+            FrameworkProblem::Undeclared {
+                malformed: Some(reason),
+            } => (FRAMEWORK_BAD_REQUIREMENT, format!("{name}: {reason}")),
+            FrameworkProblem::Undeclared { malformed: None } => (
+                FRAMEWORK_UNKNOWN,
+                format!("'{item_id}' requires framework '{name}', which {game} does not declare."),
+            ),
+        }
+    }
+}
+
+const FRAMEWORK_MISSING: &str = "ERR_CATALOG_FRAMEWORK_MISSING";
+const FRAMEWORK_TOO_OLD: &str = "ERR_CATALOG_FRAMEWORK_TOO_OLD";
+const FRAMEWORK_UNDETECTABLE: &str = "ERR_CATALOG_FRAMEWORK_UNDETECTABLE";
+const FRAMEWORK_UNKNOWN: &str = "ERR_CATALOG_UNKNOWN_FRAMEWORK";
+const FRAMEWORK_BAD_REQUIREMENT: &str = "ERR_CATALOG_BAD_REQUIREMENT";
+
+/// Whether `code` is a refusal that [`InstallRequest::allow_missing_frameworks`] overrides.
+pub fn is_framework_refusal(code: &str) -> bool {
+    matches!(
+        code,
+        FRAMEWORK_MISSING
+            | FRAMEWORK_TOO_OLD
+            | FRAMEWORK_UNDETECTABLE
+            | FRAMEWORK_UNKNOWN
+            | FRAMEWORK_BAD_REQUIREMENT
+    )
 }
 
 /// The file the plan will fetch.
@@ -267,6 +426,7 @@ pub async fn install(
         request.item,
         request.instance_id,
         transport,
+        request.dry_run || request.allow_missing_frameworks,
     )
     .await?;
 
@@ -381,7 +541,8 @@ pub async fn install(
     Ok(InstallReport { plan, state })
 }
 
-/// The plan: the compatibility entry, the frameworks, and the file. Makes no change.
+/// The plan: the compatibility entry, the frameworks, and the file. Makes no change. An unmet
+/// framework refuses here, before any network access, unless `keep_unmet`.
 async fn plan(
     ctx: &Ctx,
     manifest: &GameInstanceManifest,
@@ -389,6 +550,7 @@ async fn plan(
     item: &GameCatalogItem,
     instance_id: &str,
     transport: &dyn CatalogTransport,
+    keep_unmet: bool,
 ) -> LauncherResult<CatalogPlan> {
     let runtime = instance_runtime(manifest).ok_or_else(|| {
         generic(
@@ -400,98 +562,30 @@ async fn plan(
 
     let mut warnings = Vec::new();
     let mut frameworks = Vec::new();
+    let mut unmet_frameworks = Vec::new();
     for requirement in &compatibility.requires {
-        let framework_id = FrameworkId::new(&requirement.framework).map_err(|e| {
-            generic(
-                "ERR_CATALOG_BAD_REQUIREMENT",
-                format!("{}: {e}", requirement.framework),
-            )
-        })?;
-        let definition_of = ctx
-            .games
-            .framework(&manifest.game, &framework_id)
-            .ok_or_else(|| {
-                generic(
-                    "ERR_CATALOG_UNKNOWN_FRAMEWORK",
-                    format!(
-                        "'{}' requires framework '{}', which {} does not declare.",
-                        item.id,
-                        requirement.framework,
-                        manifest.game.as_str()
-                    ),
-                )
-            })?;
-        let name = definition_of.name.clone();
-        let status =
-            game_frameworks::framework_status(ctx, instance_id, definition, definition_of)?;
-        let found_version = match status {
-            FrameworkStatus::Absent => {
-                return Err(generic(
-                    "ERR_CATALOG_FRAMEWORK_MISSING",
-                    format!(
-                        "'{}' needs {}{}, and instance '{instance_id}' does not have it. Install {} first.",
-                        item.id,
-                        name,
-                        requirement
-                            .min_version
-                            .as_deref()
-                            .map(|v| format!(" {v} or newer"))
-                            .unwrap_or_default(),
-                        name
-                    ),
-                ));
+        let found = look_up_framework(
+            ctx,
+            &manifest.game,
+            instance_id,
+            definition,
+            &requirement.framework,
+        )?;
+        match judge_requirement(found, requirement, &item.id) {
+            RequirementOutcome::Met { check, warning } => {
+                warnings.extend(warning);
+                frameworks.push(check);
             }
-            FrameworkStatus::NotDetectable => {
-                return Err(generic(
-                    "ERR_CATALOG_FRAMEWORK_UNDETECTABLE",
-                    format!(
-                        "'{}' needs {}, and Agora cannot tell whether the instance has it: the game definition declares no way to detect it.",
-                        item.id, name
-                    ),
-                ));
-            }
-            FrameworkStatus::Present {
-                version: Some(found),
-                ..
-            } => {
-                if let Some(minimum) = requirement.min_version.as_deref() {
-                    match game_frameworks::version_at_least(&found, minimum) {
-                        Some(true) => {}
-                        Some(false) => {
-                            return Err(generic(
-                                "ERR_CATALOG_FRAMEWORK_TOO_OLD",
-                                format!(
-                                    "'{}' needs {} {} or newer, and instance '{instance_id}' has {} {}. Update {} first.",
-                                    item.id, name, minimum, name, found, name
-                                ),
-                            ));
-                        }
-                        None => warnings.push(format!(
-                            "Could not compare {name} {found} with the {minimum} that '{}' needs.",
-                            item.id
-                        )),
-                    }
-                }
-                Some(found)
-            }
-            FrameworkStatus::Present {
-                version: None,
-                unreadable,
-            } => {
-                warnings.push(format!(
-                    "Could not read the version of {name} ({}), so it was not checked against {}. The launch check still guards a mismatched build.",
-                    unreadable.unwrap_or_else(|| "unknown reason".into()),
-                    requirement.min_version.as_deref().unwrap_or("any version")
-                ));
-                None
-            }
-        };
-        frameworks.push(FrameworkCheck {
-            framework: requirement.framework.clone(),
-            name,
-            min_version: requirement.min_version.clone(),
-            found_version,
-        });
+            RequirementOutcome::Unmet(unmet) => unmet_frameworks.push(unmet),
+        }
+    }
+    if !keep_unmet {
+        if let Some(refusal) = refuse_unmet(&unmet_frameworks, item, instance_id, &manifest.game) {
+            return Err(refusal);
+        }
+    }
+    if !unmet_frameworks.is_empty() {
+        link_catalog_entries(ctx, &manifest.game, Some(&item.id), &mut unmet_frameworks);
     }
 
     let source = plan_source(item, &compatibility, transport).await?;
@@ -502,9 +596,368 @@ async fn plan(
         compatibility_index,
         compatibility,
         frameworks,
+        unmet_frameworks,
         source,
         warnings,
     })
+}
+
+/// The refusal for these unmet requirements, under the first one's code and naming them all. `None`
+/// when there are none.
+fn refuse_unmet(
+    unmet: &[UnmetFramework],
+    item: &GameCatalogItem,
+    instance_id: &str,
+    game: &GameId,
+) -> Option<LauncherError> {
+    let refusals: Vec<(&str, String)> = unmet
+        .iter()
+        .map(|unmet| unmet.refusal(&item.id, instance_id, game.as_str()))
+        .collect();
+    let code = refusals.first()?.0;
+    let message = refusals
+        .iter()
+        .map(|(_, message)| message.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(generic(code, message))
+}
+
+/// A framework as the game and the instance have it, before any one requirement is applied.
+#[derive(Clone)]
+enum FrameworkLookup {
+    Declared {
+        name: String,
+        status: FrameworkStatus,
+    },
+    NotDeclared {
+        malformed: Option<String>,
+    },
+}
+
+/// The framework `id` for this game and instance. An error means the instance could not be read,
+/// which says nothing about the framework.
+fn look_up_framework(
+    ctx: &Ctx,
+    game: &GameId,
+    instance_id: &str,
+    definition: &GameDefinition,
+    id: &str,
+) -> LauncherResult<FrameworkLookup> {
+    let framework_id = match FrameworkId::new(id) {
+        Ok(framework_id) => framework_id,
+        Err(error) => {
+            return Ok(FrameworkLookup::NotDeclared {
+                malformed: Some(error.to_string()),
+            })
+        }
+    };
+    let Some(declared) = ctx.games.framework(game, &framework_id) else {
+        return Ok(FrameworkLookup::NotDeclared { malformed: None });
+    };
+    Ok(FrameworkLookup::Declared {
+        name: declared.name.clone(),
+        status: game_frameworks::framework_status(ctx, instance_id, definition, declared)?,
+    })
+}
+
+enum RequirementOutcome {
+    Met {
+        check: FrameworkCheck,
+        warning: Option<String>,
+    },
+    Unmet(UnmetFramework),
+}
+
+/// One requirement against what the instance has. The install's refusal and the launch check both
+/// come from here, so they cannot disagree.
+fn judge_requirement(
+    found: FrameworkLookup,
+    requirement: &FrameworkRequirement,
+    item_id: &str,
+) -> RequirementOutcome {
+    let (name, status) = match found {
+        FrameworkLookup::Declared { name, status } => (name, status),
+        FrameworkLookup::NotDeclared { malformed } => {
+            return RequirementOutcome::Unmet(UnmetFramework::new(
+                requirement,
+                requirement.framework.clone(),
+                FrameworkProblem::Undeclared { malformed },
+            ))
+        }
+    };
+    let mut warning = None;
+    let found_version = match status {
+        FrameworkStatus::Absent => {
+            return RequirementOutcome::Unmet(UnmetFramework::new(
+                requirement,
+                name,
+                FrameworkProblem::Absent,
+            ))
+        }
+        FrameworkStatus::NotDetectable => {
+            return RequirementOutcome::Unmet(UnmetFramework::new(
+                requirement,
+                name,
+                FrameworkProblem::Undetectable,
+            ))
+        }
+        FrameworkStatus::Present {
+            version: Some(found),
+            ..
+        } => {
+            if let Some(minimum) = requirement.min_version.as_deref() {
+                match game_frameworks::version_at_least(&found, minimum) {
+                    Some(true) => {}
+                    Some(false) => {
+                        return RequirementOutcome::Unmet(UnmetFramework::new(
+                            requirement,
+                            name,
+                            FrameworkProblem::TooOld { found },
+                        ))
+                    }
+                    None => {
+                        warning = Some(format!(
+                            "Could not compare {name} {found} with the {minimum} that '{item_id}' needs."
+                        ))
+                    }
+                }
+            }
+            Some(found)
+        }
+        FrameworkStatus::Present {
+            version: None,
+            unreadable,
+        } => {
+            warning = Some(format!(
+                "Could not read the version of {name} ({}), so it was not checked against {}. The launch check still guards a mismatched build.",
+                unreadable.unwrap_or_else(|| "unknown reason".into()),
+                requirement.min_version.as_deref().unwrap_or("any version")
+            ));
+            None
+        }
+    };
+    RequirementOutcome::Met {
+        check: FrameworkCheck {
+            framework: requirement.framework.clone(),
+            name,
+            min_version: requirement.min_version.clone(),
+            found_version,
+        },
+        warning,
+    }
+}
+
+/// Point each unmet framework at the catalog entry that provides it, when one can be told apart.
+/// A registry that cannot be read only means no link, so it is not an error.
+fn link_catalog_entries(
+    ctx: &Ctx,
+    game: &GameId,
+    exclude: Option<&str>,
+    unmet: &mut [UnmetFramework],
+) {
+    let entries = RegistryService::new(ctx.clone())
+        .list_game_items(game.as_str())
+        .unwrap_or_default();
+    for framework in unmet {
+        framework.catalog_entry = framework_catalog_entry(&entries, exclude, framework);
+    }
+}
+
+/// The one entry that is this framework: its id is the framework's id, optionally followed by a
+/// number (`skse` and `skse64`), or its name is the framework's name, ignoring case. A manifest says
+/// which frameworks an entry needs, not which it provides, so this matches narrowly, and two
+/// candidates give no link rather than a guess.
+fn framework_catalog_entry(
+    entries: &[GameCatalogItem],
+    exclude: Option<&str>,
+    framework: &UnmetFramework,
+) -> Option<CatalogEntryRef> {
+    let id = framework.framework.to_lowercase();
+    let name = framework.name.to_lowercase();
+    let mut candidates = entries.iter().filter(|entry| {
+        let entry_id = entry.id.to_lowercase();
+        Some(entry.id.as_str()) != exclude
+            && (entry_id
+                .strip_prefix(&id)
+                .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+                || entry.name.to_lowercase() == name)
+    });
+    let only = candidates.next()?;
+    candidates.next().is_none().then(|| CatalogEntryRef {
+        id: only.id.clone(),
+        name: only.name.clone(),
+    })
+}
+
+/// What the launch check says about the frameworks an instance's catalog mods need.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RequirementFinding {
+    /// These mods need a framework the instance does not satisfy.
+    Unmet {
+        needed_by: Vec<String>,
+        unmet: UnmetFramework,
+    },
+    /// What these mods need could not be checked. Never read as "all is well".
+    NotChecked {
+        needed_by: Vec<String>,
+        reason: String,
+    },
+}
+
+impl RequirementFinding {
+    /// One line for a person.
+    pub fn summary(&self) -> String {
+        match self {
+            RequirementFinding::Unmet { needed_by, unmet } => {
+                let verb = if needed_by.len() == 1 {
+                    "needs"
+                } else {
+                    "need"
+                };
+                format!(
+                    "{} {verb} {}{}. {}",
+                    needed_by.join(", "),
+                    unmet.needs(),
+                    unmet.reason(),
+                    unmet.advice()
+                )
+            }
+            RequirementFinding::NotChecked { needed_by, reason } => format!(
+                "Agora could not check which frameworks {} need ({reason}).",
+                needed_by.join(", ")
+            ),
+        }
+    }
+}
+
+/// The enabled catalog mods of an instance whose required frameworks are unmet, judged afresh from
+/// the catalog and the files the game will see. Grouped by requirement, so five mods that need one
+/// missing framework are one finding. This is what still tells the truth after "install anyway",
+/// and after a framework is removed later. A mod the catalog no longer lists has no known
+/// requirement, so it gives nothing.
+pub fn requirement_findings(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Vec<RequirementFinding> {
+    let manifest = match game_instance::get_manifest(ctx, instance_id) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return vec![RequirementFinding::NotChecked {
+                needed_by: vec![format!("the mods in instance '{instance_id}'")],
+                reason: error.to_string(),
+            }]
+        }
+    };
+    let installed = enabled_catalog_items(ctx, &manifest);
+    if installed.is_empty() {
+        return Vec::new();
+    }
+    let Some(runtime) = instance_runtime(&manifest) else {
+        return Vec::new();
+    };
+    let connection = match RegistryService::new(ctx.clone()).connection() {
+        Ok(connection) => connection,
+        Err(error) => {
+            return vec![RequirementFinding::NotChecked {
+                needed_by: installed.into_iter().map(|(_, name)| name).collect(),
+                reason: error.to_string(),
+            }]
+        }
+    };
+
+    let mut groups: Vec<(UnmetFramework, Vec<String>)> = Vec::new();
+    let mut unchecked: Vec<(String, String)> = Vec::new();
+    let mut looked_up: HashMap<String, Result<FrameworkLookup, String>> = HashMap::new();
+    for (item_id, fallback_name) in installed {
+        let item = match registry::get_game_item(&connection, &item_id) {
+            Ok(Some(item)) => item,
+            Ok(None) => continue,
+            Err(error) => {
+                unchecked.push((fallback_name, error.to_string()));
+                continue;
+            }
+        };
+        let Ok((_, compatibility)) = choose_compatibility(&item, &runtime) else {
+            continue;
+        };
+        for requirement in &compatibility.requires {
+            // Reading a framework plans the instance's files, so it is done once per framework.
+            let found = looked_up
+                .entry(requirement.framework.clone())
+                .or_insert_with(|| {
+                    look_up_framework(
+                        ctx,
+                        &manifest.game,
+                        instance_id,
+                        definition,
+                        &requirement.framework,
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            let found = match found {
+                Ok(found) => found.clone(),
+                Err(reason) => {
+                    unchecked.push((item.name.clone(), reason.clone()));
+                    continue;
+                }
+            };
+            if let RequirementOutcome::Unmet(unmet) =
+                judge_requirement(found, requirement, &item.id)
+            {
+                match groups.iter_mut().find(|(group, _)| *group == unmet) {
+                    Some((_, needed_by)) => needed_by.push(item.name.clone()),
+                    None => groups.push((unmet, vec![item.name.clone()])),
+                }
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    for (mut unmet, needed_by) in groups {
+        link_catalog_entries(ctx, &manifest.game, None, std::slice::from_mut(&mut unmet));
+        findings.push(RequirementFinding::Unmet { needed_by, unmet });
+    }
+    if let Some((_, reason)) = unchecked.first() {
+        findings.push(RequirementFinding::NotChecked {
+            reason: reason.clone(),
+            needed_by: unchecked.iter().map(|(name, _)| name.clone()).collect(),
+        });
+    }
+    findings
+}
+
+/// The catalog entries behind an instance's enabled layers, as `(entry id, stored item name)`, each
+/// once. An item a FOMOD installer derived counts as the archive it came from. The store's ids are
+/// listed once: a lookup without them rescans the folder, per layer, on setups of hundreds of mods.
+fn enabled_catalog_items(ctx: &Ctx, manifest: &GameInstanceManifest) -> Vec<(String, String)> {
+    let Ok(ids) = content_store::item_ids(ctx) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, String)> = Vec::new();
+    for layer in manifest.layers.layers() {
+        let LayerSource::Content { content } = &layer.source else {
+            continue;
+        };
+        if !layer.enabled {
+            continue;
+        }
+        let Ok(item) = content_store::get_item_indexed(ctx, &ids, content) else {
+            continue;
+        };
+        let origin = crate::content_fomod::recorded_install(&item)
+            .and_then(|(from_item, _)| content_store::get_item_indexed(ctx, &ids, from_item).ok());
+        for source in origin.iter().chain([&item]).flat_map(|i| &i.sources) {
+            if let ContentSource::Catalog { item_id, .. } = source {
+                if !found.iter().any(|(id, _)| id == item_id) {
+                    found.push((item_id.clone(), item.name.clone()));
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The instance's runtime identity: the one it records, or its pinned base's.

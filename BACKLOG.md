@@ -352,6 +352,8 @@
 ---
 
 ## Deferred 
+- [ ] **Catalog `provides` field:** let a game catalog entry say which framework it provides, so the link from an unmet framework stops relying on the narrow id and name match in `framework_catalog_entry` (`crates/agora-core/src/catalog_install.rs`).
+
 - [x] **Cross-cutting Pack Overrides: mrpack `overrides/` extraction + non-mod file round-trip**
    - **Short:** When importing or exporting `.mrpack` packs, honor Modrinth's `overrides/` (and `client-overrides/` / `server-overrides/`) directory convention and broaden the agora-pack JSON to round-trip non-mod files.
    - **Detail:** `import_mrpack` in `mod_install.rs` now extracts override directories (`overrides/`, `client_overrides/`) alongside mod `.jar`s, applying the override sanitizer's whitelist: `config/`, `defaultconfigs/`, `resourcepacks/`, `shaderpacks/`, `datapacks/`, `kubejs/`. Sanitization runs inline in `import_mrpack` (the archive is already open in-memory, so `override_sanitizer::extract_overrides`'s zip-path API is not used directly). Banned extensions and Zip Slip protection apply.

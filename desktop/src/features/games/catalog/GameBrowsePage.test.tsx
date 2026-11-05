@@ -1,7 +1,7 @@
 /**
  * A game's Browse page: the curated catalog as Minecraft's result cards, an empty catalog that
- * points to Settings > Plugins, search, the "Install into" choice, and "Install anyway" both as
- * the switch and as the answer to a file that changed since the Agora team checked it.
+ * points to Settings > Plugins, search, the "Install into" choice, the "Allow changed files" switch, and
+ * "Install anyway" as the answer to a changed file or an unmet framework.
  */
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,7 +14,7 @@ vi.mock('@/lib/settingsSection', async (importOriginal) => ({
   openSettingsSection,
 }));
 
-import { GameBrowsePage, INSTALL_ANYWAY_COPY } from './index';
+import { GameBrowsePage, ALLOW_CHANGED_FILES_COPY } from './index';
 
 const entry = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
   id,
@@ -32,7 +32,7 @@ const twoEntries = {
   entries: [
     entry('skse', 'SKSE64'),
     entry('ussep', 'Unofficial Patch', {
-      compatibility: [{ stores: ['steam'], gameVersions: ['1.6.1170'], requires: [{ framework: 'skse', minVersion: '2.2' }], asset: null }],
+      compatibility: [{ stores: ['steam'], gameVersions: ['1.6.1170'], requires: [{ framework: 'skse', name: 'Skyrim Script Extender', minVersion: '2.2' }], asset: null }],
     }),
   ],
   instances: [{ instanceId: 'inst-1', name: 'Grounded' }],
@@ -78,7 +78,8 @@ describe('GameBrowsePage', () => {
     expect(cards[0]).toHaveTextContent('Curated');
     expect(cards[0]).toHaveTextContent('by ianpatt · Downloads from GitHub');
     expect(cards[0]).toHaveTextContent('Steam 1.6.1170');
-    expect(cards[1]).toHaveTextContent('Needs skse 2.2 or newer');
+    expect(cards[1]).toHaveTextContent('Needs Skyrim Script Extender 2.2 or newer');
+    expect(cards[1]).not.toHaveTextContent('Needs skse');
     expect(screen.getByRole('heading', { name: 'Browse' })).toBeInTheDocument();
     expect(screen.getByText('Mods the Agora team have personally reviewed and selected for the catalog.')).toBeInTheDocument();
   });
@@ -117,9 +118,9 @@ describe('GameBrowsePage', () => {
     render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
     const [first] = await screen.findAllByTestId('catalog-entry');
 
-    const toggle = screen.getByRole('switch', { name: INSTALL_ANYWAY_COPY.label });
+    const toggle = screen.getByRole('switch', { name: ALLOW_CHANGED_FILES_COPY.label });
     expect(toggle).not.toBeChecked();
-    expect(toggle).toHaveAccessibleDescription(INSTALL_ANYWAY_COPY.description);
+    expect(toggle).toHaveAccessibleDescription(ALLOW_CHANGED_FILES_COPY.description);
 
     fireEvent.click(within(first).getByRole('button', { name: 'Install' }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_catalog_install', expect.anything()));
@@ -171,6 +172,215 @@ describe('GameBrowsePage', () => {
     const alert = await within(first).findByRole('alert');
     expect(alert).toHaveTextContent('does not match its published hash');
     expect(within(alert).queryByRole('button', { name: 'Install anyway' })).not.toBeInTheDocument();
+  });
+
+  describe('a required framework that is unmet', () => {
+    const skseUnmet = {
+      framework: 'skse',
+      name: 'Skyrim Script Extender',
+      minVersion: '2.2',
+      problem: 'absent',
+      foundVersion: null,
+      message: "This mod needs Skyrim Script Extender 2.2 or newer, and this instance doesn't have it. It probably won't work until you add it.",
+      catalogEntry: { id: 'skse', name: 'SKSE64' },
+    };
+    const addressUnmet = {
+      framework: 'address-library',
+      name: 'Address Library',
+      minVersion: null,
+      problem: 'undetectable',
+      foundVersion: null,
+      message: "This mod needs Address Library, and Agora can't tell whether this instance has it. It probably won't work unless you have it.",
+      catalogEntry: null,
+    };
+    const plan = (unmetFrameworks: unknown[]) => ({
+      itemId: 'ussep',
+      itemName: 'Unofficial Patch',
+      instanceId: 'inst-1',
+      source: 'GitHub a/b release 1',
+      fileName: 'patch.7z',
+      release: '1',
+      size: 10,
+      frameworks: [],
+      unmetFrameworks,
+      warnings: [],
+    });
+    const placed = (unmetFrameworks: unknown[]) => ({
+      state: 'placed',
+      ...plan(unmetFrameworks),
+      contentItemId: 'c-1',
+      mountPath: 'Data',
+      storedSize: 10,
+      hash: { sha256: 'ab'.repeat(32), verified: true, basis: 'GitHub published it.', confirmedPast: null },
+    });
+    const refused = { code: 'core_failed', message: 'needs skse', coreCode: 'ERR_CATALOG_FRAMEWORK_MISSING' };
+    const requests = () =>
+      invokeMock.mock.calls.filter(([command]) => command === 'games_catalog_install').map(([, args]) => args.request);
+
+    /** The core's behaviour: refuses unless it is a dry run or the override is on. */
+    function core(unmet: unknown[] = [skseUnmet]) {
+      invokeMock.mockImplementation(async (command: string, args: { request?: Record<string, unknown> }) => {
+        if (command === 'games_catalog_list') return twoEntries;
+        if (command !== 'games_catalog_install') return null;
+        if (args.request?.dryRun) return { state: 'dry_run', ...plan(unmet) };
+        if (args.request?.allowMissingFrameworks) return placed(unmet);
+        throw refused;
+      });
+    }
+
+    async function patchCard() {
+      const cards = await screen.findAllByTestId('catalog-entry');
+      return cards[1];
+    }
+
+    it('stops an install, names the framework, and writes nothing until asked', async () => {
+      core();
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+
+      fireEvent.click(within(card).getByRole('button', { name: 'Install' }));
+      const warning = await within(card).findByTestId('catalog-unmet-frameworks');
+      expect(warning).toHaveTextContent('This mod needs Skyrim Script Extender 2.2 or newer');
+      expect(warning).toHaveTextContent("It probably won't work until you add it.");
+      expect(warning).not.toHaveTextContent('Installed anyway');
+      expect(within(card).getByTestId('catalog-preview')).toHaveTextContent('Nothing has been downloaded');
+      // The refused install, then the plan that names what stopped it. Neither carries the override.
+      expect(requests()).toHaveLength(2);
+      expect(requests()[0]).toMatchObject({ dryRun: false, allowMissingFrameworks: false });
+      expect(requests()[1]).toMatchObject({ dryRun: true, allowMissingFrameworks: false });
+    });
+
+    it('goes on only from the button, and says what it went past', async () => {
+      core();
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(within(card).getByRole('button', { name: 'Install' }));
+      const warning = await within(card).findByTestId('catalog-unmet-frameworks');
+
+      fireEvent.click(within(warning).getByRole('button', { name: 'Install anyway' }));
+      const placedResult = await within(card).findByTestId('catalog-placed');
+      expect(requests()[2]).toMatchObject({ dryRun: false, allowMissingFrameworks: true, installAnyway: false });
+      expect(placedResult).toHaveTextContent('Installed anyway, as you chose.');
+      expect(placedResult).toHaveTextContent('This mod needs Skyrim Script Extender');
+      expect(within(placedResult).queryByRole('button', { name: 'Install anyway' })).not.toBeInTheDocument();
+    });
+
+    it('has one Install anyway: the switch has its own name', async () => {
+      core();
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      await patchCard();
+      expect(ALLOW_CHANGED_FILES_COPY.label).toBe('Allow changed files');
+      expect(screen.getByRole('switch', { name: 'Allow changed files' })).toBeInTheDocument();
+      expect(screen.queryByText('Install anyway')).not.toBeInTheDocument();
+    });
+
+    it('the hash switch is not the framework override', async () => {
+      core();
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(screen.getByRole('switch', { name: ALLOW_CHANGED_FILES_COPY.label }));
+      fireEvent.click(within(card).getByRole('button', { name: 'Install' }));
+      await within(card).findByTestId('catalog-unmet-frameworks');
+      expect(requests()[0]).toMatchObject({ installAnyway: true, allowMissingFrameworks: false, dryRun: false });
+      expect(within(card).queryByTestId('catalog-placed')).not.toBeInTheDocument();
+    });
+
+    it('Preview names it too, and can be dismissed', async () => {
+      core();
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(within(card).getByRole('button', { name: 'Preview' }));
+      const warning = await within(card).findByTestId('catalog-unmet-frameworks');
+      expect(requests()).toHaveLength(1);
+      fireEvent.click(within(warning).getByRole('button', { name: 'Not now' }));
+      expect(within(card).queryByTestId('catalog-unmet-frameworks')).not.toBeInTheDocument();
+      expect(requests()).toHaveLength(1);
+    });
+
+    it('names both of two unmet frameworks, with a link only for the one the catalog has', async () => {
+      core([skseUnmet, addressUnmet]);
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(within(card).getByRole('button', { name: 'Preview' }));
+      const warning = await within(card).findByTestId('catalog-unmet-frameworks');
+      expect(warning).toHaveTextContent('Skyrim Script Extender');
+      expect(warning).toHaveTextContent('Address Library');
+      expect(within(warning).getAllByRole('button', { name: /^Go to / })).toHaveLength(1);
+    });
+
+    it('the link clears the search and takes the user to the framework', async () => {
+      core();
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(within(card).getByRole('button', { name: 'Preview' }));
+      await within(card).findByTestId('catalog-unmet-frameworks');
+      const search = screen.getByRole('textbox', { name: 'Search mods' });
+      fireEvent.change(search, { target: { value: 'unofficial' } });
+      expect(screen.getAllByTestId('catalog-entry')).toHaveLength(1);
+
+      fireEvent.click(within(screen.getByTestId('catalog-unmet-frameworks')).getByRole('button', { name: 'Go to SKSE64' }));
+      expect(search).toHaveValue('');
+      const [framework] = screen.getAllByTestId('catalog-entry');
+      await waitFor(() => expect(within(framework).getByRole('button', { name: 'Install' })).toHaveFocus());
+    });
+
+    it('does not offer it when something else stands in the way', async () => {
+      invokeMock.mockImplementation(async (command: string, args: { request?: Record<string, unknown> }) => {
+        if (command === 'games_catalog_list') return twoEntries;
+        if (args.request?.dryRun) {
+          throw { code: 'core_failed', message: 'No release has a matching file.', coreCode: 'ERR_CATALOG_NO_ASSET' };
+        }
+        throw refused;
+      });
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(within(card).getByRole('button', { name: 'Install' }));
+      const alert = await within(card).findByRole('alert');
+      expect(alert).toHaveTextContent('needs skse');
+      expect(alert).toHaveTextContent('No release has a matching file.');
+      expect(within(card).queryByRole('button', { name: 'Install anyway' })).not.toBeInTheDocument();
+    });
+
+    it('keeps the override when a changed file then needs its own answer', async () => {
+      invokeMock.mockImplementation(async (command: string, args: { request?: Record<string, unknown> }) => {
+        if (command === 'games_catalog_list') return twoEntries;
+        if (command !== 'games_catalog_install') return null;
+        if (args.request?.dryRun) return { state: 'dry_run', ...plan([skseUnmet]) };
+        if (!args.request?.allowMissingFrameworks) throw refused;
+        if (!args.request?.installAnyway) {
+          throw { code: 'core_failed', message: 'The file differs.', coreCode: 'ERR_HASH_CONFIRMATION_REQUIRED' };
+        }
+        return placed([skseUnmet]);
+      });
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(within(card).getByRole('button', { name: 'Install' }));
+      fireEvent.click(within(await within(card).findByTestId('catalog-unmet-frameworks')).getByRole('button', { name: 'Install anyway' }));
+      const stop = await within(card).findByRole('alert');
+      expect(stop).toHaveTextContent('The file differs.');
+      fireEvent.click(within(stop).getByRole('button', { name: 'Install anyway' }));
+      await within(card).findByTestId('catalog-placed');
+      expect(requests()[requests().length - 1]).toMatchObject({ installAnyway: true, allowMissingFrameworks: true, dryRun: false });
+    });
+
+    it('does not carry the warning over to another instance', async () => {
+      invokeMock.mockImplementation(async (command: string, args: { request?: Record<string, unknown> }) => {
+        if (command === 'games_catalog_list') {
+          return { ...twoEntries, instances: [{ instanceId: 'inst-1', name: 'Grounded' }, { instanceId: 'inst-2', name: 'Second' }] };
+        }
+        if (args.request?.dryRun) return { state: 'dry_run', ...plan([skseUnmet]) };
+        throw refused;
+      });
+      render(<GameBrowsePage gameId="skyrim-se" gameName="Skyrim SE" />);
+      const card = await patchCard();
+      fireEvent.click(within(card).getByRole('button', { name: 'Preview' }));
+      await within(card).findByTestId('catalog-unmet-frameworks');
+
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: 'inst-2' } });
+      expect(within(card).queryByTestId('catalog-unmet-frameworks')).not.toBeInTheDocument();
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: 'inst-1' } });
+      expect(within(card).getByTestId('catalog-unmet-frameworks')).toBeInTheDocument();
+    });
   });
 
   it('says so when the catalog cannot be read, and tries again', async () => {

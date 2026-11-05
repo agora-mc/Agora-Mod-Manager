@@ -9,6 +9,7 @@ import {
   fallbackTradeoffs,
   formatWhen,
   frameworksMatch,
+  frameworksText,
   launchAnywayText,
   orderFindings,
   progressText,
@@ -137,6 +138,16 @@ describe('Launch anyway wording', () => {
     expect(launchAnywayText(check())).toBeNull();
     expect(launchAnywayText(check({ status: 'warnings', findings: [finding({ blocks: false })] }))).toBeNull();
     expect(launchAnywayText(null)).toBeNull();
+  });
+});
+
+describe('frameworksText', () => {
+  it('never reads as all clear beside a framework warning', () => {
+    expect(frameworksText(null)).toBe('Not checked');
+    expect(frameworksText(check())).toBe('Match this game version');
+    expect(frameworksText(check({ status: 'warnings', findings: [finding({ kind: 'tool' })] }))).toBe('Match this game version');
+    expect(frameworksText(check({ status: 'warnings', findings: [finding({ blocks: false })] }))).toBe('Need a look: see the checks');
+    expect(frameworksText(check({ status: 'findings', findings: [finding({ blocks: true })] }))).toBe('Do not match this game version');
   });
 });
 

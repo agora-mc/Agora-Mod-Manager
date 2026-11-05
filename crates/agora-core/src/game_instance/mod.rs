@@ -1143,6 +1143,9 @@ pub struct LaunchChecks {
     pub runtime: Vec<agora_game_api::RuntimeFileFinding>,
     pub load_order: Vec<crate::game_load_order::Finding>,
     pub outputs: Vec<crate::game_tools::OutputFinding>,
+    /// Frameworks the instance's catalog mods need and it does not satisfy. A warning, never a
+    /// refusal: the user may have installed the mod past exactly this on purpose.
+    pub requirements: Vec<crate::catalog_install::RequirementFinding>,
     /// The checks that ran and passed, for the page to list beside any findings.
     pub passed: Vec<PassedCheck>,
 }
@@ -1184,6 +1187,7 @@ pub fn launch_checks(
             runtime,
             load_order: Vec::new(),
             outputs: Vec::new(),
+            requirements: Vec::new(),
             passed: Vec::new(),
         });
     }
@@ -1199,6 +1203,7 @@ pub fn launch_checks(
     };
     let outputs =
         crate::game_tools::output_findings_with_view(ctx, id, definition, links.as_ref())?;
+    let requirements = crate::catalog_install::requirement_findings(ctx, id, definition);
     let mut passed = Vec::new();
     for pass in &framework_passes {
         passed.push(PassedCheck {
@@ -1223,6 +1228,7 @@ pub fn launch_checks(
         runtime,
         load_order,
         outputs,
+        requirements,
         passed,
     })
 }

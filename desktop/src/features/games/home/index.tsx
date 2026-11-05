@@ -347,7 +347,7 @@ function CatalogStrip({ gameName, catalog, onOpenBrowse }: {
       </div>
       <div className="grid gap-2 md:grid-cols-3">
         {entries.slice(0, 3).map((entry) => {
-          const needs = entry.compatibility.flatMap((compat) => compat.requires).map((req) => req.framework);
+          const needs = entry.compatibility.flatMap((compat) => compat.requires).map((req) => req.name);
           return (
             <button
               key={entry.id}

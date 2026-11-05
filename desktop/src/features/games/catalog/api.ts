@@ -11,6 +11,8 @@ export type HashOrigin = 'curator_pin' | 'previous_install';
 
 export interface CatalogRequirement {
   framework: string;
+  /** The game's name for it, or the id when the game does not declare it. */
+  name: string;
   minVersion: string | null;
 }
 
@@ -57,6 +59,20 @@ export interface CatalogHash {
   confirmedPast: HashOrigin | null;
 }
 
+/** A required framework the instance does not satisfy (`UnmetFramework` in agora-core). */
+export interface CatalogUnmetFramework {
+  framework: string;
+  name: string;
+  minVersion: string | null;
+  problem: 'absent' | 'too_old' | 'undetectable' | 'undeclared';
+  /** The version found, when it is `too_old`. */
+  foundVersion: string | null;
+  /** The warning to show, as the core words it. */
+  message: string;
+  /** The catalog entry that provides it, when there is one. */
+  catalogEntry: { id: string; name: string } | null;
+}
+
 /** The plan fields every outcome carries. */
 export interface CatalogPlan {
   itemId: string;
@@ -67,6 +83,8 @@ export interface CatalogPlan {
   release: string | null;
   size: number | null;
   frameworks: CatalogFramework[];
+  /** Only a dry run, or an install the user chose to run past them, gets as far as naming these. */
+  unmetFrameworks: CatalogUnmetFramework[];
   warnings: string[];
 }
 
@@ -87,7 +105,10 @@ export interface CatalogInstallRequest {
   gameId: string;
   instanceId: string;
   entryId: string;
+  /** Accept a file that differs from a curator pin or an earlier install. Frameworks are separate. */
   installAnyway: boolean;
+  /** Install although a required framework is unmet, as the user chose. */
+  allowMissingFrameworks: boolean;
   dryRun: boolean;
 }
 
@@ -124,7 +145,12 @@ export async function listCatalogEntries(gameId: string): Promise<CatalogListing
 /** Plan (`dryRun`) or install one entry into an instance. */
 export async function installCatalogEntry(request: CatalogInstallRequest): Promise<CatalogInstallReply> {
   const reply: unknown = await invoke<unknown>('games_catalog_install', { request });
-  if (!isRecord(reply) || typeof reply.state !== 'string' || typeof reply.itemId !== 'string') {
+  if (
+    !isRecord(reply)
+    || typeof reply.state !== 'string'
+    || typeof reply.itemId !== 'string'
+    || !Array.isArray(reply.unmetFrameworks)
+  ) {
     throw new Error('games_catalog_install did not return an install result.');
   }
   return reply as unknown as CatalogInstallReply;

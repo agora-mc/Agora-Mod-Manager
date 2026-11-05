@@ -10,7 +10,7 @@ import {
   DEPLOYMENT_OPTIONS,
   deploymentLabel,
   formatWhen,
-  frameworksMatch,
+  frameworksText,
   launchAnywayText,
   orderFindings,
 } from './instanceText';
@@ -49,7 +49,6 @@ export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
   if (page.status === 'failed') return null;
 
   const { detail, check, checkError, refreshing, refreshError, checkedAt } = page;
-  const matches = frameworksMatch(check);
   const choice = detail.deployment ?? 'auto';
   const choiceCopy = DEPLOYMENT_OPTIONS.find((option) => option.id === choice);
   const skippedText = launchAnywayText(check);
@@ -183,9 +182,7 @@ export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
                 : `Not pinned: runs from the install folder${detail.unpinnedReason ? `. ${detail.unpinnedReason}` : ''}`}
             </AboutItem>
             <AboutItem term="Frameworks" testId="frameworks-status">
-              {matches === null && 'Not checked'}
-              {matches === true && 'Match this game version'}
-              {matches === false && 'Do not match this game version'}
+              {frameworksText(check)}
             </AboutItem>
             <AboutItem term="Saves">{detail.saves === 'own' ? "This instance's own" : 'Shared with the game'}</AboutItem>
             <AboutItem term="Last played">{formatWhen(detail.lastLaunchedAt)}</AboutItem>
