@@ -3,18 +3,18 @@ import { describe, expect, it } from 'vitest';
 import { ImportProgressView } from './ImportProgressView';
 import type { ImportProgress } from './api';
 
-const storing = {
+const storing: ImportProgress = {
   phase: 'storing',
   bytesDone: 393,
   bytesTotal: 982,
-  itemsDone: 12,
-  itemsTotal: 107,
+  modsDone: 12,
+  modsTotal: 107,
   currentMod: 'SkyUI',
-} as unknown as ImportProgress;
+};
 
 describe('ImportProgressView bar', () => {
   it('starts a measured bar as a new element, so it never slides back from full', () => {
-    const props = { title: 'Importing', sourceName: 'Mod Organizer 2', startedAt: Date.now() };
+    const props = { title: 'Importing', sourceName: 'Mod Organizer 2', startedAt: Date.now(), error: null, onBack: () => {} };
     const { rerender } = render(<ImportProgressView {...props} progress={null} />);
     const stripes = screen.getByTestId('import-bar-indeterminate');
 
