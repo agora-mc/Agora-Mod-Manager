@@ -42,16 +42,33 @@ const rowB = {
   sourcePath: 'textures',
 };
 
-const storeOther = {
-  itemId: 'cccc3333',
-  name: 'Sky Mod',
-  fileCount: 4,
-  totalSize: 2048,
-  sourceKind: 'archive',
-  sourceLabel: 'Archive: sky.7z',
-  addedAtUnixMs: 1,
-  gameIds: [],
-};
+/** A row of `games_library_list`, tied to no game unless the test says otherwise. */
+function libraryRow(itemId: string, name: string, gameIds: string[] = []) {
+  return {
+    itemId,
+    name,
+    description: null,
+    version: null,
+    gameId: gameIds.length === 1 ? gameIds[0] : null,
+    gameIds,
+    pageUrl: null,
+    iconSha256: null,
+    sourceKind: 'archive',
+    sourceLabel: 'Archive: sky.7z',
+    instances: [],
+    fileCount: 4,
+    totalSize: 2048,
+    addedAtUnixMs: 1,
+    pluginFiles: [],
+    hasInstaller: false,
+  };
+}
+
+const storeOther = libraryRow('cccc3333', 'Sky Mod');
+
+function libraryReply(...items: unknown[]) {
+  return { items, damaged: [], warnings: [] };
+}
 
 function mountTab() {
   return render(
@@ -61,12 +78,62 @@ function mountTab() {
   );
 }
 
+function addChoices(): string[] {
+  const select = screen.getByLabelText<HTMLSelectElement>('Choose an item to add');
+  return Array.from(select.options).map((option) => option.text).filter((text) => text !== 'Choose an item…');
+}
+
+describe('the "Add from your library" list', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    replies = {
+      games_instance_content_list: () => ({ instanceId: 'inst-1', items: [] }),
+    };
+    route();
+  });
+
+  it('offers this instance’s game and untied items only, sorted by name', async () => {
+    replies.games_library_list = () => libraryReply(
+      libraryRow('m1', 'Sodium', ['minecraft']),
+      libraryRow('s2', 'zEnhanced Camera', ['skyrim-se']),
+      libraryRow('u1', 'My Textures'),
+      libraryRow('s1', 'alternate Start', ['skyrim-se']),
+      libraryRow('b1', 'Both Games', ['minecraft', 'skyrim-se']),
+    );
+    mountTab();
+    await screen.findByLabelText('Choose an item to add');
+    expect(addChoices()).toEqual(['alternate Start', 'Both Games', 'My Textures', 'zEnhanced Camera']);
+  });
+
+  it('shows no leak on the Minecraft side either: a game-only item stays out', async () => {
+    replies.games_library_list = () => libraryReply(
+      libraryRow('s1', 'SkyUI', ['skyrim-se']),
+      libraryRow('m1', 'Sodium', ['minecraft']),
+    );
+    render(
+      <ConfirmProvider>
+        <InstanceContentTab gameId="minecraft" instanceId="inst-1" />
+      </ConfirmProvider>,
+    );
+    await screen.findByLabelText('Choose an item to add');
+    expect(addChoices()).toEqual(['Sodium']);
+  });
+
+  it('says the library has nothing for this game, not that it is empty or all added', async () => {
+    replies.games_library_list = () => libraryReply(libraryRow('m1', 'Sodium', ['minecraft']));
+    mountTab();
+    expect(await screen.findByText(/Your library has nothing for this game yet/)).toBeInTheDocument();
+    expect(screen.queryByLabelText('Choose an item to add')).toBeNull();
+    expect(screen.queryByText(/already in this instance/)).toBeNull();
+  });
+});
+
 describe('InstanceContentTab', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     replies = {
       games_instance_content_list: () => ({ instanceId: 'inst-1', items: [rowA, rowB] }),
-      games_content_list: () => ({ items: [storeOther], damaged: [] }),
+      games_library_list: () => libraryReply(storeOther),
     };
     route();
   });

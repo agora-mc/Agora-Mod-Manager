@@ -75,6 +75,7 @@ const unknown: ToolCandidate = {
   exe: 'Data/tools/FNIS.exe',
   modId: 'aaaa1111',
   modName: 'FNIS',
+  source: 'mod',
   knownToolId: null,
   suggestedName: 'FNIS',
   alreadyAdded: false,
@@ -84,6 +85,7 @@ const knownListed: ToolCandidate = {
   exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
   modId: 'bbbb2222',
   modName: 'Nemesis Unlimited Behavior Engine',
+  source: 'mod',
   knownToolId: 'nemesis',
   suggestedName: 'Nemesis',
   alreadyAdded: false,
@@ -93,6 +95,7 @@ const added: ToolCandidate = {
   exe: 'Data/tools/Old.exe',
   modId: 'cccc3333',
   modName: 'Old Tools',
+  source: 'mod',
   knownToolId: null,
   suggestedName: 'Old',
   alreadyAdded: true,
@@ -416,5 +419,124 @@ describe('the small helpers', () => {
   it('splits arguments on spaces outside quotes', () => {
     expect(splitArguments('  -sse   -o "C:/My Output" "" ')).toEqual(['-sse', '-o', 'C:/My Output', '']);
     expect(splitArguments('   ')).toEqual([]);
+  });
+});
+
+describe('Scan for programs', () => {
+  const written: ToolCandidate = {
+    exe: 'Data/Made/Written.exe',
+    modId: '',
+    modName: '',
+    source: 'instanceFiles',
+    knownToolId: null,
+    suggestedName: 'Written',
+    alreadyAdded: false,
+  };
+  const gameOwn: ToolCandidate = {
+    exe: 'SkyrimSELauncher.exe',
+    modId: '',
+    modName: '',
+    source: 'game',
+    knownToolId: null,
+    suggestedName: 'SkyrimSELauncher',
+    alreadyAdded: false,
+  };
+
+  const panel = async () => {
+    // Let the list finish loading first: the header's buttons change places with the empty state's
+    // on that render, and a click on the node that is about to be replaced reaches no handler.
+    await screen.findByRole('heading', { name: /Tools \(/ });
+    const empty = screen.queryByTestId('tools-empty');
+    const open = empty
+      ? within(empty).getByRole('button', { name: 'Scan for programs' })
+      : screen.getByRole('button', { name: 'Scan for programs' });
+    fireEvent.click(open);
+    return screen.findByTestId('tool-scan');
+  };
+
+  it('is offered beside "Add a tool…" in the empty state, and searches only when pressed', async () => {
+    mount();
+    const empty = await screen.findByTestId('tools-empty');
+    expect(within(empty).getByRole('button', { name: 'Scan for programs' })).toBeInTheDocument();
+    expect(within(empty).getByRole('button', { name: 'Add a tool…' })).toBeInTheDocument();
+    expect(findUserTools).not.toHaveBeenCalled();
+  });
+
+  it('is offered when tools exist too', async () => {
+    vi.mocked(listGameTools).mockResolvedValue({ instanceId: 'inst-1', tools: [nemesis], known: KNOWN });
+    mount();
+    await screen.findByRole('article', { name: 'Nemesis' });
+    expect(screen.getByRole('button', { name: 'Scan for programs' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add a tool…' })).toBeInTheDocument();
+  });
+
+  it('lists what it found with its mod, leaving out the game’s and what is already listed', async () => {
+    vi.mocked(listGameTools).mockResolvedValue({ instanceId: 'inst-1', tools: [nemesis], known: KNOWN });
+    vi.mocked(findUserTools).mockResolvedValue([unknown, knownListed, added, written, gameOwn]);
+    mount();
+    await panel();
+    const list = await screen.findByRole('list', { name: 'Programs found' });
+    const rows = within(list).getAllByRole('checkbox').map((box) => box.closest('label')?.textContent ?? '');
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toContain('FNIS');
+    expect(rows[0]).toContain('from FNIS');
+    expect(rows[1]).toContain('Written');
+    expect(rows[1]).toContain('from this instance’s own files');
+    expect(screen.getByTestId('tool-scan-count')).toHaveTextContent('Found 2 programs');
+  });
+
+  it('never adds on its own: nothing is picked at first, and only the picked program is added', async () => {
+    vi.mocked(findUserTools).mockResolvedValue([unknown, written]);
+    mount();
+    await panel();
+    const add = await screen.findByRole('button', { name: 'Add programs' });
+    expect(add).toBeDisabled();
+    expect(addUserTool).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /Written/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add 1 program' }));
+    await waitFor(() => expect(addUserTool).toHaveBeenCalledTimes(1));
+    expect(addUserTool).toHaveBeenCalledWith('inst-1', {
+      name: 'Written',
+      exe: 'Data/Made/Written.exe',
+      args: [],
+      outputIsMod: false,
+      outputFolder: null,
+      keepsOutput: false,
+    });
+    expect(await screen.findByText('Added Written.')).toBeInTheDocument();
+    expect(screen.queryByTestId('tool-scan')).toBeNull();
+  });
+
+  it('says plainly when nothing was found', async () => {
+    vi.mocked(findUserTools).mockResolvedValue([added, gameOwn]);
+    mount();
+    await panel();
+    expect(await screen.findByTestId('tool-scan-none')).toHaveTextContent('No new programs found');
+    expect(screen.queryByRole('button', { name: 'Add programs' })).toBeNull();
+  });
+
+  it('a search that fails says so, not "nothing found", and can be tried again', async () => {
+    vi.mocked(findUserTools).mockRejectedValueOnce(new Error('The mod record is damaged.'));
+    mount();
+    await panel();
+    expect(await screen.findByRole('alert')).toHaveTextContent('The mod record is damaged.');
+    expect(screen.queryByTestId('tool-scan-none')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(await screen.findByRole('list', { name: 'Programs found' })).toBeInTheDocument();
+  });
+
+  it('a program that cannot be added keeps the panel open, and says why, while the others are added', async () => {
+    vi.mocked(findUserTools).mockResolvedValue([unknown, written]);
+    vi.mocked(addUserTool).mockImplementationOnce(async () => { throw new Error('It is already listed.'); });
+    mount();
+    await panel();
+    fireEvent.click(await screen.findByRole('button', { name: 'Select all' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add 2 programs' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('FNIS: It is already listed.');
+    expect(await screen.findByText('Added Written.')).toBeInTheDocument();
+    expect(screen.getByTestId('tool-scan')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /FNIS/ })).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox', { name: /Written/ })).toBeNull();
   });
 });

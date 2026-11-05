@@ -22,17 +22,6 @@ export interface StoreItem {
   gameIds: string[];
 }
 
-/** A record in the store that cannot be read as an item: listed so it can be seen and removed. */
-export interface DamagedStoreItem {
-  itemId: string;
-  message: string;
-}
-
-export interface StoreList {
-  items: StoreItem[];
-  damaged: DamagedStoreItem[];
-}
-
 export interface StoreAdded {
   status: 'added' | 'existing';
   item: StoreItem;
@@ -101,39 +90,6 @@ export type InstanceAddOutcome =
 
 function hasItemList(value: unknown): value is { items: unknown[] } {
   return typeof value === 'object' && value !== null && Array.isArray((value as { items?: unknown }).items);
-}
-
-function isStoreItem(value: unknown): value is StoreItem {
-  if (typeof value !== 'object' || value === null) return false;
-  const item = value as Partial<StoreItem>;
-  return (
-    typeof item.itemId === 'string' &&
-    typeof item.name === 'string' &&
-    typeof item.sourceLabel === 'string' &&
-    Array.isArray(item.gameIds) &&
-    item.gameIds.every((id) => typeof id === 'string')
-  );
-}
-
-function isDamagedStoreItem(value: unknown): value is DamagedStoreItem {
-  if (typeof value !== 'object' || value === null) return false;
-  const record = value as Partial<DamagedStoreItem>;
-  return typeof record.itemId === 'string' && typeof record.message === 'string';
-}
-
-/** The content store. Rejects if the reply is not a list of items and a list of damaged records. */
-export async function listStore(): Promise<StoreList> {
-  const reply: unknown = await invoke<unknown>('games_content_list');
-  const damaged = (reply as { damaged?: unknown } | null)?.damaged;
-  if (
-    !hasItemList(reply) ||
-    !reply.items.every(isStoreItem) ||
-    !Array.isArray(damaged) ||
-    !damaged.every(isDamagedStoreItem)
-  ) {
-    throw new Error('games_content_list did not return a list of items.');
-  }
-  return reply as StoreList;
 }
 
 /**

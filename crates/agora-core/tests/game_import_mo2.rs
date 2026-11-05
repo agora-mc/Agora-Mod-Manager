@@ -400,6 +400,59 @@ fn item_id_named(ctx: &CoreContext, name: &str) -> String {
 /// A modlist that names a path outside `mods`, a drive, a separator, and a folder that is not there.
 /// Each is reported and none is read: the `outside` folder's file never reaches the content store.
 #[test]
+fn progress_names_each_mod_and_counts_bytes_up_to_the_total_then_the_unmeasured_stages() {
+    use game_import::ImportPhase;
+    let f = fixture();
+    let seen = std::cell::RefCell::new(Vec::new());
+    game_import::run(
+        &f.ctx,
+        &f.inventory,
+        &request(&f, None, false),
+        RunOptions::default(),
+        &|progress| seen.borrow_mut().push(progress),
+    )
+    .unwrap();
+    let seen = seen.into_inner();
+    let storing: Vec<_> = seen
+        .iter()
+        .filter(|p| p.phase == ImportPhase::Storing)
+        .collect();
+    assert_eq!(
+        storing.len(),
+        storing[0].mods_total * 2,
+        "one before and one after each mod"
+    );
+    assert_eq!(storing[0].mods_done, 0);
+    assert_eq!(storing[0].bytes_done, 0);
+    assert!(
+        storing[0].current_mod.is_some(),
+        "the first report names the mod being stored"
+    );
+    assert!(storing
+        .windows(2)
+        .all(|w| w[0].bytes_done <= w[1].bytes_done));
+    let last = storing.last().unwrap();
+    assert_eq!(last.mods_done, last.mods_total);
+    assert_eq!(last.bytes_done, last.bytes_total, "the bar reaches its end");
+    assert_eq!(last.current_mod, None);
+
+    // The stages after the mods come in order, and carry no mod.
+    let rest: Vec<ImportPhase> = seen
+        .iter()
+        .filter(|p| p.phase != ImportPhase::Storing && p.phase != ImportPhase::Overwrite)
+        .map(|p| p.phase)
+        .collect();
+    assert_eq!(
+        rest,
+        [
+            ImportPhase::Instance,
+            ImportPhase::Layers,
+            ImportPhase::Finishing
+        ]
+    );
+}
+
+#[test]
 fn hostile_modlist_names_are_reported_and_never_read() {
     let f = fixture();
     let report = game_import::plan(&f.ctx, &f.inventory, &request(&f, None, false)).unwrap();

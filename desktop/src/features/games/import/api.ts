@@ -123,7 +123,13 @@ export type Mo2ImportReply =
 /** The error code a preview or import fails with when the game has no install Agora found. */
 export const NO_INSTALL_CODE = 'no_install';
 
+/** The stage of a running import. Only `storing` can be measured; the others have no percentage. */
+export type ImportPhase = 'storing' | 'overwrite' | 'instance' | 'layers' | 'finishing';
+
 export interface ImportProgress {
+  phase: ImportPhase;
+  /** The mod being stored now, when there is one. */
+  currentMod: string | null;
   modsDone: number;
   modsTotal: number;
   bytesDone: number;

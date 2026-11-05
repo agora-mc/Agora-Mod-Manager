@@ -34,6 +34,7 @@ import { isGamesError, type InstallSummary } from '../shared/types';
 import { storeName } from '../shared/stores';
 import { planBlockReason } from './planRules';
 import { PlanView } from './PlanView';
+import { ImportProgressView } from './ImportProgressView';
 
 /** One step's panel inside the dialog: a quiet card on the dialog's own surface. */
 const STEP_CARD = 'space-y-3 rounded-xl border border-border bg-background/60 p-4';
@@ -51,8 +52,8 @@ type PlanState =
 
 type RunState =
   | { status: 'idle' }
-  | { status: 'running'; progress: ImportProgress | null }
-  | { status: 'error'; message: string }
+  | { status: 'running'; progress: ImportProgress | null; startedAt: number; instanceName: string }
+  | { status: 'error'; message: string; progress: ImportProgress | null; startedAt: number; instanceName: string }
   | { status: 'done'; report: Mo2RunDto };
 
 /** Where the import has got to, for the dialog's step row and footer. */
@@ -64,10 +65,10 @@ export interface ImportFlowState {
   report: Mo2RunDto | null;
 }
 
-export type ImportStep = 'setup' | 'profile' | 'preview' | 'done';
+export type ImportStep = 'setup' | 'profile' | 'preview' | 'importing' | 'done';
 
 /** The step page the dialog shows. Each step is its own page, and Back returns to the last one. */
-type Page = Exclude<ImportStep, 'done'>;
+type Page = Exclude<ImportStep, 'importing' | 'done'>;
 
 /** "3 profiles · 12 mods · found in the usual place", with what could not be read said plainly. */
 export function setupSummary(setup: SetupFound): string {
@@ -232,29 +233,37 @@ export function Mo2ImportFlow({ gameId, onStateChange }: Mo2ImportFlowProps) {
       confirmLabel: 'Import profile',
     });
     if (!ok) return;
-    setRun({ status: 'running', progress: null });
+    const startedAt = Date.now();
+    const instanceName = current.instanceName;
+    let latest: ImportProgress | null = null;
+    setRun({ status: 'running', progress: null, startedAt, instanceName });
     let unlisten: UnlistenFn | null = null;
     try {
       unlisten = await listenImportProgress((progress) => {
-        if (mounted.current) setRun({ status: 'running', progress });
+        latest = progress;
+        if (mounted.current) setRun({ status: 'running', progress, startedAt, instanceName });
       });
       const reply = await importMo2Profile(request(false));
       if (reply.kind !== 'run') throw new Error('The import did not return a report.');
       if (mounted.current) setRun({ status: 'done', report: reply });
     } catch (error) {
-      if (mounted.current) setRun({ status: 'error', message: formatError(error) });
+      if (mounted.current) {
+        setRun({ status: 'error', message: formatError(error), progress: latest, startedAt, instanceName });
+      }
     } finally {
       unlisten?.();
     }
   };
 
+  const importing = run.status === 'running' || run.status === 'error';
+
   // Each step is a fresh page: start it at its top, not where the last one was scrolled to.
   const pageTop = useRef<HTMLElement | null>(null);
   useEffect(() => {
     pageTop.current?.scrollIntoView?.({ block: 'start' });
-  }, [page]);
+  }, [page, importing]);
 
-  const step: ImportStep = run.status === 'done' ? 'done' : page;
+  const step: ImportStep = run.status === 'done' ? 'done' : importing ? 'importing' : page;
   const running = run.status === 'running';
   const report = run.status === 'done' ? run.report : null;
   useEffect(() => {
@@ -267,6 +276,26 @@ export function Mo2ImportFlow({ gameId, onStateChange }: Mo2ImportFlowProps) {
     return (
       <section ref={pageTop} className="scroll-mt-4 space-y-5" data-testid="import-page">
         <RunSummary report={run.report} />
+      </section>
+    );
+  }
+
+  if (run.status === 'running' || run.status === 'error') {
+    return (
+      <section ref={pageTop} className="scroll-mt-4" data-testid="import-page">
+        <ImportProgressView
+          title={`Importing “${run.instanceName}”`}
+          sourceName="Mod Organizer 2"
+          progress={run.progress}
+          startedAt={run.startedAt}
+          error={run.status === 'error' ? run.message : null}
+          onBack={() => {
+            // What the failed run left behind can change what a new one would do: read it again.
+            setRun({ status: 'idle' });
+            setPage('preview');
+            void previewImport();
+          }}
+        />
       </section>
     );
   }
@@ -297,7 +326,7 @@ export function Mo2ImportFlow({ gameId, onStateChange }: Mo2ImportFlowProps) {
             <ChoiceCards
               label="Install to import onto"
               value={install ?? ''}
-              disabled={plan.status === 'busy' || running}
+              disabled={plan.status === 'busy'}
               onChange={chooseInstall}
               options={installChoice.installs.map((entry) => ({
                 value: entry.installId,
@@ -318,23 +347,9 @@ export function Mo2ImportFlow({ gameId, onStateChange }: Mo2ImportFlowProps) {
           <PlanView
             plan={readyPlan}
             blockReason={planBlockReason(readyPlan, gameId)}
-            busy={running}
+            busy={false}
             onImport={() => runImport(readyPlan)}
           />
-        )}
-
-        {run.status === 'running' && (
-          <p role="status" className="rounded-xl border border-primary/40 bg-primary/5 p-4 text-sm" data-testid="import-progress">
-            {run.progress
-              ? `Storing mods: ${run.progress.modsDone} of ${run.progress.modsTotal}, ${formatBytes(run.progress.bytesDone)} of ${formatBytes(run.progress.bytesTotal)}. A large setup takes a while; keep Agora open.`
-              : 'Starting the import. Keep Agora open.'}
-          </p>
-        )}
-
-        {run.status === 'error' && (
-          <p role="alert" className="rounded-xl border border-destructive/40 bg-destructive/10 p-4 text-sm">
-            The import did not finish: {run.message} Preview the import again to see what is still to do.
-          </p>
         )}
       </section>
     );
@@ -412,7 +427,7 @@ export function Mo2ImportFlow({ gameId, onStateChange }: Mo2ImportFlowProps) {
               <div>
                 <Button
                   onClick={() => void previewImport()}
-                  disabled={!profile || plan.status === 'busy' || run.status === 'running'}
+                  disabled={!profile || plan.status === 'busy'}
                 >
                   {plan.status === 'busy' ? 'Reading the profile…' : 'Preview the import'}
                   {plan.status !== 'busy' && <ArrowRight aria-hidden="true" />}

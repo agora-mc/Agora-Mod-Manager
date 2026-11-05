@@ -5,8 +5,8 @@
   "summary": {
     "registered_rust": 391,
     "defined_rust": 391,
-    "ts_wrappers": 391,
-    "rust_only": 0,
+    "ts_wrappers": 390,
+    "rust_only": 1,
     "ts_only": 0,
     "defined_not_registered": 0
   },
@@ -886,7 +886,6 @@
       "games_catalog_install",
       "games_catalog_list",
       "games_content_add",
-      "games_content_list",
       "games_content_remove",
       "games_content_verify",
       "games_discover",
@@ -1190,7 +1189,9 @@
       "verify_lockfile",
       "wear_saved_skin"
     ],
-    "missing_ts_wrapper": [],
+    "missing_ts_wrapper": [
+      "games_content_list"
+    ],
     "missing_rust_command": [],
     "defined_not_registered": []
   }

@@ -655,7 +655,11 @@ fn tools_tab_timings() {
     let mut lists = Vec::new();
     let mut users = Vec::new();
     let mut both = Vec::new();
+    let mut scans = Vec::new();
     for _ in 0..5 {
+        let (candidates, t) = timed(|| game_user_tools::find_candidates(&ctx, &id, &def).unwrap());
+        assert_eq!(candidates.len(), 3);
+        scans.push(t);
         let ((states, _), t) = timed(|| game_tools::list_and_findings(&ctx, &id, &def).unwrap());
         assert_eq!(states.iter().filter(|s| s.is_present()).count(), 2);
         lists.push(t);
@@ -678,6 +682,11 @@ fn tools_tab_timings() {
         .files
         .len();
     println!("tools tab bench: {items} items x {files} files, {planned} planned files (content import {})", secs(t_content));
+    println!(
+        "  games_user_tools_find best {} (runs: {:?})",
+        secs(best(&scans)),
+        scans
+    );
     println!(
         "  games_tools_list      best {} (runs: {:?})",
         secs(best(&lists)),

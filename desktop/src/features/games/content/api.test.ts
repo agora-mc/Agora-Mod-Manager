@@ -7,58 +7,9 @@ import {
   addInstanceContent,
   formatBytes,
   listInstanceContent,
-  listStore,
   moveInstanceContent,
   verifyStored,
-  type StoreItem,
 } from './api';
-
-const storeItem: StoreItem = {
-  itemId: '0151b2a0',
-  name: 'Odin Patch',
-  fileCount: 1,
-  totalSize: 6772,
-  sourceKind: 'archive',
-  sourceLabel: 'Archive: odin.zip',
-  addedAtUnixMs: 1,
-  gameIds: [],
-};
-
-describe('listStore', () => {
-  beforeEach(() => {
-    invokeMock.mockReset();
-  });
-
-  it('returns the items the backend lists', async () => {
-    invokeMock.mockResolvedValueOnce({ items: [storeItem], damaged: [] });
-    await expect(listStore()).resolves.toEqual({ items: [storeItem], damaged: [] });
-    expect(invokeMock).toHaveBeenCalledWith('games_content_list');
-  });
-
-  it('accepts an empty library as an empty list, not as a failure', async () => {
-    invokeMock.mockResolvedValueOnce({ items: [], damaged: [] });
-    await expect(listStore()).resolves.toEqual({ items: [], damaged: [] });
-  });
-
-  it.each([
-    ['null (an unmocked command answers this)', null],
-    ['a bare array', [storeItem]],
-    ['an object without items', { other: [] }],
-    ['items that are not a list', { items: 'Odin Patch' }],
-    ['an item without an id', { items: [{ name: 'Odin Patch', sourceLabel: 'x', gameIds: [] }], damaged: [] }],
-    ['an item without its games', { items: [{ ...storeItem, gameIds: undefined }], damaged: [] }],
-    ['items without the damaged list', { items: [storeItem] }],
-    ['a damaged record without a reason', { items: [], damaged: [{ itemId: 'abc' }] }],
-  ])('rejects %s rather than reading it as an empty library', async (_label, reply) => {
-    invokeMock.mockResolvedValueOnce(reply);
-    await expect(listStore()).rejects.toThrow('games_content_list did not return a list of items.');
-  });
-
-  it('passes the backend error through when the command fails', async () => {
-    invokeMock.mockRejectedValueOnce({ code: 'core_failed', message: 'The store index is damaged.' });
-    await expect(listStore()).rejects.toMatchObject({ code: 'core_failed', message: 'The store index is damaged.' });
-  });
-});
 
 describe('instance content calls', () => {
   beforeEach(() => {

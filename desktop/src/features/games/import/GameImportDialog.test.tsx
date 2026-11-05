@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ConfirmProvider } from '@/components/ui/confirm';
 
@@ -120,6 +120,34 @@ const chooseInstall = {
 };
 
 import { GameImportDialog } from './GameImportDialog';
+import { importPercent, phaseWords } from './ImportProgressView';
+import type { ImportProgress } from './api';
+
+const progress = (fields: Partial<ImportProgress>): ImportProgress => ({
+  phase: 'storing',
+  currentMod: null,
+  modsDone: 0,
+  modsTotal: 107,
+  bytesDone: 0,
+  bytesTotal: 1000,
+  ...fields,
+});
+
+describe('the import’s progress in numbers', () => {
+  it('is a percentage only while bytes are being stored', () => {
+    expect(importPercent(progress({ bytesDone: 256 }))).toBe(25);
+    expect(importPercent(progress({ bytesDone: 1000, phase: 'instance' }))).toBeNull();
+    expect(importPercent(null)).toBeNull();
+    expect(importPercent(progress({ bytesTotal: 0 }))).toBeNull();
+    expect(importPercent(progress({ bytesDone: 5000 }))).toBe(100);
+  });
+
+  it('has words for every stage, and for one it does not know', () => {
+    expect(phaseWords(null)).toBe('Getting ready');
+    expect(phaseWords(progress({ phase: 'layers' }))).toBe('Adding the mods to the instance');
+    expect(phaseWords(progress({ phase: 'later' as ImportProgress['phase'] }))).toBe('Working');
+  });
+});
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -184,12 +212,93 @@ describe('the Mod Organizer 2 import dialog', () => {
 
     expect(await screen.findByTestId('import-progress')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    expect(screen.queryByRole('alert')).toBeNull();
     fireEvent.keyDown(screen.getByTestId('game-import-dialog'), { key: 'Escape' });
+    expect(onOpenChange).not.toHaveBeenCalled();
+    // It says why it stayed, rather than ignoring the key.
+    expect(await screen.findByRole('alert')).toHaveTextContent('can’t be stopped once it has started');
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(onOpenChange).not.toHaveBeenCalled();
 
     finish(importRun);
     expect(await screen.findByTestId('import-done')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  async function startImport() {
+    let finish: (value: unknown) => void = () => undefined;
+    let fail: (reason: unknown) => void = () => undefined;
+    let report: (progress: ImportProgress) => void = () => undefined;
+    api.listenImportProgress.mockImplementation(async (handler?: (progress: ImportProgress) => void) => {
+      if (handler) report = handler;
+      return () => undefined;
+    });
+    api.importMo2Profile.mockImplementation((request: { dryRun: boolean }) => (request.dryRun
+      ? Promise.resolve(plan)
+      : new Promise((resolve, reject) => { finish = resolve; fail = reject; })));
+    const handles = renderDialog();
+    fireEvent.click(await screen.findByRole('button', { name: 'Use this setup' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview the import' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Import as a new instance' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Import profile' }));
+    await screen.findByTestId('import-progress');
+    await waitFor(() => expect(api.listenImportProgress).toHaveBeenCalled());
+    return { ...handles, finish: (value: unknown) => finish(value), fail: (reason: unknown) => fail(reason), report: (value: ImportProgress) => act(() => report(value)) };
+  }
+
+  it('moves to a step of its own: a bar by bytes, the counts in words, the mod, and the read-only note', async () => {
+    const { report, finish } = await startImport();
+    expect(currentStep()).toContain('Importing');
+    expect(screen.queryByTestId('import-plan')).not.toBeInTheDocument();
+    expect(screen.getByTestId('import-read-only-note')).toHaveTextContent('Your Mod Organizer 2 setup is only read');
+    expect(screen.getByTestId('import-quit-note')).toHaveTextContent('If you quit Agora now');
+    expect(screen.getByTestId('import-elapsed')).toHaveTextContent(/\ds/);
+
+    // No event yet: nothing is measured, so no number is shown.
+    expect(screen.getByTestId('import-bar-indeterminate')).toBeInTheDocument();
+    expect(screen.getByRole('progressbar')).not.toHaveAttribute('aria-valuenow');
+    expect(screen.queryByTestId('import-percent')).toBeNull();
+
+    report(progress({ currentMod: 'SkyUI', modsDone: 2, bytesDone: 400 }));
+    expect(screen.getByTestId('import-percent')).toHaveTextContent('40%');
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '40');
+    expect(screen.getByTestId('import-current-mod')).toHaveTextContent('Now copying SkyUI');
+    expect(screen.getByTestId('import-mods')).toHaveTextContent('2 of 107 mods');
+    expect(screen.getByTestId('import-bytes')).toHaveTextContent(/400 B of 1(000 B|\.0 KB)/);
+
+    // Past the mods, the stages cannot be measured: the bar stops claiming a percentage.
+    report(progress({ phase: 'instance', modsDone: 107, bytesDone: 1000 }));
+    expect(screen.queryByTestId('import-percent')).toBeNull();
+    expect(screen.getByTestId('import-bar-indeterminate')).toBeInTheDocument();
+    expect(screen.getByTestId('import-phase')).toHaveTextContent('Making the new instance');
+
+    finish(importRun);
+    expect(await screen.findByTestId('import-done')).toBeInTheDocument();
+    expect(currentStep()).toContain('Imported');
+  });
+
+  it('a failed import shows the error, can be closed, and goes back to a fresh preview', async () => {
+    const { fail, report, onOpenChange } = await startImport();
+    report(progress({ currentMod: 'SkyUI', modsDone: 2, bytesDone: 400 }));
+    const previews = api.importMo2Profile.mock.calls.length;
+
+    fail({ code: 'core_failed', message: 'The disk is full.' });
+    const failed = await screen.findByTestId('import-failed');
+    expect(failed).toHaveTextContent('The import did not finish');
+    expect(failed).toHaveTextContent('The disk is full.');
+    expect(failed).toHaveTextContent('Your Mod Organizer 2 setup was only read');
+    expect(screen.queryByTestId('import-progress')).toBeNull();
+    expect(currentStep()).toContain('Importing');
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '← Back to the preview' }));
+    expect(await screen.findByTestId('import-plan')).toBeInTheDocument();
+    expect(currentStep()).toContain('Preview');
+    expect(api.importMo2Profile.mock.calls.length).toBe(previews + 1);
+    expect(api.importMo2Profile).toHaveBeenLastCalledWith(expect.objectContaining({ dryRun: true }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 

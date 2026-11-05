@@ -5199,6 +5199,65 @@ fn a_declared_tool_a_mod_ships_is_offered_with_its_id_and_name() {
 }
 
 #[test]
+fn a_program_in_the_instances_own_files_is_a_candidate_and_can_be_added() {
+    let f = fixture(Vec::new());
+    // The writable layer is the instance's own files; its overrides layer holds INI files only, by
+    // design, so an executable there is not part of the deployment.
+    for exe in ["Data/Made/Written.exe", "Data/Mine/Mine.exe"] {
+        let path = f.instance_dir().join("writable").join(exe);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"MZ").unwrap();
+    }
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let exes: Vec<&str> = candidates.iter().map(|c| c.exe.as_str()).collect();
+    assert_eq!(exes, ["Data/Made/Written.exe", "Data/Mine/Mine.exe"]);
+    for candidate in &candidates {
+        assert_eq!(
+            candidate.source,
+            game_user_tools::CandidateSource::InstanceFiles
+        );
+        assert_eq!(candidate.mod_id, "");
+    }
+    let added = game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: "Written".into(),
+            exe: "Data/Made/Written.exe".into(),
+            args: Vec::new(),
+            output_is_mod: false,
+            output_folder: None,
+            keeps_output: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(added.exe, "Data/Made/Written.exe");
+}
+
+#[test]
+fn the_games_own_programs_are_marked_and_a_mods_are_not() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    // Game.exe is the game's launch program, here supplied by a mod as a script extender's is.
+    f.add_mod("Loader", &[("Game.exe", b"MZ")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let source_of = |exe: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.exe == exe)
+            .map(|candidate| candidate.source)
+    };
+    assert_eq!(
+        source_of("Data/tools/My.exe"),
+        Some(game_user_tools::CandidateSource::Mod)
+    );
+    assert_eq!(
+        source_of("Game.exe"),
+        Some(game_user_tools::CandidateSource::Game)
+    );
+}
+
+#[test]
 fn a_mod_whose_record_is_missing_is_an_error_not_no_candidates() {
     let f = fixture(Vec::new());
     let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);

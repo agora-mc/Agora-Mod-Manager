@@ -8945,7 +8945,7 @@ fn run_games_import(
     action: ImportCmd,
     json: bool,
 ) -> anyhow::Result<()> {
-    use agora_core::game_import::{self, ImportProgress, Mo2Request, RunOptions};
+    use agora_core::game_import::{self, ImportPhase, ImportProgress, Mo2Request, RunOptions};
     match action {
         ImportCmd::Mo2 {
             action: Some(Mo2ImportCmd::Scan),
@@ -9032,7 +9032,8 @@ fn run_games_import(
                 &request,
                 RunOptions::default(),
                 &|p: ImportProgress| {
-                    if !json {
+                    // One line per stored mod: the report that a mod is done carries no mod name.
+                    if !json && p.phase == ImportPhase::Storing && p.current_mod.is_none() {
                         eprintln!(
                             "  stored {}/{} mods, {} of {}",
                             p.mods_done,
