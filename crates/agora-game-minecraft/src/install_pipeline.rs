@@ -2208,9 +2208,10 @@ fn apply_loader_change_policy(
             continue;
         }
         decls.extend(
-            crate::jar_metadata::parse_jar_metadata_for_loader(
+            crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
                 Path::new(source_path),
                 &manifest.loader,
+                &manifest.minecraft_version,
             )
             .dependency_decls,
         );
@@ -2330,8 +2331,11 @@ fn validate_staged_loader_compatibility(
             continue;
         }
         let staged = staging_dir.join("artifacts").join(&add.staging_filename);
-        let metadata =
-            crate::jar_metadata::parse_jar_metadata_for_loader(&staged, &manifest.loader);
+        let metadata = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+            &staged,
+            &manifest.loader,
+            &manifest.minecraft_version,
+        );
         decls.extend(metadata.dependency_decls);
     }
     if !decls
@@ -3746,7 +3750,11 @@ fn prepare_manifest(
         .map_err(|failure| failure.message())?;
         let metadata = artifact_metadata(&add.artifact);
         let jar = if metadata.content_type == "mod" {
-            crate::jar_metadata::parse_jar_metadata_for_loader(&staged, &manifest.loader)
+            crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+                &staged,
+                &manifest.loader,
+                &manifest.minecraft_version,
+            )
         } else {
             agora_core::dependency_ops::JarDeps::default()
         };

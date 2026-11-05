@@ -580,7 +580,11 @@ pub fn add_item_to_instance(
     let target = dir
         .join(helpers::content_subdir(&content_type))
         .join(&filename);
-    let metadata = crate::jar_metadata::parse_jar_metadata_for_loader(&target, &manifest.loader);
+    let metadata = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+        &target,
+        &manifest.loader,
+        &manifest.minecraft_version,
+    );
     // Restore the provenance the install recorded. A provider's full origin is rebuilt from the
     // opaque blob; without one, an item called "provider" becomes a manual mod rather than claiming
     // an origin that was not recorded. An item with no game id was the user's own choice.

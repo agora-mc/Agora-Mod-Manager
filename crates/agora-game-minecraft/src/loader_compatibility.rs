@@ -834,6 +834,89 @@ mod tests {
     }
 
     #[test]
+    fn quilt_0301_satisfies_a_fabric_mod_needing_0140() {
+        let catalog = catalog(
+            "quilt",
+            vec![entry(
+                "0.30.1",
+                LoaderReleaseChannel::Stable,
+                None,
+                &[("fabricloader", "0.19.3")],
+            )],
+        );
+        let decl = fabric_decl(
+            "moda",
+            "fabricloader",
+            &[">=0.14.0"],
+            DependencyImportance::Required,
+            DependencySource::FabricDepends,
+        );
+        let report =
+            evaluate_loader_compatibility(&request("quilt", Some("0.30.1"), &[decl], &catalog));
+        assert_eq!(report.current_status, CurrentLoaderStatus::Compatible);
+        assert_eq!(result_version(&report), Some("0.30.1"));
+        assert_eq!(
+            report.requirements[0].candidate_provided_version.as_deref(),
+            Some("0.19.3")
+        );
+        assert_eq!(
+            report.requirements[0].verdict,
+            RequirementVerdict::Satisfied
+        );
+    }
+
+    #[test]
+    fn quilt_0301_does_not_satisfy_a_fabric_mod_needing_0195() {
+        let catalog = catalog(
+            "quilt",
+            vec![entry(
+                "0.30.1",
+                LoaderReleaseChannel::Stable,
+                None,
+                &[("fabricloader", "0.19.3")],
+            )],
+        );
+        let decl = fabric_decl(
+            "moda",
+            "fabricloader",
+            &[">=0.19.5"],
+            DependencyImportance::Required,
+            DependencySource::FabricDepends,
+        );
+        let report =
+            evaluate_loader_compatibility(&request("quilt", Some("0.30.1"), &[decl], &catalog));
+        assert_eq!(report.current_status, CurrentLoaderStatus::Incompatible);
+        assert!(report.compatible_versions.is_empty());
+        assert_eq!(
+            report.requirements[0].verdict,
+            RequirementVerdict::Unsatisfied
+        );
+    }
+
+    #[test]
+    fn quilt_without_a_declared_fabricloader_stays_unmet() {
+        let catalog = catalog(
+            "quilt",
+            vec![entry("0.30.1", LoaderReleaseChannel::Stable, None, &[])],
+        );
+        let decl = fabric_decl(
+            "moda",
+            "fabricloader",
+            &[">=0.14.0"],
+            DependencyImportance::Required,
+            DependencySource::FabricDepends,
+        );
+        let report =
+            evaluate_loader_compatibility(&request("quilt", Some("0.30.1"), &[decl], &catalog));
+        assert_eq!(report.current_status, CurrentLoaderStatus::Incompatible);
+        assert!(report.compatible_versions.is_empty());
+        assert_eq!(
+            report.requirements[0].candidate_provided_version, None,
+            "no number may be invented for a Quilt entry"
+        );
+    }
+
+    #[test]
     fn explicit_language_capability_allows_forge_recommendation() {
         let catalog = catalog(
             "forge",

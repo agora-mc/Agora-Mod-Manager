@@ -518,20 +518,49 @@ fn build_manifest_arrays(
     instance_dir: &Path,
     source_label: &str,
     loader: &str,
+    minecraft_version: &str,
 ) -> LauncherResult<(ManifestInventories, Vec<String>)> {
     let notes = drop_superseded_disabled_copies(instance_dir)?;
-    let mods = inventory_directory(instance_dir, "mods", "mod", source_label, loader)?;
+    let mods = inventory_directory(
+        instance_dir,
+        "mods",
+        "mod",
+        source_label,
+        loader,
+        minecraft_version,
+    )?;
     let resourcepacks = inventory_directory(
         instance_dir,
         "resourcepacks",
         "resourcepack",
         source_label,
         loader,
+        minecraft_version,
     )?;
-    let shaders = inventory_directory(instance_dir, "shaderpacks", "shader", source_label, loader)?;
-    let datapacks =
-        inventory_directory(instance_dir, "datapacks", "datapack", source_label, loader)?;
-    let worlds = inventory_directory(instance_dir, "saves", "world", source_label, loader)?;
+    let shaders = inventory_directory(
+        instance_dir,
+        "shaderpacks",
+        "shader",
+        source_label,
+        loader,
+        minecraft_version,
+    )?;
+    let datapacks = inventory_directory(
+        instance_dir,
+        "datapacks",
+        "datapack",
+        source_label,
+        loader,
+        minecraft_version,
+    )?;
+    let worlds = inventory_directory(
+        instance_dir,
+        "saves",
+        "world",
+        source_label,
+        loader,
+        minecraft_version,
+    )?;
     Ok(((mods, resourcepacks, shaders, datapacks, worlds), notes))
 }
 
@@ -542,6 +571,7 @@ fn inventory_directory(
     content_type: &str,
     source: &str,
     loader: &str,
+    minecraft_version: &str,
 ) -> LauncherResult<Vec<InstalledMod>> {
     let root = instance_dir.join(subdir);
     if !root.is_dir() {
@@ -601,7 +631,11 @@ fn inventory_directory(
             optional_deps,
             incompatible_deps,
         ) = if filename.ends_with(".jar") && ft.is_file() {
-            let meta = crate::jar_metadata::parse_jar_metadata_for_loader(&path, loader);
+            let meta = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+                &path,
+                loader,
+                minecraft_version,
+            );
             (
                 meta.mod_jar_id.clone(),
                 meta.mod_version,
@@ -1640,8 +1674,13 @@ impl LauncherImportService {
             .as_ref()
             .map(|tuple| tuple.loader.as_str())
             .unwrap_or("vanilla");
+        let manifest_mc_version = item
+            .loader_tuple
+            .as_ref()
+            .map(|tuple| tuple.minecraft_version.as_str())
+            .unwrap_or("");
         let ((mut mods, resourcepacks, shaders, datapacks, worlds), copy_notes) =
-            build_manifest_arrays(&staging, source_label, manifest_loader)?;
+            build_manifest_arrays(&staging, source_label, manifest_loader, manifest_mc_version)?;
         // Copied jars carry no download source. Where the user allows Modrinth,
         // ask it (one batched hash lookup) so a pack made from this setup can
         // be installed elsewhere. This never fails the import.
@@ -3693,7 +3732,7 @@ name=Dup Instance
         std::fs::create_dir_all(dir.join("mods")).unwrap();
         std::fs::write(dir.join("mods").join("mymod.jar.disabled"), b"content").unwrap();
 
-        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric").unwrap();
+        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric", "1.21.1").unwrap();
         assert_eq!(items.len(), 1);
         assert!(!items[0].enabled);
         assert_eq!(items[0].filename, "mymod.jar");
@@ -3712,8 +3751,15 @@ name=Dup Instance
         .unwrap();
         std::fs::write(dir.join("resourcepacks").join("On.zip"), b"pack").unwrap();
 
-        let items =
-            inventory_directory(&dir, "resourcepacks", "resourcepack", "prism", "fabric").unwrap();
+        let items = inventory_directory(
+            &dir,
+            "resourcepacks",
+            "resourcepack",
+            "prism",
+            "fabric",
+            "1.21.1",
+        )
+        .unwrap();
         let state: Vec<(&str, bool)> = items
             .iter()
             .map(|m| (m.filename.as_str(), m.enabled))
@@ -3730,7 +3776,8 @@ name=Dup Instance
         std::fs::write(dir.join("mods").join("x.jar"), b"on").unwrap();
         std::fs::write(dir.join("mods").join("x.jar.disabled"), b"off").unwrap();
 
-        let err = inventory_directory(&dir, "mods", "mod", "prism", "fabric").unwrap_err();
+        let err =
+            inventory_directory(&dir, "mods", "mod", "prism", "fabric", "1.21.1").unwrap_err();
         assert_eq!(err.code(), "ERR_IMPORT_DUPLICATE");
     }
 
@@ -3758,7 +3805,7 @@ name=Dup Instance
         assert!(!dir.join("resourcepacks").join("pack.zip.disabled").exists());
         assert!(dir.join("mods").join("y.jar.disabled").exists());
 
-        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric").unwrap();
+        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric", "1.21.1").unwrap();
         let state: Vec<(&str, bool)> = items
             .iter()
             .map(|m| (m.filename.as_str(), m.enabled))
@@ -3773,7 +3820,7 @@ name=Dup Instance
         std::fs::write(dir.join("mods").join("enabled.jar"), b"enabled").unwrap();
         std::fs::write(dir.join("mods").join("also-enabled.jar"), b"also").unwrap();
 
-        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric").unwrap();
+        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric", "1.21.1").unwrap();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|m| m.enabled));
         assert!(items.iter().all(|m| m.source == "imported_prism"));
@@ -3796,7 +3843,8 @@ name=Dup Instance
         )
         .unwrap();
 
-        let items = inventory_directory(&dir, "shaderpacks", "shader", "prism", "fabric").unwrap();
+        let items = inventory_directory(&dir, "shaderpacks", "shader", "prism", "fabric", "1.21.1")
+            .unwrap();
         let mut names: Vec<&str> = items.iter().map(|m| m.filename.as_str()).collect();
         names.sort();
         assert_eq!(
@@ -3809,7 +3857,7 @@ name=Dup Instance
     fn test_inventory_directory_empty() {
         let dir = test_tmp("inv-empty");
         std::fs::create_dir_all(dir.join("mods")).unwrap();
-        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric").unwrap();
+        let items = inventory_directory(&dir, "mods", "mod", "prism", "fabric", "1.21.1").unwrap();
         assert!(items.is_empty());
     }
 

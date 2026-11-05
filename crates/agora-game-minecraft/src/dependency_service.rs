@@ -210,7 +210,9 @@ pub fn refresh_installed_jar_metadata(
     // The loader decides which metadata file is authoritative, so it must be
     // known. Failing here is correct: parsing with an unknown loader would
     // cache a wrong answer.
-    let loader = agora_core::helpers::read_manifest(&manifest_path)?.loader;
+    let manifest = agora_core::helpers::read_manifest(&manifest_path)?;
+    let loader = manifest.loader;
+    let minecraft_version = manifest.minecraft_version;
 
     let cache_path = instance_dir.join(JAR_META_CACHE_FILE);
     let mut cache: JarMetaCache = std::fs::read_to_string(&cache_path)
@@ -255,7 +257,11 @@ pub fn refresh_installed_jar_metadata(
             }
         }
 
-        let parsed = crate::jar_metadata::parse_jar_metadata_for_loader(&jar_path, &loader);
+        let parsed = crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+            &jar_path,
+            &loader,
+            &minecraft_version,
+        );
         // A valid mod metadata file has a primary ID. If parsing failed or the
         // file is not a recognized mod JAR, retain the manifest's cached data.
         if parsed.mod_jar_id.is_none() {

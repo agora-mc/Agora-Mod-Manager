@@ -659,16 +659,144 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         )
         self.assertEqual(entries[0]["release_channel"], "stable")
 
+    def _quilt_maven_jar(
+        self, directory: str, loader_version: str, provided: str | None
+    ) -> Path:
+        if provided is None:
+            payload = {
+                "schema_version": 1,
+                "quilt_loader": {
+                    "id": "quilt_loader",
+                    "version": loader_version,
+                    "provides": [{"id": "other", "version": "1.0"}],
+                },
+            }
+        else:
+            payload = {
+                "schema_version": 1,
+                "quilt_loader": {
+                    "id": "quilt_loader",
+                    "version": loader_version,
+                    "provides": [{"id": "fabricloader", "version": provided}],
+                },
+            }
+        path = Path(directory) / f"quilt-loader-{loader_version}.jar"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("quilt.mod.json", json.dumps(payload))
+        return path
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
     @mock.patch("fetch_loader_manifests._fetch_profile_json")
     @mock.patch("fetch_loader_manifests._fetch_json")
-    def test_quilt_new_entry_writes_capabilities(self, fetch_json, fetch_profile):
+    def test_quilt_new_entry_writes_capabilities(
+        self, fetch_json, fetch_profile, download
+    ):
         fetch_json.return_value = [{"loader": {"version": "0.28.0-beta.5"}}]
         fetch_profile.return_value = b'{"loader": {"version": "0.28.0-beta.5"}}'
-        entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.28.0-beta.5", "0.16.0"
+            )
+            entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
         self.assertEqual(
-            entries[0]["provided_versions"], {"quilt_loader": "0.28.0-beta.5"}
+            entries[0]["provided_versions"],
+            {"quilt_loader": "0.28.0-beta.5", "fabricloader": "0.16.0"},
         )
         self.assertEqual(entries[0]["release_channel"], "prerelease")
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_fabricloader_is_read_per_loader_version(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [
+            {"loader": {"version": "0.30.1"}},
+            {"loader": {"version": "0.26.3"}},
+        ]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            jars = {
+                "0.30.1": self._quilt_maven_jar(directory, "0.30.1", "0.19.3"),
+                "0.26.3": self._quilt_maven_jar(directory, "0.26.3", "0.15.11"),
+            }
+
+            def served(url: str, _name: str, **_kw: Any) -> Path:
+                version = url.split("/quilt-loader/")[1].split("/", 1)[0]
+                return jars[version]
+
+            download.side_effect = served
+            entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
+
+        by_version = {entry["loader_version"]: entry for entry in entries}
+        self.assertEqual(
+            by_version["0.30.1"]["provided_versions"],
+            {"quilt_loader": "0.30.1", "fabricloader": "0.19.3"},
+        )
+        self.assertEqual(
+            by_version["0.26.3"]["provided_versions"],
+            {"quilt_loader": "0.26.3", "fabricloader": "0.15.11"},
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_unreadable_fabricloader_is_left_out_not_guessed(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.30.1", None
+            )
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_unreadable_jar_is_left_out(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quilt-loader-0.30.1.jar"
+            path.write_text("not a zip", encoding="utf-8")
+            download.return_value = path
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_placeholder_fabricloader_is_left_out(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.30.1", "${fabric_loader_version}"
+            )
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
 
     @mock.patch("fetch_loader_manifests._download_to_cache")
     @mock.patch("fetch_loader_manifests._fetch_bytes")
@@ -759,6 +887,49 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         self.assertEqual(
             merged[0]["provided_versions"], {"fabricloader": "0.1.0"}
         )
+
+    def test_merge_adds_a_newly_declared_capability(self):
+        # Existing Quilt entries were published with only their own loader; a
+        # refresh that now reads fabricloader must enrich them, not fail.
+        existing = self._entry(
+            provided_versions={"quilt_loader": "0.30.1"}
+        )
+        fresh = dict(existing)
+        fresh["provided_versions"] = {
+            "quilt_loader": "0.30.1",
+            "fabricloader": "0.19.3",
+        }
+
+        merged = fetch_loader_manifests._merge_entries(
+            [existing], [fresh], loader="quilt"
+        )
+
+        self.assertEqual(
+            merged[0]["provided_versions"],
+            {"quilt_loader": "0.30.1", "fabricloader": "0.19.3"},
+        )
+        # A second refresh, with the same data, is unchanged.
+        rerun = fetch_loader_manifests._merge_entries(
+            merged, [fresh], loader="quilt"
+        )
+        self.assertEqual(rerun, merged)
+
+    def test_merge_rejects_removed_capability(self):
+        existing = self._entry(
+            provided_versions={
+                "quilt_loader": "0.30.1",
+                "fabricloader": "0.19.3",
+            }
+        )
+        fresh = dict(existing)
+        fresh["provided_versions"] = {"quilt_loader": "0.30.1"}
+
+        with self.assertRaises(fetch_loader_manifests.ExistingEntryMutationError) as raised:
+            fetch_loader_manifests._merge_entries(
+                [existing], [fresh], loader="quilt"
+            )
+
+        self.assertIn("provided_versions", raised.exception.mutations[0]["fields"])
 
     def test_merge_rejects_changed_capability(self):
         existing = self._entry(provided_versions={"fabricloader": "0.1.0"})

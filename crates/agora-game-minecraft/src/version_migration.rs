@@ -1387,7 +1387,11 @@ fn build_future_manifest(
             .cloned()
             .ok_or_else(|| format!("{} vanished during planning", swap.old_filename))?;
         let jar = if normalized_content_type(&swap.content_type) == "mod" {
-            crate::jar_metadata::parse_jar_metadata_for_loader(&staged, &future.loader)
+            crate::jar_metadata::parse_jar_metadata_for_loader_at_mc(
+                &staged,
+                &future.loader,
+                &future.minecraft_version,
+            )
         } else {
             agora_core::dependency_ops::JarDeps::default()
         };
