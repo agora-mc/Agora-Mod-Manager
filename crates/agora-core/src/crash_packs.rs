@@ -161,7 +161,22 @@ pub fn load_plugin_packs(
         return report;
     }
 
-    let root_real = root.canonicalize().ok();
+    let root_real = match root.canonicalize() {
+        Ok(root_real) => root_real,
+        Err(error) => {
+            // Without the folder's real path the escape check below can't run, so nothing loads.
+            for contribution in &manifest.contributions.crash_packs {
+                report.problems.push(PackProblem::new(
+                    plugin_id,
+                    contribution.path.clone(),
+                    "",
+                    "path",
+                    format!("could not resolve the plugin folder: {error}"),
+                ));
+            }
+            return report;
+        }
+    };
 
     for contribution in &manifest.contributions.crash_packs {
         let relative = contribution.path.clone();
@@ -187,17 +202,15 @@ pub fn load_plugin_packs(
             ));
             continue;
         };
-        if let Some(root_real) = &root_real {
-            if !target_real.starts_with(root_real) {
-                report.problems.push(PackProblem::new(
-                    plugin_id,
-                    relative,
-                    "",
-                    "path",
-                    "the pack path resolves outside the plugin folder",
-                ));
-                continue;
-            }
+        if !target_real.starts_with(&root_real) {
+            report.problems.push(PackProblem::new(
+                plugin_id,
+                relative,
+                "",
+                "path",
+                "the pack path resolves outside the plugin folder",
+            ));
+            continue;
         }
 
         let bytes = match std::fs::read(&target_real) {

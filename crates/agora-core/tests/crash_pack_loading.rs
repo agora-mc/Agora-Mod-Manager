@@ -138,6 +138,16 @@ fn a_missing_pack_file_is_a_validation_error() {
 }
 
 #[test]
+fn an_unresolvable_plugin_folder_loads_nothing_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("not-here");
+    let manifest = manifest(&["crash/pack.json"]);
+    let report = load_plugin_packs("acme.skyrim", &gone, &manifest);
+    assert!(report.packs.is_empty());
+    assert_eq!(report.problems[0].code, "path");
+}
+
+#[test]
 fn an_unparsable_pack_is_a_validation_error() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "crash/pack.json", "{ this is not json");
