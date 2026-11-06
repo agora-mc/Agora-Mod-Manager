@@ -5,6 +5,7 @@
 //! and how to inspect one file). The same input in any order gives the same answer.
 
 mod answer;
+pub mod attribution;
 mod consensus;
 mod evaluate;
 mod profile;
