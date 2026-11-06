@@ -1,14 +1,19 @@
 //! The crash doctor's evaluator, consensus and answer (MASTER_SPEC §30.4, §30.5, §30.11).
 //!
-//! Pure logic: nothing here reads a file, touches the network or opens a database. A caller
-//! supplies crash packs, what parsers found, and the two traits the engine needs (who owns a ref,
-//! and how to inspect one file). The same input in any order gives the same answer.
+//! The evaluator is pure logic: it reads no file, touches no network and opens no database. A
+//! caller supplies crash packs, what parsers found, and the two traits the engine needs (who owns a
+//! ref, and how to inspect one file). The same input in any order gives the same answer.
+//!
+//! [`evidence`] is the file-facing stage beside it: it collects what a session wrote, copies it
+//! into Agora's store, sweeps for changes and applies retention.
 
 mod answer;
 mod consensus;
 mod evaluate;
 mod profile;
 mod types;
+
+pub mod evidence;
 
 pub use answer::*;
 pub use consensus::*;
