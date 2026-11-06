@@ -681,6 +681,33 @@ fn a_ref_map_or_role_cannot_match_everything() {
 }
 
 #[test]
+fn a_path_pattern_wildcard_is_one_whole_segment() {
+    let map = |pattern: &str| {
+        format!(
+            r#"{{ "contract": 1, "ref_maps": [{{ "kind": "module", "lookup": {{ "path": {{ "patterns": ["{pattern}"] }} }}, "match": "casefold" }}] }}"#
+        )
+    };
+    assert!(
+        lint_pack_json(&map("red4ext/plugins/*/{value}")).is_ok(),
+        "one whole segment is supported"
+    );
+    for pattern in [
+        "red4ext/plugins/foo*/{value}",
+        "red4ext/plugins/**/{value}",
+        "red4ext/plugins/{value}/*",
+    ] {
+        let problems = lint_pack_json(&map(pattern)).expect_err(pattern);
+        assert_eq!(problems[0].code, LintCode::BadRefMap, "{pattern}");
+        assert!(
+            problems[0].message.contains("`*`"),
+            "{}: {}",
+            pattern,
+            problems[0]
+        );
+    }
+}
+
+#[test]
 fn a_superseded_rule_must_exist() {
     let mut rule: serde_json::Value = serde_json::from_str(GOOD).unwrap();
     rule["supersedes"] = serde_json::json!(["ghost"]);

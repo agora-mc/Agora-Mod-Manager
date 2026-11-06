@@ -2,7 +2,10 @@
 
 use agora_game_api::crash::{CrashPack, NameMatch, Owner, Ref, RefLookup, RefMap, Role, RoleRule};
 
-use super::index::{matches_value, normalize_index_value, normalize_path, ArchiveIndex};
+use super::index::{
+    expand_pattern, matches_segments, matches_value, normalize_index_value, normalize_path,
+    ArchiveIndex, PatternError,
+};
 use super::view::InstanceView;
 use crate::crash_engine::types::{RefResolver, Resolved};
 
@@ -116,20 +119,61 @@ impl Resolver {
         }
 
         let mut matches: Vec<PathMatch> = Vec::new();
-        let mut saw_key = false;
-        let mut archive_unknown = false;
+        let mut problem: Option<String> = None;
+        let mut could_not_rule_out: Option<String> = None;
         for (pattern_index, pattern) in patterns.iter().enumerate() {
-            let expanded = pattern.replace("{value}", value);
-            let Some(key) = normalize_path(&expanded) else {
-                continue;
+            let plan = match expand_pattern(pattern, value) {
+                Ok(plan) => plan,
+                Err(PatternError::Unsupported(reason)) => {
+                    problem.get_or_insert(reason);
+                    continue;
+                }
+                Err(PatternError::Invalid(reason)) => {
+                    problem.get_or_insert(reason);
+                    continue;
+                }
             };
-            saw_key = true;
-            let positions = self.view.index().files(&key, matching);
-            if !positions.is_empty() {
+            if plan.has_wildcard {
+                if archives {
+                    could_not_rule_out.get_or_insert_with(|| {
+                        "an archive index cannot search a wildcard path, so a file that is not loose cannot be ruled out".to_string()
+                    });
+                }
+                for record in self
+                    .view
+                    .index()
+                    .files_by_final_name(&plan.final_name, matching)
+                {
+                    let file = self.view.index().record(record);
+                    if !matches_segments(&plan.segments, &file.path, matching) {
+                        continue;
+                    }
+                    matches.push(PathMatch {
+                        pattern_index,
+                        group: format!(
+                            "{pattern_index}\0{final_name}",
+                            final_name = plan.final_name
+                        ),
+                        via: file.path.clone(),
+                        positions: vec![file.position],
+                    });
+                }
+                continue;
+            }
+
+            let key = plan
+                .full_key()
+                .expect("a pattern without a wildcard has a full key");
+            let records = self.view.index().files(&key, matching);
+            if !records.is_empty() {
                 matches.push(PathMatch {
                     pattern_index,
+                    group: key.clone(),
                     via: key.clone(),
-                    positions,
+                    positions: records
+                        .iter()
+                        .map(|record| self.view.index().record(*record).position)
+                        .collect(),
                 });
             }
             if !archives {
@@ -142,30 +186,40 @@ impl Resolver {
                             let Some(archive_key) = normalize_path(&archive) else {
                                 continue;
                             };
-                            let positions = self.view.index().files(&archive_key, matching);
-                            if !positions.is_empty() {
+                            let records = self.view.index().files(&archive_key, matching);
+                            if !records.is_empty() {
                                 matches.push(PathMatch {
                                     pattern_index,
+                                    group: archive_key.clone(),
                                     via: archive_key,
-                                    positions,
+                                    positions: records
+                                        .iter()
+                                        .map(|record| self.view.index().record(*record).position)
+                                        .collect(),
                                 });
                             }
                         }
                     }
-                    None => archive_unknown = true,
+                    None => {
+                        could_not_rule_out.get_or_insert_with(|| {
+                            "the archive index is unavailable, so a file that is not loose cannot be ruled out".to_string()
+                        });
+                    }
                 },
-                None => archive_unknown = true,
-            }
+                None => {
+                    could_not_rule_out.get_or_insert_with(|| {
+                        "the archive index is unavailable, so a file that is not loose cannot be ruled out".to_string()
+                    });
+                }
+            };
         }
 
         if matches.is_empty() {
-            if !saw_key {
-                return unknown("the ref value is not a path inside the instance");
+            if let Some(reason) = problem {
+                return unknown(reason);
             }
-            if archive_unknown {
-                return unknown(
-                    "the archive index is unavailable, so a file that is not loose cannot be ruled out",
-                );
+            if let Some(reason) = could_not_rule_out {
+                return unknown(reason);
             }
             return self.not_in_instance(role);
         }
@@ -176,6 +230,7 @@ impl Resolver {
                 matched.positions.iter().map(move |&position| Candidate {
                     position,
                     pattern_index: matched.pattern_index,
+                    group: matched.group.clone(),
                     via: matched.via.clone(),
                 })
             })
@@ -210,6 +265,7 @@ impl Resolver {
             .map(|position| Candidate {
                 position,
                 pattern_index: 0,
+                group: index.to_string(),
                 via: index.to_string(),
             })
             .collect();
@@ -244,7 +300,7 @@ impl Resolver {
         let mut also: Vec<String> = candidates
             .iter()
             .filter(|candidate| {
-                candidate.via == winner.via && candidate.position != winner.position
+                candidate.group == winner.group && candidate.position != winner.position
             })
             .map(|candidate| self.view.layers()[candidate.position].owner.label())
             .collect();
@@ -319,6 +375,8 @@ impl RefResolver for Resolver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PathMatch {
     pattern_index: usize,
+    /// What counts as the same file for `also_provided_by`.
+    group: String,
     via: String,
     positions: Vec<usize>,
 }
@@ -327,6 +385,7 @@ struct PathMatch {
 struct Candidate {
     position: usize,
     pattern_index: usize,
+    group: String,
     via: String,
 }
 

@@ -219,8 +219,9 @@ pub struct RefMap {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RefLookup {
-    /// Who provides this path in the deployed setup. `{value}` is the ref's value. `archives` also
-    /// searches inside archives the instance view has listed.
+    /// Who provides this path in the deployed setup. `{value}` is the ref's value; a segment that
+    /// is exactly `*` matches one folder on the way to it. `archives` also searches inside archives
+    /// the instance view has listed.
     Path {
         patterns: Vec<String>,
         #[serde(default)]
@@ -237,6 +238,27 @@ pub enum NameMatch {
     Casefold,
     /// `a.b.c` matches an entry `a.b` at a dot boundary: class names and packages.
     PrefixDot,
+}
+
+/// Whether a path pattern uses `*` only as a whole folder segment, and never as the file name.
+/// `Ok` is a pattern the resolver can read; `Err` names the rule for the linter.
+pub fn check_path_pattern(pattern: &str) -> Result<(), &'static str> {
+    let slashed = pattern.replace('\\', "/");
+    let segments: Vec<&str> = slashed
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    for segment in &segments {
+        if segment.contains('*') && *segment != "*" {
+            return Err(
+                "`*` must be a whole path segment, so `**` and `foo*.dll` are not supported",
+            );
+        }
+    }
+    if segments.last() == Some(&"*") {
+        return Err("`*` cannot be the last segment; the pattern must name the file after it");
+    }
+    Ok(())
 }
 
 /// Says what part a named thing plays, so a stack can be read properly. Works on any ref kind,

@@ -595,6 +595,194 @@ fn resolution_is_deterministic_in_any_input_order() {
 }
 
 #[test]
+fn a_wildcard_matches_exactly_one_folder_segment() {
+    let maps = vec![path_map(
+        "module",
+        &["red4ext/plugins/*/{value}"],
+        NameMatch::Casefold,
+        false,
+    )];
+    let found = resolver(
+        InstanceView::new(vec![layer(
+            "some-mod",
+            true,
+            item("some-mod"),
+            &["red4ext/plugins/SomeMod/x.dll"],
+        )]),
+        maps.clone(),
+        Vec::new(),
+    );
+    assert_eq!(
+        found.attribute(&reference("module", "x.dll")).owner,
+        owner("some-mod")
+    );
+
+    for files in [
+        vec!["red4ext/plugins/x.dll"],
+        vec!["red4ext/plugins/a/b/x.dll"],
+    ] {
+        let resolver = resolver(
+            InstanceView::new(vec![layer("some-mod", true, item("some-mod"), &files)]),
+            maps.clone(),
+            Vec::new(),
+        );
+        assert_eq!(
+            resolver.attribute(&reference("module", "x.dll")).owner,
+            Owner::NotInInstance,
+            "{files:?}"
+        );
+    }
+}
+
+#[test]
+fn a_wildcard_never_matches_across_a_slash() {
+    let view = InstanceView::new(vec![layer(
+        "some-mod",
+        true,
+        item("some-mod"),
+        &["red4ext/plugins/a/b/x.dll"],
+    )]);
+    let resolver = resolver(
+        view,
+        vec![path_map(
+            "module",
+            &["red4ext/plugins/*/{value}"],
+            NameMatch::Casefold,
+            false,
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        resolver.attribute(&reference("module", "x.dll")).owner,
+        Owner::NotInInstance
+    );
+}
+
+#[test]
+fn a_star_in_the_value_is_literal() {
+    let view = InstanceView::new(vec![
+        layer(
+            "some-mod",
+            true,
+            item("some-mod"),
+            &["red4ext/plugins/SomeMod/x.dll"],
+        ),
+        layer(
+            "other-mod",
+            true,
+            item("other-mod"),
+            &["red4ext/plugins/OtherMod/y.dll"],
+        ),
+    ]);
+    let resolver = resolver(
+        view,
+        vec![path_map(
+            "module",
+            &["red4ext/plugins/*/{value}"],
+            NameMatch::Casefold,
+            false,
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        resolver.attribute(&reference("module", "*.dll")).owner,
+        Owner::NotInInstance
+    );
+}
+
+#[test]
+fn an_unsupported_wildcard_pattern_is_unknown_with_a_reason() {
+    let view = InstanceView::new(vec![layer(
+        "some-mod",
+        true,
+        item("some-mod"),
+        &["red4ext/plugins/SomeMod/x.dll"],
+    )]);
+    for pattern in [
+        "red4ext/plugins/foo*/{value}",
+        "red4ext/plugins/**/{value}",
+        "{value}/*",
+    ] {
+        let resolver = resolver(
+            view.clone(),
+            vec![path_map("module", &[pattern], NameMatch::Casefold, false)],
+            Vec::new(),
+        );
+        let answer = resolver.attribute(&reference("module", "x.dll"));
+        assert_eq!(answer.owner, Owner::Unknown, "{pattern}");
+        assert!(
+            answer.reason.unwrap().contains("`*`"),
+            "the reason should name the wildcard rule for {pattern}"
+        );
+    }
+}
+
+#[test]
+fn two_mods_with_the_same_wildcard_dll_later_position_wins() {
+    let view = InstanceView::new(vec![
+        layer(
+            "mod-a",
+            true,
+            item("mod-a"),
+            &["red4ext/plugins/ModA/x.dll"],
+        ),
+        layer(
+            "mod-b",
+            true,
+            item("mod-b"),
+            &["red4ext/plugins/ModB/x.dll"],
+        ),
+    ]);
+    let resolver = resolver(
+        view,
+        vec![path_map(
+            "module",
+            &["red4ext/plugins/*/{value}"],
+            NameMatch::Casefold,
+            false,
+        )],
+        Vec::new(),
+    );
+    let answer = resolver.attribute(&reference("module", "x.dll"));
+    assert_eq!(answer.owner, owner("mod-b"));
+    assert_eq!(answer.also_provided_by, ["mod-a"]);
+}
+
+#[test]
+fn the_worked_cyberpunk_example_resolves() {
+    let pack: CrashPack = serde_json::from_str(include_str!(
+        "../../../../agora-game-api/tests/crash_examples/cyberpunk.pack.json"
+    ))
+    .expect("the Cyberpunk example parses");
+    let view = InstanceView::new(vec![
+        layer("base", true, LayerOwner::Base, &["Cyberpunk2077.exe"]),
+        layer(
+            "example-extension",
+            true,
+            item("example-extension"),
+            &["red4ext/plugins/ExampleExtension/ExampleExtension.dll"],
+        ),
+        layer(
+            "broken-script",
+            true,
+            item("broken-script"),
+            &["r6/scripts/example/broken.reds"],
+        ),
+    ]);
+    let resolver = Resolver::from_pack(view, &pack);
+
+    let game = resolver.attribute(&reference("module", "Cyberpunk2077.exe"));
+    assert_eq!(game.owner, Owner::Base);
+    assert_eq!(game.role, Some(Role::Platform));
+
+    let extension = resolver.attribute(&reference("module", "ExampleExtension.dll"));
+    assert_eq!(extension.owner, owner("example-extension"));
+
+    let script = resolver.attribute(&reference("file", "r6/scripts/example/broken.reds"));
+    assert_eq!(script.owner, owner("broken-script"));
+}
+
+#[test]
 fn the_index_scales_to_a_large_instance() {
     const MODS: usize = 368;
     const FILES_PER_MOD: usize = 1_360;
@@ -603,7 +791,7 @@ fn the_index_scales_to_a_large_instance() {
     let mut layers = Vec::with_capacity(MODS);
     for module in 0..MODS {
         let files: Vec<String> = (0..FILES_PER_MOD)
-            .map(|file| format!("Data/mod{module:03}/f{file:04}.nif"))
+            .map(|file| format!("red4ext/plugins/mod{module:03}/f{module:03}_{file:04}.dll"))
             .collect();
         layers.push(LayerView::new(
             format!("mod-{module:03}"),
@@ -619,8 +807,8 @@ fn the_index_scales_to_a_large_instance() {
     let resolver = resolver(
         view,
         vec![path_map(
-            "file",
-            &["Data/{value}"],
+            "module",
+            &["red4ext/plugins/*/{value}"],
             NameMatch::Casefold,
             false,
         )],
@@ -630,10 +818,8 @@ fn the_index_scales_to_a_large_instance() {
     for index in 0..REFS {
         let module = index % MODS;
         let file = (index * 7) % FILES_PER_MOD;
-        let answer = resolver.attribute(&reference(
-            "file",
-            &format!("mod{module:03}/f{file:04}.nif"),
-        ));
+        let answer =
+            resolver.attribute(&reference("module", &format!("f{module:03}_{file:04}.dll")));
         assert_eq!(answer.owner, owner(&format!("mod-{module:03}")));
     }
     let resolving = started.elapsed();
