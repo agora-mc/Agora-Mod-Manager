@@ -53,10 +53,10 @@ pub(crate) fn independent_group(family: Family) -> Option<&'static str> {
         Family::KnownSignature | Family::CuratedConflict => Some("knowledge"),
         Family::Execution => Some("execution"),
         Family::ObjectReference => Some("data"),
-        Family::LocalConfirmation => Some("history"),
         Family::ResourceProvider
         | Family::ChangeCorrelation
         | Family::HistoryRepeat
+        | Family::LocalConfirmation
         | Family::CoCrash
         | Family::NovelLogLine => None,
     }

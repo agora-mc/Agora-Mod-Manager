@@ -4,10 +4,10 @@
 use super::*;
 use agora_game_api::crash::{
     AttrMatch, AttrValue, Condition, CouldNotCheck, CouldNotCheckReason, CountQuery, Coverage,
-    CoverageState, Effect, EvidenceLine, Fact, FactQuery, Finding, Level, LocalText, MatchOps,
-    NextStepKind, ParseNoteKind, Ref, RepairOffer, RepairRequest, ResolvedRepair, Role, Rule,
-    RuleText, Scalar, Scope, Signal, SourceAttribution, Strength, TextMatch, TrustNote, Truth,
-    MAX_RULE_BRANCHES,
+    CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding, Level, LocalText,
+    MatchOps, NextStepKind, ParseNoteKind, Ref, RepairOffer, RepairRequest, ResolvedRepair, Role,
+    Rule, RuleText, Scalar, Scope, Signal, SourceAttribution, Strength, TextMatch, TrustNote,
+    Truth, MAX_RULE_BRANCHES,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -97,15 +97,13 @@ fn annotate_frames(facts: &mut [FactEntry], resolver: &dyn RefResolver) {
         .filter(|(_, entry)| entry.fact.kind == "core.frame")
         .map(|(index, _)| index)
         .collect();
-    frames.sort_by_key(|index| {
-        facts[*index]
-            .fact
-            .attrs
-            .get("index")
-            .and_then(first_scalar)
-            .and_then(scalar_number)
-            .map(|value| value as u64)
-            .unwrap_or(u64::MAX)
+    frames.sort_by(|a, b| {
+        let a = &facts[*a];
+        let b = &facts[*b];
+        frame_artifact(a)
+            .cmp(&frame_artifact(b))
+            .then_with(|| frame_index(a).cmp(&frame_index(b)))
+            .then_with(|| frame_content(a).cmp(&frame_content(b)))
     });
     let mut actionable = 0u64;
     for index in frames {
@@ -124,6 +122,42 @@ fn annotate_frames(facts: &mut [FactEntry], resolver: &dyn RefResolver) {
         );
         actionable += 1;
     }
+}
+
+fn frame_artifact(entry: &FactEntry) -> String {
+    entry
+        .fact
+        .span
+        .as_ref()
+        .and_then(|span| span.artifact.clone())
+        .unwrap_or_else(|| entry.artifact.clone())
+}
+
+fn frame_index(entry: &FactEntry) -> u64 {
+    entry
+        .fact
+        .attrs
+        .get("index")
+        .and_then(first_scalar)
+        .and_then(scalar_number)
+        .map(|value| value as u64)
+        .unwrap_or(u64::MAX)
+}
+
+fn frame_content(entry: &FactEntry) -> String {
+    let fact = serde_json::to_string(&entry.fact).unwrap_or_default();
+    let parser = entry
+        .parser
+        .as_ref()
+        .map(|stamp| format!("{}\0{}", stamp.plugin.id, stamp.parser_id))
+        .unwrap_or_default();
+    format!(
+        "{fact}\0{}\0{}\0{}\0{}",
+        entry.source.as_deref().unwrap_or(""),
+        entry.producer_format,
+        entry.producer_version.as_deref().unwrap_or(""),
+        parser
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,8 +352,14 @@ fn eval_condition(
             result
         }
         Condition::Any(list) => {
+            // A disjunction starts false. Starting true would skip every child.
             let mut result = EvalResult {
-                branches: vec![Branch::initial(bindings.clone())],
+                branches: vec![Branch {
+                    truth: Truth::False,
+                    bindings: bindings.clone(),
+                    evidence: Vec::new(),
+                    unknown: Vec::new(),
+                }],
                 overflow: false,
             };
             for child in list {
@@ -333,11 +373,20 @@ fn eval_condition(
                     result.overflow |= child_result.overflow;
                     for outcome in child_result.branches {
                         let truth = branch.truth.or(outcome.truth);
+                        // Only a true child contributes bindings and evidence. A speculative
+                        // binding from an unknown child must not leak into a later true branch.
+                        let bindings = if outcome.truth == Truth::True {
+                            outcome.bindings
+                        } else {
+                            branch.bindings.clone()
+                        };
                         let mut evidence = branch.evidence.clone();
-                        evidence.extend(outcome.evidence);
+                        if outcome.truth == Truth::True {
+                            evidence.extend(outcome.evidence);
+                        }
                         next.push(Branch {
                             truth,
-                            bindings: outcome.bindings,
+                            bindings,
                             evidence,
                             unknown: merge_unknown(&branch.unknown, &outcome.unknown),
                         });
@@ -496,17 +545,26 @@ fn eval_fact(
     }
     let mut branches = Vec::new();
     let mut overflow = false;
+    let mut any_unknown = false;
+    let mut reason = None;
     for entry in facts {
-        let Some(matches) = fact_matches(entry, query, bindings, resolver) else {
-            continue;
-        };
-        for (bindings, evidence) in matches {
-            branches.push(Branch {
-                truth: Truth::True,
-                bindings,
-                evidence: vec![evidence],
-                unknown: Vec::new(),
-            });
+        let outcome = fact_matches(entry, query, bindings, resolver);
+        match outcome.truth {
+            Truth::True => {
+                for (bindings, evidence) in outcome.branches {
+                    branches.push(Branch {
+                        truth: Truth::True,
+                        bindings,
+                        evidence: vec![evidence],
+                        unknown: Vec::new(),
+                    });
+                }
+            }
+            Truth::Unknown => {
+                any_unknown = true;
+                reason = merge_reason(reason, outcome.reason);
+            }
+            Truth::False => {}
         }
         if branches.len() > MAX_RULE_BRANCHES {
             overflow = true;
@@ -515,26 +573,103 @@ fn eval_fact(
         }
     }
     if branches.is_empty() {
-        branches.push(Branch::initial(bindings.clone()).with_truth(Truth::False));
+        if any_unknown {
+            branches.push(Branch {
+                truth: Truth::Unknown,
+                bindings: bindings.clone(),
+                evidence: Vec::new(),
+                unknown: vec![UnknownNote {
+                    subject: query.kind.clone(),
+                    reason: reason.unwrap_or(CouldNotCheckReason::NotCovered),
+                }],
+            });
+        } else {
+            branches.push(Branch::initial(bindings.clone()).with_truth(Truth::False));
+        }
     }
     EvalResult { branches, overflow }
 }
 
 /// Every way one fact fits the query: one per matching ref when the query names one.
+struct FactOutcome {
+    truth: Truth,
+    branches: Vec<(Bindings, EvidenceLine)>,
+    reason: Option<CouldNotCheckReason>,
+}
+
+fn merge_reason(
+    a: Option<CouldNotCheckReason>,
+    b: Option<CouldNotCheckReason>,
+) -> Option<CouldNotCheckReason> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(reason), None) | (None, Some(reason)) => Some(reason),
+        (Some(a), Some(b)) => Some(if reason_rank(a) >= reason_rank(b) {
+            a
+        } else {
+            b
+        }),
+    }
+}
+
+fn attr_unknown_reason(entry: &FactEntry, name: &str, test: &AttrMatch) -> CouldNotCheckReason {
+    let Some(attr) = entry.fact.attrs.get(name) else {
+        return CouldNotCheckReason::NotCovered;
+    };
+    let AttrMatch::Test(ops) = test else {
+        return CouldNotCheckReason::NotCovered;
+    };
+    if let Some(pattern) = &ops.regex {
+        if regex::Regex::new(pattern).is_err() {
+            return CouldNotCheckReason::CodeFailed;
+        }
+    }
+    if let Some(gate) = &ops.version {
+        let can_judge = match attr {
+            AttrValue::Scalar(Scalar::Text(text)) => gate.matches(text).is_some(),
+            AttrValue::List(list) => list
+                .iter()
+                .any(|scalar| matches!(scalar, Scalar::Text(text) if gate.matches(text).is_some())),
+            _ => false,
+        };
+        if !can_judge {
+            return CouldNotCheckReason::VersionUnknown;
+        }
+    }
+    CouldNotCheckReason::NotCovered
+}
+
 fn fact_matches(
     entry: &FactEntry,
     query: &FactQuery,
     bindings: &Bindings,
     resolver: &dyn RefResolver,
-) -> Option<Vec<(Bindings, EvidenceLine)>> {
+) -> FactOutcome {
+    let mut truth = Truth::True;
+    let mut reason = None;
     for (name, test) in &query.filter {
-        if !attr_matches(entry, name, test, bindings) {
-            return None;
+        match attr_matches(entry, name, test, bindings) {
+            Truth::False => {
+                return FactOutcome {
+                    truth: Truth::False,
+                    branches: Vec::new(),
+                    reason: None,
+                }
+            }
+            Truth::Unknown => {
+                truth = truth.and(Truth::Unknown);
+                reason = merge_reason(reason, Some(attr_unknown_reason(entry, name, test)));
+            }
+            Truth::True => {}
         }
     }
     let mut starts = vec![bindings.clone()];
     for (variable, attr) in &query.bind {
-        let value = entry.fact.attrs.get(attr).and_then(first_scalar).cloned()?;
+        let Some(value) = entry.fact.attrs.get(attr).and_then(first_scalar).cloned() else {
+            truth = truth.and(Truth::Unknown);
+            reason = merge_reason(reason, Some(CouldNotCheckReason::NotCovered));
+            continue;
+        };
         let mut next = Vec::new();
         for mut start in starts {
             if bind_value(&mut start, variable, value.clone()) {
@@ -542,18 +677,59 @@ fn fact_matches(
             }
         }
         if next.is_empty() {
-            return None;
+            return FactOutcome {
+                truth: Truth::False,
+                branches: Vec::new(),
+                reason: None,
+            };
         }
         starts = next;
     }
     let evidence = entry.evidence();
+    if truth != Truth::True {
+        return FactOutcome {
+            truth,
+            branches: Vec::new(),
+            reason,
+        };
+    }
     let Some(reference_query) = &query.reference else {
-        return Some(starts.into_iter().map(|b| (b, evidence.clone())).collect());
+        return FactOutcome {
+            truth: Truth::True,
+            branches: starts
+                .into_iter()
+                .map(|bindings| (bindings, evidence.clone()))
+                .collect(),
+            reason: None,
+        };
     };
     let mut out = Vec::new();
+    let mut ref_truth = Truth::False;
+    let mut ref_reason = None;
     for reference in &entry.fact.refs {
-        if !reference_fits(reference, reference_query, bindings, resolver) {
+        if reference.kind != reference_query.kind {
             continue;
+        }
+        if let Some(strength) = reference_query.strength {
+            if reference.strength < strength {
+                continue;
+            }
+        }
+        if let Some(role) = reference_query.role {
+            if resolver.resolve(reference).role != Some(role) {
+                continue;
+            }
+        }
+        if let Some(value) = &reference_query.value {
+            match scalar_test_text(value, &reference.value, bindings) {
+                Truth::False => continue,
+                Truth::Unknown => {
+                    ref_truth = Truth::Unknown;
+                    ref_reason = merge_reason(ref_reason, Some(CouldNotCheckReason::NotCovered));
+                    continue;
+                }
+                Truth::True => {}
+            }
         }
         for start in &starts {
             let mut next = start.clone();
@@ -571,37 +747,76 @@ fn fact_matches(
         }
     }
     if out.is_empty() {
-        None
+        FactOutcome {
+            truth: ref_truth,
+            branches: Vec::new(),
+            reason: ref_reason,
+        }
     } else {
-        Some(out)
+        FactOutcome {
+            truth: Truth::True,
+            branches: out,
+            reason: None,
+        }
     }
 }
 
-fn reference_fits(
-    reference: &Ref,
-    query: &agora_game_api::crash::RefQuery,
+fn fact_truth(
+    entry: &FactEntry,
+    filter: &BTreeMap<String, AttrMatch>,
+    reference: Option<&agora_game_api::crash::RefQuery>,
     bindings: &Bindings,
     resolver: &dyn RefResolver,
-) -> bool {
-    if reference.kind != query.kind {
-        return false;
-    }
-    if let Some(value) = &query.value {
-        if !scalar_test_text(value, &reference.value, bindings) {
-            return false;
+) -> (Truth, Option<CouldNotCheckReason>) {
+    let mut truth = Truth::True;
+    let mut reason = None;
+    for (name, test) in filter {
+        match attr_matches(entry, name, test, bindings) {
+            Truth::False => return (Truth::False, None),
+            Truth::Unknown => {
+                truth = truth.and(Truth::Unknown);
+                reason = merge_reason(reason, Some(attr_unknown_reason(entry, name, test)));
+            }
+            Truth::True => {}
         }
     }
-    if let Some(strength) = query.strength {
-        if reference.strength < strength {
-            return false;
+    if truth != Truth::True {
+        return (truth, reason);
+    }
+    let Some(reference_query) = reference else {
+        return (Truth::True, None);
+    };
+    let mut ref_truth = Truth::False;
+    let mut ref_reason = None;
+    for reference in &entry.fact.refs {
+        if reference.kind != reference_query.kind {
+            continue;
+        }
+        if let Some(strength) = reference_query.strength {
+            if reference.strength < strength {
+                continue;
+            }
+        }
+        if let Some(role) = reference_query.role {
+            if resolver.resolve(reference).role != Some(role) {
+                continue;
+            }
+        }
+        if let Some(value) = &reference_query.value {
+            match scalar_test_text(value, &reference.value, bindings) {
+                Truth::False => continue,
+                Truth::Unknown => {
+                    ref_truth = Truth::Unknown;
+                    ref_reason = merge_reason(ref_reason, Some(CouldNotCheckReason::NotCovered));
+                    continue;
+                }
+                Truth::True => return (Truth::True, None),
+            }
+        } else {
+            return (Truth::True, None);
         }
     }
-    if let Some(role) = query.role {
-        if resolver.resolve(reference).role != Some(role) {
-            return false;
-        }
-    }
-    true
+    (ref_truth, ref_reason)
 }
 
 fn eval_count(
@@ -613,10 +828,15 @@ fn eval_count(
     let facts: Vec<&FactEntry> = view.facts_of_kind(&query.kind).collect();
     if facts.is_empty() {
         return match view.coverage_of(&query.kind) {
-            CoverageClass::Covered => {
-                let count = 0u32;
-                count_branch(query, count, bindings)
-            }
+            CoverageClass::Covered => EvalResult {
+                branches: vec![Branch {
+                    truth: count_truth(query, 0, 0),
+                    bindings: bindings.clone(),
+                    evidence: Vec::new(),
+                    unknown: Vec::new(),
+                }],
+                overflow: false,
+            },
             CoverageClass::Unknown(reason) => EvalResult {
                 branches: vec![Branch {
                     truth: Truth::Unknown,
@@ -631,52 +851,59 @@ fn eval_count(
             },
         };
     }
-    let mut count = 0u32;
+    let mut known = 0u32;
+    let mut unknown = 0u32;
+    let mut reason = None;
     for entry in facts {
-        if !fact_filter_matches(entry, &query.filter, bindings) {
-            continue;
-        }
-        let reference_ok =
-            match &query.reference {
-                Some(reference_query) => entry.fact.refs.iter().any(|reference| {
-                    reference_fits(reference, reference_query, bindings, resolver)
-                }),
-                None => true,
-            };
-        if reference_ok {
-            count += 1;
+        match fact_truth(
+            entry,
+            &query.filter,
+            query.reference.as_ref(),
+            bindings,
+            resolver,
+        ) {
+            (Truth::True, _) => known += 1,
+            (Truth::Unknown, why) => {
+                unknown += 1;
+                reason = merge_reason(reason, why);
+            }
+            (Truth::False, _) => {}
         }
     }
-    count_branch(query, count, bindings)
-}
-
-fn count_branch(query: &CountQuery, count: u32, bindings: &Bindings) -> EvalResult {
-    let at_least = query.at_least.map(|n| count >= n).unwrap_or(true);
-    let at_most = query.at_most.map(|n| count <= n).unwrap_or(true);
-    let truth = if at_least && at_most {
-        Truth::True
+    let truth = count_truth(query, known, unknown);
+    let unknown = if truth == Truth::Unknown {
+        vec![UnknownNote {
+            subject: query.kind.clone(),
+            reason: reason.unwrap_or(CouldNotCheckReason::NotCovered),
+        }]
     } else {
-        Truth::False
+        Vec::new()
     };
     EvalResult {
         branches: vec![Branch {
             truth,
             bindings: bindings.clone(),
             evidence: Vec::new(),
-            unknown: Vec::new(),
+            unknown,
         }],
         overflow: false,
     }
 }
 
-fn fact_filter_matches(
-    entry: &FactEntry,
-    filter: &BTreeMap<String, AttrMatch>,
-    bindings: &Bindings,
-) -> bool {
-    filter
-        .iter()
-        .all(|(name, test)| attr_matches(entry, name, test, bindings))
+fn count_truth(query: &CountQuery, known: u32, unknown: u32) -> Truth {
+    let at_least = match query.at_least {
+        Some(n) if known >= n => Truth::True,
+        Some(n) if known + unknown >= n => Truth::Unknown,
+        Some(_) => Truth::False,
+        None => Truth::True,
+    };
+    let at_most = match query.at_most {
+        Some(n) if known > n => Truth::False,
+        Some(n) if known + unknown <= n => Truth::True,
+        Some(_) => Truth::Unknown,
+        None => Truth::True,
+    };
+    at_least.and(at_most)
 }
 
 fn eval_text(text: &TextMatch, view: &View, bindings: &Bindings) -> EvalResult {
@@ -845,110 +1072,172 @@ fn display_scalar(scalar: &Scalar) -> String {
     }
 }
 
-fn attr_matches(entry: &FactEntry, name: &str, test: &AttrMatch, bindings: &Bindings) -> bool {
+fn attr_matches(entry: &FactEntry, name: &str, test: &AttrMatch, bindings: &Bindings) -> Truth {
     let attr = entry.fact.attrs.get(name);
     if let AttrMatch::Test(ops) = test {
         if let Some(expected) = ops.present {
             if !expected {
-                return attr.is_none();
+                return if attr.is_none() {
+                    Truth::True
+                } else {
+                    Truth::False
+                };
             }
             if attr.is_none() {
-                return false;
+                return Truth::False;
             }
         }
     }
     let Some(attr) = attr else {
-        return false;
+        // A test on a missing attribute is unknown, not a clean no.
+        return Truth::Unknown;
     };
-    match (attr, test) {
-        (AttrValue::Scalar(scalar), test) => scalar_matches(scalar, test, bindings),
-        (AttrValue::List(list), test) => list
-            .iter()
-            .any(|scalar| scalar_matches(scalar, test, bindings)),
+    match attr {
+        AttrValue::Scalar(scalar) => scalar_matches(scalar, test, bindings),
+        AttrValue::List(list) => {
+            let mut unknown = false;
+            for scalar in list {
+                match scalar_matches(scalar, test, bindings) {
+                    Truth::True => return Truth::True,
+                    Truth::Unknown => unknown = true,
+                    Truth::False => {}
+                }
+            }
+            if unknown {
+                Truth::Unknown
+            } else {
+                Truth::False
+            }
+        }
     }
 }
 
-fn scalar_matches(scalar: &Scalar, test: &AttrMatch, bindings: &Bindings) -> bool {
+fn scalar_matches(scalar: &Scalar, test: &AttrMatch, bindings: &Bindings) -> Truth {
     match test {
-        AttrMatch::Is(expected) => scalar_eq(&resolve_scalar(expected, bindings), scalar),
+        AttrMatch::Is(expected) => match resolve_scalar(expected, bindings) {
+            Some(expected) => {
+                if scalar_eq(&expected, scalar) {
+                    Truth::True
+                } else {
+                    Truth::False
+                }
+            }
+            None => Truth::Unknown,
+        },
         AttrMatch::Test(ops) => scalar_ops(scalar, ops, bindings),
     }
 }
 
-fn scalar_ops(scalar: &Scalar, ops: &MatchOps, bindings: &Bindings) -> bool {
+fn scalar_ops(scalar: &Scalar, ops: &MatchOps, bindings: &Bindings) -> Truth {
     let text = match scalar {
         Scalar::Text(text) => Some(text.as_str()),
         _ => None,
     };
+    let mut truth = Truth::True;
     if let Some(expected) = &ops.eq {
-        if !scalar_eq(&resolve_scalar(expected, bindings), scalar) {
-            return false;
+        match resolve_scalar(expected, bindings) {
+            Some(expected) => {
+                truth = truth.and(if scalar_eq(&expected, scalar) {
+                    Truth::True
+                } else {
+                    Truth::False
+                })
+            }
+            None => truth = truth.and(Truth::Unknown),
         }
     }
     if let Some(list) = &ops.any_of {
-        let found = list
-            .iter()
-            .any(|expected| scalar_eq(&resolve_scalar(expected, bindings), scalar));
-        if !found {
-            return false;
+        let mut any_unknown = false;
+        let mut any_true = false;
+        for expected in list {
+            match resolve_scalar(expected, bindings) {
+                Some(expected) => {
+                    if scalar_eq(&expected, scalar) {
+                        any_true = true;
+                        break;
+                    }
+                }
+                None => any_unknown = true,
+            }
         }
+        truth = truth.and(if any_true {
+            Truth::True
+        } else if any_unknown {
+            Truth::Unknown
+        } else {
+            Truth::False
+        });
     }
     if let Some(pattern) = &ops.glob {
-        let Some(text) = text else { return false };
-        if !glob_match(pattern, text) {
-            return false;
-        }
+        let Some(text) = text else {
+            return Truth::False;
+        };
+        truth = truth.and(if glob_match(pattern, text) {
+            Truth::True
+        } else {
+            Truth::False
+        });
     }
     if let Some(pattern) = &ops.regex {
-        let Some(text) = text else { return false };
-        let Ok(regex) = regex::Regex::new(pattern) else {
-            return false;
+        let Some(text) = text else {
+            return Truth::False;
         };
-        if !regex.is_match(text) {
-            return false;
+        match regex::Regex::new(pattern) {
+            Ok(regex) => {
+                truth = truth.and(if regex.is_match(text) {
+                    Truth::True
+                } else {
+                    Truth::False
+                })
+            }
+            Err(_) => truth = truth.and(Truth::Unknown),
         }
     }
     if let Some(gte) = ops.gte {
         let Some(number) = scalar_number(scalar) else {
-            return false;
+            return Truth::False;
         };
-        if number < gte {
-            return false;
-        }
+        truth = truth.and(if number >= gte {
+            Truth::True
+        } else {
+            Truth::False
+        });
     }
     if let Some(lte) = ops.lte {
         let Some(number) = scalar_number(scalar) else {
-            return false;
+            return Truth::False;
         };
-        if number > lte {
-            return false;
-        }
+        truth = truth.and(if number <= lte {
+            Truth::True
+        } else {
+            Truth::False
+        });
     }
     if let Some(gate) = &ops.version {
-        let Some(text) = text else { return false };
-        if gate.matches(text) != Some(true) {
-            return false;
-        }
+        let Some(text) = text else {
+            return Truth::False;
+        };
+        truth = truth.and(match gate.matches(text) {
+            Some(true) => Truth::True,
+            Some(false) => Truth::False,
+            None => Truth::Unknown,
+        });
     }
-    true
+    truth
 }
 
-fn scalar_test_text(test: &AttrMatch, text: &str, bindings: &Bindings) -> bool {
+fn scalar_test_text(test: &AttrMatch, text: &str, bindings: &Bindings) -> Truth {
     scalar_matches(&Scalar::Text(text.to_string()), test, bindings)
 }
 
-fn resolve_scalar(scalar: &Scalar, bindings: &Bindings) -> Scalar {
+fn resolve_scalar(scalar: &Scalar, bindings: &Bindings) -> Option<Scalar> {
     let Scalar::Text(text) = scalar else {
-        return scalar.clone();
+        return Some(scalar.clone());
     };
     let Some(name) = text.strip_prefix('$') else {
-        return scalar.clone();
+        return Some(scalar.clone());
     };
-    bindings
-        .values
-        .get(name)
-        .cloned()
-        .unwrap_or_else(|| scalar.clone())
+    bindings.values.get(name).cloned()
 }
 
 fn scalar_eq(a: &Scalar, b: &Scalar) -> bool {
@@ -968,7 +1257,6 @@ fn scalar_number(scalar: &Scalar) -> Option<f64> {
     }
 }
 
-/// Case-insensitive `*` and `?`.
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
     let text: Vec<char> = text.to_lowercase().chars().collect();
@@ -1000,6 +1288,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 struct RuleProducts {
     plugin_id: String,
     rule_id: String,
+    fired: bool,
     signals: Vec<Signal>,
     findings: Vec<Finding>,
     could_not_check: Vec<CouldNotCheck>,
@@ -1037,6 +1326,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
 
     let fired: BTreeSet<(String, String)> = products
         .iter()
+        .filter(|product| product.fired)
         .map(|product| (product.plugin_id.clone(), product.rule_id.clone()))
         .collect();
     let mut superseded: BTreeSet<(String, String)> = BTreeSet::new();
@@ -1106,6 +1396,11 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
             source,
         });
         cap = lower_cap(cap, Level::Likely);
+    }
+
+    if bucket_predates_change(input.engine_facts) {
+        // A change since the last good launch cannot explain a bucket that predates it.
+        signals.retain(|signal| signal.family != Family::ChangeCorrelation);
     }
 
     signals.sort_by_key(signal_key);
@@ -1212,6 +1507,20 @@ fn evaluate_rule(
         }
     }
 
+    if let Some(detail) = condition_bad_regex(&rule.when) {
+        return Some(RuleProducts {
+            plugin_id: plugin.id.clone(),
+            rule_id: rule.id.clone(),
+            could_not_check: vec![CouldNotCheck {
+                reason: CouldNotCheckReason::CodeFailed,
+                subject: rule.id.clone(),
+                detail: Some(detail),
+                source: Some(rule_source(plugin, rule, None)),
+            }],
+            ..RuleProducts::default()
+        });
+    }
+
     let view = View::build(
         &allowed,
         input.engine_facts,
@@ -1247,6 +1556,12 @@ fn evaluate_rule(
         return Some(product);
     }
 
+    if result.overflow {
+        // The match set cannot be trusted, so the rule does not fire.
+        product.could_not_check.push(overflow_note(plugin, rule));
+        return Some(product);
+    }
+
     let true_branches: Vec<&Branch> = result
         .branches
         .iter()
@@ -1271,6 +1586,7 @@ fn evaluate_rule(
         return Some(product);
     }
 
+    product.fired = true;
     for branch in true_branches {
         apply_effects(input, plugin, rule, &rule.effects, branch, &mut product);
         if let Some(verify) = &rule.verify {
@@ -1385,6 +1701,41 @@ fn evaluate_rule(
     Some(product)
 }
 
+fn condition_bad_regex(condition: &Condition) -> Option<String> {
+    fn check_test(test: &AttrMatch) -> Option<String> {
+        let AttrMatch::Test(ops) = test else {
+            return None;
+        };
+        let pattern = ops.regex.as_ref()?;
+        regex::Regex::new(pattern)
+            .err()
+            .map(|error| format!("this rule's regex `{pattern}` is invalid: {error}"))
+    }
+    match condition {
+        Condition::All(list) | Condition::Any(list) | Condition::AtLeast { of: list, .. } => {
+            list.iter().find_map(condition_bad_regex)
+        }
+        Condition::Not(inner) => condition_bad_regex(inner),
+        Condition::Fact(query) => query.filter.values().find_map(check_test).or_else(|| {
+            query
+                .reference
+                .as_ref()
+                .and_then(|reference| reference.value.as_ref())
+                .and_then(check_test)
+        }),
+        Condition::Count(query) => query.filter.values().find_map(check_test).or_else(|| {
+            query
+                .reference
+                .as_ref()
+                .and_then(|reference| reference.value.as_ref())
+                .and_then(check_test)
+        }),
+        Condition::Text(text) => regex::Regex::new(&text.regex)
+            .err()
+            .map(|error| format!("this rule's regex `{}` is invalid: {error}", text.regex)),
+    }
+}
+
 fn overflow_note(plugin: &PluginIdentity, rule: &Rule) -> CouldNotCheck {
     CouldNotCheck {
         reason: CouldNotCheckReason::TooManyMatches,
@@ -1394,6 +1745,31 @@ fn overflow_note(plugin: &PluginIdentity, rule: &Rule) -> CouldNotCheck {
         )),
         source: Some(rule_source(plugin, rule, None)),
     }
+}
+
+fn culprit_owner(owner: &Owner, role: Option<Role>) -> bool {
+    if matches!(role, Some(Role::System | Role::Platform)) {
+        return false;
+    }
+    !matches!(owner, Owner::System | Owner::NotInInstance | Owner::Unknown)
+}
+
+fn unknown_owner_note(
+    product: &mut RuleProducts,
+    plugin: &PluginIdentity,
+    rule: &Rule,
+    variable: &str,
+    branch: &Branch,
+) {
+    let Some(bound) = branch.bindings.refs.get(variable) else {
+        return;
+    };
+    product.could_not_check.push(CouldNotCheck {
+        reason: CouldNotCheckReason::NotCovered,
+        subject: bound.reference.value.clone(),
+        detail: Some("Agora could not tell who owns this.".to_string()),
+        source: Some(rule_source(plugin, rule, bound.parser.as_deref())),
+    });
 }
 
 fn apply_effects(
@@ -1414,6 +1790,12 @@ fn apply_effects(
                 if let Some((owner, parser, role)) =
                     resolve_owner(&candidate.owner_of, branch, input.resolver)
                 {
+                    if !culprit_owner(&owner, role) {
+                        if matches!(owner, Owner::Unknown) {
+                            unknown_owner_note(product, plugin, rule, &candidate.owner_of, branch);
+                        }
+                        continue;
+                    }
                     let source = rule_source(plugin, rule, parser.as_deref());
                     if let Some(role) = role {
                         product.roles.insert(owner_key(&owner), role);
@@ -1444,9 +1826,27 @@ fn apply_effects(
                     }
                     None => (None, None, None),
                 };
+                let mut effective_scope = *scope;
+                if let Some(found) = &owner {
+                    if !culprit_owner(found, role) {
+                        if matches!(found, Owner::Unknown) {
+                            if let Some(candidate) = candidate {
+                                unknown_owner_note(
+                                    product,
+                                    plugin,
+                                    rule,
+                                    &candidate.owner_of,
+                                    branch,
+                                );
+                            }
+                        }
+                        owner = None;
+                        effective_scope = Scope::Environment;
+                    }
+                }
                 // A mechanism or environment finding never fills the "who did it" slot, even if
                 // a pack that skipped the linter tried to give it one.
-                if *scope != Scope::RootCause {
+                if effective_scope != Scope::RootCause {
                     owner = None;
                 }
                 let source = rule_source(plugin, rule, parser.as_deref());
@@ -1465,7 +1865,7 @@ fn apply_effects(
                     }
                 }
                 product.findings.push(Finding {
-                    scope: *scope,
+                    scope: effective_scope,
                     level: *level,
                     candidate: owner.clone(),
                     headline: rendered.headline,
@@ -1473,14 +1873,16 @@ fn apply_effects(
                     source: source.clone(),
                     evidence: clean_evidence(branch.evidence.clone()),
                 });
-                if let (Some(owner), Some(family), Some(weight)) = (owner, family, weight) {
-                    product.signals.push(Signal {
-                        family: *family,
-                        candidate: owner,
-                        weight: *weight,
-                        source,
-                        evidence: clean_evidence(branch.evidence.clone()),
-                    });
+                if effective_scope == Scope::RootCause {
+                    if let (Some(owner), Some(family), Some(weight)) = (owner, family, weight) {
+                        product.signals.push(Signal {
+                            family: *family,
+                            candidate: owner,
+                            weight: *weight,
+                            source,
+                            evidence: clean_evidence(branch.evidence.clone()),
+                        });
+                    }
                 }
             }
             Effect::Trust { cap, text } => {
@@ -1630,6 +2032,15 @@ fn substitute(template: &str, branch: &Branch, resolver: &dyn RefResolver) -> St
     }
     out.push_str(rest);
     out
+}
+
+fn bucket_predates_change(facts: &[Fact]) -> bool {
+    facts
+        .iter()
+        .filter(|fact| fact.kind == "core.history")
+        .any(|fact| {
+            fact.attrs.get("predates_last_change") == Some(&AttrValue::Scalar(Scalar::Bool(true)))
+        })
 }
 
 fn signal_key(signal: &Signal) -> String {

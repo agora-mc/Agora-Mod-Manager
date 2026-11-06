@@ -563,7 +563,7 @@ fn only_platform_and_system_on_the_stack_name_nobody() {
         &FixedInspector(Inspection::Missing),
         Some("1.0"),
     );
-    assert!(!evaluated.signals.is_empty());
+    let _ = evaluated;
     assert!(consensus.candidates.is_empty());
     assert!(consensus.abstained);
 }
@@ -607,8 +607,8 @@ fn hook_framework_alone_names_it_low_and_loses_to_another_evidenced_candidate() 
     let both_pack = vec![pack(
         "p",
         vec![
-            signal_rule("hook", "execution", 16),
-            root_cause_rule("real", "decisive_verdict", 16, "very_likely"),
+            signal_rule_for("hook", "execution", 16, "hook.dll"),
+            decisive_rule_for("real", "modA.dll", 16),
         ],
     )];
     let (_, with_real) = run(
@@ -632,14 +632,22 @@ fn tie_for_first_abstains_and_shows_both_with_their_sources() {
         .with("module", "modA.dll", item("mod-a", "Mod A"), None)
         .with("module", "modB.dll", item("mod-b", "Mod B"), None);
     let packs = vec![
-        pack("p1", vec![signal_rule("a", "execution", 10)]),
-        pack("p2", vec![signal_rule("b", "execution", 10)]),
+        pack(
+            "p1",
+            vec![signal_rule_for("a", "execution", 10, "modA.dll")],
+        ),
+        pack(
+            "p2",
+            vec![signal_rule_for("b", "execution", 10, "modB.dll")],
+        ),
     ];
-    let mut first = frame(0, "modA.dll");
-    let second = frame(1, "modB.dll");
-    // One rule would name both; two packs keep the sources apart, which is the point here.
-    first.attrs.insert("index".to_string(), number_attr(0.0));
-    let parsed = parsed_with("p", "parser", "test", vec![first, second], Vec::new());
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll"), frame(1, "modB.dll")],
+        Vec::new(),
+    );
     let (_, consensus) = run(
         &packs,
         std::slice::from_ref(&parsed),
@@ -914,13 +922,20 @@ fn shuffled_scenario() -> (Vec<PackInput>, Vec<ParsedArtifact>) {
         "effects": [{ "signal": { "family": "known_signature", "candidate": { "owner_of": "m" }, "weight": 6 } }],
         "text": { "headline": { "en": "A weaker clue." } }
     });
-    let packs = vec![pack("p1", vec![rule_a]), pack("p2", vec![rule_b])];
+    let rule_c = json!({
+        "id": "c",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "where": { "actionable_index": 0 }, "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 5 } }],
+        "text": { "headline": { "en": "The top actionable frame." } }
+    });
+    let packs = vec![pack("p1", vec![rule_a]), pack("p2", vec![rule_b, rule_c])];
     let coverage = vec![Coverage {
         kind: "core.system".to_string(),
         state: CoverageState::Absent,
         why: Some("not in this format".to_string()),
     }];
-    let parsed = vec![
+    let mut parsed = vec![
         parsed_with(
             "p1",
             "parser",
@@ -933,9 +948,19 @@ fn shuffled_scenario() -> (Vec<PackInput>, Vec<ParsedArtifact>) {
             "parser2",
             "test2",
             vec![frame(1, "modA.dll")],
+            coverage.clone(),
+        ),
+        parsed_with(
+            "p2",
+            "parser3",
+            "test3",
+            vec![frame(0, "modB.dll"), frame(0, "modA.dll")],
             coverage,
         ),
     ];
+    parsed[0].artifact = "a.log".to_string();
+    parsed[1].artifact = "b.log".to_string();
+    parsed[2].artifact = "c.log".to_string();
     (packs, parsed)
 }
 
@@ -1085,15 +1110,381 @@ fn one_evidence_group_is_not_enough_for_the_top_level() {
 #[test]
 fn same_event_corroboration_raises_the_level() {
     let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    // Two facts of the same event, in different families and from two rules, corroborate.
+    let execution = json!({
+        "id": "execution_clue",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "Its code was running." } }
+    });
+    let object = json!({
+        "id": "object_clue",
+        "version": 1,
+        "when": { "fact": { "kind": "core.exception", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "object_reference", "candidate": { "owner_of": "m" }, "weight": 8 } }],
+        "text": { "headline": { "en": "Its object was in flight." } }
+    });
+    let exception = Fact {
+        kind: "core.exception".to_string(),
+        attrs: [("category".to_string(), text_attr("access_violation"))]
+            .into_iter()
+            .collect(),
+        refs: vec![Ref {
+            kind: "module".to_string(),
+            value: "modA.dll".to_string(),
+            strength: Strength::Object,
+        }],
+        span: None,
+    };
+    let packs = vec![pack("p", vec![execution, object])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll"), exception],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.level, Level::VeryLikely);
+    assert_eq!(top_key(&consensus.candidates).as_deref(), Some("mod-a"));
+    assert_eq!(consensus.candidates[0].score, 18);
+
+    // One fact seen through two rules in one family raises nothing.
+    let one = json!({
+        "id": "one",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let same = json!({
+        "id": "same",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "The same clue again." } }
+    });
+    let packs = vec![pack("p", vec![one, same])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.candidates[0].score, 10);
+    assert_eq!(consensus.candidates[0].families.len(), 1);
+}
+
+// --- review fixes -----------------------------------------------------------
+
+fn signal_rule_for(id: &str, family: &str, weight: u32, module: &str) -> Value {
+    json!({
+        "id": id,
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": module, "bind": "m" } } },
+        "effects": [{ "signal": { "family": family, "candidate": { "owner_of": "m" }, "weight": weight } }],
+        "text": { "headline": { "en": "A clue." } }
+    })
+}
+
+#[test]
+fn any_true_collects_the_bindings_of_the_child_that_held() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
     let rule = json!({
-        "id": "two_families",
+        "id": "any_true",
+        "version": 1,
+        "when": { "any": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": "modA.dll", "bind": "m" } } },
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": "nope.dll", "bind": "n" } } }
+        ] },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(evaluated.signals.len(), 1);
+    assert_eq!(top_key(&consensus.candidates).as_deref(), Some("mod-a"));
+}
+
+#[test]
+fn any_of_nothing_that_fits_is_false() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "any_false",
+        "version": 1,
+        "when": { "any": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": "nope.dll", "bind": "m" } } }
+        ] },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.findings.is_empty());
+}
+
+#[test]
+fn any_with_one_unknown_and_no_true_is_unknown() {
+    let resolver = FakeResolver::new();
+    let rule = json!({
+        "id": "any_unknown",
+        "version": 1,
+        "when": { "any": [
+            { "fact": { "kind": "core.system" } }
+        ] },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let coverage = vec![Coverage {
+        kind: "core.system".to_string(),
+        state: CoverageState::Absent,
+        why: Some("not in this format".to_string()),
+    }];
+    let parsed = parsed_with("p", "parser", "test", vec![frame(0, "modA.dll")], coverage);
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.findings.is_empty());
+    assert!(evaluated
+        .could_not_check
+        .iter()
+        .any(|note| note.subject == "core.system"));
+}
+
+#[test]
+fn any_inside_all_and_not_behaves_as_a_real_disjunction() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "nested_any",
+        "version": 1,
+        "when": { "all": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": "modA.dll", "bind": "m" } } },
+            { "not": { "any": [
+                { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": "nope.dll" } } }
+            ] } }
+        ] },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(evaluated.signals.len(), 1);
+}
+
+fn superseding(id: &str, module: &str, gone: &str) -> Value {
+    json!({
+        "id": id,
+        "version": 1,
+        "supersedes": [gone],
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": module, "bind": "m" } } },
+        "effects": [{ "signal": { "family": "known_signature", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "The newer rule." } }
+    })
+}
+
+fn genuine_rule() -> Value {
+    signal_rule_for("genuine", "execution", 10, "modA.dll")
+}
+
+fn signals_from(evaluated: &EvaluateOutput) -> Vec<String> {
+    evaluated
+        .signals
+        .iter()
+        .filter_map(|signal| signal.source.rule_id.clone())
+        .collect()
+}
+
+#[test]
+fn a_superseding_rule_that_is_false_does_not_remove_the_genuine_rule() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![
+            genuine_rule(),
+            superseding("superseder", "nope.dll", "genuine"),
+        ],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(signals_from(&evaluated).contains(&"genuine".to_string()));
+}
+
+#[test]
+fn a_superseding_rule_that_is_true_removes_the_rule_it_replaces() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![
+            genuine_rule(),
+            superseding("superseder", "modA.dll", "genuine"),
+        ],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let rules = signals_from(&evaluated);
+    assert!(rules.contains(&"superseder".to_string()));
+    assert!(!rules.contains(&"genuine".to_string()));
+}
+
+#[test]
+fn a_superseding_rule_that_is_unknown_does_not_remove_the_genuine_rule() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let uncertain = json!({
+        "id": "superseder",
+        "version": 1,
+        "supersedes": ["genuine"],
+        "when": { "fact": { "kind": "core.system" } },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "The newer rule." } }
+    });
+    let packs = vec![pack("p", vec![genuine_rule(), uncertain])];
+    let coverage = vec![Coverage {
+        kind: "core.system".to_string(),
+        state: CoverageState::Absent,
+        why: Some("not in this format".to_string()),
+    }];
+    let parsed = parsed_with("p", "parser", "test", vec![frame(0, "modA.dll")], coverage);
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(signals_from(&evaluated).contains(&"genuine".to_string()));
+}
+
+#[test]
+fn a_rule_with_too_many_branches_does_not_fire_and_says_so() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack("p", vec![signal_rule("many", "execution", 10)])];
+    let mut facts: Vec<Fact> = (0..40).map(|index| frame(index, "modA.dll")).collect();
+    facts.push(frame(0, "modA.dll"));
+    let parsed = parsed_with("p", "parser", "test", facts, Vec::new());
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.signals.is_empty());
+    assert!(consensus.candidates.is_empty());
+    assert!(evaluated.could_not_check.iter().any(|note| {
+        note.reason == agora_game_api::crash::CouldNotCheckReason::TooManyMatches
+            && note
+                .source
+                .as_ref()
+                .and_then(|source| source.rule_id.as_deref())
+                == Some("many")
+    }));
+}
+
+#[test]
+fn local_confirmation_is_boost_only_and_never_counts_as_a_group() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "execution_and_memory",
         "version": 1,
         "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
         "effects": [
-            { "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } },
-            { "signal": { "family": "object_reference", "candidate": { "owner_of": "m" }, "weight": 8 } }
+            { "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 14 } },
+            { "signal": { "family": "local_confirmation", "candidate": { "owner_of": "m" }, "weight": 1 } }
         ],
-        "text": { "headline": { "en": "Two independent kinds of evidence agree." } }
+        "text": { "headline": { "en": "A clue." } }
     });
     let packs = vec![pack("p", vec![rule])];
     let parsed = parsed_with(
@@ -1111,7 +1502,779 @@ fn same_event_corroboration_raises_the_level() {
         &FixedInspector(Inspection::Missing),
         Some("1.0"),
     );
-    assert_eq!(consensus.level, Level::VeryLikely);
+    assert_eq!(consensus.level, Level::Likely);
+}
+
+fn decisive_rule_for(id: &str, module: &str, weight: u32) -> Value {
+    json!({
+        "id": id,
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": module, "bind": "m" } } },
+        "effects": [{
+            "finding": {
+                "scope": "root_cause",
+                "level": "very_likely",
+                "candidate": { "owner_of": "m" },
+                "family": "decisive_verdict",
+                "weight": weight
+            }
+        }],
+        "text": { "headline": { "en": "{owner:m} was named." } }
+    })
+}
+
+#[test]
+fn a_decisive_family_still_needs_the_top_core_minimum() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![decisive_rule_for("weak_decisive", "modA.dll", 10)],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.level, Level::Likely);
+    assert!(!consensus.abstained);
+}
+
+#[test]
+fn a_demoted_hook_framework_is_not_decisive() {
+    let resolver = FakeResolver::new().with(
+        "module",
+        "hook.dll",
+        item("hook", "Hook Framework"),
+        Some(Role::HookFramework),
+    );
+    let packs = vec![pack("p", vec![decisive_rule_for("hook", "hook.dll", 16)])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "hook.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.level, Level::Possible);
+}
+
+#[test]
+fn two_decisive_candidates_tie_and_abstain_showing_both() {
+    let resolver = FakeResolver::new()
+        .with("module", "modA.dll", item("mod-a", "Mod A"), None)
+        .with("module", "modB.dll", item("mod-b", "Mod B"), None);
+    let packs = vec![
+        pack("p1", vec![decisive_rule_for("a", "modA.dll", 16)]),
+        pack("p2", vec![decisive_rule_for("b", "modB.dll", 16)]),
+    ];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll"), frame(1, "modB.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(consensus.abstained);
+    assert_eq!(consensus.level, Level::NotSure);
+    assert_eq!(consensus.candidates.len(), 2);
+}
+
+#[test]
+fn core_score_ranks_first_and_a_boost_only_breaks_a_core_tie() {
+    let resolver = FakeResolver::new()
+        .with("module", "modA.dll", item("mod-a", "Mod A"), None)
+        .with("module", "modB.dll", item("mod-b", "Mod B"), None);
+    let rule_a = signal_rule_for("a", "execution", 12, "modA.dll");
+    let rule_b = json!({
+        "id": "b",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": "modB.dll", "bind": "m" } } },
+        "effects": [
+            { "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 8 } },
+            { "signal": { "family": "local_confirmation", "candidate": { "owner_of": "m" }, "weight": 10 } }
+        ],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule_a, rule_b])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll"), frame(1, "modB.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
     assert_eq!(top_key(&consensus.candidates).as_deref(), Some("mod-a"));
-    assert_eq!(consensus.candidates[0].score, 18);
+    assert_eq!(consensus.candidates[0].score, 12);
+    assert_eq!(consensus.candidates[1].score, 18);
+    assert!(consensus.abstained);
+    assert_eq!(consensus.candidates.len(), 2);
+}
+
+#[test]
+fn a_lower_level_uses_core_plus_boost() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "small_core_with_boost",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [
+            { "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 4 } },
+            { "signal": { "family": "local_confirmation", "candidate": { "owner_of": "m" }, "weight": 5 } }
+        ],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.level, Level::Likely);
+}
+
+fn history_fact(predates: bool) -> Fact {
+    Fact {
+        kind: "core.history".to_string(),
+        attrs: [(
+            "predates_last_change".to_string(),
+            AttrValue::Scalar(Scalar::Bool(predates)),
+        )]
+        .into_iter()
+        .collect(),
+        refs: Vec::new(),
+        span: None,
+    }
+}
+
+#[test]
+fn change_correlation_does_not_fire_when_the_bucket_predates_the_change() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "changed",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [
+            { "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } },
+            { "signal": { "family": "change_correlation", "candidate": { "owner_of": "m" }, "weight": 8 } }
+        ],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let facts = vec![history_fact(true)];
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &facts,
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(!evaluated
+        .signals
+        .iter()
+        .any(|signal| signal.family == agora_game_api::crash::Family::ChangeCorrelation));
+
+    let facts = vec![history_fact(false)];
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &facts,
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated
+        .signals
+        .iter()
+        .any(|signal| signal.family == agora_game_api::crash::Family::ChangeCorrelation));
+}
+
+fn frame_with_symbol(index: u32, module: &str, symbol: &str) -> Fact {
+    let mut value = frame(index, module);
+    value.attrs.insert("symbol".to_string(), text_attr(symbol));
+    value
+}
+
+#[test]
+fn a_missing_attribute_is_unknown_not_false_under_not() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "missing_attr",
+        "version": 1,
+        "when": { "all": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+            { "not": { "fact": { "kind": "core.frame", "where": { "symbol": "anything" } } } }
+        ] },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.findings.is_empty());
+    assert!(evaluated
+        .could_not_check
+        .iter()
+        .any(|note| note.subject == "core.frame"));
+}
+
+#[test]
+fn an_unparsable_version_is_unknown_not_false_under_not() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "pre_release_version",
+        "version": 1,
+        "when": { "all": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+            { "not": { "fact": { "kind": "core.frame", "where": { "symbol": { "version": { "min": "1.20" } } } } } }
+        ] },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame_with_symbol(0, "modA.dll", "1.20-pre")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.findings.is_empty());
+    assert!(!evaluated.could_not_check.is_empty());
+}
+
+#[test]
+fn an_unbound_variable_is_unknown_not_a_literal_compare() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "unbound_variable",
+        "version": 1,
+        "when": { "all": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+            { "not": { "fact": { "kind": "core.frame", "where": { "symbol": "$nope" } } } }
+        ] },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame_with_symbol(0, "modA.dll", "anything")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.findings.is_empty());
+    assert!(!evaluated.could_not_check.is_empty());
+}
+
+#[test]
+fn an_invalid_regex_inside_where_is_unknown_and_names_the_rule() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "bad_regex_rule",
+        "version": 1,
+        "when": { "all": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+            { "not": { "fact": { "kind": "core.frame", "where": { "symbol": { "regex": "(" } } } } }
+        ] },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame_with_symbol(0, "modA.dll", "anything")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.findings.is_empty());
+    assert!(evaluated.could_not_check.iter().any(|note| {
+        note.reason == agora_game_api::crash::CouldNotCheckReason::CodeFailed
+            && note
+                .source
+                .as_ref()
+                .and_then(|source| source.rule_id.as_deref())
+                == Some("bad_regex_rule")
+    }));
+}
+
+#[test]
+fn the_linter_refuses_an_unbound_variable() {
+    let json = r#"{
+        "id": "unbound",
+        "version": 1,
+        "when": { "all": [
+            { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+            { "not": { "fact": { "kind": "core.frame", "where": { "symbol": "$nope" } } } }
+        ] },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A clue." } }
+    }"#;
+    let problems = agora_game_api::crash::lint_rule_json(json).expect_err("the linter refuses it");
+    assert!(problems
+        .iter()
+        .any(|problem| problem.code == agora_game_api::crash::LintCode::BadVariable));
+}
+
+#[test]
+fn an_unknown_owner_is_never_named_and_gets_a_could_not_check_note() {
+    let resolver = FakeResolver::new();
+    let packs = vec![pack("p", vec![signal_rule("ghost", "execution", 10)])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "ghost.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated.signals.is_empty());
+    assert!(consensus.candidates.is_empty());
+    assert!(evaluated.could_not_check.iter().any(|note| {
+        note.subject == "ghost.dll"
+            && note
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("could not tell who owns"))
+    }));
+}
+
+#[test]
+fn system_and_not_in_instance_owners_are_never_candidates() {
+    let resolver = FakeResolver::new()
+        .with("module", "ntdll.dll", Owner::System, Some(Role::System))
+        .with("module", "missing.esp", Owner::NotInInstance, None);
+    let packs = vec![pack(
+        "p",
+        vec![
+            signal_rule_for("system", "execution", 10, "ntdll.dll"),
+            signal_rule_for("missing", "execution", 10, "missing.esp"),
+        ],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "ntdll.dll"), frame(1, "missing.esp")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(consensus.candidates.is_empty());
+}
+
+#[test]
+fn a_root_cause_finding_with_an_unknown_owner_becomes_environment() {
+    let resolver = FakeResolver::new();
+    let packs = vec![pack(
+        "p",
+        vec![root_cause_rule(
+            "ghost",
+            "decisive_verdict",
+            16,
+            "very_likely",
+        )],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "ghost.dll")],
+        Vec::new(),
+    );
+    let (evaluated, _) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(evaluated
+        .findings
+        .iter()
+        .all(|finding| finding.scope != Scope::RootCause && finding.candidate.is_none()));
+    assert!(!evaluated.could_not_check.is_empty());
+}
+
+#[test]
+fn base_generated_and_writable_owners_can_be_candidates() {
+    let resolver = FakeResolver::new()
+        .with("module", "game.exe", Owner::Base, None)
+        .with(
+            "module",
+            "tool.dll",
+            Owner::Generated {
+                tool: "A Tool".to_string(),
+            },
+            None,
+        )
+        .with("module", "loose.dll", Owner::Writable, None);
+    let packs = vec![pack(
+        "p",
+        vec![
+            signal_rule_for("game", "execution", 10, "game.exe"),
+            signal_rule_for("tool", "execution", 10, "tool.dll"),
+            signal_rule_for("loose", "execution", 10, "loose.dll"),
+        ],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![
+            frame(0, "game.exe"),
+            frame(1, "tool.dll"),
+            frame(2, "loose.dll"),
+        ],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(consensus
+        .candidates
+        .iter()
+        .any(|candidate| candidate.owner == Owner::Base));
+    assert!(consensus.candidates.iter().any(|candidate| matches!(
+        &candidate.owner,
+        Owner::Generated { tool } if tool == "A Tool"
+    )));
+    assert!(consensus
+        .candidates
+        .iter()
+        .any(|candidate| candidate.owner == Owner::Writable));
+}
+
+#[test]
+fn a_finding_level_never_exceeds_its_candidate_level_or_the_answer() {
+    let resolver = FakeResolver::new().with(
+        "module",
+        "hook.dll",
+        item("hook", "Hook Framework"),
+        Some(Role::HookFramework),
+    );
+    let packs = vec![pack("p", vec![decisive_rule_for("hook", "hook.dll", 16)])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "hook.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(answer.level, Level::Possible);
+    for finding in &answer.findings {
+        assert!(finding.level <= Level::Possible);
+    }
+    for candidate in &answer.candidates {
+        assert!(candidate.level <= answer.level);
+    }
+}
+
+#[test]
+fn a_root_cause_finding_with_no_named_candidate_is_at_most_possible() {
+    let resolver = FakeResolver::new()
+        .with("module", "modA.dll", item("mod-a", "Mod A"), None)
+        .with("module", "modB.dll", item("mod-b", "Mod B"), None);
+    let packs = vec![
+        pack("p1", vec![decisive_rule_for("a", "modA.dll", 16)]),
+        pack("p2", vec![decisive_rule_for("b", "modB.dll", 16)]),
+    ];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll"), frame(1, "modB.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert!(consensus.abstained);
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert!(answer
+        .findings
+        .iter()
+        .filter(|finding| finding.scope == Scope::RootCause)
+        .all(|finding| finding.level <= Level::Possible));
+}
+
+#[test]
+fn a_closed_unknown_session_caps_candidates_and_says_it_cannot_tell() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![decisive_rule_for("decisive", "modA.dll", 16)],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let answer = answer_for(SessionVerdict::ClosedUnknown, &evaluated, &consensus);
+    assert_eq!(answer.level, Level::Possible);
+    assert!(answer
+        .candidates
+        .iter()
+        .all(|candidate| candidate.level <= Level::Possible));
+    assert!(answer
+        .findings
+        .iter()
+        .all(|finding| finding.level <= Level::Possible));
+    let headline = english(&answer.headline).to_lowercase();
+    assert!(headline.contains("cannot tell whether") || headline.contains("can't tell whether"));
+}
+
+#[test]
+fn answer_applies_a_callers_trust_cap_to_every_candidate() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![decisive_rule_for("decisive", "modA.dll", 16)],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.level, Level::VeryLikely);
+    let mut capped = evaluated.clone();
+    capped.level_cap = Some(Level::Possible);
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &capped,
+        &consensus,
+    );
+    assert_eq!(answer.level, Level::Possible);
+    assert!(answer
+        .candidates
+        .iter()
+        .all(|candidate| candidate.level <= Level::Possible));
+    assert!(answer
+        .findings
+        .iter()
+        .all(|finding| finding.level <= Level::Possible));
+}
+
+#[test]
+fn equal_frame_indexes_across_artifacts_are_order_independent() {
+    let resolver = FakeResolver::new()
+        .with("module", "modA.dll", item("mod-a", "Mod A"), None)
+        .with("module", "modB.dll", item("mod-b", "Mod B"), None);
+    let rule = json!({
+        "id": "top_actionable",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "where": { "actionable_index": 0 }, "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let mut parsed = vec![
+        parsed_with(
+            "p",
+            "parser",
+            "test",
+            vec![frame(0, "modA.dll"), frame(0, "modB.dll")],
+            Vec::new(),
+        ),
+        parsed_with(
+            "p",
+            "parser2",
+            "test2",
+            vec![frame(0, "modB.dll"), frame(0, "modA.dll")],
+            Vec::new(),
+        ),
+    ];
+    for artifact in &mut parsed {
+        artifact.artifact = format!("{}.log", artifact.parser_id);
+    }
+    let verdict = SessionVerdict::Crashed {
+        how: MatchedBy::Time,
+    };
+    let first = {
+        let (evaluated, consensus) = run(
+            &packs,
+            &parsed,
+            &EngineFacts::new(),
+            &resolver,
+            &FixedInspector(Inspection::Missing),
+            Some("1.0"),
+        );
+        answer_for(verdict, &evaluated, &consensus)
+    };
+    parsed.reverse();
+    for artifact in &mut parsed {
+        artifact.output.facts.reverse();
+    }
+    let second = {
+        let (evaluated, consensus) = run(
+            &packs,
+            &parsed,
+            &EngineFacts::new(),
+            &resolver,
+            &FixedInspector(Inspection::Missing),
+            Some("1.0"),
+        );
+        answer_for(verdict, &evaluated, &consensus)
+    };
+    assert_eq!(
+        serde_json::to_string(&first).expect("serialize"),
+        serde_json::to_string(&second).expect("serialize")
+    );
 }

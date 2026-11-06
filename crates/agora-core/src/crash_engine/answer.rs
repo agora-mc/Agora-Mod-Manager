@@ -3,10 +3,10 @@
 
 use super::*;
 use agora_game_api::crash::{
-    CrashAnswer, Finding, Level, LocalText, NextStep, NextStepKind, SessionVerdict,
+    CrashAnswer, Finding, Level, LocalText, NextStep, NextStepKind, Scope, SessionVerdict,
     CRASH_CONTRACT_VERSION,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub struct AnswerInput<'a> {
     pub verdict: SessionVerdict,
@@ -20,34 +20,71 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         SessionVerdict::Normal | SessionVerdict::Stopped
     );
 
-    let mut findings: Vec<Finding> = input.evaluated.findings.clone();
-    if let Some(cap) = input.evaluated.level_cap {
-        for finding in &mut findings {
-            finding.level = finding.level.min(cap);
-        }
-    }
-    if not_a_crash {
-        findings.retain(|finding| finding.candidate.is_none());
-    }
-    let findings = clean_findings(findings);
+    let closed_unknown = input.verdict == SessionVerdict::ClosedUnknown;
+    let trust_cap = input.evaluated.level_cap;
 
     let mut level = if not_a_crash {
         Level::NotSure
     } else {
         input.consensus.level
     };
-    if let Some(cap) = input.evaluated.level_cap {
+    if let Some(cap) = trust_cap {
         level = level.min(cap);
     }
+    if closed_unknown {
+        level = level.min(Level::Possible);
+    }
 
-    let candidates = if not_a_crash {
+    let mut candidates = if not_a_crash {
         Vec::new()
     } else {
         input.consensus.candidates.clone()
     };
+    for candidate in &mut candidates {
+        if let Some(cap) = trust_cap {
+            candidate.level = candidate.level.min(cap);
+        }
+        candidate.level = candidate.level.min(level);
+    }
+    let candidate_levels: BTreeMap<String, Level> = candidates
+        .iter()
+        .map(|candidate| (owner_key(&candidate.owner), candidate.level))
+        .collect();
     let abstained = not_a_crash || input.consensus.abstained;
 
-    let headline = headline(input.verdict, &candidates, level, abstained, not_a_crash);
+    let mut findings: Vec<Finding> = input.evaluated.findings.clone();
+    for finding in &mut findings {
+        let mut cap = Level::VeryLikely;
+        if let Some(trust) = trust_cap {
+            cap = cap.min(trust);
+        }
+        cap = cap.min(level);
+        if let Some(owner) = &finding.candidate {
+            match candidate_levels.get(&owner_key(owner)) {
+                Some(candidate_level) => cap = cap.min(*candidate_level),
+                None => cap = cap.min(Level::Possible),
+            }
+        } else if finding.scope == Scope::RootCause {
+            cap = cap.min(Level::Possible);
+        }
+        if finding.scope == Scope::RootCause && abstained {
+            cap = cap.min(Level::Possible);
+        }
+        finding.level = finding.level.min(cap);
+    }
+    if not_a_crash {
+        findings.retain(|finding| finding.candidate.is_none());
+    }
+    let findings = clean_findings(findings);
+
+    let headline = headline(
+        input.verdict,
+        &candidates,
+        level,
+        abstained,
+        not_a_crash,
+        closed_unknown,
+    );
     let next = next_step(input, not_a_crash, abstained, &candidates);
     let repairs = if not_a_crash {
         Vec::new()
@@ -76,6 +113,7 @@ fn headline(
     level: Level,
     abstained: bool,
     not_a_crash: bool,
+    closed_unknown: bool,
 ) -> LocalText {
     if not_a_crash {
         let text = match verdict {
@@ -83,6 +121,16 @@ fn headline(
             _ => "You stopped the game. There is no crash to explain.",
         };
         return english(text);
+    }
+    if closed_unknown {
+        let base = "The game ended, and Agora cannot tell whether this was a crash.";
+        if candidates.is_empty() {
+            return english(base);
+        }
+        return english(&format!(
+            "{base} {} is possible evidence.",
+            owner_name(&candidates[0].owner)
+        ));
     }
     let subject = match verdict {
         SessionVerdict::FailedToStart => "The game did not start",
