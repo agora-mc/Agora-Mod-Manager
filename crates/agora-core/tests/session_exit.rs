@@ -80,7 +80,18 @@ fn start(exe: &Path, args: &[String]) -> LaunchedGame {
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let (child, job) = process_job::spawn_in_job(&mut command).expect("the crasher starts");
+    // On Linux a just-copied program can briefly read as busy: a sibling test forked while the
+    // copy was open for writing, and its child holds that write handle until it execs.
+    let mut tries = 0;
+    let (child, job) = loop {
+        match process_job::spawn_in_job(&mut command) {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => break result.expect("the crasher starts"),
+        }
+    };
     let mut identity = process_identity::capture(child.id()).expect("its identity");
     identity.job = job;
     LaunchedGame {

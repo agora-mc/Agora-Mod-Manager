@@ -121,13 +121,13 @@ fn write(root: &Path, name: &str, bytes: &[u8]) -> PathBuf {
 
 fn copied(
     root: &Path,
-    session: &CrashSession,
+    _session: &CrashSession,
     collection: &SourceCollection,
     id: &str,
 ) -> CopiedSession {
     EvidenceStore::new(root)
         .copy(id, collection, CopyLimits::default())
-        .unwrap_or_else(|error| panic!("copy failed: {error} (session {})", session.session_id))
+        .expect("the copy works")
 }
 
 #[test]
@@ -415,7 +415,8 @@ fn an_oversized_copy_keeps_head_and_tail_and_says_it_was_cut() {
     assert_eq!(&bytes[10..], &body[80..]);
 }
 
-#[cfg(unix)]
+// Linux only: macOS's file system refuses a name that isn't UTF-8.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_name_is_handled() {
     use std::os::unix::ffi::OsStringExt;
@@ -917,10 +918,11 @@ fn a_folder_of_five_thousand_children_stops_at_the_session_byte_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("reports");
     std::fs::create_dir_all(&folder).unwrap();
-    let eight_mib = 8 * 1024 * 1024u64;
+    // Small sparse-free files: a real 8 MiB each would allocate 40 GB and fill the disk.
+    let child_bytes = 1024u64;
     for index in 0..5_000 {
         let file = std::fs::File::create(folder.join(format!("log-{index}.txt"))).unwrap();
-        file.set_len(eight_mib).unwrap();
+        file.set_len(child_bytes).unwrap();
     }
 
     let session = session_with(around_now(), None, None);
@@ -935,12 +937,12 @@ fn a_folder_of_five_thousand_children_stops_at_the_session_byte_budget() {
     let collection = collect_all(tmp.path(), &[source], &session);
     assert_eq!(collection.bound.len(), 1, "the folder artifact is bound");
 
-    let budget = 32 * 1024 * 1024u64;
+    let budget = 256 * 1024u64;
     let limits = CopyLimits {
         max_total_bytes: budget,
         max_files: 10_000,
         max_entries: 10_000,
-        max_file_bytes: eight_mib,
+        max_file_bytes: child_bytes,
         ..CopyLimits::default()
     };
     let copied = EvidenceStore::new(tmp.path().join("store"))
