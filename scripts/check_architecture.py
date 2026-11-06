@@ -16,7 +16,7 @@ Checks:
 8. Tauri binding name-manifest check runs (typed signatures explicitly waived)
 9. Update checks have one core implementation
 10. Live instance reads use the canonical manifest loader
-11. Game API depends only on serde, semver and thiserror (all dependency sections)
+11. Game API depends only on serde, serde_json, semver, thiserror and regex (all dependency sections)
 12. Core must not reference the future Minecraft package's modules or crate
 """
 
@@ -490,7 +490,9 @@ def resolved_dependency(name: str, specification, workspace: dict) -> tuple[str,
 
 
 def check_game_api_dependencies() -> None:
-    allowed = {"serde", "semver", "thiserror"}
+    # serde_json and regex are for the crash contract: a pack is hand-written JSON, and its linter
+    # compiles rule regexes (MASTER_SPEC §30.11). Both are plain libraries, not a runtime.
+    allowed = {"serde", "serde_json", "semver", "thiserror", "regex"}
     if not GAME_API_CARGO.exists():
         err("agora-game-api Cargo.toml missing")
         return
@@ -507,9 +509,9 @@ def check_game_api_dependencies() -> None:
         if package not in allowed or "path" in details or "git" in details:
             forbidden.append(alias)
     if forbidden:
-        err(f"agora-game-api dependencies must be serde, semver or thiserror only: {sorted(forbidden)}")
+        err(f"agora-game-api dependencies must be serde, serde_json, semver, thiserror or regex only: {sorted(forbidden)}")
     else:
-        print("OK: agora-game-api depends only on serde, semver and thiserror")
+        print("OK: agora-game-api depends only on serde, serde_json, semver, thiserror and regex")
 
 
 def is_game_package(name: str, path: str = "") -> bool:

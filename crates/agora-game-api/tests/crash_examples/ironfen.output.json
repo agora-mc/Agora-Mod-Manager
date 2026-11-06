@@ -1,0 +1,20 @@
+{
+  "contract": 1,
+  "producer": { "format": "ironfen_crash", "version": "3" },
+  "facts": [
+    { "kind": "core.exception", "attrs": { "class": "0x7", "category": "oom" } },
+    { "kind": "core.system", "attrs": { "ram_free_mb": 128, "os": "example" } },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 0, "kind": "managed", "symbol_scheme": "ifscript", "symbol": "gates/open.ifs:spawn" },
+      "refs": [{ "kind": "script", "value": "gates/open.ifs", "strength": "exec_top" }]
+    },
+    {
+      "kind": "ironfen.script_error",
+      "attrs": { "line": 77, "tags": ["gates", "spawn"] },
+      "refs": [{ "kind": "script", "value": "gates/open.ifs", "strength": "exec_top" }]
+    }
+  ],
+  "bucket": [{ "scheme": "ironfen", "value": "7:gates/open.ifs" }],
+  "coverage": [{ "kind": "core.module", "state": "not_applicable" }]
+}

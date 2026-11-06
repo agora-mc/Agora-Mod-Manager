@@ -7,6 +7,8 @@ license.workspace = true
 description = "Game support contract shared by Agora core, compiled packages and community packages."
 
 [dependencies]
+regex = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }

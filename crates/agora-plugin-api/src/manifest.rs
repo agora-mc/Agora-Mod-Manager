@@ -553,6 +553,7 @@ impl PluginManifest {
 
         self.validate_providers()?;
         self.validate_game_packages()?;
+        self.validate_crash_packs()?;
 
         for check in &self.contributions.launch_checks {
             if check.timeout_ms == 0 {
@@ -578,6 +579,23 @@ impl PluginManifest {
         }
         for pkg in &self.contributions.game_packages {
             validate_package_path("game package path", &pkg.path)?;
+        }
+        Ok(())
+    }
+
+    fn validate_crash_packs(&self) -> PluginResult<()> {
+        let has_capability = self
+            .capabilities
+            .required
+            .iter()
+            .any(|n| n == "crash:contribute");
+        if !self.contributions.crash_packs.is_empty() && !has_capability {
+            return Err(PluginError::invalid_manifest(
+                "`crashPacks` requires the `crash:contribute` capability under `capabilities.required`",
+            ));
+        }
+        for pack in &self.contributions.crash_packs {
+            validate_package_path("crash pack path", &pack.path)?;
         }
         Ok(())
     }
@@ -955,6 +973,26 @@ mod tests {
     fn an_unrecognised_activation_event_names_what_was_expected() {
         let err = ActivationEvent::parse("whenever").unwrap_err();
         assert!(err.message.contains("onStartup"), "{}", err.message);
+    }
+
+    #[test]
+    fn crash_packs_require_their_capability_and_stay_in_the_package() {
+        let mut value = minimal_json();
+        value["contributions"] = serde_json::json!({
+            "crashPacks": [{ "path": "crash/pack.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("crash:contribute"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        value["capabilities"] = serde_json::json!({ "required": ["crash:contribute"] });
+        PluginManifest::parse(&value.to_string()).unwrap();
+
+        value["contributions"]["crashPacks"][0]["path"] = serde_json::json!("../outside.json");
+        assert!(PluginManifest::parse(&value.to_string()).is_err());
     }
 
     #[test]
