@@ -23,6 +23,7 @@ pub mod content_thunderstore;
 pub mod crash_diagnostics;
 pub mod crash_evidence;
 pub mod crash_export;
+pub mod crash_packs;
 pub mod crash_service;
 pub mod ctx;
 pub mod data_migration;

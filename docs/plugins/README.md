@@ -170,7 +170,8 @@ have to infer any of them:
     ],
 
     // Crash doctor packs: sources, parsers and rules. Requires `crash:contribute`.
-    // Not yet read by the host; see `crates/agora-game-api/src/crash/`.
+    // Core reads and lints them; script parsers run through the same host and
+    // see only the artifact the call puts in scope.
     "crashPacks": [
       { "path": "crash/pack.json" }
     ]
@@ -209,6 +210,7 @@ View and command calls have a ten-second host deadline. Diagnostic calls use the
 | `on/off` | Event's read capability | Subscribe/unsubscribe to documented events |
 | `net.fetchJson` | `network` | Declared host allowlist, network opt-in, and live lockdown policy |
 | Game packages | `game:define` | Define games: their stores, versions, folders and how to launch them |
+| `crash.readBytes/readLines` | `crash:contribute` | Scoped reads of the artifact in a parser or inspector call: bytes or text, never a path |
 | Crash packs | `crash:contribute` | Read the crash evidence Agora gives them and add rules to its diagnosis; every finding names the plugin |
 
 All service failures reject the promise with a structured error code and message. Treat errors as failures; never display a successful mutation after a rejection. The low-level `call` function exposes the same capability checks, not an escape hatch. There is no shell or arbitrary executable API. Current method definitions are in `agora-core/src/plugins/dispatch.rs`.

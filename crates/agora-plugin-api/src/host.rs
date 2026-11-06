@@ -63,6 +63,45 @@ impl ActivationRequest {
     pub const DEFAULT_STACK_LIMIT: usize = 512 * 1024;
 }
 
+/// What a script may read during one call, and nothing else.
+///
+/// The crash doctor hands a parser one artifact and lets it pull bytes or lines
+/// from that artifact and its children. A generic trait rather than a
+/// crash-specific one because a WebAssembly host will implement it too: bytes
+/// and JSON cross the boundary, never a file handle or a path.
+pub trait ScriptReads: Send + Sync {
+    /// At most `len` bytes from `offset`. A short reply at the end of the file
+    /// is normal, not an error.
+    fn read_bytes(&self, artifact: &str, offset: u64, len: u64)
+        -> Result<Vec<u8>, ScriptReadError>;
+
+    /// Lines decoded as text, as a [`serde_json::Value`] shaped like the crash
+    /// contract's `LinesReply`: `lines`, an optional `next_line`, and `cut`.
+    fn read_lines(
+        &self,
+        artifact: &str,
+        from_line: u64,
+        max_lines: u32,
+    ) -> Result<serde_json::Value, ScriptReadError>;
+}
+
+/// Why a scoped read was refused. `code` is a stable token the script can
+/// branch on; `message` is for the author and the plugin log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptReadError {
+    pub code: String,
+    pub message: String,
+}
+
+impl ScriptReadError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 /// A runtime that can load and run plugin code.
 ///
 /// Implementations must isolate plugins from each other: a plugin that throws,
@@ -92,6 +131,20 @@ pub trait ScriptHost: Send + Sync {
         export: &str,
         args: serde_json::Value,
         timeout: Duration,
+    ) -> PluginResult<serde_json::Value>;
+
+    /// Like [`ScriptHost::invoke`], but the call sees `reads` and nothing else.
+    ///
+    /// The scope lasts exactly as long as this invocation. A script cannot use
+    /// it to reach another artifact, and it cannot keep it after the export
+    /// returns. Same isolation and timeout rules as `invoke`.
+    fn invoke_with_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn ScriptReads>,
     ) -> PluginResult<serde_json::Value>;
 
     /// Deliver an event to a plugin's subscribers.

@@ -90,6 +90,15 @@ const ui = {
   notify: (tone, message) => call("ui.notify", { tone, message }),
 };
 
+// Scoped reads for crash parsers and inspectors. They reach only the artifact
+// the host put in scope for this call, and throw when there is none.
+const crash = {
+  readBytes: (artifactId, offset, len) =>
+    __agora_crash_read_bytes(artifactId, offset, len),
+  readLines: (artifactId, fromLine, maxLines) =>
+    JSON.parse(__agora_crash_read_lines(artifactId, fromLine, maxLines)),
+};
+
 // --- events ---------------------------------------------------------------
 
 const handlers = new Map();
@@ -141,8 +150,8 @@ const apiVersion = __agora_api_version;
 const pluginId = __agora_plugin_id;
 const settings = JSON.parse(__agora_settings);
 
-export { call, log, instances, content, launch, storage, net, ui, on, off, apiVersion, pluginId, settings };
-export default { call, log, instances, content, launch, storage, net, ui, on, off, apiVersion, pluginId, settings };
+export { call, log, instances, content, launch, storage, net, ui, crash, on, off, apiVersion, pluginId, settings };
+export default { call, log, instances, content, launch, storage, net, ui, crash, on, off, apiVersion, pluginId, settings };
 "#;
 
 /// Name plugins import: `import { instances } from "agora"`.
