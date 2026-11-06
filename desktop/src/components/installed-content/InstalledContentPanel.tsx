@@ -1,6 +1,6 @@
 import { DATAPACK_SYNC_EXPLAINER, datapackWorldLabel } from '../../lib/datapackWorlds';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowUpCircle, ChevronDown, ChevronUp, ChevronsUpDown, MoreHorizontal, Search, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpCircle, ChevronDown, ChevronUp, ChevronsUpDown, MoreHorizontal, Search, Trash2 } from 'lucide-react';
 import { Switch } from '../ui/switch';
 import {
   DropdownMenu,
@@ -51,26 +51,39 @@ const titleForType: Record<InstalledContentPanelProps['contentType'], string> = 
   mod: 'Installed Mods', resourcepack: 'Installed Resource Packs', shader: 'Installed Shaders', datapack: 'Installed Data Packs',
 };
 
-function preferenceKey(contentType: InstalledContentPanelProps['contentType']) {
+function storedPreferenceKey(contentType: InstalledContentPanelProps['contentType']) {
   return `agora.installed-content.v2.${contentType}`;
 }
 
-function loadPreferences(contentType: InstalledContentPanelProps['contentType']): { columns: ContentColumn[]; sort: SortState } {
+/** The sort a table header triggers, or null when the column cannot be sorted. */
+function sortColumnFor(column: ContentColumn): SortColumn | null {
+  return column === 'name' || column === 'size' || column === 'installed' || column === 'author'
+    || column === 'source' || column === 'enabled' || column === 'agora_score' || column === 'modrinth_downloads'
+    ? column
+    : null;
+}
+
+function loadPreferences(
+  key: string,
+  availableColumns: ContentColumn[],
+  fallbackColumns: ContentColumn[],
+  fallbackSort: SortState,
+): { columns: ContentColumn[]; sort: SortState } {
   try {
-    const stored = JSON.parse(localStorage.getItem(preferenceKey(contentType)) ?? '{}') as { columns?: ContentColumn[]; sort?: SortState };
-    const columns = stored.columns?.filter((column) => columnLabels[column]) ?? defaultColumns;
+    const stored = JSON.parse(localStorage.getItem(key) ?? '{}') as { columns?: ContentColumn[]; sort?: SortState };
+    const columns = stored.columns?.filter((column) => columnLabels[column] && availableColumns.includes(column)) ?? [];
     const sort = stored.sort?.column && stored.sort.direction !== undefined
       ? stored.sort
-      : { column: 'name' as const, direction: 'asc' as const };
-    return { columns: columns.length > 0 ? columns : defaultColumns, sort };
+      : fallbackSort;
+    return { columns: columns.length > 0 ? columns : fallbackColumns, sort };
   } catch {
-    return { columns: defaultColumns, sort: { column: 'name', direction: 'asc' } };
+    return { columns: fallbackColumns, sort: fallbackSort };
   }
 }
 
-function savePreferences(contentType: InstalledContentPanelProps['contentType'], columns: ContentColumn[], sort: SortState) {
+function savePreferences(key: string, columns: ContentColumn[], sort: SortState) {
   try {
-    localStorage.setItem(preferenceKey(contentType), JSON.stringify({ version: 2, columns, sort }));
+    localStorage.setItem(key, JSON.stringify({ version: 2, columns, sort }));
   } catch {
     // Preferences are best effort in private browsing and restricted webviews.
   }
@@ -154,8 +167,15 @@ function RowActionsMenu({ row, props }: { row: InstalledContentRow; props: Insta
           context. It also closes on outside click and Escape, which a bare
           <details> does not — several could be open at once before. */}
       <DropdownMenuContent align="end" className="w-44">
-        <DropdownMenuItem disabled={!row.resolved_path} onSelect={() => props.onRevealFile?.(row)}>Reveal file</DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => void navigator.clipboard.writeText(row.filename)}>Copy filename</DropdownMenuItem>
+        {props.onRevealFile ? (
+          <DropdownMenuItem
+            disabled={props.canRevealFile ? !props.canRevealFile(row) : !row.resolved_path}
+            onSelect={() => props.onRevealFile?.(row)}
+          >
+            {props.revealLabel ?? 'Reveal file'}
+          </DropdownMenuItem>
+        ) : null}
+        {props.showCopyFilename !== false && row.filename ? <DropdownMenuItem onSelect={() => void navigator.clipboard.writeText(row.filename)}>Copy filename</DropdownMenuItem> : null}
         {props.onTogglePin ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onTogglePin?.(row, !row.update_pinned)}>{row.update_pinned ? 'Unpin updates' : 'Pin updates'}</DropdownMenuItem> : null}
         {props.onExplainPresence ? <DropdownMenuItem onSelect={() => props.onExplainPresence?.(row)}>Why is this here?</DropdownMenuItem> : null}
         {props.onChooseGroup ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onChooseGroup?.([row])}>Set group…</DropdownMenuItem> : null}
@@ -166,16 +186,55 @@ function RowActionsMenu({ row, props }: { row: InstalledContentRow; props: Insta
   );
 }
 
+const defaultFilters: ContentFilters = { categories: [], curation: 'all', source: 'all', enabled: 'all' };
+
 export function InstalledContentPanel(props: InstalledContentPanelProps) {
-  const preferences = useMemo(() => loadPreferences(props.contentType), [props.contentType]);
+  const availableColumns = useMemo(() => props.availableColumns ?? allColumns, [props.availableColumns]);
+  const fallbackColumns = useMemo(() => {
+    const wanted = props.defaultColumns ?? defaultColumns;
+    return wanted.filter((column) => availableColumns.includes(column));
+  }, [props.defaultColumns, availableColumns]);
+  const fallbackSort: SortState = props.loadOrder
+    ? { column: 'load_order', direction: 'asc' }
+    : { column: 'name', direction: 'asc' };
+  const preferenceKey = props.preferencesKey ?? storedPreferenceKey(props.contentType);
+  const sortableColumns = useMemo(() => {
+    const sortable = new Set<SortColumn>();
+    for (const column of availableColumns) {
+      const key = sortColumnFor(column);
+      if (key) sortable.add(key);
+    }
+    if (props.loadOrder) sortable.add('load_order');
+    return sortable;
+  }, [availableColumns, Boolean(props.loadOrder)]);
+  const preferences = useMemo(() => {
+    const loaded = loadPreferences(preferenceKey, availableColumns, fallbackColumns, fallbackSort);
+    return {
+      columns: loaded.columns,
+      sort: sortableColumns.has(loaded.sort.column) ? loaded.sort : fallbackSort,
+    };
+    // fallbackSort is derived from loadOrder and its fields are primitives.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preferenceKey, availableColumns, fallbackColumns, sortableColumns, props.contentType, Boolean(props.loadOrder)]);
+  const features = {
+    categories: true,
+    curation: true,
+    source: true,
+    enabled: true,
+    missingFiles: true,
+    group: true,
+    ...props.availableFilters,
+  };
   const [query, setQuery] = useState('');
-  const [filters, setFilters] = useState<ContentFilters>({ categories: [], curation: 'all', source: 'all', enabled: 'all' });
+  const [filters, setFilters] = useState<ContentFilters>(defaultFilters);
   const [columns, setColumns] = useState<ContentColumn[]>(preferences.columns);
   const [sort, setSort] = useState<SortState>(preferences.sort);
   const [pending, setPending] = useState<Record<string, boolean>>({});
   const [optimisticEnabled, setOptimisticEnabled] = useState<Record<string, boolean>>({});
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [reorderBusy, setReorderBusy] = useState(false);
+  const [draggingKey, setDraggingKey] = useState<string | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updatesByFilename, setUpdatesByFilename] = useState<Record<string, UpdateInfo>>({});
   const [updatesChecked, setUpdatesChecked] = useState(false);
@@ -186,15 +245,15 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
     setColumns(preferences.columns);
     setSort(preferences.sort);
     setQuery('');
-    setFilters({ categories: [], curation: 'all', source: 'all', enabled: 'all' });
+    setFilters(defaultFilters);
     setSelectedKeys(new Set());
     setUpdatesByFilename({});
     setUpdatesChecked(false);
   }, [preferences]);
 
   useEffect(() => {
-    savePreferences(props.contentType, columns, sort);
-  }, [columns, sort, props.contentType]);
+    savePreferences(preferenceKey, columns, sort);
+  }, [columns, sort, preferenceKey]);
 
   useEffect(() => {
     setOptimisticEnabled({});
@@ -212,17 +271,35 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
 
   const rows = useMemo(() => props.rows.map((row) => optimisticEnabled[row.key] === undefined ? row : { ...row, enabled: optimisticEnabled[row.key] }), [props.rows, optimisticEnabled]);
   const available = useMemo(() => deriveAvailableFilters(rows), [rows]);
+  const positionForRow = props.loadOrder?.positionForRow;
   const visibleRows = useMemo(() => sortInstalledContent(
     filterInstalledContent(searchInstalledContent(rows, query), filters),
     sort,
-  ), [rows, query, filters, sort]);
+    positionForRow,
+  ), [rows, query, filters, sort, positionForRow]);
   const groups = useMemo(() => groupInstalledContent(visibleRows, groupBy, props.modGroups ?? {}), [visibleRows, groupBy, props.modGroups]);
   const toggleGroupCollapsed = (key: string) => setCollapsedGroups((current) => {
     const next = new Set(current);
     if (next.has(key)) next.delete(key); else next.add(key);
     return next;
   });
-  const filterCount = filters.categories.length + (filters.curation === 'all' ? 0 : 1) + (filters.source === 'all' ? 0 : 1) + (filters.enabled === 'all' ? 0 : 1);
+  const filterCount =
+    (features.categories ? filters.categories.length : 0)
+    + (features.curation && filters.curation !== 'all' ? 1 : 0)
+    + (features.source && filters.source !== 'all' ? 1 : 0)
+    + (features.enabled && filters.enabled !== 'all' ? 1 : 0);
+  const narrowed = Boolean(normalizeSearchText(query)) || filterCount > 0;
+  // A reorder must always start from the full, true load order. Filtering, searching,
+  // sorting another way or grouping all make the visible row order something else.
+  const reorderUnavailableByView = Boolean(props.loadOrder)
+    && (narrowed || sort.column !== 'load_order' || groupBy !== 'none');
+  const canReorder = Boolean(props.loadOrder) && !reorderUnavailableByView && !props.locked && !bulkBusy && !reorderBusy;
+  const loadOrderBounds = useMemo(() => {
+    if (!positionForRow) return null;
+    const positions = rows.map(positionForRow).filter((position) => Number.isFinite(position));
+    if (positions.length === 0) return null;
+    return { lowest: Math.min(...positions), highest: Math.max(...positions) };
+  }, [rows, positionForRow]);
   // Two tables side by side: the scrolling one holds every column except
   // Actions, and the Actions table sits beside it outside the scroll box. Nothing
   // can slide under Actions, whatever the width or column order. Each row of the
@@ -248,7 +325,11 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
     rowSizeObserver.current.observe(scrollTable);
   });
   useEffect(() => () => rowSizeObserver.current?.disconnect(), []);
-  const contentLabel = titleForType[props.contentType].replace('Installed ', '');
+  const title = props.title ?? titleForType[props.contentType];
+  const contentLabel = props.contentLabel ?? titleForType[props.contentType].replace('Installed ', '');
+  const labelFor = (column: ContentColumn) => props.columnLabels?.[column] ?? columnLabels[column];
+  const description = props.description
+    ?? `Manage installed ${contentLabel.toLowerCase()} without changing their safe removal workflow.`;
   const selectedRows = rows.filter((row) => selectedKeys.has(row.key));
   const visibleSelectedCount = visibleRows.filter((row) => selectedKeys.has(row.key)).length;
   const allVisibleSelected = visibleRows.length > 0 && visibleSelectedCount === visibleRows.length;
@@ -256,7 +337,37 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
   const cycleSort = (column: SortColumn) => {
     if (sort.column !== column || sort.direction === null) setSort({ column, direction: 'asc' });
     else if (sort.direction === 'asc') setSort({ column, direction: 'desc' });
-    else setSort({ column, direction: null });
+    else setSort(props.loadOrder ? { column: 'load_order', direction: 'asc' } : { column, direction: null });
+  };
+
+  const backToLoadOrder = () => {
+    setQuery('');
+    setFilters(defaultFilters);
+    setGroupBy('none');
+    setSort({ column: 'load_order', direction: 'asc' });
+  };
+
+  const moveRow = async (row: InstalledContentRow, position: number) => {
+    if (!props.loadOrder || !canReorder) return;
+    setReorderBusy(true);
+    try {
+      await props.loadOrder.onMove(row, position);
+    } catch (error) {
+      props.onError?.(formatError(error));
+    } finally {
+      setReorderBusy(false);
+    }
+  };
+
+  const dropRow = async (event: React.DragEvent, target: InstalledContentRow) => {
+    if (!props.loadOrder || !canReorder) return;
+    event.preventDefault();
+    const key = draggingKey ?? event.dataTransfer.getData('text/plain');
+    setDraggingKey(null);
+    if (!key || key === target.key) return;
+    const dragged = rows.find((row) => row.key === key);
+    if (!dragged) return;
+    await moveRow(dragged, props.loadOrder.positionForRow(target));
   };
 
   const handleToggle = async (row: InstalledContentRow) => {
@@ -422,7 +533,7 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
     props.onUpdateAll?.(availableUpdates);
   };
 
-  const clearFilters = () => setFilters({ categories: [], curation: 'all', source: 'all', enabled: 'all' });
+  const clearFilters = () => setFilters(defaultFilters);
   const toggleCategory = (category: string) => setFilters((current) => ({
     ...current,
     categories: current.categories.includes(category) ? current.categories.filter((value) => value !== category) : [...current.categories, category],
@@ -437,7 +548,7 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
   };
 
   const renderHeader = (column: ContentColumn) => {
-    const sortColumn = column === 'name' ? 'name' : column === 'size' ? 'size' : column === 'installed' ? 'installed' : column === 'author' ? 'author' : column === 'source' ? 'source' : column === 'enabled' ? 'enabled' : column === 'agora_score' ? 'agora_score' : column === 'modrinth_downloads' ? 'modrinth_downloads' : null;
+    const sortColumn = sortColumnFor(column);
     const active = sortColumn && sort.column === sortColumn && sort.direction;
     return (
       <th key={column} scope="col" aria-sort={sortColumn ? (active === 'asc' ? 'ascending' : active === 'desc' ? 'descending' : 'none') : 'none'} className={`sticky top-0 z-10 px-3 py-2 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap bg-card`}>
@@ -448,9 +559,9 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
             onClick={() => cycleSort(sortColumn)}
             onKeyDown={(event) => onHeaderKeyDown(event, sortColumn)}
           >
-            {columnLabels[column]} <SortIndicator column={sortColumn} sort={sort} />
+            {labelFor(column)} <SortIndicator column={sortColumn} sort={sort} />
           </button>
-        ) : columnLabels[column]}
+        ) : labelFor(column)}
       </th>
     );
   };
@@ -466,12 +577,15 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
       case 'name': {
         const icon = props.iconForRow?.(row) ?? row.icon_url;
         const detailAvailable = Boolean(row.registry_id || row.modrinth_id || row.mod_jar_id);
+        const position = props.loadOrder?.positionForRow(row);
+        const subtitle = props.rowSubtitle ? props.rowSubtitle(row) : row.filename;
         return <td key={column} className="min-w-[280px] max-w-[520px] px-3 py-2">
           <div className="flex items-start gap-2">
+            {position !== undefined ? <span className="mt-0.5 w-7 shrink-0 text-right text-xs tabular-nums text-muted-foreground" data-testid="load-order-number" title={`Load order position ${position}`}>{position}.</span> : null}
             {icon ? <img src={icon} alt="" className="h-8 w-8 shrink-0 rounded-sm border border-border object-cover" /> : null}
             <button type="button" disabled={!detailAvailable} onClick={() => props.onOpenDetails?.(row)} className="min-w-0 text-left disabled:cursor-default enabled:cursor-pointer">
               <span title={row.display_name} className={`block truncate font-medium ${detailAvailable ? 'hover:text-primary' : ''}`}>{row.display_name}</span>
-              <span title={row.filename} className="block truncate text-xs text-muted-foreground">{row.filename}</span>
+              {subtitle ? <span title={subtitle} className="block truncate text-xs text-muted-foreground">{subtitle}</span> : null}
               <span className="mt-1 flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
                 {row.curation_status !== 'unknown' ? <span className="rounded-full bg-primary/10 px-1.5 py-0.5 text-primary">{curationLabel(row.curation_status)}</span> : null}
                 {!row.file_present ? <span className="rounded-full bg-destructive/10 px-1.5 py-0.5 text-destructive">Missing file</span> : null}
@@ -506,7 +620,32 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
       // Rendered ONLY when an update actually exists, so the column stays quiet.
       const rowUpdate = updateForRow(row);
       const rowUpdatable = updateStatusForRow(row) === 'available' && rowUpdate;
+      const position = props.loadOrder?.positionForRow(row);
       return <td key={column} className="px-3 py-2 text-right"><div className="flex items-center justify-end gap-1">
+        {props.loadOrder && position !== undefined && loadOrderBounds ? (
+          <>
+            <button
+              type="button"
+              onClick={() => void moveRow(row, position - 1)}
+              disabled={!canReorder || position <= loadOrderBounds.lowest}
+              className="rounded-sm p-1.5 text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+              title={canReorder ? 'Move up one place (loads earlier)' : 'Reordering is only available in load order.'}
+              aria-label={`Move ${row.display_name} up`}
+            >
+              <ArrowUp className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={() => void moveRow(row, position + 1)}
+              disabled={!canReorder || position >= loadOrderBounds.highest}
+              className="rounded-sm p-1.5 text-muted-foreground hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+              title={canReorder ? 'Move down one place (loads later)' : 'Reordering is only available in load order.'}
+              aria-label={`Move ${row.display_name} down`}
+            >
+              <ArrowDown className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </>
+        ) : null}
         {rowUpdatable ? (
           <button
             type="button"
@@ -552,25 +691,27 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
 
   return <section className="rounded-xl border border-border bg-card p-4" onDragOver={props.onDrop ? (event) => { event.preventDefault(); } : undefined} onDrop={props.onDrop}>
     <div className="mb-4 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-      <div><h3 className="font-semibold text-sm">{titleForType[props.contentType]} ({props.rows.length})</h3><p className="mt-1 text-xs text-muted-foreground">Manage installed {contentLabel.toLowerCase()} without changing their safe removal workflow.</p>{props.contentType === 'datapack' ? <p className="mt-1 max-w-2xl text-xs text-muted-foreground">{DATAPACK_SYNC_EXPLAINER}{props.onSyncWorlds ? <> <button type="button" onClick={props.onSyncWorlds} disabled={props.locked} className="font-medium text-primary hover:underline disabled:opacity-50">Sync now</button></> : null}</p> : null}</div>
-      <div className="flex flex-wrap items-center gap-2">{props.onUpdateAll && availableUpdates.length > 0 ? <div data-testid="update-all-group" className="mr-3 flex items-center border-r border-border pr-5"><button type="button" onClick={handleUpdateAll} disabled={props.locked} className="inline-flex items-center gap-1.5 rounded-lg border border-primary/30 bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-50" title={props.locked ? props.lockedReason ?? `Unlock the instance to update ${contentLabel.toLowerCase()}.` : `Review one plan updating ${availableUpdates.length} ${contentLabel.toLowerCase()}`} aria-label={`Update all ${availableUpdates.length} ${contentLabel.toLowerCase()}`}><ArrowUpCircle className="h-4 w-4" aria-hidden="true" />Update All ({availableUpdates.length})</button></div> : null}<button type="button" onClick={props.onAdd} disabled={props.locked} className="rounded-lg border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50" title={props.locked ? props.lockedReason ?? `Unlock the instance to add ${contentLabel.toLowerCase()}.` : undefined}>{props.locked ? (props.lockedReason ? 'Unavailable' : 'Locked') : props.addLabel}</button>{props.extraActions}</div>
+      <div><h3 className="font-semibold text-sm">{title} ({props.rows.length})</h3><p className="mt-1 text-xs text-muted-foreground">{description}</p>{props.contentType === 'datapack' ? <p className="mt-1 max-w-2xl text-xs text-muted-foreground">{DATAPACK_SYNC_EXPLAINER}{props.onSyncWorlds ? <> <button type="button" onClick={props.onSyncWorlds} disabled={props.locked} className="font-medium text-primary hover:underline disabled:opacity-50">Sync now</button></> : null}</p> : null}</div>
+      <div className="flex flex-wrap items-center gap-2">{props.onUpdateAll && availableUpdates.length > 0 ? <div data-testid="update-all-group" className="mr-3 flex items-center border-r border-border pr-5"><button type="button" onClick={handleUpdateAll} disabled={props.locked} className="inline-flex items-center gap-1.5 rounded-lg border border-primary/30 bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-50" title={props.locked ? props.lockedReason ?? `Unlock the instance to update ${contentLabel.toLowerCase()}.` : `Review one plan updating ${availableUpdates.length} ${contentLabel.toLowerCase()}`} aria-label={`Update all ${availableUpdates.length} ${contentLabel.toLowerCase()}`}><ArrowUpCircle className="h-4 w-4" aria-hidden="true" />Update All ({availableUpdates.length})</button></div> : null}{props.onAdd ? <button type="button" onClick={props.onAdd} disabled={props.locked} className="rounded-lg border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50" title={props.locked ? props.lockedReason ?? `Unlock the instance to add ${contentLabel.toLowerCase()}.` : undefined}>{props.locked ? (props.lockedReason ? 'Unavailable' : 'Locked') : (props.addLabel ?? 'Add')}</button> : null}{props.extraActions}</div>
     </div>
     {props.locked && props.lockedReason ? <p className="mb-3 rounded-lg border border-amber-500/60 bg-amber-500/10 px-3 py-2 text-xs text-foreground" role="status">{props.lockedReason}</p> : null}
+    {props.loadOrder && reorderUnavailableByView ? <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs" role="status" data-testid="reorder-blocked"><span>{narrowed ? 'Reordering is off while the list is searched or filtered.' : 'Reordering is off while the list is sorted another way.'} The numbers still show each item’s load order.</span><button type="button" onClick={backToLoadOrder} className="font-medium text-primary hover:underline">Back to load order</button></div> : null}
     {selectedRows.length > 0 ? <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-primary/20 bg-primary/5 p-2 text-xs"><span className="font-medium">{selectedRows.length} selected</span><button type="button" onClick={() => void handleBulkToggle(true)} disabled={props.locked || bulkBusy} className="rounded-sm border border-input bg-background px-2 py-1 hover:bg-accent disabled:opacity-50">Enable selected</button><button type="button" onClick={() => void handleBulkToggle(false)} disabled={props.locked || bulkBusy} className="rounded-sm border border-input bg-background px-2 py-1 hover:bg-accent disabled:opacity-50">Disable selected</button><button type="button" onClick={handleBulkRemove} disabled={props.locked || bulkBusy} className="rounded-sm border border-destructive/40 bg-background px-2 py-1 text-destructive hover:bg-destructive/10 disabled:opacity-50">Remove selected</button><button type="button" onClick={() => setSelectedKeys(new Set())} className="ml-auto text-primary hover:underline">Clear selection</button></div> : null}
     <div className="flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-center">
       <label className="relative min-w-48 flex-1"><Search className="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search installed content…" aria-label="Search installed content" className="w-full rounded-lg border border-input bg-background py-2 pl-9 pr-3 text-sm" /></label>
       <div className="flex flex-col gap-2 lg:flex-row lg:flex-wrap lg:items-center">
         {props.onCheckUpdates ? <button type="button" onClick={() => void handleCheckUpdates()} disabled={checkingUpdates} className="rounded-lg border border-input bg-background px-3 py-2 text-sm hover:bg-accent disabled:opacity-50">{checkingUpdates ? 'Checking…' : 'Check for updates'}</button> : null}
-        <PopoverDetails label={`Category (${filters.categories.length})`} panelClassName="absolute z-20 mt-1 max-h-64 w-56 overflow-y-auto rounded-lg border border-border bg-card p-2 shadow-lg">{available.categories.length === 0 ? <span className="px-2 text-xs text-muted-foreground">No categories</span> : available.categories.map((category) => <label key={category} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent"><input type="checkbox" checked={filters.categories.includes(category)} onChange={() => toggleCategory(category)} />{category}</label>)}</PopoverDetails>
-        <select value={filters.curation} onChange={(event) => setFilters((current) => ({ ...current, curation: event.target.value }))} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Curation filter"><option value="all">Curation: All</option><option value="curated">Curated</option><option value="under_review">Under review</option><option value="uncurated">Uncurated</option><option value="archived">Archived</option><option value="unknown">Unknown</option></select>
-        <select value={filters.source} onChange={(event) => setFilters((current) => ({ ...current, source: event.target.value }))} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Source filter"><option value="all">Source: All</option>{available.sources.map((source) => <option key={source} value={source}>{source}</option>)}</select>
-        <select value={filters.enabled} onChange={(event) => setFilters((current) => ({ ...current, enabled: event.target.value as ContentFilters['enabled'] }))} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Enabled state filter"><option value="all">State: All</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option><option value="missing">Missing file</option></select><select value={groupBy} onChange={(event) => setGroupBy(event.target.value as GroupMode)} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Group installed content"><option value="none">Group: None</option><option value="pack">Group: Modpack vs Added by You</option><option value="category">Group: Category</option><option value="source">Group: Source</option>{props.modGroups && Object.keys(props.modGroups).length > 0 ? <option value="custom">Group: My groups</option> : null}</select>
-        <PopoverDetails label="Columns" panelClassName="absolute z-20 mt-1 w-56 rounded-lg border border-border bg-card p-2 shadow-lg">{allColumns.map((column) => <label key={column} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent"><input type="checkbox" checked={columnVisible(column)} onChange={() => toggleColumn(column)} />{columnLabels[column]}</label>)}</PopoverDetails>
+        {features.categories ? <PopoverDetails label={`Category (${filters.categories.length})`} panelClassName="absolute z-20 mt-1 max-h-64 w-56 overflow-y-auto rounded-lg border border-border bg-card p-2 shadow-lg">{available.categories.length === 0 ? <span className="px-2 text-xs text-muted-foreground">No categories</span> : available.categories.map((category) => <label key={category} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent"><input type="checkbox" checked={filters.categories.includes(category)} onChange={() => toggleCategory(category)} />{category}</label>)}</PopoverDetails> : null}
+        {features.curation ? <select value={filters.curation} onChange={(event) => setFilters((current) => ({ ...current, curation: event.target.value }))} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Curation filter"><option value="all">Curation: All</option><option value="curated">Curated</option><option value="under_review">Under review</option><option value="uncurated">Uncurated</option><option value="archived">Archived</option><option value="unknown">Unknown</option></select> : null}
+        {features.source ? <select value={filters.source} onChange={(event) => setFilters((current) => ({ ...current, source: event.target.value }))} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Source filter"><option value="all">Source: All</option>{available.sources.map((source) => <option key={source} value={source}>{source}</option>)}</select> : null}
+        {features.enabled ? <select value={filters.enabled} onChange={(event) => setFilters((current) => ({ ...current, enabled: event.target.value as ContentFilters['enabled'] }))} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Enabled state filter"><option value="all">State: All</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option>{features.missingFiles ? <option value="missing">Missing file</option> : null}</select> : null}
+        {features.group ? <select value={groupBy} onChange={(event) => setGroupBy(event.target.value as GroupMode)} className="rounded-lg border border-input bg-background px-3 py-2 text-sm" aria-label="Group installed content"><option value="none">Group: None</option><option value="pack">Group: Modpack vs Added by You</option><option value="category">Group: Category</option><option value="source">Group: Source</option>{props.modGroups && Object.keys(props.modGroups).length > 0 ? <option value="custom">Group: My groups</option> : null}</select> : null}
+        <PopoverDetails label="Columns" panelClassName="absolute z-20 mt-1 w-56 rounded-lg border border-border bg-card p-2 shadow-lg">{availableColumns.map((column) => <label key={column} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent"><input type="checkbox" checked={columnVisible(column)} onChange={() => toggleColumn(column)} />{labelFor(column)}</label>)}</PopoverDetails>
       </div>
     </div>
-    {(filterCount > 0 || query) ? <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">{query ? <span className="rounded-full bg-muted px-2 py-1">Search: {normalizeSearchText(query)} <button type="button" onClick={() => setQuery('')} aria-label="Clear search">×</button></span> : null}{filters.categories.map((category) => <button type="button" key={category} onClick={() => toggleCategory(category)} className="rounded-full bg-primary/10 px-2 py-1 text-primary">Category: {category} ×</button>)}{filters.source !== 'all' ? <button type="button" onClick={() => setFilters((current) => ({ ...current, source: 'all' }))} className="rounded-full bg-primary/10 px-2 py-1 text-primary">Source: {filters.source} ×</button> : null}{filters.curation !== 'all' ? <button type="button" onClick={() => setFilters((current) => ({ ...current, curation: 'all' }))} className="rounded-full bg-primary/10 px-2 py-1 text-primary">Curation: {curationLabel(filters.curation)} ×</button> : null}{filters.enabled !== 'all' ? <button type="button" onClick={() => setFilters((current) => ({ ...current, enabled: 'all' }))} className="rounded-full bg-primary/10 px-2 py-1 text-primary">State: {filters.enabled} ×</button> : null}<button type="button" onClick={clearFilters} className="font-medium text-primary hover:underline">Clear filters</button></div> : null}
+    {(filterCount > 0 || query) ? <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">{query ? <span className="rounded-full bg-muted px-2 py-1">Search: {normalizeSearchText(query)} <button type="button" onClick={() => setQuery('')} aria-label="Clear search">×</button></span> : null}{features.categories ? filters.categories.map((category) => <button type="button" key={category} onClick={() => toggleCategory(category)} className="rounded-full bg-primary/10 px-2 py-1 text-primary">Category: {category} ×</button>) : null}{features.source && filters.source !== 'all' ? <button type="button" onClick={() => setFilters((current) => ({ ...current, source: 'all' }))} className="rounded-full bg-primary/10 px-2 py-1 text-primary">Source: {filters.source} ×</button> : null}{features.curation && filters.curation !== 'all' ? <button type="button" onClick={() => setFilters((current) => ({ ...current, curation: 'all' }))} className="rounded-full bg-primary/10 px-2 py-1 text-primary">Curation: {curationLabel(filters.curation)} ×</button> : null}{features.enabled && filters.enabled !== 'all' ? <button type="button" onClick={() => setFilters((current) => ({ ...current, enabled: 'all' }))} className="rounded-full bg-primary/10 px-2 py-1 text-primary">State: {filters.enabled} ×</button> : null}<button type="button" onClick={clearFilters} className="font-medium text-primary hover:underline">Clear filters</button></div> : null}
     <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground"><span>Showing {visibleRows.length} of {props.rows.length}</span>{filterCount > 0 && !query ? <button type="button" onClick={clearFilters} className="text-primary hover:underline">Clear filters</button> : null}</div>
-    {props.rows.length === 0 ? <p className="mt-4 text-sm text-muted-foreground">No {contentLabel.toLowerCase()} installed.</p> : visibleRows.length === 0 ? <div className="mt-4 rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">No installed content matches your search and filters.<br /><button type="button" onClick={() => { setQuery(''); clearFilters(); }} className="mt-2 font-medium text-primary hover:underline">Clear filters</button></div> : <div className="mt-3 flex items-start"><div className="min-w-0 flex-1 overflow-x-auto"><table ref={scrollTableRef} className="w-full min-w-[800px] border-collapse text-left"><thead><tr className="border-b border-border"><th scope="col" className="sticky top-0 z-10 w-10 bg-card px-3 py-2"><input type="checkbox" checked={allVisibleSelected} onChange={toggleVisibleSelection} disabled={props.locked || visibleRows.length === 0} aria-label={allVisibleSelected ? 'Deselect visible rows' : 'Select visible rows'} /></th>{scrollColumns.map(renderHeader)}</tr></thead>{groups.map((group) => {
+    {props.rows.length === 0 ? (props.emptyState ?? <p className="mt-4 text-sm text-muted-foreground">No {contentLabel.toLowerCase()} installed.</p>) : visibleRows.length === 0 ? <div className="mt-4 rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">No installed content matches your search and filters.<br /><button type="button" onClick={() => { setQuery(''); clearFilters(); }} className="mt-2 font-medium text-primary hover:underline">Clear filters</button></div> : <div className="mt-3 flex items-start"><div className="min-w-0 flex-1 overflow-x-auto"><table ref={scrollTableRef} className="w-full min-w-[800px] border-collapse text-left"><thead><tr className="border-b border-border"><th scope="col" className="sticky top-0 z-10 w-10 bg-card px-3 py-2"><input type="checkbox" checked={allVisibleSelected} onChange={toggleVisibleSelection} disabled={props.locked || visibleRows.length === 0} aria-label={allVisibleSelected ? 'Deselect visible rows' : 'Select visible rows'} /></th>{scrollColumns.map(renderHeader)}</tr></thead>{groups.map((group) => {
       const isCollapsed = collapsedGroups.has(group.key);
       const anyDisabled = group.rows.some((row) => !row.enabled);
       return <tbody key={group.key}>
@@ -587,7 +728,29 @@ export function InstalledContentPanel(props: InstalledContentPanelProps) {
             </div>
           </td>
         </tr> : null}
-        {isCollapsed ? null : group.rows.map((row) => <tr key={row.key} className={`border-b border-border last:border-0 ${!row.enabled ? 'opacity-65' : ''}`}><td className="w-10 px-3 py-2"><input type="checkbox" checked={selectedKeys.has(row.key)} onChange={() => toggleSelected(row.key)} disabled={props.locked || row.file_state === 'untracked'} aria-label={`Select ${row.display_name}`} /></td>{scrollColumns.map((column) => renderCell(row, column))}</tr>)}
+        {isCollapsed ? null : group.rows.map((row) => <tr
+          key={row.key}
+          className={`border-b border-border last:border-0 ${!row.enabled ? 'opacity-65' : ''} ${draggingKey === row.key ? 'opacity-50' : ''}`}
+          draggable={canReorder}
+          onDragStart={props.loadOrder ? (event) => {
+            setDraggingKey(row.key);
+            event.dataTransfer.effectAllowed = 'move';
+            event.dataTransfer.setData('text/plain', row.key);
+          } : undefined}
+          onDragOver={props.loadOrder ? (event) => {
+            if (canReorder && draggingKey && draggingKey !== row.key) {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = 'move';
+            }
+          } : undefined}
+          onDrop={props.loadOrder ? (event) => {
+            event.stopPropagation();
+            void dropRow(event, row);
+          } : undefined}
+          onDragEnd={props.loadOrder ? () => setDraggingKey(null) : undefined}
+          data-testid={props.rowTestId}
+          data-load-order={props.loadOrder ? props.loadOrder.positionForRow(row) : undefined}
+        ><td className="w-10 px-3 py-2"><input type="checkbox" checked={selectedKeys.has(row.key)} onChange={() => toggleSelected(row.key)} disabled={props.locked || row.file_state === 'untracked'} aria-label={`Select ${row.display_name}`} /></td>{scrollColumns.map((column) => renderCell(row, column))}</tr>)}
       </tbody>;
     })}</table></div>{showActions ? <div className="shrink-0 pl-2"><table ref={actionsTableRef} className="border-collapse text-left"><thead><tr className="border-b border-border"><th scope="col" className="bg-card px-3 py-2 text-left text-xs font-semibold text-muted-foreground whitespace-nowrap">{columnLabels.actions}</th></tr></thead>{groups.map((group) => {
       const isCollapsed = collapsedGroups.has(group.key);

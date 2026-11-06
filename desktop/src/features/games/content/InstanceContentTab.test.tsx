@@ -145,20 +145,53 @@ describe('InstanceContentTab', () => {
     expect(within(rows[0]).getByText('Odin Patch')).toBeInTheDocument();
     expect(within(rows[0]).getByText('Archive: odin.zip')).toBeInTheDocument();
     expect(within(rows[0]).getByText('Installs into the Data folder')).toBeInTheDocument();
-    expect(within(rows[1]).getByText('Off')).toBeInTheDocument();
+    expect(within(rows[1]).getAllByText('Disabled').length).toBeGreaterThan(0);
     expect(within(rows[1]).getByText('Installs textures into the game folder')).toBeInTheDocument();
   });
 
   it('moves an item one place toward the top of the load order when asked to move it up', async () => {
     mountTab();
-    const rows = await screen.findAllByTestId('instance-content-row');
+    await screen.findAllByTestId('instance-content-row');
     replies.games_instance_content_move = () => null;
-    fireEvent.click(within(rows[0]).getByRole('button', { name: 'Move Odin Patch up (loads later)' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Move Texture Pack up' }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_instance_content_move', {
       instanceId: 'inst-1',
-      itemId: 'aaaa1111',
-      position: 2,
+      itemId: 'bbbb2222',
+      position: 1,
     }));
+  });
+
+  it('uses the shared content panel with only the columns and wording a game can fill', async () => {
+    mountTab();
+    await screen.findAllByTestId('instance-content-row');
+
+    expect(screen.getByRole('heading', { name: 'Content (2)' })).toBeInTheDocument();
+    expect(screen.queryByText('Installed Mods')).toBeNull();
+    expect(screen.queryByText('Modrinth downloads')).toBeNull();
+    expect(screen.queryByText('Loader mod ID')).toBeNull();
+    expect(screen.queryByLabelText('Curation filter')).toBeNull();
+    expect(screen.queryByLabelText('Group installed content')).toBeNull();
+    expect(screen.queryByText(/Group: Modpack/)).toBeNull();
+    expect(screen.getAllByTestId('load-order-number').map((element) => element.textContent)).toEqual(['1.', '2.']);
+    expect(screen.getByRole('button', { name: 'Move Texture Pack up' })).toBeInTheDocument();
+  });
+
+  it('shows a failed reorder’s error and leaves the list in its true order', async () => {
+    mountTab();
+    await screen.findAllByTestId('instance-content-row');
+    replies.games_instance_content_move = () => Promise.reject({
+      code: 'core_failed',
+      message: 'Layer file is damaged.',
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move Texture Pack up' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Could not move Texture Pack. Layer file is damaged.');
+    const rows = screen.getAllByTestId('instance-content-row');
+    expect(rows[0]).toHaveTextContent('Odin Patch');
+    expect(rows[1]).toHaveTextContent('Texture Pack');
+    expect(screen.getAllByTestId('load-order-number').map((element) => element.textContent)).toEqual(['1.', '2.']);
   });
 
   it('shows an empty state with a next step when the instance has no content', async () => {
@@ -182,7 +215,7 @@ describe('InstanceContentTab', () => {
   it('offers only library items the instance does not already have', async () => {
     mountTab();
     await screen.findAllByTestId('instance-content-row');
-    const options = Array.from(screen.getByRole('combobox').querySelectorAll('option')).map((o) => o.textContent);
+    const options = Array.from(screen.getByLabelText<HTMLSelectElement>('Choose an item to add').querySelectorAll('option')).map((o) => o.textContent);
     expect(options).toEqual(['Choose an item…', 'Sky Mod']);
   });
 
@@ -209,7 +242,7 @@ describe('InstanceContentTab', () => {
     });
     mountTab();
     await screen.findAllByTestId('instance-content-row');
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'cccc3333' } });
+    fireEvent.change(screen.getByLabelText('Choose an item to add'), { target: { value: 'cccc3333' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add to instance' }));
     expect(await screen.findByTestId('fomod-wizard')).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('games_instance_content_add', {
