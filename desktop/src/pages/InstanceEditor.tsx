@@ -2177,15 +2177,15 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 </InstanceTileButton>
               )}
               <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <h2 className="text-2xl font-bold">{row?.name}</h2>
+                <div>
+                  <h2 className="inline text-2xl font-bold">{row?.name}</h2>
                   <button
                     type="button"
                     onClick={handleRename}
                     disabled={recoveryBlocked}
                     aria-label="Rename"
                     title="Rename"
-                    className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                    className="ml-1.5 inline-flex rounded-md p-1 align-middle text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <Pencil className="h-4 w-4" aria-hidden="true" />
                   </button>
