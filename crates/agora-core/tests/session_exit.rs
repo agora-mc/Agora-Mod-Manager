@@ -259,9 +259,12 @@ fn skse_shape(game_args: &[&str], watch_dir_is_game_dir: bool) -> SessionExitRep
     } else {
         elsewhere.path().to_path_buf()
     };
+    // The game is already in the job when the watch starts, so its first poll holds it; the
+    // watch's later polls may be seconds apart under load, and a game that comes and goes between
+    // two of them would otherwise be missed.
+    rig.wait_for("game_ready");
     let handle = watch(&dir, &["game"], launched);
 
-    rig.wait_for("game_ready");
     // The loader has done its work and goes; the game keeps running.
     rig.raise("loader_go");
     std::thread::sleep(Duration::from_millis(700));
