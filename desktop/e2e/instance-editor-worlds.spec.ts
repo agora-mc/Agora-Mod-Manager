@@ -128,7 +128,7 @@ async function openWorldsTab(page: Page) {
   });
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Test Instance' })).toBeVisible();
-  await page.getByRole('button', { name: 'Worlds & Servers' }).click();
+  await page.getByRole('button', { name: 'Worlds' }).click();
   await expect(page.getByRole('heading', { name: 'Worlds', exact: true })).toBeVisible();
 }
 
@@ -180,6 +180,7 @@ test('Rename asks for a name and keeps the folder', async ({ page }) => {
 test('per-instance window size is saved from Java & Args', async ({ page }) => {
   await installWorldsMock(page);
   await openWorldsTab(page);
+  await page.getByRole('button', { name: 'Java & Logs' }).click();
   await page.getByRole('button', { name: 'Java & Args' }).click();
   await page.getByRole('radio', { name: 'Fixed size' }).check();
   await page.getByRole('button', { name: '1600×900' }).click();
@@ -213,6 +214,7 @@ test('sharing switches send both choices', async ({ page }) => {
 test('launch commands and environment variables are saved', async ({ page }) => {
   await installWorldsMock(page);
   await openWorldsTab(page);
+  await page.getByRole('button', { name: 'Java & Logs' }).click();
   await page.getByRole('button', { name: 'Java & Args' }).click();
   await page.getByLabel('Pre-launch command').fill('python sync.py');
   await page.getByLabel('Environment variables').fill('FOO=bar\nEMPTY=');
@@ -225,6 +227,7 @@ test('launch commands and environment variables are saved', async ({ page }) => 
 test('notes are saved from the Notes tab', async ({ page }) => {
   await installWorldsMock(page);
   await openWorldsTab(page);
+  await page.getByRole('button', { name: 'Screenshots & Notes' }).click();
   await page.getByRole('button', { name: 'Notes', exact: true }).click();
   await page.getByLabel('Instance notes').fill('Seed 1234');
   await page.getByRole('button', { name: 'Save notes' }).click();
@@ -234,6 +237,7 @@ test('notes are saved from the Notes tab', async ({ page }) => {
 test('screenshots render and open in a viewer', async ({ page }) => {
   await installWorldsMock(page);
   await openWorldsTab(page);
+  await page.getByRole('button', { name: 'Screenshots & Notes' }).click();
   await page.getByRole('button', { name: 'Screenshots', exact: true }).click();
   const shot = page.getByTestId('screenshot');
   await expect(shot.getByText('castle.png')).toBeVisible();

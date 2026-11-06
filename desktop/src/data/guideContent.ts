@@ -504,12 +504,12 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           callout: {
             tone: 'tip',
             title: 'You can always go back',
-            text: 'Agora saves a restore point right before it installs. If you do not like the result, select Roll Back on the result screen, or restore it later from the instance\'s Snapshots tab.',
+            text: 'Agora saves a restore point right before it installs. If you do not like the result, select Roll Back on the result screen, or restore it later from Snapshots, under Backups & Versions.',
           },
         },
         {
           title: 'Remove safely',
-          body: 'We recommend removing mods with Remove on the Mods tab rather than deleting the file yourself. That way Agora can tell you if another mod needs it, and you can undo the removal later.',
+          body: 'We recommend removing mods with Remove on the Mods page under Content rather than deleting the file yourself. That way Agora can tell you if another mod needs it, and you can undo the removal later.',
           callout: {
             tone: 'warning',
             title: 'Dependents may stop loading',
@@ -518,7 +518,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Check for updates',
-          body: 'On My Instances, select Edit on the instance, open its Mods tab, and select Check for updates. Resource Packs, Shaders and Data Packs have the same button. Update one item from its row, or use Update All to review every update in that tab at once.',
+          body: 'On My Instances, select Edit on the instance, open Content, choose Mods, and select Check for updates. Resource Packs, Shaders and Data Packs are the other Content pages and have the same button. Update one item from its row, or use Update All to review every update on that page at once.',
           bullets: [
             'A locked instance cannot be updated until you unlock it.',
             'A newer version of one mod can still clash with your others, so it is worth launching once after updating.',
@@ -597,7 +597,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Use the content tabs',
-          body: 'Open My Instances, select Edit, then choose Mods, Resource Packs, Shaders, or Data Packs. Each list shows the installed file and available actions for that content type.',
+          body: 'Open My Instances, select Edit, then open Content and choose Mods, Resource Packs, Shaders, or Data Packs. Each list shows the installed file and available actions for that content type.',
           bullets: [
             'View Details returns to the project page when Agora can resolve the source.',
             'Disable keeps a mod file available but prevents it from loading.',
@@ -838,7 +838,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           callout: {
             tone: 'tip',
             title: 'Changing the loader version yourself',
-            text: 'You can change the loader version any time with the Change loader version button next to the loader name in the instance editor. When an install needs a different loader version, the review screen offers the same choice, or lets you skip the mods that do not fit.',
+            text: 'You can change the loader version any time by clicking the loader name beside the instance title in the instance editor. Its tooltip also says Change loader version. When an install needs a different loader version, the review screen offers the same choice, or lets you skip the mods that do not fit.',
           },
         },
         {
@@ -1033,7 +1033,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Recover instead of investigate',
-          body: 'If you need to play immediately, restore the last setup that launched fine (Last Known Good) from Home or the Snapshots tab. Use Restore All & Close in Crash Doctor to undo its test changes.',
+          body: 'If you need to play immediately, restore the last setup that launched fine (Last Known Good) from Home or Snapshots, under Backups & Versions. Use Restore All & Close in Crash Doctor to undo its test changes.',
           callout: {
             tone: 'tip',
             title: 'Keep the crash report',
@@ -1100,7 +1100,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Create a loadout profile',
-          body: 'Open Loadout Profiles, give the profile a name, and save it. It remembers which mods, resource packs, shader packs, data packs and worlds are switched on or off right now. Applying it later switches everything back to match.',
+          body: 'Open Backups & Versions, choose Loadout Profiles, give the profile a name, and save it. It remembers which mods, resource packs, shader packs, data packs and worlds are switched on or off right now. Applying it later switches everything back to match.',
           bullets: [
             'If you have added a mod since saving the profile, Agora asks whether to keep it on or switch it off when you apply.',
             'After adding or removing mods, use Update from setup on the profile to save the instance as it is now. Agora shows you what will change first.',
@@ -1165,7 +1165,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Import a pack',
-          body: 'On My Instances, click Import pack file at the top and pick a .mrpack or an Agora pack file. (In an instance\'s editor, the "Import pack as new instance" button at the top does the same, and the Other launchers & files tab has "Select File & Import" for a .mrpack or Prism .zip.) Either kind of pack opens a review before anything is created: the new instance\'s name, every file with where it comes from (a Modrinth or other download, or a copy inside the pack), what is left out, and anything that would stop the import.',
+          body: 'On My Instances, click Import pack file at the top and pick a .mrpack or an Agora pack file. (In an instance\'s editor, the "Import pack as new instance" item in the More menu does the same, and the Import & Export page has "Select File & Import" for a .mrpack or Prism .zip.) Either kind of pack opens a review before anything is created: the new instance\'s name, every file with where it comes from (a Modrinth or other download, or a copy inside the pack), what is left out, and anything that would stop the import.',
           steps: [
             'Choose a pack file from someone you trust.',
             'In the review, check the instance name. If one with that name already exists, Agora suggests a numbered copy such as "Name (2)"; edit it if you like. The existing instance is never overwritten.',
@@ -1297,7 +1297,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Use a different Java for one instance',
-          body: 'Settings decides which Java Agora uses everywhere. To use a different one for a single instance, pick it on that instance\'s Java & Args tab. When you are done testing, clear it again so Agora goes back to choosing a suitable Java for you.',
+          body: 'Settings decides which Java Agora uses everywhere. To use a different one for a single instance, pick it under Java & Logs, on the Java & Args page. When you are done testing, clear it again so Agora goes back to choosing a suitable Java for you.',
         },
         {
           title: 'Trying the performance options',

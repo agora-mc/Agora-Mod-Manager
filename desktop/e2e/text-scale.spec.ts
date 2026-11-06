@@ -673,6 +673,7 @@ for (const [label, preferences] of [['Civic Gold (dark)', {}], ['light', LIGHT_T
 
 test('export feedback reaches a user who exported from a scrolled page', async ({ page }) => {
   await bootEditor(page, 1280, 700, 1);
+  await page.getByRole('button', { name: 'Import & Export' }).click();
   await page.getByRole('button', { name: 'Export', exact: true }).click();
   await page.locator('main').evaluate((main) => {
     main.style.paddingBottom = '1500px';

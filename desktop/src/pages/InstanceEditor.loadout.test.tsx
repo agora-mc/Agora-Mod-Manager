@@ -82,6 +82,7 @@ beforeEach(() => {
 
 async function openLoadoutTab() {
   render(<PackInstallProvider><InstanceEditor instanceId="alpha" onBack={() => undefined} /></PackInstallProvider>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Backups & Versions' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Loadout Profiles' }));
   await screen.findByRole('button', { name: 'Create Profile' });
 }

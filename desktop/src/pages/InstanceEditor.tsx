@@ -160,8 +160,15 @@ import {
 } from '@/components/ui/dialog';
 import { formatInstalledDate } from '../components/installed-content/contentTableState';
 import { InstanceIcon, LoaderChip, MetaChip } from '../components/InstanceIcon';
-import { Play } from 'lucide-react';
-import { InstanceTileButton, SetImageButton } from '@/components/instance-kit';
+import { ChevronDown, FolderOpen, Lock, Pencil, Play, Unlock } from 'lucide-react';
+import { InstanceTileButton } from '@/components/instance-kit';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { showToast } from '../components/Toast';
 import { describeExternalChange, useExternalInstanceChanges } from '../lib/externalChanges';
 
@@ -305,6 +312,60 @@ function wrapperCommandOf(detail: InstanceDetail): string {
 /** What the Lock control does, shown as a tooltip on Lock, Unlock and the status. */
 const LOCK_HELP = 'Locking stops mod changes (installing, updating, removing, or turning mods on and off) until you unlock. Launching still works. Locking also takes a lock snapshot, which Revert returns to.';
 
+type EditorTabId =
+  | 'mods'
+  | 'resourcepacks'
+  | 'shaders'
+  | 'datapacks'
+  | 'worlds'
+  | 'screenshots'
+  | 'notes'
+  | 'snapshots'
+  | 'loadout-profiles'
+  | 'templates'
+  | 'migrate'
+  | 'import'
+  | 'export'
+  | 'console'
+  | 'java-args';
+
+type TopTabId =
+  | 'content'
+  | 'worlds'
+  | 'screenshots-notes'
+  | 'backups-versions'
+  | 'import-export'
+  | 'java-logs';
+
+/** The six top tabs, in order, and the panel each one contains. */
+const TAB_LAYOUT: readonly { id: TopTabId; label: string; tabs: readonly EditorTabId[] }[] = [
+  { id: 'content', label: 'Content', tabs: ['mods', 'resourcepacks', 'shaders', 'datapacks'] },
+  { id: 'worlds', label: 'Worlds', tabs: ['worlds'] },
+  { id: 'screenshots-notes', label: 'Screenshots & Notes', tabs: ['screenshots', 'notes'] },
+  { id: 'backups-versions', label: 'Backups & Versions', tabs: ['snapshots', 'loadout-profiles', 'templates', 'migrate'] },
+  { id: 'import-export', label: 'Import & Export', tabs: ['import', 'export'] },
+  { id: 'java-logs', label: 'Java & Logs', tabs: ['java-args', 'console'] },
+];
+
+/** Every panel keeps its own id; this only says which top tab owns it. */
+const TOP_TAB_OF: Record<EditorTabId, TopTabId> = {
+  mods: 'content',
+  resourcepacks: 'content',
+  shaders: 'content',
+  datapacks: 'content',
+  worlds: 'worlds',
+  screenshots: 'screenshots-notes',
+  notes: 'screenshots-notes',
+  snapshots: 'backups-versions',
+  'loadout-profiles': 'backups-versions',
+  templates: 'backups-versions',
+  migrate: 'backups-versions',
+  import: 'import-export',
+  export: 'import-export',
+  'java-args': 'java-logs',
+  console: 'java-logs',
+};
+
 function countOf(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }
@@ -379,8 +440,17 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   const { getTaskForInstance, revision: packInstallRevision, startPackFile, startPlan } = usePackInstall();
   const { confirm, prompt } = useConfirm();
 
-  // Sub-sidebar active tab
-  const [activeTab, setActiveTab] = useState<'mods' | 'resourcepacks' | 'shaders' | 'datapacks' | 'worlds' | 'screenshots' | 'notes' | 'snapshots' | 'loadout-profiles' | 'templates' | 'migrate' | 'import' | 'export' | 'console' | 'java-args'>(() => (takeRequestedEditorTab() === 'console' ? 'console' : 'mods'));
+  // Sub-sidebar active tab. The top tabs only group these; the panels below
+  // still switch on this id, so every existing way of opening one keeps working.
+  const [activeTab, setActiveTab] = useState<EditorTabId>(() => (takeRequestedEditorTab() === 'console' ? 'console' : 'mods'));
+  // The sub-tab last chosen inside each top tab, so returning to that top tab
+  // lands where the user left it instead of always at the first panel.
+  const [lastSubTab, setLastSubTab] = useState<Partial<Record<TopTabId, EditorTabId>>>({});
+
+  useEffect(() => {
+    const top = TOP_TAB_OF[activeTab];
+    setLastSubTab((current) => (current[top] === activeTab ? current : { ...current, [top]: activeTab }));
+  }, [activeTab]);
 
   // Snapshots state (Phase 6)
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
@@ -1787,6 +1857,30 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     packGaps: detail ? detail.pack_gaps.length : null,
     busy: operationHeld,
   }) : null;
+  const tabLabel = (tab: EditorTabId): string => {
+    switch (tab) {
+      case 'mods': return `Mods (${mods.length})`;
+      case 'resourcepacks': return `Resource Packs (${manifest?.resourcepacks?.length ?? 0})`;
+      case 'shaders': return `Shaders (${manifest?.shaders?.length ?? 0})`;
+      case 'datapacks': return `Data Packs (${manifest?.datapacks?.length ?? 0})`;
+      case 'worlds': return 'Worlds & Servers';
+      case 'screenshots': return 'Screenshots';
+      case 'notes': return 'Notes';
+      case 'snapshots': return 'Snapshots';
+      case 'loadout-profiles': return 'Loadout Profiles';
+      case 'templates': return 'Templates';
+      case 'migrate': return 'Version Move';
+      case 'import': return 'Other launchers & files';
+      case 'export': return 'Export';
+      case 'java-args': return 'Java & Args';
+      case 'console': return 'Console';
+    }
+  };
+  const activeTopTab = TAB_LAYOUT.find((top) => top.id === TOP_TAB_OF[activeTab]) ?? TAB_LAYOUT[0];
+  const openTopTab = (top: (typeof TAB_LAYOUT)[number]) => {
+    const remembered = lastSubTab[top.id];
+    setActiveTab(remembered && top.tabs.includes(remembered) ? remembered : top.tabs[0]);
+  };
 
   useEffect(() => {
     if (packInstall?.status === 'failed' && packInstall.error) {
@@ -2083,190 +2177,191 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 </InstanceTileButton>
               )}
               <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-3">
-                <h2 className="text-2xl font-bold">
-                  {row?.name}
-                  {' '}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <h2 className="text-2xl font-bold">{row?.name}</h2>
                   <button
+                    type="button"
                     onClick={handleRename}
                     disabled={recoveryBlocked}
-                    className="text-xs text-muted-foreground hover:text-foreground underline"
+                    aria-label="Rename"
+                    title="Rename"
+                    className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Rename
-                  </button>
-                </h2>
-
-              </div>
-              <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                {manifest?.loader && (
-                  <LoaderChip loader={manifest.loader} loaderVersion={manifest.loader_version} />
-                )}
-                <MetaChip>MC {row?.minecraft_version}</MetaChip>
-              </div>
-              {manifest?.loader && manifest.loader !== 'vanilla' && (
-                <p className="text-xs text-muted-foreground mt-1.5">
-                  <button
-                    type="button"
-                    onClick={openLoaderChooser}
-                    disabled={recoveryBlocked || Boolean(row?.is_locked)}
-                    className="underline text-primary hover:text-primary/80 disabled:cursor-not-allowed disabled:opacity-50"
-                    title={recoveryBlocked
-                      ? mutationBlockReason ?? undefined
-                      : row?.is_locked
-                        ? 'Unlock the instance to change the loader version.'
-                        : 'Change the loader version for this instance.'}
-                  >
-                    Change loader version
-                  </button>
-                </p>
-              )}
-              {healthReport && healthIssueCount > 0 && (
-                <div
-                  className={`mt-3 flex max-w-md items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs ${
-                    healthBlocked
-                      ? 'border-destructive/60 bg-destructive/10'
-                      : 'border-amber-500/60 bg-amber-500/10'
-                  }`}
-                  role="alert"
-                  aria-label={healthHeadline(counts)}
-                >
-                  <div className="min-w-0">
-                    <p className={healthBlocked ? 'font-medium text-destructive' : 'font-medium text-amber-700 dark:text-amber-300'}>
-                      {healthHeadline(counts)}
-                    </p>
-                    <p className="truncate text-muted-foreground">
-                      {healthLaunchNote(counts)}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => onReviewHealth?.(instanceId, row?.name ?? 'Instance', healthReport)}
-                    className="shrink-0 rounded-sm border border-current/30 px-2 py-1 font-medium hover:bg-background/40"
-                  >
-                    Review & repair
+                    <Pencil className="h-4 w-4" aria-hidden="true" />
                   </button>
                 </div>
-              )}
-              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <span title={LOCK_HELP}>{row?.is_locked ? '🔒 Locked' : '🔓 Unlocked'}</span>
-                {row?.is_locked ? (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  {manifest?.loader && manifest.loader !== 'vanilla' ? (
+                    <button
+                      type="button"
+                      onClick={openLoaderChooser}
+                      disabled={recoveryBlocked || Boolean(row?.is_locked)}
+                      aria-label="Change loader version"
+                      className="rounded-full focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                      title={recoveryBlocked
+                        ? mutationBlockReason ?? undefined
+                        : row?.is_locked
+                          ? 'Unlock the instance to change the loader version.'
+                          : 'Change the loader version for this instance.'}
+                    >
+                      <LoaderChip loader={manifest.loader} loaderVersion={manifest.loader_version} />
+                    </button>
+                  ) : manifest?.loader ? (
+                    <LoaderChip loader={manifest.loader} loaderVersion={manifest.loader_version} />
+                  ) : null}
+                  <MetaChip>MC {row?.minecraft_version}</MetaChip>
                   <button
-                    onClick={handleUnlock}
+                    type="button"
+                    onClick={row?.is_locked ? handleUnlock : handleLock}
                     disabled={recoveryBlocked}
+                    aria-label={LOCK_HELP}
                     title={LOCK_HELP}
-                    className="rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
+                    className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Unlock
+                    {row?.is_locked
+                      ? <Lock className="h-4 w-4" aria-hidden="true" />
+                      : <Unlock className="h-4 w-4" aria-hidden="true" />}
                   </button>
-                ) : (
-                  <>
-                    <button
-                      onClick={handleLock}
-                      disabled={recoveryBlocked}
-                      title={LOCK_HELP}
-                      className="rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
-                    >
-                      Lock
-                    </button>
-                    <button
-                      onClick={handleRevert}
-                      disabled={recoveryBlocked}
-                      title="Go back to the lock snapshot: mods and config changed since the instance was last locked are put back. You can undo this from Snapshots."
-                      className="rounded-lg border border-input bg-background px-2.5 py-1 text-xs font-medium hover:bg-accent"
-                    >
-                      Revert
-                    </button>
-                  </>
-                )}
-                {row?.last_launched_at && (
-                  <span className="ml-2">· Last launched {formatInstalledDate(row.last_launched_at)}</span>
-                )}
-                {formatPlayTime(row?.total_play_ms) && (
-                  <span className="ml-2" title="Time in game across launches Agora ran itself">
-                    · {formatPlayTime(row?.total_play_ms)} played
-                  </span>
-                )}
-                {!row?.is_locked && <SetImageButton onSelect={handleSetInstanceIcon} disabled={recoveryBlocked} />}
                 </div>
+                {healthReport && healthIssueCount > 0 && (
+                  <div
+                    className={`mt-3 flex max-w-md items-center justify-between gap-3 rounded-lg border px-3 py-2 text-xs ${
+                      healthBlocked
+                        ? 'border-destructive/60 bg-destructive/10'
+                        : 'border-amber-500/60 bg-amber-500/10'
+                    }`}
+                    role="alert"
+                    aria-label={healthHeadline(counts)}
+                  >
+                    <div className="min-w-0">
+                      <p className={healthBlocked ? 'font-medium text-destructive' : 'font-medium text-amber-700 dark:text-amber-300'}>
+                        {healthHeadline(counts)}
+                      </p>
+                      <p className="truncate text-muted-foreground">
+                        {healthLaunchNote(counts)}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onReviewHealth?.(instanceId, row?.name ?? 'Instance', healthReport)}
+                      className="shrink-0 rounded-sm border border-current/30 px-2 py-1 font-medium hover:bg-background/40"
+                    >
+                      Review & repair
+                    </button>
+                  </div>
+                )}
+                {(row?.last_launched_at || formatPlayTime(row?.total_play_ms)) && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    {row?.last_launched_at && (
+                      <span>Last launched {formatInstalledDate(row.last_launched_at)}</span>
+                    )}
+                    {formatPlayTime(row?.total_play_ms) && (
+                      <span title="Time in game across launches Agora ran itself">
+                        · {formatPlayTime(row?.total_play_ms)} played
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
             <div className="flex flex-col items-end gap-3 self-end xl:self-end">
-              <div className="flex flex-wrap justify-end gap-2">
-              <button
-                onClick={() => {
-                  setPackInstallOpen(true);
-                  setPackIdInput('');
-                  setPackProgress(null);
-                  setError(null);
-                }}
-                disabled={recoveryBlocked}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-              >
-                📦 Add mods from a pack…
-              </button>
-              <button
-                onClick={handleImportPack}
-                disabled={recoveryBlocked}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-              >
-                📥 Import pack as new instance
-              </button>
-              <button
-                onClick={() => openInstanceFolder(instanceId)}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-                title="Open instance folder in file explorer"
-              >
-                📂 Open in Folder
-              </button>
-              <button
-                onClick={() => onInvestigate?.(instanceId)}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-                title="Open Crash Doctor to look through the latest logs for what went wrong"
-              >
-                Diagnose a crash
-              </button>
-              <button
-                type="button"
-                onClick={() => { void requestReadinessCheck(); }}
-                className="rounded-lg border border-input bg-background hover:bg-accent px-3 py-1.5 text-sm font-medium"
-                title="Run the launch health check and show what it finds, even when nothing needs attention"
-              >
-                Check readiness
-              </button>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => openInstanceFolder(instanceId)}
+                  className="rounded-lg border border-input bg-background p-2 hover:bg-accent"
+                  title="Open instance folder in file explorer"
+                  aria-label="Open in Folder"
+                >
+                  <FolderOpen className="h-4 w-4" aria-hidden="true" />
+                </button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 rounded-lg border border-input bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
+                    >
+                      More
+                      <ChevronDown className="h-4 w-4" aria-hidden="true" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-56">
+                    <DropdownMenuItem
+                      disabled={recoveryBlocked}
+                      onSelect={() => {
+                        setPackInstallOpen(true);
+                        setPackIdInput('');
+                        setPackProgress(null);
+                        setError(null);
+                      }}
+                    >
+                      Add mods from a pack…
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      disabled={recoveryBlocked}
+                      onSelect={() => { void handleImportPack(); }}
+                    >
+                      Import pack as new instance
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={() => { void requestReadinessCheck(); }}>
+                      Check readiness
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => onInvestigate?.(instanceId)}>
+                      Diagnose a crash
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={recoveryBlocked || Boolean(row?.is_locked)}
+                      onSelect={() => { void handleSetInstanceIcon(); }}
+                    >
+                      Set image
+                    </DropdownMenuItem>
+                    {!row?.is_locked && (
+                      <DropdownMenuItem
+                        disabled={recoveryBlocked}
+                        title="Go back to the lock snapshot: mods and config changed since the instance was last locked are put back. You can undo this from Snapshots."
+                        onSelect={() => { void handleRevert(); }}
+                      >
+                        Revert
+                      </DropdownMenuItem>
+                    )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                {processRunning ? (
+                  <button
+                    type="button"
+                    onClick={() => { void onKillProcess?.(); }}
+                    disabled={!onKillProcess || processStopping}
+                    className="inline-flex items-center gap-2 rounded-lg bg-destructive px-5 py-3 text-base font-semibold text-destructive-foreground shadow-xs hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+                    aria-label={`Kill ${row?.name ?? 'instance'}`}
+                  >
+                    Kill
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      if (!onLaunch || playDisabled) return;
+                      setPlayBusy(true);
+                      setError(null);
+                      try {
+                        await onLaunch(instanceId);
+                      } catch (cause) {
+                        setError(formatError(cause));
+                      } finally {
+                        setPlayBusy(false);
+                      }
+                    }}
+                    disabled={!onLaunch || playDisabled}
+                    className="inline-flex items-center gap-2 rounded-lg bg-primary px-5 py-3 text-base font-semibold text-primary-foreground shadow-xs hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                    aria-label={`Play ${row?.name ?? 'instance'}`}
+                  >
+                    <Play className="h-5 w-5 fill-current" aria-hidden="true" />
+                    {processLaunching || playBusy ? 'Starting…' : processStopping ? 'Stopping…' : processDelegated ? 'Running via Mojang' : anotherProcessActive ? 'Game already running' : 'Play'}
+                  </button>
+                )}
               </div>
-              {processRunning ? (
-                <button
-                  type="button"
-                  onClick={() => { void onKillProcess?.(); }}
-                  disabled={!onKillProcess || processStopping}
-                  className="inline-flex items-center gap-2 rounded-lg bg-destructive px-5 py-3 text-base font-semibold text-destructive-foreground shadow-xs hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
-                  aria-label={`Kill ${row?.name ?? 'instance'}`}
-                >
-                  Kill
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={async () => {
-                    if (!onLaunch || playDisabled) return;
-                    setPlayBusy(true);
-                    setError(null);
-                    try {
-                      await onLaunch(instanceId);
-                    } catch (cause) {
-                      setError(formatError(cause));
-                    } finally {
-                      setPlayBusy(false);
-                    }
-                  }}
-                  disabled={!onLaunch || playDisabled}
-                  className="inline-flex items-center gap-2 rounded-lg bg-primary px-5 py-3 text-base font-semibold text-primary-foreground shadow-xs hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-                  aria-label={`Play ${row?.name ?? 'instance'}`}
-                >
-                  <Play className="h-5 w-5 fill-current" aria-hidden="true" />
-                  {processLaunching || playBusy ? 'Starting…' : processStopping ? 'Stopping…' : processDelegated ? 'Running via Mojang' : anotherProcessActive ? 'Game already running' : 'Play'}
-                </button>
-              )}
               {readiness && !gameActive && (
                 <div className="max-w-sm text-right text-xs" data-testid="instance-readiness">
                   <p className={`font-medium ${
@@ -2356,26 +2451,48 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         }
       />
 
-      {/* Sub-sidebar tabs */}
-      <div className="agora-tabbar">
-        {(['mods', 'resourcepacks', 'shaders', 'datapacks', 'worlds', 'screenshots', 'notes', 'snapshots', 'loadout-profiles', 'templates', 'migrate', 'import', 'export', 'console'] as const).map((tab) => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            data-active={activeTab === tab}
-            className="agora-tab text-sm"
-          >
-            {tab === 'mods' ? `Mods (${mods.length})` : tab === 'resourcepacks' ? `Resource Packs (${manifest?.resourcepacks?.length ?? 0})` : tab === 'shaders' ? `Shaders (${manifest?.shaders?.length ?? 0})` : tab === 'datapacks' ? `Data Packs (${manifest?.datapacks?.length ?? 0})` : tab === 'worlds' ? 'Worlds & Servers' : tab === 'screenshots' ? 'Screenshots' : tab === 'notes' ? 'Notes' : tab === 'snapshots' ? 'Snapshots' : tab === 'loadout-profiles' ? 'Loadout Profiles' : tab === 'templates' ? 'Templates' : tab === 'migrate' ? 'Version Move' : tab === 'import' ? 'Other launchers & files' : tab === 'export' ? 'Export' : 'Console'}
-          </button>
-        ))}
-        <button
-            key="java-args"
-            onClick={() => setActiveTab('java-args')}
-            data-active={activeTab === 'java-args'}
-            className="agora-tab text-sm"
-          >
-            Java & Args
-        </button>
+      {/* Instance pages: six top tabs, with a quieter row inside the ones that hold several panels. */}
+      <div className="space-y-2">
+        <nav aria-label="Instance sections" className="agora-tabbar">
+          {TAB_LAYOUT.map((top) => {
+            const isActive = activeTopTab.id === top.id;
+            return (
+              <button
+                key={top.id}
+                type="button"
+                onClick={() => openTopTab(top)}
+                aria-current={isActive ? 'page' : undefined}
+                data-active={isActive}
+                className="agora-tab text-sm"
+              >
+                {top.label}
+              </button>
+            );
+          })}
+        </nav>
+        {activeTopTab.tabs.length > 1 && (
+          <div role="group" className="flex flex-wrap items-center gap-1" aria-label={`${activeTopTab.label} pages`}>
+            {activeTopTab.tabs.map((tab) => {
+              const isActive = activeTab === tab;
+              return (
+                <button
+                  key={tab}
+                  type="button"
+                  onClick={() => setActiveTab(tab)}
+                  aria-current={isActive ? 'page' : undefined}
+                  data-active={isActive}
+                  className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                    isActive
+                      ? 'bg-accent text-accent-foreground'
+                      : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
+                  }`}
+                >
+                  {tabLabel(tab)}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {activeTab === 'mods' && (

@@ -5,6 +5,7 @@
  * one instance must not follow the user to another.
  */
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { InstanceEditor } from './InstanceEditor';
 import { PackInstallProvider } from '../components/PackInstallProgress';
@@ -158,7 +159,8 @@ describe('readiness line', () => {
 describe('instance header controls', () => {
   it('says what Revert returns to, and that it can be undone', async () => {
     render(editor('alpha'));
-    const revert = await screen.findByRole('button', { name: 'Revert' });
+    await userEvent.click(await screen.findByRole('button', { name: 'More' }));
+    const revert = await screen.findByRole('menuitem', { name: 'Revert' });
     const title = revert.getAttribute('title') ?? '';
     expect(title).toContain('lock snapshot');
     expect(title).toContain('undo');
@@ -169,14 +171,15 @@ describe('instance header controls', () => {
     invokeMock.mockImplementation(async (command: string, args: { instanceId?: string } = {}) =>
       command === 'list_snapshots' ? [] : previous?.(command, args));
     render(editor('alpha'));
-    fireEvent.click(await screen.findByRole('button', { name: 'Revert' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'More' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Revert' }));
     await screen.findByText(/has no lock snapshot to revert to/);
     expect(invokeMock.mock.calls.some(([command]) => command === 'revert_instance')).toBe(false);
   });
 
-  it('explains Lock on the button itself, where a hover reaches it', async () => {
+  it('explains Lock on the icon button itself, where a hover reaches it', async () => {
     render(editor('alpha'));
-    const lock = await screen.findByRole('button', { name: 'Lock' });
+    const lock = await screen.findByRole('button', { name: /stops mod changes/ });
     expect(lock.getAttribute('title')).toContain('stops mod changes');
   });
 });
@@ -218,6 +221,7 @@ describe('installed content details', () => {
 describe('instance banners', () => {
   it('drops a status message when the editor moves to another instance', async () => {
     const view = render(editor('alpha'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Backups & Versions' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Loadout Profiles' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Apply' }));
     await screen.findByText(/Profile "Fast" applied\./);

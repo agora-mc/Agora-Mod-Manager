@@ -364,8 +364,8 @@ export const TOUR_STEPS: readonly TourStep[] = [
     title: 'The instance editor',
     body:
       'This lists everything installed, and Play launches it. Like Browse, it has two modes — the one '
-      + 'you have open is fine. Everything else here (snapshots, loadouts, import and export, the '
-      + 'console) is for when you need it.',
+      + 'you have open is fine. Everything else here (Backups & Versions, Import & Export, and '
+      + 'Java & Logs) is for when you need it.',
     anchors: ['page-instance-editor'],
     gate: 'page-instance-editor',
     advance: { kind: 'next' },

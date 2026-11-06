@@ -230,6 +230,7 @@ async function navigateToInstanceEditor(page: Page) {
 }
 
 async function openSnapshotsTab(page: Page) {
+  await page.getByRole('button', { name: 'Backups & Versions' }).click();
   await page.getByRole('button', { name: 'Snapshots' }).click();
   // Wait for the snapshot section heading to appear
   await expect(page.getByRole('heading', { name: 'Snapshots' })).toBeVisible();
@@ -289,6 +290,7 @@ test('JVM preview follows GC and pre-touch controls', async ({ page }) => {
   await installSnapshotEditorMock(page);
   await navigateToInstanceEditor(page);
 
+  await page.getByRole('button', { name: 'Java & Logs' }).click();
   await page.getByRole('button', { name: 'Java & Args' }).click();
   await expect(page.getByText(/^Generational ZGC ·/)).toBeVisible();
   await expect(page.getByRole('switch', { name: 'Automatic GC selection' })).toBeChecked();
