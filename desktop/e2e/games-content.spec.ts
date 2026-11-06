@@ -250,9 +250,49 @@ test('an instance’s content lists its load order and says where each item goes
 
   const row = page.getByTestId('instance-content-row');
   await expect(row).toContainText('Odin Patch');
-  await expect(row).toContainText('On');
+  await expect(row).toContainText('Enabled');
   await expect(row).toContainText('Installs into the Data folder');
-  await expect(row.getByRole('button', { name: 'Turn off' })).toBeVisible();
+  await expect(row.getByRole('switch', { name: 'Disable Odin Patch' })).toBeVisible();
+});
+
+test('the content list sorts and filters, and only reorders in load order', async ({ page }) => {
+  const secondRow = {
+    ...oneRow,
+    position: 2,
+    itemId: 'bbbb2222',
+    layerId: 'content:bbbb2222',
+    name: 'Sky Mod',
+    sourceLabel: 'Archive: sky.7z',
+    mountPath: '',
+    sourcePath: 'textures',
+  };
+  await boot(page, {
+    games_instance_content_list: { instanceId: 'inst-1', items: [secondRow, oneRow] },
+    games_library_list: { items: [], damaged: [], warnings: [] },
+    games_instance_content_move: null,
+  });
+  await openInstanceContent(page);
+  await page.goto('/');
+
+  const rows = page.getByTestId('instance-content-row');
+  await expect(rows).toHaveCount(2);
+  // Load order is the default, even when the reply lists the rows in another order.
+  await expect(rows.nth(0)).toContainText('Odin Patch');
+  await expect(rows.nth(0).getByTestId('load-order-number')).toHaveText('1.');
+  await expect(rows.nth(1).getByTestId('load-order-number')).toHaveText('2.');
+
+  await page.getByRole('button', { name: 'Name', exact: true }).click();
+  await expect(page.getByTestId('reorder-blocked')).toContainText('sorted another way');
+  await expect(page.getByRole('button', { name: 'Move Odin Patch up' })).toBeDisabled();
+  await expect(rows.nth(0).getByTestId('load-order-number')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Back to load order' }).click();
+  await expect(page.getByRole('button', { name: 'Move Sky Mod up' })).toBeEnabled();
+
+  await page.getByLabel('Search installed content').fill('Odin');
+  await expect(page.getByTestId('reorder-blocked')).toContainText('searched or filtered');
+  await expect(rows).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Move Odin Patch up' })).toBeDisabled();
 });
 
 test('an instance whose content cannot be read says so, and does not show an empty tab', async ({ page }) => {
@@ -338,7 +378,7 @@ test('an archive with an installer asks its questions, previews the files, then 
   await page.goto('/');
 
   await expect(page.getByText('This instance has no content yet.')).toBeVisible();
-  await page.getByRole('combobox').selectOption({ label: 'Sky Mod' });
+  await page.getByLabel('Choose an item to add').selectOption({ label: 'Sky Mod' });
   await page.getByRole('button', { name: 'Add to instance' }).click();
 
   const wizard = page.getByRole('dialog');

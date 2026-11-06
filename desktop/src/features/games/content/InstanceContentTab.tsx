@@ -2,12 +2,21 @@
  * An instance's Content tab: the content it has, in load order, with where each item came from.
  * The user turns items on and off, moves them, removes them, and adds items from the library.
  * An archive with a FOMOD installer opens the installer's questions before anything is added.
+ *
+ * The list itself is Minecraft's installed-content panel, reused through the adapter in
+ * `panelAdapter.ts`. Reusing it means search, sort, filters and bulk actions stay in one place;
+ * the panel only shows the columns and filters the game's data can fill, and its optional
+ * load-order mode adds positions, Move up/down and drag-and-drop.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/confirm';
+import { InstalledContentPanel } from '@/components/installed-content/InstalledContentPanel';
+import type { LoadOrderConfig } from '@/components/installed-content/types';
+import type { InstalledContentRow } from '@/lib/tauri';
 import { itemsForInstanceOf, listLibrary, type LibraryItem } from '@/features/library/api';
+import { openGameInstanceFolder } from '../instances/api';
 import { FomodWizard } from '../fomod';
 import { isGamesError } from '../shared/types';
 import {
@@ -20,6 +29,13 @@ import {
   type InstanceContentRow,
   type InstanceAddOutcome,
 } from './api';
+import {
+  GAME_CONTENT_COLUMNS,
+  GAME_CONTENT_COLUMN_LABELS,
+  GAME_CONTENT_FILTERS,
+  toPanelRows,
+  whereItGoes,
+} from './panelAdapter';
 
 export interface InstanceContentTabProps {
   /** The game the instance belongs to. The instance's own record says which game it is. */
@@ -31,11 +47,6 @@ function errorMessage(error: unknown): string {
   if (isGamesError(error)) return error.message;
   if (error instanceof Error) return error.message;
   return 'Something went wrong. Try again.';
-}
-
-function whereItGoes(row: InstanceContentRow): string {
-  const mount = row.mountPath ? `the ${row.mountPath} folder` : 'the game folder';
-  return row.sourcePath ? `Installs ${row.sourcePath} into ${mount}` : `Installs into ${mount}`;
 }
 
 function addedNotice(outcome: Extract<InstanceAddOutcome, { status: 'added' }>, name: string): string {
@@ -94,18 +105,120 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
     void refreshLibrary();
   }, [refresh, refreshLibrary]);
 
-  /** Run one change, then reread the tab so it shows what the core now holds. */
-  const change = async (key: string, action: () => Promise<unknown>, failure: string) => {
+  const items = content?.items ?? [];
+  const panelRows = useMemo(() => toPanelRows(items), [items]);
+  const originalsByKey = useMemo(
+    () => new Map(items.map((row) => [row.layerId, row])),
+    [items],
+  );
+
+  const originalFor = (row: InstalledContentRow): InstanceContentRow => {
+    const original = originalsByKey.get(row.key);
+    if (!original) throw new Error('That item is no longer in this instance.');
+    return original;
+  };
+
+  const originalsFor = (rows: InstalledContentRow[]): InstanceContentRow[] =>
+    rows.flatMap((row) => {
+      const original = originalsByKey.get(row.key);
+      return original ? [original] : [];
+    });
+
+  const loadOrder = useMemo<LoadOrderConfig>(() => ({
+    positionForRow: (row) => originalsByKey.get(row.key)?.position ?? 0,
+    onMove: async (row, position) => {
+      const original = originalFor(row);
+      setNotice(null);
+      setActionError(null);
+      try {
+        await moveInstanceContent(instanceId, original.itemId, position);
+      } catch (error) {
+        await refresh();
+        throw new Error(`Could not move ${original.name}. ${errorMessage(error)}`);
+      }
+      await refresh();
+    },
+  }), [instanceId, originalsByKey, refresh]);
+
+  const toggleRow = async (row: InstalledContentRow) => {
+    const original = originalFor(row);
     setNotice(null);
     setActionError(null);
-    setBusy(key);
     try {
-      await action();
+      await setInstanceContentEnabled(instanceId, original.itemId, !original.enabled);
+      await refresh();
+      return true;
+    } catch (error) {
+      await refresh();
+      throw new Error(`Could not turn ${original.name} ${original.enabled ? 'off' : 'on'}. ${errorMessage(error)}`);
+    }
+  };
+
+  const bulkToggle = async (rows: InstalledContentRow[], enabled: boolean) => {
+    setNotice(null);
+    setActionError(null);
+    try {
+      for (const row of originalsFor(rows)) {
+        await setInstanceContentEnabled(instanceId, row.itemId, enabled);
+      }
+      await refresh();
+      return true;
+    } catch (error) {
+      await refresh();
+      throw new Error(`Could not change all the selected items. ${errorMessage(error)}`);
+    }
+  };
+
+  const bulkRemove = async (rows: InstalledContentRow[]) => {
+    const targets = originalsFor(rows);
+    const confirmed = await confirm({
+      title: `Remove ${targets.length} item${targets.length === 1 ? '' : 's'} from this instance?`,
+      body: 'They stay in your library, so you can add them again later.',
+      confirmLabel: 'Remove',
+      tone: 'danger',
+    });
+    if (!confirmed) return false;
+    setNotice(null);
+    setActionError(null);
+    try {
+      for (const row of targets) {
+        await removeInstanceContent(instanceId, row.itemId);
+      }
+      await refresh();
+      return true;
+    } catch (error) {
+      await refresh();
+      setActionError(`Could not remove all the selected items. ${errorMessage(error)}`);
+      return false;
+    }
+  };
+
+  const removeRow = async (row: InstalledContentRow) => {
+    const original = originalFor(row);
+    const confirmed = await confirm({
+      title: `Remove ${original.name} from this instance?`,
+      body: 'It stays in your library, so you can add it again later.',
+      confirmLabel: 'Remove',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
+    setNotice(null);
+    setActionError(null);
+    try {
+      await removeInstanceContent(instanceId, original.itemId);
       await refresh();
     } catch (error) {
-      setActionError(`${failure} ${errorMessage(error)}`);
-    } finally {
-      setBusy(null);
+      await refresh();
+      setActionError(`Could not remove ${original.name}. ${errorMessage(error)}`);
+    }
+  };
+
+  const revealRow = async () => {
+    setActionError(null);
+    try {
+      await openGameInstanceFolder(instanceId);
+    } catch (error) {
+      setActionError(`Could not open the instance folder. ${errorMessage(error)}`);
     }
   };
 
@@ -132,32 +245,12 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
     }
   };
 
-  const removeRow = async (row: InstanceContentRow) => {
-    const confirmed = await confirm({
-      title: `Remove ${row.name} from this instance?`,
-      body: 'It stays in your library, so you can add it again later.',
-      confirmLabel: 'Remove',
-      tone: 'danger',
-    });
-    if (!confirmed) return;
-    await change(row.itemId, () => removeInstanceContent(instanceId, row.itemId), `Could not remove ${row.name}.`);
-  };
-
-  const rows = content?.items ?? [];
-  const inInstance = new Set(rows.map((row) => row.itemId));
+  const inInstance = new Set(items.map((row) => row.itemId));
   const forThisGame = itemsForInstanceOf(store ?? [], gameId);
   const addable = forThisGame.filter((item) => !inInstance.has(item.itemId));
 
   return (
-    <section aria-labelledby="instance-content-heading" className="space-y-4" data-testid="instance-content">
-      <div>
-        <h2 id="instance-content-heading" className="text-base font-semibold">Content</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          What this instance uses, in load order. Lower rows load first, so a later row wins when two items change the
-          same file.
-        </p>
-      </div>
-
+    <section className="space-y-4" data-testid="instance-content">
       {notice && <p role="status" className="text-sm text-muted-foreground">{notice}</p>}
       {actionError && (
         <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm">
@@ -174,66 +267,41 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
 
       {!contentError && content === null && <p className="text-sm text-muted-foreground">Reading the content…</p>}
 
-      {content !== null && rows.length === 0 && (
-        <p className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
-          This instance has no content yet. Add something from your library below. If your library is empty, add an
-          archive or folder on the Library tab first.
-        </p>
-      )}
-
-      {rows.length > 0 && (
-        <ol className="space-y-2">
-          {rows.map((row) => {
-            return (
-              <li key={row.layerId} className="rounded-xl border border-border bg-card p-4" data-testid="instance-content-row">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div className="min-w-0 space-y-0.5">
-                    <p className="font-medium">
-                      <span className="mr-2 tabular-nums text-muted-foreground">{row.position}.</span>
-                      {row.name}
-                      <span className={`ml-2 rounded px-1.5 py-0.5 text-xs ${row.enabled ? 'bg-primary/15' : 'bg-muted text-muted-foreground'}`}>
-                        {row.enabled ? 'On' : 'Off'}
-                      </span>
-                    </p>
-                    <p className="text-sm text-muted-foreground">{row.sourceLabel}</p>
-                    <p className="text-xs text-muted-foreground">{whereItGoes(row)}</p>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      aria-label={`Move ${row.name} up (loads later)`}
-                      onClick={() => void change(row.itemId, () => moveInstanceContent(instanceId, row.itemId, row.position + 1), `Could not move ${row.name}.`)}
-                      disabled={busy !== null || row.position === rows.length}
-                    >
-                      Move up
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      aria-label={`Move ${row.name} down (loads earlier)`}
-                      onClick={() => void change(row.itemId, () => moveInstanceContent(instanceId, row.itemId, row.position - 1), `Could not move ${row.name}.`)}
-                      disabled={busy !== null || row.position === 1}
-                    >
-                      Move down
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => void change(row.itemId, () => setInstanceContentEnabled(instanceId, row.itemId, !row.enabled), `Could not turn ${row.name} ${row.enabled ? 'off' : 'on'}.`)}
-                      disabled={busy !== null}
-                    >
-                      {row.enabled ? 'Turn off' : 'Turn on'}
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => void removeRow(row)} disabled={busy !== null}>
-                      Remove
-                    </Button>
-                  </div>
-                </div>
-              </li>
-            );
-          })}
-        </ol>
+      {content !== null && (
+        <InstalledContentPanel
+          contentType="mod"
+          preferencesKey="agora.installed-content.v2.game"
+          title="Content"
+          contentLabel="content"
+          description="What this instance uses, in load order. Lower rows load first, so a later row wins when two items change the same file."
+          rows={panelRows}
+          locked={false}
+          availableColumns={GAME_CONTENT_COLUMNS}
+          columnLabels={GAME_CONTENT_COLUMN_LABELS}
+          defaultColumns={GAME_CONTENT_COLUMNS}
+          availableFilters={GAME_CONTENT_FILTERS}
+          rowTestId="instance-content-row"
+          rowSubtitle={(row) => {
+            const original = originalsByKey.get(row.key);
+            return original ? whereItGoes(original) : null;
+          }}
+          emptyState={(
+            <p className="mt-4 rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
+              This instance has no content yet. Add something from your library below. If your library is empty, add an
+              archive or folder on the Library tab first.
+            </p>
+          )}
+          onToggle={toggleRow}
+          onBulkToggle={bulkToggle}
+          onBulkRemove={bulkRemove}
+          onRemove={(row) => void removeRow(row)}
+          onRevealFile={() => void revealRow()}
+          revealLabel="Open instance folder"
+          canRevealFile={() => true}
+          showCopyFilename={false}
+          onError={setActionError}
+          loadOrder={loadOrder}
+        />
       )}
 
       <div className="space-y-2 rounded-xl border border-border p-4">
