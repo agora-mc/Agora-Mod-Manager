@@ -4,9 +4,9 @@ use super::{modified_rfc3339, rfc3339, SessionWindow};
 use agora_game_api::crash::{
     ArtifactUnit, ChildPolicy, CopyPolicy, CrashSource, MatchedBy, Privacy, SourceBind, SourceMatch,
 };
-use agora_game_api::{fold_path_case, GamePath};
+use agora_game_api::{fold_path_case, GamePath, RelPath};
 use regex::Regex;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// What is known about the session whose evidence is being collected.
@@ -20,10 +20,20 @@ pub struct CrashSession {
     pub window: SessionWindow,
 }
 
-/// Turns a pack's [`GamePath`] into a real folder. The game plugin owns the roots; a pack never
-/// holds an absolute path.
+/// A pack location split into the caller's trusted root and the pack's relative part. The base may
+/// itself be a junction or symlink: people redirect Documents and game folders, and the caller
+/// chose that root. Every component below it is checked separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLocation {
+    pub base: PathBuf,
+    /// The pack's `/`-separated part below `base`.
+    pub relative: String,
+}
+
+/// Turns a pack's [`GamePath`] into a trusted base and a relative part. The game plugin owns the
+/// roots; a pack never holds an absolute path.
 pub trait SourceRoots {
-    fn resolve(&self, location: &GamePath) -> Result<PathBuf, String>;
+    fn resolve(&self, location: &GamePath) -> Result<SourceLocation, String>;
 }
 
 /// The `core.process` facts a parser reported for one artifact. The collector uses them only to
@@ -80,7 +90,7 @@ pub enum RejectedReason {
     NoBindDeclared,
     NoBindMatched,
     ReparsePoint,
-    ReservedName,
+    UnsafeName,
     NotFinished,
     NotAnArtifact,
     FolderArtifactExpected,
@@ -125,8 +135,10 @@ pub struct FolderObservation {
 pub enum SourceProblemKind {
     Resolve,
     PathEscapes,
+    ReparsePoint,
     InvalidRegex,
     UnreadableEntry,
+    TooManyEntries,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +149,25 @@ pub struct SourceProblem {
     pub detail: String,
 }
 
+/// How much collection may look at in one session. A huge folder must not take unbounded time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionLimits {
+    pub max_entries: usize,
+}
+
+impl Default for CollectionLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 100_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionStop {
+    Entries,
+}
+
 /// Everything collection found, good and bad.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceCollection {
@@ -144,13 +175,17 @@ pub struct SourceCollection {
     pub seen: Vec<SeenArtifact>,
     pub folders: Vec<FolderObservation>,
     pub problems: Vec<SourceProblem>,
+    /// Present when a limit stopped collection, so the caller knows the set is incomplete.
+    pub stopped_early: Option<CollectionStop>,
 }
 
-/// A Windows device name (`NUL`, `COM1`, and the like) must never be treated as a file: opening it
-/// reaches a device, not the disk.
-pub fn is_reserved_artifact_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name);
-    crate::content_store::is_windows_device_name(stem)
+/// Whether a name is safe to treat as a file on this platform. This is the same rule everywhere:
+/// top-level files, folder children and session folder names. It reuses
+/// [`crate::content_store::validate_entry_path`], which implements Microsoft's naming rules
+/// (`NUL`, `COM1`, trailing dots and spaces, forbidden characters):
+/// <https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>.
+pub fn is_safe_artifact_name(name: &str) -> bool {
+    crate::content_store::validate_entry_path(name).is_ok()
 }
 
 /// Find, filter and bind every artifact the given sources name.
@@ -159,13 +194,30 @@ pub fn collect_sources(
     roots: &dyn SourceRoots,
     facts: &dyn ArtifactFacts,
     session: &CrashSession,
+    limits: CollectionLimits,
 ) -> SourceCollection {
     let mut collection = SourceCollection::default();
+    let mut entries_seen = 0usize;
 
-    for spec in specs {
+    'sources: for spec in specs {
+        if collection.stopped_early.is_some() {
+            break;
+        }
         let source = spec.source;
-        let folder = match roots.resolve(&source.location) {
-            Ok(folder) => folder,
+        for candidate in &source.bind {
+            if let SourceBind::PidInName { regex } = candidate {
+                if let Err(error) = Regex::new(regex) {
+                    collection.problems.push(SourceProblem {
+                        plugin_id: spec.plugin_id.to_string(),
+                        source_id: source.id.clone(),
+                        kind: SourceProblemKind::InvalidRegex,
+                        detail: format!("`{regex}`: {error}"),
+                    });
+                }
+            }
+        }
+        let location = match roots.resolve(&source.location) {
+            Ok(location) => location,
             Err(detail) => {
                 collection.problems.push(SourceProblem {
                     plugin_id: spec.plugin_id.to_string(),
@@ -177,15 +229,31 @@ pub fn collect_sources(
             }
         };
 
-        if has_parent_component(&folder) {
-            collection.problems.push(SourceProblem {
-                plugin_id: spec.plugin_id.to_string(),
-                source_id: source.id.clone(),
-                kind: SourceProblemKind::PathEscapes,
-                detail: format!("the resolved folder `{}` contains `..`", folder.display()),
-            });
-            continue;
-        }
+        let relative = match RelPath::new(location.relative.clone()) {
+            Ok(relative) => relative,
+            Err(error) => {
+                collection.problems.push(SourceProblem {
+                    plugin_id: spec.plugin_id.to_string(),
+                    source_id: source.id.clone(),
+                    kind: SourceProblemKind::PathEscapes,
+                    detail: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let folder = match folder_below_trusted_root(&location.base, relative.as_str()) {
+            Ok(folder) => folder,
+            Err((kind, detail)) => {
+                collection.problems.push(SourceProblem {
+                    plugin_id: spec.plugin_id.to_string(),
+                    source_id: source.id.clone(),
+                    kind,
+                    detail,
+                });
+                continue;
+            }
+        };
 
         let entries = match std::fs::read_dir(&folder) {
             Ok(entries) => entries,
@@ -209,6 +277,18 @@ pub fn collect_sources(
         let mut entries_read = 0usize;
         let mut saw_error = false;
         for entry in entries {
+            entries_seen += 1;
+            if entries_seen > limits.max_entries {
+                collection.stopped_early = Some(CollectionStop::Entries);
+                collection.problems.push(SourceProblem {
+                    plugin_id: spec.plugin_id.to_string(),
+                    source_id: source.id.clone(),
+                    kind: SourceProblemKind::TooManyEntries,
+                    detail: "collection reached its entry limit; the evidence is incomplete"
+                        .to_string(),
+                });
+                break 'sources;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -259,13 +339,13 @@ pub fn collect_sources(
                 continue;
             }
 
-            if is_reserved_artifact_name(&name) {
+            if !is_safe_artifact_name(&name) {
                 collection.seen.push(SeenArtifact {
                     plugin_id: spec.plugin_id.to_string(),
                     source_id: source.id.clone(),
                     name,
                     path,
-                    reason: RejectedReason::ReservedName,
+                    reason: RejectedReason::UnsafeName,
                     modified_at: None,
                 });
                 continue;
@@ -330,21 +410,13 @@ pub fn collect_sources(
                     size: metadata.len(),
                     modified,
                 }),
-                Err(failure) => {
-                    if let Some(detail) = failure.invalid {
-                        collection.problems.push(SourceProblem {
-                            plugin_id: spec.plugin_id.to_string(),
-                            source_id: source.id.clone(),
-                            kind: SourceProblemKind::InvalidRegex,
-                            detail,
-                        });
-                    }
+                Err(reason) => {
                     collection.seen.push(SeenArtifact {
                         plugin_id: spec.plugin_id.to_string(),
                         source_id: source.id.clone(),
                         name,
                         path,
-                        reason: failure.reason,
+                        reason,
                         modified_at: modified.map(rfc3339),
                     });
                 }
@@ -378,9 +450,37 @@ pub fn collect_sources(
     collection
 }
 
-fn has_parent_component(path: &Path) -> bool {
-    path.components()
-        .any(|component| component == Component::ParentDir)
+/// Join the pack's part one component at a time, checking every component below the trusted root.
+/// The base itself is not checked: the caller chose it, and redirected folders are legitimate.
+fn folder_below_trusted_root(
+    base: &Path,
+    relative: &str,
+) -> Result<PathBuf, (SourceProblemKind, String)> {
+    let mut current = base.to_path_buf();
+    for part in relative.split('/').filter(|part| !part.is_empty()) {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+                    return Err((
+                        SourceProblemKind::ReparsePoint,
+                        format!(
+                            "`{}` is a junction or symlink below the trusted root",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err((
+                    SourceProblemKind::UnreadableEntry,
+                    format!("`{}`: {error}", current.display()),
+                ))
+            }
+        }
+    }
+    Ok(current)
 }
 
 fn marker_present(path: &Path, matching: &SourceMatch, folder: bool) -> bool {
@@ -398,63 +498,58 @@ fn marker_present(path: &Path, matching: &SourceMatch, folder: bool) -> bool {
     base.join(marker.replace('\\', "/")).is_file()
 }
 
-struct BindFailure {
-    reason: RejectedReason,
-    invalid: Option<String>,
-}
-
-impl BindFailure {
-    fn reason(reason: RejectedReason) -> Self {
-        Self {
-            reason,
-            invalid: None,
-        }
-    }
-}
-
-/// Evaluate every declared bind and use the strongest that works. The order in the pack is the
-/// author's preference between equally strong binds; strength itself is fixed here so a pack
-/// cannot make a time guess outrank a process id.
+/// Evaluate every declared bind. A bind that finds positive contradictory evidence vetoes the
+/// artifact whatever the others say: a log naming another process is that process's log. Absent
+/// evidence is not a contradiction, so another bind may still tie it to the session.
 fn bind(
     path: &Path,
     name: &str,
     source: &CrashSource,
     session: &CrashSession,
     facts: &dyn ArtifactFacts,
-) -> Result<MatchedBy, BindFailure> {
+) -> Result<MatchedBy, RejectedReason> {
     if source.bind.is_empty() {
-        return Err(BindFailure::reason(RejectedReason::NoBindDeclared));
+        return Err(RejectedReason::NoBindDeclared);
     }
 
     let mut best: Option<(u8, MatchedBy)> = None;
+    let mut veto: Option<(u8, RejectedReason)> = None;
     let mut failures = Vec::new();
-    let mut invalid = None;
 
     for candidate in &source.bind {
+        let strength = bind_strength(candidate);
         match evaluate_bind(candidate, path, name, session, facts) {
             Ok(Some(matched_by)) => {
-                let strength = bind_strength(candidate);
                 if best.is_none_or(|(current, _)| strength > current) {
                     best = Some((strength, matched_by));
                 }
             }
             Ok(None) => failures.push(RejectedReason::NoBindMatched),
-            Err(failure) => {
-                if failure.invalid.is_some() {
-                    invalid = failure.invalid.clone();
+            Err(reason) => {
+                if is_contradiction(&reason)
+                    && veto.as_ref().is_none_or(|(current, _)| strength > *current)
+                {
+                    veto = Some((strength, reason.clone()));
                 }
-                failures.push(failure.reason);
+                failures.push(reason);
             }
         }
     }
 
+    if let Some((_, reason)) = veto {
+        return Err(reason);
+    }
     match best {
         Some((_, matched_by)) => Ok(matched_by),
-        None => Err(BindFailure {
-            reason: strongest_failure(&failures),
-            invalid,
-        }),
+        None => Err(strongest_failure(&failures)),
     }
+}
+
+fn is_contradiction(reason: &RejectedReason) -> bool {
+    matches!(
+        reason,
+        RejectedReason::PidMismatch { found: Some(_) } | RejectedReason::WorkingDirMismatch
+    )
 }
 
 fn bind_strength(bind: &SourceBind) -> u8 {
@@ -486,13 +581,13 @@ fn evaluate_bind(
     name: &str,
     session: &CrashSession,
     facts: &dyn ArtifactFacts,
-) -> Result<Option<MatchedBy>, BindFailure> {
+) -> Result<Option<MatchedBy>, RejectedReason> {
     match bind {
         SourceBind::PidInName { regex } => {
-            let regex = Regex::new(regex).map_err(|error| BindFailure {
-                reason: RejectedReason::NoBindMatched,
-                invalid: Some(format!("`{regex}`: {error}")),
-            })?;
+            let Ok(regex) = Regex::new(regex) else {
+                // The invalid regex is reported separately; it cannot tie anything to a session.
+                return Ok(None);
+            };
             let Some(captures) = regex.captures(name) else {
                 return Ok(None);
             };
@@ -501,15 +596,17 @@ fn evaluate_bind(
                 .and_then(|group| group.as_str().parse::<u32>().ok());
             match (found, session.pid) {
                 (Some(found), Some(pid)) if found == pid => Ok(Some(MatchedBy::Pid)),
-                (found, _) => Err(BindFailure::reason(RejectedReason::PidMismatch { found })),
+                (Some(found), Some(_)) => Err(RejectedReason::PidMismatch { found: Some(found) }),
+                // No pid in the name, or Agora did not see the game's pid: no contradiction.
+                _ => Ok(None),
             }
         }
         SourceBind::PidInFacts => {
             let found = facts.process_facts(path).and_then(|facts| facts.pid);
             match (found, session.pid) {
-                (None, _) => Ok(None),
                 (Some(found), Some(pid)) if found == pid => Ok(Some(MatchedBy::Pid)),
-                (found, _) => Err(BindFailure::reason(RejectedReason::PidMismatch { found })),
+                (Some(found), Some(_)) => Err(RejectedReason::PidMismatch { found: Some(found) }),
+                _ => Ok(None),
             }
         }
         SourceBind::WorkingDirInFacts => {
@@ -525,7 +622,7 @@ fn evaluate_bind(
             if same_folder(&found, expected) {
                 Ok(Some(MatchedBy::WorkingDir))
             } else {
-                Err(BindFailure::reason(RejectedReason::WorkingDirMismatch))
+                Err(RejectedReason::WorkingDirMismatch)
             }
         }
         SourceBind::Time { before_s, after_s } => {
@@ -542,7 +639,7 @@ fn evaluate_bind(
             if window.contains(modified) {
                 Ok(Some(MatchedBy::Time))
             } else {
-                Err(BindFailure::reason(RejectedReason::OutsideSessionWindow))
+                Err(RejectedReason::OutsideSessionWindow)
             }
         }
     }

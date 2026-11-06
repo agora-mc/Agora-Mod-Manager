@@ -413,7 +413,6 @@ impl ScriptReads for MemoryArtifact {
             let line = line.strip_suffix('\r').unwrap_or(line);
             let (line, was_cut) = match line.char_indices().nth(max_len) {
                 Some((byte, _)) => (&line[..byte], true),
-                None if line.len() > max_len => (&line[..max_len], true),
                 None => (line, false),
             };
             cut |= was_cut;
@@ -425,6 +424,7 @@ impl ScriptReads for MemoryArtifact {
             lines,
             next_line: more.then_some(index),
             cut,
+            gap: None,
         };
         serde_json::to_value(reply).map_err(|error| {
             ScriptReadError::new("unreadable", format!("could not encode lines: {error}"))
@@ -1029,6 +1029,25 @@ mod tests {
         assert!(!glob_matches("crash-*.log", "crash.log"));
         assert!(!glob_matches("crash-*.log", "crash-2024.txt"));
         assert!(!glob_matches("", "anything"));
+    }
+
+    #[test]
+    fn reading_lines_limits_chars_not_bytes() {
+        let mut artifact = MemoryArtifact::new(ParserLimits {
+            max_line_len: 5,
+            ..ParserLimits::DEFAULT
+        });
+        artifact.insert(
+            "a",
+            "ééééé
+"
+            .as_bytes()
+            .to_vec(),
+        );
+        let reply: LinesReply =
+            serde_json::from_value(artifact.read_lines("a", 0, 10).unwrap()).unwrap();
+        assert_eq!(reply.lines, vec!["ééééé"]);
+        assert!(!reply.cut, "five characters fit the limit");
     }
 
     #[test]

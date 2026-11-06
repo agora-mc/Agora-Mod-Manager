@@ -154,6 +154,18 @@ pub enum HostRead {
     },
 }
 
+/// Where a stored head and tail stop being adjacent. Bytes between them were not kept, so a
+/// parser reading across this point must not treat the lines as consecutive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LineGap {
+    /// The zero-based line index where the gap falls. The first line read from the tail has this
+    /// index; when the head did not end in a newline, it continues that line.
+    pub at_line: u64,
+    /// Bytes omitted between the head and the tail.
+    pub omitted_bytes: u64,
+}
+
 /// Lines, decoded by the host: UTF-8, else the system's code page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +177,9 @@ pub struct LinesReply {
     /// Some line was longer than `max_line_len` and was cut.
     #[serde(default)]
     pub cut: bool,
+    /// Present when a head and tail were joined and are not adjacent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<LineGap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

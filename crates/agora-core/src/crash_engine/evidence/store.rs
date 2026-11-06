@@ -2,15 +2,15 @@
 //! much of it.
 
 use super::rfc3339;
-use super::source::{glob_matches, FoundArtifact, SourceCollection};
+use super::source::{glob_matches, is_safe_artifact_name, FoundArtifact, SourceCollection};
 use agora_game_api::crash::{
-    Artifact, ArtifactUnit, ChildPolicy, CopyPolicy, ParserLimits, Privacy, Retained,
+    Artifact, ArtifactUnit, ChildPolicy, CopyPolicy, LineGap, ParserLimits, Privacy, Retained,
 };
 use agora_plugin_api::host::{ScriptReadError, ScriptReads};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,6 +22,11 @@ pub const EVIDENCE_STORE_DIR: &str = "crash-evidence";
 pub const DEFAULT_MAX_COPY_BYTES: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_HEAD_BYTES: u64 = 64 * 1024;
 pub const DEFAULT_TAIL_BYTES: u64 = 256 * 1024;
+/// A single session never stores more files or bytes than these, however many a folder names.
+pub const DEFAULT_MAX_COPY_FILES: usize = 2_000;
+pub const DEFAULT_MAX_COPY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_COPY_ENTRIES: usize = 100_000;
+pub const DEFAULT_MAX_COPY_DEPTH: usize = 16;
 
 const READ_CHUNK: usize = 64 * 1024;
 
@@ -30,6 +35,14 @@ pub struct CopyLimits {
     pub max_file_bytes: u64,
     pub head_bytes: u64,
     pub tail_bytes: u64,
+    /// Files this session may store.
+    pub max_files: usize,
+    /// Bytes this session may store, across all its artifacts.
+    pub max_total_bytes: u64,
+    /// Directory entries a folder artifact walk may visit.
+    pub max_entries: usize,
+    /// Folder levels a folder artifact walk may descend.
+    pub max_depth: usize,
 }
 
 impl Default for CopyLimits {
@@ -38,6 +51,36 @@ impl Default for CopyLimits {
             max_file_bytes: DEFAULT_MAX_COPY_BYTES,
             head_bytes: DEFAULT_HEAD_BYTES,
             tail_bytes: DEFAULT_TAIL_BYTES,
+            max_files: DEFAULT_MAX_COPY_FILES,
+            max_total_bytes: DEFAULT_MAX_COPY_TOTAL_BYTES,
+            max_entries: DEFAULT_MAX_COPY_ENTRIES,
+            max_depth: DEFAULT_MAX_COPY_DEPTH,
+        }
+    }
+}
+
+/// Why copying stopped before the end. A caller must treat this as "the evidence is incomplete",
+/// never as "there was nothing else".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyStop {
+    Files,
+    TotalBytes,
+    Entries,
+    Depth,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CopyState {
+    files: usize,
+    bytes: u64,
+    entries: usize,
+    stopped: Option<CopyStop>,
+}
+
+impl CopyState {
+    fn stop(&mut self, reason: CopyStop) {
+        if self.stopped.is_none() {
+            self.stopped = Some(reason);
         }
     }
 }
@@ -90,6 +133,8 @@ pub enum CopyProblemKind {
     Vanished,
     Unreadable,
     ReparseSkipped,
+    UnsafeName,
+    DepthExceeded,
 }
 
 /// A bound file that could not be copied. Recorded rather than dropped: the difference between
@@ -108,10 +153,15 @@ pub struct CopiedSession {
     pub session_id: String,
     pub artifacts: Vec<Artifact>,
     pub problems: Vec<CopyProblem>,
+    /// Present when a file, byte, entry or depth limit stopped the copy. The evidence is then
+    /// incomplete, and a caller must say so rather than call an absent log missing.
+    pub stopped_early: Option<CopyStop>,
     /// Object id to the stored file. Never shown to a parser; only read operations use it.
     pub(crate) objects: BTreeMap<String, PathBuf>,
     /// Ids that deliberately have no bytes, with the reason a read is refused.
     pub(crate) unavailable: BTreeMap<String, String>,
+    /// For a head-and-tail copy, where its two parts stop being adjacent.
+    pub(crate) gaps: BTreeMap<String, LineGap>,
 }
 
 impl CopiedSession {
@@ -120,6 +170,7 @@ impl CopiedSession {
         StoreReads {
             files: self.objects.clone(),
             unavailable: self.unavailable.clone(),
+            gaps: self.gaps.clone(),
             limits,
             total: AtomicU64::new(0),
         }
@@ -139,6 +190,10 @@ pub struct RetentionReport {
     pub skipped: Vec<RetentionSkip>,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// Bytes held by sessions the user kept.
+    pub kept_bytes: u64,
+    /// True when the kept sessions alone are over a limit. Nothing is deleted for it.
+    pub kept_over_limits: bool,
 }
 
 /// The evidence store. Everything it deletes lives under its own root; it never writes to, moves or
@@ -183,12 +238,17 @@ impl EvidenceStore {
             session_id: session_id.to_string(),
             ..CopiedSession::default()
         };
+        let mut state = CopyState::default();
 
         for found in &collection.bound {
+            if state.stopped.is_some() {
+                break;
+            }
             match found.unit {
                 ArtifactUnit::File => {
-                    let artifact = copy_file(
+                    if let Some(artifact) = copy_file(
                         &dir,
+                        &found.path,
                         found,
                         found.copy,
                         found.privacy,
@@ -197,16 +257,19 @@ impl EvidenceStore {
                         found.modified,
                         &limits,
                         &mut copied,
-                    )?;
-                    copied.artifacts.push(artifact);
+                        &mut state,
+                    )? {
+                        copied.artifacts.push(artifact);
+                    }
                 }
                 ArtifactUnit::Folder => {
-                    let artifact = copy_folder(&dir, found, &limits, &mut copied)?;
+                    let artifact = copy_folder(&dir, found, &limits, &mut copied, &mut state)?;
                     copied.artifacts.push(artifact);
                 }
             }
         }
 
+        copied.stopped_early = state.stopped;
         copied
             .artifacts
             .sort_by(|left, right| left.name.cmp(&right.name));
@@ -264,11 +327,13 @@ impl EvidenceStore {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
             if keep_sessions.iter().any(|kept| kept == &name) {
+                let (bytes, _) = measure_tree(&path, &mut report);
+                report.kept_bytes = report.kept_bytes.saturating_add(bytes);
                 report.kept.push(name);
                 continue;
             }
-            let path = entry.path();
             // A folder that resolves outside the store (via a junction planted at the session
             // level) is not the store's to delete.
             match path.canonicalize() {
@@ -281,74 +346,98 @@ impl EvidenceStore {
                     continue;
                 }
             }
-            let (bytes, has_reparse) = measure_tree(&path, &mut report);
+            let (bytes, _) = measure_tree(&path, &mut report);
             sessions.push(SessionOnDisk {
                 name,
                 path,
                 bytes,
-                modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
-                has_reparse,
+                modified: metadata.modified().ok(),
             });
         }
 
-        sessions.sort_by(|left, right| {
-            left.modified
-                .cmp(&right.modified)
-                .then_with(|| left.name.cmp(&right.name))
-        });
+        report.bytes_before =
+            sessions.iter().map(|session| session.bytes).sum::<u64>() + report.kept_bytes;
+        report.kept_over_limits =
+            report.kept.len() > limits.max_sessions || report.kept_bytes > limits.max_bytes;
 
-        report.bytes_before = sessions.iter().map(|session| session.bytes).sum();
-        let mut sessions_left = sessions.len();
-        let mut bytes_left = report.bytes_before;
-
-        for session in sessions {
-            if sessions_left <= limits.max_sessions && bytes_left <= limits.max_bytes {
-                break;
-            }
-            if session.has_reparse {
-                // Something inside is a link. Remove only what is certainly ours; the link and
-                // whatever it points at are left alone.
-                let (freed, skipped) = remove_tree_inside(&root_real, &session.path)?;
-                bytes_left = bytes_left.saturating_sub(freed);
+        let (deletions, mut skipped) = retention_decisions(&mut sessions, limits);
+        report.skipped.append(&mut skipped);
+        let mut freed_total = 0u64;
+        for name in deletions {
+            let Some(session) = sessions.iter().find(|session| session.name == name) else {
+                continue;
+            };
+            let (freed, skipped) = remove_tree_inside(&root_real, &session.path);
+            freed_total = freed_total.saturating_add(freed);
+            if skipped.is_empty() {
+                report.removed.push(name);
+            } else {
                 report.skipped.extend(skipped);
                 report.skipped.push(RetentionSkip {
-                    path: session.path,
-                    reason: "a reparse point inside it was left in place".to_string(),
+                    path: session.path.clone(),
+                    reason: "some entries could not be removed and were left in place".to_string(),
                 });
-                continue;
-            }
-            let (freed, skipped) = remove_tree_inside(&root_real, &session.path)?;
-            if skipped.is_empty() {
-                report.removed.push(session.name);
-                sessions_left = sessions_left.saturating_sub(1);
-                bytes_left = bytes_left.saturating_sub(freed);
-            } else {
-                bytes_left = bytes_left.saturating_sub(freed);
-                report.skipped.extend(skipped);
             }
         }
 
-        report.bytes_after = bytes_left;
+        report.bytes_after = report.bytes_before.saturating_sub(freed_total);
         Ok(report)
     }
 }
 
-struct SessionOnDisk {
-    name: String,
-    path: PathBuf,
-    bytes: u64,
-    modified: std::time::SystemTime,
-    has_reparse: bool,
+#[derive(Debug, Clone)]
+pub(crate) struct SessionOnDisk {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+    pub(crate) modified: Option<std::time::SystemTime>,
+}
+
+/// Decide which sessions to delete, oldest first. A session whose age cannot be read is skipped and
+/// reported, never guessed to be the oldest. Kept sessions never reach this list.
+pub(crate) fn retention_decisions(
+    sessions: &mut [SessionOnDisk],
+    limits: RetentionLimits,
+) -> (Vec<String>, Vec<RetentionSkip>) {
+    let mut skipped = Vec::new();
+    sessions.sort_by(|left, right| match (left.modified, right.modified) {
+        (Some(left_time), Some(right_time)) => left_time
+            .cmp(&right_time)
+            .then_with(|| left.name.cmp(&right.name)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.name.cmp(&right.name),
+    });
+
+    let mut sessions_left = sessions.len();
+    let mut bytes_left: u64 = sessions.iter().map(|session| session.bytes).sum();
+    let mut deletions = Vec::new();
+    for session in sessions.iter() {
+        if sessions_left <= limits.max_sessions && bytes_left <= limits.max_bytes {
+            break;
+        }
+        if session.modified.is_none() {
+            skipped.push(RetentionSkip {
+                path: session.path.clone(),
+                reason: "its age could not be read, so it is not deleted".to_string(),
+            });
+            continue;
+        }
+        deletions.push(session.name.clone());
+        sessions_left = sessions_left.saturating_sub(1);
+        bytes_left = bytes_left.saturating_sub(session.bytes);
+    }
+    (deletions, skipped)
 }
 
 fn is_safe_component(name: &str) -> bool {
-    !name.is_empty()
+    name != "."
+        && name != ".."
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains(':')
         && !name.contains('\0')
-        && name != "."
-        && name != ".."
+        && is_safe_artifact_name(name)
 }
 
 fn copy_folder(
@@ -356,11 +445,26 @@ fn copy_folder(
     found: &FoundArtifact,
     limits: &CopyLimits,
     copied: &mut CopiedSession,
+    state: &mut CopyState,
 ) -> Result<Artifact, StoreError> {
     let mut children = Vec::new();
-    let mut stack = vec![found.path.clone()];
+    let mut stack: Vec<(PathBuf, usize)> = vec![(found.path.clone(), 0)];
 
-    while let Some(folder) = stack.pop() {
+    while let Some((folder, depth)) = stack.pop() {
+        if state.stopped.is_some() {
+            break;
+        }
+        if depth > limits.max_depth {
+            state.stop(CopyStop::Depth);
+            copied.problems.push(CopyProblem {
+                source_id: found.source_id.clone(),
+                name: relative_name(&found.path, &folder),
+                kind: CopyProblemKind::DepthExceeded,
+                detail: "the folder is nested deeper than the copy limit".to_string(),
+            });
+            break;
+        }
+
         let entries = match std::fs::read_dir(&folder) {
             Ok(entries) => entries,
             Err(error) => {
@@ -374,6 +478,14 @@ fn copy_folder(
             }
         };
         for entry in entries {
+            if state.stopped.is_some() {
+                break;
+            }
+            state.entries += 1;
+            if state.entries > limits.max_entries {
+                state.stop(CopyStop::Entries);
+                break;
+            }
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -409,18 +521,28 @@ fn copy_folder(
                 continue;
             }
             if metadata.is_dir() {
-                stack.push(path);
+                stack.push((path, depth + 1));
                 continue;
             }
             if !metadata.is_file() {
                 continue;
             }
             let relative = relative_name(&found.path, &path);
+            if !is_safe_artifact_name(&relative) {
+                copied.problems.push(CopyProblem {
+                    source_id: found.source_id.clone(),
+                    name: relative,
+                    kind: CopyProblemKind::UnsafeName,
+                    detail: "the name is not safe on this platform; it was not copied".to_string(),
+                });
+                continue;
+            }
             let (copy, privacy) = child_policy(&found.children, &relative)
                 .map(|policy| (policy.copy, policy.privacy))
                 .unwrap_or((found.copy, found.privacy));
-            let artifact = copy_file(
+            let Some(artifact) = copy_file(
                 dir,
+                &path,
                 found,
                 copy,
                 privacy,
@@ -429,7 +551,11 @@ fn copy_folder(
                 metadata.modified().ok(),
                 limits,
                 copied,
-            )?;
+                state,
+            )?
+            else {
+                continue;
+            };
             children.push(artifact);
         }
     }
@@ -443,19 +569,24 @@ fn copy_folder(
         hasher.update(b"\0");
     }
     let id = hex::encode(hasher.finalize());
-    let retained = if children.iter().any(|child| {
+    let kept_any = children.iter().any(|child| {
         !matches!(
             child.retained,
             Retained::NotRetained { .. } | Retained::FactsOnly
         )
-    }) {
+    });
+    let retained = if kept_any {
         Retained::Whole
+    } else if state.stopped.is_some() {
+        Retained::NotRetained {
+            why: "the folder copy stopped before its files were kept".to_string(),
+        }
     } else {
         Retained::NotRetained {
             why: "none of the folder's files could be kept".to_string(),
         }
     };
-    if retained == Retained::Whole {
+    if kept_any {
         copied.unavailable.insert(
             id.clone(),
             "the folder's files are kept as children".to_string(),
@@ -495,9 +626,23 @@ fn relative_name(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+/// How many bytes a copy would store, from its listed size and the policy. Used to refuse before
+/// writing, so a folder of large files cannot exceed the session budget.
+fn projected_stored_bytes(listed: u64, policy: CopyPolicy, limits: &CopyLimits) -> u64 {
+    let head_tail = policy == CopyPolicy::HeadTail || listed > limits.max_file_bytes;
+    if head_tail {
+        let head = limits.head_bytes.min(listed);
+        let tail = limits.tail_bytes.min(listed.saturating_sub(head));
+        head.saturating_add(tail)
+    } else {
+        listed
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn copy_file(
     dir: &Path,
+    source_path: &Path,
     found: &FoundArtifact,
     policy: CopyPolicy,
     privacy: Privacy,
@@ -506,7 +651,8 @@ fn copy_file(
     modified: Option<std::time::SystemTime>,
     limits: &CopyLimits,
     copied: &mut CopiedSession,
-) -> Result<Artifact, StoreError> {
+    state: &mut CopyState,
+) -> Result<Option<Artifact>, StoreError> {
     let mut artifact = Artifact {
         id: String::new(),
         name,
@@ -523,6 +669,7 @@ fn copy_file(
     let unavailable = |artifact: &mut Artifact, copied: &mut CopiedSession, why: &str| {
         let id = synthetic_id(&found.source_id, &artifact.name);
         artifact.id = id.clone();
+        artifact.size = 0;
         artifact.retained = Retained::NotRetained {
             why: why.to_string(),
         };
@@ -536,21 +683,68 @@ fn copy_file(
                 copied,
                 "this source is never copied; its parser reads it where it lies",
             );
-            return Ok(artifact);
+            return Ok(Some(artifact));
         }
         CopyPolicy::FactsOnly => {
             let id = synthetic_id(&found.source_id, &artifact.name);
             artifact.id = id.clone();
+            artifact.size = 0;
             artifact.retained = Retained::FactsOnly;
             copied
                 .unavailable
                 .insert(id, "only this artifact's facts were kept".to_string());
-            return Ok(artifact);
+            return Ok(Some(artifact));
         }
         CopyPolicy::Whole | CopyPolicy::HeadTail => {}
     }
 
-    let mut source = match File::open(&found.path) {
+    if state.files >= limits.max_files {
+        state.stop(CopyStop::Files);
+        return Ok(None);
+    }
+    let projected = projected_stored_bytes(size_hint, policy, limits);
+    if state.bytes.saturating_add(projected) > limits.max_total_bytes {
+        state.stop(CopyStop::TotalBytes);
+        return Ok(None);
+    }
+    let remaining = limits.max_total_bytes.saturating_sub(state.bytes);
+
+    // Check again, now, in case the file became a junction or symlink since collection. A small
+    // window remains between this check and `open`; that is acceptable because this code only
+    // reads the source and never writes through it.
+    match std::fs::symlink_metadata(source_path) {
+        Ok(metadata) if crate::content_store::is_reparse_point_or_symlink(&metadata) => {
+            copied.problems.push(CopyProblem {
+                source_id: found.source_id.clone(),
+                name: artifact.name.clone(),
+                kind: CopyProblemKind::ReparseSkipped,
+                detail: "the file became a junction or symlink before it was copied".to_string(),
+            });
+            unavailable(
+                &mut artifact,
+                copied,
+                "the file became a junction or symlink before it could be copied",
+            );
+            return Ok(Some(artifact));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            copied.problems.push(CopyProblem {
+                source_id: found.source_id.clone(),
+                name: artifact.name.clone(),
+                kind: CopyProblemKind::Vanished,
+                detail: error.to_string(),
+            });
+            unavailable(
+                &mut artifact,
+                copied,
+                "the file disappeared before it could be copied",
+            );
+            return Ok(Some(artifact));
+        }
+        _ => {}
+    }
+
+    let mut source = match File::open(source_path) {
         Ok(file) => file,
         Err(error) => {
             let (kind, why) = if error.kind() == std::io::ErrorKind::NotFound {
@@ -571,26 +765,28 @@ fn copy_file(
                 detail: error.to_string(),
             });
             unavailable(&mut artifact, copied, &why);
-            return Ok(artifact);
+            return Ok(Some(artifact));
         }
     };
 
-    let size = source
+    let listed = source
         .metadata()
         .map_err(|source_error| StoreError::Read {
-            path: found.path.clone(),
+            path: source_path.to_path_buf(),
             source: source_error,
         })?
         .len();
-    artifact.size = size;
-
-    let head_tail = policy == CopyPolicy::HeadTail || size > limits.max_file_bytes;
-    let (head, tail) = if head_tail {
-        let head = limits.head_bytes.min(size);
-        let tail = limits.tail_bytes.min(size.saturating_sub(head));
+    let store_cap = limits.max_file_bytes.min(remaining);
+    let head_tail = policy == CopyPolicy::HeadTail || listed > limits.max_file_bytes;
+    let (head_target, tail_target) = if head_tail {
+        let head = limits.head_bytes.min(listed).min(store_cap);
+        let tail = limits
+            .tail_bytes
+            .min(listed.saturating_sub(head))
+            .min(store_cap.saturating_sub(head));
         (head, tail)
     } else {
-        (size, 0)
+        (listed.min(store_cap), 0)
     };
 
     let temp = dir.join(format!(
@@ -610,75 +806,64 @@ fn copy_file(
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; READ_CHUNK];
     let mut read_error = None;
+    let mut actual_head = 0u64;
+    let mut actual_tail = 0u64;
+    let mut head_newlines = 0u64;
 
-    if head_tail {
-        let mut remaining = head;
-        while remaining > 0 {
-            let want = remaining.min(buffer.len() as u64) as usize;
-            match source.read(&mut buffer[..want]) {
-                Ok(0) => break,
-                Ok(read) => {
-                    hasher.update(&buffer[..read]);
-                    if let Err(source) = output.write_all(&buffer[..read]) {
-                        let _ = std::fs::remove_file(&temp);
-                        return Err(StoreError::Write {
-                            path: temp.clone(),
-                            source,
-                        });
-                    }
-                    remaining -= read as u64;
+    // Head (or the whole file).
+    let mut remaining_head = head_target;
+    while remaining_head > 0 {
+        let want = remaining_head.min(buffer.len() as u64) as usize;
+        match source.read(&mut buffer[..want]) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Err(source) = output.write_all(&buffer[..read]) {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(StoreError::Write {
+                        path: temp.clone(),
+                        source,
+                    });
                 }
-                Err(error) => {
-                    read_error = Some(error);
-                    break;
-                }
+                head_newlines +=
+                    buffer[..read].iter().filter(|byte| **byte == b'\n').count() as u64;
+                hasher.update(&buffer[..read]);
+                actual_head += read as u64;
+                remaining_head -= read as u64;
             }
-        }
-        if read_error.is_none() && tail > 0 {
-            if let Err(error) = source.seek(SeekFrom::Start(size.saturating_sub(tail))) {
+            Err(error) => {
                 read_error = Some(error);
-            } else {
-                let mut remaining = tail;
-                while remaining > 0 {
-                    let want = remaining.min(buffer.len() as u64) as usize;
-                    match source.read(&mut buffer[..want]) {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            hasher.update(&buffer[..read]);
-                            if let Err(source) = output.write_all(&buffer[..read]) {
-                                let _ = std::fs::remove_file(&temp);
-                                return Err(StoreError::Write {
-                                    path: temp.clone(),
-                                    source,
-                                });
-                            }
-                            remaining -= read as u64;
-                        }
-                        Err(error) => {
-                            read_error = Some(error);
-                            break;
-                        }
-                    }
-                }
+                break;
             }
         }
-    } else {
-        loop {
-            match source.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    hasher.update(&buffer[..read]);
-                    if let Err(source) = output.write_all(&buffer[..read]) {
-                        let _ = std::fs::remove_file(&temp);
-                        return Err(StoreError::Write {
-                            path: temp.clone(),
-                            source,
-                        });
+    }
+
+    // Tail, when there is one and the file did not shrink below it.
+    if read_error.is_none() && tail_target > 0 {
+        let tail_start = listed.saturating_sub(tail_target);
+        if let Err(error) = source.seek(SeekFrom::Start(tail_start)) {
+            read_error = Some(error);
+        } else {
+            let mut remaining_tail = tail_target;
+            while remaining_tail > 0 {
+                let want = remaining_tail.min(buffer.len() as u64) as usize;
+                match source.read(&mut buffer[..want]) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if let Err(source) = output.write_all(&buffer[..read]) {
+                            let _ = std::fs::remove_file(&temp);
+                            return Err(StoreError::Write {
+                                path: temp.clone(),
+                                source,
+                            });
+                        }
+                        hasher.update(&buffer[..read]);
+                        actual_tail += read as u64;
+                        remaining_tail -= read as u64;
                     }
-                }
-                Err(error) => {
-                    read_error = Some(error);
-                    break;
+                    Err(error) => {
+                        read_error = Some(error);
+                        break;
+                    }
                 }
             }
         }
@@ -706,9 +891,11 @@ fn copy_file(
             copied,
             &format!("the file could not be read: {error}"),
         );
-        return Ok(artifact);
+        return Ok(Some(artifact));
     }
 
+    let stored = actual_head.saturating_add(actual_tail);
+    let omitted = listed.saturating_sub(stored);
     let id = hex::encode(hasher.finalize());
     let object = dir.join(&id);
     if object.exists() {
@@ -721,13 +908,28 @@ fn copy_file(
     }
 
     artifact.id = id.clone();
-    artifact.retained = if head_tail {
-        Retained::HeadTail { head, tail }
-    } else {
+    artifact.size = stored;
+    artifact.retained = if omitted == 0 {
         Retained::Whole
+    } else {
+        Retained::HeadTail {
+            head: actual_head,
+            tail: actual_tail,
+        }
     };
+    if omitted > 0 && actual_tail > 0 {
+        copied.gaps.insert(
+            id.clone(),
+            LineGap {
+                at_line: head_newlines,
+                omitted_bytes: omitted,
+            },
+        );
+    }
     copied.objects.insert(id, object);
-    Ok(artifact)
+    state.files += 1;
+    state.bytes = state.bytes.saturating_add(stored);
+    Ok(Some(artifact))
 }
 
 fn synthetic_id(source_id: &str, name: &str) -> String {
@@ -792,28 +994,32 @@ fn measure_tree(folder: &Path, report: &mut RetentionReport) -> (u64, bool) {
 
 /// Remove ordinary files and empty folders under `path`, never a reparse point. Every resolved
 /// path is checked against the store root first, so a link planted inside cannot delete outside.
-fn remove_tree_inside(
-    root_real: &Path,
-    path: &Path,
-) -> Result<(u64, Vec<RetentionSkip>), StoreError> {
+fn remove_tree_inside(root_real: &Path, path: &Path) -> (u64, Vec<RetentionSkip>) {
     let mut freed = 0u64;
     let mut skipped = Vec::new();
     let mut stack = vec![path.to_path_buf()];
     let mut folders = Vec::new();
 
     while let Some(folder) = stack.pop() {
-        let entries = std::fs::read_dir(&folder).map_err(|source| StoreError::Read {
-            path: folder.clone(),
-            source,
-        })?;
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(source) => {
+                skipped.push(RetentionSkip {
+                    path: folder,
+                    reason: format!("could not be read: {source}"),
+                });
+                continue;
+            }
+        };
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(source) => {
-                    return Err(StoreError::Read {
+                    skipped.push(RetentionSkip {
                         path: folder.clone(),
-                        source,
-                    })
+                        reason: format!("could not be read: {source}"),
+                    });
+                    continue;
                 }
             };
             let path = entry.path();
@@ -849,11 +1055,13 @@ fn remove_tree_inside(
                 folders.push(path.clone());
                 stack.push(path);
             } else if metadata.is_file() {
-                std::fs::remove_file(&path).map_err(|source| StoreError::Write {
-                    path: path.clone(),
-                    source,
-                })?;
-                freed = freed.saturating_add(metadata.len());
+                match std::fs::remove_file(&path) {
+                    Ok(()) => freed = freed.saturating_add(metadata.len()),
+                    Err(source) => skipped.push(RetentionSkip {
+                        path,
+                        reason: format!("could not be removed: {source}"),
+                    }),
+                }
             }
         }
     }
@@ -861,15 +1069,22 @@ fn remove_tree_inside(
     // Deepest first, so every folder is empty by the time it is removed.
     folders.sort_by_key(|folder| std::cmp::Reverse(folder.components().count()));
     for folder in folders {
-        let _ = std::fs::remove_dir(&folder);
+        if let Err(source) = std::fs::remove_dir(&folder) {
+            skipped.push(RetentionSkip {
+                path: folder,
+                reason: format!("could not be removed: {source}"),
+            });
+        }
     }
     if skipped.is_empty() {
-        std::fs::remove_dir(path).map_err(|source| StoreError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        if let Err(source) = std::fs::remove_dir(path) {
+            skipped.push(RetentionSkip {
+                path: path.to_path_buf(),
+                reason: format!("could not be removed: {source}"),
+            });
+        }
     }
-    Ok((freed, skipped))
+    (freed, skipped)
 }
 
 /// Reads a copied artifact by id. Ids that were deliberately not kept say so; an id from another
@@ -877,6 +1092,7 @@ fn remove_tree_inside(
 pub struct StoreReads {
     files: BTreeMap<String, PathBuf>,
     unavailable: BTreeMap<String, String>,
+    gaps: BTreeMap<String, LineGap>,
     limits: ParserLimits,
     total: AtomicU64,
 }
@@ -966,30 +1182,27 @@ impl ScriptReads for StoreReads {
         max_lines: u32,
     ) -> Result<serde_json::Value, ScriptReadError> {
         let path = self.file(artifact)?;
-        let data = std::fs::read(path).map_err(|error| {
-            Self::refused("unreadable", format!("could not read the copy: {error}"))
+        let file = File::open(path).map_err(|error| {
+            Self::refused("unreadable", format!("could not open the copy: {error}"))
         })?;
-        self.spend(data.len() as u64)?;
-
+        let mut reader = BufReader::new(file);
         let max_lines = max_lines.min(self.limits.max_lines);
         let max_len = self.limits.max_line_len as usize;
-        let text = String::from_utf8_lossy(&data);
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = Vec::with_capacity((max_lines as usize).min(1024));
         let mut cut = false;
         let mut index = 0u64;
         let mut more = false;
+        let mut charged = 0u64;
+        let mut buffer = Vec::new();
 
-        let raw: Vec<&str> = if text.is_empty() {
-            Vec::new()
-        } else {
-            let mut parts: Vec<&str> = text.split('\n').collect();
-            if parts.last() == Some(&"") {
-                parts.pop();
+        loop {
+            buffer.clear();
+            let read = reader.read_until(b'\n', &mut buffer).map_err(|error| {
+                Self::refused("unreadable", format!("could not read the copy: {error}"))
+            })?;
+            if read == 0 {
+                break;
             }
-            parts
-        };
-
-        for line in raw {
             if index < from_line {
                 index += 1;
                 continue;
@@ -998,21 +1211,25 @@ impl ScriptReads for StoreReads {
                 more = true;
                 break;
             }
+            let text = String::from_utf8_lossy(&buffer);
+            let line = text.strip_suffix('\n').unwrap_or(&text);
             let line = line.strip_suffix('\r').unwrap_or(line);
             let (line, was_cut) = match line.char_indices().nth(max_len) {
                 Some((byte, _)) => (&line[..byte], true),
-                None if line.len() > max_len => (&line[..max_len], true),
                 None => (line, false),
             };
             cut |= was_cut;
+            charged = charged.saturating_add(line.len() as u64);
             lines.push(line.to_string());
             index += 1;
         }
+        self.spend(charged)?;
 
         serde_json::to_value(agora_game_api::crash::LinesReply {
             lines,
             next_line: more.then_some(index),
             cut,
+            gap: self.gaps.get(artifact).copied(),
         })
         .map_err(|error| Self::refused("unreadable", format!("could not encode lines: {error}")))
     }

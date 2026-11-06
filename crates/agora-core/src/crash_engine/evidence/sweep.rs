@@ -5,7 +5,7 @@
 //! is new or different since the last clean session. Bounds are stated when they stop the walk, so
 //! "not seen" is never mistaken for "clean".
 
-use super::source::is_reserved_artifact_name;
+use super::source::is_safe_artifact_name;
 use super::{unix_ms, SessionWindow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,6 +25,7 @@ pub struct SweepLimits {
     pub max_files: usize,
     pub max_bytes: u64,
     pub max_ms: u64,
+    pub max_depth: usize,
 }
 
 impl Default for SweepLimits {
@@ -33,6 +34,7 @@ impl Default for SweepLimits {
             max_files: 250_000,
             max_bytes: 4 * 1024 * 1024 * 1024,
             max_ms: 30_000,
+            max_depth: 32,
         }
     }
 }
@@ -91,6 +93,7 @@ pub enum SweepProblemKind {
     UnreadableRoot,
     UnreadableEntry,
     ReparseSkipped,
+    TooDeep,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,8 +169,8 @@ pub fn sweep(
             continue;
         }
 
-        let mut pending = vec![root.path.clone()];
-        while let Some(folder) = pending.pop() {
+        let mut pending = vec![(root.path.clone(), 0usize)];
+        while let Some((folder, depth)) = pending.pop() {
             let entries = match std::fs::read_dir(&folder) {
                 Ok(entries) => entries,
                 Err(error) => {
@@ -225,14 +228,23 @@ pub fn sweep(
                     continue;
                 }
                 if metadata.is_dir() {
-                    pending.push(path);
+                    if depth >= limits.max_depth {
+                        result.problems.push(SweepProblem {
+                            root: root.name.clone(),
+                            path,
+                            kind: SweepProblemKind::TooDeep,
+                            detail: "the folder is nested deeper than the sweep limit".to_string(),
+                        });
+                        continue;
+                    }
+                    pending.push((path, depth + 1));
                     continue;
                 }
                 if !metadata.is_file() {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !is_text_log_name(&name) || is_reserved_artifact_name(&name) {
+                if !is_text_log_name(&name) || !is_safe_artifact_name(&name) {
                     continue;
                 }
 
@@ -290,7 +302,9 @@ pub fn sweep(
         }
     }
 
-    result.baseline_complete = result.stopped_early.is_none();
+    // A sweep with any problem or early stop is incomplete. It must never replace the last good
+    // baseline, or a folder Agora could not read would look clean next time.
+    result.baseline_complete = result.stopped_early.is_none() && result.problems.is_empty();
     result
         .facts
         .sort_by(|left, right| (&left.root, &left.path).cmp(&(&right.root, &right.path)));
