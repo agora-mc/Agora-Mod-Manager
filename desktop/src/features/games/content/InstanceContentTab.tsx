@@ -273,7 +273,7 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
           preferencesKey="agora.installed-content.v2.game"
           title="Content"
           contentLabel="content"
-          description="What this instance uses, in load order. Lower rows load first, so a later row wins when two items change the same file."
+          description="What this instance uses, in load order. Items load from the top down, so when two change the same file, the lower one wins."
           rows={panelRows}
           locked={false}
           availableColumns={GAME_CONTENT_COLUMNS}
