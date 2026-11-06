@@ -4992,3 +4992,77 @@ A plugin contributes **crash packs**: JSON files listed under `contributions.cra
 **The linter** (`lint_pack_json`) refuses unknown fields; a text match with no bound and nothing else required; a rule that could fire on an empty log; a raw address without an exact game build; wording that claims certainty ("definitely", "guaranteed" and the like; the list is English, checked in every locale); a suspect that isn't a ref, or isn't always bound; a mechanism that accuses someone; a finding resting only on a boost-only kind of evidence, such as local memory; a primary source with no way to tie it to a session. Levels are `not_sure`, `possible`, `likely`, `very_likely`; there is no way to write "certain". Rules are not reviewed or capped (§30.5); `fixtures` are optional and nothing demands them.
 
 *Deferred until a game needs them:* derivers, scanners, bisect edges, rule macros, scoring profiles. The `agora-game-api` dependency list widens to `serde_json` and `regex` for this.
+
+### 30.12 The platform contract
+
+*(Designed 2026-11-06 from a code audit at `be77aaee`. Details §30.3 only lists. The format is free to change until its first public release, and Agora has no users, so old fields are replaced rather than kept alongside.)*
+
+**Conditions.** One type, `agora_game_api::condition::Condition`, in JSON:
+
+```json
+{ "present": "r6/scripts/*" }
+{ "framework": "red4ext", "version": { "min": "1.20" } }
+{ "version": { "below": "2.0" } }
+{ "all": [] } { "any": [] } { "not": {} }
+```
+
+`present` looks in the instance's merged view, `framework` at installed frameworks, and a bare `version` at the game. It returns `Truth`, the three-valued type moved here from the crash contract along with `VersionGate`, which the crash rules keep using. **Absent is unknown, not false.** A `when` applies only on true. On unknown, the thing doesn't apply and the launch log says it couldn't tell. Crash rules keep their own richer `Condition`: it asks about facts, this one about an instance.
+
+Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a framework's launch choice (replacing `when_present`), `content_rules` and `before_launch`.
+
+**Load orders.** `load_orders` replaces `plugin_list`:
+
+```json
+{ "id": "plugins", "name": "Plugins",
+  "file": "Plugins.txt",
+  "items": { "folder": "Data", "patterns": ["*.esp"], "folders": false },
+  "format": { "type": "lines", "active_prefix": "*", "header": [] },
+  "rules": { "kind": "creation_engine", "implicit": [], "implicit_list_file": null, "loot": null } }
+```
+
+- `format` is `lines` or `{ "type": "script", "parse": "fn", "render": "fn" }`, so an author can target a format Agora has never heard of.
+- `rules.kind` is `none` (any order works), `script` (`{ "kind": "script", "entry": "fn" }`, returning `LoadOrderRule`s) or `creation_engine`.
+- `creation_engine` stays in core only until the plugin split moves it out. It's the one built-in, and no new built-ins get added.
+- `items.folders` lets a list order folders, as with REDmod's `mods/<name>`.
+
+**Content rules.** `content_rules` replaces its unread namesake. They're read in `decide_placement` before `content_layout`, first match wins, and they decide a whole item's placement, as today:
+
+```json
+{ "kind": "REDmod mod", "match": { "marker": "info.json" }, "mount": "mods/{folder}", "when": null }
+{ "kind": "Archive mod", "match": { "all_files": "*.archive" }, "mount": "archive/pc/mod" }
+```
+
+`marker` finds a file at any depth up to the layout's limit, and `source_path` becomes the folder holding it. `{folder}` is that folder's name, or the item's when it's the root. A rule whose mount leaves the instance is refused at registration, and `{folder}` is checked again at placement, since it comes from an archive. No match falls through to `content_layout`, then a script `classify` hook, then the existing Unknown prompt.
+
+**Tools.** `ToolDefinition` gains:
+
+```json
+"inputs": [{ "id": "profile", "label": "Profile", "kind": "file|folder|choice|text|flag", "required": false, "default": null, "choices": [], "arg": "--profile" }],
+"scope": "instance|item",
+"input_files": ["mods/*"],
+"before_launch": { "mode": "run|ask", "when": null }
+```
+
+- Input values are stored per instance. `scope: "item"` runs once per content item the user picks.
+- `input_files` narrows the staleness fingerprint when present. Absent keeps today's fingerprint of all content.
+- `before_launch` turns on when the tool has never run, or is stale, and `when` is true. `run` runs it visibly before launch; `ask` offers it. **Either way the player can launch anyway**, because every protection has an override (§26). A failed `run` stops and offers the same choice.
+
+**Inheritance.** `parents` plus a new package field, `game_templates: { "<id>": { partial game } }`, and a game's `extends: "<id>"`:
+
+- Merging happens on raw JSON, **before** a game is parsed into `GameDefinition`, so a template can be partial.
+- Rules: objects merge deeply; scalars take the child's; arrays of objects with an `id` merge by `id`, parent first, keeping a replaced item's position; other arrays concatenate, parent first; `null` removes a field.
+- A package's `frameworks` and `tools` come along from its parents by the same rule.
+- All packages are read first, then resolved in dependency order. A missing parent, missing template or cycle is an error naming the chain, shown as a plugin warning, and that package doesn't register. Other packages carry on.
+
+**Scripts.** Plugin scripts reach game instances, through the same slots Minecraft fills:
+
+- A package's `behaviours` names plugin entrypoint functions: `{ "detect_runtime": "fn", "classify": "fn", "recognize_download": "fn", "load_order_rules": "fn", "diagnostics": "fn", "prepare_launch": "fn" }`. `ScriptedPackage` implements `GamePackage` over them. Core calls every hook: none stays dead.
+- `InstanceBackend` gets a generic-game implementation, so `instances.*` and `content.*` work for every game.
+- **Reads:** `game:read`. Scoped reads of an instance's merged view by game path, generalising `ScriptReads`, with no real paths given to the script, and byte budgets. Reparse points aren't followed.
+- **Writes:** `game:write`. Only into that plugin's own generated layer for that instance, with budgets. A script never writes to the game, a save, or another layer. Load orders are written by core, from what the script returns.
+- **A recipe's executable must be a game path inside the instance's view.** A script asking for anything else is refused and the player is told. Running outside the sandbox is the helper-program tier (§30.2), not this.
+- Official plugins may carry an entrypoint: `official.rs` stops refusing it, and the registry's pinned hash covers it. They get no capability a community plugin can't ask for.
+
+**Removed.** `native_code_patterns` is declared and enforced nowhere, so it reads as a protection that doesn't exist.
+
+**Proof.** The Cyberpunk tracer package must give a working modded game using only this section: REDmod placement, a before-launch `redmod deploy`, a script-parsed framework version. A test walks it through with no real game, and the author guide documents exactly the fields official plugins use, checked by script.
