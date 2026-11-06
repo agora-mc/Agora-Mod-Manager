@@ -1,0 +1,48 @@
+{
+  "contract": 1,
+  "producer": { "format": "crash_logger", "version": "1.2" },
+  "facts": [
+    {
+      "kind": "core.process",
+      "attrs": { "pid": 4242, "image": "SkyrimSE.exe", "image_version": "1.6.9999" }
+    },
+    {
+      "kind": "core.exception",
+      "attrs": { "class": "EXAMPLE_ACCESS_VIOLATION", "category": "access_violation", "access": "read", "pointer_class": "non_canonical", "fault_address": "0xFFFFFFFFFFFFFFFF" },
+      "span": { "section": "exception", "line_start": 3 }
+    },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 0, "kind": "probable", "rva": "0x0123450", "symbol_scheme": "addrlib-ae", "symbol": "10001", "symbol_offset": 8 },
+      "refs": [{ "kind": "module", "value": "SkyrimSE.exe", "strength": "exec_top" }]
+    },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 1, "kind": "probable", "rva": "0x0456780", "symbol_scheme": "addrlib-ae", "symbol": "10002", "symbol_offset": 16 },
+      "refs": [{ "kind": "module", "value": "SkyrimSE.exe", "strength": "exec" }]
+    },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 2, "kind": "probable", "rva": "0x00ABCD0" },
+      "refs": [{ "kind": "module", "value": "ExamplePhysics.dll", "strength": "exec" }]
+    },
+    {
+      "kind": "core.module",
+      "attrs": { "version": "2.0.0", "base_address": "0x7FF600000000" },
+      "refs": [{ "kind": "module", "value": "ExamplePhysics.dll" }]
+    },
+    {
+      "kind": "creation.object",
+      "attrs": { "location": "R13", "type": "ExampleTriShape*", "name": "ExampleHairStrand" },
+      "refs": [{ "kind": "file", "value": "meshes/example/hair.nif", "strength": "object" }]
+    }
+  ],
+  "bucket": [
+    { "scheme": "addrlib-ae", "value": "10001+0x8" },
+    { "scheme": "addrlib-ae", "value": "10002+0x10" }
+  ],
+  "coverage": [
+    { "kind": "core.log_line", "state": "not_applicable" },
+    { "kind": "creation.model_request", "state": "absent", "why": "This logger version has no model section." }
+  ]
+}

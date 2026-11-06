@@ -175,8 +175,10 @@ dependencies = [
 name = "agora-game-api"
 version = "0.9.5"
 dependencies = [
+ "regex",
  "semver",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

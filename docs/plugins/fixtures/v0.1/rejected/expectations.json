@@ -140,6 +140,12 @@
     "messageContains": "game:define",
     "why": "A game package defines games, their stores, versions, folders, and how to launch them. Contributing a game package without the game:define capability is refused."
   },
+  "crash-pack-without-capability.json": {
+    "stage": "manifest",
+    "code": "INVALID_MANIFEST",
+    "messageContains": "crash:contribute",
+    "why": "A crash pack reads crash evidence and adds suspects to a diagnosis. Contributing one without the crash:contribute capability is refused."
+  },
   "game-package-escapes-package.json": {
     "stage": "manifest",
     "code": "INVALID_MANIFEST",

@@ -4194,7 +4194,7 @@ plugin's definition file.
 **Dependency direction.** Contracts at the bottom, no cycles, no side door:
 
 ```
-agora-plugin-api    agora-game-api                 (contracts: serde, semver, thiserror only)
+agora-plugin-api    agora-game-api                 (contracts: serde, semver, thiserror; game-api adds serde_json and regex, §30.11)
         ^              ^        ^
         |              |        |
     agora-core --------+        agora-game-minecraft, agora-game-creation
@@ -4965,3 +4965,30 @@ Reuse is allowed from Agora-compatible code only: Aternos's `codex-minecraft` (M
 The importer reads a copy of Vortex's state (opening the original changes it). A clean base is built by subtraction from the store's file list, and files found only in the game folder are reported, never silently lost.
 
 **Cleaning up a game folder is a separate, explicit user option,** with a list of what it would remove and a backup first, for people who want to use their install directly, or whose Vortex refuses to work with it. Agora never does this on its own. This replaces §26.10's offer to purge during import.
+
+### 30.11 The crash contract
+
+*(Built: slice 1.1. Types, linter and worked examples only; no evaluator, sweep, host or UI yet. Lives in `agora_game_api::crash`, version `CRASH_CONTRACT_VERSION`, not frozen until the Creation Engine parsers exist.)*
+
+A plugin contributes **crash packs**: JSON files listed under `contributions.crashPacks`, needing the `crash:contribute` capability. Official and community packs are the same thing. A compiled game package has no separate path; its pack ships in a plugin. A game's normal exit codes stay in `session.normal_exit_codes`.
+
+| Slot | Says | What it is |
+|---|---|---|
+| `sources` | Where crash evidence appears, how to tie it to a session (process id, working folder, or time), how much to keep, how private it is | Data |
+| `parsers` | Turn an artifact into facts | A script export, a WebAssembly export, or a generic parser in core configured by data. **All three use one contract** |
+| `inspectors` | Open one file a rule points at and report pass, fail or unknown | Same contract |
+| `ref_maps` | How a named thing (module, plugin, file, form, class, or a kind the game invents) traces to the mod providing it | Data |
+| `roles` | What part a named thing plays: system, platform, framework, hook framework. Works on any kind, because a Java frame names a class, not a module | Data |
+| `rules` | Conditions over facts, and what follows: a clue against a suspect, a finding, a warning about the evidence | Data |
+
+**Facts.** A parser returns facts as JSON: a kind, flat attributes, and refs naming what the fact mentions. `core.*` kinds are a small closed vocabulary (exception, frame, module, process, system, load verdict, dependency problem, log line). Anything else is the plugin's own and core never interprets it. Addresses travel as text, because a script's numbers hold 53 bits.
+
+**Absent is not false.** A parser says what it looked for. A rule asking about something nobody looked for comes out unknown and shows up as "could not check". So a rule has no prerequisites list: what it asks is what it needs, and it can't forget one.
+
+**Parsers see no paths.** A parser gets a name and an id, and two read operations (`read_bytes`, `read_lines`) reaching only that artifact and its children, within limits stated in the request. Its output is untrusted: an invalid one, a timeout or a crash becomes "could not check", naming the plugin, never "nothing found". The host stamps who said what, so a pack can't claim another plugin's name.
+
+**Rules hold only generic operators.** `all`, `any`, `not`, `at_least`, `fact`, `count`, and `text` as a labelled escape hatch. Session, history, changes and ownership are facts the engine writes, so they need no operators of their own and core stays free of game words. The design's named predicates are gone for the same reason.
+
+**The linter** (`lint_pack_json`) refuses unknown fields; a text match with no bound and nothing else required; a rule that could fire on an empty log; a raw address without an exact game build; wording that claims certainty ("definitely", "guaranteed" and the like; the list is English, checked in every locale); a suspect that isn't a ref, or isn't always bound; a mechanism that accuses someone; a finding resting only on a boost-only kind of evidence, such as local memory; a primary source with no way to tie it to a session. Levels are `not_sure`, `possible`, `likely`, `very_likely`; there is no way to write "certain". Rules are not reviewed or capped (§30.5); `fixtures` are optional and nothing demands them.
+
+*Deferred until a game needs them:* derivers, scanners, bisect edges, rule macros, scoring profiles. The `agora-game-api` dependency list widens to `serde_json` and `regex` for this.

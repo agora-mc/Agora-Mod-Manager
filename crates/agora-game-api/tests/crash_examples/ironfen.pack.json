@@ -1,0 +1,85 @@
+{
+  "contract": 1,
+  "games": ["ironfen"],
+  "sources": [
+    {
+      "id": "dump",
+      "where": { "root": "runtime", "path": "CrashDumps" },
+      "match": { "glob": "*.ifd" },
+      "format": "ironfen_crash",
+      "bind": [{ "time": { "before_s": 2, "after_s": 10 } }],
+      "role": "primary"
+    },
+    {
+      "id": "game_log",
+      "where": { "root": "runtime", "path": "" },
+      "match": { "glob": "game.log" },
+      "format": "ironfen_log"
+    }
+  ],
+  "parsers": [
+    {
+      "id": "ironfen_crash",
+      "entry": { "script": { "export": "parseCrash" } },
+      "detect": { "name_glob": "*.ifd", "magic_hex": "49464644" },
+      "limits": {
+        "max_ms": 2000, "max_read_bytes": 65536, "max_total_read_bytes": 1048576, "max_lines": 1000,
+        "max_line_len": 1024, "max_facts": 300, "max_refs_per_fact": 4, "max_attr_len": 512,
+        "max_list_len": 8, "max_bucket_parts": 2, "max_notes": 8
+      }
+    },
+    {
+      "id": "ironfen_log",
+      "entry": { "generic": { "name": "text_sections", "config": { "sections": [{ "id": "errors", "header": "^== ERRORS ==$" }] } } }
+    }
+  ],
+  "inspectors": [
+    { "id": "pak_table", "accepts": ["*.ifpak"], "entry": { "script": { "export": "inspectPak" } } }
+  ],
+  "ref_maps": [
+    { "kind": "script", "lookup": { "index": "ifscript" }, "match": "casefold" },
+    { "kind": "asset", "lookup": { "path": { "patterns": ["Mods/*/{value}"], "archives": true } }, "match": "casefold" }
+  ],
+  "roles": [
+    { "kind": "module", "value": "ironfenengine.dll", "match": "casefold", "role": "platform" }
+  ],
+  "rules": [
+    {
+      "id": "script_error_at_crash",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "ironfen.script_error",
+          "ref": { "kind": "script", "strength": "exec_top", "bind": "s" },
+          "bind": { "line": "line" }
+        }
+      },
+      "effects": [
+        { "signal": { "family": "execution", "candidate": { "owner_of": "s" }, "weight": 16 } }
+      ],
+      "text": {
+        "headline": {
+          "en": "A script from {owner:s} was running when the game crashed (line {line}).",
+          "de": "Ein Skript von {owner:s} lief beim Absturz (Zeile {line})."
+        }
+      },
+      "repairs": [{ "disable_content": { "key": { "owner_of": "s" } } }],
+      "next_step": "confirm_experiment",
+      "fixtures": ["crash/fixtures/script_error.ifd"]
+    },
+    {
+      "id": "out_of_memory_with_little_free",
+      "version": 1,
+      "when": {
+        "all": [
+          { "fact": { "kind": "core.exception", "where": { "category": "oom" } } },
+          { "not": { "count": { "kind": "core.system", "where": { "ram_free_mb": { "gte": 512 } }, "at_least": 1 } } }
+        ]
+      },
+      "effects": [
+        { "finding": { "scope": "environment", "level": "possible" } }
+      ],
+      "text": { "headline": { "en": "The game ran out of memory, and this PC had little free." } }
+    }
+  ]
+}

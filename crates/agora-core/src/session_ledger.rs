@@ -32,6 +32,7 @@
 
 use std::io::{Read, Write};
 
+pub use agora_game_api::crash::{ExitObservation, MatchedBy, SessionVerdict};
 use agora_game_api::{GameDefinition, StoreId};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -43,66 +44,17 @@ use crate::launch_history::{LaunchResult, HISTORY_LIMIT};
 /// A session shorter than this that ended with a non-zero exit code probably never started.
 pub const FAILED_TO_START_MS: u64 = 120_000;
 
-/// How an artifact (a crash log) was tied to the session. Strongest first. This slice produces
-/// only [`MatchedBy::ExitStatus`]; the evidence slices add the rest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MatchedBy {
-    /// The game's exit code was an NTSTATUS failure code and no log was found.
-    ExitStatus,
-    /// The log names the process id Agora held.
-    Pid,
-    /// The log names this instance's working directory.
-    WorkingDir,
-    /// The log's time falls inside the session. Likely, not certain.
-    Time,
-}
-
-/// What Agora saw of the game's end.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ExitObservation {
-    /// The game's own process was held, and this is the code it exited with.
-    Code { pid: u32, image: String, code: u32 },
-    /// The exit could not be observed, and why. Never a guess.
-    Unavailable { reason: String },
-}
-
-impl ExitObservation {
-    pub fn unavailable(reason: impl Into<String>) -> Self {
-        Self::Unavailable {
-            reason: reason.into(),
-        }
-    }
-}
-
-impl Default for ExitObservation {
-    fn default() -> Self {
-        Self::unavailable("the session was not watched")
-    }
-}
-
-/// The game-free verdict on how a session ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionVerdict {
-    Crashed { how: MatchedBy },
-    FailedToStart,
-    Froze,
-    Stopped,
-    Normal,
-    ClosedUnknown,
-}
-
-impl SessionVerdict {
-    /// How the legacy history column describes this verdict. Only `Crashed` counts as a crash and
-    /// only `Normal` as ok; a start failure or an unknown ending claims neither.
-    pub fn as_result(self) -> LaunchResult {
-        match self {
-            Self::Crashed { .. } => LaunchResult::Crashed,
-            Self::Normal => LaunchResult::Ok,
-            Self::Stopped => LaunchResult::Stopped,
-            Self::FailedToStart | Self::Froze | Self::ClosedUnknown => LaunchResult::Unknown,
+impl From<SessionVerdict> for LaunchResult {
+    /// How the legacy history column describes a verdict. Only `Crashed` counts as a crash and only
+    /// `Normal` as ok; a start failure or an unknown ending claims neither.
+    fn from(verdict: SessionVerdict) -> Self {
+        match verdict {
+            SessionVerdict::Crashed { .. } => Self::Crashed,
+            SessionVerdict::Normal => Self::Ok,
+            SessionVerdict::Stopped => Self::Stopped,
+            SessionVerdict::FailedToStart
+            | SessionVerdict::Froze
+            | SessionVerdict::ClosedUnknown => Self::Unknown,
         }
     }
 }
@@ -755,7 +707,7 @@ fn write_end(
             duration_ms,
             serde_json::to_string(exit)?,
             serde_json::to_string(&judged)?,
-            judged.as_result().as_str(),
+            LaunchResult::from(judged).as_str(),
         ],
     )?;
     Ok(())
@@ -1512,16 +1464,15 @@ mod tests {
     fn only_crashed_counts_as_a_crash_and_only_normal_as_ok() {
         use SessionVerdict::*;
         assert_eq!(
-            Crashed {
+            LaunchResult::from(Crashed {
                 how: MatchedBy::Pid
-            }
-            .as_result(),
+            }),
             LaunchResult::Crashed
         );
-        assert_eq!(Normal.as_result(), LaunchResult::Ok);
-        assert_eq!(Stopped.as_result(), LaunchResult::Stopped);
+        assert_eq!(LaunchResult::from(Normal), LaunchResult::Ok);
+        assert_eq!(LaunchResult::from(Stopped), LaunchResult::Stopped);
         for other in [FailedToStart, Froze, ClosedUnknown] {
-            assert_eq!(other.as_result(), LaunchResult::Unknown);
+            assert_eq!(LaunchResult::from(other), LaunchResult::Unknown);
         }
     }
 }

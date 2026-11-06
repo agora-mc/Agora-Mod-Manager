@@ -63,6 +63,10 @@ pub enum Capability {
     /// Define games: their stores, versions, folders and how to launch them.
     #[serde(rename = "game:define")]
     GameDefine,
+    /// Add to Agora's crash diagnosis: where crash evidence appears, parsers that read that
+    /// evidence and nothing else, and rules that name suspects. Every finding names the plugin.
+    #[serde(rename = "crash:contribute")]
+    CrashContribute,
 }
 
 impl Capability {
@@ -78,6 +82,7 @@ impl Capability {
         Capability::Network,
         Capability::ContentProvide,
         Capability::GameDefine,
+        Capability::CrashContribute,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -92,6 +97,7 @@ impl Capability {
             Capability::Network => "network",
             Capability::ContentProvide => "content:provide",
             Capability::GameDefine => "game:define",
+            Capability::CrashContribute => "crash:contribute",
         }
     }
 
@@ -124,6 +130,9 @@ impl Capability {
             }
             Capability::GameDefine => {
                 "Define games: their stores, versions, folders and how to launch them"
+            }
+            Capability::CrashContribute => {
+                "Read your games' crash logs and add its own opinion to crash diagnoses"
             }
         }
     }
