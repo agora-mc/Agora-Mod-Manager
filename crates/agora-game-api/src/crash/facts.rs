@@ -140,7 +140,10 @@ pub const CORE_FACT_KINDS: &[(&str, &[&str])] = &[
             "line",
         ],
     ),
-    ("core.module", &["version", "sha256", "base_address"]),
+    (
+        "core.module",
+        &["version", "sha256", "base_address", "size"],
+    ),
     (
         "core.process",
         &[

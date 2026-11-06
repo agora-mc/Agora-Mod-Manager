@@ -7,6 +7,7 @@
 mod answer;
 mod consensus;
 mod evaluate;
+pub mod parsers;
 mod profile;
 mod types;
 
