@@ -603,6 +603,7 @@ agora plugin list
 agora plugin status                         # alias for list
 agora plugin preview package <PATH>
 agora plugin preview development <PATH>
+agora plugin validate <PATH>
 agora plugin install package <PATH> [--yes] [--no-code]
 agora plugin install development <PATH> [--yes] [--no-code]
 agora plugin scripts <PLUGIN_ID> allow|deny
@@ -628,6 +629,8 @@ agora plugin sign <DOCUMENT> --key <PATH> --key-id <ID>
 `plugin list` reads the core-resolved install state without starting plugins. Its status column explains why an installed plugin is not runnable, including disabled plugins, incompatible host APIs, dependency problems, cycles, and recorded activation failures. `plugin status` is a convenience alias.
 
 `plugin preview` validates a package or development folder and prints the same install preview used by the install flow. It does not install or activate anything. A package is copied into Agora's managed plugin directory; a development folder is registered in place so edits remain visible to the author.
+
+`plugin validate` checks a development folder's manifest and every crash pack it contributes, without installing or running anything. Each problem names the pack file and, for a rule, the rule's id; the command exits non-zero when there is any problem. A pack path that escapes the folder, a missing or unparsable pack, and a pack written for another crash contract version are all reported. It runs no parser code, so it is safe on an untrusted folder.
 
 An install that requests capabilities prints each required or optional capability, its user-facing explanation, and whether it can change data, then asks for consent. Answer `y` or `yes` to continue. `--yes` skips this prompt for a deliberately scripted invocation:
 

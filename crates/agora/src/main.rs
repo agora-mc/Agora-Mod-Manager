@@ -1122,6 +1122,14 @@ enum PluginCmd {
         #[command(subcommand)]
         source: PluginSourceCmd,
     },
+    /// Check a development folder's manifest and crash packs without installing.
+    ///
+    /// Prints every lint problem with the file it came from and, for a rule,
+    /// the rule's id. Exits non-zero if anything is wrong.
+    Validate {
+        /// Path to the plugin's development folder (the one holding agora-plugin.json).
+        path: PathBuf,
+    },
     /// Install a package or register a development folder.
     Install {
         #[command(subcommand)]
@@ -2827,6 +2835,32 @@ async fn run_plugin_command(
         PluginCmd::Preview { source } => {
             let preview = preview_plugin_source(service, &source)?;
             print_plugin_preview(&preview, json, false)?;
+        }
+        PluginCmd::Validate { path } => {
+            let report = agora_core::crash_packs::validate_plugin_folder(&path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for problem in &report.problems {
+                    println!("{problem}");
+                }
+                for pack in &report.packs {
+                    println!("{}: ok", pack.file);
+                }
+                if report.is_clean() {
+                    println!(
+                        "Validated {} crash pack(s) in {}.",
+                        report.packs.len(),
+                        path.display()
+                    );
+                }
+            }
+            if !report.is_clean() {
+                anyhow::bail!(
+                    "{} problem(s) in the plugin's crash packs",
+                    report.problems.len()
+                );
+            }
         }
         PluginCmd::Install {
             source,

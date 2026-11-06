@@ -86,6 +86,24 @@ export const net: {
    */
   fetchJson(url: string, options?: Record<string, Json>): Promise<{ status: number; body: Json }>;
 };
+/** The lines reply a crash parser gets from `crash.readLines`. */
+export interface CrashLinesReply {
+  lines: string[];
+  /** The line to ask for next; absent at the end of the artifact. */
+  next_line?: number;
+  /** Some line was longer than the limit and was cut. */
+  cut?: boolean;
+}
+export const crash: {
+  /**
+   * Bytes of the artifact in scope for this parser or inspector call. Returns an
+   * `ArrayBuffer`; a short reply at the end of the file is normal. Throws when
+   * this call has no artifact in scope.
+   */
+  readBytes(artifactId: string, offset: number, len: number): ArrayBuffer;
+  /** Text lines of the artifact in scope. Throws outside a parser call. */
+  readLines(artifactId: string, fromLine: number, maxLines: number): CrashLinesReply;
+};
 export const log: { debug(...values: unknown[]): void; info(...values: unknown[]): void; warn(...values: unknown[]): void; error(...values: unknown[]): void };
 export function on(eventName: string, handler: (event: PluginEvent) => void | Promise<void>): () => void;
 export function off(eventName: string, handler: (event: PluginEvent) => void | Promise<void>): void;

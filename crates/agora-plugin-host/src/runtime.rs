@@ -19,10 +19,13 @@
 //! is busy in a tight loop that yields to nothing.
 
 use agora_plugin_api::error::{PluginError, PluginErrorCode, PluginResult};
-use agora_plugin_api::host::{ActivationRequest, HostBridge};
+use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptReads};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel, PluginEventEnvelope};
 use rquickjs::function::Async;
-use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module, Object, Value};
+use rquickjs::{
+    ArrayBuffer, AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module, Object, Value,
+};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
@@ -30,6 +33,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::modules::{PackageLoader, PackageResolver};
 use crate::sdk::AGORA_MODULE;
+
+thread_local! {
+    /// The read scope of the call currently running on this plugin's thread.
+    /// One plugin, one thread, so a thread-local is exactly the right size: a
+    /// scope cannot leak to another plugin and cannot outlive its invocation.
+    static CURRENT_READS: RefCell<Option<Arc<dyn ScriptReads>>> = const { RefCell::new(None) };
+}
+
+fn current_reads() -> Option<Arc<dyn ScriptReads>> {
+    CURRENT_READS.with(|slot| slot.borrow().clone())
+}
 
 /// How many events may queue for one plugin before the oldest are dropped.
 ///
@@ -53,6 +67,7 @@ pub(crate) enum Control {
         export: String,
         args: serde_json::Value,
         timeout: Duration,
+        reads: Option<Arc<dyn ScriptReads>>,
         reply: SyncSender<PluginResult<serde_json::Value>>,
     },
     Deactivate {
@@ -206,8 +221,9 @@ async fn plugin_main(
                         let _ = reply.send(result);
                         break;
                     }
-                    Some(Control::Invoke { export, args, timeout, reply }) => {
-                        let result = invoke_export(&context, &deadline, &export, args, timeout).await;
+                    Some(Control::Invoke { export, args, timeout, reads, reply }) => {
+                        let result =
+                            invoke_export(&context, &deadline, &export, args, timeout, reads).await;
                         if let Err(error) = &result {
                             if error.code == PluginErrorCode::ScriptError {
                                 bridge.log(&plugin_id, LogLevel::Error, &format!("`{export}` failed: {}", error.message));
@@ -273,6 +289,27 @@ async fn build_context(
 
     install_host_api(&context, request, bridge.clone()).await?;
     Ok(context)
+}
+
+/// The QuickJS side of `crash.readBytes`. It is a named function rather than a
+/// closure so that its context and return value share one lifetime.
+fn crash_read_bytes<'js>(
+    ctx: Ctx<'js>,
+    artifact: String,
+    offset: u64,
+    len: u64,
+) -> rquickjs::Result<Value<'js>> {
+    let Some(reads) = current_reads() else {
+        return Err(rquickjs::Error::new_into_js_message(
+            "crash.readBytes",
+            "ArrayBuffer",
+            "there is no artifact in scope for this call",
+        ));
+    };
+    let bytes = reads.read_bytes(&artifact, offset, len).map_err(|error| {
+        rquickjs::Error::new_into_js_message("crash.readBytes", "ArrayBuffer", error.message)
+    })?;
+    Ok(ArrayBuffer::new(ctx, bytes)?.into_value())
 }
 
 async fn install_host_api(
@@ -344,6 +381,41 @@ async fn install_host_api(
             })
             .map_err(js_internal)?;
             globals.set("__agora_log", log_fn).map_err(js_internal)?;
+
+            // The scoped read primitives. They exist for every plugin, but a
+            // read outside a parser or inspector call has no scope and is
+            // refused, so their presence grants nothing on its own.
+            let read_bytes_fn = Function::new(ctx.clone(), crash_read_bytes).map_err(js_internal)?;
+            globals
+                .set("__agora_crash_read_bytes", read_bytes_fn)
+                .map_err(js_internal)?;
+
+            let read_lines_fn = Function::new(
+                ctx.clone(),
+                move |artifact: String, from_line: u64, max_lines: u32| -> rquickjs::Result<String> {
+                    let Some(reads) = current_reads() else {
+                        return Err(rquickjs::Error::new_into_js_message(
+                            "crash.readLines",
+                            "LinesReply",
+                            "there is no artifact in scope for this call",
+                        ));
+                    };
+                    let reply = reads
+                        .read_lines(&artifact, from_line, max_lines)
+                        .map_err(|error| {
+                            rquickjs::Error::new_into_js_message(
+                                "crash.readLines",
+                                "LinesReply",
+                                error.message,
+                            )
+                        })?;
+                    Ok(serde_json::to_string(&reply).unwrap_or_else(|_| "{}".into()))
+                },
+            )
+            .map_err(js_internal)?;
+            globals
+                .set("__agora_crash_read_lines", read_lines_fn)
+                .map_err(js_internal)?;
 
             globals
                 .set("__agora_api_version", api_version)
@@ -449,7 +521,7 @@ async fn run_optional_export(
     args: serde_json::Value,
     timeout: Duration,
 ) -> PluginResult<serde_json::Value> {
-    match call_export(context, deadline, export, args, timeout, true).await {
+    match call_export(context, deadline, export, args, timeout, true, None).await {
         Ok(value) => Ok(value),
         Err(e) if e.code == PluginErrorCode::NotActivated => Ok(serde_json::Value::Null),
         Err(e) => Err(e),
@@ -462,8 +534,9 @@ async fn invoke_export(
     export: &str,
     args: serde_json::Value,
     timeout: Duration,
+    reads: Option<Arc<dyn ScriptReads>>,
 ) -> PluginResult<serde_json::Value> {
-    call_export(context, deadline, export, args, timeout, false).await
+    call_export(context, deadline, export, args, timeout, false, reads).await
 }
 
 async fn call_export(
@@ -473,10 +546,13 @@ async fn call_export(
     args: serde_json::Value,
     timeout: Duration,
     optional: bool,
+    reads: Option<Arc<dyn ScriptReads>>,
 ) -> PluginResult<serde_json::Value> {
     let export_name = export.to_string();
     let args_json = serde_json::to_string(&args).unwrap_or_else(|_| "null".into());
     set_deadline(deadline, timeout);
+    // The scope is set on this plugin's own thread for exactly this call.
+    let previous_reads = CURRENT_READS.with(|slot| slot.replace(reads));
     let started = Instant::now();
 
     let work = context.async_with(
@@ -542,6 +618,8 @@ async fn call_export(
     // plugin is spinning, the interrupt wins and the error says so.
     let result = tokio::time::timeout(timeout + Duration::from_millis(250), work).await;
     clear_deadline(deadline);
+    // Restore the previous scope even when the call failed or timed out.
+    CURRENT_READS.with(|slot| *slot.borrow_mut() = previous_reads);
 
     match result {
         Ok(inner) => inner,

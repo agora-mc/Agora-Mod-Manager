@@ -954,6 +954,42 @@ impl PluginService {
             .collect()
     }
 
+    /// Load every runnable plugin's crash packs.
+    ///
+    /// One plugin's broken pack is reported and the rest still load. A plugin
+    /// that is disabled or cannot run contributes nothing, because its rules
+    /// must not speak for a game it is not part of.
+    pub fn crash_packs(&self) -> crate::crash_packs::CrashPackReport {
+        let installed: Vec<(String, PathBuf, PluginManifest)> = self
+            .inner
+            .resolution
+            .read()
+            .map(|resolution| {
+                resolution
+                    .runnable()
+                    .map(|plugin| {
+                        (
+                            plugin.id().as_str().to_string(),
+                            plugin.record.install_dir.clone(),
+                            plugin.record.manifest.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sources: Vec<crate::crash_packs::PluginPackSource<'_>> = installed
+            .iter()
+            .map(
+                |(plugin_id, root, manifest)| crate::crash_packs::PluginPackSource {
+                    plugin_id,
+                    root,
+                    manifest,
+                },
+            )
+            .collect();
+        crate::crash_packs::load_for_plugins(&sources)
+    }
+
     pub fn logs(&self, plugin_id: &PluginId, lines: usize) -> Vec<String> {
         logs::tail(&self.inner.logs_root, plugin_id, lines)
     }
