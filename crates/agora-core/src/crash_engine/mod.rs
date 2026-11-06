@@ -8,6 +8,7 @@
 //! into Agora's store, sweeps for changes and applies retention.
 
 mod answer;
+pub mod attribution;
 mod consensus;
 mod evaluate;
 mod profile;

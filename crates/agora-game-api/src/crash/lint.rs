@@ -181,6 +181,11 @@ pub fn lint_pack(pack: &CrashPack) -> Vec<LintProblem> {
                         "every path pattern needs `{value}`, or every ref would trace to one file",
                     ));
                 }
+                for pattern in patterns {
+                    if let Err(message) = check_path_pattern(pattern) {
+                        out.push(problem(LintCode::BadRefMap, &at, message));
+                    }
+                }
             }
             RefLookup::Index(index) if index.is_empty() => {
                 out.push(problem(LintCode::BadRefMap, &at, "`index` is empty"));
