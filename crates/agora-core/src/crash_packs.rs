@@ -241,11 +241,33 @@ pub fn load_plugin_packs(
         };
 
         match lint_pack_json(&text) {
-            Ok(pack) => report.packs.push(LoadedCrashPack {
-                plugin_id: plugin_id.to_string(),
-                file: relative,
-                pack,
-            }),
+            Ok(pack) => {
+                let mut config_problems = Vec::new();
+                for parser in &pack.parsers {
+                    if let CodeEntry::Generic { name, config } = &parser.entry {
+                        if let Err(message) =
+                            crate::crash_engine::parsers::validate_config(name, config)
+                        {
+                            config_problems.push(PackProblem::new(
+                                plugin_id,
+                                relative.clone(),
+                                format!("parser `{}`", parser.id),
+                                "parser_config",
+                                message,
+                            ));
+                        }
+                    }
+                }
+                if config_problems.is_empty() {
+                    report.packs.push(LoadedCrashPack {
+                        plugin_id: plugin_id.to_string(),
+                        file: relative,
+                        pack,
+                    });
+                } else {
+                    report.problems.extend(config_problems);
+                }
+            }
             Err(problems) => {
                 for problem in problems {
                     report.problems.push(PackProblem::new(
@@ -832,8 +854,65 @@ fn run_one(
     let request = &effective;
     let reads: Arc<dyn ScriptReads> = Arc::new(LimitedReads::new(reads, limits));
 
-    let export = match &parser.entry {
-        CodeEntry::Script { export } => export.clone(),
+    let value: serde_json::Value = match &parser.entry {
+        CodeEntry::Script { export } => {
+            let Ok(id) = agora_plugin_api::manifest::PluginId::parse(plugin_id) else {
+                return ParserDispatch::Failed(ParserFailure::new(
+                    plugin_id,
+                    &parser.id,
+                    ParserFailureKind::Internal,
+                    "the plugin id is not a valid id",
+                ));
+            };
+            let args = match serde_json::to_value(request) {
+                Ok(args) => args,
+                Err(error) => {
+                    return ParserDispatch::Failed(ParserFailure::new(
+                        plugin_id,
+                        &parser.id,
+                        ParserFailureKind::Internal,
+                        format!("could not encode the parser request: {error}"),
+                    ))
+                }
+            };
+            let timeout = Duration::from_millis(request.limits.max_ms);
+            match host.invoke_with_reads(&id, export, args, timeout, reads) {
+                Ok(value) => value,
+                Err(error) => {
+                    let kind = match error.code {
+                        agora_plugin_api::PluginErrorCode::Timeout => ParserFailureKind::TimedOut,
+                        agora_plugin_api::PluginErrorCode::ResourceExhausted => {
+                            ParserFailureKind::OutOfMemory
+                        }
+                        agora_plugin_api::PluginErrorCode::Cancelled => {
+                            ParserFailureKind::Cancelled
+                        }
+                        agora_plugin_api::PluginErrorCode::NotActivated => {
+                            ParserFailureKind::NotRunning
+                        }
+                        agora_plugin_api::PluginErrorCode::ScriptError
+                            if error.message.contains("exports no function named") =>
+                        {
+                            ParserFailureKind::MissingExport
+                        }
+                        agora_plugin_api::PluginErrorCode::ScriptError => {
+                            if error.message.contains("interrupted") {
+                                ParserFailureKind::TimedOut
+                            } else {
+                                ParserFailureKind::ScriptThrew
+                            }
+                        }
+                        _ => ParserFailureKind::Internal,
+                    };
+                    return ParserDispatch::Failed(ParserFailure::new(
+                        plugin_id,
+                        &parser.id,
+                        kind,
+                        error.message,
+                    ));
+                }
+            }
+        }
         CodeEntry::Wasm { .. } => {
             return ParserDispatch::Failed(ParserFailure::new(
                 plugin_id,
@@ -842,67 +921,34 @@ fn run_one(
                 "this build runs script parsers only; a WebAssembly host comes later",
             ))
         }
-        CodeEntry::Generic { .. } => {
-            return ParserDispatch::Failed(ParserFailure::new(
-                plugin_id,
-                &parser.id,
-                ParserFailureKind::UnsupportedEntry,
-                "generic parsers are not built yet; this pack names a script export instead",
-            ))
-        }
-    };
-
-    let Ok(id) = agora_plugin_api::manifest::PluginId::parse(plugin_id) else {
-        return ParserDispatch::Failed(ParserFailure::new(
-            plugin_id,
-            &parser.id,
-            ParserFailureKind::Internal,
-            "the plugin id is not a valid id",
-        ));
-    };
-    let args = match serde_json::to_value(request) {
-        Ok(args) => args,
-        Err(error) => {
-            return ParserDispatch::Failed(ParserFailure::new(
-                plugin_id,
-                &parser.id,
-                ParserFailureKind::Internal,
-                format!("could not encode the parser request: {error}"),
-            ))
-        }
-    };
-    let timeout = Duration::from_millis(request.limits.max_ms);
-
-    let value = match host.invoke_with_reads(&id, &export, args, timeout, reads) {
-        Ok(value) => value,
-        Err(error) => {
-            let kind = match error.code {
-                agora_plugin_api::PluginErrorCode::Timeout => ParserFailureKind::TimedOut,
-                agora_plugin_api::PluginErrorCode::ResourceExhausted => {
-                    ParserFailureKind::OutOfMemory
-                }
-                agora_plugin_api::PluginErrorCode::Cancelled => ParserFailureKind::Cancelled,
-                agora_plugin_api::PluginErrorCode::NotActivated => ParserFailureKind::NotRunning,
-                agora_plugin_api::PluginErrorCode::ScriptError
-                    if error.message.contains("exports no function named") =>
-                {
-                    ParserFailureKind::MissingExport
-                }
-                agora_plugin_api::PluginErrorCode::ScriptError => {
-                    if error.message.contains("interrupted") {
-                        ParserFailureKind::TimedOut
-                    } else {
-                        ParserFailureKind::ScriptThrew
+        CodeEntry::Generic { name, config } => {
+            match crate::crash_engine::parsers::run(name, config, request, reads.as_ref()) {
+                Ok(output) => match serde_json::to_value(&output) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return ParserDispatch::Failed(ParserFailure::new(
+                            plugin_id,
+                            &parser.id,
+                            ParserFailureKind::Internal,
+                            format!("could not encode the generic parser output: {error}"),
+                        ))
                     }
+                },
+                Err(error) => {
+                    let kind = match error.kind {
+                        crate::crash_engine::parsers::GenericErrorKind::TooManyFacts => {
+                            ParserFailureKind::InvalidOutput
+                        }
+                        _ => ParserFailureKind::Internal,
+                    };
+                    return ParserDispatch::Failed(ParserFailure::new(
+                        plugin_id,
+                        &parser.id,
+                        kind,
+                        format!("generic parser `{name}`: {}", error.message),
+                    ));
                 }
-                _ => ParserFailureKind::Internal,
-            };
-            return ParserDispatch::Failed(ParserFailure::new(
-                plugin_id,
-                &parser.id,
-                kind,
-                error.message,
-            ));
+            }
         }
     };
 
