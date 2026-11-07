@@ -6,6 +6,7 @@ import http.client
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import finalize_release_assets as fra
 import refresh_loader_manifests
 import validate_loader_catalog_delta
 import build_docs_web as bdw
+import check_package_docs as cpd
 import pin_hashes
 import stage_cli_sidecar
 import stage_vfs_files
@@ -3035,6 +3037,170 @@ class OfficialPluginPackageTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 bop.verify_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
         self.assertIn("current.sha256", str(caught.exception))
+
+
+class TestPackageDocsSurfaceCheck(unittest.TestCase):
+    """Tests for the game-package documentation surface check."""
+
+    def test_documented_names_are_inline_code_spans(self):
+        names = cpd.documented_names("Use `foo` and `bar`, not `baz qux`.")
+        self.assertEqual(names, {"foo", "bar", "baz qux"})
+
+    def test_map_values_are_not_schema_keys(self):
+        data = {
+            "game_templates": {"engine": {"content_layout": {"data_path": "Data"}}},
+            "environment": {"LD_PRELOAD": {"kind": "literal", "value": "x"}},
+            "behaviours": {"classify": "classifyItem"},
+        }
+        keys = {key for key, _ in cpd.iter_json_keys(data)}
+
+        self.assertIn("game_templates", keys)
+        self.assertIn("content_layout", keys)
+        self.assertIn("data_path", keys)
+        self.assertIn("environment", keys)
+        self.assertIn("kind", keys)
+        self.assertIn("value", keys)
+        self.assertIn("behaviours", keys)
+        self.assertIn("classify", keys)
+
+        self.assertNotIn("engine", keys)
+        self.assertNotIn("LD_PRELOAD", keys)
+        self.assertNotIn("classifyItem", keys)
+
+    def test_rust_fields_honour_serde_rename_and_skip_type_paths(self):
+        source = """
+pub struct ContentRule {
+    pub kind: String,
+    #[serde(rename = "match")]
+    pub matching: ContentMatch,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub when: Option<Condition>,
+}
+
+pub enum LoadOrderRule {
+    Before {
+        first: String,
+        second: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+    },
+    Requires {
+        item: String,
+        master: String,
+    },
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / f"game-{os.getpid()}.rs"
+            path.write_text(source, encoding="utf-8")
+            fields = cpd.rust_fields(path)
+
+        self.assertEqual(
+            fields,
+            {
+                "kind",
+                "match",
+                "when",
+                "first",
+                "second",
+                "optional",
+                "item",
+                "master",
+            },
+        )
+        self.assertNotIn("std", fields)
+        self.assertNotIn("ops", fields)
+        self.assertNotIn("Not", fields)
+
+    def test_this_repository_documents_every_key_and_field(self):
+        self.assertEqual(cpd.check(), [])
+
+    def test_both_package_roots_are_checked(self):
+        files = cpd.package_files()
+        self.assertEqual(len(files), 6, [str(path) for path in files])
+        self.assertTrue(any("official" in path.parts for path in files))
+        self.assertTrue(any("tracers" in path.parts for path in files))
+
+
+class TestGamePackageGuideExamples(unittest.TestCase):
+    """The guide's complete package examples must parse into a package."""
+
+    GUIDE = (
+        Path(__file__).resolve().parent.parent
+        / "docs"
+        / "plugins"
+        / "game-packages.md"
+    )
+    REQUIRED_PACKAGE = {
+        "id",
+        "version",
+        "api_range",
+        "parents",
+        "games",
+        "frameworks",
+        "tools",
+    }
+    REQUIRED_GAME = {
+        "id",
+        "name",
+        "stores",
+        "version_sources",
+        "deployment",
+        "framework_ids",
+        "tool_ids",
+        "log_paths",
+        "crash_paths",
+        "user_files",
+        "save_paths",
+        "linked_archive_patterns",
+    }
+    REQUIRED_LAUNCH = {
+        "executable",
+        "arguments",
+        "environment",
+        "working_directory",
+    }
+
+    def _json_blocks(self):
+        text = self.GUIDE.read_text(encoding="utf-8")
+        return re.findall(r"```json\n(.*?)```", text, re.DOTALL)
+
+    def test_complete_package_examples_have_the_required_fields(self):
+        complete = []
+        for block in self._json_blocks():
+            try:
+                value = json.loads(block)
+            except json.JSONDecodeError:
+                # A fragment such as `"load_orders": [...]` is not a document.
+                continue
+            if isinstance(value, dict) and {
+                "games",
+                "version",
+                "api_range",
+            } <= value.keys():
+                complete.append(value)
+
+        self.assertTrue(complete, "the guide has no complete package example")
+        for package in complete:
+            self.assertEqual(
+                self.REQUIRED_PACKAGE - package.keys(),
+                set(),
+                f"package example is missing {self.REQUIRED_PACKAGE - package.keys()}",
+            )
+            for game in package["games"]:
+                self.assertEqual(
+                    self.REQUIRED_GAME - game.keys(),
+                    set(),
+                    f"game example is missing {self.REQUIRED_GAME - game.keys()}",
+                )
+                launch = game.get("launch")
+                if launch is not None:
+                    self.assertEqual(
+                        self.REQUIRED_LAUNCH - launch.keys(),
+                        set(),
+                        "launch example is missing "
+                        f"{self.REQUIRED_LAUNCH - launch.keys()}",
+                    )
 
 
 if __name__ == "__main__":

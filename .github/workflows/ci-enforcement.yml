@@ -256,6 +256,8 @@ jobs:
           python-version: "3.12"
       - name: Documentation quality gates (internal links, guide integrity, stale claims)
         run: python scripts/check_docs.py
+      - name: Game-package guide covers every package key and Rust field
+        run: python scripts/check_package_docs.py
 
   version-metadata:
     runs-on: ubuntu-latest
