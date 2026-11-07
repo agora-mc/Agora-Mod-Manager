@@ -174,6 +174,11 @@ impl CoreContext {
             }
         })?;
 
+        // The plugin runtime is created later, but a scripted package needs a
+        // stable handle to it now. The handle is empty until the plugin service
+        // is built, and a hook called before then says so instead of guessing.
+        let behaviour_runtime = crate::game_registry::scripted::BehaviourRuntime::new();
+
         // 2b. Read every plugin game package as raw JSON first, resolve inheritance, then register
         //     the packages that survived. A plugin package never stops startup, but a failure to
         //     read plugins is said out loud: silently losing games looks like a bug.
@@ -233,6 +238,8 @@ impl CoreContext {
                         });
 
                         let mut inputs: Vec<crate::game_registry::PackageInput> = Vec::new();
+                        let mut has_entrypoint: std::collections::BTreeMap<String, bool> =
+                            std::collections::BTreeMap::new();
                         for record in records {
                             if !record.enabled
                                 || crate::plugins::store::is_tombstone(&record)
@@ -242,6 +249,10 @@ impl CoreContext {
                             {
                                 continue;
                             }
+                            has_entrypoint.insert(
+                                record.id().to_string(),
+                                record.manifest.entrypoint.is_some(),
+                            );
 
                             let blocked = match official.get(record.id().as_str()) {
                                 Some(crate::plugins::official::OfficialStatus::Official {
@@ -346,17 +357,66 @@ impl CoreContext {
                             if package.blocked {
                                 continue;
                             }
-                            if let Err(err) = game_builder.add(
-                                package.source,
-                                Arc::new(crate::game_registry::DeclarativePackage(
+                            let plugin_id = match &package.source {
+                                crate::game_registry::PackageSource::Plugin { plugin_id } => {
+                                    Some(plugin_id.clone())
+                                }
+                                _ => None,
+                            };
+                            let entrypoint = plugin_id
+                                .as_deref()
+                                .and_then(|id| has_entrypoint.get(id).copied())
+                                .unwrap_or(false);
+                            if let Some(reason) = crate::game_registry::scripted::needs_entrypoint(
+                                &package.definition,
+                            ) {
+                                if !entrypoint {
+                                    warnings.push(format!(
+                                        "{}: skipped, because {reason} but the plugin has no entrypoint to run",
+                                        package.label
+                                    ));
+                                    continue;
+                                }
+                            }
+                            let source = package.source.clone();
+                            let label = package.label.clone();
+                            let package: Arc<dyn agora_game_api::GamePackage> = match (
+                                &package.source,
+                                package
+                                    .definition
+                                    .behaviours
+                                    .as_ref()
+                                    .is_some_and(agora_game_api::Behaviours::names_any),
+                            ) {
+                                (
+                                    crate::game_registry::PackageSource::Plugin { plugin_id },
+                                    true,
+                                ) => match agora_plugin_api::manifest::PluginId::parse(plugin_id) {
+                                    Ok(id) => Arc::new(
+                                        crate::game_registry::scripted::ScriptedPackage::new(
+                                            package.definition,
+                                            id,
+                                            behaviour_runtime.clone(),
+                                        ),
+                                    ),
+                                    Err(error) => {
+                                        warnings.push(format!(
+                                            "{}: skipped, because its plugin id is invalid: {}",
+                                            label, error.message
+                                        ));
+                                        continue;
+                                    }
+                                },
+                                _ => Arc::new(crate::game_registry::DeclarativePackage(
                                     package.definition,
                                 )),
-                            ) {
+                            };
+                            if let Err(err) = game_builder.add(source, package) {
                                 warnings.push(format!(
                                     "{}: rejected game package: {err}. A game or store product \
                                      already claimed (official plugins register first) cannot be \
                                      claimed again.",
-                                    package.label
+                                    label
                                 ));
                             }
                         }
@@ -491,6 +551,7 @@ impl CoreContext {
             process_session_manager: ProcessSessionManager::new(),
             games,
         };
+        ctx.extensions.insert(behaviour_runtime);
 
         // 6. Let game packages load their catalogs from the signed registry
         //    (or fall back to embedded data when there is none).

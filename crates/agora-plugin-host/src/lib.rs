@@ -21,7 +21,7 @@ mod runtime;
 mod sdk;
 
 use agora_plugin_api::error::{PluginError, PluginErrorCode, PluginResult};
-use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost, ScriptReads};
+use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReads};
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_api::protocol::PluginEventEnvelope;
 use runtime::{Control, PluginHandle};
@@ -49,6 +49,7 @@ impl QuickJsHost {
         args: serde_json::Value,
         timeout: Duration,
         reads: Option<Arc<dyn ScriptReads>>,
+        game_reads: Option<Arc<dyn GameReads>>,
     ) -> PluginResult<serde_json::Value> {
         let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.with_handle(plugin_id, |handle| {
@@ -60,6 +61,7 @@ impl QuickJsHost {
                     args,
                     timeout,
                     reads,
+                    game_reads,
                     reply: reply_tx,
                 })
                 .map_err(|_| {
@@ -186,7 +188,7 @@ impl ScriptHost for QuickJsHost {
         args: serde_json::Value,
         timeout: Duration,
     ) -> PluginResult<serde_json::Value> {
-        self.invoke_inner(plugin_id, export, args, timeout, None)
+        self.invoke_inner(plugin_id, export, args, timeout, None, None)
     }
 
     fn invoke_with_reads(
@@ -197,7 +199,18 @@ impl ScriptHost for QuickJsHost {
         timeout: Duration,
         reads: Arc<dyn ScriptReads>,
     ) -> PluginResult<serde_json::Value> {
-        self.invoke_inner(plugin_id, export, args, timeout, Some(reads))
+        self.invoke_inner(plugin_id, export, args, timeout, Some(reads), None)
+    }
+
+    fn invoke_with_game_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn GameReads>,
+    ) -> PluginResult<serde_json::Value> {
+        self.invoke_inner(plugin_id, export, args, timeout, None, Some(reads))
     }
 
     fn deliver_event(

@@ -893,6 +893,19 @@ fn resolve_tool_launch(
     external: Option<&Path>,
 ) -> Result<crate::game_launch::ResolvedLaunch, LaunchError> {
     let Some(program) = external else {
+        // A package's tool recipe gets the same check as a launch recipe: its
+        // executable, working folder and argument paths stay in the view, and
+        // no loader environment key is set. A user's own tool is exempt: the
+        // player chose that program themselves.
+        crate::game_script::validate_launch_recipe(
+            &tool.launch,
+            &crate::game_script::RecipeRoots {
+                runtime: &roots.runtime,
+                install: roots.install.as_deref(),
+                base: roots.base.as_deref(),
+            },
+        )
+        .map_err(|message| LaunchError::UnsafeRecipe { message })?;
         return game_launch::resolve_recipe(&tool.launch, roots);
     };
     if !program.is_file() {
@@ -4507,6 +4520,35 @@ mod tests {
             roots.contains(&real_path(&base.location)),
             "the pinned base {} is not a forbidden output root: {roots:?}",
             base.location.display()
+        );
+    }
+    #[test]
+    fn a_tool_recipe_gets_the_same_recipe_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("game");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("tool.exe"), b"x").unwrap();
+        let tool: agora_game_api::ToolDefinition = serde_json::from_value(serde_json::json!({
+            "id": "tool",
+            "game": "test-game",
+            "name": "Tool",
+            "launch": {
+                "executable": { "root": "runtime", "path": "tool.exe" },
+                "arguments": ["-javaagent:C:/Users/someone/agent.jar"],
+                "environment": {},
+                "working_directory": { "root": "runtime", "path": "" }
+            }
+        }))
+        .unwrap();
+        let roots = crate::game_launch::LaunchRoots {
+            runtime: root,
+            install: None,
+            base: None,
+        };
+        let error = resolve_tool_launch(&tool, &roots, None).unwrap_err();
+        assert!(
+            matches!(error, crate::game_launch::LaunchError::UnsafeRecipe { .. }),
+            "{error}"
         );
     }
 }

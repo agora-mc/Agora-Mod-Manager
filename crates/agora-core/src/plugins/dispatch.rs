@@ -58,6 +58,9 @@ pub struct DispatchContext<'a> {
     pub settings_schema: &'a [SettingDefinition],
     pub subscriptions: &'a EventSubscriptions,
     pub ui: &'a dyn PluginUiSink,
+    /// The instance a hook is bound to. `None` for a normal plugin call.
+    /// A bound call may not name a different instance.
+    pub bound_instance: Option<&'a str>,
 }
 
 /// Every method this host API version serves.
@@ -153,6 +156,31 @@ pub const METHODS: &[(&str, Option<Capability>, &str)] = &[
         None,
         "Raise a toast attributed to this plugin.",
     ),
+    (
+        "game.readBytes",
+        Some(Capability::GameRead),
+        "Read bytes from a game instance's merged view by game path.",
+    ),
+    (
+        "game.readLines",
+        Some(Capability::GameRead),
+        "Read lines from a game instance's merged view by game path.",
+    ),
+    (
+        "game.list",
+        Some(Capability::GameRead),
+        "List the children of a game path in an instance.",
+    ),
+    (
+        "game.writeBytes",
+        Some(Capability::GameWrite),
+        "Write bytes into this plugin's own generated layer.",
+    ),
+    (
+        "game.writeText",
+        Some(Capability::GameWrite),
+        "Write text into this plugin's own generated layer.",
+    ),
 ];
 
 /// What calling a method requires.
@@ -216,6 +244,11 @@ pub fn dispatch(
         "net.fetchJson" => net_fetch_json(cx, args),
         "ui.refresh" => ui_refresh(cx, args),
         "ui.notify" => ui_notify(cx, args),
+        "game.readBytes" => game_read_bytes(cx, args),
+        "game.readLines" => game_read_lines(cx, args),
+        "game.list" => game_list(cx, args),
+        "game.writeBytes" => game_write_bytes(cx, args),
+        "game.writeText" => game_write_text(cx, args),
         // Unreachable: `required_capability` already rejected unknown names.
         other => Err(PluginError::unknown_method(other)),
     }
@@ -788,6 +821,144 @@ fn net_fetch_json(
 }
 
 // ---------------------------------------------------------------------------
+// Game instance view (MASTER_SPEC §30.12)
+// ---------------------------------------------------------------------------
+
+fn game_instance_id(cx: &DispatchContext<'_>, args: &serde_json::Value) -> PluginResult<String> {
+    let instance_id = arg_str(args, "instanceId")?;
+    if let Some(bound) = cx.bound_instance {
+        if bound != instance_id {
+            return Err(PluginError::new(
+                PluginErrorCode::CapabilityDenied,
+                format!(
+                    "this hook is bound to instance `{bound}`; it may not name `{instance_id}`"
+                ),
+            ));
+        }
+    }
+    Ok(instance_id)
+}
+
+fn game_budgets(cx: &DispatchContext<'_>) -> std::sync::Arc<crate::game_script::GameBudgets> {
+    cx.ctx
+        .extensions
+        .get_or_insert_with(crate::game_script::GameBudgets::default)
+}
+
+fn game_reads(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<crate::game_script::GameViewReads> {
+    let instance_id = game_instance_id(cx, args)?;
+    let budget = game_budgets(cx).session(cx.plugin_id.as_str()).reads;
+    crate::game_script::instance_reads_with_budget(cx.ctx, &instance_id, budget)
+        .map_err(|message| PluginError::new(PluginErrorCode::OperationFailed, message))
+}
+
+fn game_read_error(error: agora_plugin_api::host::ScriptReadError) -> PluginError {
+    PluginError::new(PluginErrorCode::OperationFailed, error.message).with_detail(error.code)
+}
+
+fn game_read_bytes(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    use agora_plugin_api::host::GameReads;
+    let path = arg_str(args, "path")?;
+    let offset = args
+        .get("offset")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let len = args
+        .get("len")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(crate::game_script::DEFAULT_MAX_READ_BYTES);
+    let reads = game_reads(cx, args)?;
+    let bytes = reads
+        .read_bytes(&path, offset, len)
+        .map_err(game_read_error)?;
+    Ok(serde_json::json!({ "bytes": bytes }))
+}
+
+fn game_read_lines(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    use agora_plugin_api::host::GameReads;
+    let path = arg_str(args, "path")?;
+    let from_line = args
+        .get("fromLine")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let max_lines = args
+        .get("maxLines")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(crate::game_script::DEFAULT_MAX_LINES as u64)
+        .min(u32::MAX as u64) as u32;
+    let reads = game_reads(cx, args)?;
+    reads
+        .read_lines(&path, from_line, max_lines)
+        .map_err(game_read_error)
+}
+
+fn game_list(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    use agora_plugin_api::host::GameReads;
+    let path = arg_opt_str(args, "path").unwrap_or_default();
+    let reads = game_reads(cx, args)?;
+    reads.list(&path).map_err(game_read_error)
+}
+
+fn game_write_scope(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<crate::game_script::GameWriteScope> {
+    let instance_id = game_instance_id(cx, args)?;
+    let budget = game_budgets(cx).session(cx.plugin_id.as_str()).writes;
+    crate::game_script::instance_write_scope_with_budget(cx.ctx, cx.plugin_id, &instance_id, budget)
+        .map_err(|message| PluginError::new(PluginErrorCode::OperationFailed, message))
+}
+
+fn game_write_bytes(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    let path = arg_str(args, "path")?;
+    let bytes: Vec<u8> = args
+        .get("bytes")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| PluginError::invalid_arguments("`bytes` must be an array of byte values"))?
+        .iter()
+        .map(|value| value.as_u64())
+        .collect::<Option<Vec<u64>>>()
+        .ok_or_else(|| PluginError::invalid_arguments("every byte must be a whole number"))?
+        .into_iter()
+        .map(|value| {
+            u8::try_from(value)
+                .map_err(|_| PluginError::invalid_arguments("every byte must be between 0 and 255"))
+        })
+        .collect::<PluginResult<Vec<u8>>>()?;
+    let scope = game_write_scope(cx, args)?;
+    scope.write(&path, &bytes).map_err(game_read_error)?;
+    Ok(serde_json::json!({ "written": bytes.len() }))
+}
+
+fn game_write_text(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    let path = arg_str(args, "path")?;
+    let text = arg_str(args, "text")?;
+    let scope = game_write_scope(cx, args)?;
+    scope
+        .write(&path, text.as_bytes())
+        .map_err(game_read_error)?;
+    Ok(serde_json::json!({ "written": text.len() }))
+}
+
+// ---------------------------------------------------------------------------
 // UI intents
 // ---------------------------------------------------------------------------
 
@@ -924,6 +1095,158 @@ mod tests {
         }
     }
 
+    fn dispatch_with(
+        granted: CapabilitySet,
+        method: &str,
+        args: serde_json::Value,
+    ) -> PluginResult<serde_json::Value> {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        let plugin_id = PluginId::parse("acme.test").unwrap();
+        let subscriptions = EventSubscriptions::new();
+        let cx = DispatchContext {
+            ctx: &ctx,
+            plugin_id: &plugin_id,
+            granted: &granted,
+            declared_hosts: &[],
+            settings_schema: &[],
+            subscriptions: &subscriptions,
+            ui: &NoopUiSink,
+            bound_instance: None,
+        };
+        dispatch(&cx, method, &args)
+    }
+
+    #[test]
+    fn reads_without_game_read_are_refused() {
+        for method in ["game.readBytes", "game.readLines", "game.list"] {
+            let error = dispatch_with(
+                CapabilitySet::new(),
+                method,
+                serde_json::json!({ "instanceId": "i", "path": "a.txt" }),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, PluginErrorCode::CapabilityDenied, "{method}");
+        }
+    }
+
+    #[test]
+    fn writes_without_game_write_are_refused() {
+        for method in ["game.writeBytes", "game.writeText"] {
+            let error = dispatch_with(
+                CapabilitySet::new(),
+                method,
+                serde_json::json!({ "instanceId": "i", "path": "a.txt", "text": "x" }),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, PluginErrorCode::CapabilityDenied, "{method}");
+        }
+    }
+
+    #[test]
+    fn game_read_does_not_grant_game_write() {
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameRead);
+        let error = dispatch_with(
+            granted,
+            "game.writeText",
+            serde_json::json!({ "instanceId": "i", "path": "a.txt", "text": "x" }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::CapabilityDenied);
+    }
+
+    /// A core context with one instance folder. Each script request is one
+    /// `dispatch` call, exactly as the bridge makes them; the budgets are meant
+    /// to span the whole plugin call, so they must survive from one request to
+    /// the next.
+    fn instance_ctx() -> (tempfile::TempDir, crate::ctx::CoreContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        std::fs::create_dir_all(ctx.paths.instance_dir("i").unwrap().join("writable")).unwrap();
+        (tmp, ctx)
+    }
+
+    fn dispatch_in(
+        ctx: &crate::ctx::CoreContext,
+        granted: &CapabilitySet,
+        method: &str,
+        args: serde_json::Value,
+    ) -> PluginResult<serde_json::Value> {
+        let plugin_id = PluginId::parse("acme.test").unwrap();
+        let subscriptions = EventSubscriptions::new();
+        let cx = DispatchContext {
+            ctx,
+            plugin_id: &plugin_id,
+            granted,
+            declared_hosts: &[],
+            settings_schema: &[],
+            subscriptions: &subscriptions,
+            ui: &NoopUiSink,
+            bound_instance: None,
+        };
+        dispatch(&cx, method, &args)
+    }
+
+    #[test]
+    fn one_plugin_call_cannot_create_more_files_than_its_budget() {
+        let (_tmp, ctx) = instance_ctx();
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameWrite);
+        let budget = crate::game_script::DEFAULT_MAX_WRITE_FILES as usize;
+        let mut refused = None;
+        for n in 0..=budget {
+            let result = dispatch_in(
+                &ctx,
+                &granted,
+                "game.writeText",
+                serde_json::json!({ "instanceId": "i", "path": format!("f{n}.txt"), "text": "x" }),
+            );
+            if let Err(error) = result {
+                refused = Some((n, error));
+                break;
+            }
+        }
+        let (n, error) = refused.expect("file number budget+1 in one plugin call must be refused");
+        assert_eq!(n, budget);
+        assert_eq!(error.detail.as_deref(), Some("file_budget_spent"));
+    }
+
+    #[test]
+    fn one_plugin_call_cannot_read_more_than_its_budget() {
+        let (_tmp, ctx) = instance_ctx();
+        let one_mib = 1024 * 1024;
+        std::fs::write(
+            ctx.paths
+                .instance_dir("i")
+                .unwrap()
+                .join("writable")
+                .join("big.bin"),
+            vec![0u8; one_mib],
+        )
+        .unwrap();
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameRead);
+        let budget = crate::game_script::DEFAULT_MAX_TOTAL_READ_BYTES as usize;
+        let reads = budget / one_mib;
+        let mut refused = None;
+        for n in 0..=reads {
+            let result = dispatch_in(
+                &ctx,
+                &granted,
+                "game.readBytes",
+                serde_json::json!({ "instanceId": "i", "path": "big.bin", "offset": 0, "len": one_mib }),
+            );
+            if let Err(error) = result {
+                refused = Some((n, error));
+                break;
+            }
+        }
+        let (n, error) = refused.expect("read number budget+1 in one plugin call must be refused");
+        assert_eq!(n, reads);
+        assert_eq!(error.detail.as_deref(), Some("budget_spent"));
+    }
+
     #[test]
     fn subscribing_to_an_event_needs_the_capability_that_guards_its_data() {
         assert_eq!(
@@ -944,5 +1267,40 @@ mod tests {
                 "`{name}` can be subscribed to with no capability at all"
             );
         }
+    }
+    #[test]
+    fn a_hook_bound_to_one_instance_refuses_a_different_id() {
+        let (_tmp, ctx) = instance_ctx();
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameRead);
+        let plugin_id = PluginId::parse("acme.test").unwrap();
+        let subscriptions = EventSubscriptions::new();
+        let cx = DispatchContext {
+            ctx: &ctx,
+            plugin_id: &plugin_id,
+            granted: &granted,
+            declared_hosts: &[],
+            settings_schema: &[],
+            subscriptions: &subscriptions,
+            ui: &NoopUiSink,
+            bound_instance: Some("i"),
+        };
+        let error = dispatch(
+            &cx,
+            "game.readBytes",
+            &serde_json::json!({ "instanceId": "other", "path": "a.txt" }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::CapabilityDenied);
+        assert!(error.message.contains("bound to instance `i`"));
+
+        // The bound instance itself is not refused for being the wrong one.
+        let error = dispatch(
+            &cx,
+            "game.readBytes",
+            &serde_json::json!({ "instanceId": "i", "path": "missing.txt" }),
+        )
+        .unwrap_err();
+        assert_ne!(error.code, PluginErrorCode::CapabilityDenied);
     }
 }

@@ -10,7 +10,7 @@
 
 use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
-use crate::error::LauncherResult;
+use crate::error::{LauncherError, LauncherResult};
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -102,6 +102,170 @@ pub trait InstanceBackend: Send + Sync {
         filename: &str,
         pinned: bool,
     ) -> LauncherResult<bool>;
+}
+
+/// The generic instances every game package already has (MASTER_SPEC §30.12),
+/// behind the same SDK calls Minecraft's package uses.
+///
+/// Stateless: it reads the context on every call, so a plugin does not need a
+/// separate backend per game and a newly created instance appears immediately.
+pub struct GenericInstanceBackend;
+
+fn instance_error(error: crate::game_instance::InstanceError) -> LauncherError {
+    LauncherError::Generic {
+        code: "ERR_INSTANCE_FAILED".into(),
+        message: error.to_string(),
+    }
+}
+
+fn generic_row(
+    record: &crate::game_instance::GameInstanceRecord,
+    ctx: &Ctx,
+) -> crate::models::InstanceRow {
+    let runtime = crate::game_instance::get_manifest(ctx, &record.instance_id)
+        .ok()
+        .and_then(|manifest| manifest.runtime_identity)
+        .map(|runtime| runtime.version)
+        .unwrap_or_default();
+    crate::models::InstanceRow {
+        instance_id: record.instance_id.clone(),
+        name: record.name.clone(),
+        minecraft_version: runtime,
+        loader: record.game.as_str().to_string(),
+        loader_version: String::new(),
+        is_modpack: false,
+        is_locked: false,
+        last_launched_at: record.last_launched_at.clone(),
+        jvm_memory_mb: 0,
+        jvm_memory_mode: String::new(),
+        jvm_gc: String::new(),
+        jvm_custom_args: String::new(),
+        jvm_always_pre_touch: false,
+        created_at: record.created_at.clone(),
+        java_path: None,
+        java_incompatible_override: false,
+        icon_path: None,
+        launch_mode_override: "auto".to_string(),
+        import_source: None,
+        total_play_ms: 0,
+    }
+}
+
+impl InstanceBackend for GenericInstanceBackend {
+    fn list(&self, ctx: &Ctx) -> LauncherResult<Vec<crate::models::InstanceRow>> {
+        let records = crate::game_instance::list(ctx).map_err(instance_error)?;
+        Ok(records
+            .iter()
+            .map(|record| generic_row(record, ctx))
+            .collect())
+    }
+
+    fn get(
+        &self,
+        ctx: &Ctx,
+        instance_id: &str,
+    ) -> LauncherResult<
+        Option<(
+            crate::models::InstanceRow,
+            Option<crate::models::InstanceManifest>,
+        )>,
+    > {
+        let Some(record) = crate::game_instance::get(ctx, instance_id).map_err(instance_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((generic_row(&record, ctx), None)))
+    }
+
+    fn rename(&self, ctx: &Ctx, instance_id: &str, name: &str) -> LauncherResult<()> {
+        crate::game_instance::rename(ctx, instance_id, name).map_err(instance_error)
+    }
+
+    fn update_jvm(
+        &self,
+        _ctx: &Ctx,
+        _instance_id: &str,
+        _memory_mb: i64,
+        _gc: &str,
+        _always_pre_touch: bool,
+        _custom_args: &str,
+        _memory_mode: &str,
+    ) -> LauncherResult<()> {
+        Err(LauncherError::Generic {
+            code: "ERR_NOT_APPLICABLE".into(),
+            message: "this game instance has no Java memory setting".into(),
+        })
+    }
+
+    fn content(
+        &self,
+        ctx: &Ctx,
+        instance_id: &str,
+        content_type: Option<&str>,
+    ) -> LauncherResult<Option<Vec<agora_plugin_api::dto::ContentEntry>>> {
+        let Some(record) = crate::game_instance::get(ctx, instance_id).map_err(instance_error)?
+        else {
+            return Ok(None);
+        };
+        let manifest = match crate::game_instance::get_manifest(ctx, instance_id) {
+            Ok(manifest) => manifest,
+            Err(crate::game_instance::InstanceError::NotFound(_)) => {
+                return Ok(Some(Vec::new()));
+            }
+            Err(error) => return Err(instance_error(error)),
+        };
+        // Generic content is the instance's content layers. A type filter has
+        // no meaning for a game that does not name types, so only `mod` (or no
+        // filter) returns them.
+        if content_type.is_some_and(|kind| kind != "mod") {
+            return Ok(Some(Vec::new()));
+        }
+        let mut entries = Vec::new();
+        for layer in manifest.layers.layers() {
+            let agora_game_api::LayerSource::Content { content } = &layer.source else {
+                continue;
+            };
+            let item = crate::content_store::get_item(ctx, content).ok();
+            entries.push(agora_plugin_api::dto::ContentEntry {
+                key: content.clone(),
+                filename: item
+                    .as_ref()
+                    .map(|item| item.name.clone())
+                    .unwrap_or_else(|| content.clone()),
+                display_name: item
+                    .as_ref()
+                    .map(|item| item.name.clone())
+                    .unwrap_or_else(|| content.clone()),
+                version: item.as_ref().and_then(|item| item.version.clone()),
+                content_type: "mod".to_string(),
+                enabled: layer.enabled,
+                installed_at: String::new(),
+                source_label: "Agora".to_string(),
+                pack_managed: false,
+                installed_as_dependency: false,
+                update_pinned: false,
+                file_present: true,
+                size_bytes: item.as_ref().map(|item| item.total_size),
+                author: None,
+                categories: Vec::new(),
+                source_url: item.as_ref().and_then(|item| item.page_url.clone()),
+                registry_id: None,
+                modrinth_id: None,
+            });
+        }
+        let _ = record;
+        Ok(Some(entries))
+    }
+
+    fn set_update_pinned(
+        &self,
+        _ctx: &Ctx,
+        _instance_id: &str,
+        _filename: &str,
+        _pinned: bool,
+    ) -> LauncherResult<bool> {
+        Ok(false)
+    }
 }
 
 /// Every registered package's instances behind one [`InstanceBackend`].
@@ -320,6 +484,70 @@ mod tests {
         fn set_update_pinned(&self, _: &Ctx, _: &str, _: &str, _: bool) -> LauncherResult<bool> {
             Ok(false)
         }
+    }
+
+    #[test]
+    fn instances_and_content_calls_work_on_a_game_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::app_paths::AppPaths::from_root(tmp.path().to_path_buf());
+        paths.create_required_dirs().unwrap();
+        crate::db::init_local_state_db(&paths.local_state_db()).unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+
+        let base = agora_game_api::BaseReference::Unpinned {
+            install: agora_game_api::InstallId::new("steam:test").unwrap(),
+            reason: "test".into(),
+        };
+        let conn = crate::db::local_state_connection(&paths.local_state_db()).unwrap();
+        conn.execute(
+            "INSERT INTO game_instances (instance_id, game, name, base_json, created_at)
+             VALUES ('generic-1', 'test-game', 'Generic', ?1, '2026-11-06T00:00:00Z')",
+            [serde_json::to_string(&base).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut manifest = crate::game_instance::GameInstanceManifest::new(
+            agora_game_api::GameId::new("test-game").unwrap(),
+            "generic-1",
+            "Generic",
+            None,
+            base,
+        );
+        manifest.layers = agora_game_api::LayerStack::new(vec![agora_game_api::Layer {
+            id: agora_game_api::LayerId::new("content:item-1").unwrap(),
+            enabled: true,
+            mount_path: agora_game_api::RelPath::default(),
+            source_path: agora_game_api::RelPath::default(),
+            source: agora_game_api::LayerSource::Content {
+                content: "item-1".into(),
+            },
+            whiteouts: Vec::new(),
+            own_copy: false,
+        }])
+        .unwrap();
+        let instance_dir = ctx.paths.instance_dir("generic-1").unwrap();
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        std::fs::write(
+            instance_dir.join("instance_manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let backend = GenericInstanceBackend;
+        let rows = backend.list(&ctx).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].instance_id, "generic-1");
+        assert_eq!(rows[0].loader, "test-game");
+
+        let (row, _) = backend.get(&ctx, "generic-1").unwrap().unwrap();
+        assert_eq!(row.name, "Generic");
+        assert!(backend.get(&ctx, "nobody").unwrap().is_none());
+
+        let content = backend.content(&ctx, "generic-1", None).unwrap().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].key, "item-1");
+        assert!(content[0].enabled);
     }
 
     #[test]

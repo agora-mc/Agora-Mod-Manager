@@ -19,8 +19,8 @@ pins them in `registry/official-plugins/<plugin-id>.json`. Skyrim Special Editio
 `packages/official/skyrim-se/` (plugin id `agora.creation-engine`, game id `skyrim-se`). The app does
 not compile Skyrim in, so `agora games list` shows it only when the plugin is installed.
 
-To use it while developing, install the folder as a development plugin. It is data only, so it
-loads with no plugin switch and no code consent:
+To use it while developing, install the folder as a development plugin. It ships no code today, so
+it loads with no plugin switch and no code consent:
 
 ```bash
 agora --data-dir ./tmp/agora-dev plugin install --yes development packages/official/skyrim-se
@@ -212,6 +212,9 @@ View and command calls have a ten-second host deadline. Diagnostic calls use the
 | Game packages | `game:define` | Define games: their stores, versions, folders and how to launch them |
 | `crash.readBytes/readLines` | `crash:contribute` | Scoped reads of the artifact in a parser or inspector call: bytes or text, never a path |
 | Crash packs | `crash:contribute` | Read the crash evidence Agora gives them and add rules to its diagnosis; every finding names the plugin |
+| `game.readBytes/readLines/list` | `game:read` | Scoped reads of one instance's merged view by game path, with a byte budget; a script never sees a real path |
+| `game.writeBytes/writeText` | `game:write` | Write into this plugin's own generated layer for one instance, with byte and file budgets; it cannot change the game, a save, or another layer |
+| `behaviours` in a game package | `game:define` | `detect_runtime`, `classify`, `recognize_download`, `load_order_rules`, `diagnostics`, `prepare_launch` and script load-order parsing/rendering, each time- and memory-limited by the plugin runtime |
 
 All service failures reject the promise with a structured error code and message. Treat errors as failures; never display a successful mutation after a rejection. The low-level `call` function exposes the same capability checks, not an escape hatch. There is no shell or arbitrary executable API. Current method definitions are in `agora-core/src/plugins/dispatch.rs`.
 
@@ -385,7 +388,7 @@ private HTML.
 
 ## Who may run code: one answer per plugin, and an emergency stop
 
-A plugin's **scripts** (anything with an `entrypoint`) run only if the user allowed *that plugin* to run code. This is asked once, with the install, as part of the install consent: "<name> runs code. Allow it?" The user can allow it, or install the plugin without running its code. The answer is stored per plugin in local state (never in the manifest) and can be changed later in Settings -> Plugins (the "Allow code" switch on the plugin's row) or with `agora plugin scripts <ID> allow|deny`. Turning it off stops that plugin now. One plugin's answer never affects another's, and it is the same rule for every plugin that has code. Official plugins are data-only and may not ship scripts at all: an official package that contains an `entrypoint` is refused. Updating a plugin keeps the answer for the same code; a version that brings new or changed code, or code from a different publisher, asks again and does not run until the user says so. An update signed by a different publisher than the one pinned at install is shown as such in the update prompt and has to be confirmed explicitly.
+A plugin's **scripts** (anything with an `entrypoint`) run only if the user allowed *that plugin* to run code. This is asked once, with the install, as part of the install consent: "<name> runs code. Allow it?" The user can allow it, or install the plugin without running its code. The answer is stored per plugin in local state (never in the manifest) and can be changed later in Settings -> Plugins (the "Allow code" switch on the plugin's row) or with `agora plugin scripts <ID> allow|deny`. Turning it off stops that plugin now. One plugin's answer never affects another's, and it is the same rule for every plugin that has code. Official plugins follow the same rule: they may carry scripts, and the signed package hash covers them. Updating a plugin keeps the answer for the same code; a version that brings new or changed code, or code from a different publisher, asks again and does not run until the user says so. An update signed by a different publisher than the one pinned at install is shown as such in the update prompt and has to be confirmed explicitly.
 
 Above that sits the **emergency stop**, Settings -> Plugins -> "Stop all plugin code" (`agora plugin stop` / `agora plugin resume`). It is **not engaged** by default. While it is engaged no plugin script runs, whatever each plugin was allowed. Engaging it also stops what is running right now. It is stored as `plugins_emergency_stop`. An unreadable or malformed value counts as engaged.
 
@@ -393,7 +396,7 @@ Above that sits the **emergency stop**, Settings -> Plugins -> "Stop all plugin 
 
 The old `plugins_enabled` setting ("community plugins on", off by default) is gone. It meant the opposite of the stop and was seeded `false` in every database, so reading it with the new meaning would have engaged the stop for everyone. It is ignored and treated as absent, whatever value it holds.
 
-Official plugins (listed in Agora's signed registry) are data-only, so they have no scripts to exempt. What official status changes is verification and loading: an official plugin whose installed files no longer match the hashes recorded at install, one the signed catalog explicitly revokes, and any plugin that uses an official plugin's id without being it, is **blocked** (status "Blocked", with the reason) and its game packages do not load. If the catalog itself cannot be checked (missing, corrupt, offline) or no longer lists an old version, the installed files are checked against the hashes recorded at install: matching files keep loading with a warning on the plugin and its games, and an Update action where the catalog offers one. A data-only plugin keeps working in that state; a plugin with scripts does not run them until a verified catalog says it is official again.
+Official plugins (listed in Agora's signed registry) may carry scripts like any other plugin; the signed hash covers their code too. What official status changes is verification and loading: an official plugin whose installed files no longer match the hashes recorded at install, one the signed catalog explicitly revokes, and any plugin that uses an official plugin's id without being it, is **blocked** (status "Blocked", with the reason) and its game packages do not load. If the catalog itself cannot be checked (missing, corrupt, offline) or no longer lists an old version, the installed files are checked against the hashes recorded at install: matching files keep loading with a warning on the plugin and its games, and an Update action where the catalog offers one. A data-only plugin keeps working in that state; a plugin with scripts does not run them until a verified catalog says it is official again.
 
 ## Recovery and compatibility
 

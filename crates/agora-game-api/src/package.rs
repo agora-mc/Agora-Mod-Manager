@@ -41,6 +41,18 @@ pub struct Behaviours {
     pub prepare_launch: Option<String>,
 }
 
+impl Behaviours {
+    /// Whether this names any script hook at all.
+    pub fn names_any(&self) -> bool {
+        self.detect_runtime.is_some()
+            || self.classify.is_some()
+            || self.recognize_download.is_some()
+            || self.load_order_rules.is_some()
+            || self.diagnostics.is_some()
+            || self.prepare_launch.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameContext {
     pub instance: String,
@@ -181,6 +193,32 @@ pub trait GamePackage: Send + Sync {
         _host: &'a dyn GameHost,
         _context: GameContext,
     ) -> GameFuture<'a, Option<LaunchRecipe>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Read a `script` load order file (MASTER_SPEC §30.12). `None` means the
+    /// package does not implement the format; core reports that instead of
+    /// treating the file as empty.
+    fn parse_load_order<'a>(
+        &'a self,
+        _host: &'a dyn GameHost,
+        _context: GameContext,
+        _list_id: &'a str,
+        _bytes: Vec<u8>,
+    ) -> GameFuture<'a, Option<Vec<LoadOrderLine>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Render a `script` load order file (MASTER_SPEC §30.12). Core writes the
+    /// bytes it returns to the list's declared file; the hook cannot choose a
+    /// path. `None` is a failure to report.
+    fn render_load_order<'a>(
+        &'a self,
+        _host: &'a dyn GameHost,
+        _context: GameContext,
+        _list_id: &'a str,
+        _lines: Vec<LoadOrderLine>,
+    ) -> GameFuture<'a, Option<Vec<u8>>> {
         Box::pin(async { Ok(None) })
     }
 }

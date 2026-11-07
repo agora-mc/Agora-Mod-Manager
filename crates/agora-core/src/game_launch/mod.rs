@@ -56,6 +56,8 @@ pub enum LaunchError {
     ExecutableOutsideGame,
     #[error("game definition has no launch recipe")]
     NoRecipe,
+    #[error("unsafe launch recipe: {message}")]
+    UnsafeRecipe { message: String },
     #[error("base is damaged ({} problem(s))", problems.len())]
     BaseDamaged { problems: Vec<BaseProblem> },
     /// A framework in the game's files was built for another runtime version (MASTER_SPEC §26.6).

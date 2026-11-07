@@ -28,7 +28,7 @@ use agora_plugin_api::diagnostics::{DiagnosticReport, RepairAction, RepairPropos
 use agora_plugin_api::distribution::{Release, UpdateDocument};
 use agora_plugin_api::dto::ViewModel;
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
-use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
+use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost};
 use agora_plugin_api::manifest::{ActivationEvent, PluginId, PluginManifest};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
 use serde::{Deserialize, Serialize};
@@ -373,6 +373,7 @@ impl HostBridge for CoreBridge {
             settings_schema: &record.manifest.contributions.settings,
             subscriptions: &self.inner.subscriptions,
             ui: self.inner.ui.as_ref(),
+            bound_instance: request.bound_instance.as_deref(),
         };
 
         // Everything this call causes is attributed to the plugin, which is
@@ -385,6 +386,117 @@ impl HostBridge for CoreBridge {
 
     fn log(&self, plugin_id: &PluginId, level: LogLevel, message: &str) {
         logs::append(&self.inner.logs_root, plugin_id, level, message);
+    }
+}
+
+/// What a scripted game package calls. It is deliberately a thin wrapper: the
+/// plugin service owns consent, activation, time and memory limits.
+struct ScriptBehaviourInvoker {
+    service: PluginService,
+}
+
+impl crate::game_registry::scripted::BehaviourInvoker for ScriptBehaviourInvoker {
+    fn invoke(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.service
+            .invoke_behaviour(plugin_id, export, args, timeout, None)
+    }
+
+    fn invoke_with_game_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn GameReads>,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.service
+            .invoke_behaviour(plugin_id, export, args, timeout, Some(reads))
+    }
+
+    fn invoke_hook(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, PluginError> {
+        // One hook, one budget session. Every `game.*` call the script makes
+        // during this hook shares it, and the session closes when the hook
+        // returns, however it returns.
+        let budgets = self
+            .service
+            .inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default);
+        let _budget = budgets.begin(plugin_id.as_str());
+        let session = budgets.session(plugin_id.as_str());
+
+        // A hook that names an instance gets that instance's merged view in
+        // scope, so `game:read` works inside it and `game.*` is bound to that
+        // instance. `detect_runtime` names an install instead, which gets the
+        // install's folder as its view.
+        let granted_read = self.service.inner.record(plugin_id).is_some_and(|record| {
+            record
+                .granted
+                .contains(agora_plugin_api::Capability::GameRead)
+        });
+        if granted_read {
+            let instance = args
+                .get("context")
+                .and_then(|context| context.get("instance"))
+                .and_then(|instance| instance.as_str());
+            if let Some(instance_id) = instance {
+                if let Ok(reads) = crate::game_script::instance_reads_with_budget(
+                    &self.service.inner.ctx,
+                    instance_id,
+                    session.reads.clone(),
+                ) {
+                    return self.service.invoke_behaviour(
+                        plugin_id,
+                        export,
+                        args,
+                        timeout,
+                        Some(Arc::new(reads)),
+                    );
+                }
+            }
+            let install = args
+                .get("install")
+                .and_then(|install| install.get("location"))
+                .and_then(|location| location.as_str());
+            if let Some(location) = install {
+                if let Ok(reads) = crate::game_script::install_reads(
+                    std::path::PathBuf::from(location),
+                    session.reads.clone(),
+                ) {
+                    return self.service.invoke_behaviour(
+                        plugin_id,
+                        export,
+                        args,
+                        timeout,
+                        Some(Arc::new(reads)),
+                    );
+                }
+            }
+        }
+        self.service
+            .invoke_behaviour(plugin_id, export, args, timeout, None)
+    }
+
+    fn report(&self, plugin_id: &PluginId, message: &str) {
+        logs::append(
+            &self.service.inner.logs_root,
+            plugin_id,
+            LogLevel::Warn,
+            message,
+        );
     }
 }
 
@@ -435,10 +547,43 @@ impl PluginService {
             registry_trust,
             official: RwLock::new(BTreeMap::new()),
         });
-        Self {
+        let service = Self {
             bus: PluginEventBus::new(subscriptions, host),
             inner,
+        };
+        // A scripted game package is built before this service exists, so it
+        // holds a handle the service now fills in. One bridge serves every
+        // package, and looks the caller's grants up on each call.
+        let runtime = service
+            .inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_registry::scripted::BehaviourRuntime::new);
+        runtime.install(Arc::new(ScriptBehaviourInvoker {
+            service: service.clone(),
+        }));
+        // A scripted hook asked before the service existed left its answer
+        // unknown. Now that the runtime is here, re-run detection once so an
+        // early call cannot stick: what was unknown is asked again.
+        if service.inner.ctx.games.games().any(|game| {
+            game.version_sources
+                .iter()
+                .any(|source| matches!(source, agora_game_api::VersionSource::PackageBehaviour))
+        }) {
+            let inventory = crate::game_registry::installed_games(&service.inner.ctx);
+            for install in inventory.installs {
+                if let crate::game_registry::RuntimeResolution::Unidentified { reasons } =
+                    &install.runtime
+                {
+                    eprintln!(
+                        "[plugins] runtime detection for {} is still unknown: {}",
+                        install.game,
+                        reasons.join(", ")
+                    );
+                }
+            }
         }
+        service
     }
 
     /// A service with no UI sink, for the CLI and for tests.
@@ -2070,6 +2215,35 @@ impl PluginService {
 
     // -- calling into plugins ---------------------------------------------
 
+    /// Call an export on behalf of a scripted game package. The consent check
+    /// and the runtime are the same as every other call into a plugin.
+    fn invoke_behaviour(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Option<Arc<dyn GameReads>>,
+    ) -> Result<serde_json::Value, PluginError> {
+        self.ensure_running(plugin_id)?;
+        match reads {
+            Some(reads) => self
+                .inner
+                .host
+                .invoke_with_game_reads(plugin_id, export, args, timeout, reads),
+            None => self.inner.host.invoke(plugin_id, export, args, timeout),
+        }
+    }
+
+    /// Open a budget session for one top-level call into a plugin.
+    fn budget_guard(&self, plugin_id: &PluginId) -> crate::game_script::BudgetGuard {
+        self.inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default)
+            .begin(plugin_id.as_str())
+    }
+
     /// Render a contributed view.
     pub fn render_view(
         &self,
@@ -2077,6 +2251,7 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<ViewModel, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
         let value = self
             .inner
@@ -2099,6 +2274,7 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
         self.inner
             .host
@@ -2112,6 +2288,7 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<DiagnosticReport, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
         let value = self
             .inner
@@ -2186,6 +2363,7 @@ impl PluginService {
         export: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
+        let _budget = self.budget_guard(plugin_id);
         let granted = self.inner.record(plugin_id).is_some_and(|record| {
             record
                 .granted
@@ -2233,6 +2411,7 @@ impl PluginService {
             }
             for check in &record.manifest.contributions.launch_checks {
                 let plugin_id = record.id().clone();
+                let _budget = self.budget_guard(&plugin_id);
                 if let Err(error) = self.ensure_running(&plugin_id) {
                     outcome
                         .errors

@@ -104,6 +104,44 @@ export const crash: {
   /** Text lines of the artifact in scope. Throws outside a parser call. */
   readLines(artifactId: string, fromLine: number, maxLines: number): CrashLinesReply;
 };
+/** One entry in a game path listing. */
+export interface GameListEntry {
+  name: string;
+  dir: boolean;
+  size: number;
+}
+/** A listing, possibly cut at the host's entry cap. */
+export interface GameListReply {
+  entries: GameListEntry[];
+  cut: boolean;
+}
+/** A reply from `game.readLines`, shaped like the crash contract's. */
+export interface GameLinesReply {
+  lines: string[];
+  nextLine?: number;
+  cut?: boolean;
+}
+/** Reads and writes against one game instance, by game path. */
+export const game: {
+  /** Bytes at `path` in this call's instance view. Throws when there is no view in scope. */
+  readBytes(path: string, offset?: number, len?: number): ArrayBuffer;
+  /** Text lines at `path` in this call's instance view. */
+  readLines(path: string, fromLine?: number, maxLines?: number): GameLinesReply;
+  /** Direct children of `path` in this call's instance view. */
+  list(path?: string): GameListReply;
+  /** Write bytes into this plugin's own generated layer for `instanceId`. */
+  writeBytes(instanceId: string, path: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
+  /** Write text into this plugin's own generated layer for `instanceId`. */
+  writeText(instanceId: string, path: string, text: string): Promise<{ written: number }>;
+  /** The same reads and writes for an ordinary plugin call, naming the instance. */
+  forInstance(instanceId: string): {
+    readBytes(path: string, offset?: number, len?: number): Promise<ArrayBuffer>;
+    readLines(path: string, fromLine?: number, maxLines?: number): Promise<GameLinesReply>;
+    list(path?: string): Promise<GameListReply>;
+    writeBytes(path: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
+    writeText(path: string, text: string): Promise<{ written: number }>;
+  };
+};
 export const log: { debug(...values: unknown[]): void; info(...values: unknown[]): void; warn(...values: unknown[]): void; error(...values: unknown[]): void };
 export function on(eventName: string, handler: (event: PluginEvent) => void | Promise<void>): () => void;
 export function off(eventName: string, handler: (event: PluginEvent) => void | Promise<void>): void;
