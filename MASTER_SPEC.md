@@ -5021,7 +5021,8 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
 ```
 
 - `format` is `lines` or `{ "type": "script", "parse": "fn", "render": "fn" }`, so an author can target a format Agora has never heard of.
-- `rules.kind` is `none` (any order works), `script` (`{ "kind": "script", "entry": "fn" }`, returning `LoadOrderRule`s) or `creation_engine`.
+- `destination` is `instance` (the default) or `view`. An `instance` file is the instance's copy, swapped in through a `user_files` mapping as before. A `view` file is a game path: core renders it into a generated layer of the instance, the deployment puts it above content and tool output, and a tool reads it as a normal runtime path. It never writes the real game folder, needs no `user_files` mapping, and the player's order always wins.
+- `rules.kind` is `none` (any order works), `script` (`{ "kind": "script", "entry": "fn" }`, returning `LoadOrderRule`s) or `creation_engine`. A `LoadOrderRule` may carry `"optional": true`: it applies only when both items are present (or, for `conflicts`, both active) and says nothing otherwise. Without it a missing name is still reported.
 - `creation_engine` stays in core only until the plugin split moves it out. It's the one built-in, and no new built-ins get added.
 - `items.folders` lets a list order folders, as with REDmod's `mods/<name>`.
 
@@ -5032,7 +5033,7 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
 { "kind": "Archive mod", "match": { "all_files": "*.archive" }, "mount": "archive/pc/mod" }
 ```
 
-`marker` finds a file at any depth up to the layout's limit, and `source_path` becomes the folder holding it. `{folder}` is that folder's name, or the item's when it's the root. A rule whose mount leaves the instance is refused at registration, and `{folder}` is checked again at placement, since it comes from an archive. No match falls through to `content_layout`, then a script `classify` hook, then the existing Unknown prompt. If a rule's `when` could not be judged and nothing places the item, the Unknown prompt says so in words.
+`marker` finds a file at any depth up to the layout's limit, and `source_path` becomes the folder holding it. `{folder}` is that folder's name, or the item's when it's the root. A rule whose mount leaves the instance is refused at registration, and `{folder}` is checked again at placement, since it comes from an archive. No match falls through to `content_layout`, then a script `classify` hook, then the existing Unknown prompt. `classify` also receives the item's name as a hint; a `{folder}` in its mount is filled from that name and passes the same checks a rule's `{folder}` does. If a rule's `when` could not be judged and nothing places the item, the Unknown prompt says so in words.
 
 **Tools.** `ToolDefinition` gains:
 
@@ -5063,6 +5064,10 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
 - **A recipe's executable must be a game path inside the instance's view.** A script asking for anything else is refused and the player is told. Running outside the sandbox is the helper-program tier (§30.2), not this.
 - Official plugins may carry an entrypoint: `official.rs` stops refusing it, and the registry's pinned hash covers it. They get no capability a community plugin can't ask for.
 
+**Globs.** `present` and `input_files` use the same path globs as content rules. `*` stays inside one folder, `**` crosses folders, and matching ignores case. A `present` glob also matches a folder that holds a matching path, so `r6/scripts/*` sees `r6/scripts/Mod/a.reds`; a literal path stays exact. A dotfile is an ordinary name: `mods/*` matches the game's own `mods/.stub`, so "an installed REDmod" is written `mods/*/info.json`.
+
 **Removed.** `native_code_patterns` is declared and enforced nowhere, so it reads as a protection that doesn't exist.
 
 **Proof.** The Cyberpunk tracer package must give a working modded game using only this section: REDmod placement, a before-launch `redmod deploy`, a script-parsed framework version. A test walks it through with no real game, and the author guide documents exactly the fields official plugins use, checked by script.
+
+**Known gaps.** A game whose saves are chosen by an INI setting can get per-instance saves through `save_location`; a game that keeps them in JSON or another format cannot yet. Cyberpunk 2077 is the first case: its saves live under `Saved Games` and its settings are `UserSettings.json`, so Agora lists the saves but cannot redirect them per instance.
