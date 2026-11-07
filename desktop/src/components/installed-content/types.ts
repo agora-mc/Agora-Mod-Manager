@@ -120,6 +120,8 @@ export interface InstalledContentPanelProps {
   rowTestId?: string;
   /** Load-order mode: positions, Move up/down and drag-and-drop. */
   loadOrder?: LoadOrderConfig;
+  /** Extra items for a row's More actions menu, such as running a tool on that item. */
+  extraRowMenuItems?: (row: InstalledContentRow) => React.ReactNode;
   onToggle: (row: InstalledContentRow) => Promise<boolean | void>;
   onBulkToggle: (rows: InstalledContentRow[], enabled: boolean) => Promise<boolean>;
   /**

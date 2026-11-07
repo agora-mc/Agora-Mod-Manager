@@ -99,6 +99,9 @@ const orderFinding = {
 
 const listed = {
   supported: true,
+  listId: 'plugins',
+  listName: 'Plugins',
+  rulesKind: 'creation_engine',
   rulesApply: true,
   listExists: true,
   rows: [...alwaysLoaded, skyui, requiem],
@@ -111,9 +114,11 @@ async function openPage(
   tabPage: 'plugins' | 'ini-saves',
   replies: Record<string, unknown>,
   fail?: { command: string; error: unknown },
+  sequences?: Record<string, unknown[]>,
 ) {
   await installGamesMock(page, {
     replies: { ...BOOT_REPLIES, ...instanceHeaderReplies(INSTANCE_ID), ...replies },
+    sequences,
     settings: { active_game: 'skyrim-se' },
   });
   // Added after the mock, so the failing wrapper sees the mock's invoke and not the other way round.
@@ -266,7 +271,7 @@ test.describe('Plugins tab', () => {
 
   test('a list with no plugins yet says what to do', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, rulesApply: true, listExists: true, rows: [], findings: [], masterlist: null },
+      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'creation_engine', rulesApply: true, listExists: true, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText("No plugins are in this instance's list yet.")).toBeVisible();
@@ -275,7 +280,7 @@ test.describe('Plugins tab', () => {
 
   test('an instance with no list yet is told when one appears', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, rulesApply: true, listExists: false, rows: [], findings: [], masterlist: null },
+      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'creation_engine', rulesApply: true, listExists: false, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText('This instance has no plugin list yet.')).toBeVisible();
@@ -283,7 +288,7 @@ test.describe('Plugins tab', () => {
 
   test('a game with no plugin list says so instead of showing an empty list', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: false, rulesApply: false, listExists: false, rows: [], findings: [], masterlist: null },
+      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', rulesApply: false, listExists: false, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText('This game does not keep a plugin list')).toBeVisible();
@@ -312,6 +317,41 @@ test.describe('Plugins tab', () => {
     await expect(page.getByTestId('plugin-row')).toHaveCount(0);
   });
 });
+
+  test('a game with two load order lists shows a tab for each, and a none-rule list has no Sort', async ({ page }) => {
+    const redmods = {
+      ...listed,
+      listId: 'redmods',
+      listName: 'REDmods',
+      rulesKind: 'none',
+      rulesApply: false,
+      rows: [plugin({ position: 1, name: 'my_mod', managed: true, headerRead: false })],
+    };
+    await openPage(
+      page,
+      'plugins',
+      {
+        games_plugins_lists: {
+          lists: [
+            { id: 'plugins', name: 'Plugins', rulesKind: 'creation_engine' },
+            { id: 'redmods', name: 'REDmods', rulesKind: 'none' },
+          ],
+        },
+      },
+      undefined,
+      { games_plugins_list: [listed, redmods] },
+    );
+
+    const tabs = page.getByRole('tablist', { name: 'Load order lists' });
+    await expect(tabs.getByRole('tab')).toHaveText(['Plugins', 'REDmods']);
+    await expect(page.getByRole('heading', { name: 'Plugins' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Sort…' })).toBeVisible();
+
+    await tabs.getByRole('tab', { name: 'REDmods' }).click();
+    await expect(page.getByRole('heading', { name: 'REDmods' })).toBeVisible();
+    await expect(page.getByTestId('plugin-row')).toHaveCount(1);
+    await expect(page.getByRole('button', { name: 'Sort…' })).toHaveCount(0);
+  });
 
 test.describe('INI & saves tab', () => {
   const skyrimIni = {

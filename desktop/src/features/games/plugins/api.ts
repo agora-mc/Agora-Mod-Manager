@@ -43,9 +43,26 @@ export interface MasterlistView {
   source: string;
 }
 
+export interface LoadOrderListRow {
+  id: string;
+  name: string;
+  /** `none`, `script` or `creation_engine`. */
+  rulesKind: string;
+}
+
+export interface LoadOrderListsView {
+  lists: LoadOrderListRow[];
+}
+
 export interface PluginsView {
   /** False when the game keeps no plugin list. The tab says so instead of showing an empty list. */
   supported: boolean;
+  /** The list's id within the game. */
+  listId: string;
+  /** The list's name as a person reads it. */
+  listName: string;
+  /** `none`, `script` or `creation_engine`. */
+  rulesKind: string;
   /** Whether the game's load order rules (masters, light and full limits) apply. */
   rulesApply: boolean;
   /** False until the instance has a copy of the list, which is made at deploy time. */
@@ -156,6 +173,9 @@ function isMasterlistView(value: unknown): value is MasterlistView {
 function isPluginsView(value: unknown): value is PluginsView {
   if (!isObject(value)) return false;
   return typeof value.supported === 'boolean'
+    && typeof value.listId === 'string'
+    && typeof value.listName === 'string'
+    && typeof value.rulesKind === 'string'
     && typeof value.rulesApply === 'boolean'
     && typeof value.listExists === 'boolean'
     && Array.isArray(value.rows)
@@ -163,6 +183,17 @@ function isPluginsView(value: unknown): value is PluginsView {
     && Array.isArray(value.findings)
     && value.findings.every(isPluginFinding)
     && (value.masterlist === null || isMasterlistView(value.masterlist));
+}
+
+function isLoadOrderListsView(value: unknown): value is LoadOrderListsView {
+  return isObject(value)
+    && Array.isArray(value.lists)
+    && value.lists.every((row) =>
+      isObject(row)
+      && typeof row.id === 'string'
+      && typeof row.name === 'string'
+      && typeof row.rulesKind === 'string',
+    );
 }
 
 function isPluginChange(value: unknown): value is PluginChange {
@@ -207,45 +238,51 @@ function checkedReply<T>(command: string, reply: unknown, ok: (value: unknown) =
   return reply;
 }
 
+/** Every load order list this game declares, in the order it declares them. */
+export async function listLoadOrderLists(instanceId: string): Promise<LoadOrderListsView> {
+  const reply = await invoke<unknown>('games_plugins_lists', { instanceId });
+  return checkedReply('games_plugins_lists', reply, isLoadOrderListsView);
+}
+
 /** An instance's plugins in load order, with what the game's rules say about them. */
-export async function listGamePlugins(instanceId: string): Promise<PluginsView> {
-  const reply = await invoke<unknown>('games_plugins_list', { instanceId });
+export async function listGamePlugins(instanceId: string, listId?: string): Promise<PluginsView> {
+  const reply = await invoke<unknown>('games_plugins_list', { instanceId, listId: listId ?? null });
   return checkedReply('games_plugins_list', reply, isPluginsView);
 }
 
 /** Turn a plugin on or off in the instance's list. Refused while the game is running. */
-export async function setGamePluginActive(instanceId: string, plugin: string, active: boolean): Promise<PluginChange> {
-  const reply = await invoke<unknown>('games_plugins_set_active', { instanceId, plugin, active });
+export async function setGamePluginActive(instanceId: string, plugin: string, active: boolean, listId?: string): Promise<PluginChange> {
+  const reply = await invoke<unknown>('games_plugins_set_active', { instanceId, plugin, active, listId: listId ?? null });
   return checkedReply('games_plugins_set_active', reply, isPluginChange);
 }
 
 /** Lock or unlock a plugin's place, so sort and move leave it where it is. */
-export async function setGamePluginLocked(instanceId: string, plugin: string, locked: boolean): Promise<PluginChange> {
-  const reply = await invoke<unknown>('games_plugins_set_locked', { instanceId, plugin, locked });
+export async function setGamePluginLocked(instanceId: string, plugin: string, locked: boolean, listId?: string): Promise<PluginChange> {
+  const reply = await invoke<unknown>('games_plugins_set_locked', { instanceId, plugin, locked, listId: listId ?? null });
   return checkedReply('games_plugins_set_locked', reply, isPluginChange);
 }
 
 /** Move a plugin to a 1-based position that counts the always-loaded plugins. */
-export async function moveGamePlugin(instanceId: string, plugin: string, to: number): Promise<MoveChange> {
-  const reply = await invoke<unknown>('games_plugins_move', { instanceId, plugin, to });
+export async function moveGamePlugin(instanceId: string, plugin: string, to: number, listId?: string): Promise<MoveChange> {
+  const reply = await invoke<unknown>('games_plugins_move', { instanceId, plugin, to, listId: listId ?? null });
   return checkedReply('games_plugins_move', reply, isMoveChange);
 }
 
 /** Sort by the game's master rules. A dry run reports the moves and writes nothing. */
-export async function sortGamePlugins(instanceId: string, dryRun: boolean): Promise<SortChange> {
-  const reply = await invoke<unknown>('games_plugins_sort', { instanceId, dryRun });
+export async function sortGamePlugins(instanceId: string, dryRun: boolean, listId?: string): Promise<SortChange> {
+  const reply = await invoke<unknown>('games_plugins_sort', { instanceId, dryRun, listId: listId ?? null });
   return checkedReply('games_plugins_sort', reply, isSortChange);
 }
 
 /** Download and verify LOOT's masterlist for the game. */
-export async function updateGameMasterlist(instanceId: string): Promise<MasterlistView> {
-  const reply = await invoke<unknown>('games_plugins_update_masterlist', { instanceId });
+export async function updateGameMasterlist(instanceId: string, listId?: string): Promise<MasterlistView> {
+  const reply = await invoke<unknown>('games_plugins_update_masterlist', { instanceId, listId: listId ?? null });
   return checkedReply('games_plugins_update_masterlist', reply, isMasterlistView);
 }
 
 /** The load order's findings, read again. Read only. */
-export async function checkGamePlugins(instanceId: string): Promise<CheckView> {
-  const reply = await invoke<unknown>('games_plugins_check', { instanceId });
+export async function checkGamePlugins(instanceId: string, listId?: string): Promise<CheckView> {
+  const reply = await invoke<unknown>('games_plugins_check', { instanceId, listId: listId ?? null });
   return checkedReply('games_plugins_check', reply, isCheckView);
 }
 

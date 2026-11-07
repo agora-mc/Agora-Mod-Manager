@@ -72,6 +72,12 @@ pub struct ToolRow {
     pub from_mod: Option<String>,
     /// The tool has nothing to build: the screen offers "Run", with no build status.
     pub run_only: bool,
+    /// Whether the tool runs once for the instance or once per content item the player picks.
+    pub scope: String,
+    /// The values the tool asks the player for before it runs (MASTER_SPEC §30.12).
+    pub inputs: Vec<agora_game_api::ToolInput>,
+    /// The values already saved for this instance, keyed by input id.
+    pub input_values: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -429,6 +435,9 @@ pub fn tools_view(
                     .map(|found| found.mod_name.clone())
                     .filter(|name| !name.is_empty()),
                 run_only: state.run_only,
+                scope: "instance".to_string(),
+                inputs: Vec::new(),
+                input_values: std::collections::BTreeMap::new(),
             }
         })
         .collect();
@@ -447,12 +456,23 @@ fn view_of(ctx: &Ctx, instance_id: &str, game: &GameDefinition) -> Result<ToolsV
         .iter()
         .filter_map(|id| ctx.games.tool(&game.id, id).map(|tool| tool.name.clone()))
         .collect();
-    Ok(tools_view(
-        instance_id.to_string(),
-        states,
-        &findings,
-        known,
-    ))
+    let mut view = tools_view(instance_id.to_string(), states, &findings, known);
+    // Declared inputs, scope and saved values come from the package, not the output record.
+    let stored = game_tools::read_tool_inputs(ctx, instance_id).map_err(core_error)?;
+    for row in &mut view.tools {
+        if let Some(tool) = ctx.games.tool(
+            &game.id,
+            &ToolId::new(row.tool_id.clone()).map_err(core_error)?,
+        ) {
+            row.scope = match tool.scope {
+                agora_game_api::ToolScope::Instance => "instance".to_string(),
+                agora_game_api::ToolScope::Item => "item".to_string(),
+            };
+            row.inputs = tool.inputs.clone();
+            row.input_values = stored.get(&row.tool_id).cloned().unwrap_or_default();
+        }
+    }
+    Ok(view)
 }
 
 impl From<&SwapCosts> for SwapCostsDto {
@@ -589,6 +609,32 @@ pub async fn games_tools_list(
     .await
 }
 
+/// Save the values the player filled in for a tool's inputs. A blank value removes the saved one,
+/// so the input's default applies again. Choices and flags are checked by core.
+#[tauri::command]
+pub async fn games_tools_save_inputs(
+    app: tauri::AppHandle,
+    instance_id: String,
+    tool_id: String,
+    values: std::collections::BTreeMap<String, String>,
+) -> Result<(), GamesError> {
+    let tool = tool_id_of(&tool_id)?;
+    with_ctx(app, move |ctx| {
+        let game = definition_of(&ctx, &instance_id)?;
+        for (input_id, value) in values {
+            if value.trim().is_empty() {
+                game_tools::clear_tool_input(&ctx, &instance_id, &tool, &input_id)
+                    .map_err(core_error)?;
+            } else {
+                game_tools::set_tool_input(&ctx, &instance_id, &game, &tool, &input_id, &value)
+                    .map_err(core_error)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Run a tool in the instance. `refusal` is the reason the virtual file system gave, when the user has
 /// chosen the tier that runs instead of it; `confirm_swap` says the swap's costs were shown and accepted.
 #[tauri::command]
@@ -599,6 +645,7 @@ pub async fn games_tools_run(
     capture: String,
     refusal: Option<String>,
     confirm_swap: bool,
+    item_id: Option<String>,
 ) -> Result<RunResult, GamesError> {
     let tool = tool_id_of(&tool_id)?;
     let capture = parse_capture(&capture)?;
@@ -606,8 +653,19 @@ pub async fn games_tools_run(
     with_ctx(app, move |ctx| {
         let game = definition_of(&ctx, &instance_id)?;
         let cancel = CancellationToken::new();
-        let result = match refusal {
-            Some(reason) => game_tools::run_after_vfs_refusal(
+        let result = match (item_id.as_deref(), refusal) {
+            (Some(item), _) => game_tools::run_for_item(
+                &ctx,
+                &instance_id,
+                &game,
+                &tool,
+                item,
+                capture,
+                confirm_swap,
+                &SystemLauncher,
+                &cancel,
+            ),
+            (None, Some(reason)) => game_tools::run_after_vfs_refusal(
                 &ctx,
                 &instance_id,
                 &game,
@@ -618,7 +676,7 @@ pub async fn games_tools_run(
                 &SystemLauncher,
                 &cancel,
             ),
-            None => game_tools::run(
+            (None, None) => game_tools::run(
                 &ctx,
                 &instance_id,
                 &game,

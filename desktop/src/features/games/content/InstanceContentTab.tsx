@@ -11,12 +11,23 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { DropdownMenuItem } from '@/components/ui/dropdown-menu';
 import { useConfirm } from '@/components/ui/confirm';
 import { InstalledContentPanel } from '@/components/installed-content/InstalledContentPanel';
 import type { LoadOrderConfig } from '@/components/installed-content/types';
 import type { InstalledContentRow } from '@/lib/tauri';
 import { itemsForInstanceOf, listLibrary, type LibraryItem } from '@/features/library/api';
 import { openGameInstanceFolder } from '../instances/api';
+import { listGameTools, runGameTool, saveGameToolInputs, type ToolRow } from '../tools/api';
+import { ToolInputsForm } from '../tools/ToolInputsForm';
 import { FomodWizard } from '../fomod';
 import { isGamesError } from '../shared/types';
 import {
@@ -73,6 +84,12 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [wizardFor, setWizardFor] = useState<string | null>(null);
+  const [itemTools, setItemTools] = useState<ToolRow[]>([]);
+  const [itemToolsError, setItemToolsError] = useState<string | null>(null);
+  const [toolTarget, setToolTarget] = useState<{ tool: ToolRow; item: InstanceContentRow } | null>(null);
+  const [toolBusy, setToolBusy] = useState(false);
+  const [toolError, setToolError] = useState<string | null>(null);
+  const [placementNote, setPlacementNote] = useState<{ topLevel: string[]; note: string } | null>(null);
 
   const refresh = useCallback(async () => {
     setContentError(null);
@@ -101,9 +118,16 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
     setNotice(null);
     setActionError(null);
     setPickedId('');
+    setItemToolsError(null);
     void refresh();
     void refreshLibrary();
-  }, [refresh, refreshLibrary]);
+    listGameTools(instanceId)
+      .then((view) => setItemTools(view.tools.filter((tool) => tool.scope === 'item')))
+      .catch((error: unknown) => {
+        setItemTools([]);
+        setItemToolsError(errorMessage(error));
+      });
+  }, [instanceId, refresh, refreshLibrary]);
 
   const items = content?.items ?? [];
   const panelRows = useMemo(() => toPanelRows(items), [items]);
@@ -239,9 +263,44 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
       }
       setPickedId('');
     } catch (error) {
-      setActionError(`Could not add ${item.name}: ${errorMessage(error)}`);
+      if (isGamesError(error) && error.code === 'placement_unknown') {
+        const details = error.details as { topLevel?: unknown; note?: unknown } | undefined;
+        if (typeof details?.note === 'string' && details.note !== '') {
+          setPlacementNote({
+            topLevel: Array.isArray(details.topLevel) ? details.topLevel.filter((entry): entry is string => typeof entry === 'string') : [],
+            note: details.note,
+          });
+        } else {
+          setActionError(`Could not add ${item.name}: ${errorMessage(error)}`);
+        }
+      } else {
+        setActionError(`Could not add ${item.name}: ${errorMessage(error)}`);
+      }
     } finally {
       setBusy(null);
+    }
+  };
+
+  const runItemTool = async (tool: ToolRow, item: InstanceContentRow, values: Record<string, string>) => {
+    setToolBusy(true);
+    setToolError(null);
+    try {
+      if (tool.inputs.length > 0) await saveGameToolInputs(instanceId, tool.toolId, values);
+      const result = await runGameTool(instanceId, tool.toolId, 'auto', { itemId: item.itemId });
+      if (result.status === 'finished') {
+        setNotice(`Ran ${tool.name} on ${item.name}.`);
+        setToolTarget(null);
+      } else if (result.status === 'vfsRefused') {
+        setToolError(`${tool.name} could not run its usual way. ${result.reason}`);
+      } else if (result.status === 'needsSwap') {
+        setToolError(`${tool.name} works on the game's real install. Run it from the Tools tab.`);
+      } else {
+        setToolError(`${tool.name} could not run: its output folder already has files.`);
+      }
+    } catch (error) {
+      setToolError(errorMessage(error));
+    } finally {
+      setToolBusy(false);
     }
   };
 
@@ -255,6 +314,16 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
       {actionError && (
         <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm">
           {actionError}
+        </p>
+      )}
+      {itemToolsError && (
+        <p role="status" className="text-xs text-muted-foreground">
+          Tools that run on one item could not be read: {itemToolsError}
+        </p>
+      )}
+      {toolError && (
+        <p role="alert" className="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm">
+          {toolError}
         </p>
       )}
 
@@ -301,6 +370,18 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
           showCopyFilename={false}
           onError={setActionError}
           loadOrder={loadOrder}
+          extraRowMenuItems={(row) => {
+            const original = originalsByKey.get(row.key);
+            if (!original || itemTools.length === 0) return null;
+            return itemTools.map((tool) => (
+              <DropdownMenuItem key={tool.toolId} onSelect={() => {
+                setToolError(null);
+                setToolTarget({ tool, item: original });
+              }}>
+                Run {tool.name} on this
+              </DropdownMenuItem>
+            ));
+          }}
         />
       )}
 
@@ -337,6 +418,57 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
           </div>
         )}
       </div>
+
+      <Dialog open={placementNote !== null} onOpenChange={(open) => { if (!open) setPlacementNote(null); }}>
+        <DialogContent data-testid="placement-unknown">
+          <DialogHeader>
+            <DialogTitle>Agora cannot tell where these files go</DialogTitle>
+            <DialogDescription>
+              {placementNote !== null && placementNote.topLevel.length > 0
+                ? `Top-level entries: ${placementNote.topLevel.join(', ')}`
+                : 'This game has no rule for these files.'}
+            </DialogDescription>
+          </DialogHeader>
+          {placementNote !== null && (
+            <p className="text-sm text-muted-foreground">{placementNote.note}</p>
+          )}
+          <DialogFooter>
+            <Button type="button" onClick={() => setPlacementNote(null)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={toolTarget !== null} onOpenChange={(open) => { if (!open && !toolBusy) setToolTarget(null); }}>
+        <DialogContent data-testid="item-tool-dialog">
+          <DialogHeader>
+            <DialogTitle>{toolTarget === null ? 'Run a tool' : `Run ${toolTarget.tool.name} on ${toolTarget.item.name}`}</DialogTitle>
+            <DialogDescription>
+              {toolTarget?.tool.inputs.length
+                ? 'Fill in what the tool needs, then run it on this item.'
+                : 'This tool runs on this item only.'}
+            </DialogDescription>
+          </DialogHeader>
+          {toolTarget !== null && toolTarget.tool.inputs.length > 0 ? (
+            <ToolInputsForm
+              inputs={toolTarget.tool.inputs}
+              initialValues={toolTarget.tool.inputValues}
+              busy={toolBusy}
+              submitLabel={`Run ${toolTarget.tool.name}`}
+              onSubmit={(values) => runItemTool(toolTarget.tool, toolTarget.item, values)}
+              onCancel={() => setToolTarget(null)}
+            />
+          ) : (
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setToolTarget(null)} disabled={toolBusy}>Cancel</Button>
+              <Button type="button" disabled={toolBusy} onClick={() => {
+                if (toolTarget !== null) void runItemTool(toolTarget.tool, toolTarget.item, {});
+              }}>
+                Run {toolTarget?.tool.name}
+              </Button>
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
 
       {wizardFor && (
         <FomodWizard

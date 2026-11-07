@@ -412,9 +412,8 @@ fn add_error(error: AddToInstanceError) -> GamesError {
         AddToInstanceError::Content(error) => content_error(error),
         AddToInstanceError::Thunderstore(error) => GamesError::new(CORE_FAILED, error.to_string()),
         AddToInstanceError::Deploy(error) => deploy_error(error),
-        AddToInstanceError::PlacementUnknown { top_level, note } => GamesError::new(
-            PLACEMENT_UNKNOWN,
-            match note {
+        AddToInstanceError::PlacementUnknown { top_level, note } => {
+            let message = match &note {
                 Some(note) => format!(
                     "Agora cannot tell where these files go (top-level entries: {}), and this game has no rule for them. {note}",
                     top_level.join(", ")
@@ -423,8 +422,12 @@ fn add_error(error: AddToInstanceError) -> GamesError {
                     "Agora cannot tell where these files go (top-level entries: {}), and this game has no rule for them.",
                     top_level.join(", ")
                 ),
-            },
-        ),
+            };
+            GamesError::new(PLACEMENT_UNKNOWN, message).with_details(serde_json::json!({
+                "topLevel": top_level,
+                "note": note,
+            }))
+        }
         AddToInstanceError::Classify(message) => GamesError::new(
             CORE_FAILED,
             format!("Agora cannot place the content: {message}"),
@@ -760,6 +763,18 @@ mod tests {
         assert_eq!(
             unknown.message,
             "Agora cannot tell where these files go (top-level entries: stuff, docs), and this game has no rule for them."
+        );
+        let noted = add_error(AddToInstanceError::PlacementUnknown {
+            top_level: vec!["stuff".into()],
+            note: Some("A rule could not be judged.".into()),
+        });
+        assert_eq!(
+            noted
+                .details
+                .as_ref()
+                .and_then(|d| d.get("note"))
+                .and_then(|n| n.as_str()),
+            Some("A rule could not be judged.")
         );
         let no_rules = add_error(AddToInstanceError::NoContentLayout {
             game_id: "skyrim-se".into(),

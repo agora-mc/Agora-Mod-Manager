@@ -26,6 +26,8 @@ export interface GameLaunchState {
   reply: LaunchReply | null;
   /** The last launch failed outright, in a sentence. */
   error: string | null;
+  /** The before-launch tool Agora is running now, when it is. */
+  runningTool: string | null;
 }
 
 export interface LaunchOptions {
@@ -33,9 +35,15 @@ export interface LaunchOptions {
   launchAnyway?: boolean;
   /** Run this once with another deployment (the answer to the virtual file system question). */
   deployment?: DeploymentMode;
+  /** How to answer each before-launch tool; leave out to be asked. */
+  beforeLaunch?: Record<string, 'run' | 'launch_anyway'>;
+  /** Launch without running any before-launch tool. */
+  skipBeforeLaunch?: boolean;
+  /** The tool whose run the progress line names. */
+  runningTool?: string;
 }
 
-const IDLE: GameLaunchState = Object.freeze({ busy: false, startedAt: null, reply: null, error: null });
+const IDLE: GameLaunchState = Object.freeze({ busy: false, startedAt: null, reply: null, error: null, runningTool: null });
 
 const states = new Map<string, GameLaunchState>();
 const listeners = new Set<() => void>();
@@ -64,12 +72,46 @@ export function gameLaunchState(instanceId: string): GameLaunchState {
  */
 export async function startGameLaunch(instanceId: string, options: LaunchOptions = {}): Promise<LaunchReply | null> {
   if (gameLaunchState(instanceId).busy) return null;
-  update(instanceId, { busy: true, startedAt: Date.now(), reply: null, error: null });
+  update(instanceId, {
+    busy: true,
+    startedAt: Date.now(),
+    reply: null,
+    error: null,
+    runningTool: options.runningTool ?? null,
+  });
   try {
-    const reply = await launchGameInstance(instanceId, {
+    let reply = await launchGameInstance(instanceId, {
       launchAnyway: options.launchAnyway ?? false,
       deployment: options.deployment,
+      beforeLaunch: options.beforeLaunch,
+      skipBeforeLaunch: options.skipBeforeLaunch,
     });
+    // Run-mode tools run by themselves, visibly. Ask-mode tools stay for the page's dialog.
+    if (
+      reply.status === 'before_launch_needed'
+      && options.beforeLaunch === undefined
+      && options.skipBeforeLaunch !== true
+    ) {
+      const needs = reply.beforeLaunch ?? [];
+      const asks = needs.filter((need) => need.mode === 'ask');
+      const runs = needs.filter((need) => need.mode === 'run');
+      if (asks.length === 0 && runs.length > 0) {
+        const answers: Record<string, 'run' | 'launch_anyway'> = {};
+        for (const need of runs) answers[need.tool] = 'run';
+        update(instanceId, {
+          busy: true,
+          startedAt: Date.now(),
+          reply: null,
+          error: null,
+          runningTool: runs[0]?.name ?? null,
+        });
+        reply = await launchGameInstance(instanceId, {
+          launchAnyway: options.launchAnyway ?? false,
+          deployment: options.deployment,
+          beforeLaunch: answers,
+        });
+      }
+    }
     update(instanceId, { ...IDLE, reply });
     return reply;
   } catch (failure) {

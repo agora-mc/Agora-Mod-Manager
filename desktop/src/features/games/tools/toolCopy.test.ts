@@ -147,7 +147,7 @@ describe('shownPaths', () => {
 });
 
 describe('conflictLine', () => {
-  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: null, fromMod: null, runOnly: false };
+  const nemesis: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: '1', previous: null, status: 'current', conflicts: true, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: null, fromMod: null, runOnly: false, scope: 'instance', inputs: [], inputValues: {} };
   const pandora: ToolRow = { ...nemesis, toolId: 'pandora', name: 'Pandora', conflicts: true };
   const bodyslide: ToolRow = { ...nemesis, toolId: 'bodyslide', name: 'BodySlide', conflicts: false };
 
@@ -186,7 +186,7 @@ describe('the Tools tab wording', () => {
   });
 
   it('says where a tool comes from', () => {
-    const base: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: null, previous: null, status: null, conflicts: false, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: 'Data/x.exe', fromMod: 'Nemesis Engine', runOnly: false };
+    const base: ToolRow = { toolId: 'nemesis', name: 'Nemesis', declared: true, current: null, previous: null, status: null, conflicts: false, outputKind: 'generated_layer', outputFolder: null, installed: true, exe: 'Data/x.exe', fromMod: 'Nemesis Engine', runOnly: false, scope: 'instance', inputs: [], inputValues: {} };
     expect(originLine(base)).toBe('From the mod “Nemesis Engine”');
     expect(originLine({ ...base, fromMod: null })).toBe('From the game’s own files');
     expect(originLine({ ...base, installed: false, fromMod: null })).toBe('Not installed in this instance');

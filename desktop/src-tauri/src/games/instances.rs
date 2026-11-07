@@ -176,6 +176,31 @@ pub struct LaunchReply {
     pub findings: Vec<CheckFinding>,
     pub reason: Option<String>,
     pub next: Option<String>,
+    /// For `before_launch_needed`: the tools that have not run (or whose output is stale).
+    pub before_launch: Vec<BeforeLaunchNeedView>,
+    /// For `before_launch_failed`: the tool that ran and did not finish.
+    pub before_launch_failure: Option<BeforeLaunchFailureView>,
+}
+
+/// One tool a launch should run first, as the page shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeLaunchNeedView {
+    pub tool: String,
+    pub name: String,
+    /// `run` or `ask`.
+    pub mode: String,
+    /// Why the tool is needed, in core's words.
+    pub reason: String,
+}
+
+/// A before-launch run that failed, in the words the dialog shows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeforeLaunchFailureView {
+    pub tool: String,
+    pub name: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -456,8 +481,8 @@ pub async fn games_instance_launch(
         }
         game_instance::BeforeLaunchChoice::Answers(parsed)
     } else {
-        // The page does not ask yet: run what the game says to run.
-        game_instance::BeforeLaunchChoice::Run
+        // The page asks before a protected launch: nothing runs unasked.
+        game_instance::BeforeLaunchChoice::Ask
     };
     blocking(move || launch_instance(&app, &instance_id, launch_anyway, chosen, before)).await
 }
@@ -904,6 +929,16 @@ fn launch_instance(
         Err(InstanceError::VfsUnavailable { reason, next, .. }) => {
             return Ok(vfs_question(reason, next));
         }
+        Err(InstanceError::BeforeLaunchNeeded { tools, .. }) => {
+            return Ok(before_launch_question(tools));
+        }
+        Err(InstanceError::BeforeLaunchFailed {
+            tool,
+            name,
+            message,
+        }) => {
+            return Ok(before_launch_failed(tool, name, message));
+        }
         Err(InstanceError::LaunchError(LaunchError::RuntimeMismatch { findings })) => {
             return Ok(refused(findings.iter().map(framework_finding).collect()));
         }
@@ -938,6 +973,8 @@ fn launch_instance(
         findings,
         reason: None,
         next: None,
+        before_launch: Vec::new(),
+        before_launch_failure: None,
     };
 
     // The user's saves and settings are swapped in for this session. They go back when the game
@@ -1165,6 +1202,8 @@ fn vfs_question(reason: String, next: Option<DeployMode>) -> LaunchReply {
         findings: Vec::new(),
         reason: Some(reason),
         next: next.map(|mode| mode.as_str().to_string()),
+        before_launch: Vec::new(),
+        before_launch_failure: None,
     }
 }
 
@@ -1177,6 +1216,54 @@ fn refused(findings: Vec<CheckFinding>) -> LaunchReply {
         findings,
         reason: None,
         next: None,
+        before_launch: Vec::new(),
+        before_launch_failure: None,
+    }
+}
+
+/// The launch needs these tools first. Nothing was started; the page asks.
+fn before_launch_question(tools: Vec<agora_core::game_tools::BeforeLaunchNeed>) -> LaunchReply {
+    LaunchReply {
+        status: "before_launch_needed",
+        pid: None,
+        deployment: None,
+        notice: None,
+        findings: Vec::new(),
+        reason: None,
+        next: None,
+        before_launch: tools
+            .into_iter()
+            .map(|need| BeforeLaunchNeedView {
+                tool: need.tool,
+                name: need.name,
+                mode: match need.mode {
+                    agora_game_api::BeforeLaunchMode::Run => "run".to_string(),
+                    agora_game_api::BeforeLaunchMode::Ask => "ask".to_string(),
+                },
+                reason: need.reason,
+            })
+            .collect(),
+        before_launch_failure: None,
+    }
+}
+
+/// A before-launch tool ran and did not finish. Nothing was started; the page offers launching
+/// anyway, as every protection does.
+fn before_launch_failed(tool: String, name: String, message: String) -> LaunchReply {
+    LaunchReply {
+        status: "before_launch_failed",
+        pid: None,
+        deployment: None,
+        notice: None,
+        findings: Vec::new(),
+        reason: None,
+        next: None,
+        before_launch: Vec::new(),
+        before_launch_failure: Some(BeforeLaunchFailureView {
+            tool,
+            name,
+            message,
+        }),
     }
 }
 

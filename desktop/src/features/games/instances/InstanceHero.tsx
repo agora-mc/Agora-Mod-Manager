@@ -10,6 +10,14 @@
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
   InstancePageHeader,
   InstanceTileButton,
   ReadinessLine,
@@ -41,7 +49,7 @@ export function readinessView(check: InstanceCheck | null, checkError: string | 
 
 export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
   const session = useInstanceSession();
-  const { page, busy, launchStartedAt, reply, actionError } = session;
+  const { page, busy, launchStartedAt, runningTool, reply, actionError } = session;
   const [now, setNow] = useState(() => Date.now());
   const customIcon = useGameInstanceIcon(session.instanceId);
   const [imageBusy, setImageBusy] = useState(false);
@@ -157,6 +165,7 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
   const showBanners = busy === 'launch' || reply !== null || actionError !== null || imageError !== null || headerNotice !== null;
 
   return (
+    <>
     <InstancePageHeader
       testId="instance-hero"
       running={detail.running}
@@ -218,7 +227,9 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
           )}
           {busy === 'launch' && (
             <div role="status" className="space-y-1 text-sm">
-              <p className="font-medium">Checking, preparing and starting the game…</p>
+              <p className="font-medium">
+                {runningTool === null ? 'Checking, preparing and starting the game…' : `Running ${runningTool}…`}
+              </p>
               <p className="text-muted-foreground">
                 {elapsedText(elapsed)} so far. A large instance can take several minutes the first time, and Agora cannot show a percentage yet.
               </p>
@@ -234,6 +245,92 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
         </>
       )}
     />
+    <BeforeLaunchDialog
+      reply={reply}
+      busy={busy === 'launch'}
+      onRun={(needs) => {
+        const answers: Record<string, 'run' | 'launch_anyway'> = {};
+        for (const need of needs) answers[need.tool] = 'run';
+        void session.launch(undefined, { beforeLaunch: answers, runningTool: needs[0]?.name });
+      }}
+      onLaunchAnyway={() => void session.launch(undefined, { skipBeforeLaunch: true })}
+      onCancel={session.dismissReply}
+    />
+    </>
+  );
+}
+
+/** The question a launch asks about tools that should run first, and the failure if one did not. */
+export function BeforeLaunchDialog({
+  reply,
+  busy,
+  onRun,
+  onLaunchAnyway,
+  onCancel,
+}: {
+  reply: LaunchReply | null;
+  busy: boolean;
+  onRun: (needs: NonNullable<LaunchReply['beforeLaunch']>) => void;
+  onLaunchAnyway: () => void;
+  onCancel: () => void;
+}) {
+  const needs = reply?.status === 'before_launch_needed'
+    ? (reply.beforeLaunch ?? []).filter((need) => need.mode === 'ask')
+    : [];
+  const failure = reply?.status === 'before_launch_failed' ? reply.beforeLaunchFailure : null;
+  const open = needs.length > 0 || failure !== null;
+
+  if (!open) return null;
+
+  if (failure !== null) {
+    return (
+      <Dialog open onOpenChange={(next) => { if (!next) onCancel(); }}>
+        <DialogContent data-testid="before-launch-failed">
+          <DialogHeader>
+            <DialogTitle>{failure.name} didn’t finish</DialogTitle>
+            <DialogDescription className="text-sm text-foreground whitespace-pre-wrap">
+              {failure.message}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button type="button" variant="outline" onClick={onCancel} disabled={busy}>Cancel</Button>
+            <Button type="button" onClick={onLaunchAnyway} disabled={busy}>Launch anyway</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
+  const single = needs.length === 1 ? needs[0] : null;
+  const body = needs.some((need) => need.reason.includes('out of date'))
+    ? 'Your mods have changed since it last ran.'
+    : needs.some((need) => need.reason.includes('never run'))
+      ? 'It hasn’t run for this instance yet.'
+      : 'Agora cannot tell whether it has run since your mods last changed.';
+
+  return (
+    <Dialog open onOpenChange={(next) => { if (!next) onCancel(); }}>
+      <DialogContent data-testid="before-launch-question">
+        <DialogHeader>
+          <DialogTitle>{single === null ? 'These should run first' : `${single.name} should run first`}</DialogTitle>
+          <DialogDescription asChild>
+            <div className="space-y-2 text-sm">
+              {single === null && (
+                <ul className="list-disc space-y-1 pl-5 text-foreground">
+                  {needs.map((need) => <li key={need.tool}>{need.name}</li>)}
+                </ul>
+              )}
+              <p>{body}</p>
+            </div>
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="gap-2">
+          <Button type="button" variant="outline" onClick={onCancel} disabled={busy}>Cancel</Button>
+          <Button type="button" variant="outline" onClick={onLaunchAnyway} disabled={busy}>Launch anyway</Button>
+          <Button type="button" onClick={() => onRun(needs)} disabled={busy}>Run and launch</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -246,6 +343,8 @@ function LaunchResult({
   onChoose: (next: DeploymentMode, always: boolean) => void;
   onDismiss: () => void;
 }) {
+  // The before-launch question is a dialog of its own; the banner under the header says nothing.
+  if (reply.status === 'before_launch_needed' || reply.status === 'before_launch_failed') return null;
   if (reply.status === 'launched') {
     return (
       <div role="status" className="space-y-2 rounded-lg border border-border p-3 text-sm">

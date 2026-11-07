@@ -55,7 +55,7 @@ const nemesis: ToolRow = {
   installed: true,
   exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
   fromMod: 'Nemesis Unlimited Behavior Engine',
-  runOnly: false,
+  runOnly: false, scope: 'instance', inputs: [], inputValues: {},
 };
 
 const fnis: UserToolRow = {
