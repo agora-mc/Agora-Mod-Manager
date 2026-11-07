@@ -8,8 +8,8 @@ use agora_core::game_base::{
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{
     create, delete, delete_permanently, delete_with_options, get, get_manifest,
-    prepare_launch_with_discovery, record_launch, DeleteOptions, GameInstanceManifest,
-    InstanceError,
+    prepare_launch_with, prepare_launch_with_discovery, record_launch, DeleteOptions,
+    GameInstanceManifest, InstanceError,
 };
 use agora_core::game_launch::LaunchError;
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
@@ -918,9 +918,20 @@ fn a_pinned_undeployed_launch_checks_its_recipe() {
         installs: vec![install.discovered.clone()],
         warnings: vec![],
     };
-    let error =
-        prepare_launch_with_discovery(&ctx, &rec.instance_id, &def, false, &|| report.clone())
-            .unwrap_err();
+    let error = prepare_launch_with(
+        &ctx,
+        &rec.instance_id,
+        &def,
+        agora_core::game_instance::LaunchOptions {
+            launch_anyway: false,
+            // Linked files need no VFS, so the recipe check runs without one.
+            deployment: Some(agora_core::game_deploy::DeployMode::Links),
+            ..Default::default()
+        },
+        &|| report.clone(),
+        &agora_core::game_launch::SystemLauncher,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
 }
 
@@ -949,13 +960,21 @@ fn a_deployed_launch_checks_its_recipe() {
         installs: vec![install.discovered.clone()],
         warnings: vec![],
     };
-    let error =
-        prepare_launch_with_discovery(&ctx, &rec.instance_id, &def, false, &|| report.clone())
-            .unwrap_err();
-    assert!(
-        error.to_string().contains("LD_PRELOAD") || error.to_string().contains("unsafe"),
-        "{error}"
-    );
+    let error = prepare_launch_with(
+        &ctx,
+        &rec.instance_id,
+        &def,
+        agora_core::game_instance::LaunchOptions {
+            launch_anyway: false,
+            // Linked files need no VFS, so the recipe check runs without one.
+            deployment: Some(agora_core::game_deploy::DeployMode::Links),
+            ..Default::default()
+        },
+        &|| report.clone(),
+        &agora_core::game_launch::SystemLauncher,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
 }
 
 #[test]

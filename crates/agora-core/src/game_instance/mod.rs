@@ -563,6 +563,20 @@ pub(crate) fn hook_context(
     definition: &GameDefinition,
 ) -> Result<agora_game_api::GameContext, InstanceError> {
     let manifest = get_manifest(ctx, &record.instance_id)?;
+    Ok(hook_context_from_manifest(
+        &record.instance_id,
+        &manifest,
+        definition,
+    ))
+}
+
+/// The hook context for an instance whose manifest is already read. A folder-only instance (one
+/// with a manifest but no `game_instances` row) has the same facts for a hook as one in the table.
+pub(crate) fn hook_context_from_manifest(
+    instance_id: &str,
+    manifest: &GameInstanceManifest,
+    definition: &GameDefinition,
+) -> agora_game_api::GameContext {
     let runtime = manifest
         .runtime_identity
         .clone()
@@ -576,15 +590,15 @@ pub(crate) fn hook_context(
             version: String::new(),
             build: None,
         });
-    Ok(agora_game_api::GameContext {
-        instance: record.instance_id.clone(),
+    agora_game_api::GameContext {
+        instance: instance_id.to_string(),
         runtime,
         base: Some(manifest.base.clone()),
         frameworks: manifest.frameworks.clone(),
-        layers: manifest.layers,
+        layers: manifest.layers.clone(),
         load_order: agora_game_api::LoadOrder::default(),
         settings: std::collections::BTreeMap::new(),
-    })
+    }
 }
 
 /// List all generic game instances ordered by last launched, then created.
@@ -2179,6 +2193,14 @@ pub fn list_all(ctx: &Ctx) -> (Vec<InstanceSummary>, Vec<String>) {
         });
         {
             for row in mc_rows {
+                // The combined backend also lists the generic instances added above. Keep the
+                // richer generic summary and do not count any instance twice.
+                if summaries
+                    .iter()
+                    .any(|summary| summary.instance_id == row.instance_id)
+                {
+                    continue;
+                }
                 let runtime = if row.loader.is_empty() {
                     row.minecraft_version
                 } else {

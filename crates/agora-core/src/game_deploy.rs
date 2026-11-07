@@ -3100,15 +3100,8 @@ impl<'a> PlacementClassifier<'a> {
 
     pub(crate) fn run(&self, files: &[RelPath]) -> Option<Suggestion> {
         let package = self.ctx.games.package_for(&self.definition.id).cloned()?;
-        let record = match crate::game_instance::get(self.ctx, self.instance_id) {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                *self.error.borrow_mut() = Some(GameError {
-                    code: "ERR_INSTANCE_MISSING".into(),
-                    message: format!("there is no instance '{}'", self.instance_id),
-                });
-                return None;
-            }
+        let manifest = match crate::game_instance::get_manifest(self.ctx, self.instance_id) {
+            Ok(manifest) => manifest,
             Err(error) => {
                 *self.error.borrow_mut() = Some(GameError {
                     code: "ERR_INSTANCE_FAILED".into(),
@@ -3117,16 +3110,11 @@ impl<'a> PlacementClassifier<'a> {
                 return None;
             }
         };
-        let context = match crate::game_instance::hook_context(self.ctx, &record, self.definition) {
-            Ok(context) => context,
-            Err(error) => {
-                *self.error.borrow_mut() = Some(GameError {
-                    code: "ERR_INSTANCE_FAILED".into(),
-                    message: error.to_string(),
-                });
-                return None;
-            }
-        };
+        let context = crate::game_instance::hook_context_from_manifest(
+            self.instance_id,
+            &manifest,
+            self.definition,
+        );
         match crate::game_registry::block_on_hook(package.classify(context, files.to_vec())) {
             Ok(suggestion) => suggestion,
             Err(error) => {
