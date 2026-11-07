@@ -48,12 +48,26 @@ describe('the before-launch question', () => {
     const dialog = screen.getByRole('dialog');
     expect(dialog).toHaveTextContent('REDmod deploy should run first');
     expect(dialog).toHaveTextContent('It hasn’t run for this instance yet.');
+    expect(screen.getByRole('button', { name: 'Run and launch' }).parentElement).toHaveClass('sm:flex-wrap');
     fireEvent.click(screen.getByRole('button', { name: 'Run and launch' }));
     expect(onRun).toHaveBeenCalledWith([expect.objectContaining({ tool: 'deploy', mode: 'ask' })]);
     fireEvent.click(screen.getByRole('button', { name: 'Launch anyway' }));
     expect(onLaunchAnyway).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('says plainly when it cannot tell whether a tool needs to run', () => {
+    render(
+      <BeforeLaunchDialog
+        reply={reply({ beforeLaunch: [{ tool: 'deploy', name: 'REDmod deploy', mode: 'ask', reason: 'Agora cannot tell whether its output is current' }] })}
+        busy={false}
+        onRun={() => undefined}
+        onLaunchAnyway={() => undefined}
+        onCancel={() => undefined}
+      />,
+    );
+    expect(screen.getByRole('dialog')).toHaveTextContent("Agora can't tell whether it has run since your mods last changed.");
   });
 
   it('lists several tools under “These should run first”', () => {

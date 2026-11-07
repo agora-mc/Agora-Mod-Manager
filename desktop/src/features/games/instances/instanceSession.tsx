@@ -30,6 +30,7 @@ export interface BeforeLaunchAnswerOptions {
   beforeLaunch?: Record<string, 'run' | 'launch_anyway'>;
   skipBeforeLaunch?: boolean;
   runningTool?: string;
+  runningTools?: number;
 }
 
 export interface InstanceSnapshot {
@@ -50,8 +51,10 @@ export interface InstanceSession {
   page: InstancePageState;
   busy: 'deployment' | 'launch' | null;
   launchStartedAt: number | null;
-  /** The before-launch tool being run now, when one is. */
+  /** The before-launch tool being run now, when exactly one is. */
   runningTool: string | null;
+  /** How many before-launch tools the launch is running. */
+  runningTools: number;
   reply: LaunchReply | null;
   actionError: string | null;
   launchAnyway: boolean;
@@ -100,6 +103,7 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
   const launchStartedAt = launchState.startedAt;
   const reply = launchState.reply;
   const runningTool = launchState.runningTool;
+  const runningTools = launchState.runningTools;
   const actionError = ownError ?? launchState.error;
   const [launchAnyway, setLaunchAnyway] = useState(false);
   // An answer that arrives after the user moved to another instance is remembered, not shown.
@@ -220,6 +224,7 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
       beforeLaunch: before.beforeLaunch,
       skipBeforeLaunch: before.skipBeforeLaunch,
       runningTool: before.runningTool,
+      runningTools: before.runningTools,
     });
     if (answer === null) return;
     // Launched, or failed outright: either way the header's running state may have changed.
@@ -254,6 +259,7 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
     busy,
     launchStartedAt,
     runningTool,
+    runningTools,
     reply,
     actionError,
     launchAnyway,
@@ -264,7 +270,7 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
     launch,
     answerFallback,
     dismissReply,
-  }), [instanceId, page, busy, launchStartedAt, runningTool, reply, actionError, launchAnyway, reload, refreshDetail, changeDeployment, launch, answerFallback, dismissReply]);
+  }), [instanceId, page, busy, launchStartedAt, runningTool, runningTools, reply, actionError, launchAnyway, reload, refreshDetail, changeDeployment, launch, answerFallback, dismissReply]);
 
   return <InstanceSessionContext.Provider value={session}>{children}</InstanceSessionContext.Provider>;
 }

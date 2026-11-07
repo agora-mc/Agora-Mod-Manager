@@ -26,8 +26,10 @@ export interface GameLaunchState {
   reply: LaunchReply | null;
   /** The last launch failed outright, in a sentence. */
   error: string | null;
-  /** The before-launch tool Agora is running now, when it is. */
+  /** The before-launch tool Agora is running now, when exactly one is running. */
   runningTool: string | null;
+  /** How many before-launch tools the launch is running, so the page can avoid naming one. */
+  runningTools: number;
 }
 
 export interface LaunchOptions {
@@ -39,11 +41,13 @@ export interface LaunchOptions {
   beforeLaunch?: Record<string, 'run' | 'launch_anyway'>;
   /** Launch without running any before-launch tool. */
   skipBeforeLaunch?: boolean;
-  /** The tool whose run the progress line names. */
+  /** The tool whose run the progress line names, when exactly one is running. */
   runningTool?: string;
+  /** How many before-launch tools are running. */
+  runningTools?: number;
 }
 
-const IDLE: GameLaunchState = Object.freeze({ busy: false, startedAt: null, reply: null, error: null, runningTool: null });
+const IDLE: GameLaunchState = Object.freeze({ busy: false, startedAt: null, reply: null, error: null, runningTool: null, runningTools: 0 });
 
 const states = new Map<string, GameLaunchState>();
 const listeners = new Set<() => void>();
@@ -78,6 +82,7 @@ export async function startGameLaunch(instanceId: string, options: LaunchOptions
     reply: null,
     error: null,
     runningTool: options.runningTool ?? null,
+    runningTools: options.runningTools ?? 0,
   });
   try {
     let reply = await launchGameInstance(instanceId, {
@@ -103,7 +108,8 @@ export async function startGameLaunch(instanceId: string, options: LaunchOptions
           startedAt: Date.now(),
           reply: null,
           error: null,
-          runningTool: runs[0]?.name ?? null,
+          runningTool: runs.length === 1 ? runs[0]?.name ?? null : null,
+          runningTools: runs.length,
         });
         reply = await launchGameInstance(instanceId, {
           launchAnyway: options.launchAnyway ?? false,

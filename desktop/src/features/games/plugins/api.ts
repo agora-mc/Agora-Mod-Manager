@@ -63,6 +63,8 @@ export interface PluginsView {
   listName: string;
   /** `none`, `script` or `creation_engine`. */
   rulesKind: string;
+  /** Whether this list declares a LOOT masterlist source. */
+  hasLoot: boolean;
   /** Whether the game's load order rules (masters, light and full limits) apply. */
   rulesApply: boolean;
   /** False until the instance has a copy of the list, which is made at deploy time. */
@@ -176,6 +178,7 @@ function isPluginsView(value: unknown): value is PluginsView {
     && typeof value.listId === 'string'
     && typeof value.listName === 'string'
     && typeof value.rulesKind === 'string'
+    && typeof value.hasLoot === 'boolean'
     && typeof value.rulesApply === 'boolean'
     && typeof value.listExists === 'boolean'
     && Array.isArray(value.rows)

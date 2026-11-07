@@ -49,7 +49,7 @@ export function readinessView(check: InstanceCheck | null, checkError: string | 
 
 export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
   const session = useInstanceSession();
-  const { page, busy, launchStartedAt, runningTool, reply, actionError } = session;
+  const { page, busy, launchStartedAt, runningTool, runningTools, reply, actionError } = session;
   const [now, setNow] = useState(() => Date.now());
   const customIcon = useGameInstanceIcon(session.instanceId);
   const [imageBusy, setImageBusy] = useState(false);
@@ -228,7 +228,11 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
           {busy === 'launch' && (
             <div role="status" className="space-y-1 text-sm">
               <p className="font-medium">
-                {runningTool === null ? 'Checking, preparing and starting the game…' : `Running ${runningTool}…`}
+                {runningTools > 1
+                  ? 'Running the tools this launch needs…'
+                  : runningTool === null
+                    ? 'Checking, preparing and starting the game…'
+                    : `Running ${runningTool}…`}
               </p>
               <p className="text-muted-foreground">
                 {elapsedText(elapsed)} so far. A large instance can take several minutes the first time, and Agora cannot show a percentage yet.
@@ -251,7 +255,11 @@ export function InstanceHero({ onShowChecks }: { onShowChecks: () => void }) {
       onRun={(needs) => {
         const answers: Record<string, 'run' | 'launch_anyway'> = {};
         for (const need of needs) answers[need.tool] = 'run';
-        void session.launch(undefined, { beforeLaunch: answers, runningTool: needs[0]?.name });
+        void session.launch(undefined, {
+          beforeLaunch: answers,
+          runningTool: needs.length === 1 ? needs[0]?.name : undefined,
+          runningTools: needs.length,
+        });
       }}
       onLaunchAnyway={() => void session.launch(undefined, { skipBeforeLaunch: true })}
       onCancel={session.dismissReply}
@@ -306,7 +314,7 @@ export function BeforeLaunchDialog({
     ? 'Your mods have changed since it last ran.'
     : needs.some((need) => need.reason.includes('never run'))
       ? 'It hasn’t run for this instance yet.'
-      : 'Agora cannot tell whether it has run since your mods last changed.';
+      : "Agora can't tell whether it has run since your mods last changed.";
 
   return (
     <Dialog open onOpenChange={(next) => { if (!next) onCancel(); }}>

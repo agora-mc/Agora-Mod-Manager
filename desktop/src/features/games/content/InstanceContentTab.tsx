@@ -291,11 +291,11 @@ export function InstanceContentTab({ gameId, instanceId }: InstanceContentTabPro
         setNotice(`Ran ${tool.name} on ${item.name}.`);
         setToolTarget(null);
       } else if (result.status === 'vfsRefused') {
-        setToolError(`${tool.name} could not run its usual way. ${result.reason}`);
+        setToolError(`${tool.name} could not start the usual way. Open the Tools tab and run it there, where Agora can offer another way.`);
       } else if (result.status === 'needsSwap') {
-        setToolError(`${tool.name} works on the game's real install. Run it from the Tools tab.`);
+        setToolError(`${tool.name} needs the game's real install folder. Open the Tools tab and run it there so Agora can ask before it swaps files.`);
       } else {
-        setToolError(`${tool.name} could not run: its output folder already has files.`);
+        setToolError(`${tool.name}'s output folder already has files. Open the Tools tab and choose to move them aside there.`);
       }
     } catch (error) {
       setToolError(errorMessage(error));

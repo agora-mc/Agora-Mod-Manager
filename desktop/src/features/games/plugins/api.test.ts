@@ -7,6 +7,7 @@ import {
   checkGamePlugins,
   describeFailure,
   listGamePlugins,
+  listLoadOrderLists,
   moveGamePlugin,
   setGamePluginActive,
   setGamePluginLocked,
@@ -35,12 +36,31 @@ const view: PluginsView = {
   listId: 'plugins',
   listName: 'Plugins',
   rulesKind: 'creation_engine',
+  hasLoot: true,
   rulesApply: true,
   listExists: true,
   rows: [row],
   findings: [],
   masterlist: null,
 };
+
+describe('load order lists', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('reads every list the game declares', async () => {
+    const lists = { lists: [{ id: 'mods', name: 'Mods', rulesKind: 'none' }] };
+    invokeMock.mockResolvedValueOnce(lists);
+    await expect(listLoadOrderLists('inst-1')).resolves.toEqual(lists);
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_lists', { instanceId: 'inst-1' });
+  });
+
+  it('rejects a reply that is not a list of lists', async () => {
+    invokeMock.mockResolvedValueOnce({ lists: [{ id: 'x' }] });
+    await expect(listLoadOrderLists('inst-1')).rejects.toThrow('games_plugins_lists did not return the expected plugin data.');
+  });
+});
 
 describe('plugin commands', () => {
   beforeEach(() => {

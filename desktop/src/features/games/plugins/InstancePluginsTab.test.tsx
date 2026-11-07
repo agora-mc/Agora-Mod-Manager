@@ -22,6 +22,7 @@ function view(overrides: Record<string, unknown> = {}) {
     listId: 'plugins',
     listName: 'Plugins',
     rulesKind: 'creation_engine',
+    hasLoot: true,
     rulesApply: true,
     listExists: true,
     rows: [],
@@ -75,6 +76,25 @@ describe('load order lists', () => {
     expect(screen.getByRole('button', { name: 'Sort…' })).toBeEnabled();
   });
 
+  it('uses the list’s name and plain words for a game that is not Creation Engine', async () => {
+    replies.games_plugins_lists = () => ({ lists: [{ id: 'mods', name: 'Mods', rulesKind: 'none' }] });
+    replies.games_plugins_list = () => view({
+      listId: 'mods',
+      listName: 'Mods',
+      rulesKind: 'none',
+      hasLoot: false,
+      rulesApply: false,
+      rows: [{ ...row, name: 'my_mod', headerRead: false }],
+    });
+    mountTab();
+    expect(await screen.findByRole('heading', { name: 'Mods' })).toBeInTheDocument();
+    expect(screen.getByText('The game reads these from the top of this list down. When two change the same thing, the lower one wins.')).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Name' })).toBeInTheDocument();
+    expect(screen.queryByRole('columnheader', { name: 'Plugin' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Sort…' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Update masterlist/ })).toBeNull();
+  });
+
   it('shows a tab per list and each list keeps its own order', async () => {
     replies.games_plugins_lists = () => ({
       lists: [
@@ -83,7 +103,7 @@ describe('load order lists', () => {
       ],
     });
     replies.games_plugins_list = (args) => args.listId === 'redmods'
-      ? view({ listId: 'redmods', listName: 'REDmods', rulesKind: 'none', rulesApply: false, rows: [{ ...row, name: 'my_mod' }] })
+      ? view({ listId: 'redmods', listName: 'REDmods', rulesKind: 'none', hasLoot: false, rulesApply: false, rows: [{ ...row, name: 'my_mod' }] })
       : view({ rows: [row] });
 
     mountTab();
@@ -94,7 +114,7 @@ describe('load order lists', () => {
     fireEvent.click(within(tabs).getByRole('tab', { name: 'REDmods' }));
     expect(await screen.findByText('my_mod')).toBeInTheDocument();
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_plugins_list', { instanceId: 'inst-1', listId: 'redmods' }));
-    expect(screen.getByRole('heading', { name: 'REDmods' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Load order' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Sort…' })).toBeNull();
   });
 });

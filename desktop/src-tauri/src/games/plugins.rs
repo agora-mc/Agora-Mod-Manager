@@ -84,6 +84,8 @@ pub struct PluginsView {
     pub list_name: String,
     /// The list's rule kind: `none`, `script` or `creation_engine`.
     pub rules_kind: String,
+    /// Whether this list declares a LOOT masterlist source.
+    pub has_loot: bool,
     /// Whether the game's load order rules (masters, light and full limits) apply.
     pub rules_apply: bool,
     /// Whether the instance has a copy of the plugin list yet. It is created at deploy time.
@@ -156,6 +158,7 @@ impl PluginsView {
             list_id: String::new(),
             list_name: String::new(),
             rules_kind: String::new(),
+            has_loot: false,
             rules_apply: false,
             list_exists: false,
             rows: Vec::new(),
@@ -170,6 +173,7 @@ impl PluginsView {
             list_id: order.list_id.clone(),
             list_name: order.list_name.clone(),
             rules_kind: order.rules_kind.clone(),
+            has_loot: false,
             rules_apply: order.engine,
             list_exists: order.exists,
             rows: order
@@ -357,6 +361,7 @@ pub async fn games_plugins_list(
             .map_err(core_failed)?;
         let mut view = PluginsView::from_order(&order);
         let rule = load_order::list_by_id(definition, list_id.as_deref()).map_err(core_failed)?;
+        view.has_loot = rule.rules.loot.is_some();
         if rule.rules.loot.is_some() {
             view.masterlist = loot_masterlist::cached_in(&ctx, definition, Some(&rule.id))
                 .map_err(core_failed)?

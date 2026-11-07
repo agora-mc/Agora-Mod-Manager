@@ -11,6 +11,7 @@ import { InstanceTabBar } from '@/components/instance-kit';
 import { InstanceHero, InstanceOverviewTab, InstanceSessionProvider } from '../instances';
 import { InstanceContentTab } from '../content';
 import { InstancePluginsTab } from '../plugins';
+import { useLoadOrderTab } from '../plugins/loadOrderTab';
 import { InstanceIniSavesTab } from '../iniSaves';
 import { InstanceToolsTab } from '../tools';
 import { GAME_INSTANCE_PAGE_TABS } from './gameNav';
@@ -24,6 +25,10 @@ interface GameInstancePageProps {
 }
 
 export function GameInstancePage({ gameId, instanceId, page, onNavigatePage, onBack }: GameInstancePageProps) {
+  const loadOrderTab = useLoadOrderTab(instanceId);
+  const tabs = GAME_INSTANCE_PAGE_TABS
+    .filter((tab) => tab.id !== 'plugins' || loadOrderTab.show)
+    .map((tab) => (tab.id === 'plugins' ? { ...tab, label: loadOrderTab.label } : tab));
   return (
     <InstanceSessionProvider key={instanceId} instanceId={instanceId}>
       <div className="space-y-4" data-testid="game-instance-page">
@@ -31,7 +36,7 @@ export function GameInstancePage({ gameId, instanceId, page, onNavigatePage, onB
           <BackButton onBack={onBack} label="Instances" />
         </div>
         <InstanceHero onShowChecks={() => onNavigatePage('overview')} />
-        <InstanceTabBar tabs={GAME_INSTANCE_PAGE_TABS} active={page} onSelect={onNavigatePage} />
+        <InstanceTabBar tabs={tabs} active={page} onSelect={onNavigatePage} />
         {page === 'overview' && <InstanceOverviewTab gameId={gameId} instanceId={instanceId} />}
         {page === 'content' && <InstanceContentTab gameId={gameId} instanceId={instanceId} />}
         {page === 'plugins' && <InstancePluginsTab gameId={gameId} instanceId={instanceId} />}
