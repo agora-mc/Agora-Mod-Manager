@@ -203,6 +203,20 @@ pub enum InstanceError {
         reason: String,
         next: Option<DeployMode>,
     },
+    /// Tools the game says should run before a launch have not, or their output is stale, and the
+    /// caller asked to see them instead of answering (MASTER_SPEC §30.12). Nothing was launched.
+    #[error("instance '{instance_id}' needs these tools run before launch: {}", .tools.iter().map(|t| format!("{} ({})", t.name, t.reason)).collect::<Vec<_>>().join("; "))]
+    BeforeLaunchNeeded {
+        instance_id: String,
+        tools: Vec<crate::game_tools::BeforeLaunchNeed>,
+    },
+    /// A before-launch tool ran and failed. Nothing was launched; the caller may launch anyway.
+    #[error("{} could not run before launch: {message}", .name)]
+    BeforeLaunchFailed {
+        tool: String,
+        name: String,
+        message: String,
+    },
     #[error(transparent)]
     Deploy(#[from] crate::game_deploy::DeployError),
     #[error(transparent)]
@@ -509,6 +523,37 @@ pub fn get_manifest(ctx: &Ctx, id: &str) -> Result<GameInstanceManifest, Instanc
     let content = std::fs::read_to_string(&manifest_path)?;
     let manifest: GameInstanceManifest = serde_json::from_str(&content)?;
     Ok(manifest)
+}
+
+/// The launch log an instance's launches append plain-word notes to.
+pub fn launch_log_path(ctx: &Ctx, id: &str) -> Result<PathBuf, InstanceError> {
+    let dir = ctx
+        .paths
+        .instance_dir(id)
+        .map_err(|e| InstanceError::InvalidId(id.to_string(), e.to_string()))?;
+    Ok(dir.join("logs").join("launch.log"))
+}
+
+/// Append one line to an instance's launch log.
+pub fn append_launch_log(ctx: &Ctx, id: &str, line: &str) -> Result<(), InstanceError> {
+    let path = launch_log_path(ctx, id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+fn write_launch_notes(ctx: &Ctx, id: &str, notes: &[String]) -> Result<(), InstanceError> {
+    for note in notes {
+        append_launch_log(ctx, id, note)?;
+    }
+    Ok(())
 }
 
 /// List all generic game instances ordered by last launched, then created.
@@ -956,8 +1001,34 @@ pub enum VfsFailure {
     FallBack,
 }
 
+/// What to do with a tool that should run before the launch (MASTER_SPEC §30.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeforeLaunchAnswer {
+    /// Run it before the launch.
+    Run,
+    /// Leave it and launch anyway. The launch log records the choice.
+    LaunchAnyway,
+}
+
+/// How a caller answers the tools a launch needs (MASTER_SPEC §30.12). Every answer still lets the
+/// launch happen: a protection always has an override.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BeforeLaunchChoice {
+    /// The non-interactive default: run a `run`-mode tool, and leave an `ask`-mode one unrun
+    /// (never run unasked).
+    #[default]
+    Run,
+    /// Launch anyway for every needed tool (the CLI's `--skip-before-launch`).
+    Skip,
+    /// Do not answer here: return [`InstanceError::BeforeLaunchNeeded`] so the caller can ask.
+    Ask,
+    /// The player's answer per tool id.
+    Answers(std::collections::BTreeMap<String, BeforeLaunchAnswer>),
+}
+
 /// Choices for one launch.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     /// Launch even if the base fails verification.
     pub launch_anyway: bool,
@@ -968,6 +1039,8 @@ pub struct LaunchOptions {
     pub deployment: Option<DeployMode>,
     /// What to do if the virtual file system cannot start. Asks by default.
     pub on_vfs_failure: VfsFailure,
+    /// How the tools a launch needs are answered (MASTER_SPEC §30.12).
+    pub before_launch: BeforeLaunchChoice,
 }
 
 /// The rung a game definition starts from when nobody has chosen one (MASTER_SPEC §26.5).
@@ -1241,6 +1314,117 @@ fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
+/// Answer the tools a launch needs (MASTER_SPEC §30.12): run them through the normal tool pipeline,
+/// or record that the player chose to launch anyway. A failed run is reported, not swallowed, and
+/// the caller may launch anyway with a later answer.
+fn answer_before_launch(
+    ctx: &Ctx,
+    id: &str,
+    definition: &GameDefinition,
+    options: &LaunchOptions,
+    launcher: &dyn Launcher,
+) -> Result<(), InstanceError> {
+    let declares_before_launch = ctx
+        .games
+        .package_for(&definition.id)
+        .is_some_and(|package| {
+            package
+                .definition()
+                .tools
+                .iter()
+                .any(|tool| tool.game == definition.id && tool.before_launch.is_some())
+        });
+    if !declares_before_launch {
+        return Ok(());
+    }
+    let facts = crate::game_conditions::InstanceFacts::for_instance(ctx, id, definition);
+    let mut notes = Vec::new();
+    let needs = crate::game_tools::before_launch_needs(ctx, id, definition, &facts, &mut notes)
+        .map_err(|e| InstanceError::Other(e.to_string()))?;
+    write_launch_notes(ctx, id, &notes)?;
+    if needs.is_empty() {
+        return Ok(());
+    }
+    if matches!(options.before_launch, BeforeLaunchChoice::Ask) {
+        return Err(InstanceError::BeforeLaunchNeeded {
+            instance_id: id.to_string(),
+            tools: needs,
+        });
+    }
+    for need in &needs {
+        let answer = match &options.before_launch {
+            BeforeLaunchChoice::Skip => BeforeLaunchAnswer::LaunchAnyway,
+            BeforeLaunchChoice::Run => {
+                if need.mode == agora_game_api::BeforeLaunchMode::Run {
+                    BeforeLaunchAnswer::Run
+                } else {
+                    BeforeLaunchAnswer::LaunchAnyway
+                }
+            }
+            BeforeLaunchChoice::Answers(answers) => {
+                answers.get(&need.tool).copied().unwrap_or_else(|| {
+                    if need.mode == agora_game_api::BeforeLaunchMode::Run {
+                        BeforeLaunchAnswer::Run
+                    } else {
+                        BeforeLaunchAnswer::LaunchAnyway
+                    }
+                })
+            }
+            BeforeLaunchChoice::Ask => unreachable!("handled above"),
+        };
+        match answer {
+            BeforeLaunchAnswer::LaunchAnyway => append_launch_log(
+                ctx,
+                id,
+                &format!(
+                    "Before launch: {} was not run ({}); the player chose to launch anyway.",
+                    need.name, need.reason
+                ),
+            )?,
+            BeforeLaunchAnswer::Run => {
+                let tool_id = agora_game_api::ToolId::new(need.tool.clone())
+                    .map_err(|e| InstanceError::Other(e.to_string()))?;
+                let cancel = crate::event_sink::CancellationToken::new();
+                match crate::game_tools::run(
+                    ctx,
+                    id,
+                    definition,
+                    &tool_id,
+                    crate::game_tools::CaptureMode::Auto,
+                    false,
+                    launcher,
+                    &cancel,
+                ) {
+                    Ok(outcome) if outcome.promoted => {
+                        append_launch_log(ctx, id, &format!("Before launch: ran {}.", need.name))?
+                    }
+                    Ok(outcome) => {
+                        return Err(InstanceError::BeforeLaunchFailed {
+                            tool: need.tool.clone(),
+                            name: need.name.clone(),
+                            message: format!(
+                                "its run was discarded (exit code {})",
+                                outcome
+                                    .exit_code
+                                    .map(|code| code.to_string())
+                                    .unwrap_or_else(|| "unknown".into())
+                            ),
+                        })
+                    }
+                    Err(error) => {
+                        return Err(InstanceError::BeforeLaunchFailed {
+                            tool: need.tool.clone(),
+                            name: need.name.clone(),
+                            message: error.to_string(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Prepare launch for a generic game instance.
 pub fn prepare_launch(
     ctx: &Ctx,
@@ -1270,6 +1454,7 @@ pub fn prepare_launch_with_discovery(
             plain: false,
             deployment: None,
             on_vfs_failure: VfsFailure::default(),
+            before_launch: BeforeLaunchChoice::default(),
         },
         discover_fn,
         &SystemLauncher,
@@ -1292,6 +1477,9 @@ pub fn prepare_launch_with(
 ) -> Result<PreparedLaunch, InstanceError> {
     let record = get(ctx, id)?.ok_or_else(|| InstanceError::NotFound(id.to_string()))?;
     let manifest = get_manifest(ctx, id)?;
+    if matches!(record.base, BaseReference::Pinned { .. }) {
+        answer_before_launch(ctx, id, definition, &options, launcher)?;
+    }
     match record.base {
         BaseReference::Pinned { id: base_id, .. } => {
             let chosen = options.deployment.or(manifest.deployment);
@@ -1337,12 +1525,34 @@ pub fn prepare_launch_with(
                     definition,
                     &base_manifest.runtime.store,
                 )?;
-                let prepared = crate::game_launch::prepare_base_launch_with(
-                    &base_manifest,
+                let Some(recipe) = &definition.launch else {
+                    return Err(LaunchError::NoRecipe.into());
+                };
+                let mut notes = Vec::new();
+                let prepared = if crate::game_launch::needs_instance_facts(
                     definition,
-                    options.launch_anyway,
+                    recipe,
                     options.plain,
-                )?;
+                ) {
+                    let facts =
+                        crate::game_conditions::InstanceFacts::for_instance(ctx, id, definition);
+                    crate::game_launch::prepare_base_launch_with_facts(
+                        &base_manifest,
+                        definition,
+                        options.launch_anyway,
+                        options.plain,
+                        &facts,
+                        &mut notes,
+                    )?
+                } else {
+                    crate::game_launch::prepare_base_launch_with(
+                        &base_manifest,
+                        definition,
+                        options.launch_anyway,
+                        options.plain,
+                    )?
+                };
+                write_launch_notes(ctx, id, &notes)?;
                 Ok(prepared)
             }
         }
@@ -1377,12 +1587,40 @@ pub fn prepare_launch_with(
             let Some(recipe) = &definition.launch else {
                 return Err(LaunchError::NoRecipe.into());
             };
-            let mut resolved = crate::game_launch::resolve_recipe(recipe, &roots)?;
-            let alternative = if options.plain {
-                None
-            } else {
-                crate::game_launch::apply_launch_alternative(definition, &roots, &mut resolved)?
-            };
+            let mut notes = Vec::new();
+            let (mut resolved, alternative) =
+                if crate::game_launch::needs_instance_facts(definition, recipe, options.plain) {
+                    let facts =
+                        crate::game_conditions::InstanceFacts::for_instance(ctx, id, definition);
+                    let (mut resolved, recipe_notes) =
+                        crate::game_launch::resolve_recipe_with_facts(recipe, &roots, &facts)?;
+                    notes.extend(recipe_notes);
+                    let alternative = if options.plain {
+                        None
+                    } else {
+                        crate::game_launch::apply_launch_alternative_with_facts(
+                            definition,
+                            &roots,
+                            &mut resolved,
+                            &facts,
+                            &mut notes,
+                        )?
+                    };
+                    (resolved, alternative)
+                } else {
+                    let mut resolved = crate::game_launch::resolve_recipe(recipe, &roots)?;
+                    let alternative = if options.plain {
+                        None
+                    } else {
+                        crate::game_launch::apply_launch_alternative(
+                            definition,
+                            &roots,
+                            &mut resolved,
+                        )?
+                    };
+                    (resolved, alternative)
+                };
+            write_launch_notes(ctx, id, &notes)?;
             if discovered.store.as_str() == "steam" {
                 let product = definition
                     .stores
@@ -1489,12 +1727,35 @@ fn prepare_deployed(
     let Some(recipe) = &definition.launch else {
         return Err(LaunchError::NoRecipe.into());
     };
-    let mut resolved = crate::game_launch::resolve_recipe(recipe, &roots)?;
-    let alternative = if options.plain {
-        None
-    } else {
-        crate::game_launch::apply_launch_alternative(definition, &roots, &mut resolved)?
-    };
+    let mut notes = Vec::new();
+    let (mut resolved, alternative) =
+        if crate::game_launch::needs_instance_facts(definition, recipe, options.plain) {
+            let facts = crate::game_conditions::InstanceFacts::for_instance(ctx, id, definition);
+            let (mut resolved, recipe_notes) =
+                crate::game_launch::resolve_recipe_with_facts(recipe, &roots, &facts)?;
+            notes.extend(recipe_notes);
+            let alternative = if options.plain {
+                None
+            } else {
+                crate::game_launch::apply_launch_alternative_with_facts(
+                    definition,
+                    &roots,
+                    &mut resolved,
+                    &facts,
+                    &mut notes,
+                )?
+            };
+            (resolved, alternative)
+        } else {
+            let mut resolved = crate::game_launch::resolve_recipe(recipe, &roots)?;
+            let alternative = if options.plain {
+                None
+            } else {
+                crate::game_launch::apply_launch_alternative(definition, &roots, &mut resolved)?
+            };
+            (resolved, alternative)
+        };
+    write_launch_notes(ctx, id, &notes)?;
     if base_manifest.runtime.store.as_str() == "steam" {
         let product = base_manifest.source_product.as_deref().or_else(|| {
             definition
@@ -1652,6 +1913,7 @@ pub fn launch_with_discovery(
             plain: false,
             deployment: None,
             on_vfs_failure: VfsFailure::default(),
+            before_launch: BeforeLaunchChoice::default(),
         },
         discover_fn,
         &SystemLauncher,
@@ -1674,7 +1936,8 @@ pub fn launch_with(
         .map_err(|e| InstanceError::Other(e.to_string()))?;
 
     // 1. Prepare launch (which performs deployment if needed)
-    let prepared = prepare_launch_with(ctx, id, definition, options, discover_fn, launcher)?;
+    let prepared =
+        prepare_launch_with(ctx, id, definition, options.clone(), discover_fn, launcher)?;
 
     // 2. Determine store and running_from
     let (store, running_from) = match &record.base {

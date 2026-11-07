@@ -237,8 +237,15 @@ fn plans_per_preparation(plugin_list: u8, links: bool, vfs: bool) -> (usize, usi
     let mut counts = Vec::new();
     for _ in 0..2 {
         let before = PLAN_CALLS.load(Ordering::Relaxed);
-        prepare_launch_with(&ctx, &inst.instance_id, &def, options, &discover, &launcher)
-            .expect("prepare launch");
+        prepare_launch_with(
+            &ctx,
+            &inst.instance_id,
+            &def,
+            options.clone(),
+            &discover,
+            &launcher,
+        )
+        .expect("prepare launch");
         counts.push(PLAN_CALLS.load(Ordering::Relaxed) - before);
     }
     (counts[0], counts[1])

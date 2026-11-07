@@ -135,6 +135,46 @@ pub enum Condition {
 }
 
 impl Condition {
+    /// The condition in words a player can read, for a launch log or a check page.
+    pub fn describe(&self) -> String {
+        fn gate(version: &VersionGate) -> String {
+            if !version.exact.is_empty() {
+                return version.exact.join(" or ").to_string();
+            }
+            match (&version.min, &version.below) {
+                (Some(min), Some(below)) => format!("at least {min} and below {below}"),
+                (Some(min), None) => format!("at least {min}"),
+                (None, Some(below)) => format!("below {below}"),
+                (None, None) => "any version".to_string(),
+            }
+        }
+        match self {
+            Self::Present(path) => format!("`{}` is present", path.as_str()),
+            Self::Framework { framework, version } => match version {
+                Some(version) => format!("framework `{framework}` is {}", gate(version)),
+                None => format!("framework `{framework}` is installed"),
+            },
+            Self::Version(version) => format!("the game version is {}", gate(version)),
+            Self::All(conditions) => format!(
+                "all of ({})",
+                conditions
+                    .iter()
+                    .map(Self::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Self::Any(conditions) => format!(
+                "any of ({})",
+                conditions
+                    .iter()
+                    .map(Self::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Self::Not(condition) => format!("not ({})", condition.describe()),
+        }
+    }
+
     /// Evaluate against an instance. Unknown answers stay unknown; `all` of nothing is true and
     /// `any` of nothing is false, as in ordinary logic.
     pub fn evaluate(&self, facts: &dyn ConditionFacts) -> Truth {

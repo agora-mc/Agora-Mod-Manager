@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use agora_game_api::{
-    fold_path_case, glob_match, BaseReference, DeploymentStrategy, GameDefinition, GamePath,
-    InputFingerprint, Layer, LayerId, LayerSource, LayerStack, RelPath, StoreId, ToolDefinition,
-    ToolId, ToolOutput,
+    fold_path_case, glob_match, BaseReference, BeforeLaunchMode, DeploymentStrategy,
+    GameDefinition, GamePath, InputFingerprint, Layer, LayerId, LayerSource, LayerStack, RelPath,
+    StoreId, ToolDefinition, ToolId, ToolInputKind, ToolOutput, ToolScope,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -79,6 +79,23 @@ pub enum ToolError {
     NoOutput(String),
     #[error("tool '{0}' has no earlier generation to compare with or roll back to")]
     NoPrevious(String),
+    /// A tool asks for a value the player has not filled in (MASTER_SPEC §30.12).
+    #[error("{tool} needs '{label}' ({input}) filled in before it can run")]
+    MissingInput {
+        tool: String,
+        input: String,
+        label: String,
+    },
+    /// A stored value is not one of the input's choices, or is not the kind it declares.
+    #[error("{tool} input '{input}' is not valid: {reason}")]
+    InvalidInput {
+        tool: String,
+        input: String,
+        reason: String,
+    },
+    /// An item-scoped tool needs the content item it should run for.
+    #[error("{tool} runs once per content item, but no item was chosen")]
+    ItemScopeWithoutItem { tool: String },
     /// A mod-output tool's folder already holds files. Nothing ran: the user has to choose between
     /// moving it aside and cancelling (MASTER_SPEC §26.9).
     #[error("{tool} would write into '{folder}', but that folder already has files. Move it aside to '{aside}' and run again, or cancel.")]
@@ -1110,6 +1127,340 @@ fn split_setting(setting: &str) -> Result<(&str, &str, &str), ToolError> {
     }
 }
 
+const TOOL_INPUTS_FILE: &str = "tool_inputs.json";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ToolInputsFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    tools: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// A tool's stored input values for an instance, keyed by tool then input id.
+pub fn read_tool_inputs(
+    ctx: &Ctx,
+    instance_id: &str,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>, ToolError> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    let path = dir.join(TOOL_INPUTS_FILE);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let file: ToolInputsFile = serde_json::from_str(&text)?;
+    Ok(file.tools)
+}
+
+fn write_tool_inputs(
+    ctx: &Ctx,
+    instance_id: &str,
+    tools: BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<(), ToolError> {
+    let dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|e| ToolError::Other(e.to_string()))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(TOOL_INPUTS_FILE);
+    let tmp = dir.join(format!("{TOOL_INPUTS_FILE}.{}.tmp", new_id_suffix()));
+    let file = ToolInputsFile { version: 1, tools };
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Store one input value for a tool in an instance. The value is checked against the declared
+/// input's kind and choices here, so a bad value is refused at the door (MASTER_SPEC \u00a730.12).
+pub fn set_tool_input(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    input_id: &str,
+    value: &str,
+) -> Result<(), ToolError> {
+    let tool = declared_tool(ctx, definition, tool_id)?;
+    let input = tool
+        .inputs
+        .iter()
+        .find(|input| input.id == input_id)
+        .ok_or_else(|| ToolError::InvalidInput {
+            tool: tool_id.to_string(),
+            input: input_id.to_string(),
+            reason: "the tool declares no such input".into(),
+        })?;
+    validate_input_value(&tool.id, input, value)?;
+    let mut inputs = read_tool_inputs(ctx, instance_id)?;
+    inputs
+        .entry(tool_id.to_string())
+        .or_default()
+        .insert(input_id.to_string(), value.to_string());
+    write_tool_inputs(ctx, instance_id, inputs)
+}
+
+/// Remove a stored value, so the input's default (if any) applies again.
+pub fn clear_tool_input(
+    ctx: &Ctx,
+    instance_id: &str,
+    tool_id: &ToolId,
+    input_id: &str,
+) -> Result<(), ToolError> {
+    let mut inputs = read_tool_inputs(ctx, instance_id)?;
+    if let Some(tool) = inputs.get_mut(tool_id.as_str()) {
+        tool.remove(input_id);
+        if tool.is_empty() {
+            inputs.remove(tool_id.as_str());
+        }
+    }
+    write_tool_inputs(ctx, instance_id, inputs)
+}
+
+fn validate_input_value(
+    tool: &ToolId,
+    input: &agora_game_api::ToolInput,
+    value: &str,
+) -> Result<(), ToolError> {
+    match input.kind {
+        ToolInputKind::Choice => {
+            if !input.choices.iter().any(|choice| choice == value) {
+                return Err(ToolError::InvalidInput {
+                    tool: tool.to_string(),
+                    input: input.id.clone(),
+                    reason: format!("'{value}' is not one of {}", input.choices.join(", ")),
+                });
+            }
+        }
+        ToolInputKind::Flag => {
+            parse_flag(value).ok_or_else(|| ToolError::InvalidInput {
+                tool: tool.to_string(),
+                input: input.id.clone(),
+                reason: format!("'{value}' is not a yes or no"),
+            })?;
+        }
+        ToolInputKind::File | ToolInputKind::Folder | ToolInputKind::Text => {}
+    }
+    Ok(())
+}
+
+fn parse_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// The arguments a tool's inputs add to its recipe, with `{item}` replaced by `item_path` for an
+/// item-scoped tool (MASTER_SPEC \u00a730.12). A required input with no value refuses the run; a value
+/// outside a choice list refuses it too.
+pub fn tool_input_arguments(
+    tool: &ToolDefinition,
+    stored: &BTreeMap<String, String>,
+    item_path: Option<&str>,
+) -> Result<Vec<std::ffi::OsString>, ToolError> {
+    if tool.scope == ToolScope::Item && item_path.is_none() {
+        return Err(ToolError::ItemScopeWithoutItem {
+            tool: tool.id.to_string(),
+        });
+    }
+    let substitute = |value: &str| match item_path {
+        Some(item) => value.replace("{item}", item),
+        None => value.to_string(),
+    };
+    let mut args = Vec::new();
+    for input in &tool.inputs {
+        let value = stored
+            .get(&input.id)
+            .cloned()
+            .or_else(|| input.default.clone())
+            .filter(|value| !value.is_empty());
+        let Some(value) = value else {
+            if input.required {
+                return Err(ToolError::MissingInput {
+                    tool: tool.id.to_string(),
+                    input: input.id.clone(),
+                    label: input.label.clone(),
+                });
+            }
+            continue;
+        };
+        if input.kind == ToolInputKind::Choice
+            && !input.choices.iter().any(|choice| choice == &value)
+        {
+            return Err(ToolError::InvalidInput {
+                tool: tool.id.to_string(),
+                input: input.id.clone(),
+                reason: format!("'{value}' is not one of {}", input.choices.join(", ")),
+            });
+        }
+        let Some(arg) = &input.arg else {
+            continue;
+        };
+        let arg = substitute(arg);
+        if input.kind == ToolInputKind::Flag {
+            if parse_flag(&value).ok_or_else(|| ToolError::InvalidInput {
+                tool: tool.id.to_string(),
+                input: input.id.clone(),
+                reason: format!("'{value}' is not a yes or no"),
+            })? {
+                args.push(std::ffi::OsString::from(arg));
+            }
+        } else {
+            args.push(std::ffi::OsString::from(arg));
+            args.push(std::ffi::OsString::from(substitute(&value)));
+        }
+    }
+    Ok(args)
+}
+
+/// The item-scoped tool's path in the instance view: the mount path of the content layer the item
+/// fills. `None` when the item is not in the instance.
+pub fn item_view_path(
+    ctx: &Ctx,
+    instance_id: &str,
+    item_id: &str,
+) -> Result<Option<String>, ToolError> {
+    let manifest = load_manifest(ctx, instance_id)?;
+    for layer in manifest.layers.layers() {
+        if let LayerSource::Content { content } = &layer.source {
+            if content == item_id {
+                return Ok(Some(layer.mount_path.as_str().to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A tool a launch should run first because it has never run here, or its output is stale
+/// (MASTER_SPEC \u00a730.12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeforeLaunchNeed {
+    pub tool: String,
+    pub name: String,
+    pub mode: BeforeLaunchMode,
+    /// Why the tool is needed, such as "it has never run here".
+    pub reason: String,
+}
+
+/// The tools that must or may run before this instance launches. `when` is judged against
+/// `facts`; unknown means the tool is not needed, but the launch log is told.
+pub fn before_launch_needs(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    facts: &dyn agora_game_api::ConditionFacts,
+    notes: &mut Vec<String>,
+) -> Result<Vec<BeforeLaunchNeed>, ToolError> {
+    let manifest = load_manifest(ctx, instance_id)?;
+    let mut needs = Vec::new();
+    let Some(package) = ctx.games.package_for(&definition.id) else {
+        return Ok(needs);
+    };
+    for tool in &package.definition().tools {
+        let Some(before) = &tool.before_launch else {
+            continue;
+        };
+        if tool.game != definition.id {
+            continue;
+        }
+        if let Some(when) = &before.when {
+            match when.evaluate(facts) {
+                agora_game_api::Truth::True => {}
+                agora_game_api::Truth::False => continue,
+                agora_game_api::Truth::Unknown => {
+                    notes.push(format!(
+                        "Could not tell whether {} holds, so {} was not run before launch.",
+                        when.describe(),
+                        tool.name
+                    ));
+                    continue;
+                }
+            }
+        }
+        let (reason, needed) = before_launch_status(ctx, instance_id, definition, tool, &manifest);
+        if needed {
+            needs.push(BeforeLaunchNeed {
+                tool: tool.id.to_string(),
+                name: tool.name.clone(),
+                mode: before.mode,
+                reason,
+            });
+        }
+    }
+    Ok(needs)
+}
+
+fn before_launch_status(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool: &ToolDefinition,
+    manifest: &GameInstanceManifest,
+) -> (String, bool) {
+    let mut recorded: Option<InputFingerprint> = None;
+    for layer in manifest.layers.layers() {
+        if let LayerSource::Generated {
+            tool: layer_tool,
+            inputs: layer_inputs,
+            ..
+        } = &layer.source
+        {
+            if layer.enabled && layer_tool == &tool.id {
+                recorded = Some(layer_inputs.clone());
+            }
+        }
+    }
+    let Some(recorded) = recorded else {
+        return ("it has never run here".to_string(), true);
+    };
+    let InputFingerprint::Known(recorded) = recorded else {
+        return (
+            "Agora cannot tell whether its output is current".to_string(),
+            true,
+        );
+    };
+    match input_fingerprint(ctx, instance_id, definition, tool) {
+        Ok(now) if now == recorded => ("its output is current".to_string(), false),
+        Ok(_) => ("its output is out of date".to_string(), true),
+        Err(_) => (
+            "Agora cannot tell whether its output is current".to_string(),
+            true,
+        ),
+    }
+}
+
+fn view_path(layer: &Layer, file: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !layer.mount_path.as_str().is_empty() {
+        parts.push(layer.mount_path.as_str());
+    }
+    if !layer.source_path.as_str().is_empty() {
+        parts.push(layer.source_path.as_str());
+    }
+    parts.push(file);
+    parts.join("/")
+}
+
+/// Whether a content layer provides at least one file matching the tool's `input_files` globs.
+fn layer_matches_input_files(
+    ctx: &Ctx,
+    layer: &Layer,
+    content: &str,
+    patterns: &[String],
+) -> Result<bool, ToolError> {
+    let item = crate::content_store::get_item(ctx, content)?;
+    Ok(item.files.iter().any(|file| {
+        let path = view_path(layer, file.path.as_str());
+        patterns
+            .iter()
+            .any(|pattern| glob_match(&fold_path_case(pattern), &fold_path_case(&path)))
+    }))
+}
+
 /// The digest of everything a tool's output depends on: the enabled content layers in order, the
 /// active plugin load order, and the values of the tool's relevant settings (MASTER_SPEC §26.9).
 pub fn input_fingerprint(
@@ -1119,6 +1470,72 @@ pub fn input_fingerprint(
     tool: &ToolDefinition,
 ) -> Result<String, ToolError> {
     input_fingerprint_with_view(ctx, instance_id, definition, tool, None)
+}
+
+/// The fingerprint a run uses: the whole instance's, or for an item-scoped tool only the item it
+/// was given (MASTER_SPEC §30.12).
+pub(crate) fn input_fingerprint_scoped(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool: &ToolDefinition,
+    scope_item: Option<&str>,
+) -> Result<String, ToolError> {
+    match scope_item {
+        Some(item) => input_fingerprint_for_item(ctx, instance_id, tool, item),
+        None => input_fingerprint(ctx, instance_id, definition, tool),
+    }
+}
+
+/// The digest of one content item's files, for a tool that runs once per item. Changes to any
+/// other content item leave it alone.
+pub fn input_fingerprint_for_item(
+    ctx: &Ctx,
+    instance_id: &str,
+    tool: &ToolDefinition,
+    item_id: &str,
+) -> Result<String, ToolError> {
+    let manifest = load_manifest(ctx, instance_id)?;
+    let mut hasher = Sha256::new();
+    let mut found = false;
+    for layer in manifest.layers.layers() {
+        if let (true, LayerSource::Content { content }) = (layer.enabled, &layer.source) {
+            if content != item_id {
+                continue;
+            }
+            found = true;
+            hasher.update(
+                format!(
+                    "content\t{content}\t{}\t{}\n",
+                    layer.mount_path.as_str(),
+                    layer.source_path.as_str()
+                )
+                .as_bytes(),
+            );
+            let item = crate::content_store::get_item(ctx, content)?;
+            for file in &item.files {
+                let path = view_path(layer, file.path.as_str());
+                if tool.input_files.is_empty()
+                    || tool
+                        .input_files
+                        .iter()
+                        .any(|pattern| glob_match(&fold_path_case(pattern), &fold_path_case(&path)))
+                {
+                    hasher.update(
+                        format!("file\t{}\t{}\n", file.path.as_str(), file.sha256).as_bytes(),
+                    );
+                }
+            }
+        }
+    }
+    if !found {
+        return Err(ToolError::InvalidInput {
+            tool: tool.id.to_string(),
+            input: "item".into(),
+            reason: format!("'{item_id}' is not content of this instance"),
+        });
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// [`input_fingerprint`], reading `links` (the instance's Links plan) for the load order when the
@@ -1134,6 +1551,11 @@ pub(crate) fn input_fingerprint_with_view(
     let mut hasher = Sha256::new();
     for layer in manifest.layers.layers() {
         if let (true, LayerSource::Content { content }) = (layer.enabled, &layer.source) {
+            if !tool.input_files.is_empty()
+                && !layer_matches_input_files(ctx, layer, content, &tool.input_files)?
+            {
+                continue;
+            }
             hasher.update(
                 format!(
                     "content\t{content}\t{}\t{}\n",
@@ -1142,6 +1564,21 @@ pub(crate) fn input_fingerprint_with_view(
                 )
                 .as_bytes(),
             );
+            if !tool.input_files.is_empty() {
+                let item = crate::content_store::get_item(ctx, content)?;
+                for file in &item.files {
+                    let path = view_path(layer, file.path.as_str());
+                    if tool
+                        .input_files
+                        .iter()
+                        .any(|pattern| glob_match(&fold_path_case(pattern), &fold_path_case(&path)))
+                    {
+                        hasher.update(
+                            format!("file\t{}\t{}\n", file.path.as_str(), file.sha256).as_bytes(),
+                        );
+                    }
+                }
+            }
         }
     }
     if !definition.load_orders.is_empty() {
@@ -1918,6 +2355,59 @@ pub fn run(
         None,
         None,
         false,
+        None,
+    )
+}
+
+/// Run an item-scoped tool for one content item (MASTER_SPEC §30.12). The item's path in the view
+/// is passed wherever the recipe says `{item}`, and the tool's input fingerprint is narrowed to
+/// that item.
+#[allow(clippy::too_many_arguments)]
+pub fn run_for_item(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    tool_id: &ToolId,
+    item_id: &str,
+    capture: CaptureMode,
+    swap_costs_acknowledged: bool,
+    launcher: &dyn Launcher,
+    cancel: &CancellationToken,
+) -> Result<RunOutcome, ToolError> {
+    let tool = as_installed(
+        ctx,
+        instance_id,
+        definition,
+        declared_tool(ctx, definition, tool_id)?,
+    );
+    if tool.scope != ToolScope::Item {
+        return Err(ToolError::InvalidInput {
+            tool: tool_id.to_string(),
+            input: "scope".into(),
+            reason: "this tool runs once for the instance, not per item".into(),
+        });
+    }
+    if item_view_path(ctx, instance_id, item_id)?.is_none() {
+        return Err(ToolError::InvalidInput {
+            tool: tool_id.to_string(),
+            input: "item".into(),
+            reason: format!("'{item_id}' is not content of this instance"),
+        });
+    }
+    run_inner(
+        ctx,
+        instance_id,
+        definition,
+        &tool,
+        tool_id,
+        capture,
+        swap_costs_acknowledged,
+        launcher,
+        cancel,
+        None,
+        None,
+        false,
+        Some(item_id),
     )
 }
 
@@ -2000,6 +2490,7 @@ pub fn run_after_vfs_refusal(
             Some(refusal),
             None,
             false,
+            None,
         ),
         CaptureMode::Vfs | CaptureMode::Auto => Err(ToolError::Other(
             "only link capture or the full-copy swap can follow a refused virtual file system run"
@@ -2111,6 +2602,7 @@ fn run_user_inner(
                     fallback,
                     None,
                     move_aside,
+                    None,
                 );
             }
         }
@@ -2134,6 +2626,7 @@ fn run_user_inner(
         fallback,
         external.as_deref(),
         move_aside,
+        None,
     )
 }
 
@@ -2159,6 +2652,7 @@ fn run_inner(
     fallback: Option<&str>,
     external: Option<&Path>,
     move_aside: bool,
+    scope_item: Option<&str>,
 ) -> Result<RunOutcome, ToolError> {
     if capture == CaptureMode::Swap && !swap_costs_acknowledged {
         return Err(ToolError::SwapNotConfirmed);
@@ -2231,6 +2725,39 @@ fn run_inner(
         }
     };
 
+    // The player's stored input values (MASTER_SPEC §30.12). A required one with no value refuses
+    // the run before anything is deployed. `{item}` is the chosen item's path in the view.
+    let item_path = match scope_item {
+        Some(item) => item_view_path(ctx, instance_id, item)?,
+        None => None,
+    };
+    if effective.scope == ToolScope::Item && item_path.is_none() {
+        return Err(ToolError::ItemScopeWithoutItem {
+            tool: tool_id.to_string(),
+        });
+    }
+    let stored = read_tool_inputs(ctx, instance_id)?
+        .get(effective.id.as_str())
+        .cloned()
+        .unwrap_or_default();
+    for argument in tool_input_arguments(&effective, &stored, item_path.as_deref())? {
+        effective
+            .launch
+            .arguments
+            .push(agora_game_api::LaunchValue::Literal {
+                value: argument.to_string_lossy().into_owned(),
+            });
+    }
+    if let Some(item) = item_path.as_deref() {
+        for argument in &mut effective.launch.arguments {
+            if let agora_game_api::LaunchValue::Literal { value } = argument {
+                if value.contains("{item}") {
+                    *value = value.replace("{item}", item);
+                }
+            }
+        }
+    }
+
     let tool = &effective;
 
     // Decided before anything is deployed (MASTER_SPEC §26.9, decision 1). Under `auto` a virtual instance
@@ -2298,6 +2825,7 @@ fn run_inner(
                 external.as_deref(),
                 output_dir.as_deref(),
                 configured.as_ref(),
+                scope_item,
             )?;
             Ok(with_offers(
                 ctx,
@@ -2323,6 +2851,7 @@ fn run_inner(
                 external.as_deref(),
                 output_dir.as_deref(),
                 configured.as_ref(),
+                scope_item,
             ) {
                 Ok(found) => found,
                 // The program would not start under the VFS, after the instance was deployed: nothing ran,
@@ -2365,6 +2894,7 @@ fn run_inner(
                 external.as_deref(),
                 output_dir.as_deref(),
                 configured.as_ref(),
+                scope_item,
             )?;
             Ok(with_offers(
                 ctx,
@@ -2435,6 +2965,7 @@ fn run_under_vfs(
     external: Option<&Path>,
     output_dir: Option<&Path>,
     configured: Option<&ConfiguredOutput>,
+    scope_item: Option<&str>,
 ) -> Result<(RunOutcome, bool), ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -2445,7 +2976,7 @@ fn run_under_vfs(
     let writable = instance_dir.join("writable");
 
     deploy_locked(ctx, instance_id, definition, DeployMode::Virtual)?;
-    let fingerprint = input_fingerprint(ctx, instance_id, definition, tool)?;
+    let fingerprint = input_fingerprint_scoped(ctx, instance_id, definition, tool, scope_item)?;
 
     let roots = LaunchRoots {
         runtime: game_dir.clone(),
@@ -2588,6 +3119,7 @@ fn run_from_links(
     external: Option<&Path>,
     output_dir: Option<&Path>,
     configured: Option<&ConfiguredOutput>,
+    scope_item: Option<&str>,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -2609,7 +3141,7 @@ fn run_from_links(
         copied.as_deref(),
     )?;
     let before = read_deployment_record(&deployment_dir)?;
-    let fingerprint = input_fingerprint(ctx, instance_id, definition, tool)?;
+    let fingerprint = input_fingerprint_scoped(ctx, instance_id, definition, tool, scope_item)?;
 
     let roots = LaunchRoots {
         runtime: game_dir.clone(),
@@ -2705,6 +3237,7 @@ fn run_by_swap(
     external: Option<&Path>,
     output_dir: Option<&Path>,
     configured: Option<&ConfiguredOutput>,
+    scope_item: Option<&str>,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -2722,7 +3255,7 @@ fn run_by_swap(
     let staging = dir.join(format!("staging-{run}"));
 
     game_tool_swap::preflight(&install, &real_data, &aside, &copy.space_need())?;
-    let fingerprint = input_fingerprint(ctx, instance_id, definition, tool)?;
+    let fingerprint = input_fingerprint_scoped(ctx, instance_id, definition, tool, scope_item)?;
 
     // The user files go in before the real Data moves, so the swap journal is the only swap in progress
     // for this game when the recovery check runs.

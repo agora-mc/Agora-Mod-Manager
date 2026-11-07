@@ -426,12 +426,40 @@ pub async fn games_instance_launch(
     instance_id: String,
     launch_anyway: bool,
     deployment: Option<String>,
+    skip_before_launch: Option<bool>,
+    before_launch: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<LaunchReply, GamesError> {
     let chosen = match deployment {
         Some(word) => parse_deployment(&word)?,
         None => None,
     };
-    blocking(move || launch_instance(&app, &instance_id, launch_anyway, chosen)).await
+    let before = if skip_before_launch.unwrap_or(false) {
+        game_instance::BeforeLaunchChoice::Skip
+    } else if let Some(answers) = before_launch {
+        let mut parsed = std::collections::BTreeMap::new();
+        for (tool, answer) in answers {
+            let answer = match answer.as_str() {
+                "run" => game_instance::BeforeLaunchAnswer::Run,
+                "launch_anyway" | "launch-anyway" => {
+                    game_instance::BeforeLaunchAnswer::LaunchAnyway
+                }
+                other => {
+                    return Err(GamesError::new(
+                        "ERR_BEFORE_LAUNCH_ANSWER",
+                        format!(
+                            "Unknown before-launch answer '{other}'. Use run or launch_anyway."
+                        ),
+                    ))
+                }
+            };
+            parsed.insert(tool, answer);
+        }
+        game_instance::BeforeLaunchChoice::Answers(parsed)
+    } else {
+        // The page does not ask yet: run what the game says to run.
+        game_instance::BeforeLaunchChoice::Run
+    };
+    blocking(move || launch_instance(&app, &instance_id, launch_anyway, chosen, before)).await
 }
 
 async fn blocking<T, F>(work: F) -> Result<T, GamesError>
@@ -843,6 +871,7 @@ fn launch_instance(
     instance_id: &str,
     launch_anyway: bool,
     deployment: Option<DeployMode>,
+    before_launch: game_instance::BeforeLaunchChoice,
 ) -> Result<LaunchReply, GamesError> {
     let ctx = crate::core_context(app)?;
     let record = load_record(&ctx, instance_id)?;
@@ -861,6 +890,7 @@ fn launch_instance(
         deployment,
         // Ask, never step down on our own: the page asks the user and launches again if they say yes.
         on_vfs_failure: VfsFailure::Ask,
+        before_launch,
     };
     let launched = match game_instance::launch_with(
         &ctx,

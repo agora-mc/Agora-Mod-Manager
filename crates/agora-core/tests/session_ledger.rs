@@ -283,6 +283,7 @@ fn launch(f: &Fixture, launcher: &CrasherLauncher) -> LaunchedInstance {
             plain: false,
             deployment: Some(DeployMode::Links),
             on_vfs_failure: VfsFailure::Ask,
+            before_launch: Default::default(),
         },
         &DiscoveryReport::default,
         launcher,

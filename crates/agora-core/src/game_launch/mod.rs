@@ -460,16 +460,68 @@ impl ConditionFacts for LaunchRootsFacts<'_> {
     }
 }
 
-/// Whether a condition applies. Only a known true applies; an unknown answer leaves the thing out,
-/// as §30.12 says, and the launch log records that it could not tell.
-fn applies(when: &Condition, roots: &LaunchRoots) -> bool {
-    when.evaluate(&LaunchRootsFacts { roots }) == Truth::True
+/// Whether a recipe or the game's launch alternatives ask something the roots cannot answer: a
+/// framework's version or the game's version. A `present` check is answered by the roots, so it
+/// does not force a read of the whole instance view.
+pub fn needs_instance_facts(
+    definition: &GameDefinition,
+    recipe: &LaunchRecipe,
+    plain: bool,
+) -> bool {
+    fn asks_about_versions(condition: &Condition) -> bool {
+        match condition {
+            Condition::Framework { .. } | Condition::Version(_) => true,
+            Condition::All(conditions) | Condition::Any(conditions) => {
+                conditions.iter().any(asks_about_versions)
+            }
+            Condition::Not(condition) => asks_about_versions(condition),
+            Condition::Present(_) => false,
+        }
+    }
+    let value_asks = |value: &LaunchValue| match value {
+        LaunchValue::Conditional { when, .. } => asks_about_versions(when),
+        _ => false,
+    };
+    recipe.arguments.iter().any(value_asks)
+        || recipe.environment.values().any(value_asks)
+        || (!plain
+            && definition
+                .launch_alternatives
+                .iter()
+                .any(|alternative| asks_about_versions(&alternative.when)))
 }
 
-fn resolve_launch_value(val: &LaunchValue, roots: &LaunchRoots) -> Result<OsString, LaunchError> {
+/// Whether a condition applies. Only a known true applies; an unknown answer leaves the thing out,
+/// as §30.12 says, and `notes` records in plain words that it could not tell.
+fn applies(when: &Condition, facts: &dyn ConditionFacts, notes: &mut Vec<String>) -> bool {
+    match when.evaluate(facts) {
+        Truth::True => true,
+        Truth::False => false,
+        Truth::Unknown => {
+            notes.push(format!(
+                "Could not tell whether {} holds, so it was left out: {}.",
+                when.describe(),
+                "the instance's files or version could not be read"
+            ));
+            false
+        }
+    }
+}
+
+fn resolve_launch_value(
+    val: &LaunchValue,
+    roots: &LaunchRoots,
+    facts: &dyn ConditionFacts,
+    notes: &mut Vec<String>,
+) -> Result<OsString, LaunchError> {
     match val {
         LaunchValue::Literal { value } => Ok(OsString::from(value)),
-        LaunchValue::Conditional { value, .. } => resolve_launch_value(value, roots),
+        LaunchValue::Conditional { value, when } => {
+            if !applies(when, facts, notes) {
+                return Ok(OsString::new());
+            }
+            resolve_launch_value(value, roots, facts, notes)
+        }
         LaunchValue::Path {
             path,
             prefix,
@@ -500,11 +552,23 @@ fn resolve_launch_value(val: &LaunchValue, roots: &LaunchRoots) -> Result<OsStri
     }
 }
 
-/// Resolve a declarative launch recipe against available roots.
+/// Resolve a declarative launch recipe against available roots, with launch alternatives conditions
+/// asking only what the roots can tell (`present`).
 pub fn resolve_recipe(
     recipe: &LaunchRecipe,
     roots: &LaunchRoots,
 ) -> Result<ResolvedLaunch, LaunchError> {
+    Ok(resolve_recipe_with_facts(recipe, roots, &LaunchRootsFacts { roots })?.0)
+}
+
+/// Resolve a declarative launch recipe against `facts` (the instance's merged view, frameworks and
+/// version). Returns the resolved launch and plain-word notes about conditions that could not be
+/// judged, which the caller writes to the launch log (MASTER_SPEC §30.12).
+pub fn resolve_recipe_with_facts(
+    recipe: &LaunchRecipe,
+    roots: &LaunchRoots,
+    facts: &dyn ConditionFacts,
+) -> Result<(ResolvedLaunch, Vec<String>), LaunchError> {
     // A game's executable lives in the game's own folders. A definition comes
     // from a package (possibly a community plugin holding `game:define`), and
     // consenting to "define a game" is not consenting to run any program in
@@ -521,37 +585,47 @@ pub fn resolve_recipe(
     }
 
     let cwd = resolve_game_path(&recipe.working_directory, roots)?;
+    let mut notes = Vec::new();
 
     let mut args = Vec::with_capacity(recipe.arguments.len());
     for arg in &recipe.arguments {
         if let LaunchValue::Conditional { value, when } = arg {
-            if !applies(when, roots) {
+            if !applies(when, facts, &mut notes) {
                 continue;
             }
-            args.push(resolve_launch_value(value, roots)?);
+            args.push(resolve_launch_value(value, roots, facts, &mut notes)?);
         } else {
-            args.push(resolve_launch_value(arg, roots)?);
+            args.push(resolve_launch_value(arg, roots, facts, &mut notes)?);
         }
     }
 
     let mut env = BTreeMap::new();
     for (k, v) in &recipe.environment {
         if let LaunchValue::Conditional { value, when } = v {
-            if !applies(when, roots) {
+            if !applies(when, facts, &mut notes) {
                 continue;
             }
-            env.insert(k.clone(), resolve_launch_value(value, roots)?);
+            env.insert(
+                k.clone(),
+                resolve_launch_value(value, roots, facts, &mut notes)?,
+            );
         } else {
-            env.insert(k.clone(), resolve_launch_value(v, roots)?);
+            env.insert(
+                k.clone(),
+                resolve_launch_value(v, roots, facts, &mut notes)?,
+            );
         }
     }
 
-    Ok(ResolvedLaunch {
-        program,
-        args,
-        env,
-        cwd,
-    })
+    Ok((
+        ResolvedLaunch {
+            program,
+            args,
+            env,
+            cwd,
+        },
+        notes,
+    ))
 }
 
 /// Replace the recipe's executable with the first launch alternative of the game whose
@@ -566,8 +640,26 @@ pub fn apply_launch_alternative(
     roots: &LaunchRoots,
     resolved: &mut ResolvedLaunch,
 ) -> Result<Option<AppliedAlternative>, LaunchError> {
+    apply_launch_alternative_with_facts(
+        definition,
+        roots,
+        resolved,
+        &LaunchRootsFacts { roots },
+        &mut Vec::new(),
+    )
+}
+
+/// [`apply_launch_alternative`] with instance facts, and the notes about alternatives whose `when`
+/// could not be judged appended to `notes`.
+pub fn apply_launch_alternative_with_facts(
+    definition: &GameDefinition,
+    roots: &LaunchRoots,
+    resolved: &mut ResolvedLaunch,
+    facts: &dyn ConditionFacts,
+    notes: &mut Vec<String>,
+) -> Result<Option<AppliedAlternative>, LaunchError> {
     for alternative in &definition.launch_alternatives {
-        if !applies(&alternative.when, roots) {
+        if !applies(&alternative.when, facts, notes) {
             continue;
         }
         if !matches!(
@@ -610,6 +702,33 @@ pub fn prepare_base_launch_with(
     launch_anyway: bool,
     plain: bool,
 ) -> Result<PreparedLaunch, LaunchError> {
+    let roots = LaunchRoots {
+        runtime: manifest.location.clone(),
+        install: Some(manifest.source_location.clone()),
+        base: Some(manifest.location.clone()),
+    };
+    let mut notes = Vec::new();
+    let prepared = prepare_base_launch_with_facts(
+        manifest,
+        definition,
+        launch_anyway,
+        plain,
+        &LaunchRootsFacts { roots: &roots },
+        &mut notes,
+    )?;
+    Ok(prepared)
+}
+
+/// [`prepare_base_launch_with`] with the instance facts a conditional argument asks about, and the
+/// notes about conditions that could not be judged appended to `notes`.
+pub fn prepare_base_launch_with_facts(
+    manifest: &BaseManifest,
+    definition: &GameDefinition,
+    launch_anyway: bool,
+    plain: bool,
+    facts: &dyn ConditionFacts,
+    notes: &mut Vec<String>,
+) -> Result<PreparedLaunch, LaunchError> {
     let Some(recipe) = &definition.launch else {
         return Err(LaunchError::NoRecipe);
     };
@@ -639,11 +758,12 @@ pub fn prepare_base_launch_with(
         base: Some(manifest.location.clone()),
     };
 
-    let mut resolved = resolve_recipe(recipe, &roots)?;
+    let (mut resolved, recipe_notes) = resolve_recipe_with_facts(recipe, &roots, facts)?;
+    notes.extend(recipe_notes);
     let alternative = if plain {
         None
     } else {
-        apply_launch_alternative(definition, &roots, &mut resolved)?
+        apply_launch_alternative_with_facts(definition, &roots, &mut resolved, facts, notes)?
     };
 
     // Store launch environment:

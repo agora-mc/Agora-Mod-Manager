@@ -24,8 +24,8 @@ use agora_core::game_deploy::{
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_ini;
 use agora_core::game_instance::{
-    create, get_manifest, launch_with, GameInstanceRecord, InstanceError, LaunchOptions,
-    LaunchedInstance, VfsFailure,
+    create, get_manifest, launch_with, prepare_launch_with, BeforeLaunchAnswer, BeforeLaunchChoice,
+    GameInstanceRecord, InstanceError, LaunchOptions, LaunchedInstance, VfsFailure,
 };
 use agora_core::game_launch::{LaunchError, LaunchedGame, Launcher, PreparedLaunch};
 use agora_core::game_load_order::{self, MoveTarget};
@@ -39,11 +39,12 @@ use agora_core::game_user_files::{record_process, swap_in};
 use agora_core::game_user_tools::{self, NewUserTool, EXCLUDED_EXE_NAMES, NAME_MAX_CHARS};
 use agora_core::process_identity;
 use agora_game_api::{
-    BaseReference, DeploymentStrategy, FailureMarker, GameDefinition, GameId, GamePackage,
-    GamePath, InputFingerprint, InstallId, InstallKind, LaunchRecipe, LaunchValue, LayerSource,
-    LoadOrderDefinition, LoadOrderFormat, PackageDefinition, RelPath, RequiredMagic,
-    RuntimeIdentity, StoreId, StoreIdentifier, ToolDefinition, ToolId, ToolOutput,
-    UserDataLocation, UserFileMapping, UserFileStrategy,
+    BaseReference, BeforeLaunch, BeforeLaunchMode, Condition, DeploymentStrategy, FailureMarker,
+    GameDefinition, GameId, GamePackage, GamePath, InputFingerprint, InstallId, InstallKind,
+    LaunchRecipe, LaunchValue, LayerSource, LoadOrderDefinition, LoadOrderFormat,
+    PackageDefinition, RelPath, RequiredMagic, RuntimeIdentity, StoreId, StoreIdentifier,
+    ToolDefinition, ToolId, ToolInput, ToolInputKind, ToolOutput, ToolScope, UserDataLocation,
+    UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -442,6 +443,7 @@ fn launch(
             plain: false,
             deployment: None,
             on_vfs_failure: VfsFailure::Ask,
+            before_launch: Default::default(),
         },
         &DiscoveryReport::default,
         launcher,
@@ -6679,4 +6681,240 @@ fn a_user_tool_is_run_only_unless_it_keeps_output_or_writes_a_mod() {
             .unwrap()
             .run_only
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tool inputs, item scope and before-launch tools (MASTER_SPEC §30.12)
+// ---------------------------------------------------------------------------
+
+fn input(id: &str, kind: ToolInputKind, arg: &str) -> ToolInput {
+    ToolInput {
+        id: id.into(),
+        label: format!("{id} label"),
+        kind,
+        required: false,
+        default: None,
+        choices: Vec::new(),
+        arg: Some(arg.into()),
+    }
+}
+
+fn prepare_with(
+    f: &Fixture,
+    before: BeforeLaunchChoice,
+    launcher: &dyn Launcher,
+) -> Result<agora_core::game_launch::PreparedLaunch, InstanceError> {
+    prepare_launch_with(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        LaunchOptions {
+            launch_anyway: false,
+            plain: false,
+            deployment: None,
+            on_vfs_failure: VfsFailure::Ask,
+            before_launch: before,
+        },
+        &DiscoveryReport::default,
+        launcher,
+    )
+}
+
+fn item_named(f: &Fixture, name: &str, mount: Option<&str>, files: &[(&str, &[u8])]) -> String {
+    let dir = TempDir::new().unwrap();
+    for (rel, bytes) in files {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let outcome = agora_core::content_store::add_folder(&f.ctx, dir.path(), Some(name)).unwrap();
+    let id = outcome.item().item_id.clone();
+    add_content(&f.ctx, f.id(), &id, mount, None).unwrap();
+    id
+}
+
+#[test]
+fn a_required_input_unfilled_refuses_with_its_name() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    let mut required = input("profile", ToolInputKind::Text, "--profile");
+    required.required = true;
+    t.inputs = vec![required];
+    let error = game_tools::tool_input_arguments(&t, &Default::default(), None).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("profile label"), "{text}");
+    assert!(text.contains("profile"), "{text}");
+}
+
+#[test]
+fn a_choice_outside_the_list_is_refused() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    let mut choice = input("mode", ToolInputKind::Choice, "--mode");
+    choice.choices = vec!["fast".into(), "slow".into()];
+    t.inputs = vec![choice];
+    let f = fixture(vec![t.clone()]);
+    let error = game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("nemesis").unwrap(),
+        "mode",
+        "sideways",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("fast"), "{error}");
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert("mode".to_string(), "sideways".to_string());
+    assert!(game_tools::tool_input_arguments(&t, &stored, None).is_err());
+}
+
+#[test]
+fn input_files_ignores_other_content_changes() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    t.input_files = vec!["mods/A/*".into()];
+    let f = fixture(vec![t.clone()]);
+    item_named(&f, "A", Some("mods/A"), &[("a.txt", b"a")]);
+    let before = game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &t).unwrap();
+    item_named(&f, "B", Some("mods/B"), &[("b.txt", b"b")]);
+    let after = game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &t).unwrap();
+    assert_eq!(
+        before, after,
+        "an unrelated content change moved the fingerprint"
+    );
+}
+
+#[test]
+fn an_item_scoped_tool_gets_only_that_item() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    t.scope = ToolScope::Item;
+    let mut target = input("target", ToolInputKind::Text, "--target");
+    target.default = Some("{item}".into());
+    t.inputs = vec![target];
+    let f = fixture(vec![t.clone()]);
+    let a = item_named(&f, "A", Some("mods/A"), &[("a.txt", b"a")]);
+    let b = item_named(&f, "B", Some("mods/B"), &[("b.txt", b"b")]);
+    let first = game_tools::input_fingerprint_for_item(&f.ctx, f.id(), &t, &a).unwrap();
+    let other = game_tools::input_fingerprint_for_item(&f.ctx, f.id(), &t, &b).unwrap();
+    assert_ne!(first, other);
+    // Another item arriving does not change this item's fingerprint.
+    item_named(&f, "C", Some("mods/C"), &[("c.txt", b"c")]);
+    assert_eq!(
+        first,
+        game_tools::input_fingerprint_for_item(&f.ctx, f.id(), &t, &a).unwrap()
+    );
+    let path = game_tools::item_view_path(&f.ctx, f.id(), &a).unwrap();
+    assert_eq!(path.as_deref(), Some("mods/A"));
+    let args = game_tools::tool_input_arguments(&t, &Default::default(), path.as_deref()).unwrap();
+    assert_eq!(
+        args,
+        vec![
+            std::ffi::OsString::from("--target"),
+            std::ffi::OsString::from("mods/A")
+        ]
+    );
+    assert!(game_tools::tool_input_arguments(&t, &Default::default(), None).is_err());
+}
+
+fn before_launch_tool(id: &str, mode: BeforeLaunchMode) -> ToolDefinition {
+    let mut t = writes_or_fails(id);
+    t.before_launch = Some(BeforeLaunch { mode, when: None });
+    t
+}
+
+fn needs_of(f: &Fixture) -> Vec<game_tools::BeforeLaunchNeed> {
+    let facts = agora_core::game_conditions::InstanceFacts::for_instance(&f.ctx, f.id(), &f.def);
+    game_tools::before_launch_needs(&f.ctx, f.id(), &f.def, &facts, &mut Vec::new()).unwrap()
+}
+
+#[test]
+fn a_stale_before_launch_tool_stops_launch_with_the_outcome() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    let error = prepare_with(&f, BeforeLaunchChoice::Ask, &StagingLauncher::new()).unwrap_err();
+    match error {
+        InstanceError::BeforeLaunchNeeded { tools, .. } => {
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].tool, "nemesis");
+            assert_eq!(tools[0].mode, BeforeLaunchMode::Run);
+        }
+        other => panic!("expected the needs outcome, got {other}"),
+    }
+}
+
+#[test]
+fn a_fresh_one_does_not() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    f.run_ok("nemesis", &StagingLauncher::new());
+    assert!(needs_of(&f).is_empty());
+    prepare_with(&f, BeforeLaunchChoice::Ask, &StagingLauncher::new())
+        .expect("a fresh tool does not stop the launch");
+}
+
+#[test]
+fn when_false_does_not() {
+    let mut t = writes_or_fails("nemesis");
+    t.before_launch = Some(BeforeLaunch {
+        mode: BeforeLaunchMode::Run,
+        when: Some(Condition::Present(RelPath::new("not-there.txt").unwrap())),
+    });
+    let f = fixture(vec![t]);
+    assert!(needs_of(&f).is_empty());
+    prepare_with(&f, BeforeLaunchChoice::Ask, &StagingLauncher::new())
+        .expect("a false when does not need the tool");
+}
+
+#[test]
+fn launch_anyway_launches_and_records_it() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    let prepared = prepare_with(
+        &f,
+        BeforeLaunchChoice::Answers(
+            [("nemesis".to_string(), BeforeLaunchAnswer::LaunchAnyway)]
+                .into_iter()
+                .collect(),
+        ),
+        &StagingLauncher::new(),
+    )
+    .expect("launch anyway still prepares the launch");
+    assert!(prepared.deploy_outcome.is_some());
+    let log = std::fs::read_to_string(
+        agora_core::game_instance::launch_log_path(&f.ctx, f.id()).unwrap(),
+    )
+    .unwrap();
+    assert!(log.contains("launch anyway"), "{log}");
+}
+
+#[test]
+fn a_failed_run_stops_and_can_still_launch_anyway() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    let failing = StagingLauncher::new().with_env("AGORA_TEST_FAIL", "1");
+    let error = prepare_with(&f, BeforeLaunchChoice::Run, &failing).unwrap_err();
+    assert!(
+        matches!(error, InstanceError::BeforeLaunchFailed { .. }),
+        "expected the failed-run outcome, got {error}"
+    );
+    prepare_with(&f, BeforeLaunchChoice::Skip, &StagingLauncher::new())
+        .expect("launch anyway still works after a failed run");
+}
+
+#[test]
+fn a_run_mode_tool_that_runs_makes_the_next_launch_fresh() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    prepare_with(&f, BeforeLaunchChoice::Run, &StagingLauncher::new())
+        .expect("the run-mode tool runs and the launch goes on");
+    assert!(needs_of(&f).is_empty(), "the output should be current now");
+}
+
+#[test]
+fn ask_mode_never_runs_unasked() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Ask)]);
+    prepare_with(&f, BeforeLaunchChoice::Run, &StagingLauncher::new())
+        .expect("the launch goes on without running the ask-mode tool");
+    assert!(
+        f.generated("nemesis").is_none(),
+        "an ask-mode tool ran without being asked"
+    );
+    let log = std::fs::read_to_string(
+        agora_core::game_instance::launch_log_path(&f.ctx, f.id()).unwrap(),
+    )
+    .unwrap();
+    assert!(log.contains("chose to launch anyway"), "{log}");
 }
