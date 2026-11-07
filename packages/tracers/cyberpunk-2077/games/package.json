@@ -210,6 +210,9 @@
           "path": ""
         }
       },
+      "output": {
+        "kind": "generated_layer"
+      },
       "input_files": [
         "mods/**"
       ],
