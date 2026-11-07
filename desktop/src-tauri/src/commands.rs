@@ -16,8 +16,7 @@ use crate::modrinth_raw;
 use crate::mojang;
 use crate::paths;
 use crate::registry::{
-    AuditLogEntry, CategoryInfo, CuratedAnnotation, ModReview, PackModRow, RegistryItem,
-    SortOption, UnderReviewItem,
+    CategoryInfo, CuratedAnnotation, ModReview, PackModRow, RegistryItem, SortOption,
 };
 use crate::state::LauncherState;
 use crate::version_cache::{self, ModVersionPage, SharedVersionCache};
@@ -286,26 +285,6 @@ pub async fn plan_curated_pack(
     agora_core::curated_pack::CuratedPackService::new(ctx)
         .plan(&pack_id, &selection)
         .await
-}
-
-/// List audit log entries from the registry DB (§4.6).
-#[tauri::command]
-pub async fn list_audit_log(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    limit: Option<i64>,
-) -> LauncherResult<Vec<AuditLogEntry>> {
-    let limit = limit.unwrap_or(200).clamp(1, 1000);
-    tokio::task::spawn_blocking(move || {
-        let ctx = crate::core_context(&app)?;
-        let svc = agora_core::registry::RegistryService::new(ctx);
-        svc.list_audit_log(limit)
-    })
-    .await
-    .map_err(|_| LauncherError::Generic {
-        code: "ERR_REGISTRY_QUERY".to_string(),
-        message: "Audit log query task failed.".to_string(),
-    })?
 }
 
 /// List all user instances from `local_state.db`.
@@ -2840,44 +2819,6 @@ pub async fn fetch_modrinth_project(
     modrinth_raw::fetch_project_full(&ctx.http_clients, &app, &project_id).await
 }
 
-/// List registry items whose status is `under_review`, ordered by net_score.
-#[tauri::command]
-pub async fn list_under_review_items(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-) -> LauncherResult<Vec<UnderReviewItem>> {
-    tokio::task::spawn_blocking(move || {
-        let ctx = crate::core_context(&app)?;
-        let svc = agora_core::registry::RegistryService::new(ctx);
-        svc.list_under_review_items()
-    })
-    .await
-    .map_err(|_| LauncherError::Generic {
-        code: "ERR_REGISTRY_QUERY".to_string(),
-        message: "Under-review query task failed.".to_string(),
-    })?
-}
-
-/// List recent triage resolutions from the audit log.
-#[tauri::command]
-pub async fn list_recent_resolutions(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    limit: Option<u32>,
-) -> LauncherResult<Vec<AuditLogEntry>> {
-    let limit = limit.unwrap_or(50);
-    tokio::task::spawn_blocking(move || {
-        let ctx = crate::core_context(&app)?;
-        let svc = agora_core::registry::RegistryService::new(ctx);
-        svc.list_recent_resolutions(limit)
-    })
-    .await
-    .map_err(|_| LauncherError::Generic {
-        code: "ERR_REGISTRY_QUERY".to_string(),
-        message: "Recent resolutions query task failed.".to_string(),
-    })?
-}
-
 /// Load parsed curator reviews for a single registry item.
 #[tauri::command]
 pub async fn list_mod_reviews(
@@ -2895,16 +2836,6 @@ pub async fn list_mod_reviews(
         code: "ERR_REGISTRY_QUERY".to_string(),
         message: "Mod reviews query task failed.".to_string(),
     })?
-}
-
-/// Fetch the live triage poll for a mod from GitHub Discussions.
-#[tauri::command]
-pub async fn fetch_triage_poll(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    mod_id: String,
-) -> LauncherResult<crate::governance::TriagePoll> {
-    crate::governance::fetch_triage_poll(&app, mod_id).await
 }
 
 /// Return the resolved governance configuration.

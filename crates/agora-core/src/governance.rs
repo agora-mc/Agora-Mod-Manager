@@ -241,18 +241,6 @@ pub fn parse_governance_state(dir: &Path) -> Option<GovernanceStateFile> {
 }
 
 // ---------------------------------------------------------------------------
-// TriagePoll — read-only GitHub Discussions query result
-// ---------------------------------------------------------------------------
-
-/// A live triage poll for a given mod, fetched from GitHub Discussions.
-#[derive(Debug, Serialize, Clone)]
-pub struct TriagePoll {
-    pub discussion_url: Option<String>,
-    pub keep_votes: i64,
-    pub remove_votes: i64,
-}
-
-// ---------------------------------------------------------------------------
 // DiagnosticCheck / DiagnosticStatus — diagnostics output
 // ---------------------------------------------------------------------------
 

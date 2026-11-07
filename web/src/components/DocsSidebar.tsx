@@ -65,7 +65,14 @@ export function DocsSidebar({ sections }: DocsSidebarProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
   useEffect(() => setMobileOpen(false), [pathname]);
 
-  const primary = sections.filter((section) => section.audience !== 'internal');
+  // Desktop pages join the hand-written links under the one desktop heading.
+  const desktopLinks = sections
+    .filter((section) => section.audience === 'desktop')
+    .flatMap((section) => section.groups.flatMap((group) => group.links))
+    .map((link) => ({ href: `/docs/${link.slug}`, label: link.title }));
+  const primary = sections.filter(
+    (section) => section.audience !== 'internal' && section.audience !== 'desktop'
+  );
   const internal = sections.filter((section) => section.audience === 'internal');
   const internalIsActive = internal.some((section) =>
     section.groups.some((group) =>
@@ -92,11 +99,11 @@ export function DocsSidebar({ sections }: DocsSidebarProps) {
       <div id="docs-nav-panel" className={`${mobileOpen ? 'mt-4' : 'hidden'} lg:mt-0 lg:block`}>
       <div className="border-y border-gray-200 py-2.5 dark:border-gray-700">
         <p className="px-2 text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-          Start here
+          Desktop App Users
         </p>
       </div>
       <ul className="mt-2 space-y-0.5 text-sm">
-        {START_HERE.map((item) => {
+        {[...START_HERE, ...desktopLinks].map((item) => {
           const active =
             item.href === '/docs'
               ? pathname === '/docs'

@@ -24,11 +24,11 @@ Keep reusable behavior in `agora-core`. Desktop, CLI, and MCP hosts should adapt
 
 ## Prerequisites
 
-- current stable Rust toolchain;
-- Node.js and npm supported by the lockfile;
-- Python supported by the compiler requirements;
-- platform prerequisites required by Tauri;
-- Git.
+- current stable Rust toolchain
+- Node.js and npm supported by the lockfile
+- Python supported by the compiler requirements
+- platform prerequisites required by Tauri
+- Git
 
 Use the repository lockfiles. Avoid replacing them merely to satisfy a local global-tool mismatch.
 
@@ -92,9 +92,9 @@ The Python compiler may load `.env` for local development. Copy `.env.example` t
 
 Secret examples include:
 
-- the Ed25519 private signing key;
-- GitHub tokens;
-- Discord webhook URLs.
+- the Ed25519 private signing key
+- GitHub tokens
+- Discord webhook URLs
 
 Never commit real values.
 
@@ -113,11 +113,11 @@ The matching `ED25519_PRIVATE_KEY`, GitHub tokens, updater signing key, and webh
 
 Release workflows must verify the packaged executable can:
 
-- authenticate through intended public client configuration;
-- verify the signed catalog;
-- synchronize the catalog;
-- populate Browse;
-- load loader/runtime catalog data.
+- authenticate through intended public client configuration
+- verify the signed catalog
+- synchronize the catalog
+- populate Browse
+- load loader/runtime catalog data
 
 Do not assume a successful source build proves packaged configuration is present.
 
@@ -184,13 +184,13 @@ A new or renamed Tauri command also needs `python scripts/check_tauri_bindings.p
 
 For a user-visible change:
 
-1. update `desktop/src/data/guideContent.ts`;
-2. update CLI help and `docs/CLI.md` when applicable;
-3. update website docs when first-run behavior changes;
-4. search for obsolete labels and defaults;
-5. test all newly documented commands against a temporary data root;
-6. verify links;
-7. avoid copying secret-bearing operator commands into player documentation.
+1. Update `desktop/src/data/guideContent.ts`.
+2. Update CLI help and `docs/CLI.md` when applicable.
+3. Update website docs when first-run behavior changes.
+4. Search for obsolete labels and defaults.
+5. Test all newly documented commands against a temporary data root.
+6. Verify links.
+7. Avoid copying secret-bearing operator commands into player documentation.
 
 Run the hermetic documentation gate:
 
@@ -235,10 +235,10 @@ Close Agora before removing that temporary directory. Microsoft credentials use 
 
 Include the smallest relevant evidence:
 
-- tests run;
-- packaged or development build used;
-- screenshots for UI changes;
-- CLI help/output for CLI changes;
-- migration or rollback behavior for persistent-state changes;
-- timing methodology for performance changes;
-- documentation files reviewed.
+- tests run
+- packaged or development build used
+- screenshots for UI changes
+- CLI help/output for CLI changes
+- migration or rollback behavior for persistent-state changes
+- timing methodology for performance changes
+- documentation files reviewed

@@ -14,12 +14,12 @@ The compiler can run governance analysis in three modes:
 
 Before running anything against production:
 
-- confirm the repository;
-- confirm the policy;
-- confirm input and output state paths;
-- confirm whether alerts are configured;
-- confirm the working tree;
-- confirm the token identity and permissions.
+- Confirm the repository.
+- Confirm the policy.
+- Confirm input and output state paths.
+- Confirm whether alerts are configured.
+- Confirm the working tree.
+- Confirm the token identity and permissions.
 
 Never use a sandbox policy with the production state file.
 
@@ -91,15 +91,15 @@ issues and is ignored as a vote source.
 
 Monitor mode should be activated only after:
 
-- sandbox scenarios have passed;
-- state validation passes;
-- repository and policy are pinned;
-- alert destinations are verified;
-- duplicate-event behavior is tested;
-- curator decision transitions are tested;
-- the workflow's commit scope is restricted to intended state files;
-- rollback and malformed-state recovery have been rehearsed;
-- a maintainer has explicitly approved activation.
+- sandbox scenarios have passed
+- state validation passes
+- repository and policy are pinned
+- alert destinations are verified
+- duplicate-event behavior is tested
+- curator decision transitions are tested
+- the workflow's commit scope is restricted to intended state files
+- rollback and malformed-state recovery have been rehearsed
+- a maintainer has explicitly approved activation
 
 For monitor testing, use the sandbox repository, sandbox policy, a sandbox-owned temporary state file, and a test alert destination. Never run a local monitor command against `registry/governance/governance-state.json`; production monitor writes belong to the guarded nightly workflow.
 
@@ -109,13 +109,13 @@ A decision maps a stable event ID to an accepted or rejected outcome.
 
 Operational rules:
 
-1. inspect the event and affected reactions;
-2. preserve the evidence and rationale;
-3. edit the decision file through review;
-4. validate JSON and event identity;
-5. run read-only analysis;
-6. merge the decision;
-7. allow monitor mode to persist the resulting state transition.
+1. Inspect the event and affected reactions.
+2. Preserve the evidence and rationale.
+3. Edit the decision file through review.
+4. Validate JSON and event identity.
+5. Run read-only analysis.
+6. Merge the decision.
+7. Allow monitor mode to persist the resulting state transition.
 
 Do not edit historical event IDs to make a decision apply.
 
@@ -123,15 +123,15 @@ Do not edit historical event IDs to make a decision apply.
 
 When state cannot be parsed or validated:
 
-1. stop monitor writes;
-2. preserve the malformed file;
-3. inspect recent Git history;
-4. identify the last valid state;
-5. determine whether unreviewed events would be lost;
-6. restore only after curator review;
-7. run the state validator;
-8. run governance read-only;
-9. resume monitor mode only after outputs are understood.
+1. Stop monitor writes.
+2. Preserve the malformed file.
+3. Inspect recent Git history.
+4. Identify the last valid state.
+5. Determine whether unreviewed events would be lost.
+6. Restore only after curator review.
+7. Run the state validator.
+8. Run governance read-only.
+9. Resume monitor mode only after outputs are understood.
 
 Do not truncate state or generate a fresh empty file merely to make CI green.
 
@@ -139,11 +139,11 @@ Do not truncate state or generate a fresh empty file merely to make CI green.
 
 Keep automated commit scopes narrow:
 
-- compiled database and web exports belong in release assets;
-- governance monitor commits should stage only intended governance state;
-- curator decisions are maintained through review;
-- loader-manifest refreshes belong to their dedicated workflow;
-- no workflow should commit unrelated local build output.
+- Compiled database and web exports belong in release assets.
+- Governance monitor commits should stage only intended governance state.
+- Curator decisions are maintained through review.
+- Loader-manifest refreshes belong to their dedicated workflow.
+- No workflow should commit unrelated local build output.
 
 ## Incident record
 

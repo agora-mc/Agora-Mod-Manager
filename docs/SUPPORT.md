@@ -59,13 +59,13 @@ Do not include the whole Agora data root, `local_state.db`, `mcp_token`, credent
 
 Logs and diagnostic output can contain:
 
-- local account names and filesystem paths;
-- Minecraft or GitHub names;
-- server addresses and chat text;
-- instance and private pack names;
-- access tokens, authorization codes, or request headers;
-- JVM arguments and environment-derived values;
-- mod configuration or crash context that reveals private data.
+- local account names and filesystem paths
+- Minecraft or GitHub names
+- server addresses and chat text
+- instance and private pack names
+- access tokens, authorization codes, or request headers
+- JVM arguments and environment-derived values
+- mod configuration or crash context that reveals private data
 
 Remove secrets rather than masking only part of them. When a token may have been exposed, revoke or regenerate it before sharing any cleaned evidence.
 
@@ -75,10 +75,10 @@ Use **Settings > Appearance > Reset appearance** to restore visual preferences. 
 
 Agora has no in-app factory-reset action. Resetting application data is a different and destructive operation:
 
-1. close Agora and Minecraft;
-2. resolve and record the active root with `agora paths` using the same data-root override;
-3. back up valuable worlds and any profile data that must survive;
-4. rename the data root rather than deleting it;
-5. start Agora and confirm it creates a clean profile before removing any backup.
+1. Close Agora and Minecraft.
+2. Resolve and record the active root with `agora paths` using the same data-root override.
+3. Back up valuable worlds and any profile data that must survive.
+4. Rename the data root rather than deleting it.
+5. Start Agora and confirm it creates a clean profile before removing any backup.
 
 Microsoft credentials are stored in the operating-system credential store and are not isolated by `--data-dir` or `AGORA_DATA_DIR`. Renaming the data root does not guarantee a sign-out, and `agora auth logout` affects the shared credential entry rather than only a disposable data directory.

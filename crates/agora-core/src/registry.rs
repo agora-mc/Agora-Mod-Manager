@@ -543,24 +543,6 @@ impl RegistryService {
         get_known_conflicts(&conn)
     }
 
-    /// Check whether a registry item has status `under_review`.
-    ///
-    /// Returns `false` when the item does not exist or when the registry DB
-    /// cannot be opened (graceful degradation).
-    pub fn is_under_review(&self, item_id: &str) -> LauncherResult<bool> {
-        let conn = match self.connection() {
-            Ok(c) => c,
-            Err(_) => return Ok(false),
-        };
-        let mut stmt = match conn.prepare(
-            "SELECT 1 FROM registry_items WHERE id = ?1 AND status = 'under_review' LIMIT 1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Ok(false),
-        };
-        Ok(stmt.exists([item_id]).unwrap_or(false))
-    }
-
     // -----------------------------------------------------------------------
     // Governance schema-7 queries
     // -----------------------------------------------------------------------
@@ -1182,7 +1164,7 @@ pub fn pack_version_mods(
     rows.collect::<Result<Vec<_>, _>>().map_err(query_error)
 }
 
-/// A row from the `audit_log` transparency table (§4.6).
+/// A row from the `audit_log` table (§4.6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLogEntry {
     pub id: i64,
@@ -1261,7 +1243,7 @@ pub fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistryItem> {
     })
 }
 
-/// An under-review registry item for the Triage Center.
+/// An under-review registry item.
 #[derive(Debug, Clone, Serialize)]
 pub struct UnderReviewItem {
     pub id: String,
@@ -4015,7 +3997,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // RegistryService::known_conflicts / is_under_review tests
+    // RegistryService::known_conflicts / list_under_review_items tests
     // -------------------------------------------------------------------
 
     #[test]
@@ -4042,7 +4024,7 @@ mod tests {
     }
 
     #[test]
-    fn service_is_under_review_when_present() {
+    fn service_lists_under_review_items() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("registry.db");
         let conn = Connection::open(&db_path).unwrap();
@@ -4071,17 +4053,8 @@ mod tests {
         let ctx = Ctx::for_testing(dir.path().to_owned());
         let svc = RegistryService::new(ctx);
 
-        assert!(svc.is_under_review("review-mod").unwrap());
-        assert!(!svc.is_under_review("unknown-mod").unwrap());
-    }
-
-    #[test]
-    fn service_is_under_review_missing_registry_returns_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = Ctx::for_testing(dir.path().to_owned());
-        let svc = RegistryService::new(ctx);
-        // Graceful degradation: missing registry → false
-        let result = svc.is_under_review("anything").unwrap();
-        assert!(!result);
+        let items = svc.list_under_review_items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "review-mod");
     }
 }

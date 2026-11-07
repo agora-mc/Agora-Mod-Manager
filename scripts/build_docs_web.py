@@ -61,7 +61,9 @@ EMPHASIS_RE = re.compile(r"(\*{1,3}|_{1,3})(.+?)\1")
 # Audience/group classification for the website's grouped documentation nav.
 #
 # audience is the top-level split the site navigates by:
-#   user      - anyone running Agora, including power users driving the CLI
+#   desktop   - people using the desktop app; shown with the hand-written
+#               "Desktop App Users" links at the top of the site's navigation
+#   user      - people driving the CLI
 #   developer - contributors, curators, maintainers, and operators
 #   internal  - working notes and archived plans; still published so no
 #               cross-reference 404s, but kept out of the main nav
@@ -69,6 +71,8 @@ EMPHASIS_RE = re.compile(r"(\*{1,3}|_{1,3})(.+?)\1")
 # Rules are matched longest-prefix-first against the repo-relative POSIX path,
 # so a directory prefix ("docs/architecture/") classifies everything under it.
 DOC_CATEGORIES: dict[str, tuple[str, str]] = {
+    "docs/DESKTOP_TROUBLESHOOTING.md": ("desktop", "Get help"),
+    "docs/FAQ.md": ("desktop", "Get help"),
     "docs/TROUBLESHOOTING.md": ("user", "Fix a problem"),
     "docs/SUPPORT.md": ("user", "Fix a problem"),
     "docs/CLI.md": ("user", "Power tools"),
@@ -87,8 +91,9 @@ DEFAULT_CATEGORY = ("internal", "Working notes")
 
 # Display order for the website's grouped nav. Groups not listed here sort
 # last, alphabetically, so a new group is visible rather than silently hidden.
-AUDIENCE_ORDER = ["user", "developer", "internal"]
+AUDIENCE_ORDER = ["desktop", "user", "developer", "internal"]
 GROUP_ORDER = [
+    "Get help",
     "Fix a problem",
     "Power tools",
     "Contribute and curate",

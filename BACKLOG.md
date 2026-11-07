@@ -75,9 +75,9 @@
 
 - [x] **Audit log generation**
   - **Short:** Generate `registry/governance/audit_log.json` during compilation with spec-compliant rotation. Implemented in `compiler/compile.py`.
-  - **Detail:** Append-only transparency log written at end of compile. When the log exceeds 10,000 entries, the oldest 2,000 are moved to a dated archive. Also writes `audit_log_json` path to `system_config`. Verified by implementation and focused tests; the full compiler suite currently has unrelated/stale failures recorded in the verification note above.
+  - **Detail:** Append-only audit log written at end of compile. When the log exceeds 10,000 entries, the oldest 2,000 are moved to a dated archive. Also writes `audit_log_json` path to `system_config`. Verified by implementation and focused tests; the full compiler suite currently has unrelated/stale failures recorded in the verification note above.
   - **Spec:** §4.6
-  - **Acceptance:** `audit_log.json` exists after compile; Transparency Log UI has data to surface.
+  - **Acceptance:** `audit_log.json` exists after compile.
 
 - [x] **Raid Shield (Interaction Limits toggle)**
   - **Short:** Programmatically enable GitHub Interaction Limits on velocity anomalies during compilation.
@@ -269,9 +269,9 @@
 
 ## Phase 5 — Governance & Triage
 
-- [x] **Triage Center tab** (§5, §6.1)
+- [x] **Triage Center tab** (§5, §6.1) — since removed; see §5.6
    - **Short:** Implement the Community Governance tab with under-review items, live poll data, and recent resolutions.
-   - **Detail:** `Governance.tsx` renders the Triage Center with three sections: (a) Active Triage Polls — queries `list_under_review_items` backend command, displays items with `status = 'under_review'` and their poll percentages; (b) Recent Resolutions feed — `list_recent_resolutions` command returns promoted/demoted items with timestamps; (c) Transparency Log (already implemented in §4.6 item). Backend commands: `list_under_review_items`, `fetch_triage_poll`, `list_recent_resolutions` in `governance.rs` + `commands.rs`.
+   - **Detail:** `Governance.tsx` renders the Triage Center with two sections: (a) Active Triage Polls — queries `list_under_review_items` backend command, displays items with `status = 'under_review'` and their poll percentages; (b) Recent Resolutions feed — `list_recent_resolutions` command returns promoted/demoted items with timestamps. Backend commands: `list_under_review_items`, `fetch_triage_poll`, `list_recent_resolutions` in `governance.rs` + `commands.rs`.
    - **Spec:** §5, §6.1
    - **Acceptance:** Under-review item appears in Triage Center with live poll percentage.
 
@@ -281,17 +281,11 @@
   - **Spec:** §5.4
   - **Acceptance:** Immune mod profile page shows "Curator Shield" banner above download button.
 
-- [x] **Flag Review system** (§5.6)
+- [x] **Flag Review system** (§5.5) — since removed; see §5.5
    - **Short:** "🚩 Flag Review" button on every comment (rate-limited).
    - **Detail:** `ModDetail.tsx` renders a 🚩 Flag button on each curator review; clicking it calls `flag_review` backend command (`governance.rs`) which creates a GitHub issue in the `agora-mc/admin-alerts` repo with the review text and reviewer info. Rate-limited via `get_flag_rate_limit` + `FlagRateLimit` struct (per-user, sliding window). `db.rs` has the `flag_submissions` table for storing flagged items.
    - **Spec:** §5.6
    - **Acceptance:** User can flag a comment; triggering creates a GitHub issue in `agora-mc/admin-alerts`.
-
-- [x] **In-app Transparency Log** (§4.6)
-  - **Short:** Display `audit_log_json` entries in the Governance tab.
-  - **Detail:** Compiler (`compiler/compile.py`) now bakes the audit entries into an `audit_log` table (`id, timestamp, action, details`) in `registry.db` (parameterized `executemany`; table created if absent; `verify_db.py` reports `audit_log: 8`). Desktop backend `list_audit_log` command (`registry.rs` + `commands.rs`, reads newest-first, defensively returns `[]` if the table is absent in older builds). `Governance.tsx` renders a scrollable Transparency Log section (loading/error/empty states, `<time>` timestamps, action badge, details). `audit_log_json` path indicator in `system_config` preserved.
-  - **Spec:** §4.6
-  - **Acceptance:** User can see governance actions (immune grants, velocity overrides) in a scrollable log.
 
 ---
 

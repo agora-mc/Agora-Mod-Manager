@@ -14,7 +14,8 @@ Agora's documentation is organized by audience and by depth. The goal is to help
 | Governance operators | [Governance operations](./GOVERNANCE_OPERATIONS.md) | Read-only diagnostics, monitor state, decisions, and incident recovery |
 | Catalog curators | [Catalog curation reference](../REGISTRY_CURATION_REFERENCE.md) | Manifest authoring and review rules |
 | Review participants | [Code of Engagement](../CODE_OF_ENGAGEMENT.md) | Conduct and review boundaries |
-| Troubleshooting and support | [Troubleshooting](./TROUBLESHOOTING.md) | Safe diagnosis and evidence collection |
+| Players with a problem or a quick question | [Troubleshooting Agora](./DESKTOP_TROUBLESHOOTING.md) and [FAQ](./FAQ.md) | Fixes by symptom and short answers, for the desktop app |
+| CLI users with a problem | [CLI troubleshooting](./TROUBLESHOOTING.md) | Commands to diagnose a problem, starting from the exit code |
 | Support evidence and local data | [Support reference](./SUPPORT.md) | Data roots, logs, versions, minimal support bundles, redaction, and reset boundaries |
 
 ## Three tiers of detail
@@ -54,7 +55,7 @@ Release, signing, compiler, governance-monitor, and incident-recovery procedures
 
 The website does not keep its own copy of any documentation. Two build steps feed it:
 
-- `scripts/build_docs_web.py` reads every markdown file under `docs/` plus the configured root documents, and writes `docs-web.json`. For each page it derives the slug, title, description, and an **audience** (`user`, `developer`, `internal`) and **group** used to build the site's grouped navigation. It also emits a `body` with the leading H1 removed, because the website renders the title in its own page header.
+- `scripts/build_docs_web.py` reads every markdown file under `docs/` plus the configured root documents, and writes `docs-web.json`. For each page it derives the slug, title, description, and an **audience** (`desktop`, `user` for CLI users, `developer`, `internal`) and **group** used to build the site's grouped navigation. It also emits a `body` with the leading H1 removed, because the website renders the title in its own page header.
 - The website imports `desktop/src/data/guideContent.ts` directly and publishes those topics at `/docs/guides/`. There is no second copy of the guide text, so the app and the website cannot describe the product differently.
 
 New markdown is published automatically, but it defaults to the `internal` audience — visible only under the collapsed "Working notes and archive" section. Add a rule to `DOC_CATEGORIES` in `scripts/build_docs_web.py` to place a page in front of players or contributors.

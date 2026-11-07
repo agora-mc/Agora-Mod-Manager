@@ -24,10 +24,16 @@ const ROUTES = [
     cta: 'Task guides',
   },
   {
-    href: '/docs/troubleshooting',
+    href: '/docs/desktop-troubleshooting',
     heading: 'Something is not working',
-    body: 'Start from the symptom: launch blocked, loader mismatch, missing Java, crash after launch, offline failures.',
+    body: 'Start from what you are seeing: a crash, a blocked launch, the wrong Java, or an empty Browse page.',
     cta: 'Troubleshooting',
+  },
+  {
+    href: '/docs/faq',
+    heading: 'I have a quick question',
+    body: 'Short answers about accounts, mods, your data, and what Agora can do.',
+    cta: 'FAQ',
   },
   {
     href: '/docs/cli',
@@ -79,24 +85,13 @@ const COMMON_QUESTIONS = [
   { href: '/docs/guides/controller-handheld', label: 'Can I use Agora with a controller?' },
 ];
 
-// Troubleshooting is already a primary route card on this page, so it is
-// skipped in the advanced and developer listing below to avoid duplication.
-const SLUGS_HIDDEN_FROM_LIBRARY = new Set(['troubleshooting']);
-
 export default async function DocsPage() {
   const sections = await getDocNav();
-  const library = sections
-    .filter((section) => section.audience !== 'internal')
-    .map((section) => ({
-      ...section,
-      groups: section.groups
-        .map((group) => ({
-          ...group,
-          docs: group.docs.filter((doc) => !SLUGS_HIDDEN_FROM_LIBRARY.has(doc.slug)),
-        }))
-        .filter((group) => group.docs.length > 0),
-    }))
-    .filter((section) => section.groups.length > 0);
+  // Desktop pages are already primary route cards above, so this listing only
+  // covers the advanced and developer docs.
+  const library = sections.filter(
+    (section) => section.audience !== 'internal' && section.audience !== 'desktop'
+  );
   const guideCount = getGuideTopics().length;
 
   return (

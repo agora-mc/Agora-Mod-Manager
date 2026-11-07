@@ -155,15 +155,15 @@ Do not rely on fixed installer filenames or package sizes in documentation. Taur
 
 The workflow leaves the release as a draft with all artifacts uploaded and `SHA256SUMS` generated. It never publishes automatically. Inspect the draft after the workflow finishes before publishing, and cancel or re-run the workflow if any of these are wrong:
 
-- platform and architecture coverage;
-- both Apple Silicon and Intel macOS installers, with architecture-bearing bundle names;
-- asset names match the scheme in [Release asset names](#release-asset-names);
-- version shown by the application;
-- installer identity;
-- `SHA256SUMS` covers every downloadable artifact and nothing else;
-- updater metadata contains signed `darwin-aarch64` and `darwin-x86_64` entries;
-- release notes;
-- accidental debug artifacts.
+- platform and architecture coverage
+- both Apple Silicon and Intel macOS installers, with architecture-bearing bundle names
+- asset names match the scheme in [Release asset names](#release-asset-names)
+- version shown by the application
+- installer identity
+- `SHA256SUMS` covers every downloadable artifact and nothing else
+- updater metadata contains signed `darwin-aarch64` and `darwin-x86_64` entries
+- release notes
+- accidental debug artifacts
 
 ### Release asset names
 
@@ -181,13 +181,13 @@ about desktop vs CLI and mixes `x64`, `x86_64`, and `amd64`. The
 `assemble-release` job post-processes the draft with
 `scripts/finalize_release_assets.py` before verification:
 
-- it renames each `Agora.Launcher*` bundle in place and fails on a name or an
-  embedded version it does not recognize;
-- it deletes the updater `*.sig` sidecar assets — the signatures also live
-  inline in `latest.json`, which is what the updater consumes;
-- it rewrites every `latest.json` platform URL to the renamed asset and
-  re-uploads `latest.json`;
-- it writes and uploads `SHA256SUMS`, covering every downloadable artifact
+- It renames each `Agora.Launcher*` bundle in place and fails on a name or an
+  embedded version it does not recognize.
+- It deletes the updater `*.sig` sidecar assets — the signatures also live
+  inline in `latest.json`, which is what the updater consumes.
+- It rewrites every `latest.json` platform URL to the renamed asset and
+  re-uploads `latest.json`.
+- It writes and uploads `SHA256SUMS`, covering every downloadable artifact
   except `latest.json` and `SHA256SUMS` itself.
 
 GitHub lists assets alphabetically (case-insensitively, so `agora-cli-*` sorts
@@ -213,19 +213,19 @@ Use the actual release artifact, not `tauri dev`.
 
 Minimum test:
 
-1. install or run the packaged build;
+1. Install or run the packaged build.
    - On macOS, launch both the Apple Silicon and Intel `.app` packages on their matching hardware.
-2. complete first-run setup on a clean disposable profile;
-3. synchronize and verify the catalog;
-4. confirm Browse returns curated content;
-5. confirm loader and Java catalogs are available;
-6. create or import a disposable instance;
-7. run health;
-8. launch through the default delegated mode;
-9. launch directly with a test Microsoft account when that platform is supported;
-10. restart and verify settings and instances persist;
-11. exercise update detection from the previous release;
-12. open Settings → Services → AI assistant and confirm it shows the bundled CLI's path, then
+2. Complete first-run setup on a clean disposable profile.
+3. Synchronize and verify the catalog.
+4. Confirm Browse returns curated content.
+5. Confirm loader and Java catalogs are available.
+6. Create or import a disposable instance.
+7. Run health.
+8. Launch through the default delegated mode.
+9. Launch directly with a test Microsoft account when that platform is supported.
+10. Restart and verify settings and instances persist.
+11. Exercise update detection from the previous release.
+12. Open Settings → Services → AI assistant and confirm it shows the bundled CLI's path, then
     run that path with `--version` and `skill`. On Windows check both the installed copy and
     the portable ZIP's `agora.exe`; the workflow already checks the macOS app and the Linux
     `.deb`, but not the Windows installer.
@@ -243,10 +243,10 @@ After the packaged smoke test passes, publish the draft:
 
 After publishing:
 
-- confirm the website download control selects the intended release;
-- perform one clean public download;
-- confirm update checks can see the release;
-- monitor support channels for migration, signing, and installer failures.
+- Confirm the website download control selects the intended release.
+- Perform one clean public download.
+- Confirm update checks can see the release.
+- Monitor support channels for migration, signing, and installer failures.
 
 ## Catalog release checklist
 
@@ -268,32 +268,32 @@ The private signing key belongs only in the protected CI environment. Never plac
 
 When a desktop release is broken:
 
-1. stop promoting the release;
-2. document the affected platforms and user-visible failure;
-3. preserve the failed artifacts for investigation;
-4. publish or restore a known-good release according to updater behavior;
-5. test migration from both the broken and previous good versions;
-6. explain whether users must take manual action.
+1. Stop promoting the release.
+2. Document the affected platforms and user-visible failure.
+3. Preserve the failed artifacts for investigation.
+4. Publish or restore a known-good release according to updater behavior.
+5. Test migration from both the broken and previous good versions.
+6. Explain whether users must take manual action.
 
 ### Catalog
 
 When a catalog release is invalid:
 
-1. do not weaken signature verification;
-2. retain the invalid release for audit unless policy requires removal;
-3. restore or republish the Last Known Good signed catalog;
-4. verify client fallback behavior;
-5. correct source manifests or compiler logic through review;
-6. publish a new signed release.
+1. Do not weaken signature verification.
+2. Retain the invalid release for audit unless policy requires removal.
+3. Restore or republish the Last Known Good signed catalog.
+4. Verify client fallback behavior.
+5. Correct source manifests or compiler logic through review.
+6. Publish a new signed release.
 
 ## Release documentation
 
 Release notes should lead with player impact:
 
-- what changed;
-- whether migration is automatic;
-- known limitations;
-- recovery advice;
-- platform-specific concerns.
+- what changed
+- whether migration is automatic
+- known limitations
+- recovery advice
+- platform-specific concerns
 
 Detailed compiler, signing, or governance internals belong in maintainer documents, not the first screen of player release notes.

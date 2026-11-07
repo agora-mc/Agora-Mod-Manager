@@ -73,7 +73,7 @@ export default function GuidesIndexPage() {
             href="/docs/troubleshooting"
             className="text-indigo-600 hover:underline dark:text-indigo-400"
           >
-            Troubleshooting
+            CLI troubleshooting
           </Link>
           <Link href="/docs/support" className="text-indigo-600 hover:underline dark:text-indigo-400">
             Data, logs, and support evidence

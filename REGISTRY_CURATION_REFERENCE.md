@@ -239,7 +239,7 @@ does not inherit the preferred source's host policy.
 | `compatible_versions` | array | Optional (**required for `direct_hash`**) | Array of `{mc_version, loader, mod_version}` objects. If absent, the compiler queries Modrinth for real version data (when a `modrinth_id` is resolvable). Otherwise falls back to `[{mc_version: "1.21", loader: "fabric", mod_version: "latest"}]`. **Do not set this manually unless you need to override** — the hydrator does it for you. The exception is `direct_hash`, where nothing hydrates: it must be supplied by hand, and the `"latest"` placeholder is rejected. |
 | `mod_dependencies` | object | Optional | `{required: [...], optional: [...], incompatible: [...]}`. Mod IDs this mod depends on / is incompatible with. If absent, the compiler extracts from the jar's `fabric.mod.json` / `mods.toml` at install time (desktop-side), so this is a curated override only. |
 | `mod_jar_aliases` | string[] | Optional | Alternate jar-declared IDs for cross-source matching (e.g. catalog `fabric-api` ↔ jar `fabric` ↔ Modrinth `fabric_api`). Lets the dependency-aware install system match across sources. Only needed when the jar-declared ID differs from the manifest `id`. |
-| `governance.immune` | boolean | Optional (default `false`) | If `true`, bypasses all automated triage, vote penalties, and velocity circuit breakers. |
+| `governance.immune` | boolean | Optional (default `false`) | If `true`, takes the entry out of voting and all automated vote checks. |
 | `governance.override_justification` | string\|null | Required if `immune=true` | Displayed verbatim in the UI. |
 | `governance.allow_comments` | boolean | Optional (default `true`) | If `false`, the review section is locked on this mod's page. |
 
@@ -504,7 +504,7 @@ condemning every version of a pair forever, scope the fact to the releases it ap
 
 ### 6.2 Poll blacklist (`poll_blacklist.json`)
 
-A list of GitHub usernames excluded from triage poll vote tallies (bots, known bad actors). Empty by default.
+A list of GitHub usernames excluded from vote tallies (bots, known bad actors). Empty by default.
 
 ```json
 {"usernames": []}
@@ -618,7 +618,7 @@ For `github_release` and `modrinth_id` strategies, the compiler populates the ha
 - **`direct_hash` cannot be used for CurseForge.** Since July 2026 the CurseForge CDN requires API-key authentication; unauthenticated requests to `edge.forgecdn.net` / `mediafilez.forgecdn.net` are refused. A pinned `forgecdn` URL will not download, and Agora has nowhere to hold a key (secrets never enter manifests or source, and a key-holding proxy would mean running a backend). CurseForge-exclusive mods are simply out of scope.
 - **Curator notes matter.** The `curator_note` field is shown in the UI and used as semantic context for the AI crash investigator. Write a clear, 1-3 sentence summary of what the mod does and why a user would (or wouldn't) want it.
 - **Don't set `compatible_versions` manually** unless you have a specific reason to override. The compiler fetches real version data from Modrinth's API for any mod with a resolvable `modrinth_id` (or whose manifest `id` matches a Modrinth slug). Manual overrides should be rare — `direct_hash` is the one strategy where it is mandatory.
-- **Immunity is rare.** `governance.immune: true` should only be set for mods that are foundational and shouldn't be subject to community vote triage (e.g. a core API). Always include `override_justification` when doing this.
+- **Immunity is rare.** `governance.immune: true` should only be set for mods that are foundational and shouldn't be subject to community voting (e.g. a core API). Always include `override_justification` when doing this.
 - **Archiving, not deleting.** To retire an entry, move its JSON file to `registry/archived/`. The compiler skips that directory entirely, so the entry disappears from the compiled catalog without losing git history.
 
 ---

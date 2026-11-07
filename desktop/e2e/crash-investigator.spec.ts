@@ -19,6 +19,7 @@ interface CrashCfg {
   stillCrashingSuspects?: number;
   stillCrashingRuledOut?: string;
   launchError?: string;
+  underReview?: boolean;
 }
 
 async function installMock(page: Page, cfg: CrashCfg = {}) {
@@ -34,6 +35,7 @@ async function installMock(page: Page, cfg: CrashCfg = {}) {
     stillCrashingSuspects: 1,
     stillCrashingRuledOut: 'suspect-mod',
     launchError: '',
+    underReview: false,
   };
   const merged = { ...defaults, ...cfg };
 
@@ -48,7 +50,7 @@ async function installMock(page: Page, cfg: CrashCfg = {}) {
       const lastArgs: Record<string, Record<string, unknown>> = {};
 
       // Pre-built suspect data (immune to structured-clone issues)
-      const SUSPECT_1 = { mod_id: 'suspect-mod', filename: 'suspect-mod.jar', total_score: 0.85, breakdown: { stack_frame_score: 0.65, curated_conflict_score: 0.2 }, is_dependent_of: null };
+      const SUSPECT_1 = { mod_id: 'suspect-mod', filename: 'suspect-mod.jar', total_score: 0.85, breakdown: { stack_frame_score: 0.65, curated_conflict_score: 0.2 }, is_dependent_of: null, under_review: cfg.underReview };
       const SUSPECT_2 = { mod_id: 'second-suspect', filename: 'second-suspect.jar', total_score: 0.45, breakdown: { stack_frame_score: 0.3, prior_local_crashes: 0.15 }, is_dependent_of: null };
 
       function makeInitialResult() {
@@ -280,6 +282,14 @@ test.describe('CrashInvestigator', () => {
     await expect(page.getByText('ubiquity dampener')).toHaveCount(0);
     await expect(page.getByText('conflict pairs')).toHaveCount(0);
     await expect(page.getByText('Looks like the most likely cause').first()).toBeVisible();
+  });
+
+  test('a suspect under curator review can still be tested', async ({ page }) => {
+    await installMock(page, { underReview: true });
+    await openDialog(page);
+    await waitForContent(page);
+    await expect(page.getByText('curators are reviewing this project')).toHaveCount(1);
+    await expect(page.getByRole('button', { name: /Try without "suspect-mod\.jar"/ })).toBeVisible();
   });
 
   test('displays exception class and signature name', async ({ page }) => {

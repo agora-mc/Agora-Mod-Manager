@@ -260,7 +260,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Use the sidebar',
-          body: 'Home is the dashboard, Browse is the catalog, My Instances is your library, Community Governance shows curation activity, Help & Guide is this learning center, and Settings controls Agora itself.',
+          body: 'Home is the dashboard, Browse is the catalog, My Instances is your library, Community Governance explains how voting and reviews work, Help & Guide is this learning center, and Settings controls Agora itself.',
           steps: [
             'Select an item to move to that area.',
             'Use the arrow button at the sidebar edge to collapse or expand it.',
@@ -811,31 +811,31 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Start an investigation',
-          body: 'A recent crash can appear as a Home alert or on an instance card. Open Troubleshoot or paste a log when automatic detection cannot find the report. Crash Doctor ranks likely suspects from available signals.',
+          body: 'A recent crash can appear as an alert on Home. To open Crash Doctor yourself, select Troubleshoot on the instance card or Diagnose a crash in the instance editor. If it cannot find the crash on its own, use Choose a file or Paste crash text. Crash Doctor then lists the mods that might be causing it, most likely first.',
         },
         {
           title: 'Test the top suspect',
-          body: 'Select "Disable & Relaunch". Agora creates a recovery snapshot before changing the enabled state. After testing, choose "Yes", "Fixed" or "Still crashing" so the investigation can record the result and continue.',
+          body: 'Select Try without on the top suspect. Agora saves a backup, turns that mod off, and starts the game. Mods that need it are turned off with it, and the card tells you when that happens.',
           steps: [
-            'Read the suspect name and evidence summary.',
-            'Review any dependent mods that would also be affected.',
-            'Disable the smallest safe set and relaunch.',
-            'Reproduce the action that caused the crash.',
-            'Report the result accurately rather than changing several other things first.',
+            'Read which mod is suspected and whether any others will be turned off with it.',
+            'Select Try without.',
+            'Do whatever made the game crash before.',
+            'Close the game, then choose Yes, it worked or No, still crashing. If it still crashes, Crash Doctor puts your mods back and moves on to the next suspect.',
+            'Try not to change anything else in between, so the answer stays clear.',
           ],
         },
         {
           title: 'When no single mod looks guilty',
-          body: 'If the evidence does not point anywhere, use guided bisect. Agora disables half your mods, you launch and report whether it still crashes, and Agora halves the remaining candidates each round until one is left. A handful of launches will find a culprit that no crash log named.',
+          body: 'If no suspect stands out, use Find the mod that breaks it. Agora turns off half your mods, you launch and answer Still broken or Worked fine, and the list of suspects halves each round until one is left. A handful of launches will find a culprit that no crash log named. Stop and restore my mods ends it at any point and turns everything back on as it was.',
           callout: {
             tone: 'note',
             title: 'Each half is kept loadable',
-            text: 'Bisect never splits a mod away from something it depends on. A trial that crashed on a missing dependency would tell you about the split rather than the bug, so the halves are chosen to stay launchable. If you answer a round wrongly, you can step back and take the other half.',
+            text: 'A mod is never separated from something it depends on. A trial that crashed on a missing dependency would tell you about the split rather than the bug, so the halves are chosen to stay launchable. If you answer a round wrongly, use Step back to try the other half.',
           },
         },
         {
           title: 'Recover instead of investigate',
-          body: 'If you need to play immediately, restore the last setup that launched fine (Last Known Good) from Home or the Snapshots tab. Use Restore All & Close in Crash Doctor to undo its test changes.',
+          body: 'If you need to play immediately, restore the last setup that launched fine (Last Known Good) from Home or the Snapshots tab. To undo Crash Doctor\'s test changes, choose Undo and close.',
           callout: {
             tone: 'tip',
             title: 'Keep the crash report',
@@ -1236,11 +1236,6 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         {
           title: 'Only turn on what you use',
           body: 'We suggest turning off services you do not use. If launching through the official launcher works for you, you do not need to sign in with Microsoft in Agora at all. Privacy lets you go further and block individual kinds of connection.',
-          callout: {
-            tone: 'tip',
-            title: 'Checking in order',
-            text: 'When something will not connect, check that it is turned on, that you are signed in, that Privacy allows it, and finally that your internet is working.',
-          },
         },
       ],
     },
@@ -1321,61 +1316,106 @@ export const GUIDE_TOPICS: GuideTopic[] = [
   },
   {
     id: 'governance',
-    title: 'Community governance and curation',
+    title: 'Voting, reviews, and community governance',
     shortTitle: 'Community governance',
     category: 'Connect',
-    description: 'Understand curated entries, triage polls, reviews, resolutions, and the transparency log.',
-    keywords: ['governance', 'curation', 'vote', 'triage', 'reviews', 'transparency'],
+    description: 'Vote on curated projects, read and write reviews, and see what the Curated badge means.',
+    keywords: ['governance', 'curation', 'curated', 'vote', 'voting', 'upvote', 'downvote', 'score', 'reviews', 'quarantined', 'immunity'],
     basic: {
-      summary: 'Agora\'s catalog is community curated. Governance makes inclusion, review, and removal activity visible instead of hiding those decisions behind a private service.',
+      summary: 'Players help shape Agora\'s curated catalog by voting on projects and reviewing them. Both are optional. You never need to vote or review to download or play.',
       outcomes: [
-        'Read active polls and completed resolutions.',
-        'Vote or flag responsibly through GitHub.',
-        'Understand what the Curated label does and does not promise.',
+        'Vote on a curated project, and change or remove your vote.',
+        'Know what other people can see when you vote.',
+        'Understand what the Curated badge does and does not promise.',
       ],
       sections: [
         {
-          title: 'Read the governance page',
-          body: 'Active Triage Polls show projects currently under review. Recent Resolutions records completed outcomes. The Transparency Log lists governance actions and timestamps so catalog decisions remain inspectable.',
+          title: 'How the catalog works',
+          body: 'Curated projects are the ones listed in Agora\'s own catalog. Each has a net score, which is its upvotes minus its downvotes, and you can sort Browse by it. Curators, the volunteers who look after the catalog, make the final call on what stays listed.',
         },
         {
-          title: 'Participate with GitHub',
-          body: 'Connect GitHub under Accounts to see live poll data and follow vote links. Read the linked evidence and community rules before voting. Flag a review only for a specific policy or safety concern, not because you dislike a project.',
-        },
-        {
-          title: 'Interpret curation',
-          body: 'Curated means an entry passed Agora\'s community process and includes reviewed metadata. It does not guarantee that every version works with every other mod or that a project can never develop a security issue.',
+          title: 'Vote on a project',
+          body: 'You vote from the project\'s page in Agora, using a free GitHub account.',
+          steps: [
+            'If you have not already, sign in with GitHub in Settings, under Accounts.',
+            'Open a curated project and find the Community section.',
+            'Press the up arrow if you would recommend the project, or the down arrow if you would not.',
+            'The first time you vote, Agora reminds you that votes are public. Choose Vote publicly to continue.',
+          ],
           callout: {
             tone: 'tip',
-            title: 'Check the Agora tab',
-            text: 'A curated detail page can include curator notes, categories, community reviews, status, and an immunity explanation.',
+            title: 'Changed your mind?',
+            text: 'Press the same arrow again to remove your vote, or the other arrow to switch it. The score you see updates after the next catalog update, so it may not change right away.',
           },
+        },
+        {
+          title: 'Your vote is public',
+          body: 'A vote is a thumbs up or thumbs down on GitHub, posted from your account. Anyone can see it there, along with your GitHub username.',
+        },
+        {
+          title: 'If you cannot vote on a project',
+          body: 'There is usually a simple reason:',
+          bullets: [
+            'The arrows are grayed out: you are not signed in to GitHub yet.',
+            '"Voting opens once this entry has a catalog vote thread": this project is curated, but voting has not been set up for it yet.',
+            '"Immunity Shield Active": curators have taken this project out of voting. The banner explains why when a reason was given.',
+            'No Agora score at all: the project is not in the curated catalog, so you see numbers from where it came from instead, such as Modrinth downloads.',
+          ],
+        },
+        {
+          title: 'What the Curated badge means',
+          body: 'It means the project is listed in Agora\'s catalog and people have looked over its listing. It does not promise that every version works with your other mods, or that the project will never have a problem. We recommend reading the project page and any Curator warning before you install.',
         },
       ],
     },
     advanced: {
-      summary: 'Making sense of votes, reviews, and decisions, and how to raise a concern so it gets taken seriously.',
+      summary: 'What the numbers on a project\'s Agora tab mean, how to write a useful review, and where to raise a concern.',
       outcomes: [
-        'Read votes and decisions in context.',
-        'Know what immunity and triage do and do not mean.',
-        'Report a concern with the details curators need.',
+        'Read the Governance Summary on a project\'s Agora tab.',
+        'Write a review that helps other players.',
+        'Know where to go when something seems wrong.',
       ],
       sections: [
         {
-          title: 'Each signal means something different',
-          body: 'Score, how fast votes are coming in, reviews, triage, immunity, and compatibility each tell you something different. A high score means the community likes a project, not that it will work with your mods. A mod that clashes with another is a bug, not a rule being broken.',
+          title: 'Votes and reviews do different jobs',
+          body: 'A vote is a quick signal that changes the score. A review explains what you found when you used the project, and it does not change the score. A high score tells you people like a project, not that it will work with your other mods.',
         },
         {
-          title: 'Read decisions in context',
-          body: 'A decision\'s badge tells you what kind of action was taken, and the Transparency Log says when and why. Follow the link to the discussion for the full story. A decision about one release does not always apply to every version of the project.',
-        },
-        {
-          title: 'Raising a concern',
-          body: 'Curators can act much faster when you include the exact project and version, what happens and how to make it happen, logs if they help, links to the source, and which rule you think it breaks. Please leave out personal details and stick to what you have seen.',
+          title: 'Read the Governance Summary',
+          body: 'Curated projects have an Agora tab with a Governance Summary. It shows how the score was reached:',
+          bullets: [
+            'Counted votes: the votes that make up the score.',
+            'Raw votes: every vote cast, including any that are not counted.',
+            'Quarantined votes: votes set aside because many arrived in a suspicious burst. Curators check them, and the score leaves them out in the meantime.',
+            'Conflicted voters: people who have both upvoted and downvoted the same project. If this is you, Agora asks you to choose one.',
+          ],
           callout: {
-            tone: 'warning',
-            title: 'Governance is not a support shortcut',
-            text: 'Use project support or Crash Doctor for ordinary compatibility bugs. Use governance for curation, conduct, integrity, or community-policy concerns.',
+            tone: 'note',
+            title: 'Vote on GitHub',
+            text: 'The Vote on GitHub link takes you to the same vote on GitHub, if you would rather vote there. Both ways count toward one score, and you only need to use one.',
+          },
+        },
+        {
+          title: 'Write a review',
+          body: 'Reviews are for first-hand, technical feedback such as performance, stability, compatibility, features, and setup. You need to be signed in to GitHub to read them on the Agora tab.',
+          steps: [
+            'On the project\'s Agora tab, choose Copy ID. The review form asks for this ID.',
+            'Choose Write a technical review to open the form on GitHub.',
+            'Fill in the project version, Minecraft version, and loader you used, then describe what you found.',
+          ],
+          callout: {
+            tone: 'tip',
+            title: 'Check the rules first',
+            text: 'The Community Governance page lists the rules for votes and reviews. In short: stay technical, stay on topic, and be respectful.',
+          },
+        },
+        {
+          title: 'Raise a concern',
+          body: 'If you think a project is unsafe or breaks the catalog\'s rules, you can tell the curators on the Agora Discord, linked on the Community Governance page. They can act faster when you include the exact project and version, what happens and how to make it happen, any logs that help, and links to the source. Please leave out personal details and stick to what you have seen.',
+          callout: {
+            tone: 'tip',
+            title: 'For everyday mod problems',
+            text: 'If a mod crashes or clashes with another mod, Crash Doctor or the project\'s own support page is usually the quickest way to get help.',
           },
         },
       ],
@@ -1659,30 +1699,26 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       ],
     },
     advanced: {
-      summary: 'Advice from someone else, or from an AI, is a good guess to test, not a sure answer. Here is how to try it safely.',
+      summary: 'Once you\'ve done what troubleshooting you can on your own, it\'s a good idea to seek advice from someone else, or from an AI assistant. Here is how to try it effectively.',
       outcomes: [
         'Try a suggested fix in a way you can undo.',
         'Tell which change actually fixed the problem.',
-        'Let an AI assistant work with Agora directly, if you want.',
+        'Let an AI assistant work with Agora directly.',
       ],
       sections: [
         {
-          title: 'Try suggestions one at a time',
-          body: 'Before acting on a suggestion, take a snapshot. Then make one change at a time, such as turning off a mod or changing Java, and launch in between, so you know which change fixed it. Be wary of any suggestion to skip Agora\'s download checks, share your passwords, or delete your worlds.',
+          title: 'When asking for help, try suggestions one at a time',
+          body: 'We recommend making a snapshot in Agora before acting on a suggestion from someone else or an AI assistant. Then make one change at a time, such as turning off a mod or changing Java, and launch in between, so you know which change fixed it. Be wary of any suggestion to skip Agora\'s download checks or delete your worlds. Never share passwords or other private information.',
           callout: {
             tone: 'tip',
             title: 'Ask what should happen',
-            text: 'A helpful answer tells you what you should see if it is right, such as "the crash should stop once X is off". That makes it easy to check.',
+            text: 'When asking for help, it can be useful to explain your specific problem, circumstances, and needs. Rather than saying "my game crashed", instead say "I was playing version A with mod B and C installed and the game crashed when I did D, here are my logs". Furthermore, the most useful answers will be the ones that explain what to look for and how to test it. This is especially true for AI assistants, which can give a plausible-sounding answer that does not actually fix the problem.',
           },
         },
         {
           title: 'Let an assistant use Agora directly',
           body: 'Instead of copying and pasting, you can let an AI assistant app on your computer look at your instances and crash reports and suggest changes itself, with you approving each one. See Get help from an AI assistant.',
-        },
-        {
-          title: 'You do not need any of this',
-          body: 'Crash Doctor, the console, snapshots, and lockfiles all work on your computer without outside help. Asking others is always optional.',
-        },
+        }
       ],
     },
   },
@@ -1703,9 +1739,9 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Pick an assistant app',
-          body: 'You need an assistant app that can run commands on your computer. A chat window in a web browser cannot. Any of these will do; pick the one you already have an account with, or start with the first.',
+          body: 'You need an assistant app that can run commands on your computer. A chat window in a web browser cannot. Here are a few suggestions to get you started, if you already have a premium account with an AI company, research to see if they include a "coding agent" first before picking one of these.',
           bullets: [
-            'OpenCode desktop: open source, quick to set up, and has some free models. It can also use an account you already have with most AI companies.',
+            'OpenCode desktop: an open source and quick to set up AI app with a few free models. It can also use accounts from several other AI companies.',
             'Codex in the ChatGPT app: OpenAI\'s assistant, included with a ChatGPT account. How much you can use it depends on your plan.',
             'Claude Code: Anthropic\'s assistant, in the Claude desktop app. It needs a paid Claude plan, so it suits you if you already have one.',
             'Google Antigravity: Google\'s assistant app. Sign in with a Google account.',
@@ -1741,27 +1777,27 @@ export const GUIDE_TOPICS: GuideTopic[] = [
     advanced: {
       summary: 'How the assistant learns to use Agora, what it can reach on your computer, and when the MCP route suits you better. The approval prompts in your assistant app are what keep you in control.',
       outcomes: [
-        'Understand what agora skill gives an agent.',
+        'Understand what Agora skill gives an agent.',
         'Know where the trust boundary really is.',
         'Know when MCP is the better choice.',
       ],
       sections: [
         {
-          title: 'What agora skill provides',
-          body: 'agora skill prints a guide in the common SKILL.md format: Agora\'s vocabulary, house rules (ask before changing anything, snapshot and dry-run first, never pass --yes on the person\'s behalf), the crash workflow, and what each exit code range means. It is compiled into the binary, so it always matches the commands that binary has, and it is printed without opening any Agora data.',
+          title: 'What Agora skill provides',
+          body: 'The agora skill command prints out a markdown format guide that teaches the agent how to use Agora\'s command-line tool and gives a few recommended practices.',
           bullets: [
-            'The agent reads results with --json and checks exit codes rather than parsing human tables.',
-            'The CLI resolves the same data root as the desktop app, including a portable copy\'s folder. Both can run at once: whichever is changing an instance holds its lock, and the app reloads an instance the agent changed.',
-            'The guide asks the agent to have you launch from the app, since agora launch uses direct launch and needs a Microsoft sign-in.',
+            'The agent reads results with --json and checks exit codes.',
+            'The CLI and desktop app share the same folder and the desktop app is configured to reload data changed by the CLI, so you can run both simultaneously with ease.',
+            'The guide asks the agent to have you launch from the app for your own convenience and security, you can simply ask the agent to launch for you if you want!',
           ],
         },
         {
           title: 'Where the trust boundary is',
-          body: 'An agent with a terminal can do anything your account can, including editing instance files without Agora. Agora\'s own confirmations stop by default in a non-interactive session and tell the agent to ask you before passing --yes, but that relies on the agent following instructions. Keep the app\'s per-command approval on, lock instances you care about, and point experiments at a disposable data root with --data-dir.',
+          body: 'An agent with a terminal can do anything your account can, including editing instance files without Agora. Since AI sometimes makes mistakes, Agora\'s important commands stop and tell the agent to ask you before continuing. We recommend keeping the app\'s per-command approval on, locking instances you care about, and pointing experiments at a disposable directory.',
           callout: {
             tone: 'tip',
             title: 'Undo is cheap',
-            text: 'Ask the agent to take a snapshot before each change. agora snapshots restore puts the mods and configuration back, though not worlds: automatic snapshots exclude saves.',
+            text: 'Ask the agent to take a snapshot before each change. Agora automatically stores snapshots of mods and configurations, though not worlds require manual snapshots. Thanks to snapshots, you can restore a change at any time.',
           },
         },
         {
@@ -1773,13 +1809,13 @@ export const GUIDE_TOPICS: GuideTopic[] = [
   },
   {
     id: 'mcp-automation',
-    title: 'MCP and external AI tools',
+    title: 'MCP and external AI tools (Advanced)',
     shortTitle: 'MCP & automation',
     category: 'Connect',
     description: 'Connect an external local AI client and control what it may do to instances.',
     keywords: ['mcp', 'external ai', 'automation', 'localhost', 'bearer token', 'tools'],
     basic: {
-      summary: 'MCP is an advanced optional bridge that lets a compatible AI tool inspect Agora and request supported actions. Most users do not need it: copying a crash report from Crash Doctor is simpler for occasional help, and an assistant app that can run commands is easier to set up (see Get help from an AI assistant).',
+      summary: 'MCP is an advanced and optional bridge that lets a compatible AI tool inspect Agora and request supported actions. It is not recommended for most users: copying a crash report from Crash Doctor is simpler for occasional help, and an assistant app that can run commands is easier to set up and more capable(see Get help from an AI assistant).',
       outcomes: [
         'Decide whether MCP is appropriate for your workflow.',
         'Start and stop the local server.',
@@ -1787,8 +1823,8 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       ],
       sections: [
         {
-          title: 'Copy and paste, or MCP?',
-          body: 'For an occasional question, copying a crash report from Crash Doctor is simplest. MCP suits you if you already use an AI app that supports it and want it to look at your instances and crash reports, and ask to turn mods on or off, without you copying things back and forth.',
+          title: 'Copy and paste, CLI, or MCP?',
+          body: 'For an occasional question, copying a crash report from Crash Doctor is simplest. Otherwise we recommend using the CLI with a coding agent for direct access. MCP suits advanced users that would rather not have an agent run on your machine. MCP works well if you want AI to look at your instances and crash reports, and ask to turn mods on or off, without giving it direct filesystem access.',
         },
         {
           title: 'Connect an AI app',
@@ -1803,7 +1839,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Approve changes carefully',
-          body: 'An AI asking to do something does not mean it is a good idea. Check which instance it wants to change and what it wants to do. We recommend locking instances you care about and taking a snapshot before allowing changes.',
+          body: 'AI can make mistakes. Check which instance it wants to change and what it wants to do. We recommend locking instances you care about and taking a snapshot before allowing changes.',
           callout: {
             tone: 'warning',
             title: 'Keep the token private',
@@ -1834,7 +1870,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           callout: {
             tone: 'note',
             title: 'Preserve Agora\'s safety rails',
-            text: 'Prefer MCP tools that route modifications through Agora\'s existing dependency, snapshot, and health workflows rather than direct filesystem commands.',
+            text: 'We suggest using MCP tools that route modifications through Agora\'s existing dependency, snapshot, and health workflows rather than direct filesystem commands.',
           },
         },
       ],

@@ -388,7 +388,7 @@ export default async function InstallPage() {
               Let an assistant app read your crash logs and fix problems, with your approval.
             </p>
           </Link>
-          <Link href="/docs/troubleshooting" className="panel-inset card-lift p-5">
+          <Link href="/docs/desktop-troubleshooting" className="panel-inset card-lift p-5">
             <h3 className="font-semibold text-indigo-700 dark:text-indigo-400">
               Troubleshooting
             </h3>

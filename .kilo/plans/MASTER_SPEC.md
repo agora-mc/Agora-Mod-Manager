@@ -599,7 +599,7 @@ If the launcher cannot reach GitHub Releases to fetch or update `registry.db`, i
    - Users can install mods manually, one at a time, bypassing the central registry entirely.
 6. **Manual Download Mode:** A "Drag .jar Here" panel is always available. Users can install manually downloaded mod files directly into instances.
 7. Users can still create **Custom Instances** from scratch and install modloaders, because `loader_manifests.json` is cached locally.
-8. Governance features (Triage Center, voting, reviews) are disabled because they require GitHub API access.
+8. Governance features (voting, reviews) are disabled because they require GitHub API access.
 
 **Exit Condition:** Degraded Mode exits automatically when the launcher successfully completes a registry update check against GitHub.
 
@@ -766,7 +766,7 @@ The compiler generates an append-only **`/governance/audit_log.json`** file in t
 - `REACTION_SCRUBBED` — Malicious reaction deleted by compiler
 - `SIGNATURE_REJECTED` — Registry signature failed verification (logged by client, submitted via telemetry)
 
-**Retention:** The audit log is appended to nightly. When it exceeds 10,000 entries, the oldest 2,000 entries are moved to `/governance/audit_log_archive.{YYYYMMDD}.json`. The current log and the last 3 archived logs are included in `registry.db` as `audit_log_json` for in-app display in the Triage Center "Transparency Log" panel.
+**Retention:** The audit log is appended to nightly. When it exceeds 10,000 entries, the oldest 2,000 entries are moved to `/governance/audit_log_archive.{YYYYMMDD}.json`. The current log is copied into the `audit_log` table in `registry.db`, which `agora registry audit-log` reads.
 
 ---
 
@@ -890,6 +890,8 @@ When `immune = true`:
 
 ### 5.5 In-App Comment Reporting
 
+**Status: removed.** The launcher no longer has a flag button; concerns reach curators through the community channels. The original design is kept below for reference.
+
 The launcher's UI includes a "🚩 Flag Review" button on every comment. This must be rate-limited to prevent abuse.
 
 **Rate Limiting:** Each user is limited to **5 flag submissions per hour** and **20 per day**. If the limit is exceeded, the flag button is greyed out with a tooltip showing when the limit resets. This prevents a single user from generating thousands of admin tickets.
@@ -917,13 +919,15 @@ The launcher's UI includes a "🚩 Flag Review" button on every comment. This mu
 
 **Note:** The private admin repo must be created during project initialization. The Tauri app pre-configures its `owner/repo` path.
 
-### 5.6 Triage Center UI (In-App Tab)
+### 5.6 Community Governance UI (In-App Tab)
 
-A dedicated sidebar tab labeled **"Community Governance"** or **"Triage Center"** shows:
+The **Community Governance** sidebar tab is a static page: it makes no network calls. It explains why votes matter, how to vote, how moderation works and the rules of engagement, and links to the community. Participation happens on each curated item's detail page:
 
-- **Active Triage Polls:** Live cards for every mod currently under review. Each card shows the mod name, reason for triage, live Keep/Remove percentage bars (fetched from GitHub Discussions API on page load), and a **"Cast Your Vote"** button that deep-links directly to the GitHub Discussion.
-- **Recent Resolutions:** A historical feed showing recently resolved votes (kept or removed), with the final percentages displayed. Maintains absolute platform transparency.
-- **Crash-to-Poll Connection:** If a user experiences a crash, and the crash log's `package_signatures` cross-reference reveals the crashing mod is currently under community review, the crash popup will dynamically say: *"This mod is currently being voted on by the community due to similar issues. Click here to read the report and view the active poll."*
+- **Voting:** Up and down arrows in the Community section add or remove the signed-in user's public GitHub reaction on the item's canonical vote issue. The first vote asks the user to confirm it will be public. Published scores change after the next catalog build. Immune items, and items with no vote issue, show no arrows.
+- **Agora tab:** The Governance Summary shows counted, raw and quarantined votes and conflicted voters, with links to vote on GitHub and to write a technical review. Community reviews are listed below it for signed-in users.
+- **Crash connection:** Crash Doctor marks any suspect that is `under_review` with a note that curators are reviewing it and that this may not be related to the crash. The normal guided test is still offered.
+
+The in-app triage poll and resolution feeds were removed. Production runs the governance pipeline described in §24, which quarantines suspicious votes for curator review; §3.1 steps 5 and 8 and §5.3 now apply only when the compiler runs without an explicit governance mode.
 
 ---
 
@@ -936,7 +940,7 @@ Sidebar Tabs:
   ├── 🏠 Home (Featured & Trending)
   ├── 🔍 Browse (Curated Mod/Pack/Shader/etc. discovery)
   ├── 📦 My Instances
-  ├── 🗳️ Community Governance (Triage Center)
+  ├── 🗳️ Community Governance
   └── ⚙️ Settings
 
 Main Content Area: Dynamic based on sidebar selection
@@ -1031,9 +1035,8 @@ After onboarding, users can revisit and modify their integration preferences at 
 | Use MCP AI tools (if AI ON) | ✅ | ❌ |
 | Vote on mods | ✅ | ❌ |
 | Submit reviews | ✅ | ❌ |
-| Access Triage Center | ✅ | ❌ |
+| Read community reviews | ✅ | ❌ |
 | Report crashes to GitHub | ✅ | ❌ |
-| Flag comments | ✅ | ❌ |
 
 All features work offline once `registry.db` is cached, except those requiring live API calls. Integration toggles are independent of OAuth state — a user can have Modrinth ON and AI OFF, or vice versa, in Browse-Only Mode.
 ```
@@ -2068,7 +2071,6 @@ This section gives a concrete build order so a coding agent (or human developer)
 3. "Recent Resolutions" history feed.
 4. Curator Shield banner for immune items.
 5. Flag review system (GitHub issue direct creation).
-6. In-app Transparency Log display from `audit_log.json`.
 
 **Acceptance test:** An item marked under_review appears in the Triage Center with live poll data.
 
@@ -2198,7 +2200,7 @@ This section is an honest disclosure of what the spec does not yet cover, what a
 
 5. **The `loader_manifests.json` maintenance burden.** Every new modloader version requires a curator PR to add the hash. If the curator team is small, this becomes a bottleneck.
 
-6. **The audit log grows unboundedly.** Even with rotation, this is a 10,000-entry file. Performance is fine for `append` operations but reading the whole file for the Triage Center Transparency Log could be slow.
+6. **The audit log grows unboundedly.** Even with rotation, this is a 10,000-entry file. Performance is fine for `append` operations.
 
 7. **Race conditions in the readers-writer lock on `registry.db`.** A simple lock works but has edge cases. Consider using a SQLite-native approach or a proper RWLock with timeout.
 
@@ -2370,7 +2372,7 @@ Cross-referenced against section 17 phase definitions:
 | 2 (Tauri skeleton + instance engine) | Done (with v1 crate migration in progress) | agora-core holds most logic; desktop still has thick mod_install/instances/crash_investigator/mcp modules pending migration. |
 | 3 (Browse, discovery, search) | Done | Browse + Modrinth federated into single page; For-You algorithm; debounce + removed per-item log spam during 2026-07-05 audit. |
 | 4 (Crash diagnostics) | Done | Pre-launch interceptor, regex triage, GitHub issue search, preview-before-submit, manual log viewer, section 19.4 dynamic investigator wired (A5). |
-| 5 (Governance & Triage) | Done | Triage Center tab, Curator Shield, Flag Review, Transparency Log. |
+| 5 (Governance & Triage) | Done | Curator Shield and in-app voting. The Triage Center tab and Flag Review were built, then removed (§5.5, §5.6). |
 | 6 (MCP Server) | Done | All 6 currently-implemented tools functional; per-session auth deferred (B2 approval pending user re-decision). |
 | 7 (Dev Mode sandboxed builds) | Not started | Spec section 11. |
 | 8 (Web directory) | Done | Static Next.js, registry.db fetched at CI build via scripts/fetch_registry_db.py, react-markdown with tightened sanitize schema, CSP header in 

@@ -83,7 +83,7 @@ export default async function DocPage({
           rel="noopener noreferrer"
           className="font-medium text-indigo-600 hover:underline dark:text-indigo-400"
         >
-          Edit this page on GitHub
+          View on GitHub
         </a>
       </div>
     </article>

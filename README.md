@@ -20,7 +20,8 @@ Windows is tested and signed, I don't have macOS or Linux right now so they are 
 - [Documentation home](https://agoramc.com/docs) - start here; it routes you by what you are trying to do.
 - [Task guides](https://agoramc.com/docs/guides) - every workflow, written both as steps and as an explanation.
 - [Desktop and CLI releases](https://github.com/agora-mc/Agora-Launcher/releases) - choose the newest published `v*` release, not a `registry-*` data release.
-- [Troubleshooting and support](https://agoramc.com/docs/troubleshooting)
+- [Troubleshooting](https://agoramc.com/docs/desktop-troubleshooting) and [FAQ](https://agoramc.com/docs/faq) for the desktop app
+- [CLI troubleshooting](https://agoramc.com/docs/troubleshooting)
 - [CLI reference](https://agoramc.com/docs/cli)
 - [How the documentation is organized](./docs/README.md)
 
@@ -65,7 +66,7 @@ Agora makes no automated analytics calls. Functional features can still contact 
 - **low cost no-server, highly scalable footprint** - GitHub, GitHub Release Assets, and static hosting carry the public distribution load.
 - **No forced sign-in** - Agora works without a Microsoft account, so delegated launch is the default. Direct launch is an equally supported mode, not a fallback.
 - **Curated, not warehoused** - boutique quality and community review take priority over inventory size.
-- **Decentralized governance** - votes, reviews, and triage remain inspectable GitHub interactions.
+- **Decentralized governance** - votes and reviews remain inspectable GitHub interactions.
 - **Modrinth independence** - primary curated artifacts use pinned sources; Modrinth is optional.
 
 ## Contributor quick start
