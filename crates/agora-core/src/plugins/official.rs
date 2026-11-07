@@ -1314,6 +1314,15 @@ impl PluginService {
                 preview: Box::new(preview),
             });
         }
+        // An update that adds a script where there was none is a new decision
+        // even when it asks for no new capability: the prompt names that it now
+        // runs code. A first install's script consent is handled by the
+        // ordinary installer below.
+        if preview.replaces_version.is_some() && preview.adds_code && !consent.scripts {
+            return Ok(UpdateOutcome::NeedsConsent {
+                preview: Box::new(preview),
+            });
+        }
 
         // The ordinary installer: same consent comparison, data checkpoint,
         // staging and rollback as any package. It also clears any earlier

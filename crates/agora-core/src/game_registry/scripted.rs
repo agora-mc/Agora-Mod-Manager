@@ -17,7 +17,7 @@
 
 use agora_game_api::{
     Behaviours, ContentClassification, Diagnostic, DownloadRecognition, GameContext, GameError,
-    GameFuture, GameHost, GameInstall, GamePackage, LoadOrder, LoadOrderDefinition, LoadOrderRule,
+    GameFuture, GameHost, GameInstall, GamePackage, LoadOrderLine, LoadOrderRule,
     PackageDefinition as PackageDefinitionType, RuntimeIdentity,
 };
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
@@ -165,6 +165,39 @@ impl ScriptedPackage {
         }
     }
 
+    /// Call a hook whose `None` means "not implemented". A failure is an
+    /// error here, never `None`: collapsing it would read as a clean answer.
+    fn call_required(
+        &self,
+        export: &str,
+        args: serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, GameError> {
+        let invoker = self.invoker()?;
+        match invoker.invoke_hook(&self.plugin_id, export, args, HOOK_TIMEOUT) {
+            Ok(value) if value.is_null() => Ok(None),
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                self.report(&format!("`{export}` did not complete: {}", error.message));
+                Err(GameError {
+                    code: "ERR_GAME_HOOK_FAILED".into(),
+                    message: format!("{} `{export}` failed: {}", self.plugin_id, error.message),
+                })
+            }
+        }
+    }
+
+    fn warning(&self, export: &str, error: &GameError) -> Diagnostic {
+        Diagnostic {
+            code: "ERR_GAME_HOOK_FAILED".into(),
+            message: format!(
+                "{} could not run its `{export}` check: {}. This check was not completed.",
+                self.plugin_id, error.message
+            ),
+            severity: agora_game_api::DiagnosticSeverity::Warning,
+            repairs: Vec::new(),
+        }
+    }
+
     fn parse<T: serde::de::DeserializeOwned>(
         &self,
         export: &str,
@@ -226,7 +259,7 @@ impl GamePackage for ScriptedPackage {
                 return Ok(None);
             };
             let args = serde_json::json!({ "context": context, "archive": archive });
-            let Some(value) = self.call_optional(export, args)? else {
+            let Some(value) = self.call_required(export, args)? else {
                 return Ok(None);
             };
             self.parse(export, value).map(Some)
@@ -240,7 +273,15 @@ impl GamePackage for ScriptedPackage {
         entries: &[String],
     ) -> Option<DownloadRecognition> {
         let export = self.behaviours.recognize_download.as_deref()?.to_string();
-        let invoker = self.runtime.invoker()?;
+        let Some(invoker) = self.runtime.invoker() else {
+            // Before the plugin service starts nothing is known about this
+            // file. Reporting it as "not recognised" would be a wrong answer;
+            // it is skipped and asked again on the next scan.
+            self.report(&format!(
+                "`{export}` could not run: the plugin runtime is not available yet; recognition                  was skipped this time"
+            ));
+            return None;
+        };
         let args = serde_json::json!({ "fileName": file_name, "entries": entries });
         let plugin_id = self.plugin_id.clone();
 
@@ -295,16 +336,25 @@ impl GamePackage for ScriptedPackage {
         &'a self,
         _host: &'a dyn GameHost,
         context: GameContext,
+        list_id: &'a str,
     ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
         Box::pin(async move {
-            let Some(export) = self.behaviours.load_order_rules.as_deref() else {
+            let export = self
+                .definition
+                .games
+                .iter()
+                .flat_map(|game| game.load_orders.iter())
+                .find(|order| order.id == list_id)
+                .and_then(|order| order.rules.entry.clone())
+                .or_else(|| self.behaviours.load_order_rules.clone());
+            let Some(export) = export else {
                 return Ok(None);
             };
-            let args = self.game_script_args("context", context);
-            let Some(value) = self.call_optional(export, args)? else {
+            let args = serde_json::json!({ "context": context, "listId": list_id });
+            let Some(value) = self.call_required(&export, args)? else {
                 return Ok(None);
             };
-            self.parse(export, value).map(Some)
+            self.parse(&export, value).map(Some)
         })
     }
 
@@ -318,9 +368,13 @@ impl GamePackage for ScriptedPackage {
                 return Ok(Vec::new());
             };
             let args = self.game_script_args("context", context);
-            match self.call_optional(export, args)? {
-                None => Ok(Vec::new()),
-                Some(value) => self.parse(export, value),
+            match self.call_required(export, args) {
+                Ok(None) => Ok(Vec::new()),
+                Ok(Some(value)) => match self.parse(export, value) {
+                    Ok(diagnostics) => Ok(diagnostics),
+                    Err(error) => Ok(vec![self.warning(export, &error)]),
+                },
+                Err(error) => Ok(vec![self.warning(export, &error)]),
             }
         })
     }
@@ -335,7 +389,7 @@ impl GamePackage for ScriptedPackage {
                 return Ok(None);
             };
             let args = self.game_script_args("context", context);
-            let Some(value) = self.call_optional(export, args)? else {
+            let Some(value) = self.call_required(export, args)? else {
                 return Ok(None);
             };
             self.parse(export, value).map(Some)
@@ -345,40 +399,69 @@ impl GamePackage for ScriptedPackage {
     fn parse_load_order<'a>(
         &'a self,
         _host: &'a dyn GameHost,
-        _definition: &'a LoadOrderDefinition,
-        _contents: Vec<u8>,
-    ) -> GameFuture<'a, Option<LoadOrder>> {
+        context: GameContext,
+        list_id: &'a str,
+        bytes: Vec<u8>,
+    ) -> GameFuture<'a, Option<Vec<LoadOrderLine>>> {
         Box::pin(async move {
-            let Some(export) = self.behaviours.parse_load_order.as_deref() else {
+            let Some(export) = self.script_format_export(list_id, true) else {
                 return Ok(None);
             };
             let args = serde_json::json!({
-                "definition": _definition,
-                "contents": _contents,
+                "context": context,
+                "listId": list_id,
+                "bytes": bytes,
             });
-            let Some(value) = self.call_optional(export, args)? else {
+            let Some(value) = self.call_required(&export, args)? else {
                 return Ok(None);
             };
-            self.parse(export, value).map(Some)
+            self.parse(&export, value).map(Some)
         })
     }
 
     fn render_load_order<'a>(
         &'a self,
         _host: &'a dyn GameHost,
-        _definition: &'a LoadOrderDefinition,
-        order: &'a LoadOrder,
-    ) -> GameFuture<'a, Option<String>> {
+        context: GameContext,
+        list_id: &'a str,
+        lines: Vec<LoadOrderLine>,
+    ) -> GameFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
-            let Some(export) = self.behaviours.render_load_order.as_deref() else {
+            let Some(export) = self.script_format_export(list_id, false) else {
                 return Ok(None);
             };
-            let args = serde_json::json!({ "definition": _definition, "order": order });
-            let Some(value) = self.call_optional(export, args)? else {
+            let args = serde_json::json!({
+                "context": context,
+                "listId": list_id,
+                "lines": lines,
+            });
+            let Some(value) = self.call_required(&export, args)? else {
                 return Ok(None);
             };
-            self.parse(export, value).map(Some)
+            // A script may return text or an array of byte values.
+            if let Some(text) = value.as_str() {
+                return Ok(Some(text.as_bytes().to_vec()));
+            }
+            let bytes: Vec<u8> = self.parse(&export, value)?;
+            Ok(Some(bytes))
         })
+    }
+}
+
+impl ScriptedPackage {
+    /// The parse or render export a list's script format names.
+    fn script_format_export(&self, list_id: &str, parse: bool) -> Option<String> {
+        self.definition
+            .games
+            .iter()
+            .flat_map(|game| game.load_orders.iter())
+            .find(|order| order.id == list_id)
+            .and_then(|order| match &order.format {
+                agora_game_api::LoadOrderFormat::Script { parse: p, render } => {
+                    Some(if parse { p.clone() } else { render.clone() })
+                }
+                agora_game_api::LoadOrderFormat::Lines { .. } => None,
+            })
     }
 }
 
@@ -425,6 +508,7 @@ impl ScriptedPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agora_game_api::LoadOrder;
     use std::sync::Mutex;
 
     /// A fake engine: it answers with whatever the test told it to, and records
@@ -482,7 +566,11 @@ mod tests {
     }
 
     fn package(invoker: Arc<dyn BehaviourInvoker>) -> ScriptedPackage {
-        let definition: PackageDefinitionType = serde_json::from_value(serde_json::json!({
+        package_with(invoker, serde_json::json!({ "detect_runtime": "detect" }))
+    }
+
+    fn definition_with(behaviours: serde_json::Value) -> PackageDefinitionType {
+        serde_json::from_value(serde_json::json!({
             "id": "test.pkg",
             "version": "0.1.0",
             "api_range": ">=0.1, <0.2",
@@ -511,9 +599,16 @@ mod tests {
             }],
             "frameworks": [],
             "tools": [],
-            "behaviours": { "detect_runtime": "detect" }
+            "behaviours": behaviours
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    fn package_with(
+        invoker: Arc<dyn BehaviourInvoker>,
+        behaviours: serde_json::Value,
+    ) -> ScriptedPackage {
+        let definition = definition_with(behaviours);
         let runtime = BehaviourRuntime::new();
         runtime.install(invoker);
         // `definition` is our own type; construct the scripted package without
@@ -677,5 +772,68 @@ mod tests {
         block_on(package.detect_runtime(&NoHost, install())).unwrap();
         let timeouts = fake.timeouts.lock().unwrap();
         assert_eq!(timeouts.as_slice(), &[HOOK_TIMEOUT]);
+    }
+
+    fn game_context() -> GameContext {
+        serde_json::from_value(serde_json::json!({
+            "instance": "steam:test",
+            "runtime": { "game": "test-game", "store": "steam", "version": "1.0" },
+            "base": null,
+            "frameworks": [],
+            "layers": [],
+            "load_order": { "entries": [], "rules": [] },
+            "settings": {}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_diagnostics_hook_that_fails_is_not_a_clean_launch() {
+        // A diagnostics hook that throws or runs out of time must not come back
+        // as an empty list, which launch checks show as "nothing wrong".
+        for error in [
+            PluginError::new(PluginErrorCode::ScriptError, "TypeError: boom"),
+            PluginError::new(
+                PluginErrorCode::Timeout,
+                "`diagnose` did not finish within 5000ms",
+            ),
+        ] {
+            let package = package_with(
+                FakeInvoker::fail(error),
+                serde_json::json!({ "diagnostics": "diagnose" }),
+            );
+            match block_on(package.diagnostics(&NoHost, game_context())) {
+                Err(_) => {}
+                Ok(found) => assert!(
+                    !found.is_empty(),
+                    "a failed diagnostics hook reads as no findings"
+                ),
+            }
+        }
+    }
+    #[test]
+    fn an_early_detect_call_cannot_stick() {
+        let runtime = BehaviourRuntime::new();
+        let package = ScriptedPackage::new(
+            definition_with(serde_json::json!({ "detect_runtime": "detect" })),
+            PluginId::parse("acme.test").unwrap(),
+            runtime.clone(),
+        );
+        // Before the plugin service exists the answer is unknown, not "no
+        // version", and nothing caches it.
+        let early = block_on(package.detect_runtime(&NoHost, install())).unwrap_err();
+        assert_eq!(early.code, "ERR_GAME_SCRIPT_HOST");
+
+        // Once the service starts, the same package asks again and gets a
+        // version. An early call did not stick.
+        runtime.install(FakeInvoker::answer(serde_json::json!({
+            "game": "test-game",
+            "store": "steam",
+            "version": "2.0"
+        })));
+        let later = block_on(package.detect_runtime(&NoHost, install()))
+            .unwrap()
+            .expect("a version once the runtime is available");
+        assert_eq!(later.version, "2.0");
     }
 }

@@ -43,6 +43,9 @@ thread_local! {
     /// on this plugin's thread. Same isolation as `CURRENT_READS`.
     static CURRENT_GAME_READS: RefCell<Option<Arc<dyn GameReads>>> =
         const { RefCell::new(None) };
+    /// The instance a hook is bound to, so a `game.*` call from the script
+    /// cannot name a different one.
+    static CURRENT_BOUND_INSTANCE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn current_reads() -> Option<Arc<dyn ScriptReads>> {
@@ -51,6 +54,10 @@ fn current_reads() -> Option<Arc<dyn ScriptReads>> {
 
 fn current_game_reads() -> Option<Arc<dyn GameReads>> {
     CURRENT_GAME_READS.with(|slot| slot.borrow().clone())
+}
+
+fn current_bound_instance() -> Option<String> {
+    CURRENT_BOUND_INSTANCE.with(|slot| slot.borrow().clone())
 }
 
 /// How many events may queue for one plugin before the oldest are dropped.
@@ -380,6 +387,7 @@ async fn install_host_api(
                             if deadline_ms > 0 {
                                 host_request.deadline_ms = deadline_ms;
                             }
+                            host_request.bound_instance = current_bound_instance();
                             // The bridge is synchronous core code. Running it
                             // on the blocking pool keeps this thread's event
                             // loop free, which is what lets the timeout below
@@ -654,7 +662,12 @@ async fn call_export(
     set_deadline(deadline, timeout);
     // The scopes are set on this plugin's own thread for exactly this call.
     let previous_reads = CURRENT_READS.with(|slot| slot.replace(reads));
+    let bound_instance = game_reads
+        .as_ref()
+        .and_then(|reads| reads.instance())
+        .map(str::to_string);
     let previous_game_reads = CURRENT_GAME_READS.with(|slot| slot.replace(game_reads));
+    let previous_bound = CURRENT_BOUND_INSTANCE.with(|slot| slot.replace(bound_instance));
     let started = Instant::now();
 
     let work = context.async_with(
@@ -723,6 +736,7 @@ async fn call_export(
     // Restore the previous scopes even when the call failed or timed out.
     CURRENT_READS.with(|slot| *slot.borrow_mut() = previous_reads);
     CURRENT_GAME_READS.with(|slot| *slot.borrow_mut() = previous_game_reads);
+    CURRENT_BOUND_INSTANCE.with(|slot| *slot.borrow_mut() = previous_bound);
 
     match result {
         Ok(inner) => inner,

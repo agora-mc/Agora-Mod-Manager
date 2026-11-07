@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;
 use agora_core::game_base::{
@@ -18,6 +19,7 @@ use agora_game_api::{
     BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePath, InstallId, InstallKind,
     LaunchRecipe, LaunchValue, RelPath, RuntimeIdentity, StoreId, StoreIdentifier,
 };
+use agora_plugin_api::host::GameReads;
 use tempfile::TempDir;
 
 fn make_test_definition() -> GameDefinition {
@@ -845,5 +847,175 @@ fn building_over_a_damaged_record_an_instance_is_pinned_to_is_refused_and_keeps_
         std::fs::read_to_string(&manifest_path).unwrap(),
         "{ not json",
         "the damaged record is untouched"
+    );
+}
+
+fn a_definition_with_a_bad_recipe(deployment: DeploymentStrategy) -> GameDefinition {
+    let mut definition = make_test_definition();
+    definition.deployment = deployment;
+    definition.launch.as_mut().unwrap().environment.insert(
+        "LD_PRELOAD".into(),
+        LaunchValue::Literal {
+            value: "/tmp/evil.so".into(),
+        },
+    );
+    definition
+}
+
+#[test]
+fn an_unpinned_launch_checks_its_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = a_definition_with_a_bad_recipe(DeploymentStrategy::Redirect);
+    let install = make_test_install(&install_dir, "microsoft-store", "skyrim", false, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Unpinned",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let report = DiscoveryReport {
+        installs: vec![install.discovered.clone()],
+        warnings: vec![],
+    };
+    let error =
+        prepare_launch_with_discovery(&ctx, &rec.instance_id, &def, false, &|| report.clone())
+            .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
+}
+
+#[test]
+fn a_pinned_undeployed_launch_checks_its_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = a_definition_with_a_bad_recipe(DeploymentStrategy::Redirect);
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Pinned",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let report = DiscoveryReport {
+        installs: vec![install.discovered.clone()],
+        warnings: vec![],
+    };
+    let error =
+        prepare_launch_with_discovery(&ctx, &rec.instance_id, &def, false, &|| report.clone())
+            .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
+}
+
+#[test]
+fn a_deployed_launch_checks_its_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = a_definition_with_a_bad_recipe(DeploymentStrategy::VirtualFileSystem);
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Deployed",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let report = DiscoveryReport {
+        installs: vec![install.discovered.clone()],
+        warnings: vec![],
+    };
+    let error =
+        prepare_launch_with_discovery(&ctx, &rec.instance_id, &def, false, &|| report.clone())
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("LD_PRELOAD") || error.to_string().contains("unsafe"),
+        "{error}"
+    );
+}
+
+#[test]
+fn instance_reads_include_base_and_content_before_deploy() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let mut def = make_test_definition();
+    def.deployment = DeploymentStrategy::Redirect;
+    let package = agora_game_api::PackageDefinition {
+        id: "test.pkg".into(),
+        version: semver::Version::new(0, 1, 0),
+        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+        parents: Vec::new(),
+        games: vec![def.clone()],
+        frameworks: Vec::new(),
+        tools: Vec::new(),
+        game_templates: Default::default(),
+        behaviours: None,
+    };
+    let mut builder = agora_core::game_registry::GameRegistry::builder();
+    builder
+        .add(
+            agora_core::game_registry::PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            Arc::new(agora_core::game_registry::DeclarativePackage(package)),
+        )
+        .unwrap();
+    let ctx =
+        CoreContext::for_testing(tmp.path().join("app_data")).with_games(Arc::new(builder.build()));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Undeployed",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let content_dir = tmp.path().join("mod");
+    std::fs::create_dir_all(content_dir.join("mods")).unwrap();
+    std::fs::write(content_dir.join("mods/cool.txt"), b"cool").unwrap();
+    let add = agora_core::content_store::add_folder(&ctx, &content_dir, Some("Cool")).unwrap();
+    let item_id = match add {
+        agora_core::content_store::AddOutcome::Added { item, .. }
+        | agora_core::content_store::AddOutcome::Existing { item, .. } => item.item_id,
+    };
+    agora_core::game_deploy::add_content(&ctx, &rec.instance_id, &item_id, None, None).unwrap();
+
+    let reads = agora_core::game_script::instance_reads(&ctx, &rec.instance_id).unwrap();
+    assert_eq!(reads.read_bytes("Game.exe", 0, 4).unwrap(), b"fake");
+    assert_eq!(
+        reads.read_bytes("mods/cool.txt", 0, 4).unwrap(),
+        b"cool",
+        "content is in the view even though nothing was deployed"
     );
 }

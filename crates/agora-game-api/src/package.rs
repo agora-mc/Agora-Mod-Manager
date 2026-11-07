@@ -39,12 +39,6 @@ pub struct Behaviours {
     pub diagnostics: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepare_launch: Option<String>,
-    /// Parse a script-format load order (MASTER_SPEC §30.12).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parse_load_order: Option<String>,
-    /// Render a script-format load order (MASTER_SPEC §30.12).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub render_load_order: Option<String>,
 }
 
 impl Behaviours {
@@ -56,8 +50,6 @@ impl Behaviours {
             || self.load_order_rules.is_some()
             || self.diagnostics.is_some()
             || self.prepare_launch.is_some()
-            || self.parse_load_order.is_some()
-            || self.render_load_order.is_some()
     }
 }
 
@@ -156,6 +148,7 @@ pub trait GamePackage: Send + Sync {
         &'a self,
         _host: &'a dyn GameHost,
         _context: GameContext,
+        _list_id: &'a str,
     ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
         Box::pin(async { Ok(None) })
     }
@@ -176,25 +169,29 @@ pub trait GamePackage: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Parse a script-format load order (MASTER_SPEC §30.12). `None` asks core
-    /// to use the declarative `lines` format.
+    /// Read a `script` load order file (MASTER_SPEC §30.12). `None` means the
+    /// package does not implement the format; core reports that instead of
+    /// treating the file as empty.
     fn parse_load_order<'a>(
         &'a self,
         _host: &'a dyn GameHost,
-        _definition: &'a LoadOrderDefinition,
-        _contents: Vec<u8>,
-    ) -> GameFuture<'a, Option<LoadOrder>> {
+        _context: GameContext,
+        _list_id: &'a str,
+        _bytes: Vec<u8>,
+    ) -> GameFuture<'a, Option<Vec<LoadOrderLine>>> {
         Box::pin(async { Ok(None) })
     }
 
-    /// Render a script-format load order (MASTER_SPEC §30.12). `None` asks core
-    /// to use the declarative `lines` format.
+    /// Render a `script` load order file (MASTER_SPEC §30.12). Core writes the
+    /// bytes it returns to the list's declared file; the hook cannot choose a
+    /// path. `None` is a failure to report.
     fn render_load_order<'a>(
         &'a self,
         _host: &'a dyn GameHost,
-        _definition: &'a LoadOrderDefinition,
-        _order: &'a LoadOrder,
-    ) -> GameFuture<'a, Option<String>> {
+        _context: GameContext,
+        _list_id: &'a str,
+        _lines: Vec<LoadOrderLine>,
+    ) -> GameFuture<'a, Option<Vec<u8>>> {
         Box::pin(async { Ok(None) })
     }
 }

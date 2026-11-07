@@ -149,10 +149,12 @@ impl Capability {
             Capability::CrashContribute => {
                 "Read your games' crash logs and add its own opinion to crash diagnoses"
             }
-            Capability::GameRead => "Read files a game instance can see, by game path",
+            Capability::GameRead => {
+                "Read the files in your game instances, including their mods and settings."
+            }
             Capability::GameWrite => {
-                "Write files into its own generated layer for a game instance; it cannot change \
-                 the game, a save, or another layer"
+                "Add files to your game instances. These can include programs and mods that run \
+                 when you play, so only allow this for plugins you trust."
             }
         }
     }

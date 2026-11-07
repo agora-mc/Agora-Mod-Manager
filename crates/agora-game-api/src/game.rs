@@ -1987,6 +1987,15 @@ pub struct LoadOrderEntry {
     pub locked: bool,
 }
 
+/// One line a `script` load order format reads or writes (MASTER_SPEC §30.12): the item's name as
+/// the file writes it and whether the game loads it. A script format's own syntax stays in the
+/// script; core only moves these lines through the hooks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadOrderLine {
+    pub name: String,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoadOrderRule {

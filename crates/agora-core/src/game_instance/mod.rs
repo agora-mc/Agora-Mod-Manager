@@ -1353,7 +1353,6 @@ pub fn prepare_launch_with(
     // A game that ships no launch recipe can ask its package's script for one.
     // The recipe is checked against the instance's view before anything runs.
     let mut definition_owned = definition.clone();
-    let mut scripted_recipe = false;
     if definition_owned.launch.is_none() {
         if let Some(package) = ctx.games.package_for(&definition_owned.id).cloned() {
             let context = hook_context(ctx, &record, &definition_owned)?;
@@ -1362,7 +1361,6 @@ pub fn prepare_launch_with(
             ) {
                 Ok(Some(recipe)) => {
                     definition_owned.launch = Some(recipe);
-                    scripted_recipe = true;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1413,18 +1411,16 @@ pub fn prepare_launch_with(
                 }
                 let content = std::fs::read_to_string(&manifest_path)?;
                 let base_manifest: crate::game_base::BaseManifest = serde_json::from_str(&content)?;
-                if scripted_recipe {
-                    if let Some(recipe) = &definition.launch {
-                        crate::game_script::validate_launch_recipe(
-                            recipe,
-                            &crate::game_script::RecipeRoots {
-                                runtime: &base_manifest.location,
-                                install: Some(&base_manifest.source_location),
-                                base: Some(&base_manifest.location),
-                            },
-                        )
-                        .map_err(InstanceError::Other)?;
-                    }
+                if let Some(recipe) = &definition.launch {
+                    crate::game_script::validate_launch_recipe(
+                        recipe,
+                        &crate::game_script::RecipeRoots {
+                            runtime: &base_manifest.location,
+                            install: Some(&base_manifest.source_location),
+                            base: Some(&base_manifest.location),
+                        },
+                    )
+                    .map_err(InstanceError::Other)?;
                 }
                 // Layers removed since the last deploy take their plugin lines with them.
                 crate::game_plugins::sync_without_content(
@@ -1470,18 +1466,16 @@ pub fn prepare_launch_with(
                 install: Some(discovered.location.clone()),
                 base: None,
             };
-            if scripted_recipe {
-                if let Some(recipe) = &definition.launch {
-                    crate::game_script::validate_launch_recipe(
-                        recipe,
-                        &crate::game_script::RecipeRoots {
-                            runtime: &roots.runtime,
-                            install: roots.install.as_deref(),
-                            base: roots.base.as_deref(),
-                        },
-                    )
-                    .map_err(InstanceError::Other)?;
-                }
+            if let Some(recipe) = &definition.launch {
+                crate::game_script::validate_launch_recipe(
+                    recipe,
+                    &crate::game_script::RecipeRoots {
+                        runtime: &roots.runtime,
+                        install: roots.install.as_deref(),
+                        base: roots.base.as_deref(),
+                    },
+                )
+                .map_err(InstanceError::Other)?;
             }
             let Some(recipe) = &definition.launch else {
                 return Err(LaunchError::NoRecipe.into());
@@ -1595,6 +1589,17 @@ fn prepare_deployed(
         install: Some(base_manifest.source_location.clone()),
         base: Some(base_manifest.location.clone()),
     };
+    if let Some(recipe) = &definition.launch {
+        crate::game_script::validate_launch_recipe(
+            recipe,
+            &crate::game_script::RecipeRoots {
+                runtime: &roots.runtime,
+                install: roots.install.as_deref(),
+                base: roots.base.as_deref(),
+            },
+        )
+        .map_err(InstanceError::Other)?;
+    }
     let Some(recipe) = &definition.launch else {
         return Err(LaunchError::NoRecipe.into());
     };

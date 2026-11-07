@@ -92,6 +92,12 @@ pub trait ScriptReads: Send + Sync {
 /// no host path is ever revealed. The scope is one instance and one call
 /// (MASTER_SPEC §30.12).
 pub trait GameReads: Send + Sync {
+    /// The instance this scope is bound to, when it is bound to one. A hook's
+    /// `game.*` calls use it to refuse a different instance id.
+    fn instance(&self) -> Option<&str> {
+        None
+    }
+
     /// At most `len` bytes from `offset`, or an error that says why.
     fn read_bytes(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ScriptReadError>;
 

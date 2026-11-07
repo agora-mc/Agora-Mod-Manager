@@ -1494,6 +1494,37 @@ fn script_zip(id: &str, version: &str) -> Vec<u8> {
     buffer.into_inner()
 }
 
+/// The script package above with a chosen capability, so an update can add
+/// code without adding a permission.
+fn script_zip_requiring(id: &str, version: &str, capability: &str) -> Vec<u8> {
+    use std::io::Write;
+    let manifest = format!(
+        r#"{{
+        "manifest": 1,
+        "id": "{id}",
+        "name": "Scripted",
+        "version": "{version}",
+        "license": "GPL-3.0-only",
+        "apiRange": ">=0.1, <0.2",
+        "entrypoint": "main.js",
+        "activation": ["onStartup"],
+        "capabilities": {{ "required": ["{capability}"] }}
+    }}"#
+    );
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("agora-plugin.json", options).unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        zip.start_file("main.js", options).unwrap();
+        zip.write_all(b"export function noop() { return 1; }\n")
+            .unwrap();
+        zip.finish().unwrap();
+    }
+    buffer.into_inner()
+}
+
 /// A publisher key made from raw bytes, for update-source fixtures.
 fn publisher_key(seed: u8) -> PublicKey {
     use base64::Engine as _;
@@ -2549,4 +2580,138 @@ async fn an_update_that_changes_only_a_data_file_is_new_code_too() {
         )
         .unwrap();
     assert!(!updated.scripts_allowed);
+}
+
+#[tokio::test]
+async fn an_official_update_that_adds_a_script_asks_again_with_no_new_capability() {
+    let world = World::new();
+    let data_only = fixture_zip("1.0.0");
+    world.publish(vec![(
+        Release::of("1.0.0", "current", &data_only),
+        data_only,
+    )]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    // v1.1 adds an entrypoint and asks for exactly what v1.0 already had.
+    let scripted = script_zip_requiring(PLUGIN, "1.1.0", "game:define");
+    world.publish(vec![(Release::of("1.1.0", "current", &scripted), scripted)]);
+
+    let outcome = world
+        .service
+        .update_official(
+            PLUGIN,
+            Consent {
+                capabilities: true,
+                scripts: false,
+            },
+            &world.fetcher,
+        )
+        .await
+        .unwrap();
+    match outcome {
+        UpdateOutcome::NeedsConsent { preview } => {
+            assert!(preview.adds_code, "the prompt knows it now runs code");
+            assert!(preview.added_capabilities.is_empty(), "no new capability");
+            assert!(preview.manifest.entrypoint.is_some());
+        }
+        UpdateOutcome::Installed { .. } => panic!("adding a script must ask again"),
+    }
+
+    // Answering yes installs it and the code is allowed.
+    let installed = installed(
+        world
+            .service
+            .update_official(PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    assert!(installed.runs_code);
+    assert!(installed.scripts_allowed);
+}
+
+#[test]
+fn a_package_with_duplicate_entries_hashes_what_it_extracts() {
+    // The `zip` writer refuses duplicate names, so build the bytes directly.
+    // A malicious package is not constrained by a writer.
+    fn duplicate_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        fn crc(data: &[u8]) -> u32 {
+            let mut crc = flate2::Crc::new();
+            crc.update(data);
+            crc.sum()
+        }
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let offset = out.len() as u32;
+            let sum = crc(data);
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&sum.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&sum.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_start = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    let first = b"export function noop() { return 1; }\n";
+    let last = b"export function noop() { return 2; }\n";
+    let bytes = duplicate_zip(&[("main.js", first), ("main.js", last)]);
+    let pinned = zip_tree_digest(&bytes).expect("the pinned hash reads both entries");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let destination = tmp.path().join("unpacked");
+    agora_core::plugins::install::extract_package(&bytes, &destination).unwrap();
+    assert_eq!(
+        tree_digest(&destination).unwrap(),
+        pinned,
+        "the pinned hash describes exactly what unpacking wrote"
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("main.js")).unwrap(),
+        String::from_utf8_lossy(last)
+    );
 }

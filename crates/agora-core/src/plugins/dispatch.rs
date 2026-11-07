@@ -58,6 +58,9 @@ pub struct DispatchContext<'a> {
     pub settings_schema: &'a [SettingDefinition],
     pub subscriptions: &'a EventSubscriptions,
     pub ui: &'a dyn PluginUiSink,
+    /// The instance a hook is bound to. `None` for a normal plugin call.
+    /// A bound call may not name a different instance.
+    pub bound_instance: Option<&'a str>,
 }
 
 /// Every method this host API version serves.
@@ -821,12 +824,34 @@ fn net_fetch_json(
 // Game instance view (MASTER_SPEC §30.12)
 // ---------------------------------------------------------------------------
 
+fn game_instance_id(cx: &DispatchContext<'_>, args: &serde_json::Value) -> PluginResult<String> {
+    let instance_id = arg_str(args, "instanceId")?;
+    if let Some(bound) = cx.bound_instance {
+        if bound != instance_id {
+            return Err(PluginError::new(
+                PluginErrorCode::CapabilityDenied,
+                format!(
+                    "this hook is bound to instance `{bound}`; it may not name `{instance_id}`"
+                ),
+            ));
+        }
+    }
+    Ok(instance_id)
+}
+
+fn game_budgets(cx: &DispatchContext<'_>) -> std::sync::Arc<crate::game_script::GameBudgets> {
+    cx.ctx
+        .extensions
+        .get_or_insert_with(crate::game_script::GameBudgets::default)
+}
+
 fn game_reads(
     cx: &DispatchContext<'_>,
     args: &serde_json::Value,
 ) -> PluginResult<crate::game_script::GameViewReads> {
-    let instance_id = arg_str(args, "instanceId")?;
-    crate::game_script::instance_reads(cx.ctx, &instance_id)
+    let instance_id = game_instance_id(cx, args)?;
+    let budget = game_budgets(cx).session(cx.plugin_id.as_str()).reads;
+    crate::game_script::instance_reads_with_budget(cx.ctx, &instance_id, budget)
         .map_err(|message| PluginError::new(PluginErrorCode::OperationFailed, message))
 }
 
@@ -890,8 +915,9 @@ fn game_write_scope(
     cx: &DispatchContext<'_>,
     args: &serde_json::Value,
 ) -> PluginResult<crate::game_script::GameWriteScope> {
-    let instance_id = arg_str(args, "instanceId")?;
-    crate::game_script::instance_write_scope(cx.ctx, cx.plugin_id, &instance_id)
+    let instance_id = game_instance_id(cx, args)?;
+    let budget = game_budgets(cx).session(cx.plugin_id.as_str()).writes;
+    crate::game_script::instance_write_scope_with_budget(cx.ctx, cx.plugin_id, &instance_id, budget)
         .map_err(|message| PluginError::new(PluginErrorCode::OperationFailed, message))
 }
 
@@ -1086,6 +1112,7 @@ mod tests {
             settings_schema: &[],
             subscriptions: &subscriptions,
             ui: &NoopUiSink,
+            bound_instance: None,
         };
         dispatch(&cx, method, &args)
     }
@@ -1129,6 +1156,97 @@ mod tests {
         assert_eq!(error.code, PluginErrorCode::CapabilityDenied);
     }
 
+    /// A core context with one instance folder. Each script request is one
+    /// `dispatch` call, exactly as the bridge makes them; the budgets are meant
+    /// to span the whole plugin call, so they must survive from one request to
+    /// the next.
+    fn instance_ctx() -> (tempfile::TempDir, crate::ctx::CoreContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::CoreContext::for_testing(tmp.path().to_path_buf());
+        std::fs::create_dir_all(ctx.paths.instance_dir("i").unwrap().join("writable")).unwrap();
+        (tmp, ctx)
+    }
+
+    fn dispatch_in(
+        ctx: &crate::ctx::CoreContext,
+        granted: &CapabilitySet,
+        method: &str,
+        args: serde_json::Value,
+    ) -> PluginResult<serde_json::Value> {
+        let plugin_id = PluginId::parse("acme.test").unwrap();
+        let subscriptions = EventSubscriptions::new();
+        let cx = DispatchContext {
+            ctx,
+            plugin_id: &plugin_id,
+            granted,
+            declared_hosts: &[],
+            settings_schema: &[],
+            subscriptions: &subscriptions,
+            ui: &NoopUiSink,
+            bound_instance: None,
+        };
+        dispatch(&cx, method, &args)
+    }
+
+    #[test]
+    fn one_plugin_call_cannot_create_more_files_than_its_budget() {
+        let (_tmp, ctx) = instance_ctx();
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameWrite);
+        let budget = crate::game_script::DEFAULT_MAX_WRITE_FILES as usize;
+        let mut refused = None;
+        for n in 0..=budget {
+            let result = dispatch_in(
+                &ctx,
+                &granted,
+                "game.writeText",
+                serde_json::json!({ "instanceId": "i", "path": format!("f{n}.txt"), "text": "x" }),
+            );
+            if let Err(error) = result {
+                refused = Some((n, error));
+                break;
+            }
+        }
+        let (n, error) = refused.expect("file number budget+1 in one plugin call must be refused");
+        assert_eq!(n, budget);
+        assert_eq!(error.detail.as_deref(), Some("file_budget_spent"));
+    }
+
+    #[test]
+    fn one_plugin_call_cannot_read_more_than_its_budget() {
+        let (_tmp, ctx) = instance_ctx();
+        let one_mib = 1024 * 1024;
+        std::fs::write(
+            ctx.paths
+                .instance_dir("i")
+                .unwrap()
+                .join("writable")
+                .join("big.bin"),
+            vec![0u8; one_mib],
+        )
+        .unwrap();
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameRead);
+        let budget = crate::game_script::DEFAULT_MAX_TOTAL_READ_BYTES as usize;
+        let reads = budget / one_mib;
+        let mut refused = None;
+        for n in 0..=reads {
+            let result = dispatch_in(
+                &ctx,
+                &granted,
+                "game.readBytes",
+                serde_json::json!({ "instanceId": "i", "path": "big.bin", "offset": 0, "len": one_mib }),
+            );
+            if let Err(error) = result {
+                refused = Some((n, error));
+                break;
+            }
+        }
+        let (n, error) = refused.expect("read number budget+1 in one plugin call must be refused");
+        assert_eq!(n, reads);
+        assert_eq!(error.detail.as_deref(), Some("budget_spent"));
+    }
+
     #[test]
     fn subscribing_to_an_event_needs_the_capability_that_guards_its_data() {
         assert_eq!(
@@ -1149,5 +1267,40 @@ mod tests {
                 "`{name}` can be subscribed to with no capability at all"
             );
         }
+    }
+    #[test]
+    fn a_hook_bound_to_one_instance_refuses_a_different_id() {
+        let (_tmp, ctx) = instance_ctx();
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameRead);
+        let plugin_id = PluginId::parse("acme.test").unwrap();
+        let subscriptions = EventSubscriptions::new();
+        let cx = DispatchContext {
+            ctx: &ctx,
+            plugin_id: &plugin_id,
+            granted: &granted,
+            declared_hosts: &[],
+            settings_schema: &[],
+            subscriptions: &subscriptions,
+            ui: &NoopUiSink,
+            bound_instance: Some("i"),
+        };
+        let error = dispatch(
+            &cx,
+            "game.readBytes",
+            &serde_json::json!({ "instanceId": "other", "path": "a.txt" }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::CapabilityDenied);
+        assert!(error.message.contains("bound to instance `i`"));
+
+        // The bound instance itself is not refused for being the wrong one.
+        let error = dispatch(
+            &cx,
+            "game.readBytes",
+            &serde_json::json!({ "instanceId": "i", "path": "missing.txt" }),
+        )
+        .unwrap_err();
+        assert_ne!(error.code, PluginErrorCode::CapabilityDenied);
     }
 }

@@ -110,6 +110,11 @@ export interface GameListEntry {
   dir: boolean;
   size: number;
 }
+/** A listing, possibly cut at the host's entry cap. */
+export interface GameListReply {
+  entries: GameListEntry[];
+  cut: boolean;
+}
 /** A reply from `game.readLines`, shaped like the crash contract's. */
 export interface GameLinesReply {
   lines: string[];
@@ -123,7 +128,7 @@ export const game: {
   /** Text lines at `path` in this call's instance view. */
   readLines(path: string, fromLine?: number, maxLines?: number): GameLinesReply;
   /** Direct children of `path` in this call's instance view. */
-  list(path?: string): GameListEntry[];
+  list(path?: string): GameListReply;
   /** Write bytes into this plugin's own generated layer for `instanceId`. */
   writeBytes(instanceId: string, path: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
   /** Write text into this plugin's own generated layer for `instanceId`. */
@@ -132,7 +137,7 @@ export const game: {
   forInstance(instanceId: string): {
     readBytes(path: string, offset?: number, len?: number): Promise<ArrayBuffer>;
     readLines(path: string, fromLine?: number, maxLines?: number): Promise<GameLinesReply>;
-    list(path?: string): Promise<GameListEntry[]>;
+    list(path?: string): Promise<GameListReply>;
     writeBytes(path: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
     writeText(path: string, text: string): Promise<{ written: number }>;
   };
