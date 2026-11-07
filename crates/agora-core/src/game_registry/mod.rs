@@ -315,20 +315,8 @@ impl GameRegistryBuilder {
                         ),
                     });
                 }
-                // A script format or rule needs a plugin entrypoint. A compiled package has none;
-                // a plugin's manifest is not visible here, so it is checked when scripts load.
-                if (rule.format.is_script() || rule.rules.is_script())
-                    && matches!(source, PackageSource::Compiled { .. })
-                {
-                    return Err(GameRegistryError::InvalidLoadOrder {
-                        game_id: game.id.clone(),
-                        reason: format!(
-                            "load order '{}' uses a script, but a compiled package has no plugin \
-                             entrypoint",
-                            rule.id
-                        ),
-                    });
-                }
+                // A compiled package answers script hooks in Rust, and a plugin's manifest is not
+                // visible here, so the entrypoints are checked when the script loads.
                 for name in &rule.rules.implicit {
                     if name.trim().is_empty() || name.contains(['/', '\\']) {
                         return Err(GameRegistryError::InvalidPluginList {

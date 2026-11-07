@@ -1175,9 +1175,12 @@ pub fn launch_checks(
     let pinned = matches!(record.base, BaseReference::Pinned { .. });
     let (runtime, links) = std::thread::scope(|scope| {
         let runtime = scope.spawn(|| runtime_check(ctx, id, definition));
-        let links = scope.spawn(|| match definition.load_orders.first() {
-            Some(_) if pinned => crate::game_load_order::plan_for_order(ctx, id, definition),
-            _ => Ok(None),
+        let links = scope.spawn(|| {
+            if pinned {
+                crate::game_load_order::plan_for_instance(ctx, id, definition)
+            } else {
+                Ok(None)
+            }
         });
         (join_scoped(runtime), join_scoped(links))
     });
@@ -1192,15 +1195,16 @@ pub fn launch_checks(
         });
     }
     let links = links?;
-    let (load_order, plugin_count) = match definition.load_orders.first() {
-        Some(_) => {
-            let order =
-                crate::game_load_order::order_with_view(ctx, id, definition, links.as_ref())?;
-            let count = order.entries.len();
-            (order.findings, Some(count))
-        }
-        None => (Vec::new(), None),
+    let orders = crate::game_load_order::orders_with_view(ctx, id, definition, links.as_ref())?;
+    let plugin_count: Option<usize> = if definition.load_orders.is_empty() {
+        None
+    } else {
+        Some(orders.iter().map(|order| order.entries.len()).sum())
     };
+    let load_order: Vec<crate::game_load_order::Finding> = orders
+        .into_iter()
+        .flat_map(|order| order.findings)
+        .collect();
     let outputs =
         crate::game_tools::output_findings_with_view(ctx, id, definition, links.as_ref())?;
     let requirements = crate::catalog_install::requirement_findings(ctx, id, definition);
@@ -1443,10 +1447,7 @@ fn prepare_deployed(
     // linked) when the game declares the Creation Engine rules: the only load-order check that
     // plans. Otherwise it needs no plan, and neither do the generated outputs.
     let links_plan;
-    let needs_links_view = definition
-        .load_orders
-        .first()
-        .is_some_and(crate::game_load_order::is_engine);
+    let needs_links_view = crate::game_load_order::any_needs_plan(definition);
     let links: Option<&crate::game_deploy::DeploymentPlan> = if !needs_links_view {
         None
     } else if rung.mode == crate::game_deploy::DeployMode::Links {
@@ -1563,7 +1564,7 @@ fn check_load_order(
     if definition.load_orders.is_empty() {
         return Ok(Vec::new());
     }
-    let findings = crate::game_load_order::check_with_view(ctx, id, definition, links)
+    let findings = crate::game_load_order::check_all_with_view(ctx, id, definition, links)
         .map_err(|e| InstanceError::Other(format!("cannot check the plugin load order: {e}")))?;
     Ok(crate::game_launch::refuse_load_order(
         findings,

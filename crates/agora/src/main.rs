@@ -715,6 +715,9 @@ enum InstancePluginsCmd {
         instance_id: String,
         /// Plugin file name, e.g. SkyUI_SE.esp.
         name: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
     /// Deactivate a plugin in an instance's plugin list (it stays listed).
     Disable {
@@ -722,6 +725,9 @@ enum InstancePluginsCmd {
         instance_id: String,
         /// Plugin file name, e.g. SkyUI_SE.esp.
         name: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
     /// Sort the plugin list so every master comes before the plugins that need it.
     Sort {
@@ -730,6 +736,9 @@ enum InstancePluginsCmd {
         /// Print the moves without writing the list.
         #[arg(long)]
         dry_run: bool,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
     /// Move a plugin to a position, or before or after another plugin.
     Move {
@@ -746,6 +755,9 @@ enum InstancePluginsCmd {
         /// Move to just after this plugin.
         #[arg(long)]
         after: Option<String>,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
     /// Lock a plugin's place, so sort and move leave it where it is.
     Lock {
@@ -753,6 +765,9 @@ enum InstancePluginsCmd {
         instance_id: String,
         /// Plugin file name, e.g. SkyUI_SE.esp.
         plugin: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
     /// Unlock a plugin's place, so sort and move may move it again.
     Unlock {
@@ -760,16 +775,25 @@ enum InstancePluginsCmd {
         instance_id: String,
         /// Plugin file name, e.g. SkyUI_SE.esp.
         plugin: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
     /// Print the load order findings. Exits 1 only when a launch would refuse; warnings exit 0.
     Check {
         /// Instance ID.
         instance_id: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
     /// Download and verify LOOT's masterlist for the game, if one is not saved yet or it is stale.
     Masterlist {
         /// Instance ID.
         instance_id: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
     },
 }
 
@@ -8411,14 +8435,24 @@ async fn run_command(
                     instance_id,
                     action,
                 } => {
-                    let (instance_id, toggle) = match (instance_id, action) {
-                        (Some(id), None) => (id, None),
-                        (None, Some(InstancePluginsCmd::Enable { instance_id, name })) => {
-                            (instance_id, Some((name, true)))
-                        }
-                        (None, Some(InstancePluginsCmd::Disable { instance_id, name })) => {
-                            (instance_id, Some((name, false)))
-                        }
+                    let (instance_id, toggle, list_id) = match (instance_id, action) {
+                        (Some(id), None) => (id, None, None),
+                        (
+                            None,
+                            Some(InstancePluginsCmd::Enable {
+                                instance_id,
+                                name,
+                                list,
+                            }),
+                        ) => (instance_id, Some((name, true)), list),
+                        (
+                            None,
+                            Some(InstancePluginsCmd::Disable {
+                                instance_id,
+                                name,
+                                list,
+                            }),
+                        ) => (instance_id, Some((name, false)), list),
                         _ => {
                             eprintln!(
                                 "Error: name an instance: agora games instance plugins <instance>"
@@ -8448,7 +8482,12 @@ async fn run_command(
                     })?;
                     match toggle {
                         None => {
-                            match agora_core::game_load_order::order(ctx, &instance_id, game_def) {
+                            match agora_core::game_load_order::order_in(
+                                ctx,
+                                &instance_id,
+                                game_def,
+                                list_id.as_deref(),
+                            ) {
                                 Ok(order) => {
                                     if json {
                                         println!("{}", serde_json::to_string_pretty(&order)?);
@@ -8460,10 +8499,11 @@ async fn run_command(
                             }
                         }
                         Some((name, active)) => {
-                            match agora_core::game_plugins::set_active(
+                            match agora_core::game_plugins::set_active_in(
                                 ctx,
                                 &instance_id,
                                 game_def,
+                                list_id.as_deref(),
                                 &name,
                                 active,
                             ) {
@@ -10662,11 +10702,20 @@ fn plugins_load_order_command(
         | InstancePluginsCmd::Move { instance_id, .. }
         | InstancePluginsCmd::Lock { instance_id, .. }
         | InstancePluginsCmd::Unlock { instance_id, .. }
-        | InstancePluginsCmd::Check { instance_id }
-        | InstancePluginsCmd::Masterlist { instance_id } => instance_id.clone(),
+        | InstancePluginsCmd::Check { instance_id, .. }
+        | InstancePluginsCmd::Masterlist { instance_id, .. } => instance_id.clone(),
         InstancePluginsCmd::Enable { .. } | InstancePluginsCmd::Disable { .. } => {
             fail("not a load order command".to_string())
         }
+    };
+    let list_id = match &cmd {
+        InstancePluginsCmd::Sort { list, .. }
+        | InstancePluginsCmd::Move { list, .. }
+        | InstancePluginsCmd::Lock { list, .. }
+        | InstancePluginsCmd::Unlock { list, .. }
+        | InstancePluginsCmd::Check { list, .. }
+        | InstancePluginsCmd::Masterlist { list, .. } => list.clone(),
+        InstancePluginsCmd::Enable { .. } | InstancePluginsCmd::Disable { .. } => None,
     };
     let record = match agora_core::game_instance::get(ctx, &instance_id)? {
         Some(r) => r,
@@ -10680,7 +10729,13 @@ fn plugins_load_order_command(
     let locking = matches!(cmd, InstancePluginsCmd::Lock { .. });
     match cmd {
         InstancePluginsCmd::Sort { dry_run, .. } => {
-            match load_order::sort_and_order(ctx, &instance_id, game_def, dry_run) {
+            match load_order::sort_and_order_in(
+                ctx,
+                &instance_id,
+                game_def,
+                list_id.as_deref(),
+                dry_run,
+            ) {
                 Ok((report, order)) => {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -10721,7 +10776,7 @@ fn plugins_load_order_command(
             }
         }
         InstancePluginsCmd::Masterlist { .. } => {
-            match agora_core::loot_masterlist::update(ctx, game_def) {
+            match agora_core::loot_masterlist::update_in(ctx, game_def, list_id.as_deref()) {
                 Ok(status) => {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -10748,7 +10803,14 @@ fn plugins_load_order_command(
                 (None, None, Some(other)) => MoveTarget::After(other),
                 _ => fail("name one target: --to N, --before PLUGIN or --after PLUGIN".to_string()),
             };
-            match load_order::move_plugin(ctx, &instance_id, game_def, &plugin, &target) {
+            match load_order::move_plugin_in(
+                ctx,
+                &instance_id,
+                game_def,
+                list_id.as_deref(),
+                &plugin,
+                &target,
+            ) {
                 Ok(report) => {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -10765,10 +10827,11 @@ fn plugins_load_order_command(
             }
         }
         InstancePluginsCmd::Lock { plugin, .. } | InstancePluginsCmd::Unlock { plugin, .. } => {
-            match agora_core::game_plugins::set_locked(
+            match agora_core::game_plugins::set_locked_in(
                 ctx,
                 &instance_id,
                 game_def,
+                list_id.as_deref(),
                 &plugin,
                 locking,
             ) {
@@ -10795,41 +10858,43 @@ fn plugins_load_order_command(
                 Err(e) => fail(e.to_string()),
             }
         }
-        InstancePluginsCmd::Check { .. } => match load_order::check(ctx, &instance_id, game_def) {
-            Ok(findings) => {
-                // Only a finding a launch refuses for exits 1; warnings are printed and exit 0.
-                let refuses = findings.iter().any(load_order::Finding::refuses_launch);
-                let status = if refuses {
-                    "findings"
-                } else if findings.is_empty() {
-                    "ok"
-                } else {
-                    "warnings"
-                };
-                if json {
-                    let out = serde_json::json!({
-                        "status": status,
-                        "instance_id": instance_id,
-                        "findings": findings,
-                        "exitCode": if refuses { 1 } else { 0 },
-                    });
-                    println!("{}", serde_json::to_string_pretty(&out)?);
-                } else if findings.is_empty() {
-                    println!("No findings: the load order satisfies the game's rules.");
-                } else {
-                    for f in &findings {
-                        println!("- {}", f.message());
+        InstancePluginsCmd::Check { .. } => {
+            match load_order::check_in(ctx, &instance_id, game_def, list_id.as_deref()) {
+                Ok(findings) => {
+                    // Only a finding a launch refuses for exits 1; warnings are printed and exit 0.
+                    let refuses = findings.iter().any(load_order::Finding::refuses_launch);
+                    let status = if refuses {
+                        "findings"
+                    } else if findings.is_empty() {
+                        "ok"
+                    } else {
+                        "warnings"
+                    };
+                    if json {
+                        let out = serde_json::json!({
+                            "status": status,
+                            "instance_id": instance_id,
+                            "findings": findings,
+                            "exitCode": if refuses { 1 } else { 0 },
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else if findings.is_empty() {
+                        println!("No findings: the load order satisfies the game's rules.");
+                    } else {
+                        for f in &findings {
+                            println!("- {}", f.message());
+                        }
+                        if let Some(hint) = sort_hint(&instance_id, &findings) {
+                            println!("{hint}");
+                        }
                     }
-                    if let Some(hint) = sort_hint(&instance_id, &findings) {
-                        println!("{hint}");
+                    if refuses {
+                        std::process::exit(1);
                     }
                 }
-                if refuses {
-                    std::process::exit(1);
-                }
+                Err(e) => fail(e.to_string()),
             }
-            Err(e) => fail(e.to_string()),
-        },
+        }
         InstancePluginsCmd::Enable { .. } | InstancePluginsCmd::Disable { .. } => {
             fail("not a load order command".to_string())
         }

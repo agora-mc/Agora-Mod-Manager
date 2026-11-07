@@ -13,9 +13,16 @@
 //! free plugins trade places only among the positions that no locked or implicit plugin holds.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{fold_path_case, glob_match, GameDefinition, LoadOrderDefinition};
+use agora_game_api::{
+    fold_path_case, glob_match, ArchiveRequest, ArtifactReadRequest, DownloadRequest,
+    DownloadedArtifact, ExtractedArchive, FomodRequest, FomodResult, GameContext, GameDefinition,
+    GameError, GameEvent, GameFuture, GameHost, GamePackage, GameResult, InstallReadRequest,
+    LoadOrderDefinition, LoadOrderLine, LoadOrderRule, SortLoadOrderRequest, ToolRunRequest,
+    ToolRunResult,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
@@ -42,6 +49,16 @@ pub enum LoadOrderError {
     Plugins(#[from] PluginListError),
     #[error("game '{0}' declares no load order rules, so its plugins cannot be sorted")]
     NoRules(String),
+    #[error("game '{game}' declares no load order named '{list}'")]
+    UnknownList { game: String, list: String },
+    #[error("load order '{0}' declares no ordering rules, so it cannot be sorted")]
+    NoSort(String),
+    #[error("load order '{list}' uses script rules, but they failed: {reason}")]
+    RulesScript { list: String, reason: String },
+    #[error("load order '{list}' uses a script format, but it failed: {reason}")]
+    FormatScript { list: String, reason: String },
+    #[error("game '{0}' has no game package to run its load order scripts")]
+    NoPackage(String),
     #[error("cannot read the game's files for instance '{instance_id}': {reason}")]
     Files { instance_id: String, reason: String },
     #[error("cannot read {path}: {source}")]
@@ -121,6 +138,15 @@ pub struct LoadOrderEntry {
 /// An instance's load order and what the game's rules say about it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadOrder {
+    /// The list's id within the game.
+    #[serde(default)]
+    pub list_id: String,
+    /// The list's name as a person reads it.
+    #[serde(default)]
+    pub list_name: String,
+    /// The list's `rules.kind`: `none`, `script` or `creation_engine`.
+    #[serde(default)]
+    pub rules_kind: String,
     /// Whether the Creation Engine rules apply to this game.
     pub engine: bool,
     /// Whether the instance has a copy of the plugin list yet.
@@ -169,6 +195,20 @@ pub enum Finding {
     TooManyFullPlugins { active: usize, limit: usize },
     /// More light plugins are active than the engine loads.
     TooManyLightPlugins { active: usize, limit: usize },
+    /// A script rule names an item the list does not have, so the rule cannot be applied.
+    MissingRuleItem {
+        list: String,
+        item: String,
+        rule: String,
+    },
+    /// Both items of a `conflicts` rule are active.
+    RuleConflict {
+        list: String,
+        first: String,
+        second: String,
+    },
+    /// The list's rules hook failed, so its order could not be judged.
+    RulesFailed { list: String, reason: String },
 }
 
 /// Why a master does not come before its plugin.
@@ -195,7 +235,11 @@ impl Finding {
             Finding::MasterCycle { .. }
             | Finding::TooManyFullPlugins { .. }
             | Finding::TooManyLightPlugins { .. } => true,
-            Finding::UnreadableHeader { .. } | Finding::DuplicateListing { .. } => false,
+            Finding::UnreadableHeader { .. }
+            | Finding::DuplicateListing { .. }
+            | Finding::MissingRuleItem { .. }
+            | Finding::RuleConflict { .. }
+            | Finding::RulesFailed { .. } => false,
         }
     }
 
@@ -228,6 +272,19 @@ impl Finding {
             }
             Finding::TooManyLightPlugins { active, limit } => {
                 format!("{active} light plugins are active; the game loads at most {limit}")
+            }
+            Finding::MissingRuleItem { list, item, rule } => format!(
+                "the '{list}' load order's {rule} rule names '{item}', which the list does not have"
+            ),
+            Finding::RuleConflict {
+                list,
+                first,
+                second,
+            } => {
+                format!("the '{list}' load order says '{first}' conflicts with '{second}', and both are on")
+            }
+            Finding::RulesFailed { list, reason } => {
+                format!("the '{list}' load order's rules could not be read: {reason}")
             }
         }
     }
@@ -342,6 +399,235 @@ pub fn is_engine(rule: &LoadOrderDefinition) -> bool {
     rule.rules.kind == CREATION_ENGINE
 }
 
+/// The list a caller means. `None` means the game's first list; naming an id the game does not
+/// declare is an error, never a quiet fall back to the first.
+pub fn list_by_id<'a>(
+    definition: &'a GameDefinition,
+    list_id: Option<&str>,
+) -> Result<&'a LoadOrderDefinition, LoadOrderError> {
+    match list_id {
+        None => definition
+            .load_orders
+            .first()
+            .ok_or_else(|| PluginListError::NoRule(definition.id.clone()).into()),
+        Some(id) => definition
+            .load_orders
+            .iter()
+            .find(|rule| rule.id == id)
+            .ok_or_else(|| LoadOrderError::UnknownList {
+                game: definition.id.as_str().to_string(),
+                list: id.to_string(),
+            }),
+    }
+}
+
+/// Whether any of the game's lists uses the Creation Engine rules, so the launch needs a Links
+/// plan to read installed plugins.
+pub fn any_engine(definition: &GameDefinition) -> bool {
+    definition.load_orders.iter().any(is_engine)
+}
+
+/// Whether any list needs a deployment plan at all: rules that read the game's files, or a list
+/// of folders.
+pub fn any_needs_plan(definition: &GameDefinition) -> bool {
+    definition
+        .load_orders
+        .iter()
+        .any(|rule| is_engine(rule) || rule.rules.kind == "script" || rule.items.folders)
+}
+
+// ---------------------------------------------------------------------------
+// Script hooks
+// ---------------------------------------------------------------------------
+
+/// A host for a load-order hook that asks for nothing. Script rules and formats return their
+/// answer without touching the game; a script that tries to use a host operation is told, plainly,
+/// that this step has none. The scripts slice supplies the real host later.
+struct HooklessHost;
+
+fn hookless<T>(what: &str) -> GameFuture<'_, T> {
+    let message = format!("{what} is not available while reading a load order");
+    Box::pin(async move {
+        Err(GameError {
+            code: "host_unavailable".into(),
+            message,
+        })
+    })
+}
+
+impl GameHost for HooklessHost {
+    fn download(&self, _request: DownloadRequest) -> GameFuture<'_, DownloadedArtifact> {
+        hookless("downloading")
+    }
+
+    fn read_install_file(&self, _request: InstallReadRequest) -> GameFuture<'_, Vec<u8>> {
+        hookless("reading the game's files")
+    }
+
+    fn read_artifact(&self, _request: ArtifactReadRequest) -> GameFuture<'_, Vec<u8>> {
+        hookless("reading an artifact")
+    }
+
+    fn extract_archive(&self, _request: ArchiveRequest) -> GameFuture<'_, ExtractedArchive> {
+        hookless("extracting an archive")
+    }
+
+    fn run_fomod(&self, _request: FomodRequest) -> GameFuture<'_, FomodResult> {
+        hookless("running a FOMOD installer")
+    }
+
+    fn sort_load_order(
+        &self,
+        _request: SortLoadOrderRequest,
+    ) -> GameFuture<'_, agora_game_api::LoadOrder> {
+        hookless("sorting another load order")
+    }
+
+    fn run_tool(&self, _request: ToolRunRequest) -> GameFuture<'_, ToolRunResult> {
+        hookless("running a tool")
+    }
+
+    fn emit_event(&self, _event: GameEvent) -> GameResult<()> {
+        Err(GameError {
+            code: "host_unavailable".into(),
+            message: "events are not available while reading a load order".into(),
+        })
+    }
+}
+
+/// Drive a package hook from core's synchronous code. Called on a blocking thread under the
+/// desktop's multi-thread runtime, or on a plain thread in the CLI and tests.
+fn block_on_hook<F: Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(future),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for a package hook")
+            .block_on(future),
+    }
+}
+
+fn package_of<'a>(
+    ctx: &'a Ctx,
+    definition: &GameDefinition,
+) -> Result<&'a std::sync::Arc<dyn GamePackage>, LoadOrderError> {
+    ctx.games
+        .package_for(&definition.id)
+        .ok_or_else(|| LoadOrderError::NoPackage(definition.id.as_str().to_string()))
+}
+
+/// The context a load-order hook runs with: the instance, its runtime, layers and the list as it
+/// stands before the hook decides anything.
+fn hook_context(
+    ctx: &Ctx,
+    instance_id: &str,
+    _definition: &GameDefinition,
+    _rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+) -> Result<GameContext, LoadOrderError> {
+    let manifest = crate::game_instance::get_manifest(ctx, instance_id).map_err(|error| {
+        LoadOrderError::Files {
+            instance_id: instance_id.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    let runtime = manifest
+        .runtime_identity
+        .clone()
+        .ok_or_else(|| LoadOrderError::Files {
+            instance_id: instance_id.to_string(),
+            reason: "the instance has no runtime yet".to_string(),
+        })?;
+    let load_order = agora_game_api::LoadOrder {
+        entries: entries
+            .iter()
+            .map(|entry| agora_game_api::LoadOrderEntry {
+                id: entry.name.clone(),
+                enabled: entry.active,
+                locked: entry.locked,
+            })
+            .collect(),
+        rules: Vec::new(),
+    };
+    Ok(GameContext {
+        instance: instance_id.to_string(),
+        runtime,
+        base: Some(manifest.base.clone()),
+        frameworks: manifest.frameworks.clone(),
+        layers: manifest.layers.clone(),
+        load_order,
+        settings: BTreeMap::new(),
+    })
+}
+
+/// Ask a package for a script list's rules. `None` is a failure, not "no rules".
+pub(crate) fn call_load_order_rules(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+) -> Result<Vec<LoadOrderRule>, String> {
+    let package = package_of(ctx, definition).map_err(|error| error.to_string())?;
+    let context = hook_context(ctx, instance_id, definition, rule, entries)
+        .map_err(|error| error.to_string())?;
+    let host = HooklessHost;
+    let result = block_on_hook(package.load_order_rules(&host, context, &rule.id))
+        .map_err(|error| error.message)?;
+    result.ok_or_else(|| {
+        format!(
+            "the package declares script rules for '{}' but returned none",
+            rule.id
+        )
+    })
+}
+
+/// Read a script list through its package's parse hook.
+pub(crate) fn call_parse_format(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    bytes: Vec<u8>,
+) -> Result<Vec<LoadOrderLine>, String> {
+    let package = package_of(ctx, definition).map_err(|error| error.to_string())?;
+    let context =
+        hook_context(ctx, instance_id, definition, rule, &[]).map_err(|error| error.to_string())?;
+    let host = HooklessHost;
+    let result = block_on_hook(package.parse_load_order(&host, context, &rule.id, bytes))
+        .map_err(|error| error.message)?;
+    result.ok_or_else(|| {
+        format!(
+            "the package declares a script format for '{}' but cannot parse it",
+            rule.id
+        )
+    })
+}
+
+/// Render a script list through its package's render hook. The bytes go to the list's declared
+/// file; the hook never receives or chooses a path.
+pub(crate) fn call_render_format(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    lines: Vec<LoadOrderLine>,
+) -> Result<Vec<u8>, String> {
+    let package = package_of(ctx, definition).map_err(|error| error.to_string())?;
+    let context =
+        hook_context(ctx, instance_id, definition, rule, &[]).map_err(|error| error.to_string())?;
+    let host = HooklessHost;
+    let result = block_on_hook(package.render_load_order(&host, context, &rule.id, lines))
+        .map_err(|error| error.message)?;
+    result.ok_or_else(|| {
+        format!(
+            "the package declares a script format for '{}' but cannot render it",
+            rule.id
+        )
+    })
+}
+
 /// The plugin names in a game's `implicit_list_file`, one per line, in the file's order.
 pub fn parse_implicit_list(text: &str) -> Vec<String> {
     text.trim_start_matches('\u{feff}')
@@ -430,6 +716,9 @@ pub fn build_order(
 
     let findings = findings(&entries);
     LoadOrder {
+        list_id: rule.id.clone(),
+        list_name: rule.name.clone(),
+        rules_kind: rule.rules.kind.clone(),
         engine,
         exists,
         entries,
@@ -598,6 +887,156 @@ pub fn findings(entries: &[LoadOrderEntry]) -> Vec<Finding> {
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Script rules
+//
+// A `script` list returns `LoadOrderRule`s. Core turns them into the same "must come before"
+// edges the Creation Engine's masters use, so the ordering and cycle check are shared. Missing
+// items and conflicts (which are not an ordering) are findings of their own.
+// ---------------------------------------------------------------------------
+
+fn rule_prerequisites(
+    entries: &[LoadOrderEntry],
+    rules: &[LoadOrderRule],
+    list: &str,
+) -> (HashMap<String, Vec<String>>, Vec<Finding>) {
+    let known = |name: &str| entries.iter().any(|entry| key(&entry.name) == key(name));
+    let mut prereqs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut findings = Vec::new();
+    for rule in rules {
+        match rule {
+            LoadOrderRule::Requires { item, master } => {
+                for name in [item, master] {
+                    if !known(name) {
+                        findings.push(Finding::MissingRuleItem {
+                            list: list.to_string(),
+                            item: name.clone(),
+                            rule: "requires".to_string(),
+                        });
+                    }
+                }
+                if known(item) && known(master) {
+                    let edges = prereqs.entry(key(item)).or_default();
+                    if !edges.iter().any(|edge| key(edge) == key(master)) {
+                        edges.push(master.clone());
+                    }
+                }
+            }
+            LoadOrderRule::Before { first, second } => {
+                for name in [first, second] {
+                    if !known(name) {
+                        findings.push(Finding::MissingRuleItem {
+                            list: list.to_string(),
+                            item: name.clone(),
+                            rule: "before".to_string(),
+                        });
+                    }
+                }
+                if known(first) && known(second) {
+                    let edges = prereqs.entry(key(second)).or_default();
+                    if !edges.iter().any(|edge| key(edge) == key(first)) {
+                        edges.push(first.clone());
+                    }
+                }
+            }
+            LoadOrderRule::Conflicts { first, second } => {
+                for name in [first, second] {
+                    if !known(name) {
+                        findings.push(Finding::MissingRuleItem {
+                            list: list.to_string(),
+                            item: name.clone(),
+                            rule: "conflicts".to_string(),
+                        });
+                    }
+                }
+                let active = |name: &str| {
+                    entries
+                        .iter()
+                        .any(|entry| key(&entry.name) == key(name) && loads(entry))
+                };
+                if active(first) && active(second) {
+                    findings.push(Finding::RuleConflict {
+                        list: list.to_string(),
+                        first: first.clone(),
+                        second: second.clone(),
+                    });
+                }
+            }
+        }
+    }
+    (prereqs, findings)
+}
+
+/// The findings a script list's rules raise against its current order: missing items, conflicts,
+/// late prerequisites, and cycles. Pure, like [`findings`].
+pub fn script_findings(
+    entries: &[LoadOrderEntry],
+    rules: &[LoadOrderRule],
+    list: &str,
+) -> Vec<Finding> {
+    let (prereqs, mut out) = rule_prerequisites(entries, rules, list);
+    for (at, entry) in entries.iter().enumerate() {
+        if !loads(entry) {
+            continue;
+        }
+        let Some(masters) = prereqs.get(&key(&entry.name)) else {
+            continue;
+        };
+        let mut reported: HashSet<String> = HashSet::new();
+        for master in masters {
+            let k = key(master);
+            if !reported.insert(k.clone()) || master_loads_before(entries, at, &k) {
+                continue;
+            }
+            out.push(Finding::MasterNotEarlier {
+                plugin: entry.name.clone(),
+                master: master.clone(),
+                problem: master_problem(entries, at, &k),
+            });
+        }
+    }
+
+    let mut scratch = entries.to_vec();
+    for entry in &mut scratch {
+        let masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
+        entry.header_read = !masters.is_empty();
+        entry.masters = masters;
+    }
+    for group in cycle_groups(&scratch) {
+        out.push(Finding::MasterCycle {
+            plugins: group
+                .iter()
+                .map(|&index| scratch[index].name.clone())
+                .collect(),
+        });
+    }
+    out
+}
+
+/// Sort a script list by its rules, reusing the same fixed slots and cycle handling as the
+/// Creation Engine sort. The scratch entries carry the rule edges as masters; the returned entries
+/// carry none of that, so the order reads as it did.
+pub fn script_sort(
+    entries: &mut [LoadOrderEntry],
+    rules: &[LoadOrderRule],
+    list: &str,
+) -> Result<(Vec<SortMove>, Vec<Blocked>), LoadOrderError> {
+    let (prereqs, _) = rule_prerequisites(entries, rules, list);
+    let mut scratch = entries.to_vec();
+    for entry in &mut scratch {
+        let masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
+        entry.header_read = !masters.is_empty();
+        entry.masters = masters;
+    }
+    let (moves, blocked) = sort_entries(&mut scratch)?;
+    for entry in &mut scratch {
+        entry.masters.clear();
+        entry.header_read = false;
+    }
+    entries.clone_from_slice(&scratch);
+    Ok((moves, blocked))
 }
 
 // ---------------------------------------------------------------------------
@@ -902,11 +1341,11 @@ pub fn move_entry(
 // Entry points
 // ---------------------------------------------------------------------------
 
-fn rule_of(definition: &GameDefinition) -> Result<&LoadOrderDefinition, LoadOrderError> {
-    definition
-        .load_orders
-        .first()
-        .ok_or_else(|| PluginListError::NoRule(definition.id.clone()).into())
+fn rule_of<'a>(
+    definition: &'a GameDefinition,
+    list_id: Option<&str>,
+) -> Result<&'a LoadOrderDefinition, LoadOrderError> {
+    list_by_id(definition, list_id)
 }
 
 /// The names a game's `implicit_list_file` holds, as the instance's deployment provides it. Empty
@@ -917,17 +1356,18 @@ pub fn implicit_list_names(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<Vec<String>, LoadOrderError> {
-    implicit_list_names_with_view(ctx, instance_id, definition, None)
+    implicit_list_names_in(ctx, instance_id, definition, None, None)
 }
 
-/// [`implicit_list_names`], reading `links` (the instance's Links plan) instead of planning again.
-pub(crate) fn implicit_list_names_with_view(
+/// [`implicit_list_names`] for one list; `None` names the game's first list.
+pub fn implicit_list_names_in(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    list_id: Option<&str>,
     links: Option<&DeploymentPlan>,
 ) -> Result<Vec<String>, LoadOrderError> {
-    let rule = rule_of(definition)?;
+    let rule = rule_of(definition, list_id)?;
     let (_, names) = installed_files(ctx, instance_id, definition, rule, links)?;
     Ok(names)
 }
@@ -976,6 +1416,23 @@ fn installed_files(
             list_path = Some(game_deploy::source_path(ctx, &file.source));
             continue;
         }
+        if rule.items.folders {
+            // A folder is an item when it sits directly under the list's folder.
+            let prefix = format!("{folder}/");
+            let Some(rest) = path.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let Some(name) = rest.split('/').next().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let lower = key(name);
+            if patterns.iter().any(|p| glob_match(p, &lower)) {
+                installed
+                    .entry(lower)
+                    .or_insert_with(|| game_deploy::source_path(ctx, &file.source));
+            }
+            continue;
+        }
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
         if fold_path_case(parent) != fold_path_case(folder) {
             continue;
@@ -1006,7 +1463,36 @@ pub fn plan_for_order(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<Option<DeploymentPlan>, LoadOrderError> {
-    if !is_engine(rule_of(definition)?) {
+    plan_for_order_in(ctx, instance_id, definition, None)
+}
+
+/// The Links plan any of the game's lists reads, planned once. `None` when no list reads one,
+/// including a game with no lists.
+pub fn plan_for_instance(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<Option<DeploymentPlan>, LoadOrderError> {
+    if !any_needs_plan(definition) {
+        return Ok(None);
+    }
+    game_deploy::plan(ctx, instance_id, definition, DeployMode::Links)
+        .map(Some)
+        .map_err(|e| LoadOrderError::Files {
+            instance_id: instance_id.to_string(),
+            reason: e.to_string(),
+        })
+}
+
+/// [`plan_for_order`] for one list; `None` names the game's first list.
+pub fn plan_for_order_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Option<DeploymentPlan>, LoadOrderError> {
+    let rule = rule_of(definition, list_id)?;
+    if !(is_engine(rule) || rule.rules.kind == "script" || rule.items.folders) {
         return Ok(None);
     }
     game_deploy::plan(ctx, instance_id, definition, DeployMode::Links)
@@ -1022,29 +1508,35 @@ fn order_of(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<LoadOrder, LoadOrderError> {
-    order_of_with_view(ctx, instance_id, definition, None)
+    order_of_with_view(ctx, instance_id, definition, None, None)
 }
 
 fn order_of_with_view(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    list_id: Option<&str>,
     links: Option<&DeploymentPlan>,
 ) -> Result<LoadOrder, LoadOrderError> {
-    let rule = rule_of(definition)?;
-    let listed = game_plugins::list(ctx, instance_id, definition)?;
+    let rule = rule_of(definition, list_id)?;
+    let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let needs_view = is_engine(rule) || rule.rules.kind == "script" || rule.items.folders;
+    if !needs_view {
+        return Ok(build_order(rule, &listed.entries, None, &[], listed.exists));
+    }
+
+    let (installed, names) = installed_files(ctx, instance_id, definition, rule, links)?;
+    let mut order = build_order(
+        rule,
+        &listed.entries,
+        Some(&installed),
+        &names,
+        listed.exists,
+    );
     if is_engine(rule) {
-        let (installed, names) = installed_files(ctx, instance_id, definition, rule, links)?;
-        let mut order = build_order(
-            rule,
-            &listed.entries,
-            Some(&installed),
-            &names,
-            listed.exists,
-        );
         if let (Some(loot), Ok(Some(cached))) = (
             rule.rules.loot.as_ref(),
-            crate::loot_masterlist::cached(ctx, definition),
+            crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id)),
         ) {
             if let Ok(notes) =
                 crate::loot_masterlist::notes(&order.entries, &installed, loot, &cached)
@@ -1052,10 +1544,20 @@ fn order_of_with_view(
                 order.notes = notes;
             }
         }
-        Ok(order)
-    } else {
-        Ok(build_order(rule, &listed.entries, None, &[], listed.exists))
+    } else if rule.rules.kind == "script" {
+        match call_load_order_rules(ctx, instance_id, definition, rule, &order.entries) {
+            Ok(rules) => {
+                order
+                    .findings
+                    .extend(script_findings(&order.entries, &rules, &rule.id));
+            }
+            Err(reason) => order.findings.push(Finding::RulesFailed {
+                list: rule.id.clone(),
+                reason,
+            }),
+        }
     }
+    Ok(order)
 }
 
 /// The instance's load order, with what the game's rules say about it.
@@ -1067,15 +1569,44 @@ pub fn order(
     order_of(ctx, instance_id, definition)
 }
 
-/// [`order`], reading `links` (the instance's Links plan, see [`crate::game_deploy`]) instead of
-/// planning again. `None` plans it.
-pub(crate) fn order_with_view(
+/// [`order`] for one list; `None` names the game's first list. An id the game does not declare is
+/// an error.
+pub fn order_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<LoadOrder, LoadOrderError> {
+    order_of_with_view(ctx, instance_id, definition, list_id, None)
+}
+
+/// Every list the game keeps, in the order it declares them. A game with no lists gives an empty
+/// result, not an error.
+pub fn orders(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<Vec<LoadOrder>, LoadOrderError> {
+    definition
+        .load_orders
+        .iter()
+        .map(|rule| order_of_with_view(ctx, instance_id, definition, Some(&rule.id), None))
+        .collect()
+}
+
+/// Every list's order, reading `links` instead of planning once per list. A game with no lists
+/// gives an empty result.
+pub(crate) fn orders_with_view(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     links: Option<&DeploymentPlan>,
-) -> Result<LoadOrder, LoadOrderError> {
-    order_of_with_view(ctx, instance_id, definition, links)
+) -> Result<Vec<LoadOrder>, LoadOrderError> {
+    definition
+        .load_orders
+        .iter()
+        .map(|rule| order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links))
+        .collect()
 }
 
 /// The findings against the instance's order. A launch check calls this and acts on the result.
@@ -1087,20 +1618,49 @@ pub fn check(
     Ok(order_of(ctx, instance_id, definition)?.findings)
 }
 
-/// [`check`], reading `links` (the instance's Links plan) instead of planning again. `None` plans it.
-pub(crate) fn check_with_view(
+/// [`check`] for one list; `None` names the game's first list.
+pub fn check_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Vec<Finding>, LoadOrderError> {
+    Ok(order_of_with_view(ctx, instance_id, definition, list_id, None)?.findings)
+}
+
+/// The findings against every list the game keeps. A game with no lists has none.
+pub fn check_all(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<Vec<Finding>, LoadOrderError> {
+    orders(ctx, instance_id, definition)
+        .map(|all| all.into_iter().flat_map(|order| order.findings).collect())
+}
+
+/// [`check_all`], reading `links` instead of planning again.
+pub(crate) fn check_all_with_view(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     links: Option<&DeploymentPlan>,
 ) -> Result<Vec<Finding>, LoadOrderError> {
-    Ok(order_of_with_view(ctx, instance_id, definition, links)?.findings)
+    definition
+        .load_orders
+        .iter()
+        .map(|rule| {
+            order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links)
+                .map(|order| order.findings)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|all| all.into_iter().flatten().collect())
 }
 
 fn write_entries(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
     entries: &[LoadOrderEntry],
 ) -> Result<(), LoadOrderError> {
     let order: Vec<(String, bool)> = entries
@@ -1108,19 +1668,30 @@ fn write_entries(
         .filter(|e| !e.implicit)
         .map(|e| (e.name.clone(), e.active))
         .collect();
-    game_plugins::write_order_locked(ctx, instance_id, definition, &order)?;
+    game_plugins::write_order_locked_in(ctx, instance_id, definition, Some(&rule.id), &order)?;
     Ok(())
 }
 
 /// Sort the instance's list so masters come before the plugins that need them. With `dry_run` it
-/// reports the moves and writes nothing. Requires the Creation Engine rules.
+/// reports the moves and writes nothing.
 pub fn sort(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     dry_run: bool,
 ) -> Result<SortReport, LoadOrderError> {
-    Ok(sort_inner(ctx, instance_id, definition, dry_run, false)?.0)
+    Ok(sort_inner(ctx, instance_id, definition, None, dry_run, false)?.0)
+}
+
+/// [`sort`] for one list; `None` names the game's first list.
+pub fn sort_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    dry_run: bool,
+) -> Result<SortReport, LoadOrderError> {
+    Ok(sort_inner(ctx, instance_id, definition, list_id, dry_run, false)?.0)
 }
 
 /// [`sort`], then the instance's load order as it stands afterwards. Both read the installed
@@ -1131,7 +1702,19 @@ pub fn sort_and_order(
     definition: &GameDefinition,
     dry_run: bool,
 ) -> Result<(SortReport, LoadOrder), LoadOrderError> {
-    let (report, order) = sort_inner(ctx, instance_id, definition, dry_run, true)?;
+    let (report, order) = sort_inner(ctx, instance_id, definition, None, dry_run, true)?;
+    Ok((report, order.expect("the order was asked for")))
+}
+
+/// [`sort_and_order`] for one list; `None` names the game's first list.
+pub fn sort_and_order_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    dry_run: bool,
+) -> Result<(SortReport, LoadOrder), LoadOrderError> {
+    let (report, order) = sort_inner(ctx, instance_id, definition, list_id, dry_run, true)?;
     Ok((report, order.expect("the order was asked for")))
 }
 
@@ -1139,11 +1722,15 @@ fn sort_inner(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    list_id: Option<&str>,
     dry_run: bool,
     want_order: bool,
 ) -> Result<(SortReport, Option<LoadOrder>), LoadOrderError> {
-    let rule = rule_of(definition)?;
-    if !is_engine(rule) {
+    let rule = rule_of(definition, list_id)?;
+    if rule.rules.kind == "none" {
+        return Err(LoadOrderError::NoSort(rule.id.clone()));
+    }
+    if !is_engine(rule) && rule.rules.kind != "script" {
         return Err(LoadOrderError::NoRules(definition.id.as_str().to_string()));
     }
     let _lock = ctx
@@ -1153,8 +1740,8 @@ fn sort_inner(
             "plugins-order",
         )
         .map_err(PluginListError::from)?;
-    let links = plan_for_order(ctx, instance_id, definition)?;
-    let listed = game_plugins::list(ctx, instance_id, definition)?;
+    let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
     let (installed, names) = installed_files(ctx, instance_id, definition, rule, links.as_ref())?;
     let mut entries = build_order(
         rule,
@@ -1165,62 +1752,73 @@ fn sort_inner(
     )
     .entries;
 
-    let mut counted: HashMap<String, usize> = HashMap::new();
-    let mut duplicated = false;
-    for entry in entries.iter().filter(|entry| !entry.implicit) {
-        let count = counted.entry(key(&entry.name)).or_insert(0);
-        *count += 1;
-        duplicated |= *count > 1;
-    }
-    let unreadable = entries
-        .iter()
-        .any(|entry| entry.present && entry.header_error.is_some());
-
     let mut notes = Vec::new();
     let mut mode = SortMode::Masters;
     let mut message = None;
-    let (moves, blocked) = match &rule.rules.loot {
-        Some(loot) if !duplicated && !unreadable => {
-            match crate::loot_masterlist::cached(ctx, definition)? {
-                Some(cached) => match crate::loot_masterlist::sort_and_notes(
-                    &entries, &installed, loot, &cached,
-                ) {
-                    Ok(outcome) => {
-                        let moves = apply_loot_order(&mut entries, &outcome.order)?;
-                        notes = outcome.notes;
-                        let fixed = Fixed::of(&entries);
-                        let blocked = blocked_of(&entries, &fixed);
-                        mode = SortMode::Loot;
-                        (moves, blocked)
-                    }
-                    Err(LoadOrderError::Masterlist { .. }) => {
-                        message = Some(CACHED_MASTERLIST_UNREADABLE.to_string());
+    let (moves, blocked) = if rule.rules.kind == "script" {
+        let rules = call_load_order_rules(ctx, instance_id, definition, rule, &entries).map_err(
+            |reason| LoadOrderError::RulesScript {
+                list: rule.id.clone(),
+                reason,
+            },
+        )?;
+        script_sort(&mut entries, &rules, &rule.id)?
+    } else {
+        let mut counted: HashMap<String, usize> = HashMap::new();
+        let mut duplicated = false;
+        for entry in entries.iter().filter(|entry| !entry.implicit) {
+            let count = counted.entry(key(&entry.name)).or_insert(0);
+            *count += 1;
+            duplicated |= *count > 1;
+        }
+        let unreadable = entries
+            .iter()
+            .any(|entry| entry.present && entry.header_error.is_some());
+
+        match &rule.rules.loot {
+            Some(loot) if !duplicated && !unreadable => {
+                match crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id))? {
+                    Some(cached) => match crate::loot_masterlist::sort_and_notes(
+                        &entries, &installed, loot, &cached,
+                    ) {
+                        Ok(outcome) => {
+                            let moves = apply_loot_order(&mut entries, &outcome.order)?;
+                            notes = outcome.notes;
+                            let fixed = Fixed::of(&entries);
+                            let blocked = blocked_of(&entries, &fixed);
+                            mode = SortMode::Loot;
+                            (moves, blocked)
+                        }
+                        Err(LoadOrderError::Masterlist { .. }) => {
+                            message = Some(CACHED_MASTERLIST_UNREADABLE.to_string());
+                            sort_entries(&mut entries)?
+                        }
+                        Err(error) => return Err(error),
+                    },
+                    None => {
+                        message = Some(MASTERS_ONLY_MESSAGE.to_string());
                         sort_entries(&mut entries)?
                     }
-                    Err(error) => return Err(error),
-                },
-                None => {
-                    message = Some(MASTERS_ONLY_MESSAGE.to_string());
-                    sort_entries(&mut entries)?
                 }
             }
+            Some(_) => {
+                message = Some(
+                    "A plugin is listed twice or its header cannot be read, so LOOT cannot sort it.                  Sorted by masters only."
+                        .to_string(),
+                );
+                sort_entries(&mut entries)?
+            }
+            None => sort_entries(&mut entries)?,
         }
-        Some(_) => {
-            message = Some(
-                "A plugin is listed twice or its header cannot be read, so LOOT cannot sort it.                  Sorted by masters only."
-                    .to_string(),
-            );
-            sort_entries(&mut entries)?
-        }
-        None => sort_entries(&mut entries)?,
     };
 
     let written = !dry_run && !moves.is_empty();
     if written {
-        write_entries(ctx, instance_id, definition, &entries)?;
+        write_entries(ctx, instance_id, definition, rule, &entries)?;
     }
     let order = if want_order {
-        let mut order = order_of_with_view(ctx, instance_id, definition, links.as_ref())?;
+        let mut order =
+            order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links.as_ref())?;
         order.notes = notes;
         Some(order)
     } else {
@@ -1246,7 +1844,19 @@ pub fn move_plugin(
     plugin: &str,
     target: &MoveTarget,
 ) -> Result<MoveReport, LoadOrderError> {
-    Ok(move_inner(ctx, instance_id, definition, plugin, target, false)?.0)
+    Ok(move_inner(ctx, instance_id, definition, None, plugin, target, false)?.0)
+}
+
+/// [`move_plugin`] for one list; `None` names the game's first list.
+pub fn move_plugin_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    plugin: &str,
+    target: &MoveTarget,
+) -> Result<MoveReport, LoadOrderError> {
+    Ok(move_inner(ctx, instance_id, definition, list_id, plugin, target, false)?.0)
 }
 
 /// [`move_plugin`], then the instance's load order as it stands afterwards. Both read the installed
@@ -1258,7 +1868,20 @@ pub fn move_plugin_and_order(
     plugin: &str,
     target: &MoveTarget,
 ) -> Result<(MoveReport, LoadOrder), LoadOrderError> {
-    let (report, order) = move_inner(ctx, instance_id, definition, plugin, target, true)?;
+    let (report, order) = move_inner(ctx, instance_id, definition, None, plugin, target, true)?;
+    Ok((report, order.expect("the order was asked for")))
+}
+
+/// [`move_plugin_and_order`] for one list; `None` names the game's first list.
+pub fn move_plugin_and_order_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    plugin: &str,
+    target: &MoveTarget,
+) -> Result<(MoveReport, LoadOrder), LoadOrderError> {
+    let (report, order) = move_inner(ctx, instance_id, definition, list_id, plugin, target, true)?;
     Ok((report, order.expect("the order was asked for")))
 }
 
@@ -1266,11 +1889,12 @@ fn move_inner(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    list_id: Option<&str>,
     plugin: &str,
     target: &MoveTarget,
     want_order: bool,
 ) -> Result<(MoveReport, Option<LoadOrder>), LoadOrderError> {
-    rule_of(definition)?;
+    let rule = rule_of(definition, list_id)?;
     let _lock = ctx
         .lock_manager
         .acquire(
@@ -1278,18 +1902,20 @@ fn move_inner(
             "plugins-order",
         )
         .map_err(PluginListError::from)?;
-    let links = plan_for_order(ctx, instance_id, definition)?;
-    let mut entries = order_of_with_view(ctx, instance_id, definition, links.as_ref())?.entries;
+    let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let mut entries =
+        order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links.as_ref())?.entries;
     let (name, from, to) = move_entry(&mut entries, plugin, target)?;
     let written = from != to;
     if written {
-        write_entries(ctx, instance_id, definition, &entries)?;
+        write_entries(ctx, instance_id, definition, rule, &entries)?;
     }
     let order = if want_order {
         Some(order_of_with_view(
             ctx,
             instance_id,
             definition,
+            Some(&rule.id),
             links.as_ref(),
         )?)
     } else {

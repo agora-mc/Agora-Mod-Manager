@@ -401,15 +401,29 @@ pub fn build_manifest(
 
     // Load order.
     if !definition.load_orders.is_empty() {
-        match crate::game_plugins::list(ctx, instance_id, definition) {
-            Ok(list) => {
-                let mut hasher = Sha256::new();
-                for entry in &list.entries {
-                    hasher.update(format!("{}\t{}\n", entry.name, entry.active).as_bytes());
+        let mut hasher = Sha256::new();
+        let mut failed = false;
+        for rule in &definition.load_orders {
+            match crate::game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id)) {
+                Ok(list) => {
+                    for entry in &list.entries {
+                        hasher.update(
+                            format!("{}\t{}\t{}\n", rule.id, entry.name, entry.active).as_bytes(),
+                        );
+                    }
                 }
-                manifest.load_orders_hash = Some(hex::encode(hasher.finalize()));
+                Err(e) => {
+                    failed = true;
+                    manifest
+                        .unreadable
+                        .push(format!("load order '{}': {e}", rule.id));
+                }
             }
-            Err(e) => manifest.unreadable.push(format!("load order: {e}")),
+        }
+        if failed {
+            manifest.load_orders_hash = None;
+        } else {
+            manifest.load_orders_hash = Some(hex::encode(hasher.finalize()));
         }
     } else {
         manifest.load_orders_hash = Some(sha_hex(b""));

@@ -208,7 +208,11 @@ fn finding_view(finding: &Finding) -> PluginFinding {
         | Finding::UnreadableHeader { plugin, .. }
         | Finding::DuplicateListing { plugin } => vec![plugin.clone()],
         Finding::MasterCycle { plugins } => plugins.clone(),
-        Finding::TooManyFullPlugins { .. } | Finding::TooManyLightPlugins { .. } => Vec::new(),
+        Finding::RuleConflict { first, second, .. } => vec![first.clone(), second.clone()],
+        Finding::MissingRuleItem { item, .. } => vec![item.clone()],
+        Finding::TooManyFullPlugins { .. }
+        | Finding::TooManyLightPlugins { .. }
+        | Finding::RulesFailed { .. } => Vec::new(),
     };
     PluginFinding {
         message: finding.message(),
@@ -290,21 +294,19 @@ pub struct SortChange {
 pub async fn games_plugins_list(
     app: tauri::AppHandle,
     instance_id: String,
+    list_id: Option<String>,
 ) -> Result<PluginsView, GamesError> {
     run_blocking(app, "Reading the plugin list", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
         if definition.load_orders.is_empty() {
             return Ok(PluginsView::unsupported());
         }
-        let order = load_order::order(&ctx, &instance_id, definition).map_err(core_failed)?;
+        let order = load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref())
+            .map_err(core_failed)?;
         let mut view = PluginsView::from_order(&order);
-        if definition
-            .load_orders
-            .first()
-            .and_then(|rule| rule.rules.loot.as_ref())
-            .is_some()
-        {
-            view.masterlist = loot_masterlist::cached(&ctx, definition)
+        let rule = load_order::list_by_id(definition, list_id.as_deref()).map_err(core_failed)?;
+        if rule.rules.loot.is_some() {
+            view.masterlist = loot_masterlist::cached_in(&ctx, definition, Some(&rule.id))
                 .map_err(core_failed)?
                 .map(|cached| MasterlistView::from_status(&cached.status));
         }
@@ -318,10 +320,12 @@ pub async fn games_plugins_list(
 pub async fn games_plugins_update_masterlist(
     app: tauri::AppHandle,
     instance_id: String,
+    list_id: Option<String>,
 ) -> Result<MasterlistView, GamesError> {
     run_blocking(app, "Updating the masterlist", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        let status = loot_masterlist::update(&ctx, definition).map_err(core_failed)?;
+        let status = loot_masterlist::update_in(&ctx, definition, list_id.as_deref())
+            .map_err(core_failed)?;
         Ok(MasterlistView::from_status(&status))
     })
     .await
@@ -334,13 +338,24 @@ pub async fn games_plugins_set_active(
     instance_id: String,
     plugin: String,
     active: bool,
+    list_id: Option<String>,
 ) -> Result<PluginChange, GamesError> {
     run_blocking(app, "Changing the plugin", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        let changed = game_plugins::set_active(&ctx, &instance_id, definition, &plugin, active)
-            .map_err(core_failed)?;
+        let changed = game_plugins::set_active_in(
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+            &plugin,
+            active,
+        )
+        .map_err(core_failed)?;
         // The change is saved: a failed re-read must not turn it into a reported failure.
-        plugin_change_after_save(changed, load_order::order(&ctx, &instance_id, definition))
+        plugin_change_after_save(
+            changed,
+            load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref()),
+        )
     })
     .await
 }
@@ -352,13 +367,24 @@ pub async fn games_plugins_set_locked(
     instance_id: String,
     plugin: String,
     locked: bool,
+    list_id: Option<String>,
 ) -> Result<PluginChange, GamesError> {
     run_blocking(app, "Changing the lock", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        let changed = game_plugins::set_locked(&ctx, &instance_id, definition, &plugin, locked)
-            .map_err(core_failed)?;
+        let changed = game_plugins::set_locked_in(
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+            &plugin,
+            locked,
+        )
+        .map_err(core_failed)?;
         // The change is saved: a failed re-read must not turn it into a reported failure.
-        plugin_change_after_save(changed, load_order::order(&ctx, &instance_id, definition))
+        plugin_change_after_save(
+            changed,
+            load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref()),
+        )
     })
     .await
 }
@@ -370,14 +396,16 @@ pub async fn games_plugins_move(
     instance_id: String,
     plugin: String,
     to: usize,
+    list_id: Option<String>,
 ) -> Result<MoveChange, GamesError> {
     run_blocking(app, "Moving the plugin", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
         // One deployment plan serves the move and the order it returns.
-        let (report, order) = load_order::move_plugin_and_order(
+        let (report, order) = load_order::move_plugin_and_order_in(
             &ctx,
             &instance_id,
             definition,
+            list_id.as_deref(),
             &plugin,
             &MoveTarget::Position(to),
         )
@@ -397,12 +425,19 @@ pub async fn games_plugins_sort(
     app: tauri::AppHandle,
     instance_id: String,
     dry_run: bool,
+    list_id: Option<String>,
 ) -> Result<SortChange, GamesError> {
     run_blocking(app, "Sorting the plugins", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
         // One deployment plan serves the sort and the order it returns.
-        let (report, order) = load_order::sort_and_order(&ctx, &instance_id, definition, dry_run)
-            .map_err(core_failed)?;
+        let (report, order) = load_order::sort_and_order_in(
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+            dry_run,
+        )
+        .map_err(core_failed)?;
         Ok(SortChange {
             report,
             plugins: PluginsView::from_order(&order),
@@ -416,6 +451,7 @@ pub async fn games_plugins_sort(
 pub async fn games_plugins_check(
     app: tauri::AppHandle,
     instance_id: String,
+    list_id: Option<String>,
 ) -> Result<CheckView, GamesError> {
     run_blocking(app, "Checking the plugins", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
@@ -425,11 +461,12 @@ pub async fn games_plugins_check(
                 findings: Vec::new(),
             });
         }
-        let findings: Vec<PluginFinding> = load_order::check(&ctx, &instance_id, definition)
-            .map_err(core_failed)?
-            .iter()
-            .map(finding_view)
-            .collect();
+        let findings: Vec<PluginFinding> =
+            load_order::check_in(&ctx, &instance_id, definition, list_id.as_deref())
+                .map_err(core_failed)?
+                .iter()
+                .map(finding_view)
+                .collect();
         Ok(CheckView {
             status: check_status(&findings).to_string(),
             findings,
@@ -462,6 +499,9 @@ mod tests {
 
     fn order(entries: Vec<LoadOrderEntry>, findings: Vec<Finding>) -> LoadOrder {
         LoadOrder {
+            list_id: "plugins".into(),
+            list_name: "Plugins".into(),
+            rules_kind: "creation_engine".into(),
             engine: true,
             exists: true,
             entries,

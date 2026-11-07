@@ -29,6 +29,7 @@ use agora_core::game_instance::{
 };
 use agora_core::game_launch::{LaunchError, LaunchedGame, Launcher, PreparedLaunch};
 use agora_core::game_load_order::{self, MoveTarget};
+use agora_core::game_plugins;
 use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
@@ -1062,6 +1063,62 @@ fn the_fingerprint_changes_with_the_plugin_load_order() {
     .unwrap();
     assert_ne!(before, order(), "the move changed the order");
     assert_ne!(first, fingerprint(), "a changed plugin order changes it");
+}
+
+#[test]
+fn the_fingerprint_changes_when_the_second_list_changes() {
+    let _user_data = UserData::new();
+    let mut f = fixture_with(vec![writes_or_fails("nemesis")], true, true);
+    f.add_mod("Plugins", &[("Data/A.esp", b"A")]);
+    deploy(&f.ctx, f.id(), &f.def, DeployMode::Virtual).unwrap();
+
+    let mut second = plugin_rule();
+    second.id = "second".into();
+    second.name = "Second".into();
+    second.file = RelPath::new("user/Second.txt").unwrap();
+    f.def.load_orders.push(second);
+    f.def.user_files.push(
+        UserFileMapping::new(
+            GamePath::UserData {
+                location: UserDataLocation::LocalAppData,
+                path: RelPath::new("Test Game/Second.txt").unwrap(),
+            },
+            RelPath::new("user/Second.txt").unwrap(),
+            UserFileStrategy::JournaledSwap,
+        )
+        .with_stores(vec![StoreId::steam()]),
+    );
+
+    let tool_def = f
+        .ctx
+        .games
+        .tool(&f.def.id, &ToolId::new("nemesis").unwrap())
+        .unwrap()
+        .clone();
+    let fingerprint = || game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &tool_def).unwrap();
+
+    game_plugins::import_list_in(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        Some("second"),
+        &[("X.esp".into(), true)],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let first = fingerprint();
+    game_plugins::import_list_in(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        Some("second"),
+        &[("Y.esp".into(), true)],
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_ne!(first, fingerprint(), "the second list's change changes it");
 }
 
 #[test]

@@ -1145,10 +1145,12 @@ pub(crate) fn input_fingerprint_with_view(
         }
     }
     if !definition.load_orders.is_empty() {
-        let order = game_load_order::order_with_view(ctx, instance_id, definition, links)
+        let orders = game_load_order::orders_with_view(ctx, instance_id, definition, links)
             .map_err(|e| ToolError::Other(format!("cannot read the load order: {e}")))?;
-        for entry in order.entries.iter().filter(|entry| entry.active) {
-            hasher.update(format!("plugin\t{}\n", entry.name).as_bytes());
+        for order in &orders {
+            for entry in order.entries.iter().filter(|entry| entry.active) {
+                hasher.update(format!("plugin\t{}\t{}\n", order.list_id, entry.name).as_bytes());
+            }
         }
     }
     for setting in &tool.relevant_settings {
@@ -1228,7 +1230,7 @@ fn list_links(
     if definition.load_orders.is_empty() || !matches!(manifest.base, BaseReference::Pinned { .. }) {
         return Ok(None);
     }
-    game_load_order::plan_for_order(ctx, instance_id, definition)
+    game_load_order::plan_for_instance(ctx, instance_id, definition)
         .map_err(|e| ToolError::Other(format!("cannot plan the instance's links: {e}")))
 }
 

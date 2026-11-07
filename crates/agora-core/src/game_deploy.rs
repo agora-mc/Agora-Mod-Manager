@@ -2031,9 +2031,9 @@ fn activate_plugins(
     plan: &DeploymentPlan,
     links: Option<&DeploymentPlan>,
 ) -> Result<Option<crate::game_plugins::PluginSyncReport>, DeployError> {
-    let Some(rule) = definition.load_orders.first() else {
+    if definition.load_orders.is_empty() {
         return Ok(None);
-    };
+    }
     let content_layer_items: Vec<String> = manifest
         .layers
         .layers()
@@ -2043,20 +2043,34 @@ fn activate_plugins(
             _ => None,
         })
         .collect();
-    let desired = crate::game_plugins::desired_plugins(
-        rule,
-        &content_layer_items,
-        plan,
-        base_manifest.files.iter().map(|f| f.path.as_str()),
-    );
-    Ok(crate::game_plugins::sync_locked_with_view(
-        ctx,
-        instance_id,
-        definition,
-        &base_manifest.runtime.store,
-        &desired,
-        links,
-    )?)
+    let base_paths: Vec<&str> = base_manifest
+        .files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    let mut all = crate::game_plugins::PluginSyncReport::default();
+    for rule in &definition.load_orders {
+        let desired = crate::game_plugins::desired_plugins(
+            rule,
+            &content_layer_items,
+            plan,
+            base_paths.iter().copied(),
+        );
+        if let Some(report) = crate::game_plugins::sync_locked_in_with_view(
+            ctx,
+            instance_id,
+            definition,
+            Some(&rule.id),
+            &base_manifest.runtime.store,
+            &desired,
+            links,
+        )? {
+            all.added.extend(report.added);
+            all.removed.extend(report.removed);
+            all.warnings.extend(report.warnings);
+        }
+    }
+    Ok(Some(all))
 }
 
 pub fn undeploy(ctx: &Ctx, instance_id: &str) -> Result<HarvestReport, DeployError> {

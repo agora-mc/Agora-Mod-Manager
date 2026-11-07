@@ -16,8 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    fold_path_case, glob_match, GameDefinition, GameId, LoadOrderDefinition, StoreId,
-    UserFileMapping, UserFileStrategy,
+    fold_path_case, glob_match, GameDefinition, GameId, LoadOrderDefinition, LoadOrderFormat,
+    StoreId, UserFileMapping, UserFileStrategy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,10 @@ const STATE_FILE: &str = "plugin_list_state.json";
 pub enum PluginListError {
     #[error("game '{0}' does not keep a plugin list")]
     NoRule(GameId),
+    #[error("game '{game}' declares no load order named '{list}'")]
+    UnknownList { game: String, list: String },
+    #[error("load order '{list}' could not be read: {reason}")]
+    Format { list: String, reason: String },
     #[error("instance '{0}' not found")]
     InstanceNotFound(String),
     #[error("'{0}' is not in the instance's plugin list")]
@@ -89,15 +93,34 @@ pub struct PluginEntry {
 /// An instance's plugin list, in load order among the listed plugins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginList {
+    /// The list's id within the game.
+    #[serde(default)]
+    pub list_id: String,
+    /// The list's name as a person reads it.
+    #[serde(default)]
+    pub list_name: String,
     pub path: PathBuf,
     /// False when the instance has no copy of the list yet (it has never been deployed).
     pub exists: bool,
     pub entries: Vec<PluginEntry>,
 }
 
-/// `plugin_list_state.json`. A file written before locks existed has only `managed`.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// One list's managed and locked names. A file written before locks existed has only `managed`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct ManagedState {
+    managed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    locked: Vec<String>,
+}
+
+/// `plugin_list_state.json`: one entry per list, so two lists never share managed or locked names.
+/// A file written before several lists (or before locks) has the names at the top; they are read
+/// as the first list's and moved under its id on the next write.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StateFile {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    lists: std::collections::BTreeMap<String, ManagedState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     managed: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     locked: Vec<String>,
@@ -297,10 +320,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PluginListError> {
     Ok(result?)
 }
 
-fn read_state(instance_dir: &Path) -> Result<ManagedState, PluginListError> {
+fn read_state_file(instance_dir: &Path) -> Result<StateFile, PluginListError> {
     let path = instance_dir.join(STATE_FILE);
     match read_optional(&path)? {
-        None => Ok(ManagedState::default()),
+        None => Ok(StateFile::default()),
         Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| PluginListError::CorruptState {
             path,
             reason: e.to_string(),
@@ -308,11 +331,38 @@ fn read_state(instance_dir: &Path) -> Result<ManagedState, PluginListError> {
     }
 }
 
-fn write_state(instance_dir: &Path, state: &ManagedState) -> Result<(), PluginListError> {
+/// One list's state. A file from before several lists keeps its names at the top; they are the
+/// first list's, so they are handed to `list_id` and moved under it by the next write.
+fn state_of(mut file: StateFile, list_id: &str) -> ManagedState {
+    if let Some(state) = file.lists.remove(list_id) {
+        return state;
+    }
+    if file.lists.is_empty() && (!file.managed.is_empty() || !file.locked.is_empty()) {
+        return ManagedState {
+            managed: std::mem::take(&mut file.managed),
+            locked: std::mem::take(&mut file.locked),
+        };
+    }
+    ManagedState::default()
+}
+
+fn write_state(instance_dir: &Path, state: &StateFile) -> Result<(), PluginListError> {
     write_atomic(
         &instance_dir.join(STATE_FILE),
         &serde_json::to_vec_pretty(state)?,
     )
+}
+
+fn store_state(
+    instance_dir: &Path,
+    list_id: &str,
+    state: ManagedState,
+) -> Result<(), PluginListError> {
+    let mut file = read_state_file(instance_dir)?;
+    file.lists.insert(list_id.to_string(), state);
+    file.managed.clear();
+    file.locked.clear();
+    write_state(instance_dir, &file)
 }
 
 fn user_file_mapping<'a>(
@@ -362,12 +412,13 @@ fn recover_stale_session(
 /// it, else the rule's header.
 fn starting_contents(
     ctx: &Ctx,
+    instance_id: &str,
     definition: &GameDefinition,
     store: &StoreId,
     mapping: &UserFileMapping,
     rule: &LoadOrderDefinition,
     report: &mut PluginSyncReport,
-) -> Result<ListFile, PluginListError> {
+) -> Result<ListDoc, PluginListError> {
     let journal = ctx
         .paths
         .user_files_journal_path(definition.id.as_str(), store.as_str());
@@ -378,12 +429,12 @@ fn starting_contents(
              game's header instead of your current list"
                 .to_string(),
         );
-        return Ok(ListFile::from_header(rule));
+        return Ok(blank_doc(rule));
     }
     let real = crate::game_user_files::resolve_user_file_source(&mapping.source)?;
     Ok(match read_optional(&real)? {
-        Some(bytes) => ListFile::parse(&bytes),
-        None => ListFile::from_header(rule),
+        Some(bytes) => parse_doc(ctx, instance_id, definition, rule, bytes)?,
+        None => blank_doc(rule),
     })
 }
 
@@ -431,6 +482,28 @@ pub fn desired_plugins<'a>(
             continue;
         };
         let path = file.path.as_str();
+        if rule.items.folders {
+            // A list of folders orders the folder directly under `items.folder`, not each file.
+            let prefix = format!("{}/", folder.trim_matches('/'));
+            let Some(rest) = path.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            let Some(name) = rest.split('/').next().filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let lower = fold_path_case(name);
+            let Some(pattern_rank) = patterns
+                .iter()
+                .position(|p| !p.is_empty() && glob_match(p, &lower))
+            else {
+                continue;
+            };
+            let Some(layer_rank) = content_layer_items.iter().position(|i| i == item_id) else {
+                continue;
+            };
+            found.push((layer_rank, pattern_rank, lower, name.to_string()));
+            continue;
+        }
         let (parent, name) = match path.rsplit_once('/') {
             Some((parent, name)) => (parent, name),
             None => ("", path),
@@ -454,6 +527,7 @@ pub fn desired_plugins<'a>(
         found.push((layer_rank, pattern_rank, lower, name.to_string()));
     }
     found.sort();
+    found.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
     found.into_iter().map(|(_, _, _, name)| name).collect()
 }
 
@@ -474,16 +548,151 @@ fn implicit_keys(
     let mut names: Vec<String> = rule.rules.implicit.clone();
     if rule.rules.implicit_list_file.is_some() {
         names.extend(
-            crate::game_load_order::implicit_list_names_with_view(
+            crate::game_load_order::implicit_list_names_in(
                 ctx,
                 instance_id,
                 definition,
+                Some(&rule.id),
                 links,
             )
             .map_err(|e| PluginListError::Other(e.to_string()))?,
         );
     }
     Ok(names.iter().map(|n| key(n.as_bytes())).collect())
+}
+
+/// A list's contents while it is being edited: raw lines for `lines`, parsed entries for `script`.
+enum ListDoc {
+    Lines(ListFile),
+    Script(Vec<agora_game_api::LoadOrderLine>),
+}
+
+/// Read a list's bytes through the format it declares. A script format's hook failing is an
+/// error: an unreadable file is never an empty list.
+fn parse_doc(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    bytes: Vec<u8>,
+) -> Result<ListDoc, PluginListError> {
+    match rule.format {
+        LoadOrderFormat::Lines { .. } => Ok(ListDoc::Lines(ListFile::parse(&bytes))),
+        LoadOrderFormat::Script { .. } => {
+            let lines = crate::game_load_order::call_parse_format(
+                ctx,
+                instance_id,
+                definition,
+                rule,
+                bytes,
+            )
+            .map_err(|reason| PluginListError::Format {
+                list: rule.id.clone(),
+                reason,
+            })?;
+            Ok(ListDoc::Script(lines))
+        }
+    }
+}
+
+/// Render a list through the format it declares. The bytes go to the declared file only.
+fn render_doc(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    doc: &ListDoc,
+) -> Result<Vec<u8>, PluginListError> {
+    match (doc, &rule.format) {
+        (ListDoc::Lines(file), LoadOrderFormat::Lines { .. }) => Ok(file.render()),
+        (ListDoc::Script(lines), LoadOrderFormat::Script { .. }) => {
+            crate::game_load_order::call_render_format(
+                ctx,
+                instance_id,
+                definition,
+                rule,
+                lines.clone(),
+            )
+            .map_err(|reason| PluginListError::Format {
+                list: rule.id.clone(),
+                reason,
+            })
+        }
+        _ => Err(PluginListError::Other(format!(
+            "load order '{}' changed format while it was being written",
+            rule.id
+        ))),
+    }
+}
+
+/// A new list's contents: the format's header for `lines`, an empty script list otherwise.
+fn blank_doc(rule: &LoadOrderDefinition) -> ListDoc {
+    match rule.format {
+        LoadOrderFormat::Lines { .. } => ListDoc::Lines(ListFile::from_header(rule)),
+        LoadOrderFormat::Script { .. } => ListDoc::Script(Vec::new()),
+    }
+}
+
+/// The entries and active state in a document, in its order.
+fn doc_entries(doc: &ListDoc, rule: &LoadOrderDefinition) -> Vec<(String, bool)> {
+    match doc {
+        ListDoc::Lines(file) => file
+            .lines
+            .iter()
+            .filter_map(|line| plugin_line(line, rule))
+            .map(|(active, name)| (String::from_utf8_lossy(name).into_owned(), active))
+            .collect(),
+        ListDoc::Script(lines) => lines
+            .iter()
+            .map(|line| (line.name.clone(), line.active))
+            .collect(),
+    }
+}
+
+/// Bring a script list in step with the plugins a deployment provides, by the same rules the
+/// `lines` format uses: remove what Agora managed and no longer deploys, activate a newly managed
+/// line, and append a deployed plugin the list does not name.
+fn apply_sync_script(
+    lines: &mut Vec<agora_game_api::LoadOrderLine>,
+    desired: &[String],
+    old_managed: &[String],
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
+    let desired_keys: HashSet<Vec<u8>> = desired.iter().map(|n| key(n.as_bytes())).collect();
+    let old_keys: HashSet<Vec<u8>> = old_managed.iter().map(|n| key(n.as_bytes())).collect();
+
+    let mut removed = Vec::new();
+    lines.retain(|line| {
+        let k = key(line.name.as_bytes());
+        if old_keys.contains(&k) && !desired_keys.contains(&k) {
+            removed.push(line.name.clone());
+            false
+        } else {
+            true
+        }
+    });
+
+    let mut added = Vec::new();
+    for line in lines.iter_mut() {
+        let k = key(line.name.as_bytes());
+        if !line.active && desired_keys.contains(&k) && !old_keys.contains(&k) {
+            line.active = true;
+            added.push(line.name.clone());
+        }
+    }
+
+    let mut present: HashSet<Vec<u8>> =
+        lines.iter().map(|line| key(line.name.as_bytes())).collect();
+    for name in desired {
+        if present.insert(key(name.as_bytes())) {
+            lines.push(agora_game_api::LoadOrderLine {
+                name: name.clone(),
+                active: true,
+            });
+            added.push(name.clone());
+        }
+    }
+    (added, removed)
 }
 
 /// Bring an instance's plugin list in step with the plugins its deployment provides.
@@ -496,25 +705,26 @@ pub fn sync_locked(
     store: &StoreId,
     desired: &[String],
 ) -> Result<Option<PluginSyncReport>, PluginListError> {
-    sync_locked_with_view(ctx, instance_id, definition, store, desired, None)
+    sync_locked_in_with_view(ctx, instance_id, definition, None, store, desired, None)
 }
 
-/// [`sync_locked`], reading `links` (the instance's Links plan) when the caller has it, rather than
-/// planning the names a game's implicit list holds again.
-pub(crate) fn sync_locked_with_view(
+/// [`sync_locked`] for one list; `None` names the game's first list. An id the game does not
+/// declare is an error, never the first list by accident.
+pub(crate) fn sync_locked_in_with_view(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
+    list_id: Option<&str>,
     store: &StoreId,
     desired: &[String],
     links: Option<&DeploymentPlan>,
 ) -> Result<Option<PluginSyncReport>, PluginListError> {
-    let Some(rule) = definition.load_orders.first() else {
+    let Some(rule) = rule_opt(definition, list_id)? else {
         return Ok(None);
     };
     let dir = instance_dir(ctx, instance_id)?;
     let copy_path = dir.join(rule.file.as_str());
-    let old = read_state(&dir)?;
+    let old = state_of(read_state_file(&dir)?, &rule.id);
     let mut report = PluginSyncReport::default();
 
     let Some(mapping) = user_file_mapping(definition, rule, store) else {
@@ -535,9 +745,17 @@ pub(crate) fn sync_locked_with_view(
     // Recovery rewrites the instance copy from the session's file.
     let existing = read_optional(&copy_path)?;
     let have_copy = existing.is_some();
-    let mut file = match existing {
-        Some(bytes) => ListFile::parse(&bytes),
-        None => starting_contents(ctx, definition, store, mapping, rule, &mut report)?,
+    let mut doc = match existing {
+        Some(bytes) => parse_doc(ctx, instance_id, definition, rule, bytes)?,
+        None => starting_contents(
+            ctx,
+            instance_id,
+            definition,
+            store,
+            mapping,
+            rule,
+            &mut report,
+        )?,
     };
 
     // A plugin the game loads itself is never Agora's, whatever an earlier sync recorded for it.
@@ -555,17 +773,24 @@ pub(crate) fn sync_locked_with_view(
         .cloned()
         .collect();
 
-    let (added, removed) = apply_sync(&mut file, rule, &wanted, &managed_before);
+    let (added, removed) = match &mut doc {
+        ListDoc::Lines(file) => apply_sync(file, rule, &wanted, &managed_before),
+        ListDoc::Script(lines) => apply_sync_script(lines, &wanted, &managed_before),
+    };
     let changed = !added.is_empty() || !removed.is_empty();
     // The list goes first: a state file that is behind only delays a removal, one that is
     // ahead would forget lines Agora still owns.
     if changed || (!have_copy && !wanted.is_empty()) {
-        write_atomic(&copy_path, &file.render())?;
+        write_atomic(
+            &copy_path,
+            &render_doc(ctx, instance_id, definition, rule, &doc)?,
+        )?;
     }
     if !same_names(&old.managed, &wanted) {
-        write_state(
+        store_state(
             &dir,
-            &ManagedState {
+            &rule.id,
+            ManagedState {
                 managed: wanted,
                 locked: old.locked,
             },
@@ -577,7 +802,7 @@ pub(crate) fn sync_locked_with_view(
 }
 
 /// [`sync_locked`] for a launch of an instance that deploys no content: layers removed since
-/// the last deploy still take their lines with them.
+/// the last deploy still take their lines with them. Works over every list the game keeps.
 pub fn sync_without_content(
     ctx: &Ctx,
     instance_id: &str,
@@ -591,18 +816,54 @@ pub fn sync_without_content(
         LockResource::Instance(instance_id.to_string()),
         "plugins-sync",
     )?;
-    sync_locked(ctx, instance_id, definition, store, &[])
+    let mut all = PluginSyncReport::default();
+    for rule in &definition.load_orders {
+        if let Some(report) = sync_locked_in_with_view(
+            ctx,
+            instance_id,
+            definition,
+            Some(&rule.id),
+            store,
+            &[],
+            None,
+        )? {
+            all.added.extend(report.added);
+            all.removed.extend(report.removed);
+            all.warnings.extend(report.warnings);
+        }
+    }
+    Ok(Some(all))
 }
 
 // ---------------------------------------------------------------------------
 // Inspect and toggle
 // ---------------------------------------------------------------------------
 
-fn rule_of(definition: &GameDefinition) -> Result<&LoadOrderDefinition, PluginListError> {
-    definition
-        .load_orders
-        .first()
-        .ok_or_else(|| PluginListError::NoRule(definition.id.clone()))
+/// One list, or `None` when the caller named no id and the game keeps none. Naming an id the
+/// game does not declare is an error.
+fn rule_opt<'a>(
+    definition: &'a GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Option<&'a LoadOrderDefinition>, PluginListError> {
+    match list_id {
+        None => Ok(definition.load_orders.first()),
+        Some(id) => definition
+            .load_orders
+            .iter()
+            .find(|rule| rule.id == id)
+            .map(Some)
+            .ok_or_else(|| PluginListError::UnknownList {
+                game: definition.id.as_str().to_string(),
+                list: id.to_string(),
+            }),
+    }
+}
+
+fn rule_of<'a>(
+    definition: &'a GameDefinition,
+    list_id: Option<&str>,
+) -> Result<&'a LoadOrderDefinition, PluginListError> {
+    rule_opt(definition, list_id)?.ok_or_else(|| PluginListError::NoRule(definition.id.clone()))
 }
 
 /// The instance's plugin list with each line's state and whether Agora manages it.
@@ -611,39 +872,50 @@ pub fn list(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<PluginList, PluginListError> {
-    let rule = rule_of(definition)?;
+    list_in(ctx, instance_id, definition, None)
+}
+
+/// [`list`] for one list; `None` names the game's first list.
+pub fn list_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<PluginList, PluginListError> {
+    let rule = rule_of(definition, list_id)?;
     crate::game_instance::get_manifest(ctx, instance_id).map_err(|e| match e {
         crate::game_instance::InstanceError::NotFound(id) => PluginListError::InstanceNotFound(id),
         other => PluginListError::Other(other.to_string()),
     })?;
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
-    let state = read_state(&dir)?;
+    let state = state_of(read_state_file(&dir)?, &rule.id);
     let managed: std::collections::HashSet<Vec<u8>> =
         state.managed.iter().map(|n| key(n.as_bytes())).collect();
     let locked: std::collections::HashSet<Vec<u8>> =
         state.locked.iter().map(|n| key(n.as_bytes())).collect();
     let Some(bytes) = read_optional(&path)? else {
         return Ok(PluginList {
+            list_id: rule.id.clone(),
+            list_name: rule.name.clone(),
             path,
             exists: false,
             entries: Vec::new(),
         });
     };
-    let file = ListFile::parse(&bytes);
-    let entries = file
-        .lines
-        .iter()
-        .filter_map(|line| {
-            plugin_line(line, rule).map(|(active, name)| PluginEntry {
-                name: String::from_utf8_lossy(name).into_owned(),
-                active,
-                managed: managed.contains(&key(name)),
-                locked: locked.contains(&key(name)),
-            })
+    let doc = parse_doc(ctx, instance_id, definition, rule, bytes)?;
+    let entries = doc_entries(&doc, rule)
+        .into_iter()
+        .map(|(name, active)| PluginEntry {
+            managed: managed.contains(&key(name.as_bytes())),
+            locked: locked.contains(&key(name.as_bytes())),
+            name,
+            active,
         })
         .collect();
     Ok(PluginList {
+        list_id: rule.id.clone(),
+        list_name: rule.name.clone(),
         path,
         exists: true,
         entries,
@@ -681,8 +953,25 @@ pub fn set_active(
     name: &str,
     active: bool,
 ) -> Result<bool, PluginListError> {
-    let rule = rule_of(definition)?;
-    if !active && rule.format.active_prefix().is_empty() {
+    set_active_in(ctx, instance_id, definition, None, name, active)
+}
+
+/// [`set_active`] for one list; `None` names the game's first list.
+pub fn set_active_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    name: &str,
+    active: bool,
+) -> Result<bool, PluginListError> {
+    let rule = rule_of(definition, list_id)?;
+    if !active
+        && matches!(
+            &rule.format,
+            LoadOrderFormat::Lines { active_prefix, .. } if active_prefix.is_empty()
+        )
+    {
         return Err(PluginListError::NoInactiveState(name.to_string()));
     }
     let _lock = ctx.lock_manager.acquire(
@@ -696,29 +985,47 @@ pub fn set_active(
     let Some(bytes) = read_optional(&path)? else {
         return Err(PluginListError::NotInList(name.to_string()));
     };
-    let mut file = ListFile::parse(&bytes);
+    let mut doc = parse_doc(ctx, instance_id, definition, rule, bytes)?;
     let wanted = key(name.trim().as_bytes());
     let mut found = false;
     let mut changed = false;
-    for line in &mut file.lines {
-        let Some((is_active, line_name)) = plugin_line(line, rule) else {
-            continue;
-        };
-        if key(line_name) != wanted {
-            continue;
+    match &mut doc {
+        ListDoc::Lines(file) => {
+            for line in &mut file.lines {
+                let Some((is_active, line_name)) = plugin_line(line, rule) else {
+                    continue;
+                };
+                if key(line_name) != wanted {
+                    continue;
+                }
+                found = true;
+                if is_active != active {
+                    *line = render_line(rule, line_name, active);
+                    changed = true;
+                }
+            }
         }
-        found = true;
-        if is_active != active {
-            let rewritten = render_line(rule, line_name, active);
-            *line = rewritten;
-            changed = true;
+        ListDoc::Script(lines) => {
+            for line in lines.iter_mut() {
+                if key(line.name.as_bytes()) != wanted {
+                    continue;
+                }
+                found = true;
+                if line.active != active {
+                    line.active = active;
+                    changed = true;
+                }
+            }
         }
     }
     if !found {
         return Err(PluginListError::NotInList(name.to_string()));
     }
     if changed {
-        write_atomic(&path, &file.render())?;
+        write_atomic(
+            &path,
+            &render_doc(ctx, instance_id, definition, rule, &doc)?,
+        )?;
     }
     Ok(changed)
 }
@@ -755,8 +1062,24 @@ pub fn import_list(
     managed: &[String],
     locked: &[String],
 ) -> Result<(), PluginListError> {
-    let rule = rule_of(definition)?;
-    if rule.format.active_prefix().is_empty() {
+    import_list_in(ctx, instance_id, definition, None, lines, managed, locked)
+}
+
+/// [`import_list`] for one list; `None` names the game's first list.
+pub fn import_list_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    lines: &[(String, bool)],
+    managed: &[String],
+    locked: &[String],
+) -> Result<(), PluginListError> {
+    let rule = rule_of(definition, list_id)?;
+    if matches!(
+        &rule.format,
+        LoadOrderFormat::Lines { active_prefix, .. } if active_prefix.is_empty()
+    ) {
         if let Some((name, _)) = lines.iter().find(|(_, active)| !active) {
             return Err(PluginListError::NoInactiveState(name.clone()));
         }
@@ -764,14 +1087,32 @@ pub fn import_list(
     ensure_copy_editable(ctx, instance_id, definition)?;
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
-    let mut file = ListFile::from_header(rule);
-    for (name, active) in lines {
-        file.lines.push(render_line(rule, name.as_bytes(), *active));
-    }
-    write_atomic(&path, &file.render())?;
-    write_state(
+    let doc = match &rule.format {
+        LoadOrderFormat::Lines { .. } => {
+            let mut file = ListFile::from_header(rule);
+            for (name, active) in lines {
+                file.lines.push(render_line(rule, name.as_bytes(), *active));
+            }
+            ListDoc::Lines(file)
+        }
+        LoadOrderFormat::Script { .. } => ListDoc::Script(
+            lines
+                .iter()
+                .map(|(name, active)| agora_game_api::LoadOrderLine {
+                    name: name.clone(),
+                    active: *active,
+                })
+                .collect(),
+        ),
+    };
+    write_atomic(
+        &path,
+        &render_doc(ctx, instance_id, definition, rule, &doc)?,
+    )?;
+    store_state(
         &dir,
-        &ManagedState {
+        &rule.id,
+        ManagedState {
             managed: managed.to_vec(),
             locked: locked.to_vec(),
         },
@@ -787,13 +1128,25 @@ pub fn set_locked(
     name: &str,
     locked: bool,
 ) -> Result<bool, PluginListError> {
-    rule_of(definition)?;
+    set_locked_in(ctx, instance_id, definition, None, name, locked)
+}
+
+/// [`set_locked`] for one list; `None` names the game's first list.
+pub fn set_locked_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    name: &str,
+    locked: bool,
+) -> Result<bool, PluginListError> {
+    let rule = rule_of(definition, list_id)?;
     let _lock = ctx.lock_manager.acquire(
         LockResource::Instance(instance_id.to_string()),
         "plugins-lock",
     )?;
     let wanted = key(name.trim().as_bytes());
-    let listed = list(ctx, instance_id, definition)?;
+    let listed = list_in(ctx, instance_id, definition, Some(&rule.id))?;
     let Some(entry) = listed
         .entries
         .iter()
@@ -803,7 +1156,7 @@ pub fn set_locked(
     };
     let canonical = entry.name.clone();
     let dir = instance_dir(ctx, instance_id)?;
-    let mut state = read_state(&dir)?;
+    let mut state = state_of(read_state_file(&dir)?, &rule.id);
     let is_locked = state.locked.iter().any(|n| key(n.as_bytes()) == wanted);
     if is_locked == locked {
         return Ok(false);
@@ -813,7 +1166,7 @@ pub fn set_locked(
     } else {
         state.locked.retain(|n| key(n.as_bytes()) != wanted);
     }
-    write_state(&dir, &state)?;
+    store_state(&dir, &rule.id, state)?;
     Ok(true)
 }
 
@@ -828,7 +1181,18 @@ pub fn write_order_locked(
     definition: &GameDefinition,
     order: &[(String, bool)],
 ) -> Result<bool, PluginListError> {
-    let rule = rule_of(definition)?;
+    write_order_locked_in(ctx, instance_id, definition, None, order)
+}
+
+/// [`write_order_locked`] for one list; `None` names the game's first list.
+pub fn write_order_locked_in(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    order: &[(String, bool)],
+) -> Result<bool, PluginListError> {
+    let rule = rule_of(definition, list_id)?;
     ensure_copy_editable(ctx, instance_id, definition)?;
     let dir = instance_dir(ctx, instance_id)?;
     let path = dir.join(rule.file.as_str());
@@ -840,50 +1204,94 @@ pub fn write_order_locked(
             "instance '{instance_id}' has no plugin list to reorder"
         )));
     };
-    let mut file = ListFile::parse(&bytes);
-    let before = file.lines.clone();
-
-    // Names in the order are lossy strings from `list`, so both sides use the lossy key.
-    let lossy_key = |raw: &[u8]| key(String::from_utf8_lossy(raw).as_bytes());
-    let wanted: std::collections::HashSet<Vec<u8>> =
-        order.iter().map(|(name, _)| key(name.as_bytes())).collect();
-    let mut slots = Vec::new();
-    let mut originals: std::collections::HashMap<Vec<u8>, std::collections::VecDeque<Vec<u8>>> =
-        std::collections::HashMap::new();
-    for (index, line) in file.lines.iter().enumerate() {
-        let Some((_, name)) = plugin_line(line, rule) else {
-            continue;
-        };
-        let k = lossy_key(name);
-        originals
-            .entry(k.clone())
-            .or_default()
-            .push_back(name.to_vec());
-        if wanted.contains(&k) {
-            slots.push(index);
-        }
-    }
-    if slots.len() != order.len() {
-        return Err(PluginListError::Other(format!(
-            "the plugin list of instance '{instance_id}' changed while it was being reordered; nothing was written"
-        )));
-    }
-    for (slot, (name, active)) in slots.into_iter().zip(order) {
-        let k = key(name.as_bytes());
-        let original = originals
-            .get_mut(&k)
-            .and_then(std::collections::VecDeque::pop_front)
-            .ok_or_else(|| {
-                PluginListError::Other(format!(
+    let mut doc = parse_doc(ctx, instance_id, definition, rule, bytes)?;
+    let changed = match &mut doc {
+        ListDoc::Lines(file) => {
+            let before = file.lines.clone();
+            // Names in the order are lossy strings from `list`, so both sides use the lossy key.
+            let lossy_key = |raw: &[u8]| key(String::from_utf8_lossy(raw).as_bytes());
+            let wanted: std::collections::HashSet<Vec<u8>> =
+                order.iter().map(|(name, _)| key(name.as_bytes())).collect();
+            let mut slots = Vec::new();
+            let mut originals: std::collections::HashMap<
+                Vec<u8>,
+                std::collections::VecDeque<Vec<u8>>,
+            > = std::collections::HashMap::new();
+            for (index, line) in file.lines.iter().enumerate() {
+                let Some((_, name)) = plugin_line(line, rule) else {
+                    continue;
+                };
+                let k = lossy_key(name);
+                originals
+                    .entry(k.clone())
+                    .or_default()
+                    .push_back(name.to_vec());
+                if wanted.contains(&k) {
+                    slots.push(index);
+                }
+            }
+            if slots.len() != order.len() {
+                return Err(PluginListError::Other(format!(
                     "the plugin list of instance '{instance_id}' changed while it was being reordered; nothing was written"
-                ))
-            })?;
-        file.lines[slot] = render_line(rule, &original, *active);
-    }
-    if file.lines == before {
+                )));
+            }
+            for (slot, (name, active)) in slots.into_iter().zip(order) {
+                let k = key(name.as_bytes());
+                let original = originals
+                    .get_mut(&k)
+                    .and_then(std::collections::VecDeque::pop_front)
+                    .ok_or_else(|| {
+                        PluginListError::Other(format!(
+                            "the plugin list of instance '{instance_id}' changed while it was being reordered; nothing was written"
+                        ))
+                    })?;
+                file.lines[slot] = render_line(rule, &original, *active);
+            }
+            file.lines != before
+        }
+        ListDoc::Script(lines) => {
+            let before = lines.clone();
+            if lines.len() != order.len() {
+                return Err(PluginListError::Other(format!(
+                    "the plugin list of instance '{instance_id}' changed while it was being reordered; nothing was written"
+                )));
+            }
+            let mut originals: std::collections::HashMap<
+                Vec<u8>,
+                std::collections::VecDeque<String>,
+            > = std::collections::HashMap::new();
+            for line in lines.iter() {
+                originals
+                    .entry(key(line.name.as_bytes()))
+                    .or_default()
+                    .push_back(line.name.clone());
+            }
+            let mut rebuilt = Vec::with_capacity(order.len());
+            for (name, active) in order {
+                let original = originals
+                    .get_mut(&key(name.as_bytes()))
+                    .and_then(std::collections::VecDeque::pop_front)
+                    .ok_or_else(|| {
+                        PluginListError::Other(format!(
+                            "the plugin list of instance '{instance_id}' changed while it was being reordered; nothing was written"
+                        ))
+                    })?;
+                rebuilt.push(agora_game_api::LoadOrderLine {
+                    name: original,
+                    active: *active,
+                });
+            }
+            *lines = rebuilt;
+            *lines != before
+        }
+    };
+    if !changed {
         return Ok(false);
     }
-    write_atomic(&path, &file.render())?;
+    write_atomic(
+        &path,
+        &render_doc(ctx, instance_id, definition, rule, &doc)?,
+    )?;
     Ok(true)
 }
 

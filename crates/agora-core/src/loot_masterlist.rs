@@ -91,11 +91,14 @@ fn status_path(ctx: &Ctx, definition: &GameDefinition) -> PathBuf {
     game_dir(ctx, definition).join("masterlist.json")
 }
 
-fn loot_rule(definition: &GameDefinition) -> Result<&LootRule, LoadOrderError> {
-    definition
-        .load_orders
-        .first()
-        .and_then(|rule| rule.rules.loot.as_ref())
+fn loot_rule<'a>(
+    definition: &'a GameDefinition,
+    list_id: Option<&str>,
+) -> Result<&'a LootRule, LoadOrderError> {
+    let rule = crate::game_load_order::list_by_id(definition, list_id)?;
+    rule.rules
+        .loot
+        .as_ref()
         .ok_or_else(|| LoadOrderError::NoLootMasterlist(definition.id.as_str().to_string()))
 }
 
@@ -107,7 +110,16 @@ pub fn cached(
     ctx: &Ctx,
     definition: &GameDefinition,
 ) -> Result<Option<CachedMasterlist>, LoadOrderError> {
-    let rule = loot_rule(definition)?;
+    cached_in(ctx, definition, None)
+}
+
+/// [`cached`] for one list; `None` names the game's first list.
+pub fn cached_in(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Option<CachedMasterlist>, LoadOrderError> {
+    let rule = loot_rule(definition, list_id)?;
     let dir = game_dir(ctx, definition);
     let status_file = status_path(ctx, definition);
     let raw = match std::fs::read(&status_file) {
@@ -418,10 +430,19 @@ fn validate_download(
 /// Nothing is written until every file has been downloaded and its blob SHA-1 matches the one
 /// GitHub reports, so a failed update leaves the previous copy in place.
 pub fn update(ctx: &Ctx, definition: &GameDefinition) -> Result<MasterlistStatus, LoadOrderError> {
+    update_in(ctx, definition, None)
+}
+
+/// [`update`] for one list; `None` names the game's first list.
+pub fn update_in(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<MasterlistStatus, LoadOrderError> {
     let fetcher = CoreFetcher {
         clients: &ctx.http_clients,
     };
-    update_with(ctx, definition, &fetcher)
+    update_with_in(ctx, definition, list_id, &fetcher)
 }
 
 /// [`update`] with an injected fetcher.
@@ -430,7 +451,17 @@ pub fn update_with(
     definition: &GameDefinition,
     fetcher: &dyn Fetcher,
 ) -> Result<MasterlistStatus, LoadOrderError> {
-    let rule = loot_rule(definition)?.clone();
+    update_with_in(ctx, definition, None, fetcher)
+}
+
+/// [`update_with`] for one list; `None` names the game's first list.
+pub fn update_with_in(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    fetcher: &dyn Fetcher,
+) -> Result<MasterlistStatus, LoadOrderError> {
+    let rule = loot_rule(definition, list_id)?.clone();
     // Read the branch once, then fetch the file *at that commit*. Fetching the commit and the
     // file separately can straddle a branch update, which would record a commit the bytes did
     // not come from. GitHub's contents endpoint takes any commit/branch/tag as `ref`
