@@ -8268,6 +8268,7 @@ async fn run_command(
                         load_order,
                         outputs: generated,
                         requirements,
+                        diagnostics: _,
                         passed: _,
                     } = match agora_core::game_instance::launch_checks(ctx, &record, game_def) {
                         Ok(checks) => checks,

@@ -511,6 +511,37 @@ pub fn get_manifest(ctx: &Ctx, id: &str) -> Result<GameInstanceManifest, Instanc
     Ok(manifest)
 }
 
+/// The facts a scripted package's hooks ask about one instance (MASTER_SPEC §30.12).
+fn hook_context(
+    ctx: &Ctx,
+    record: &GameInstanceRecord,
+    definition: &GameDefinition,
+) -> Result<agora_game_api::GameContext, InstanceError> {
+    let manifest = get_manifest(ctx, &record.instance_id)?;
+    let runtime = manifest
+        .runtime_identity
+        .clone()
+        .or_else(|| match &manifest.base {
+            BaseReference::Pinned { runtime, .. } => Some(runtime.clone()),
+            BaseReference::Unpinned { .. } => None,
+        })
+        .unwrap_or_else(|| RuntimeIdentity {
+            game: definition.id.clone(),
+            store: StoreId::direct(),
+            version: String::new(),
+            build: None,
+        });
+    Ok(agora_game_api::GameContext {
+        instance: record.instance_id.clone(),
+        runtime,
+        base: Some(manifest.base.clone()),
+        frameworks: manifest.frameworks.clone(),
+        layers: manifest.layers,
+        load_order: agora_game_api::LoadOrder::default(),
+        settings: std::collections::BTreeMap::new(),
+    })
+}
+
 /// List all generic game instances ordered by last launched, then created.
 pub fn list(ctx: &Ctx) -> Result<Vec<GameInstanceRecord>, InstanceError> {
     let db_path = ctx.paths.local_state_db();
@@ -1146,6 +1177,8 @@ pub struct LaunchChecks {
     /// Frameworks the instance's catalog mods need and it does not satisfy. A warning, never a
     /// refusal: the user may have installed the mod past exactly this on purpose.
     pub requirements: Vec<crate::catalog_install::RequirementFinding>,
+    /// Findings the game's package script reported (MASTER_SPEC §30.12).
+    pub diagnostics: Vec<agora_game_api::Diagnostic>,
     /// The checks that ran and passed, for the page to list beside any findings.
     pub passed: Vec<PassedCheck>,
 }
@@ -1173,6 +1206,28 @@ pub fn launch_checks(
 ) -> Result<LaunchChecks, LaunchChecksError> {
     let id = record.instance_id.as_str();
     let pinned = matches!(record.base, BaseReference::Pinned { .. });
+    // A package's script can add findings to the same launch checks the page
+    // already shows. A failing hook is reported, never silently dropped.
+    let diagnostics = match ctx.games.package_for(&definition.id).cloned() {
+        Some(package) => {
+            let context = hook_context(ctx, record, definition)?;
+            match crate::game_registry::block_on_hook(
+                package.diagnostics(crate::game_registry::null_game_host(), context),
+            ) {
+                Ok(diagnostics) => diagnostics,
+                Err(error) => vec![agora_game_api::Diagnostic {
+                    code: "ERR_GAME_HOOK_FAILED".to_string(),
+                    message: format!(
+                        "the game's plugin could not run its diagnostics: {}",
+                        error.message
+                    ),
+                    severity: agora_game_api::DiagnosticSeverity::Warning,
+                    repairs: Vec::new(),
+                }],
+            }
+        }
+        None => Vec::new(),
+    };
     let (runtime, links) = std::thread::scope(|scope| {
         let runtime = scope.spawn(|| runtime_check(ctx, id, definition));
         let links = scope.spawn(|| match definition.load_orders.first() {
@@ -1188,6 +1243,7 @@ pub fn launch_checks(
             load_order: Vec::new(),
             outputs: Vec::new(),
             requirements: Vec::new(),
+            diagnostics,
             passed: Vec::new(),
         });
     }
@@ -1229,6 +1285,7 @@ pub fn launch_checks(
         load_order,
         outputs,
         requirements,
+        diagnostics,
         passed,
     })
 }
@@ -1292,6 +1349,32 @@ pub fn prepare_launch_with(
 ) -> Result<PreparedLaunch, InstanceError> {
     let record = get(ctx, id)?.ok_or_else(|| InstanceError::NotFound(id.to_string()))?;
     let manifest = get_manifest(ctx, id)?;
+
+    // A game that ships no launch recipe can ask its package's script for one.
+    // The recipe is checked against the instance's view before anything runs.
+    let mut definition_owned = definition.clone();
+    let mut scripted_recipe = false;
+    if definition_owned.launch.is_none() {
+        if let Some(package) = ctx.games.package_for(&definition_owned.id).cloned() {
+            let context = hook_context(ctx, &record, &definition_owned)?;
+            match crate::game_registry::block_on_hook(
+                package.prepare_launch(crate::game_registry::null_game_host(), context),
+            ) {
+                Ok(Some(recipe)) => {
+                    definition_owned.launch = Some(recipe);
+                    scripted_recipe = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(InstanceError::Other(format!(
+                        "the game's plugin could not prepare a launch: {}",
+                        error.message
+                    )))
+                }
+            }
+        }
+    }
+    let definition = &definition_owned;
     match record.base {
         BaseReference::Pinned { id: base_id, .. } => {
             let chosen = options.deployment.or(manifest.deployment);
@@ -1330,6 +1413,19 @@ pub fn prepare_launch_with(
                 }
                 let content = std::fs::read_to_string(&manifest_path)?;
                 let base_manifest: crate::game_base::BaseManifest = serde_json::from_str(&content)?;
+                if scripted_recipe {
+                    if let Some(recipe) = &definition.launch {
+                        crate::game_script::validate_launch_recipe(
+                            recipe,
+                            &crate::game_script::RecipeRoots {
+                                runtime: &base_manifest.location,
+                                install: Some(&base_manifest.source_location),
+                                base: Some(&base_manifest.location),
+                            },
+                        )
+                        .map_err(InstanceError::Other)?;
+                    }
+                }
                 // Layers removed since the last deploy take their plugin lines with them.
                 crate::game_plugins::sync_without_content(
                     ctx,
@@ -1374,6 +1470,19 @@ pub fn prepare_launch_with(
                 install: Some(discovered.location.clone()),
                 base: None,
             };
+            if scripted_recipe {
+                if let Some(recipe) = &definition.launch {
+                    crate::game_script::validate_launch_recipe(
+                        recipe,
+                        &crate::game_script::RecipeRoots {
+                            runtime: &roots.runtime,
+                            install: roots.install.as_deref(),
+                            base: roots.base.as_deref(),
+                        },
+                    )
+                    .map_err(InstanceError::Other)?;
+                }
+            }
             let Some(recipe) = &definition.launch else {
                 return Err(LaunchError::NoRecipe.into());
             };

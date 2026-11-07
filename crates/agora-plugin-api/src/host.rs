@@ -85,6 +85,29 @@ pub trait ScriptReads: Send + Sync {
     ) -> Result<serde_json::Value, ScriptReadError>;
 }
 
+/// Read an instance's merged view by game path, and nothing else.
+///
+/// The literals a script passes are game paths, never filesystem paths: a
+/// reply, an error and a log line may name the path the script asked for, and
+/// no host path is ever revealed. The scope is one instance and one call
+/// (MASTER_SPEC §30.12).
+pub trait GameReads: Send + Sync {
+    /// At most `len` bytes from `offset`, or an error that says why.
+    fn read_bytes(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ScriptReadError>;
+
+    /// Lines as text, shaped like the crash contract's `LinesReply`.
+    fn read_lines(
+        &self,
+        path: &str,
+        from_line: u64,
+        max_lines: u32,
+    ) -> Result<serde_json::Value, ScriptReadError>;
+
+    /// The direct children of a game path. Directories are marked so a script
+    /// can tell them apart without guessing from an extension.
+    fn list(&self, path: &str) -> Result<serde_json::Value, ScriptReadError>;
+}
+
 /// Why a scoped read was refused. `code` is a stable token the script can
 /// branch on; `message` is for the author and the plugin log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +168,18 @@ pub trait ScriptHost: Send + Sync {
         args: serde_json::Value,
         timeout: Duration,
         reads: Arc<dyn ScriptReads>,
+    ) -> PluginResult<serde_json::Value>;
+
+    /// Like [`ScriptHost::invoke`], but the call sees one instance's merged
+    /// view through `reads` (MASTER_SPEC §30.12). The scope lasts exactly as
+    /// long as this invocation and cannot be kept afterwards.
+    fn invoke_with_game_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn GameReads>,
     ) -> PluginResult<serde_json::Value>;
 
     /// Deliver an event to a plugin's subscribers.

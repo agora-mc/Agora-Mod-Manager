@@ -1304,25 +1304,11 @@ impl PluginService {
                 ),
             ));
         }
-        // Official plugins are data-only: they ship a game definition, not a
-        // script. A package with an entrypoint is Agora's own release mistake,
-        // not something a user could meaningfully consent to, so it is refused.
-        if preview.runs_code {
-            return Err(refused(
-                "ERR_OFFICIAL_PLUGIN_HAS_CODE",
-                format!(
-                    "The official package for `{}` {} contains code (`{}`). Official plugins \
-                     are data-only, so nothing was installed.",
-                    entry.plugin_id,
-                    entry.version,
-                    preview
-                        .manifest
-                        .entrypoint
-                        .as_deref()
-                        .unwrap_or("an entrypoint")
-                ),
-            ));
-        }
+        // Official plugins may carry a script. The signed entry pins the whole
+        // package tree (checked above and again after unpacking), so the script
+        // is covered by the same hash as its data. An official plugin gets no
+        // capability a community plugin could not request, and it goes through
+        // the same script consent below.
         if preview.requires_capability_consent() && !consent.capabilities {
             return Ok(UpdateOutcome::NeedsConsent {
                 preview: Box::new(preview),

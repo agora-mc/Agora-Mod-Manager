@@ -4135,12 +4135,12 @@ reproducibly by `scripts/build_official_plugin.py` and attached to a release tag
 must agree byte for byte with the Rust digest. Code: `crates/agora-core/src/plugins/official.rs`,
 the registry compiler in `compiler/compile.py`, and `packages/official/skyrim-se/`.
 
-**Official plugins stay data-only.** Official status buys verification and registration order, not
-privilege. If a game needs something a definition cannot express, the capability is added to
-`agora-core` as a `GameHost` service that any plugin may call, not written as an official script.
-This is a rule the review process holds, not one the installer enforces (`install_official` does
-not refuse an `entrypoint`); an official plugin that did ship scripts would still be asked about
-and stoppable like any other, as below.
+**Official plugins may carry code** (§30.12). Official status buys verification and registration
+order, not privilege: an official plugin's scripts go through the same per-plugin consent, the same
+emergency stop and the same host capabilities as any community plugin's, and the signed
+`package_tree_sha256` covers the script files as well as the data. If a game needs something a
+definition cannot express, the capability is still added to `agora-core` for every plugin to use,
+not handed to officials alone.
 
 **Who may run code: one consent per plugin, and an emergency stop** (final decision, 2026-10-31;
 as built). The earlier single global switch (`plugins_enabled`, "community plugins on", off by

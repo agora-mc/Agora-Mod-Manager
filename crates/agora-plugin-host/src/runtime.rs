@@ -19,7 +19,7 @@
 //! is busy in a tight loop that yields to nothing.
 
 use agora_plugin_api::error::{PluginError, PluginErrorCode, PluginResult};
-use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptReads};
+use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptReads};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel, PluginEventEnvelope};
 use rquickjs::function::Async;
 use rquickjs::{
@@ -39,10 +39,18 @@ thread_local! {
     /// One plugin, one thread, so a thread-local is exactly the right size: a
     /// scope cannot leak to another plugin and cannot outlive its invocation.
     static CURRENT_READS: RefCell<Option<Arc<dyn ScriptReads>>> = const { RefCell::new(None) };
+    /// The instance view a scripted game hook may read, for the call running
+    /// on this plugin's thread. Same isolation as `CURRENT_READS`.
+    static CURRENT_GAME_READS: RefCell<Option<Arc<dyn GameReads>>> =
+        const { RefCell::new(None) };
 }
 
 fn current_reads() -> Option<Arc<dyn ScriptReads>> {
     CURRENT_READS.with(|slot| slot.borrow().clone())
+}
+
+fn current_game_reads() -> Option<Arc<dyn GameReads>> {
+    CURRENT_GAME_READS.with(|slot| slot.borrow().clone())
 }
 
 /// How many events may queue for one plugin before the oldest are dropped.
@@ -68,6 +76,7 @@ pub(crate) enum Control {
         args: serde_json::Value,
         timeout: Duration,
         reads: Option<Arc<dyn ScriptReads>>,
+        game_reads: Option<Arc<dyn GameReads>>,
         reply: SyncSender<PluginResult<serde_json::Value>>,
     },
     Deactivate {
@@ -221,9 +230,17 @@ async fn plugin_main(
                         let _ = reply.send(result);
                         break;
                     }
-                    Some(Control::Invoke { export, args, timeout, reads, reply }) => {
-                        let result =
-                            invoke_export(&context, &deadline, &export, args, timeout, reads).await;
+                    Some(Control::Invoke { export, args, timeout, reads, game_reads, reply }) => {
+                        let result = invoke_export(
+                            &context,
+                            &deadline,
+                            &export,
+                            args,
+                            timeout,
+                            reads,
+                            game_reads,
+                        )
+                        .await;
                         if let Err(error) = &result {
                             if error.code == PluginErrorCode::ScriptError {
                                 bridge.log(&plugin_id, LogLevel::Error, &format!("`{export}` failed: {}", error.message));
@@ -308,6 +325,27 @@ fn crash_read_bytes<'js>(
     };
     let bytes = reads.read_bytes(&artifact, offset, len).map_err(|error| {
         rquickjs::Error::new_into_js_message("crash.readBytes", "ArrayBuffer", error.message)
+    })?;
+    Ok(ArrayBuffer::new(ctx, bytes)?.into_value())
+}
+
+/// The QuickJS side of `game.readBytes`. Named rather than a closure so the
+/// returned `ArrayBuffer` shares the call's context lifetime.
+fn game_read_bytes<'js>(
+    ctx: Ctx<'js>,
+    path: String,
+    offset: u64,
+    len: u64,
+) -> rquickjs::Result<Value<'js>> {
+    let Some(reads) = current_game_reads() else {
+        return Err(rquickjs::Error::new_into_js_message(
+            "game.readBytes",
+            "ArrayBuffer",
+            "there is no instance in scope for this call",
+        ));
+    };
+    let bytes = reads.read_bytes(&path, offset, len).map_err(|error| {
+        rquickjs::Error::new_into_js_message("game.readBytes", "ArrayBuffer", error.message)
     })?;
     Ok(ArrayBuffer::new(ctx, bytes)?.into_value())
 }
@@ -417,6 +455,63 @@ async fn install_host_api(
                 .set("__agora_crash_read_lines", read_lines_fn)
                 .map_err(js_internal)?;
 
+            // Instance-view reads for scripted game hooks. As with the crash
+            // primitives, the function exists for every plugin but has no scope
+            // unless the host put one in place for this call.
+            let game_read_bytes_fn =
+                Function::new(ctx.clone(), game_read_bytes).map_err(js_internal)?;
+            globals
+                .set("__agora_game_read_bytes", game_read_bytes_fn)
+                .map_err(js_internal)?;
+
+            let game_read_lines_fn = Function::new(
+                ctx.clone(),
+                |path: String, from_line: u64, max_lines: u32| -> rquickjs::Result<String> {
+                    let Some(reads) = current_game_reads() else {
+                        return Err(rquickjs::Error::new_into_js_message(
+                            "game.readLines",
+                            "LinesReply",
+                            "there is no instance in scope for this call",
+                        ));
+                    };
+                    let reply = reads
+                        .read_lines(&path, from_line, max_lines)
+                        .map_err(|error| {
+                            rquickjs::Error::new_into_js_message(
+                                "game.readLines",
+                                "LinesReply",
+                                error.message,
+                            )
+                        })?;
+                    Ok(serde_json::to_string(&reply).unwrap_or_else(|_| "{}".into()))
+                },
+            )
+            .map_err(js_internal)?;
+            globals
+                .set("__agora_game_read_lines", game_read_lines_fn)
+                .map_err(js_internal)?;
+
+            let game_list_fn = Function::new(
+                ctx.clone(),
+                |path: String| -> rquickjs::Result<String> {
+                    let Some(reads) = current_game_reads() else {
+                        return Err(rquickjs::Error::new_into_js_message(
+                            "game.list",
+                            "EntryList",
+                            "there is no instance in scope for this call",
+                        ));
+                    };
+                    let reply = reads.list(&path).map_err(|error| {
+                        rquickjs::Error::new_into_js_message("game.list", "EntryList", error.message)
+                    })?;
+                    Ok(serde_json::to_string(&reply).unwrap_or_else(|_| "[]".into()))
+                },
+            )
+            .map_err(js_internal)?;
+            globals
+                .set("__agora_game_list", game_list_fn)
+                .map_err(js_internal)?;
+
             globals
                 .set("__agora_api_version", api_version)
                 .map_err(js_internal)?;
@@ -521,7 +616,7 @@ async fn run_optional_export(
     args: serde_json::Value,
     timeout: Duration,
 ) -> PluginResult<serde_json::Value> {
-    match call_export(context, deadline, export, args, timeout, true, None).await {
+    match call_export(context, deadline, export, args, timeout, true, None, None).await {
         Ok(value) => Ok(value),
         Err(e) if e.code == PluginErrorCode::NotActivated => Ok(serde_json::Value::Null),
         Err(e) => Err(e),
@@ -535,10 +630,15 @@ async fn invoke_export(
     args: serde_json::Value,
     timeout: Duration,
     reads: Option<Arc<dyn ScriptReads>>,
+    game_reads: Option<Arc<dyn GameReads>>,
 ) -> PluginResult<serde_json::Value> {
-    call_export(context, deadline, export, args, timeout, false, reads).await
+    call_export(
+        context, deadline, export, args, timeout, false, reads, game_reads,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_export(
     context: &AsyncContext,
     deadline: &Arc<AtomicU64>,
@@ -547,12 +647,14 @@ async fn call_export(
     timeout: Duration,
     optional: bool,
     reads: Option<Arc<dyn ScriptReads>>,
+    game_reads: Option<Arc<dyn GameReads>>,
 ) -> PluginResult<serde_json::Value> {
     let export_name = export.to_string();
     let args_json = serde_json::to_string(&args).unwrap_or_else(|_| "null".into());
     set_deadline(deadline, timeout);
-    // The scope is set on this plugin's own thread for exactly this call.
+    // The scopes are set on this plugin's own thread for exactly this call.
     let previous_reads = CURRENT_READS.with(|slot| slot.replace(reads));
+    let previous_game_reads = CURRENT_GAME_READS.with(|slot| slot.replace(game_reads));
     let started = Instant::now();
 
     let work = context.async_with(
@@ -618,8 +720,9 @@ async fn call_export(
     // plugin is spinning, the interrupt wins and the error says so.
     let result = tokio::time::timeout(timeout + Duration::from_millis(250), work).await;
     clear_deadline(deadline);
-    // Restore the previous scope even when the call failed or timed out.
+    // Restore the previous scopes even when the call failed or timed out.
     CURRENT_READS.with(|slot| *slot.borrow_mut() = previous_reads);
+    CURRENT_GAME_READS.with(|slot| *slot.borrow_mut() = previous_game_reads);
 
     match result {
         Ok(inner) => inner,

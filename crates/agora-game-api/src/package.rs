@@ -39,6 +39,26 @@ pub struct Behaviours {
     pub diagnostics: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepare_launch: Option<String>,
+    /// Parse a script-format load order (MASTER_SPEC §30.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_load_order: Option<String>,
+    /// Render a script-format load order (MASTER_SPEC §30.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_load_order: Option<String>,
+}
+
+impl Behaviours {
+    /// Whether this names any script hook at all.
+    pub fn names_any(&self) -> bool {
+        self.detect_runtime.is_some()
+            || self.classify.is_some()
+            || self.recognize_download.is_some()
+            || self.load_order_rules.is_some()
+            || self.diagnostics.is_some()
+            || self.prepare_launch.is_some()
+            || self.parse_load_order.is_some()
+            || self.render_load_order.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +173,28 @@ pub trait GamePackage: Send + Sync {
         _host: &'a dyn GameHost,
         _context: GameContext,
     ) -> GameFuture<'a, Option<LaunchRecipe>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Parse a script-format load order (MASTER_SPEC §30.12). `None` asks core
+    /// to use the declarative `lines` format.
+    fn parse_load_order<'a>(
+        &'a self,
+        _host: &'a dyn GameHost,
+        _definition: &'a LoadOrderDefinition,
+        _contents: Vec<u8>,
+    ) -> GameFuture<'a, Option<LoadOrder>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Render a script-format load order (MASTER_SPEC §30.12). `None` asks core
+    /// to use the declarative `lines` format.
+    fn render_load_order<'a>(
+        &'a self,
+        _host: &'a dyn GameHost,
+        _definition: &'a LoadOrderDefinition,
+        _order: &'a LoadOrder,
+    ) -> GameFuture<'a, Option<String>> {
         Box::pin(async { Ok(None) })
     }
 }

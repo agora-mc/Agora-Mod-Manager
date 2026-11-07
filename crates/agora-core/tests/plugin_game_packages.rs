@@ -451,3 +451,56 @@ fn a_tampered_package_path_is_refused_at_load() {
         "{warnings:?}"
     );
 }
+
+#[test]
+fn a_package_naming_a_behaviour_with_no_entrypoint_does_not_register() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = AppPaths::from_root(tmp.path().to_path_buf());
+    paths.create_required_dirs().unwrap();
+    agora_core::db::init_local_state_db(&paths.local_state_db()).unwrap();
+    let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+
+    let plugin_dir = tmp.path().join("plugins").join("test-scripted");
+    std::fs::create_dir_all(plugin_dir.join("games")).unwrap();
+    let mut package = dummy_package_def("scripted-game");
+    package.behaviours = Some(
+        serde_json::from_value(serde_json::json!({
+            "detect_runtime": "detect"
+        }))
+        .unwrap(),
+    );
+    std::fs::write(
+        plugin_dir.join("games/package.json"),
+        serde_json::to_string(&package).unwrap(),
+    )
+    .unwrap();
+
+    // The manifest names a game package but has no entrypoint, so the package
+    // could never honour `detect_runtime`: it is warned about and skipped.
+    let manifest = dummy_manifest("test.scripted", "games/package.json", true);
+    let mut granted = CapabilitySet::new();
+    granted.insert(Capability::GameDefine);
+    store::upsert(
+        &conn,
+        &manifest,
+        &granted,
+        &PluginSource::Package,
+        &plugin_dir,
+        true,
+        "2026-10-03T00:00:00Z",
+    )
+    .unwrap();
+    drop(conn);
+
+    let (ctx, warnings) = CoreContext::initialize(paths, GameRegistry::builder()).unwrap();
+    assert!(ctx
+        .games
+        .game(&GameId::new("scripted-game").unwrap())
+        .is_none());
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("no entrypoint")),
+        "the warning says why: {warnings:?}"
+    );
+}

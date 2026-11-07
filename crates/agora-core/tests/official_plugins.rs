@@ -1603,8 +1603,8 @@ impl World {
 
 const SCRIPTED_B: &str = "acme.second";
 
-/// A data-only official plugin (official packages ship no code) and two
-/// community script plugins, all installed with their code allowed.
+/// An official plugin whose fixture ships no code, and two community script
+/// plugins, all installed with their code allowed.
 async fn world_with_script_plugins() -> World {
     let world = World::new();
     let official = fixture_zip("1.0.0");
@@ -1795,31 +1795,75 @@ async fn one_plugins_permission_does_not_affect_another() {
 }
 
 #[tokio::test]
-async fn an_official_package_that_ships_code_is_refused() {
+async fn an_official_plugin_with_a_script_installs_when_its_hash_matches() {
     let world = World::new();
     let zip = script_zip(PLUGIN, "1.0.0");
     world.publish(vec![(Release::of("1.0.0", "current", &zip), zip)]);
 
-    // Official plugins are data-only. A release that ships an entrypoint is
-    // Agora's own mistake, so it is refused rather than offered to the user.
-    let error = world
+    // Official plugins may carry an entrypoint. The signed entry pins the whole
+    // package tree, so the script is covered by the same hash as the data.
+    // Installing it is the first decision; running its code is the second.
+    let plugin = installed(
+        world
+            .service
+            .install_official(PLUGIN, Consent::without_code(), &world.fetcher)
+            .await
+            .expect("an official package with a matching hash installs"),
+    );
+    assert!(plugin.runs_code);
+    assert!(!plugin.scripts_allowed, "the script was not allowed yet");
+    assert!(matches!(world.status(), OfficialStatus::Official { .. }));
+}
+
+#[tokio::test]
+async fn official_plugins_get_no_extra_capability() {
+    let zip = script_zip(PLUGIN, "1.0.0");
+
+    let official_world = World::new();
+    official_world.publish(vec![(Release::of("1.0.0", "current", &zip), zip.clone())]);
+    let official = installed(
+        official_world
+            .service
+            .install_official(PLUGIN, true, &official_world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    let community_world = World::new();
+    let community = community_world
         .service
-        .install_official(PLUGIN, Consent::without_code(), &world.fetcher)
-        .await
-        .expect_err("an official package with code must be refused");
-    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_HAS_CODE");
-    assert!(
-        error.to_string().contains("data-only"),
-        "the message says why: {error}"
+        .install_package_bytes(&zip, true)
+        .unwrap();
+
+    // The same bytes, so the same request. Official status changes where the
+    // package came from, not what it may ask for.
+    assert_eq!(official.capabilities, community.capabilities);
+    assert_eq!(official.capabilities, vec!["instance:read".to_string()]);
+}
+
+#[tokio::test]
+async fn an_official_script_changed_after_pinning_is_refused() {
+    let world = World::new();
+    let zip = script_zip(PLUGIN, "1.0.0");
+    world.publish(vec![(Release::of("1.0.0", "current", &zip), zip)]);
+    installed(
+        world
+            .service
+            .install_official(PLUGIN, Consent::without_code(), &world.fetcher)
+            .await
+            .unwrap(),
     );
-    assert!(
-        world.service.list().is_empty(),
-        "nothing was recorded as installed"
-    );
-    assert!(
-        !world.installed_dir().exists(),
-        "nothing was written to the plugin folder"
-    );
+
+    // The pinned tree covers `main.js`, so editing it loses official standing
+    // and its game packages stop loading.
+    std::fs::write(
+        world.installed_dir().join("main.js"),
+        b"export function noop() { return 2; }
+",
+    )
+    .unwrap();
+    world.service.reload().unwrap();
+    assert!(matches!(world.status(), OfficialStatus::Unverified { .. }));
 }
 
 #[tokio::test]
@@ -2362,8 +2406,8 @@ async fn an_unverified_official_plugin_with_scripts_does_not_run_them() {
         .install_package_bytes(&scripted, true)
         .unwrap();
 
-    // A legacy install (before official packages were required to be data-only)
-    // that the catalog vouched for. Record that standing by hand: the test is
+    // A legacy install from before official plugins could carry scripts, which
+    // the catalog vouched for. Record that standing by hand: the test is
     // about what happens when the catalog can no longer be read.
     let conn = agora_core::db::local_state_connection(&world.paths().local_state_db()).unwrap();
     agora_core::plugins::store::set_official(
