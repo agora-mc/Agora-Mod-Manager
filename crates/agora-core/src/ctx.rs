@@ -174,9 +174,9 @@ impl CoreContext {
             }
         })?;
 
-        // 2b. Load plugin game packages into the registry builder before building it.
-        //     A plugin package never stops startup, but a failure to read
-        //     plugins is said out loud: silently losing games looks like a bug.
+        // 2b. Read every plugin game package as raw JSON first, resolve inheritance, then register
+        //     the packages that survived. A plugin package never stops startup, but a failure to
+        //     read plugins is said out loud: silently losing games looks like a bug.
         match crate::db::local_state_connection(&db_path) {
             Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
             Ok(conn) => {
@@ -212,155 +212,152 @@ impl CoreContext {
                     }
                 };
 
-                {
-                    match crate::plugins::store::list(&conn) {
-                        Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
-                        Ok(mut records) => {
-                            // Official plugins register first. A game id or a store
-                            // product id goes to whoever claims it first, and the
-                            // records come back in plugin-id order, so without this
-                            // a community plugin named `aaaa.x` could take
-                            // `skyrim-se` before the official plugin was read.
-                            // Stable, so each group stays in plugin-id order.
-                            // Blocked (Unverified) official plugins come first
-                            // too: they hold their game ids even though they do
-                            // not load, so the reservation must happen before
-                            // any community package is read.
-                            records.sort_by_key(|record| {
-                                matches!(
-                                    official.get(record.id().as_str()),
-                                    None | Some(
-                                        crate::plugins::official::OfficialStatus::Community
-                                    )
+                match crate::plugins::store::list(&conn) {
+                    Err(e) => warnings.push(format!("Cannot read plugin game packages: {e}")),
+                    Ok(mut records) => {
+                        // Official plugins register first. A game id or a store
+                        // product id goes to whoever claims it first, and the
+                        // records come back in plugin-id order, so without this
+                        // a community plugin named `aaaa.x` could take
+                        // `skyrim-se` before the official plugin was read.
+                        // Stable, so each group stays in plugin-id order.
+                        // Blocked (Unverified) official plugins come first
+                        // too: they hold their game ids even though they do
+                        // not load, so the reservation must happen before
+                        // any community package is read.
+                        records.sort_by_key(|record| {
+                            matches!(
+                                official.get(record.id().as_str()),
+                                None | Some(crate::plugins::official::OfficialStatus::Community)
+                            )
+                        });
+
+                        let mut inputs: Vec<crate::game_registry::PackageInput> = Vec::new();
+                        for record in records {
+                            if !record.enabled
+                                || crate::plugins::store::is_tombstone(&record)
+                                || !record
+                                    .granted
+                                    .contains(agora_plugin_api::Capability::GameDefine)
+                            {
+                                continue;
+                            }
+
+                            let blocked = match official.get(record.id().as_str()) {
+                                Some(crate::plugins::official::OfficialStatus::Official {
+                                    ..
+                                }) => false,
+                                Some(crate::plugins::official::OfficialStatus::Unverified {
+                                    reason,
+                                }) => {
+                                    warnings.push(format!(
+                                        "Plugin {} is blocked and its games are not loaded: {reason}.",
+                                        record.id()
+                                    ));
+                                    true
+                                }
+                                Some(
+                                    crate::plugins::official::OfficialStatus::CatalogUnavailable {
+                                        reason,
+                                    },
                                 )
-                            });
-                            for record in records {
-                                if !record.enabled
-                                    || crate::plugins::store::is_tombstone(&record)
-                                    || !record
-                                        .granted
-                                        .contains(agora_plugin_api::Capability::GameDefine)
-                                {
+                                | Some(crate::plugins::official::OfficialStatus::NotListed {
+                                    reason,
+                                }) => {
+                                    // It still loads from its installed files;
+                                    // say (once, on the plugin and here) that
+                                    // it could not be checked this time.
+                                    warnings.push(format!(
+                                        "Plugin {} is loaded from its installed files: {reason}",
+                                        record.id()
+                                    ));
+                                    false
+                                }
+                                Some(crate::plugins::official::OfficialStatus::Community)
+                                | None => false,
+                            };
+
+                            for pkg_contrib in &record.manifest.contributions.game_packages {
+                                // Validated at install, but the stored manifest is
+                                // user-writable: never read outside the plugin.
+                                let Ok(rel) = agora_game_api::RelPath::new(&pkg_contrib.path)
+                                else {
+                                    warnings.push(format!(
+                                        "Plugin {}: game package path {:?} leaves the plugin folder; skipped",
+                                        record.id(),
+                                        pkg_contrib.path
+                                    ));
                                     continue;
-                                }
-
-                                match official.get(record.id().as_str()) {
-                                    Some(crate::plugins::official::OfficialStatus::Official {
-                                        ..
-                                    }) => {}
-                                    Some(
-                                        crate::plugins::official::OfficialStatus::Unverified {
-                                            reason,
-                                        },
-                                    ) => {
+                                };
+                                let file_path = record.install_dir.join(rel.as_str());
+                                let content = match std::fs::read_to_string(&file_path) {
+                                    Ok(c) => c,
+                                    Err(err) => {
                                         warnings.push(format!(
-                                            "Plugin {} is blocked and its games are not loaded: {reason}.",
-                                            record.id()
+                                            "Plugin {}: cannot read game package {}: {err}",
+                                            record.id(),
+                                            file_path.display()
                                         ));
-                                        // The files did not verify, so the games are
-                                        // not loaded. The ids it holds still belong
-                                        // to this install, though: a community
-                                        // package must not take a game over by
-                                        // shadowing a blocked official one.
-                                        for pkg_contrib in
-                                            &record.manifest.contributions.game_packages
-                                        {
-                                            let Ok(rel) =
-                                                agora_game_api::RelPath::new(&pkg_contrib.path)
-                                            else {
-                                                continue;
-                                            };
-                                            let file_path = record.install_dir.join(rel.as_str());
-                                            let Ok(content) = std::fs::read_to_string(&file_path)
-                                            else {
-                                                continue;
-                                            };
-                                            let Ok(package_def) =
-                                                serde_json::from_str::<
-                                                    agora_game_api::PackageDefinition,
-                                                >(&content)
-                                            else {
-                                                continue;
-                                            };
-                                            game_builder.reserve_blocked(&package_def);
-                                        }
                                         continue;
                                     }
-                                    Some(
-                                        crate::plugins::official::OfficialStatus::CatalogUnavailable {
-                                            reason,
-                                        },
-                                    )
-                                    | Some(
-                                        crate::plugins::official::OfficialStatus::NotListed {
-                                            reason,
-                                        },
-                                    ) => {
-                                        // It still loads from its installed files;
-                                        // say (once, on the plugin and here) that
-                                        // it could not be checked this time.
+                                };
+                                let json: serde_json::Value = match serde_json::from_str(&content) {
+                                    Ok(json) => json,
+                                    Err(err) => {
                                         warnings.push(format!(
-                                            "Plugin {} is loaded from its installed files: {reason}",
-                                            record.id()
-                                        ));
-                                    }
-                                    Some(crate::plugins::official::OfficialStatus::Community)
-                                    | None => {}
-                                }
-
-                                for pkg_contrib in &record.manifest.contributions.game_packages {
-                                    // Validated at install, but the stored manifest is
-                                    // user-writable: never read outside the plugin.
-                                    let Ok(rel) = agora_game_api::RelPath::new(&pkg_contrib.path)
-                                    else {
-                                        warnings.push(format!(
-                                    "Plugin {}: game package path {:?} leaves the plugin folder; skipped",
-                                    record.id(),
-                                    pkg_contrib.path
-                                ));
-                                        continue;
-                                    };
-                                    let file_path = record.install_dir.join(rel.as_str());
-                                    let content = match std::fs::read_to_string(&file_path) {
-                                        Ok(c) => c,
-                                        Err(err) => {
-                                            warnings.push(format!(
-                                                "Plugin {}: cannot read game package {}: {err}",
-                                                record.id(),
-                                                file_path.display()
-                                            ));
-                                            continue;
-                                        }
-                                    };
-                                    let package_def: agora_game_api::PackageDefinition =
-                                        match serde_json::from_str(&content) {
-                                            Ok(d) => d,
-                                            Err(err) => {
-                                                warnings.push(format!(
                                             "Plugin {}: failed to parse game package {}: {err}",
                                             record.id(),
                                             file_path.display()
                                         ));
-                                                continue;
-                                            }
-                                        };
-                                    if let Err(err) = game_builder.add(
-                                        crate::game_registry::PackageSource::Plugin {
-                                            plugin_id: record.id().to_string(),
-                                        },
-                                        Arc::new(crate::game_registry::DeclarativePackage(
-                                            package_def,
-                                        )),
-                                    ) {
-                                        warnings.push(format!(
-                                            "Plugin {}: rejected game package {}: {err}. \
-                                             A game or store product already claimed (official \
-                                             plugins register first) cannot be claimed again.",
-                                            record.id(),
-                                            file_path.display()
-                                        ));
+                                        continue;
                                     }
-                                }
+                                };
+                                inputs.push(crate::game_registry::PackageInput {
+                                    source: crate::game_registry::PackageSource::Plugin {
+                                        plugin_id: record.id().to_string(),
+                                    },
+                                    blocked,
+                                    label: format!(
+                                        "Plugin {}, game package {}",
+                                        record.id(),
+                                        file_path.display()
+                                    ),
+                                    json,
+                                });
+                            }
+                        }
+
+                        // All packages are read before any is resolved, so a parent may live in
+                        // another plugin. A broken package warns with its chain and the others
+                        // carry on.
+                        let (resolved, mut resolve_warnings) =
+                            crate::game_registry::inherit::resolve(inputs);
+                        warnings.append(&mut resolve_warnings);
+
+                        // A blocked official plugin's games stay reserved before any community
+                        // package is registered, even though the blocked package itself does not
+                        // register.
+                        for package in &resolved {
+                            if package.blocked {
+                                game_builder.reserve_blocked(&package.definition);
+                            }
+                        }
+                        for package in resolved {
+                            if package.blocked {
+                                continue;
+                            }
+                            if let Err(err) = game_builder.add(
+                                package.source,
+                                Arc::new(crate::game_registry::DeclarativePackage(
+                                    package.definition,
+                                )),
+                            ) {
+                                warnings.push(format!(
+                                    "{}: rejected game package: {err}. A game or store product \
+                                     already claimed (official plugins register first) cannot be \
+                                     claimed again.",
+                                    package.label
+                                ));
                             }
                         }
                     }

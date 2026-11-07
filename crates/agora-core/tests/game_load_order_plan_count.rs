@@ -19,7 +19,7 @@ use agora_core::game_registry::{
 };
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
-    LaunchRecipe, LaunchValue, PackageDefinition, PluginListRule, RelPath, RuntimeIdentity,
+    LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath, RuntimeIdentity,
     StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
@@ -38,6 +38,7 @@ fn definition() -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("count-game").unwrap(),
+        extends: None,
         name: "Count Game".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::new("steam").unwrap(),
@@ -46,7 +47,6 @@ fn definition() -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: Some(LaunchRecipe {
@@ -68,7 +68,7 @@ fn definition() -> GameDefinition {
         linked_archive_patterns: vec![],
         declared_writes: vec!["writeable_base.txt".into()],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: Vec::new(),
@@ -76,17 +76,31 @@ fn definition() -> GameDefinition {
         copy_patterns: Vec::new(),
     };
     if plugin_list > 0 {
-        def.plugin_list = Some(PluginListRule {
-            user_file: RelPath::new("user/Plugins.txt").unwrap(),
-            plugin_folder: RelPath::new("Data").unwrap(),
-            patterns: vec!["*.esp".into(), "*.esm".into()],
-            active_prefix: String::new(),
-            header: vec![],
-            semantics: (plugin_list == 2).then(|| "creation_engine".to_string()),
-            implicit: vec![],
-            implicit_list_file: None,
-            loot: None,
-        });
+        def.load_orders = vec![LoadOrderDefinition {
+            id: "plugins".into(),
+            name: "Plugins".into(),
+            file: RelPath::new("user/Plugins.txt").unwrap(),
+            items: agora_game_api::LoadOrderItems {
+                folder: RelPath::new("Data").unwrap(),
+                patterns: vec!["*.esp".into(), "*.esm".into()],
+                folders: false,
+            },
+            format: agora_game_api::LoadOrderFormat::Lines {
+                active_prefix: String::new(),
+                header: vec![],
+            },
+            rules: agora_game_api::LoadOrderRules {
+                kind: if plugin_list == 2 {
+                    "creation_engine".to_string()
+                } else {
+                    "none".to_string()
+                },
+                entry: None,
+                implicit: vec![],
+                implicit_list_file: None,
+                loot: None,
+            },
+        }];
         def.user_files = vec![UserFileMapping::new(
             GamePath::UserData {
                 location: UserDataLocation::LocalAppData,
@@ -117,6 +131,8 @@ fn each_plugin_command_plans_once() {
             version: semver::Version::new(0, 1, 0),
             api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
             parents: vec![],
+            game_templates: std::collections::BTreeMap::new(),
+            behaviours: None,
             games: vec![def.clone()],
             frameworks: vec![],
             tools: vec![],

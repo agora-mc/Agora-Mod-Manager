@@ -93,9 +93,9 @@ fn status_path(ctx: &Ctx, definition: &GameDefinition) -> PathBuf {
 
 fn loot_rule(definition: &GameDefinition) -> Result<&LootRule, LoadOrderError> {
     definition
-        .plugin_list
-        .as_ref()
-        .and_then(|rule| rule.loot.as_ref())
+        .load_orders
+        .first()
+        .and_then(|rule| rule.rules.loot.as_ref())
         .ok_or_else(|| LoadOrderError::NoLootMasterlist(definition.id.as_str().to_string()))
 }
 
@@ -810,18 +810,18 @@ mod tests {
     }
 
     fn test_definition() -> GameDefinition {
-        use agora_game_api::{DeploymentStrategy, GameId, PluginListRule, RelPath};
+        use agora_game_api::{DeploymentStrategy, GameId, LoadOrderDefinition, RelPath};
         GameDefinition {
             mo2_game_name: None,
             session: Default::default(),
             id: GameId::new("loot-test-game").unwrap(),
+            extends: None,
             name: "LOOT Test Game".into(),
             stores: vec![],
             version_sources: vec![],
             deployment: DeploymentStrategy::VirtualFileSystem,
             content_rules: vec![],
             content_layout: None,
-            native_code_patterns: vec![],
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
@@ -833,22 +833,32 @@ mod tests {
             declared_writes: vec![],
             copy_patterns: vec![],
             excluded_paths: vec![],
-            plugin_list: Some(PluginListRule {
-                user_file: RelPath::new("user/Plugins.txt").unwrap(),
-                plugin_folder: RelPath::new("Data").unwrap(),
-                patterns: vec!["*.esp".into(), "*.esm".into()],
-                active_prefix: "*".into(),
-                header: vec![],
-                semantics: Some("creation_engine".into()),
-                implicit: vec![],
-                implicit_list_file: None,
-                loot: Some(LootRule {
-                    masterlist_repo: "loot/skyrimse".into(),
-                    prelude_repo: Some("loot/prelude".into()),
-                    branch: "v0.29".into(),
-                    game_type: "SkyrimSE".into(),
-                }),
-            }),
+            load_orders: vec![LoadOrderDefinition {
+                id: "plugins".into(),
+                name: "Plugins".into(),
+                file: RelPath::new("user/Plugins.txt").unwrap(),
+                items: agora_game_api::LoadOrderItems {
+                    folder: RelPath::new("Data").unwrap(),
+                    patterns: vec!["*.esp".into(), "*.esm".into()],
+                    folders: false,
+                },
+                format: agora_game_api::LoadOrderFormat::Lines {
+                    active_prefix: "*".into(),
+                    header: vec![],
+                },
+                rules: agora_game_api::LoadOrderRules {
+                    kind: "creation_engine".into(),
+                    entry: None,
+                    implicit: vec![],
+                    implicit_list_file: None,
+                    loot: Some(LootRule {
+                        masterlist_repo: "loot/skyrimse".into(),
+                        prelude_repo: Some("loot/prelude".into()),
+                        branch: "v0.29".into(),
+                        game_type: "SkyrimSE".into(),
+                    }),
+                },
+            }],
             launch_alternatives: vec![],
             runtime_files: vec![],
             save_location: vec![],

@@ -1175,7 +1175,7 @@ pub fn launch_checks(
     let pinned = matches!(record.base, BaseReference::Pinned { .. });
     let (runtime, links) = std::thread::scope(|scope| {
         let runtime = scope.spawn(|| runtime_check(ctx, id, definition));
-        let links = scope.spawn(|| match definition.plugin_list {
+        let links = scope.spawn(|| match definition.load_orders.first() {
             Some(_) if pinned => crate::game_load_order::plan_for_order(ctx, id, definition),
             _ => Ok(None),
         });
@@ -1192,7 +1192,7 @@ pub fn launch_checks(
         });
     }
     let links = links?;
-    let (load_order, plugin_count) = match definition.plugin_list {
+    let (load_order, plugin_count) = match definition.load_orders.first() {
         Some(_) => {
             let order =
                 crate::game_load_order::order_with_view(ctx, id, definition, links.as_ref())?;
@@ -1444,8 +1444,8 @@ fn prepare_deployed(
     // plans. Otherwise it needs no plan, and neither do the generated outputs.
     let links_plan;
     let needs_links_view = definition
-        .plugin_list
-        .as_ref()
+        .load_orders
+        .first()
         .is_some_and(crate::game_load_order::is_engine);
     let links: Option<&crate::game_deploy::DeploymentPlan> = if !needs_links_view {
         None
@@ -1560,7 +1560,7 @@ fn check_load_order(
     launch_anyway: bool,
     links: Option<&crate::game_deploy::DeploymentPlan>,
 ) -> Result<Vec<crate::game_load_order::Finding>, InstanceError> {
-    if definition.plugin_list.is_none() {
+    if definition.load_orders.is_empty() {
         return Ok(Vec::new());
     }
     let findings = crate::game_load_order::check_with_view(ctx, id, definition, links)

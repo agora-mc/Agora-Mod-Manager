@@ -46,6 +46,8 @@ fn test_ctx() -> (TempDir, Ctx) {
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: Vec::new(),
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![game],
         frameworks: Vec::new(),
         tools: Vec::new(),

@@ -22,9 +22,10 @@ use agora_core::game_registry::{
     GameRegistry, GameRegistryError, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
-    DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
-    LaunchAlternative, LaunchRecipe, LootRule, PackageDefinition, PluginListRule, RelPath,
-    RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
+    Condition, DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
+    InstallKind, LaunchAlternative, LaunchRecipe, LoadOrderDefinition, LoadOrderFormat, LootRule,
+    PackageDefinition, RelPath, RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation,
+    UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -60,26 +61,44 @@ fn package_of(def: &GameDefinition) -> PackageDefinition {
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def.clone()],
         frameworks: vec![],
         tools: vec![],
     }
 }
 
-fn plugin_rule() -> PluginListRule {
-    PluginListRule {
-        user_file: RelPath::new("user/Plugins.txt").unwrap(),
-        plugin_folder: RelPath::new("Data").unwrap(),
-        patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-        active_prefix: "*".into(),
-        header: vec![
-            "# This file is used by Skyrim to keep track of your downloaded content.".into(),
-            "# Please do not modify this file.".into(),
-        ],
-        semantics: None,
-        implicit: Vec::new(),
-        implicit_list_file: None,
-        loot: None,
+fn plugin_rule() -> LoadOrderDefinition {
+    LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        items: agora_game_api::LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+            folders: false,
+        },
+        format: LoadOrderFormat::Lines {
+            active_prefix: "*".into(),
+            header: vec![
+                "# This file is used by Skyrim to keep track of your downloaded content.".into(),
+                "# Please do not modify this file.".into(),
+            ],
+        },
+        rules: agora_game_api::LoadOrderRules {
+            kind: "none".into(),
+            entry: None,
+            implicit: Vec::new(),
+            implicit_list_file: None,
+            loot: None,
+        },
+    }
+}
+
+fn set_active_prefix(rule: &mut LoadOrderDefinition, prefix: String) {
+    if let LoadOrderFormat::Lines { active_prefix, .. } = &mut rule.format {
+        *active_prefix = prefix;
     }
 }
 
@@ -88,6 +107,7 @@ fn definition() -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("test-game").unwrap(),
+        extends: None,
         name: "Test Game".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::steam(),
@@ -97,7 +117,6 @@ fn definition() -> GameDefinition {
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
         content_layout: None,
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: Some(LaunchRecipe {
@@ -125,12 +144,12 @@ fn definition() -> GameDefinition {
         linked_archive_patterns: vec![],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: Some(plugin_rule()),
+        load_orders: vec![plugin_rule()],
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: vec![LaunchAlternative {
             id: "loader".into(),
-            when_present: RelPath::new("loader.exe").unwrap(),
+            when: Condition::Present(RelPath::new("loader.exe").unwrap()),
             executable: GamePath::Runtime {
                 path: RelPath::new("loader.exe").unwrap(),
             },
@@ -461,9 +480,9 @@ fn base_plugins_are_never_added_even_when_a_layer_overrides_them() {
 /// The test game, with the plugins the game always loads named in its rule and in `Skyrim.ccc`.
 fn implicit_definition() -> GameDefinition {
     let mut def = definition();
-    let rule = def.plugin_list.as_mut().unwrap();
-    rule.implicit = vec!["Skyrim.esm".into(), "Update.esm".into()];
-    rule.implicit_list_file = Some(RelPath::new("Skyrim.ccc").unwrap());
+    let rule = def.load_orders.first_mut().unwrap();
+    rule.rules.implicit = vec!["Skyrim.esm".into(), "Update.esm".into()];
+    rule.rules.implicit_list_file = Some(RelPath::new("Skyrim.ccc").unwrap());
     def
 }
 
@@ -714,7 +733,7 @@ fn an_unreadable_state_file_fails_closed() {
 #[test]
 fn a_game_without_a_plugin_list_deploys_as_before() {
     let mut def = definition();
-    def.plugin_list = None;
+    def.load_orders.clear();
     let h = Harness::with_definition(def);
     let inst = h.instance("plain-game");
     let item = h.item("mod", &[("Data/A.esp", b"a")]);
@@ -772,7 +791,7 @@ fn toggling_an_unknown_plugin_or_a_missing_list_is_an_error() {
 #[test]
 fn a_list_with_no_inactive_state_cannot_disable_a_plugin() {
     let mut def = definition();
-    def.plugin_list.as_mut().unwrap().active_prefix = String::new();
+    set_active_prefix(def.load_orders.first_mut().unwrap(), String::new());
     let h = Harness::with_definition(def);
     let inst = h.instance("always-active");
     let item = h.item("mod", &[("Data/A.esp", b"a")]);
@@ -804,7 +823,7 @@ fn a_plugin_list_naming_no_user_file_mapping_is_refused_at_registration() {
     assert!(register(&definition()).is_ok());
 
     let mut def = definition();
-    def.plugin_list.as_mut().unwrap().user_file = RelPath::new("user/Other.txt").unwrap();
+    def.load_orders.first_mut().unwrap().file = RelPath::new("user/Other.txt").unwrap();
     assert!(matches!(
         register(&def),
         Err(GameRegistryError::PluginListUserFileNotFound { .. })
@@ -829,19 +848,19 @@ fn a_plugin_list_naming_no_user_file_mapping_is_refused_at_registration() {
 #[test]
 fn a_plugin_list_that_could_match_nothing_is_refused() {
     let mut def = definition();
-    def.plugin_list.as_mut().unwrap().patterns = vec![];
+    def.load_orders.first_mut().unwrap().items.patterns = vec![];
     assert!(matches!(
         register(&def),
         Err(GameRegistryError::InvalidPluginList { .. })
     ));
     let mut def = definition();
-    def.plugin_list.as_mut().unwrap().patterns = vec!["  ".into()];
+    def.load_orders.first_mut().unwrap().items.patterns = vec!["  ".into()];
     assert!(matches!(
         register(&def),
         Err(GameRegistryError::InvalidPluginList { .. })
     ));
     let mut def = definition();
-    def.plugin_list.as_mut().unwrap().active_prefix = "* ".into();
+    set_active_prefix(def.load_orders.first_mut().unwrap(), "* ".into());
     assert!(matches!(
         register(&def),
         Err(GameRegistryError::InvalidPluginList { .. })
@@ -876,7 +895,7 @@ fn malformed_launch_alternatives_are_refused_at_registration() {
     ));
 
     let mut def = definition();
-    def.launch_alternatives[0].when_present = RelPath::default();
+    def.launch_alternatives[0].when = Condition::Present(RelPath::default());
     assert!(matches!(
         register(&def),
         Err(GameRegistryError::InvalidLaunchAlternative { .. })
@@ -967,7 +986,7 @@ fn the_first_matching_alternative_wins() {
         0,
         LaunchAlternative {
             id: "other".into(),
-            when_present: RelPath::new("other.exe").unwrap(),
+            when: Condition::Present(RelPath::new("other.exe").unwrap()),
             executable: GamePath::Runtime {
                 path: RelPath::new("other.exe").unwrap(),
             },
@@ -1012,9 +1031,9 @@ fn plugin_file(flags: u32, masters: &[&str]) -> Vec<u8> {
 
 fn engine_definition(implicit: &[&str]) -> GameDefinition {
     let mut def = definition();
-    let rule = def.plugin_list.as_mut().unwrap();
-    rule.semantics = Some("creation_engine".into());
-    rule.implicit = implicit.iter().map(|s| s.to_string()).collect();
+    let rule = def.load_orders.first_mut().unwrap();
+    rule.rules.kind = "creation_engine".into();
+    rule.rules.implicit = implicit.iter().map(|s| s.to_string()).collect();
     def
 }
 
@@ -1481,9 +1500,9 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
 #[test]
 fn a_corrupted_saved_masterlist_sorts_by_masters_and_says_so() {
     let mut def = definition();
-    let rule = def.plugin_list.as_mut().unwrap();
-    rule.semantics = Some("creation_engine".into());
-    rule.loot = Some(LootRule {
+    let rule = def.load_orders.first_mut().unwrap();
+    rule.rules.kind = "creation_engine".into();
+    rule.rules.loot = Some(LootRule {
         masterlist_repo: "loot/skyrimse".into(),
         prelude_repo: None,
         branch: "v0.29".into(),
@@ -1518,7 +1537,7 @@ fn a_corrupted_saved_masterlist_sorts_by_masters_and_says_so() {
 #[test]
 fn loot_messages_appear_on_the_first_list_read_when_a_masterlist_is_saved() {
     let mut def = engine_definition(&[]);
-    def.plugin_list.as_mut().unwrap().loot = Some(LootRule {
+    def.load_orders.first_mut().unwrap().rules.loot = Some(LootRule {
         masterlist_repo: "loot/skyrimse".into(),
         prelude_repo: None,
         branch: "v0.29".into(),
@@ -1564,9 +1583,9 @@ fn loot_messages_appear_on_the_first_list_read_when_a_masterlist_is_saved() {
 #[test]
 fn with_no_masterlist_sort_says_it_used_masters_only() {
     let mut def = definition();
-    let rule = def.plugin_list.as_mut().unwrap();
-    rule.semantics = Some("creation_engine".into());
-    rule.loot = Some(LootRule {
+    let rule = def.load_orders.first_mut().unwrap();
+    rule.rules.kind = "creation_engine".into();
+    rule.rules.loot = Some(LootRule {
         masterlist_repo: "loot/skyrimse".into(),
         prelude_repo: None,
         branch: "v0.29".into(),

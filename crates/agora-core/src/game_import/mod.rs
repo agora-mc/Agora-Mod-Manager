@@ -921,7 +921,7 @@ fn plan_plugins(
     base_data: &Path,
     warnings: &mut Vec<String>,
 ) -> Result<PluginPlan, ImportError> {
-    let Some(rule) = &def.plugin_list else {
+    let Some(rule) = def.load_orders.first() else {
         return Ok(PluginPlan {
             kept: false,
             lines: Vec::new(),
@@ -951,7 +951,12 @@ fn plan_plugins(
         .filter(|p| p.active)
         .map(|p| fold_path_case(&p.name))
         .collect();
-    let implicit: HashSet<String> = rule.implicit.iter().map(|n| fold_path_case(n)).collect();
+    let implicit: HashSet<String> = rule
+        .rules
+        .implicit
+        .iter()
+        .map(|n| fold_path_case(n))
+        .collect();
 
     let managed: Vec<String> = {
         let mut seen = HashSet::new();

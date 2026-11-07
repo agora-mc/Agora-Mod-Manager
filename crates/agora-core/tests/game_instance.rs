@@ -25,6 +25,7 @@ fn make_test_definition() -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("skyrim-se").unwrap(),
+        extends: None,
         name: "Skyrim Special Edition".into(),
         stores: vec![
             StoreIdentifier {
@@ -39,7 +40,6 @@ fn make_test_definition() -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: Some(LaunchRecipe {
@@ -61,7 +61,7 @@ fn make_test_definition() -> GameDefinition {
         linked_archive_patterns: vec!["Data/*.bsa".into()],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: Vec::new(),

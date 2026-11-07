@@ -68,9 +68,6 @@
           "reshade-shaders"
         ]
       },
-      "native_code_patterns": [
-        "Data/SKSE/Plugins/*.dll"
-      ],
       "framework_ids": [
         "skse"
       ],
@@ -250,39 +247,53 @@
       "excluded_paths": [
         "Data/SSEEdit Backups/**"
       ],
-      "plugin_list": {
-        "user_file": "user/Plugins.txt",
-        "plugin_folder": "Data",
-        "patterns": [
-          "*.esm",
-          "*.esl",
-          "*.esp"
-        ],
-        "active_prefix": "*",
-        "header": [
-          "# This file is used by Skyrim to keep track of your downloaded content.",
-          "# Please do not modify this file."
-        ],
-        "semantics": "creation_engine",
-        "implicit": [
-          "Skyrim.esm",
-          "Update.esm",
-          "Dawnguard.esm",
-          "HearthFires.esm",
-          "Dragonborn.esm"
-        ],
-        "implicit_list_file": "Skyrim.ccc",
-        "loot": {
-          "masterlist_repo": "loot/skyrimse",
-          "prelude_repo": "loot/prelude",
-          "branch": "v0.29",
-          "game_type": "SkyrimSE"
+      "load_orders": [
+        {
+          "id": "plugins",
+          "name": "Plugins",
+          "file": "user/Plugins.txt",
+          "items": {
+            "folder": "Data",
+            "patterns": [
+              "*.esm",
+              "*.esl",
+              "*.esp"
+            ],
+            "folders": false
+          },
+          "format": {
+            "type": "lines",
+            "active_prefix": "*",
+            "header": [
+              "# This file is used by Skyrim to keep track of your downloaded content.",
+              "# Please do not modify this file."
+            ]
+          },
+          "rules": {
+            "kind": "creation_engine",
+            "implicit": [
+              "Skyrim.esm",
+              "Update.esm",
+              "Dawnguard.esm",
+              "HearthFires.esm",
+              "Dragonborn.esm"
+            ],
+            "implicit_list_file": "Skyrim.ccc",
+            "loot": {
+              "masterlist_repo": "loot/skyrimse",
+              "prelude_repo": "loot/prelude",
+              "branch": "v0.29",
+              "game_type": "SkyrimSE"
+            }
+          }
         }
-      },
+      ],
       "launch_alternatives": [
         {
           "id": "skse",
-          "when_present": "skse64_loader.exe",
+          "when": {
+            "present": "skse64_loader.exe"
+          },
           "executable": {
             "root": "runtime",
             "path": "skse64_loader.exe"
@@ -426,21 +437,36 @@
           "path": "Data/Pandora Behaviour Engine+/Pandora Behaviour Engine+.exe"
         },
         "arguments": [
-          { "kind": "literal", "value": "--output" },
+          {
+            "kind": "literal",
+            "value": "--output"
+          },
           {
             "kind": "path",
-            "path": { "root": "runtime", "path": "Data" },
+            "path": {
+              "root": "runtime",
+              "path": "Data"
+            },
             "prefix": "",
             "suffix": ""
           },
-          { "kind": "literal", "value": "--tesv" },
+          {
+            "kind": "literal",
+            "value": "--tesv"
+          },
           {
             "kind": "path",
-            "path": { "root": "runtime", "path": "" },
+            "path": {
+              "root": "runtime",
+              "path": ""
+            },
             "prefix": "",
             "suffix": ""
           },
-          { "kind": "literal", "value": "--auto_close" }
+          {
+            "kind": "literal",
+            "value": "--auto_close"
+          }
         ],
         "environment": {},
         "working_directory": {
@@ -450,7 +476,9 @@
       },
       "relevant_settings": [],
       "after_tools": [],
-      "conflicts_with": ["nemesis"],
+      "conflicts_with": [
+        "nemesis"
+      ],
       "uses_install_path": true,
       "output_patterns": [
         "Data/meshes/actors/character/**",
@@ -571,7 +599,9 @@
       "after_tools": [],
       "uses_install_path": true,
       "run_only": true,
-      "executable_names": ["SSEEdit64.exe"]
+      "executable_names": [
+        "SSEEdit64.exe"
+      ]
     },
     {
       "id": "loot",
@@ -613,7 +643,9 @@
       "relevant_settings": [],
       "after_tools": [],
       "uses_install_path": true,
-      "output_patterns": ["Data/Synthesis.esp"]
+      "output_patterns": [
+        "Data/Synthesis.esp"
+      ]
     }
   ]
 }

@@ -27,7 +27,7 @@ use agora_core::game_registry::{
 use agora_core::game_tools::{self, CaptureMode};
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
-    LaunchRecipe, LaunchValue, PackageDefinition, PluginListRule, RelPath, RuntimeIdentity,
+    LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath, RuntimeIdentity,
     StoreId, StoreIdentifier, ToolDefinition, ToolId, ToolOutput, UserDataLocation,
     UserFileMapping, UserFileStrategy,
 };
@@ -103,6 +103,10 @@ fn writes_a_file(id: &str, file: &str) -> ToolDefinition {
         required_magic: Vec::new(),
         run_only: false,
         executable_names: Vec::new(),
+        inputs: Vec::new(),
+        scope: Default::default(),
+        input_files: Vec::new(),
+        before_launch: None,
     }
 }
 
@@ -112,6 +116,7 @@ fn definition(tools: &[ToolDefinition]) -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new(GAME).unwrap(),
+        extends: None,
         name: "Count Game".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::steam(),
@@ -120,7 +125,6 @@ fn definition(tools: &[ToolDefinition]) -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: tools.iter().map(|t| t.id.clone()).collect(),
         launch: Some(LaunchRecipe {
@@ -148,18 +152,27 @@ fn definition(tools: &[ToolDefinition]) -> GameDefinition {
         linked_archive_patterns: vec![],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: Some(PluginListRule {
-            user_file: RelPath::new("user/Plugins.txt").unwrap(),
-            plugin_folder: RelPath::new("Data").unwrap(),
-            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-            active_prefix: "*".into(),
-            header: vec![],
-            // The Creation Engine rules: only an engine game's load order reads a deployment plan.
-            semantics: Some("creation_engine".to_string()),
-            implicit: Vec::new(),
-            implicit_list_file: None,
-            loot: None,
-        }),
+        load_orders: vec![LoadOrderDefinition {
+            id: "plugins".into(),
+            name: "Plugins".into(),
+            file: RelPath::new("user/Plugins.txt").unwrap(),
+            items: agora_game_api::LoadOrderItems {
+                folder: RelPath::new("Data").unwrap(),
+                patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+                folders: false,
+            },
+            format: agora_game_api::LoadOrderFormat::Lines {
+                active_prefix: "*".into(),
+                header: vec![],
+            },
+            rules: agora_game_api::LoadOrderRules {
+                kind: "creation_engine".to_string(),
+                entry: None,
+                implicit: Vec::new(),
+                implicit_list_file: None,
+                loot: None,
+            },
+        }],
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: Vec::new(),
@@ -175,6 +188,8 @@ fn registry(def: &GameDefinition, tools: Vec<ToolDefinition>) -> Arc<GameRegistr
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def.clone()],
         frameworks: vec![],
         tools,

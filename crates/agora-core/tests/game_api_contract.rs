@@ -39,8 +39,8 @@ fn declarative_skyrim_and_valheim_packages_need_no_discovered_install_ids() {
                 "id": game, "name": game, "stores": [{"store": "steam", "product": "store-id"}],
                 "version_sources": [{"kind": "executable", "path": executable}],
                 "deployment": strategy,
-                "content_rules": [{"source_pattern": "**/*", "destination": "mods", "content_kind": "mod"}],
-                "native_code_patterns": ["mods/**/*.dll"], "framework_ids": [framework],
+                "content_rules": [{"kind": "mod", "match": {"all_files": "**/*"}, "mount": "mods"}],
+                "framework_ids": [framework],
                 "tool_ids": ["patcher"], "launch": launch,
                 "log_paths": [{"root": "user_data", "location": "local_app_data", "path": "game/logs"}],
                 "crash_paths": [], "user_files": [], "save_paths": [], "linked_archive_patterns": ["*.bsa"]

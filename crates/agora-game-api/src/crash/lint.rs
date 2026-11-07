@@ -4,8 +4,8 @@
 //! Unknown fields are refused while parsing, so hand-written JSON should go through
 //! [`lint_pack_json`] or [`lint_rule_json`], not plain `serde_json`.
 
-use super::rule::{compare_dotted, dotted};
 use super::*;
+use crate::condition::{compare_dotted, dotted};
 use regex::{Regex, RegexBuilder};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

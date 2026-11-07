@@ -3,7 +3,7 @@
 //! lock operations that change it.
 //!
 //! Core owns the ordered list, its locks and its writes ([`crate::game_plugins`]). The meaning
-//! belongs to the game: a [`PluginListRule`] with `semantics = "creation_engine"` turns on the
+//! belongs to the game: a [`LoadOrderDefinition`] with `rules.kind = "creation_engine"` turns on the
 //! master, light and limit rules here. Plugin headers come from LOOT's `esplugin` crate, read from
 //! the files the game will see: the deployment plan's source for each plugin in the plugin folder.
 //!
@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{fold_path_case, glob_match, GameDefinition, PluginListRule};
+use agora_game_api::{fold_path_case, glob_match, GameDefinition, LoadOrderDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
@@ -338,8 +338,8 @@ fn key(name: &str) -> String {
 }
 
 /// Whether the game declares the Creation Engine rules.
-pub fn is_engine(rule: &PluginListRule) -> bool {
-    rule.semantics.as_deref() == Some(CREATION_ENGINE)
+pub fn is_engine(rule: &LoadOrderDefinition) -> bool {
+    rule.rules.kind == CREATION_ENGINE
 }
 
 /// The plugin names in a game's `implicit_list_file`, one per line, in the file's order.
@@ -359,7 +359,7 @@ pub fn parse_implicit_list(text: &str) -> Vec<String> {
 /// from the rule's `implicit_list_file`. A line in the list that names an always-loaded plugin is
 /// dropped from the order: the game loads that plugin first regardless.
 pub fn build_order(
-    rule: &PluginListRule,
+    rule: &LoadOrderDefinition,
     listed: &[PluginEntry],
     installed: Option<&Installed>,
     implicit_names: &[String],
@@ -368,7 +368,7 @@ pub fn build_order(
     let engine = is_engine(rule);
     let mut implicit_keys = HashSet::new();
     let mut implicit = Vec::new();
-    for name in rule.implicit.iter().chain(implicit_names) {
+    for name in rule.rules.implicit.iter().chain(implicit_names) {
         if implicit_keys.insert(key(name)) {
             implicit.push(name.clone());
         }
@@ -902,10 +902,10 @@ pub fn move_entry(
 // Entry points
 // ---------------------------------------------------------------------------
 
-fn rule_of(definition: &GameDefinition) -> Result<&PluginListRule, LoadOrderError> {
+fn rule_of(definition: &GameDefinition) -> Result<&LoadOrderDefinition, LoadOrderError> {
     definition
-        .plugin_list
-        .as_ref()
+        .load_orders
+        .first()
         .ok_or_else(|| PluginListError::NoRule(definition.id.clone()).into())
 }
 
@@ -938,7 +938,7 @@ fn installed_files(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
-    rule: &PluginListRule,
+    rule: &LoadOrderDefinition,
     links: Option<&DeploymentPlan>,
 ) -> Result<(Installed, Vec<String>), LoadOrderError> {
     let planned;
@@ -954,14 +954,16 @@ fn installed_files(
             &planned
         }
     };
-    let folder = rule.plugin_folder.as_str().trim_matches('/');
+    let folder = rule.items.folder.as_str().trim_matches('/');
     let patterns: Vec<String> = rule
+        .items
         .patterns
         .iter()
         .map(|p| fold_path_case(p.trim()))
         .filter(|p| !p.is_empty())
         .collect();
     let list_file = rule
+        .rules
         .implicit_list_file
         .as_ref()
         .map(|p| fold_path_case(p.as_str()));
@@ -1041,7 +1043,7 @@ fn order_of_with_view(
             listed.exists,
         );
         if let (Some(loot), Ok(Some(cached))) = (
-            rule.loot.as_ref(),
+            rule.rules.loot.as_ref(),
             crate::loot_masterlist::cached(ctx, definition),
         ) {
             if let Ok(notes) =
@@ -1177,7 +1179,7 @@ fn sort_inner(
     let mut notes = Vec::new();
     let mut mode = SortMode::Masters;
     let mut message = None;
-    let (moves, blocked) = match &rule.loot {
+    let (moves, blocked) = match &rule.rules.loot {
         Some(loot) if !duplicated && !unreadable => {
             match crate::loot_masterlist::cached(ctx, definition)? {
                 Some(cached) => match crate::loot_masterlist::sort_and_notes(
@@ -1831,17 +1833,27 @@ mod tests {
         }
     }
 
-    fn engine_rule() -> PluginListRule {
-        PluginListRule {
-            user_file: agora_game_api::RelPath::new("user/Plugins.txt").unwrap(),
-            plugin_folder: agora_game_api::RelPath::new("Data").unwrap(),
-            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-            active_prefix: "*".into(),
-            header: Vec::new(),
-            semantics: Some(CREATION_ENGINE.into()),
-            implicit: vec!["Skyrim.esm".into(), "Dawnguard.esm".into()],
-            implicit_list_file: Some(agora_game_api::RelPath::new("Skyrim.ccc").unwrap()),
-            loot: None,
+    fn engine_rule() -> LoadOrderDefinition {
+        LoadOrderDefinition {
+            id: "plugins".into(),
+            name: "Plugins".into(),
+            file: agora_game_api::RelPath::new("user/Plugins.txt").unwrap(),
+            items: agora_game_api::LoadOrderItems {
+                folder: agora_game_api::RelPath::new("Data").unwrap(),
+                patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+                folders: false,
+            },
+            format: agora_game_api::LoadOrderFormat::Lines {
+                active_prefix: "*".into(),
+                header: Vec::new(),
+            },
+            rules: agora_game_api::LoadOrderRules {
+                kind: CREATION_ENGINE.into(),
+                entry: None,
+                implicit: vec!["Skyrim.esm".into(), "Dawnguard.esm".into()],
+                implicit_list_file: Some(agora_game_api::RelPath::new("Skyrim.ccc").unwrap()),
+                loot: None,
+            },
         }
     }
 
@@ -1912,7 +1924,7 @@ mod tests {
     #[test]
     fn a_game_without_creation_rules_reads_no_headers_and_has_no_findings() {
         let mut rule = engine_rule();
-        rule.semantics = None;
+        rule.rules.kind = "none".into();
         let listed = [plugin_line_of("A.esp", true), plugin_line_of("B.esp", true)];
         let order = build_order(&rule, &listed, None, &[], true);
         assert!(!order.engine);

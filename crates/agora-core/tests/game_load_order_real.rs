@@ -17,7 +17,7 @@ use agora_core::game_load_order::{
     build_order, parse_implicit_list, read_header, sort_entries, Installed,
 };
 use agora_core::game_plugins::PluginEntry;
-use agora_game_api::PluginListRule;
+use agora_game_api::LoadOrderDefinition;
 
 fn env_dir(name: &str) -> Option<PathBuf> {
     let value = std::env::var_os(name)?;
@@ -41,7 +41,7 @@ fn is_plugin(path: &Path) -> bool {
 }
 
 /// The Skyrim SE plugin list rule, read from the package definition the app ships.
-fn skyrim_rule() -> Option<PluginListRule> {
+fn skyrim_rule() -> Option<LoadOrderDefinition> {
     let path = env_dir_or_file("AGORA_SKYRIM_PACKAGE")?;
     let text = std::fs::read_to_string(&path).expect("read the package definition");
     let package: serde_json::Value =
@@ -50,7 +50,7 @@ fn skyrim_rule() -> Option<PluginListRule> {
         .as_array()
         .and_then(|games| games.iter().find(|g| g["id"] == "skyrim-se"))
         .expect("skyrim-se is defined");
-    Some(serde_json::from_value(game["plugin_list"].clone()).expect("plugin_list parses"))
+    Some(serde_json::from_value(game["load_orders"][0].clone()).expect("load order parses"))
 }
 
 fn env_dir_or_file(name: &str) -> Option<PathBuf> {
@@ -197,6 +197,7 @@ fn the_salvage_profile_order_findings_and_sort_dry_run() {
         }
     };
     let present_implicit = rule
+        .rules
         .implicit
         .iter()
         .chain(&implicit_names)
@@ -204,7 +205,7 @@ fn the_salvage_profile_order_findings_and_sort_dry_run() {
         .count();
     println!(
         "always loaded: {} named, {} present",
-        rule.implicit.len() + implicit_names.len(),
+        rule.rules.implicit.len() + implicit_names.len(),
         present_implicit
     );
 

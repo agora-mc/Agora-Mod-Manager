@@ -8326,7 +8326,7 @@ async fn run_command(
                                 println!("- {}", finding.summary());
                             }
                         }
-                        if game_def.plugin_list.is_some() {
+                        if !game_def.load_orders.is_empty() {
                             if load_order.is_empty() {
                                 println!(
                                     "No load order problems found in instance '{instance_id}'."

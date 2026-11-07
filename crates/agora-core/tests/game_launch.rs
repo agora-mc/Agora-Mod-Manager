@@ -22,6 +22,7 @@ fn make_test_definition(recipe: Option<LaunchRecipe>) -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("test-game").unwrap(),
+        extends: None,
         name: "Test Game".into(),
         stores: vec![
             StoreIdentifier {
@@ -36,7 +37,6 @@ fn make_test_definition(recipe: Option<LaunchRecipe>) -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: recipe,
@@ -47,7 +47,7 @@ fn make_test_definition(recipe: Option<LaunchRecipe>) -> GameDefinition {
         linked_archive_patterns: vec!["Data/*.bsa".into()],
         declared_writes: vec!["d3dx9_42.log".into()],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: Vec::new(),

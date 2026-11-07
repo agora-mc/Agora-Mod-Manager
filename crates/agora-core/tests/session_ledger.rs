@@ -38,6 +38,7 @@ fn definition() -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("test-game").unwrap(),
+        extends: None,
         name: "Test Game".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::new("steam").unwrap(),
@@ -46,7 +47,6 @@ fn definition() -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: Some(LaunchRecipe {
@@ -75,7 +75,7 @@ fn definition() -> GameDefinition {
         linked_archive_patterns: vec![],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: Vec::new(),
@@ -99,6 +99,8 @@ fn registry(def: &GameDefinition) -> Arc<GameRegistry> {
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def.clone()],
         frameworks: vec![],
         tools: vec![],

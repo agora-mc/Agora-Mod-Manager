@@ -1,3 +1,4 @@
+use crate::condition::Condition;
 use crate::id::{FrameworkId, GameId, InstallId, LayerId, RelPath, StoreId, ToolId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -322,7 +323,7 @@ pub enum UserDataLocation {
 /// Recipes refer to managed paths without inventing a string interpolation
 /// language or asking a package for absolute host paths. Core resolves paths
 /// and joins path lists with the platform separator (e.g. Java's classpath).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LaunchValue {
     Literal {
@@ -337,6 +338,67 @@ pub enum LaunchValue {
         paths: Vec<GamePath>,
         prefix: String,
     },
+    /// An argument that applies only when `when` is true (MASTER_SPEC §30.12). An unknown answer
+    /// leaves it out; the launch log says it could not tell.
+    Conditional {
+        value: Box<LaunchValue>,
+        when: Condition,
+    },
+}
+
+/// A launch argument is written as a plain string, an old-shaped value, or
+/// `{ "value": "-x", "when": {} }`.
+impl<'de> Deserialize<'de> for LaunchValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Plain(String),
+            Conditional {
+                value: Box<LaunchValue>,
+                when: Condition,
+            },
+            Tagged(Tagged),
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            Literal {
+                value: String,
+            },
+            Path {
+                path: GamePath,
+                prefix: String,
+                suffix: String,
+            },
+            PathList {
+                paths: Vec<GamePath>,
+                prefix: String,
+            },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Plain(value) => Ok(Self::Literal { value }),
+            Repr::Conditional { value, when } => Ok(Self::Conditional { value, when }),
+            Repr::Tagged(Tagged::Literal { value }) => Ok(Self::Literal { value }),
+            Repr::Tagged(Tagged::Path {
+                path,
+                prefix,
+                suffix,
+            }) => Ok(Self::Path {
+                path,
+                prefix,
+                suffix,
+            }),
+            Repr::Tagged(Tagged::PathList { paths, prefix }) => {
+                Ok(Self::PathList { paths, prefix })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,24 +434,48 @@ pub enum Suggestion {
     },
 }
 
+/// A rule that places a whole content item by what it holds (MASTER_SPEC §30.12). The first rule
+/// that matches decides the item's mount; no match falls through to `content_layout`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClassificationRule {
-    pub source_pattern: String,
-    pub destination: RelPath,
-    pub content_kind: String,
+pub struct ContentRule {
+    /// The kind in the game's own words, shown to the player.
+    pub kind: String,
+    #[serde(rename = "match")]
+    pub matching: ContentMatch,
+    /// Where the item goes. `{folder}` is the folder holding the marker, or the item's own name
+    /// when the marker is at its root.
+    pub mount: RelPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<Condition>,
+}
+
+/// What a content rule looks for. Exactly one of `marker` or `all_files` is written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentMatch {
+    /// A file at any depth up to the layout's limit, e.g. `info.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    /// Every file in the item matches this glob, e.g. `*.archive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all_files: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameDefinition {
     pub id: GameId,
     pub name: String,
+    /// A package `game_templates` entry this game starts from (MASTER_SPEC §30.12). The template
+    /// is merged before parsing, so it may be partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
     pub stores: Vec<StoreIdentifier>,
     pub version_sources: Vec<VersionSource>,
     pub deployment: DeploymentStrategy,
-    pub content_rules: Vec<ClassificationRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_rules: Vec<ContentRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_layout: Option<ContentLayout>,
-    pub native_code_patterns: Vec<RelPath>,
     pub framework_ids: Vec<FrameworkId>,
     pub tool_ids: Vec<ToolId>,
     /// Declarative launch recipe for this game, if any.
@@ -410,8 +496,8 @@ pub struct GameDefinition {
     pub copy_patterns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_paths: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin_list: Option<PluginListRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_orders: Vec<LoadOrderDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_alternatives: Vec<LaunchAlternative>,
     /// Files a framework ships once per game version (MASTER_SPEC §26.6), checked before launch.
@@ -462,31 +548,99 @@ impl SessionRules {
     }
 }
 
+/// One list a game keeps in load order (MASTER_SPEC §30.12). `load_orders` replaces the old single
+/// `plugin_list`: a game may keep any number of lists, in any folder, with open rule sets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginListRule {
-    pub user_file: RelPath,
-    pub plugin_folder: RelPath,
+pub struct LoadOrderDefinition {
+    /// Local to the game; refused when two lists share one.
+    pub id: String,
+    /// What the list is called to a person.
+    pub name: String,
+    /// The instance file the list is written to, e.g. `user/Plugins.txt`.
+    pub file: RelPath,
+    pub items: LoadOrderItems,
+    pub format: LoadOrderFormat,
+    pub rules: LoadOrderRules,
+}
+
+/// What a load order lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadOrderItems {
+    /// The game folder the items are in, e.g. `Data`.
+    pub folder: RelPath,
+    /// Case-insensitive globs naming the files to list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
-    pub active_prefix: String,
-    pub header: Vec<String>,
-    /// The load-order rules the game's plugin format obeys. `"creation_engine"` turns on the
-    /// masters, light plugin and limit rules of MASTER_SPEC §26.6; any other value is refused
-    /// at registration. Absent means the list only activates plugins, as before.
+    /// Whether folders are listed too, as REDmod's `mods/<name>` are.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folders: bool,
+}
+
+/// How a load order file is read and written. `lines` is the common text list; `script` lets a
+/// plugin parse a format Agora has never heard of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LoadOrderFormat {
+    Lines {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        active_prefix: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        header: Vec<String>,
+    },
+    Script {
+        /// The plugin entrypoint that parses the list.
+        parse: String,
+        /// The plugin entrypoint that renders it.
+        render: String,
+    },
+}
+
+impl LoadOrderFormat {
+    /// The prefix that marks an active line. A script format has none, so Agora cannot mark a line
+    /// inactive itself.
+    pub fn active_prefix(&self) -> &str {
+        match self {
+            Self::Lines { active_prefix, .. } => active_prefix,
+            Self::Script { .. } => "",
+        }
+    }
+
+    pub fn header(&self) -> &[String] {
+        match self {
+            Self::Lines { header, .. } => header,
+            Self::Script { .. } => &[],
+        }
+    }
+
+    pub fn is_script(&self) -> bool {
+        matches!(self, Self::Script { .. })
+    }
+}
+
+/// How a list's order is judged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadOrderRules {
+    /// `none` (any order works), `script` or `creation_engine`. Any other value is refused at
+    /// registration.
+    pub kind: String,
+    /// The plugin entrypoint a `script` rule set calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantics: Option<String>,
-    /// Plugins the game always loads first, in this order, when they are present in the plugin
-    /// folder. They are not written into the instance's list.
+    pub entry: Option<String>,
+    /// Plugins the game always loads first, in this order, when present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub implicit: Vec<String>,
-    /// A file (relative to the game's root) naming more always-loaded plugins, one per line, in
-    /// the file's order. Each loads after `implicit`, and only when present in the plugin folder.
+    /// A file (relative to the game's root) naming more always-loaded plugins, one per line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_list_file: Option<RelPath>,
-    /// LOOT masterlist sources for this game, so sorting can use LOOT's rules. The repository
-    /// slug, branch and LOOT game name are package data: a game package supplies its own, and
-    /// core never hardcodes a game's repository.
+    /// LOOT masterlist sources for this game, so sorting can use LOOT's rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loot: Option<LootRule>,
+}
+
+impl LoadOrderRules {
+    pub fn is_script(&self) -> bool {
+        self.kind == "script"
+    }
 }
 
 /// Where a game's LOOT masterlist comes from (MASTER_SPEC §26.6).
@@ -508,7 +662,9 @@ pub struct LootRule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchAlternative {
     pub id: String,
-    pub when_present: RelPath,
+    /// When the alternative applies. A framework's loader is
+    /// `{ "present": "skse64_loader.exe" }`; unknown leaves the plain executable.
+    pub when: Condition,
     pub executable: GamePath,
     pub reason: String,
 }
@@ -806,18 +962,6 @@ pub const DEFAULT_COPY_PATTERNS: &[&str] = &[
 ];
 
 impl GameDefinition {
-    /// Whether native code is legitimate at `path` (relative to the install root).
-    /// Runs on the normalized path, rejecting escapes such as `Data/SKSE/Plugins/../../x.dll`.
-    pub fn allows_native_code_at(&self, path: &str) -> bool {
-        let Ok(rel) = RelPath::new(path) else {
-            return false;
-        };
-        let normalized = rel.as_str();
-        self.native_code_patterns
-            .iter()
-            .any(|pattern| glob_match(pattern.as_str(), normalized))
-    }
-
     /// Whether `path` (relative to the install root) matches a linked archive pattern.
     /// Runs on the normalized path, comparing ASCII case-insensitively.
     pub fn is_linked_archive(&self, path: &str) -> bool {
@@ -1738,6 +1882,77 @@ pub struct ToolDefinition {
     /// lists the tool when a mod ships any of them; the match ignores case and folder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub executable_names: Vec<String>,
+    /// Values the player fills in for a run (MASTER_SPEC §30.12), stored per instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<ToolInput>,
+    /// Whether the tool runs once for the instance or once per content item the player picks.
+    #[serde(default, skip_serializing_if = "ToolScope::is_instance")]
+    pub scope: ToolScope,
+    /// Narrows the staleness fingerprint to these game-relative globs. Absent keeps today's
+    /// fingerprint of all content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_files: Vec<String>,
+    /// Whether the tool runs (or is offered) before a launch when it is new or stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_launch: Option<BeforeLaunch>,
+}
+
+/// One value a tool asks the player for before it runs (MASTER_SPEC §30.12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInput {
+    pub id: String,
+    pub label: String,
+    pub kind: ToolInputKind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// The command-line argument the value is passed as, e.g. `--profile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolInputKind {
+    File,
+    Folder,
+    Choice,
+    Text,
+    Flag,
+}
+
+/// How often a tool runs (MASTER_SPEC §30.12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolScope {
+    #[default]
+    Instance,
+    Item,
+}
+
+impl ToolScope {
+    pub fn is_instance(&self) -> bool {
+        matches!(self, Self::Instance)
+    }
+}
+
+/// Whether a new or stale tool runs, or is offered, before a launch (MASTER_SPEC §30.12). Either
+/// way the player can launch anyway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeforeLaunch {
+    pub mode: BeforeLaunchMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<Condition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeforeLaunchMode {
+    Run,
+    Ask,
 }
 
 /// A file a tool writes to report a failure, and the text that says so.
@@ -2051,73 +2266,18 @@ mod tests {
     }
 
     #[test]
-    fn native_code_checks_reject_path_traversal() {
-        let def = GameDefinition {
-            mo2_game_name: None,
-            session: Default::default(),
-            id: GameId::new("skyrim").unwrap(),
-            name: "Skyrim".into(),
-            stores: vec![],
-            version_sources: vec![],
-            deployment: DeploymentStrategy::VirtualFileSystem,
-            content_rules: vec![],
-            content_layout: None,
-            native_code_patterns: vec![
-                RelPath::new("Data/SKSE/Plugins/*.dll").unwrap(),
-                RelPath::new("mods/**/*.dll").unwrap(),
-            ],
-            framework_ids: vec![],
-            tool_ids: vec![],
-            launch: Some(LaunchRecipe {
-                executable: GamePath::Runtime {
-                    path: RelPath::new("SkyrimSE.exe").unwrap(),
-                },
-                arguments: vec![],
-                environment: BTreeMap::new(),
-                working_directory: GamePath::Runtime {
-                    path: RelPath::default(),
-                },
-            }),
-            log_paths: vec![],
-            crash_paths: vec![],
-            user_files: vec![],
-            save_paths: vec![],
-            linked_archive_patterns: vec![],
-            declared_writes: vec![],
-            excluded_paths: vec![],
-            plugin_list: None,
-            runtime_files: Vec::new(),
-            save_location: Vec::new(),
-            launch_alternatives: Vec::new(),
-            copy_patterns: Vec::new(),
-        };
-
-        // Normal valid paths
-        assert!(def.allows_native_code_at("Data/SKSE/Plugins/plugin.dll"));
-        assert!(def.allows_native_code_at("Data\\SKSE\\Plugins\\plugin.dll"));
-        assert!(def.allows_native_code_at("mods/sub/nested/mod.dll"));
-
-        // Path traversal attempts must NOT be accepted!
-        assert!(!def.allows_native_code_at("Data/SKSE/Plugins/../../x.dll"));
-        assert!(!def.allows_native_code_at("Data\\SKSE\\Plugins\\..\\..\\x.dll"));
-        assert!(!def.allows_native_code_at("../mods/evil.dll"));
-        assert!(!def.allows_native_code_at("C:/evil.dll"));
-        assert!(!def.allows_native_code_at("Data/foo.dll"));
-    }
-
-    #[test]
     fn linked_archive_matching_is_case_insensitive() {
         let def = GameDefinition {
             mo2_game_name: None,
             session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
+            extends: None,
             name: "Skyrim SE".into(),
             stores: vec![],
             version_sources: vec![],
             deployment: DeploymentStrategy::VirtualFileSystem,
             content_rules: vec![],
             content_layout: None,
-            native_code_patterns: vec![],
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
@@ -2133,7 +2293,7 @@ mod tests {
             ],
             declared_writes: vec![],
             excluded_paths: vec![],
-            plugin_list: None,
+            load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
             launch_alternatives: Vec::new(),
@@ -2162,13 +2322,13 @@ mod tests {
             mo2_game_name: None,
             session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
+            extends: None,
             name: "Skyrim SE".into(),
             stores: vec![],
             version_sources: vec![],
             deployment: DeploymentStrategy::VirtualFileSystem,
             content_rules: vec![],
             content_layout: None,
-            native_code_patterns: vec![],
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
@@ -2179,7 +2339,7 @@ mod tests {
             linked_archive_patterns: vec![],
             declared_writes: vec!["d3dx9_42.log".into(), "logs/*.log".into()],
             excluded_paths: vec![],
-            plugin_list: None,
+            load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
             launch_alternatives: Vec::new(),
@@ -2203,13 +2363,13 @@ mod tests {
             mo2_game_name: None,
             session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
+            extends: None,
             name: "Skyrim SE".into(),
             stores: vec![],
             version_sources: vec![],
             deployment: DeploymentStrategy::VirtualFileSystem,
             content_rules: vec![],
             content_layout: None,
-            native_code_patterns: vec![],
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
@@ -2220,7 +2380,7 @@ mod tests {
             linked_archive_patterns: vec![],
             declared_writes: vec![],
             excluded_paths: vec!["Data/SSEEdit Backups/**".into()],
-            plugin_list: None,
+            load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
             launch_alternatives: Vec::new(),
@@ -2240,13 +2400,13 @@ mod tests {
             mo2_game_name: None,
             session: Default::default(),
             id: GameId::new("valheim").unwrap(),
+            extends: None,
             name: "Valheim".into(),
             stores: vec![],
             version_sources: vec![],
             deployment: DeploymentStrategy::VirtualFileSystem,
             content_rules: vec![],
             content_layout: None,
-            native_code_patterns: vec![],
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
@@ -2257,7 +2417,7 @@ mod tests {
             linked_archive_patterns: vec![],
             declared_writes: vec![],
             excluded_paths: vec![],
-            plugin_list: None,
+            load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
             launch_alternatives: Vec::new(),

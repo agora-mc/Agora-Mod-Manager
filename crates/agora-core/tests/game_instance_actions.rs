@@ -61,7 +61,6 @@ fn definition() -> GameDefinition {
         "version_sources": [],
         "deployment": "virtual_file_system",
         "content_rules": [],
-        "native_code_patterns": [],
         "framework_ids": [],
         "tool_ids": [],
         "launch": {

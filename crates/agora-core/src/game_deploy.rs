@@ -2031,7 +2031,7 @@ fn activate_plugins(
     plan: &DeploymentPlan,
     links: Option<&DeploymentPlan>,
 ) -> Result<Option<crate::game_plugins::PluginSyncReport>, DeployError> {
-    let Some(rule) = &definition.plugin_list else {
+    let Some(rule) = definition.load_orders.first() else {
         return Ok(None);
     };
     let content_layer_items: Vec<String> = manifest
@@ -3581,12 +3581,12 @@ mod placement_tests {
             mo2_game_name: None,
             session: Default::default(),
             id: agora_game_api::GameId::new("rules-game").unwrap(),
+            extends: None,
             name: "Rules Game".into(),
             stores: vec![],
             version_sources: vec![],
             deployment: agora_game_api::DeploymentStrategy::VirtualFileSystem,
             content_rules: vec![],
-            native_code_patterns: vec![],
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
@@ -3601,7 +3601,7 @@ mod placement_tests {
                 "Data/**/Config.ini".into(),
             ],
             excluded_paths: vec![],
-            plugin_list: None,
+            load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
             launch_alternatives: Vec::new(),

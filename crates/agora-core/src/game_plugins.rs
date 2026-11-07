@@ -2,7 +2,7 @@
 //!
 //! Skyrim-family games load a plugin (`.esp`, `.esm`, `.esl`) only when the game's
 //! `Plugins.txt` names it. A game definition declares that as a
-//! [`PluginListRule`]; this module keeps the instance's copy of the list in step with the
+//! [`LoadOrderDefinition`]; this module keeps the instance's copy of the list in step with the
 //! plugins its content layers deploy. Ordering rules (masters, limits, sorting) belong to
 //! [`crate::game_load_order`], which reads and writes the list through this module.
 //!
@@ -16,8 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    fold_path_case, glob_match, GameDefinition, GameId, PluginListRule, StoreId, UserFileMapping,
-    UserFileStrategy,
+    fold_path_case, glob_match, GameDefinition, GameId, LoadOrderDefinition, StoreId,
+    UserFileMapping, UserFileStrategy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -134,9 +134,14 @@ impl ListFile {
         Self { lines, eol }
     }
 
-    fn from_header(rule: &PluginListRule) -> Self {
+    fn from_header(rule: &LoadOrderDefinition) -> Self {
         Self {
-            lines: rule.header.iter().map(|l| l.as_bytes().to_vec()).collect(),
+            lines: rule
+                .format
+                .header()
+                .iter()
+                .map(|l| l.as_bytes().to_vec())
+                .collect(),
             eol: CRLF,
         }
     }
@@ -152,12 +157,12 @@ impl ListFile {
 }
 
 /// A line that names a plugin: its state and the name as written.
-fn plugin_line<'a>(line: &'a [u8], rule: &PluginListRule) -> Option<(bool, &'a [u8])> {
+fn plugin_line<'a>(line: &'a [u8], rule: &LoadOrderDefinition) -> Option<(bool, &'a [u8])> {
     let trimmed = line.trim_ascii();
     if trimmed.is_empty() || trimmed.starts_with(b"#") {
         return None;
     }
-    let prefix = rule.active_prefix.as_bytes();
+    let prefix = rule.format.active_prefix().as_bytes();
     let (active, name) = if prefix.is_empty() {
         (true, trimmed)
     } else if let Some(rest) = trimmed.strip_prefix(prefix) {
@@ -181,10 +186,10 @@ fn key(name: &[u8]) -> Vec<u8> {
     }
 }
 
-fn render_line(rule: &PluginListRule, name: &[u8], active: bool) -> Vec<u8> {
+fn render_line(rule: &LoadOrderDefinition, name: &[u8], active: bool) -> Vec<u8> {
     let mut line = Vec::new();
     if active {
-        line.extend_from_slice(rule.active_prefix.as_bytes());
+        line.extend_from_slice(rule.format.active_prefix().as_bytes());
     }
     line.extend_from_slice(name);
     line
@@ -194,7 +199,7 @@ fn render_line(rule: &PluginListRule, name: &[u8], active: bool) -> Vec<u8> {
 /// the plugins Agora `old_managed`. Returns what was added and removed.
 fn apply_sync(
     file: &mut ListFile,
-    rule: &PluginListRule,
+    rule: &LoadOrderDefinition,
     desired: &[String],
     old_managed: &[String],
 ) -> (Vec<String>, Vec<String>) {
@@ -312,12 +317,12 @@ fn write_state(instance_dir: &Path, state: &ManagedState) -> Result<(), PluginLi
 
 fn user_file_mapping<'a>(
     definition: &'a GameDefinition,
-    rule: &PluginListRule,
+    rule: &LoadOrderDefinition,
     store: &StoreId,
 ) -> Option<&'a UserFileMapping> {
     definition.user_files.iter().find(|m| {
         m.strategy == UserFileStrategy::JournaledSwap
-            && m.instance_path == rule.user_file
+            && m.instance_path == rule.file
             && m.applies_to_store(store)
     })
 }
@@ -360,7 +365,7 @@ fn starting_contents(
     definition: &GameDefinition,
     store: &StoreId,
     mapping: &UserFileMapping,
-    rule: &PluginListRule,
+    rule: &LoadOrderDefinition,
     report: &mut PluginSyncReport,
 ) -> Result<ListFile, PluginListError> {
     let journal = ctx
@@ -405,15 +410,16 @@ fn same_names(a: &[String], b: &[String]) -> bool {
 /// layer's position (lowest first), then the position of the first matching pattern (so a
 /// definition lists its patterns in load priority: masters before plain plugins), then name.
 pub fn desired_plugins<'a>(
-    rule: &PluginListRule,
+    rule: &LoadOrderDefinition,
     content_layer_items: &[String],
     plan: &DeploymentPlan,
     base_paths: impl IntoIterator<Item = &'a str>,
 ) -> Vec<String> {
     let base_keys: std::collections::HashSet<String> =
         base_paths.into_iter().map(fold_path_case).collect();
-    let folder = rule.plugin_folder.as_str().trim_matches('/');
+    let folder = rule.items.folder.as_str().trim_matches('/');
     let patterns: Vec<String> = rule
+        .items
         .patterns
         .iter()
         .map(|p| fold_path_case(p.trim()))
@@ -462,11 +468,11 @@ fn implicit_keys(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
-    rule: &PluginListRule,
+    rule: &LoadOrderDefinition,
     links: Option<&DeploymentPlan>,
 ) -> Result<std::collections::HashSet<Vec<u8>>, PluginListError> {
-    let mut names: Vec<String> = rule.implicit.clone();
-    if rule.implicit_list_file.is_some() {
+    let mut names: Vec<String> = rule.rules.implicit.clone();
+    if rule.rules.implicit_list_file.is_some() {
         names.extend(
             crate::game_load_order::implicit_list_names_with_view(
                 ctx,
@@ -503,11 +509,11 @@ pub(crate) fn sync_locked_with_view(
     desired: &[String],
     links: Option<&DeploymentPlan>,
 ) -> Result<Option<PluginSyncReport>, PluginListError> {
-    let Some(rule) = &definition.plugin_list else {
+    let Some(rule) = definition.load_orders.first() else {
         return Ok(None);
     };
     let dir = instance_dir(ctx, instance_id)?;
-    let copy_path = dir.join(rule.user_file.as_str());
+    let copy_path = dir.join(rule.file.as_str());
     let old = read_state(&dir)?;
     let mut report = PluginSyncReport::default();
 
@@ -578,7 +584,7 @@ pub fn sync_without_content(
     definition: &GameDefinition,
     store: &StoreId,
 ) -> Result<Option<PluginSyncReport>, PluginListError> {
-    if definition.plugin_list.is_none() {
+    if definition.load_orders.is_empty() {
         return Ok(None);
     }
     let _lock = ctx.lock_manager.acquire(
@@ -592,10 +598,10 @@ pub fn sync_without_content(
 // Inspect and toggle
 // ---------------------------------------------------------------------------
 
-fn rule_of(definition: &GameDefinition) -> Result<&PluginListRule, PluginListError> {
+fn rule_of(definition: &GameDefinition) -> Result<&LoadOrderDefinition, PluginListError> {
     definition
-        .plugin_list
-        .as_ref()
+        .load_orders
+        .first()
         .ok_or_else(|| PluginListError::NoRule(definition.id.clone()))
 }
 
@@ -611,7 +617,7 @@ pub fn list(
         other => PluginListError::Other(other.to_string()),
     })?;
     let dir = instance_dir(ctx, instance_id)?;
-    let path = dir.join(rule.user_file.as_str());
+    let path = dir.join(rule.file.as_str());
     let state = read_state(&dir)?;
     let managed: std::collections::HashSet<Vec<u8>> =
         state.managed.iter().map(|n| key(n.as_bytes())).collect();
@@ -676,7 +682,7 @@ pub fn set_active(
     active: bool,
 ) -> Result<bool, PluginListError> {
     let rule = rule_of(definition)?;
-    if !active && rule.active_prefix.is_empty() {
+    if !active && rule.format.active_prefix().is_empty() {
         return Err(PluginListError::NoInactiveState(name.to_string()));
     }
     let _lock = ctx.lock_manager.acquire(
@@ -686,7 +692,7 @@ pub fn set_active(
     ensure_copy_editable(ctx, instance_id, definition)?;
 
     let dir = instance_dir(ctx, instance_id)?;
-    let path = dir.join(rule.user_file.as_str());
+    let path = dir.join(rule.file.as_str());
     let Some(bytes) = read_optional(&path)? else {
         return Err(PluginListError::NotInList(name.to_string()));
     };
@@ -750,14 +756,14 @@ pub fn import_list(
     locked: &[String],
 ) -> Result<(), PluginListError> {
     let rule = rule_of(definition)?;
-    if rule.active_prefix.is_empty() {
+    if rule.format.active_prefix().is_empty() {
         if let Some((name, _)) = lines.iter().find(|(_, active)| !active) {
             return Err(PluginListError::NoInactiveState(name.clone()));
         }
     }
     ensure_copy_editable(ctx, instance_id, definition)?;
     let dir = instance_dir(ctx, instance_id)?;
-    let path = dir.join(rule.user_file.as_str());
+    let path = dir.join(rule.file.as_str());
     let mut file = ListFile::from_header(rule);
     for (name, active) in lines {
         file.lines.push(render_line(rule, name.as_bytes(), *active));
@@ -825,7 +831,7 @@ pub fn write_order_locked(
     let rule = rule_of(definition)?;
     ensure_copy_editable(ctx, instance_id, definition)?;
     let dir = instance_dir(ctx, instance_id)?;
-    let path = dir.join(rule.user_file.as_str());
+    let path = dir.join(rule.file.as_str());
     let Some(bytes) = read_optional(&path)? else {
         if order.is_empty() {
             return Ok(false);
@@ -886,17 +892,27 @@ mod tests {
     use super::*;
     use agora_game_api::RelPath;
 
-    fn rule() -> PluginListRule {
-        PluginListRule {
-            user_file: RelPath::new("user/Plugins.txt").unwrap(),
-            plugin_folder: RelPath::new("Data").unwrap(),
-            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-            active_prefix: "*".into(),
-            header: vec!["# header".into()],
-            semantics: None,
-            implicit: Vec::new(),
-            implicit_list_file: None,
-            loot: None,
+    fn rule() -> LoadOrderDefinition {
+        LoadOrderDefinition {
+            id: "plugins".into(),
+            name: "Plugins".into(),
+            file: RelPath::new("user/Plugins.txt").unwrap(),
+            items: agora_game_api::LoadOrderItems {
+                folder: RelPath::new("Data").unwrap(),
+                patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+                folders: false,
+            },
+            format: agora_game_api::LoadOrderFormat::Lines {
+                active_prefix: "*".into(),
+                header: vec!["# header".into()],
+            },
+            rules: agora_game_api::LoadOrderRules {
+                kind: "none".into(),
+                entry: None,
+                implicit: Vec::new(),
+                implicit_list_file: None,
+                loot: None,
+            },
         }
     }
 
@@ -1031,7 +1047,9 @@ mod tests {
     #[test]
     fn a_rule_without_a_prefix_treats_every_line_as_active() {
         let mut r = rule();
-        r.active_prefix = String::new();
+        if let agora_game_api::LoadOrderFormat::Lines { active_prefix, .. } = &mut r.format {
+            *active_prefix = String::new();
+        }
         assert_eq!(plugin_line(b"A.esp", &r), Some((true, &b"A.esp"[..])));
         let mut f = ListFile::parse(b"A.esp\r\n");
         apply_sync(&mut f, &r, &names(&["B.esp"]), &[]);

@@ -17,22 +17,32 @@ use agora_core::game_instance::{GameInstanceManifest, SavesChoice};
 use agora_core::game_registry::{DeclarativePackage, GameRegistry, PackageSource};
 use agora_core::library;
 use agora_game_api::{
-    BaseReference, GameId, InstallId, Layer, LayerId, LayerSource, LayerStack, PackageDefinition,
-    PluginListRule, RelPath,
+    BaseReference, GameId, InstallId, Layer, LayerId, LayerSource, LayerStack, LoadOrderDefinition,
+    PackageDefinition, RelPath,
 };
 use tempfile::TempDir;
 
-fn plugin_rule() -> PluginListRule {
-    PluginListRule {
-        user_file: RelPath::new("user/Plugins.txt").unwrap(),
-        plugin_folder: RelPath::new("Data").unwrap(),
-        patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-        active_prefix: "*".into(),
-        header: Vec::new(),
-        semantics: None,
-        implicit: Vec::new(),
-        implicit_list_file: None,
-        loot: None,
+fn plugin_rule() -> LoadOrderDefinition {
+    LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        items: agora_game_api::LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+            folders: false,
+        },
+        format: agora_game_api::LoadOrderFormat::Lines {
+            active_prefix: "*".into(),
+            header: Vec::new(),
+        },
+        rules: agora_game_api::LoadOrderRules {
+            kind: "none".into(),
+            entry: None,
+            implicit: Vec::new(),
+            implicit_list_file: None,
+            loot: None,
+        },
     }
 }
 
@@ -40,12 +50,14 @@ fn plugin_rule() -> PluginListRule {
 fn test_ctx() -> (TempDir, Ctx) {
     let tmp = tempfile::tempdir().unwrap();
     let mut game = common::skyrim_definition();
-    game.plugin_list = Some(plugin_rule());
+    game.load_orders = vec![plugin_rule()];
     let package = PackageDefinition {
         id: "test.skyrim".into(),
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: Vec::new(),
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![game],
         frameworks: Vec::new(),
         tools: Vec::new(),

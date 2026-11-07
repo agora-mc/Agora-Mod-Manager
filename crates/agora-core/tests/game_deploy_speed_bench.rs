@@ -72,6 +72,7 @@ fn bench_definition() -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("bench-game").unwrap(),
+        extends: None,
         name: "Bench Game".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::new("steam").unwrap(),
@@ -80,7 +81,6 @@ fn bench_definition() -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: Some(LaunchRecipe {
@@ -102,7 +102,7 @@ fn bench_definition() -> GameDefinition {
         linked_archive_patterns: vec!["Data/*.bsa".into()],
         declared_writes: vec!["writeable_base.txt".into()],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: Vec::new(),
@@ -118,6 +118,8 @@ fn register(def: GameDefinition) -> Arc<GameRegistry> {
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def],
         frameworks: vec![],
         tools: vec![],
@@ -258,17 +260,27 @@ fn deploy_and_launch_timings() {
     if env_usize("AGORA_BENCH_PLUGINS", 0) == 1 {
         // A game with a plugin list under the Creation Engine rules, as Skyrim has: the launch checks the
         // load order, and that check reads the installed plugins from a plan.
-        def.plugin_list = Some(agora_game_api::PluginListRule {
-            user_file: RelPath::new("user/Plugins.txt").unwrap(),
-            plugin_folder: RelPath::new("Data").unwrap(),
-            patterns: vec!["*.esp".into(), "*.esm".into()],
-            active_prefix: String::new(),
-            header: vec![],
-            semantics: Some("creation_engine".into()),
-            implicit: vec![],
-            implicit_list_file: None,
-            loot: None,
-        });
+        def.load_orders = vec![agora_game_api::LoadOrderDefinition {
+            id: "plugins".into(),
+            name: "Plugins".into(),
+            file: RelPath::new("user/Plugins.txt").unwrap(),
+            items: agora_game_api::LoadOrderItems {
+                folder: RelPath::new("Data").unwrap(),
+                patterns: vec!["*.esp".into(), "*.esm".into()],
+                folders: false,
+            },
+            format: agora_game_api::LoadOrderFormat::Lines {
+                active_prefix: String::new(),
+                header: vec![],
+            },
+            rules: agora_game_api::LoadOrderRules {
+                kind: "creation_engine".into(),
+                entry: None,
+                implicit: vec![],
+                implicit_list_file: None,
+                loot: None,
+            },
+        }];
         def.user_files = vec![agora_game_api::UserFileMapping::new(
             GamePath::UserData {
                 location: agora_game_api::UserDataLocation::LocalAppData,
@@ -427,7 +439,7 @@ fn deploy_and_launch_timings() {
     println!();
     println!(
         "== bench: {items} items x {files} files, {base_files} base files, plugin list: {}; {planned_files} planned files ({linked} linked, {copied} copied)",
-        def.plugin_list.is_some()
+        !def.load_orders.is_empty()
     );
     println!(
         "setup (not timed in the table): base {}, content import {}, add to instance {}",
@@ -518,17 +530,27 @@ fn tools_tab_timings() {
     let dir = scratch.path().to_path_buf();
 
     let mut def = bench_definition();
-    def.plugin_list = Some(agora_game_api::PluginListRule {
-        user_file: RelPath::new("user/Plugins.txt").unwrap(),
-        plugin_folder: RelPath::new("Data").unwrap(),
-        patterns: vec!["*.esp".into(), "*.esm".into()],
-        active_prefix: String::new(),
-        header: vec![],
-        semantics: Some("creation_engine".into()),
-        implicit: vec![],
-        implicit_list_file: None,
-        loot: None,
-    });
+    def.load_orders = vec![agora_game_api::LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        items: agora_game_api::LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esp".into(), "*.esm".into()],
+            folders: false,
+        },
+        format: agora_game_api::LoadOrderFormat::Lines {
+            active_prefix: String::new(),
+            header: vec![],
+        },
+        rules: agora_game_api::LoadOrderRules {
+            kind: "creation_engine".into(),
+            entry: None,
+            implicit: vec![],
+            implicit_list_file: None,
+            loot: None,
+        },
+    }];
     def.user_files = vec![agora_game_api::UserFileMapping::new(
         GamePath::UserData {
             location: agora_game_api::UserDataLocation::LocalAppData,
@@ -564,6 +586,10 @@ fn tools_tab_timings() {
         required_magic: vec![],
         run_only: false,
         executable_names: vec![],
+        inputs: Vec::new(),
+        scope: Default::default(),
+        input_files: Vec::new(),
+        before_launch: None,
     };
     let tools: Vec<ToolDefinition> = (0..9)
         .map(|n| tool(&format!("tool{n}"), &format!("Data/tool{n}/Tool{n}.exe")))
@@ -580,6 +606,8 @@ fn tools_tab_timings() {
                 version: semver::Version::new(0, 1, 0),
                 api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
                 parents: vec![],
+                game_templates: std::collections::BTreeMap::new(),
+                behaviours: None,
                 games: vec![def.clone()],
                 frameworks: vec![],
                 tools,

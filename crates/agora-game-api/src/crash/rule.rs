@@ -32,39 +32,11 @@ pub const RULE_REGEX_SIZE_LIMIT: usize = 1 << 20;
 /// The heaviest a rule may weigh a suspect.
 pub const MAX_RULE_WEIGHT: u32 = 32;
 
-/// Three-valued logic (Kleene). The evaluator must use these operations rather than booleans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Truth {
-    True,
-    False,
-    Unknown,
-}
-
-impl Truth {
-    pub fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::False, _) | (_, Self::False) => Self::False,
-            (Self::True, Self::True) => Self::True,
-            _ => Self::Unknown,
-        }
-    }
-
-    pub fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::True, _) | (_, Self::True) => Self::True,
-            (Self::False, Self::False) => Self::False,
-            _ => Self::Unknown,
-        }
-    }
-
-    pub fn negate(self) -> Self {
-        match self {
-            Self::True => Self::False,
-            Self::False => Self::True,
-            Self::Unknown => Self::Unknown,
-        }
-    }
-}
+/// Three-valued logic (Kleene), shared with the platform condition language. The evaluator must use
+/// these operations rather than booleans.
+pub use crate::condition::Truth;
+/// The version gate the platform condition language defines; crash rules keep using it.
+pub use crate::condition::VersionGate;
 
 /// One rule. Its `id` is local to the plugin, and the host stamps the source, so a pack can't claim
 /// another plugin's name.
@@ -124,52 +96,6 @@ pub struct ProducerGate {
     pub format: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<VersionGate>,
-}
-
-/// A version check that works on game versions, which are not semver (`1.2.3.4`, a snapshot name).
-/// Either `exact` names versions, or `min` (inclusive) and `below` (exclusive) bound a range of
-/// dotted numbers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VersionGate {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exact: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub below: Option<String>,
-}
-
-impl VersionGate {
-    /// Whether `version` passes. `None` means it can't be judged: a range was asked of a version
-    /// that isn't dotted numbers, which must read as could-not-check rather than as a no.
-    pub fn matches(&self, version: &str) -> Option<bool> {
-        if !self.exact.is_empty() {
-            return Some(self.exact.iter().any(|v| v == version));
-        }
-        let version = dotted(version)?;
-        let above_min = match &self.min {
-            Some(min) => compare_dotted(&version, &dotted(min)?).is_ge(),
-            None => true,
-        };
-        let under_below = match &self.below {
-            Some(below) => compare_dotted(&version, &dotted(below)?).is_lt(),
-            None => true,
-        };
-        Some(above_min && under_below)
-    }
-}
-
-pub(super) fn dotted(version: &str) -> Option<Vec<u64>> {
-    version.split('.').map(|p| p.parse().ok()).collect()
-}
-
-pub(super) fn compare_dotted(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
-    let at = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
-    (0..a.len().max(b.len()))
-        .map(|i| at(a, i).cmp(&at(b, i)))
-        .find(|o| o.is_ne())
-        .unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// A condition, written with one key: `{ "all": [...] }`, `{ "fact": {...} }`.

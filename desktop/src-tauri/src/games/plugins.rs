@@ -293,15 +293,15 @@ pub async fn games_plugins_list(
 ) -> Result<PluginsView, GamesError> {
     run_blocking(app, "Reading the plugin list", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        if definition.plugin_list.is_none() {
+        if definition.load_orders.is_empty() {
             return Ok(PluginsView::unsupported());
         }
         let order = load_order::order(&ctx, &instance_id, definition).map_err(core_failed)?;
         let mut view = PluginsView::from_order(&order);
         if definition
-            .plugin_list
-            .as_ref()
-            .and_then(|rule| rule.loot.as_ref())
+            .load_orders
+            .first()
+            .and_then(|rule| rule.rules.loot.as_ref())
             .is_some()
         {
             view.masterlist = loot_masterlist::cached(&ctx, definition)
@@ -419,7 +419,7 @@ pub async fn games_plugins_check(
 ) -> Result<CheckView, GamesError> {
     run_blocking(app, "Checking the plugins", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        if definition.plugin_list.is_none() {
+        if definition.load_orders.is_empty() {
             return Ok(CheckView {
                 status: "ok".to_string(),
                 findings: Vec::new(),

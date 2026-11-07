@@ -5,10 +5,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agora_game_api::{
-    FrameworkId, GameDefinition, GameId, GameInstall, GamePackage, GamePath, InstallId,
-    InstallKind, RelPath, RuntimeIdentity, StoreId, ToolId, UserFileStrategy, GAME_API_VERSION,
+    Condition, FrameworkId, GameDefinition, GameId, GameInstall, GamePackage, GamePath, InstallId,
+    InstallKind, LoadOrderFormat, RelPath, RuntimeIdentity, StoreId, ToolId, UserFileStrategy,
+    GAME_API_VERSION,
 };
 use serde::{Deserialize, Serialize};
+
+pub mod inherit;
+pub use inherit::{PackageInput, ResolvedPackage};
 
 use crate::app_paths::AppPaths;
 use crate::ctx::Ctx;
@@ -87,8 +91,18 @@ pub enum GameRegistryError {
     InvalidSaveLocation { game_id: GameId, reason: String },
     #[error("game {game_id} has an invalid plugin_list: {reason}")]
     InvalidPluginList { game_id: GameId, reason: String },
+    #[error("game {game_id} has an invalid load order: {reason}")]
+    InvalidLoadOrder { game_id: GameId, reason: String },
     #[error("game {game_id} has an invalid launch alternative: {reason}")]
     InvalidLaunchAlternative { game_id: GameId, reason: String },
+}
+
+/// Whether a condition is a `present` with nothing to look for, which would silently never match.
+fn condition_names_no_path(condition: &Condition) -> bool {
+    match condition {
+        Condition::Present(path) => path.as_str().is_empty(),
+        _ => false,
+    }
 }
 
 pub struct GameRegistry {
@@ -234,43 +248,88 @@ impl GameRegistryBuilder {
             }
         }
 
-        // 7. A plugin list rule must be able to work, or it would silently do nothing
+        // 7. Each load order must be able to work, or it would silently do nothing.
         for game in &def.games {
-            if let Some(rule) = &game.plugin_list {
-                let matches_user_file = game.user_files.iter().any(|uf| {
-                    uf.instance_path == rule.user_file
-                        && uf.strategy == UserFileStrategy::JournaledSwap
-                });
-                if !matches_user_file {
-                    return Err(GameRegistryError::PluginListUserFileNotFound {
+            let mut load_order_ids = BTreeSet::new();
+            for rule in &game.load_orders {
+                if rule.id.trim().is_empty() {
+                    return Err(GameRegistryError::InvalidLoadOrder {
                         game_id: game.id.clone(),
-                        user_file: rule.user_file.clone(),
+                        reason: "a load order has an empty id".to_string(),
                     });
                 }
-                if rule.patterns.iter().all(|p| p.trim().is_empty()) {
-                    return Err(GameRegistryError::InvalidPluginList {
+                if !load_order_ids.insert(rule.id.clone()) {
+                    return Err(GameRegistryError::InvalidLoadOrder {
                         game_id: game.id.clone(),
-                        reason: "patterns names no plugin file".to_string(),
+                        reason: format!("load order '{}' is declared twice", rule.id),
                     });
                 }
-                if rule.active_prefix.chars().any(|c| c.is_whitespace()) {
-                    return Err(GameRegistryError::InvalidPluginList {
+                if !matches!(
+                    rule.rules.kind.as_str(),
+                    "none" | "script" | "creation_engine"
+                ) {
+                    return Err(GameRegistryError::InvalidLoadOrder {
                         game_id: game.id.clone(),
-                        reason: "active_prefix must not contain whitespace".to_string(),
+                        reason: format!(
+                            "load order '{}' has unknown rule kind '{}'",
+                            rule.id, rule.rules.kind
+                        ),
                     });
                 }
-                // An unknown rule set would silently turn the load order rules off.
-                if let Some(semantics) = &rule.semantics {
-                    if semantics != crate::game_load_order::CREATION_ENGINE {
+                if let LoadOrderFormat::Lines { active_prefix, .. } = &rule.format {
+                    if active_prefix.chars().any(char::is_whitespace) {
                         return Err(GameRegistryError::InvalidPluginList {
                             game_id: game.id.clone(),
-                            reason: format!(
-                                "semantics '{semantics}' is not a known load order rule set"
-                            ),
+                            reason: "active_prefix must not contain whitespace".to_string(),
+                        });
+                    }
+                    let matches_user_file = game.user_files.iter().any(|uf| {
+                        uf.instance_path == rule.file
+                            && uf.strategy == UserFileStrategy::JournaledSwap
+                    });
+                    if !matches_user_file {
+                        return Err(GameRegistryError::PluginListUserFileNotFound {
+                            game_id: game.id.clone(),
+                            user_file: rule.file.clone(),
+                        });
+                    }
+                    if rule.items.patterns.iter().all(|p| p.trim().is_empty()) {
+                        return Err(GameRegistryError::InvalidPluginList {
+                            game_id: game.id.clone(),
+                            reason: "patterns names no item file".to_string(),
                         });
                     }
                 }
-                for name in &rule.implicit {
+                if rule.rules.is_script()
+                    && rule
+                        .rules
+                        .entry
+                        .as_deref()
+                        .is_none_or(|entry| entry.trim().is_empty())
+                {
+                    return Err(GameRegistryError::InvalidLoadOrder {
+                        game_id: game.id.clone(),
+                        reason: format!(
+                            "load order '{}' has a script rule set with no entrypoint",
+                            rule.id
+                        ),
+                    });
+                }
+                // A script format or rule needs a plugin entrypoint. A compiled package has none;
+                // a plugin's manifest is not visible here, so it is checked when scripts load.
+                if (rule.format.is_script() || rule.rules.is_script())
+                    && matches!(source, PackageSource::Compiled { .. })
+                {
+                    return Err(GameRegistryError::InvalidLoadOrder {
+                        game_id: game.id.clone(),
+                        reason: format!(
+                            "load order '{}' uses a script, but a compiled package has no plugin \
+                             entrypoint",
+                            rule.id
+                        ),
+                    });
+                }
+                for name in &rule.rules.implicit {
                     if name.trim().is_empty() || name.contains(['/', '\\']) {
                         return Err(GameRegistryError::InvalidPluginList {
                             game_id: game.id.clone(),
@@ -324,9 +383,9 @@ impl GameRegistryBuilder {
                     Some("an alternative has an empty id".to_string())
                 } else if !seen.insert(alt.id.clone()) {
                     Some(format!("alternative '{}' is declared twice", alt.id))
-                } else if alt.when_present.as_str().is_empty() {
+                } else if condition_names_no_path(&alt.when) {
                     Some(format!(
-                        "alternative '{}' has an empty when_present",
+                        "alternative '{}' has an empty present path",
                         alt.id
                     ))
                 } else if !matches!(
@@ -783,16 +842,18 @@ pub mod test_support {
             version: semver::Version::new(0, 1, 0),
             api_range: semver::VersionReq::parse(">=0.1, <0.2").expect("valid range"),
             parents: Vec::new(),
+            game_templates: std::collections::BTreeMap::new(),
+            behaviours: None,
             games: vec![GameDefinition {
                 mo2_game_name: None,
                 session: Default::default(),
                 id: GameId::new(game_id).expect("valid game id"),
+                extends: None,
                 name: game_id.to_string(),
                 stores: Vec::new(),
                 version_sources: Vec::new(),
                 deployment: DeploymentStrategy::Redirect,
                 content_rules: Vec::new(),
-                native_code_patterns: Vec::new(),
                 framework_ids: Vec::new(),
                 tool_ids: Vec::new(),
                 launch: None,
@@ -804,7 +865,7 @@ pub mod test_support {
                 declared_writes: Vec::new(),
                 excluded_paths: Vec::new(),
                 content_layout: None,
-                plugin_list: None,
+                load_orders: Vec::new(),
                 runtime_files: Vec::new(),
                 save_location: Vec::new(),
                 launch_alternatives: Vec::new(),

@@ -1507,6 +1507,7 @@ mod instance {
             mo2_game_name: None,
             session: Default::default(),
             id: GameId::new("test-game").unwrap(),
+            extends: None,
             name: "Test Game".into(),
             stores: vec![StoreIdentifier {
                 store: StoreId::new("steam").unwrap(),
@@ -1515,7 +1516,6 @@ mod instance {
             version_sources: vec![],
             deployment: DeploymentStrategy::VirtualFileSystem,
             content_rules: vec![],
-            native_code_patterns: vec![],
             framework_ids: vec![],
             tool_ids: vec![],
             launch: Some(LaunchRecipe {
@@ -1535,7 +1535,7 @@ mod instance {
             linked_archive_patterns: vec![],
             declared_writes: vec![],
             excluded_paths: vec![],
-            plugin_list: None,
+            load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
             launch_alternatives: Vec::new(),
@@ -1566,6 +1566,8 @@ mod instance {
                     version: semver::Version::new(0, 1, 0),
                     api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
                     parents: vec![],
+                    game_templates: std::collections::BTreeMap::new(),
+                    behaviours: None,
                     games: vec![def.clone()],
                     frameworks: vec![],
                     tools: vec![],

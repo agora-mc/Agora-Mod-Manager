@@ -70,6 +70,7 @@ pub fn skyrim_definition() -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("skyrim-se").unwrap(),
+        extends: None,
         name: "The Elder Scrolls V: Skyrim Special Edition".to_string(),
         stores: vec![
             StoreIdentifier {
@@ -84,7 +85,6 @@ pub fn skyrim_definition() -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: None,
@@ -95,7 +95,7 @@ pub fn skyrim_definition() -> GameDefinition {
         linked_archive_patterns: vec![],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         runtime_files: Vec::new(),
         launch_alternatives: Vec::new(),
         content_layout: None,

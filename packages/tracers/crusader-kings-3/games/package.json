@@ -20,7 +20,6 @@
       ],
       "deployment": "redirect",
       "content_rules": [],
-      "native_code_patterns": [],
       "framework_ids": [],
       "tool_ids": [],
       "launch": {

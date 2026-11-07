@@ -238,6 +238,7 @@ impl GamePackage for TestPackage {
 fn test_definition() -> GameDefinition {
     GameDefinition {
         id: GameId::new("test-game").unwrap(),
+        extends: None,
         name: "Test Game".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::new("steam").unwrap(),
@@ -246,7 +247,6 @@ fn test_definition() -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![FrameworkId::new("skse").unwrap()],
         tool_ids: vec![],
         launch: Some(LaunchRecipe {
@@ -268,7 +268,7 @@ fn test_definition() -> GameDefinition {
         linked_archive_patterns: vec![],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         mo2_game_name: None,
@@ -308,6 +308,8 @@ fn register(def: GameDefinition, frameworks: Vec<FrameworkDefinition>) -> Arc<Ga
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def],
         frameworks,
         tools: vec![],

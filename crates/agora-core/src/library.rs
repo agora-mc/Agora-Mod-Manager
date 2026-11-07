@@ -818,8 +818,13 @@ fn plugin_files(ctx: &Ctx, item: &ContentItem, games: &[String]) -> Vec<String> 
         .iter()
         .filter_map(|game| agora_game_api::GameId::new(game).ok())
         .filter_map(|game| ctx.games.game(&game).cloned())
-        .filter_map(|definition| definition.plugin_list)
-        .flat_map(|rule| rule.patterns)
+        .flat_map(|definition| {
+            definition
+                .load_orders
+                .first()
+                .map(|rule| rule.items.patterns.clone())
+                .unwrap_or_default()
+        })
         .map(|pattern| pattern.to_ascii_lowercase())
         .collect();
     if patterns.is_empty() {

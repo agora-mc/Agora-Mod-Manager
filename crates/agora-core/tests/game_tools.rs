@@ -41,9 +41,9 @@ use agora_core::process_identity;
 use agora_game_api::{
     BaseReference, DeploymentStrategy, FailureMarker, GameDefinition, GameId, GamePackage,
     GamePath, InputFingerprint, InstallId, InstallKind, LaunchRecipe, LaunchValue, LayerSource,
-    PackageDefinition, PluginListRule, RelPath, RequiredMagic, RuntimeIdentity, StoreId,
-    StoreIdentifier, ToolDefinition, ToolId, ToolOutput, UserDataLocation, UserFileMapping,
-    UserFileStrategy,
+    LoadOrderDefinition, LoadOrderFormat, PackageDefinition, RelPath, RequiredMagic,
+    RuntimeIdentity, StoreId, StoreIdentifier, ToolDefinition, ToolId, ToolOutput,
+    UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -191,23 +191,37 @@ fn tool(id: &str, name: &str, args: &[&str]) -> ToolDefinition {
         required_magic: Vec::new(),
         run_only: false,
         executable_names: Vec::new(),
+        inputs: Vec::new(),
+        scope: Default::default(),
+        input_files: Vec::new(),
+        before_launch: None,
     }
 }
 
-fn plugin_rule() -> PluginListRule {
-    PluginListRule {
-        user_file: RelPath::new("user/Plugins.txt").unwrap(),
-        plugin_folder: RelPath::new("Data").unwrap(),
-        patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-        active_prefix: "*".into(),
-        header: vec![
-            "# This file is used by Skyrim to keep track of your downloaded content.".into(),
-            "# Please do not modify this file.".into(),
-        ],
-        semantics: None,
-        implicit: Vec::new(),
-        implicit_list_file: None,
-        loot: None,
+fn plugin_rule() -> LoadOrderDefinition {
+    LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        items: agora_game_api::LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+            folders: false,
+        },
+        format: LoadOrderFormat::Lines {
+            active_prefix: "*".into(),
+            header: vec![
+                "# This file is used by Skyrim to keep track of your downloaded content.".into(),
+                "# Please do not modify this file.".into(),
+            ],
+        },
+        rules: agora_game_api::LoadOrderRules {
+            kind: "none".into(),
+            entry: None,
+            implicit: Vec::new(),
+            implicit_list_file: None,
+            loot: None,
+        },
     }
 }
 
@@ -243,6 +257,7 @@ fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> Game
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new(GAME).unwrap(),
+        extends: None,
         name: "Test Game".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::steam(),
@@ -251,7 +266,6 @@ fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> Game
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: tools.iter().map(|t| t.id.clone()).collect(),
         launch: Some(LaunchRecipe {
@@ -271,7 +285,11 @@ fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> Game
         linked_archive_patterns: vec![],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: plugins.then(plugin_rule),
+        load_orders: if plugins {
+            vec![plugin_rule()]
+        } else {
+            Vec::new()
+        },
         runtime_files: Vec::new(),
         save_location: Vec::new(),
         launch_alternatives: Vec::new(),
@@ -287,6 +305,8 @@ fn registry(def: &GameDefinition, tools: Vec<ToolDefinition>) -> Arc<GameRegistr
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def.clone()],
         frameworks: vec![],
         tools,

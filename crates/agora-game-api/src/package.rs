@@ -12,6 +12,33 @@ pub struct PackageDefinition {
     pub games: Vec<GameDefinition>,
     pub frameworks: Vec<FrameworkDefinition>,
     pub tools: Vec<ToolDefinition>,
+    /// Partial games a game may start from with `extends` (MASTER_SPEC §30.12). They are merged on
+    /// raw JSON before a game is parsed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub game_templates: BTreeMap<String, serde_json::Value>,
+    /// Plugin entrypoints a scripted package runs (MASTER_SPEC §30.12). Unused by data-only
+    /// packages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behaviours: Option<Behaviours>,
+}
+
+/// The plugin entrypoints a scripted package exposes (MASTER_SPEC §30.12). Each names a function
+/// in the plugin's script.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Behaviours {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect_runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classify: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognize_download: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_order_rules: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepare_launch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

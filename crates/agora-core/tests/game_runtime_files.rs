@@ -20,7 +20,7 @@ use agora_core::game_registry::{
 };
 use agora_game_api::{
     BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
-    InstallKind, LaunchRecipe, LaunchValue, PackageDefinition, PluginListRule, RelPath,
+    InstallKind, LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath,
     RuntimeFileProblem, RuntimeFileRule, RuntimeIdentity, StoreId, StoreIdentifier,
 };
 use tempfile::TempDir;
@@ -52,17 +52,27 @@ fn other_framework_rule() -> RuntimeFileRule {
 }
 
 /// A plugin list rule with no engine semantics, so a check needs no plugin headers.
-fn plugin_list_rule() -> PluginListRule {
-    PluginListRule {
-        user_file: RelPath::new("user/Plugins.txt").unwrap(),
-        plugin_folder: RelPath::new("Data").unwrap(),
-        patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-        active_prefix: "*".into(),
-        header: vec![],
-        semantics: None,
-        implicit: Vec::new(),
-        implicit_list_file: None,
-        loot: None,
+fn plugin_list_rule() -> LoadOrderDefinition {
+    LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        items: agora_game_api::LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+            folders: false,
+        },
+        format: agora_game_api::LoadOrderFormat::Lines {
+            active_prefix: "*".into(),
+            header: vec![],
+        },
+        rules: agora_game_api::LoadOrderRules {
+            kind: "none".into(),
+            entry: None,
+            implicit: Vec::new(),
+            implicit_list_file: None,
+            loot: None,
+        },
     }
 }
 
@@ -85,6 +95,7 @@ fn make_test_definition() -> GameDefinition {
         mo2_game_name: None,
         session: Default::default(),
         id: GameId::new("skyrim-se").unwrap(),
+        extends: None,
         name: "Skyrim Special Edition".into(),
         stores: vec![StoreIdentifier {
             store: StoreId::new("steam").unwrap(),
@@ -93,7 +104,6 @@ fn make_test_definition() -> GameDefinition {
         version_sources: vec![],
         deployment: DeploymentStrategy::VirtualFileSystem,
         content_rules: vec![],
-        native_code_patterns: vec![],
         framework_ids: vec![],
         tool_ids: vec![],
         launch: Some(LaunchRecipe {
@@ -115,7 +125,7 @@ fn make_test_definition() -> GameDefinition {
         linked_archive_patterns: vec!["Data/*.bsa".into()],
         declared_writes: vec![],
         excluded_paths: vec![],
-        plugin_list: None,
+        load_orders: Vec::new(),
         launch_alternatives: Vec::new(),
         runtime_files: vec![skse_rule()],
         save_location: Vec::new(),
@@ -141,6 +151,8 @@ fn create_test_context(tmp: &TempDir, def: &GameDefinition) -> CoreContext {
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def.clone()],
         frameworks: vec![],
         tools: vec![],
@@ -474,7 +486,7 @@ fn a_disabled_content_layer_with_another_versions_skse_gives_no_finding() {
 #[test]
 fn launch_checks_list_the_frameworks_and_plugin_count_that_passed() {
     let mut s = setup(&["skse64_1_6_1170.dll"]);
-    s.def.plugin_list = Some(plugin_list_rule());
+    s.def.load_orders = vec![plugin_list_rule()];
     write_plugin_list(&s, &["A.esp", "B.esp"]);
 
     let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
@@ -493,7 +505,7 @@ fn launch_checks_list_the_frameworks_and_plugin_count_that_passed() {
 fn launch_checks_say_zero_plugins_rather_than_omitting_the_load_order() {
     let mut s = setup(&[]);
     s.def.runtime_files = Vec::new();
-    s.def.plugin_list = Some(plugin_list_rule());
+    s.def.load_orders = vec![plugin_list_rule()];
 
     let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
     assert_eq!(checks.passed.len(), 1, "{:?}", checks.passed);

@@ -26,7 +26,7 @@ use agora_core::game_registry::{
 use agora_core::game_saves;
 use agora_game_api::{
     ContentLayout, GameDefinition, GameId, GamePackage, GamePath, InputFingerprint, InstallId,
-    InstallKind, LaunchRecipe, LayerSource, PackageDefinition, PluginListRule, RelPath,
+    InstallKind, LaunchRecipe, LayerSource, LoadOrderDefinition, PackageDefinition, RelPath,
     RuntimeIdentity, StoreId, ToolDefinition, ToolId, ToolOutput,
 };
 use sha2::{Digest, Sha256};
@@ -89,20 +89,30 @@ fn skyrim_like() -> GameDefinition {
         root_markers: vec![],
         thunderstore_bepinex: false,
     });
-    def.plugin_list = Some(PluginListRule {
-        user_file: RelPath::new("user/Plugins.txt").unwrap(),
-        plugin_folder: RelPath::new("Data").unwrap(),
-        patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-        active_prefix: "*".into(),
-        header: vec![
-            "# This file is used by Skyrim to keep track of your downloaded content.".into(),
-            "# Please do not modify this file.".into(),
-        ],
-        semantics: None,
-        implicit: vec!["Skyrim.esm".into(), "Update.esm".into()],
-        implicit_list_file: None,
-        loot: None,
-    });
+    def.load_orders = vec![LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        items: agora_game_api::LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+            folders: false,
+        },
+        format: agora_game_api::LoadOrderFormat::Lines {
+            active_prefix: "*".into(),
+            header: vec![
+                "# This file is used by Skyrim to keep track of your downloaded content.".into(),
+                "# Please do not modify this file.".into(),
+            ],
+        },
+        rules: agora_game_api::LoadOrderRules {
+            kind: "none".into(),
+            entry: None,
+            implicit: vec!["Skyrim.esm".into(), "Update.esm".into()],
+            implicit_list_file: None,
+            loot: None,
+        },
+    }];
     def.tool_ids = vec![ToolId::new("nemesis").unwrap()];
     def.launch = Some(LaunchRecipe {
         executable: GamePath::Runtime {
@@ -144,6 +154,10 @@ fn nemesis() -> ToolDefinition {
         required_magic: Vec::new(),
         run_only: false,
         executable_names: Vec::new(),
+        inputs: Vec::new(),
+        scope: Default::default(),
+        input_files: Vec::new(),
+        before_launch: None,
     }
 }
 
@@ -295,6 +309,8 @@ fn fixture() -> Fixture {
         version: semver::Version::new(0, 1, 0),
         api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
         parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
         games: vec![def.clone()],
         frameworks: vec![],
         tools: vec![tool],

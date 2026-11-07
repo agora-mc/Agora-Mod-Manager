@@ -537,6 +537,10 @@ pub fn user_tool_definition(
         required_magic: Vec::new(),
         run_only: user.is_run_only(),
         executable_names: Vec::new(),
+        inputs: Vec::new(),
+        scope: Default::default(),
+        input_files: Vec::new(),
+        before_launch: None,
     })
 }
 
@@ -1140,7 +1144,7 @@ pub(crate) fn input_fingerprint_with_view(
             );
         }
     }
-    if definition.plugin_list.is_some() {
+    if !definition.load_orders.is_empty() {
         let order = game_load_order::order_with_view(ctx, instance_id, definition, links)
             .map_err(|e| ToolError::Other(format!("cannot read the load order: {e}")))?;
         for entry in order.entries.iter().filter(|entry| entry.active) {
@@ -1221,7 +1225,7 @@ fn list_links(
     definition: &GameDefinition,
     manifest: &GameInstanceManifest,
 ) -> Result<Option<crate::game_deploy::DeploymentPlan>, ToolError> {
-    if definition.plugin_list.is_none() || !matches!(manifest.base, BaseReference::Pinned { .. }) {
+    if definition.load_orders.is_empty() || !matches!(manifest.base, BaseReference::Pinned { .. }) {
         return Ok(None);
     }
     game_load_order::plan_for_order(ctx, instance_id, definition)

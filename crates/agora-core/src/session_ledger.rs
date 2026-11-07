@@ -400,7 +400,7 @@ pub fn build_manifest(
     }
 
     // Load order.
-    if definition.plugin_list.is_some() {
+    if !definition.load_orders.is_empty() {
         match crate::game_plugins::list(ctx, instance_id, definition) {
             Ok(list) => {
                 let mut hasher = Sha256::new();

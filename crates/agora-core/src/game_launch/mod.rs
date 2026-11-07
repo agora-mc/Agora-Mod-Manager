@@ -10,8 +10,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use agora_game_api::{
-    check_runtime_files, describe_runtime_findings, GameDefinition, GamePath, LaunchRecipe,
-    LaunchValue, RuntimeFileFinding, RuntimeFilePass, UserDataLocation,
+    check_runtime_files, describe_runtime_findings, Condition, ConditionFacts, FrameworkId,
+    GameDefinition, GamePath, LaunchRecipe, LaunchValue, RelPath, RuntimeFileFinding,
+    RuntimeFilePass, Truth, UserDataLocation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -427,9 +428,48 @@ fn resolve_game_path(path: &GamePath, roots: &LaunchRoots) -> Result<PathBuf, La
     }
 }
 
+/// The instance facts a launch recipe's conditions can ask about, from the roots it resolves
+/// against. A framework version or the game version is not visible here, so those stay unknown.
+struct LaunchRootsFacts<'a> {
+    roots: &'a LaunchRoots,
+}
+
+impl ConditionFacts for LaunchRootsFacts<'_> {
+    fn present(&self, path: &RelPath) -> Option<bool> {
+        let roots = [
+            Some(&self.roots.runtime),
+            self.roots.install.as_ref(),
+            self.roots.base.as_ref(),
+        ];
+        let mut any = false;
+        for root in roots.into_iter().flatten() {
+            any = true;
+            if join_rel(root, path.as_str()).is_file() {
+                return Some(true);
+            }
+        }
+        any.then_some(false)
+    }
+
+    fn framework(&self, _framework: &FrameworkId) -> Option<Option<String>> {
+        None
+    }
+
+    fn game_version(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Whether a condition applies. Only a known true applies; an unknown answer leaves the thing out,
+/// as §30.12 says, and the launch log records that it could not tell.
+fn applies(when: &Condition, roots: &LaunchRoots) -> bool {
+    when.evaluate(&LaunchRootsFacts { roots }) == Truth::True
+}
+
 fn resolve_launch_value(val: &LaunchValue, roots: &LaunchRoots) -> Result<OsString, LaunchError> {
     match val {
         LaunchValue::Literal { value } => Ok(OsString::from(value)),
+        LaunchValue::Conditional { value, .. } => resolve_launch_value(value, roots),
         LaunchValue::Path {
             path,
             prefix,
@@ -484,12 +524,26 @@ pub fn resolve_recipe(
 
     let mut args = Vec::with_capacity(recipe.arguments.len());
     for arg in &recipe.arguments {
-        args.push(resolve_launch_value(arg, roots)?);
+        if let LaunchValue::Conditional { value, when } = arg {
+            if !applies(when, roots) {
+                continue;
+            }
+            args.push(resolve_launch_value(value, roots)?);
+        } else {
+            args.push(resolve_launch_value(arg, roots)?);
+        }
     }
 
     let mut env = BTreeMap::new();
     for (k, v) in &recipe.environment {
-        env.insert(k.clone(), resolve_launch_value(v, roots)?);
+        if let LaunchValue::Conditional { value, when } = v {
+            if !applies(when, roots) {
+                continue;
+            }
+            env.insert(k.clone(), resolve_launch_value(value, roots)?);
+        } else {
+            env.insert(k.clone(), resolve_launch_value(v, roots)?);
+        }
     }
 
     Ok(ResolvedLaunch {
@@ -513,8 +567,7 @@ pub fn apply_launch_alternative(
     resolved: &mut ResolvedLaunch,
 ) -> Result<Option<AppliedAlternative>, LaunchError> {
     for alternative in &definition.launch_alternatives {
-        let marker = join_rel(&roots.runtime, alternative.when_present.as_str());
-        if !marker.is_file() {
+        if !applies(&alternative.when, roots) {
             continue;
         }
         if !matches!(
