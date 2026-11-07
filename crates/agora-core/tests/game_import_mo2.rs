@@ -93,6 +93,7 @@ fn skyrim_like() -> GameDefinition {
         id: "plugins".into(),
         name: "Plugins".into(),
         file: RelPath::new("user/Plugins.txt").unwrap(),
+        destination: Default::default(),
         items: agora_game_api::LoadOrderItems {
             folder: RelPath::new("Data").unwrap(),
             patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],

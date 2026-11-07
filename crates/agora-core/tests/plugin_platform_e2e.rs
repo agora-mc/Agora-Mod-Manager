@@ -267,6 +267,7 @@ fn a_real_plugin_supplies_every_platform_hook() {
         vec![LoadOrderRule::Before {
             first: "A.esp".into(),
             second: "B.esp".into(),
+            optional: false,
         }]
     );
 

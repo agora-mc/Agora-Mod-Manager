@@ -554,14 +554,32 @@ impl SessionRules {
 
 /// One list a game keeps in load order (MASTER_SPEC §30.12). `load_orders` replaces the old single
 /// `plugin_list`: a game may keep any number of lists, in any folder, with open rule sets.
+/// Where a list's file lives (MASTER_SPEC §30.12).
+///
+/// `Instance` is the long-standing shape: the file is an instance copy, swapped into the game
+/// when the game keeps one outside its own folder. `View` keeps the file in the game's merged view:
+/// core renders it into a generated layer, so a tool can name it as an ordinary runtime path and
+/// the real game folder is never written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadOrderDestination {
+    #[default]
+    Instance,
+    View,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadOrderDefinition {
     /// Local to the game; refused when two lists share one.
     pub id: String,
     /// What the list is called to a person.
     pub name: String,
-    /// The instance file the list is written to, e.g. `user/Plugins.txt`.
+    /// The file the list is written to. An `instance` destination is an instance file; a `view`
+    /// destination is a game path in the instance's merged view.
     pub file: RelPath,
+    /// Where `file` lives. Absent means `instance`, the behaviour before this field existed.
+    #[serde(default)]
+    pub destination: LoadOrderDestination,
     pub items: LoadOrderItems,
     pub format: LoadOrderFormat,
     pub rules: LoadOrderRules,
@@ -1023,8 +1041,9 @@ impl GameDefinition {
 pub const PLACEMENT_MAX_DEPTH: usize = 8;
 
 /// A package's fallback classification of an item, when neither a content rule nor the layout
-/// places it (MASTER_SPEC §30.12).
-pub type PlacementClassify<'a> = &'a dyn Fn(&[RelPath]) -> Option<Suggestion>;
+/// places it (MASTER_SPEC §30.12). The item name is a hint; a `{folder}` in the reply is filled
+/// from it and checked the same way a content rule's is.
+pub type PlacementClassify<'a> = &'a dyn Fn(&str, &[RelPath]) -> Option<Suggestion>;
 
 /// Where a content item goes by its game's `content_layout` alone.
 pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestion {
@@ -1085,8 +1104,8 @@ pub fn suggest_placement_with_rules(
     });
     let finish = |top_level: Vec<String>| -> Suggestion {
         if let Some(classify) = classify {
-            if let Some(suggestion) = classify(files) {
-                return suggestion;
+            if let Some(suggestion) = classify(item_name, files) {
+                return check_classified(suggestion, item_name, top_level);
             }
         }
         Suggestion::Unknown {
@@ -1234,6 +1253,47 @@ pub fn suggest_placement_with_rules(
     }
 
     finish(Vec::new())
+}
+
+/// Check a package's classified placement: a `{folder}` in its mount is filled from the item
+/// name, and that name passes the same rules a content rule's `{folder}` does. A reply that cannot
+/// become a path inside the instance is the Unknown prompt, never a guess.
+fn check_classified(suggestion: Suggestion, item_name: &str, top_level: Vec<String>) -> Suggestion {
+    match suggestion {
+        Suggestion::Place {
+            source_path,
+            mount_path,
+            reason,
+        } => {
+            let mount = if mount_path.as_str().contains("{folder}") {
+                if let Err(why) = safe_folder_name(item_name) {
+                    return Suggestion::Unknown {
+                        top_level,
+                        note: Some(format!(
+                            "the item's name cannot be a folder in the mount: {why}"
+                        )),
+                    };
+                }
+                mount_path.as_str().replace("{folder}", item_name)
+            } else {
+                mount_path.as_str().to_string()
+            };
+            let Ok(mount) = RelPath::new(mount) else {
+                return Suggestion::Unknown {
+                    top_level,
+                    note: Some(
+                        "the classified mount is not a path inside the instance".to_string(),
+                    ),
+                };
+            };
+            Suggestion::Place {
+                source_path,
+                mount_path: mount,
+                reason,
+            }
+        }
+        other => other,
+    }
 }
 
 fn append_skipped(reason: String, skipped: &[String]) -> String {
@@ -2251,9 +2311,38 @@ pub struct LoadOrderLine {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoadOrderRule {
-    Before { first: String, second: String },
-    Requires { item: String, master: String },
-    Conflicts { first: String, second: String },
+    Before {
+        first: String,
+        second: String,
+        /// The rule applies only when both items are in the list, and says nothing otherwise.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+    },
+    Requires {
+        item: String,
+        master: String,
+        /// The rule applies only when both items are in the list, and says nothing otherwise.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+    },
+    Conflicts {
+        first: String,
+        second: String,
+        /// The rule applies only when both items are active, and says nothing otherwise.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+    },
+}
+
+impl LoadOrderRule {
+    /// Whether a rule that cannot apply stays silent instead of reporting the absent item.
+    pub fn optional(&self) -> bool {
+        match self {
+            Self::Before { optional, .. }
+            | Self::Requires { optional, .. }
+            | Self::Conflicts { optional, .. } => *optional,
+        }
+    }
 }
 
 #[cfg(test)]

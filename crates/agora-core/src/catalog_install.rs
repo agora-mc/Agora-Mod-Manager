@@ -494,13 +494,16 @@ pub async fn install(
         .package_for(&definition.id)
         .map(|_| game_deploy::PlacementClassifier::new(ctx, request.instance_id, definition));
     let decision = {
-        let classify = classifier
-            .as_ref()
-            .map(|classifier| |files: &[agora_game_api::RelPath]| classifier.run(files));
+        let classify = classifier.as_ref().map(|classifier| {
+            |item_name: &str, files: &[agora_game_api::RelPath]| classifier.run(item_name, files)
+        });
         let classify_ref: Option<agora_game_api::PlacementClassify<'_>> =
             classify.as_ref().map(|classify| {
                 classify
-                    as &dyn Fn(&[agora_game_api::RelPath]) -> Option<agora_game_api::Suggestion>
+                    as &dyn Fn(
+                        &str,
+                        &[agora_game_api::RelPath],
+                    ) -> Option<agora_game_api::Suggestion>
             });
         game_deploy::decide_placement_with(
             &content_item,

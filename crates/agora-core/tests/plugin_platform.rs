@@ -99,6 +99,7 @@ fn a_rule_kind_of_anything_else_is_refused() {
             id: "plugins".into(),
             name: "Plugins".into(),
             file: agora_game_api::RelPath::new("user/Plugins.txt").unwrap(),
+            destination: Default::default(),
             items: agora_game_api::LoadOrderItems {
                 folder: agora_game_api::RelPath::new("Data").unwrap(),
                 patterns: vec!["*.esp".into()],

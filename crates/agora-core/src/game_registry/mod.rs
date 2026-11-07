@@ -288,7 +288,9 @@ impl GameRegistryBuilder {
                         uf.instance_path == rule.file
                             && uf.strategy == UserFileStrategy::JournaledSwap
                     });
-                    if !matches_user_file {
+                    if rule.destination == agora_game_api::LoadOrderDestination::Instance
+                        && !matches_user_file
+                    {
                         return Err(GameRegistryError::PluginListUserFileNotFound {
                             game_id: game.id.clone(),
                             user_file: rule.file.clone(),

@@ -114,9 +114,13 @@ pub trait GamePackage: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Place an item the game's data rules did not. `item_name` is a hint from Agora (the
+    /// archive's or folder's name) and must not be trusted: a `{folder}` in the returned mount is
+    /// filled from it and passes the same checks a content rule's `{folder}` does.
     fn classify<'a>(
         &'a self,
         _context: GameContext,
+        _item_name: &'a str,
         _files: Vec<RelPath>,
     ) -> GameFuture<'a, Option<Suggestion>> {
         Box::pin(async { Ok(None) })

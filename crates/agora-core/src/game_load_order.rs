@@ -846,7 +846,11 @@ fn rule_prerequisites(
     let mut findings = Vec::new();
     for rule in rules {
         match rule {
-            LoadOrderRule::Requires { item, master } => {
+            LoadOrderRule::Requires { item, master, .. } => {
+                let both = known(item) && known(master);
+                if rule.optional() && !both {
+                    continue;
+                }
                 for name in [item, master] {
                     if !known(name) {
                         findings.push(Finding::MissingRuleItem {
@@ -856,14 +860,18 @@ fn rule_prerequisites(
                         });
                     }
                 }
-                if known(item) && known(master) {
+                if both {
                     let edges = prereqs.entry(key(item)).or_default();
                     if !edges.iter().any(|edge| key(edge) == key(master)) {
                         edges.push(master.clone());
                     }
                 }
             }
-            LoadOrderRule::Before { first, second } => {
+            LoadOrderRule::Before { first, second, .. } => {
+                let both = known(first) && known(second);
+                if rule.optional() && !both {
+                    continue;
+                }
                 for name in [first, second] {
                     if !known(name) {
                         findings.push(Finding::MissingRuleItem {
@@ -873,14 +881,23 @@ fn rule_prerequisites(
                         });
                     }
                 }
-                if known(first) && known(second) {
+                if both {
                     let edges = prereqs.entry(key(second)).or_default();
                     if !edges.iter().any(|edge| key(edge) == key(first)) {
                         edges.push(first.clone());
                     }
                 }
             }
-            LoadOrderRule::Conflicts { first, second } => {
+            LoadOrderRule::Conflicts { first, second, .. } => {
+                let active = |name: &str| {
+                    entries
+                        .iter()
+                        .any(|entry| key(&entry.name) == key(name) && loads(entry))
+                };
+                let both = active(first) && active(second);
+                if rule.optional() && !both {
+                    continue;
+                }
                 for name in [first, second] {
                     if !known(name) {
                         findings.push(Finding::MissingRuleItem {
@@ -890,12 +907,7 @@ fn rule_prerequisites(
                         });
                     }
                 }
-                let active = |name: &str| {
-                    entries
-                        .iter()
-                        .any(|entry| key(&entry.name) == key(name) && loads(entry))
-                };
-                if active(first) && active(second) {
+                if both {
                     findings.push(Finding::RuleConflict {
                         list: list.to_string(),
                         first: first.clone(),
@@ -2403,6 +2415,7 @@ mod tests {
             id: "plugins".into(),
             name: "Plugins".into(),
             file: agora_game_api::RelPath::new("user/Plugins.txt").unwrap(),
+            destination: Default::default(),
             items: agora_game_api::LoadOrderItems {
                 folder: agora_game_api::RelPath::new("Data").unwrap(),
                 patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
