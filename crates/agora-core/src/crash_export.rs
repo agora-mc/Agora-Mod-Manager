@@ -48,7 +48,7 @@ const AGORA_BRIEFING: &str = "\
 
 Agora is a free, open-source, ad-free Minecraft mod launcher.
 
-- Source code, releases and issue tracker: https://github.com/agora-mc/Agora-Launcher
+- Source code, releases and issue tracker: https://github.com/agora-mc/Agora-Mod-Manager
 - Community help and curation: https://discord.gg/56tpsa2sTZ
 
 Terms used above:
@@ -237,7 +237,7 @@ mod tests {
         let report = build_crash_report(None, &ctx);
 
         assert!(report.contains("## About Agora"));
-        assert!(report.contains("https://github.com/agora-mc/Agora-Launcher"));
+        assert!(report.contains("https://github.com/agora-mc/Agora-Mod-Manager"));
         // Where a person, rather than a model, can help.
         assert!(report.contains("https://discord.gg/56tpsa2sTZ"));
         // Guidance that keeps an answer safe to act on.

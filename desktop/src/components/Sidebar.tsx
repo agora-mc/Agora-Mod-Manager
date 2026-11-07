@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useRef, type ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { ChevronLeft, ChevronRight, Command, Puzzle } from 'lucide-react';
 import { BrandMark } from './BrandMark';
@@ -25,6 +25,10 @@ interface SidebarProps {
   pluginPages?: { id: string; label: string }[];
   activePluginPage?: string | null;
   onSelectPluginPage?: (id: string) => void;
+  /** Shown under the brand: the game switcher, when there is a second game to switch to. */
+  switcher?: ReactNode;
+  /** A small count next to a nav item, such as the Library's new downloads. */
+  badges?: Partial<Record<Tab, number>>;
 }
 
 const MIN_WIDTH = 180;
@@ -65,6 +69,8 @@ export function Sidebar({
   pluginPages = [],
   activePluginPage = null,
   onSelectPluginPage,
+  switcher,
+  badges = {},
 }: SidebarProps) {
   const latestWidth = useRef(width);
 
@@ -116,12 +122,14 @@ export function Sidebar({
       >
       <div className={`border-b border-border ${collapsed ? 'p-3' : 'p-4'}`}>
         <BrandMark compact={collapsed} className={collapsed ? 'justify-center' : ''} />
+        {switcher && <div className="mt-3">{switcher}</div>}
       </div>
 
       <nav className="min-h-0 flex-1 space-y-1 overflow-y-auto p-3" aria-label="Main navigation">
         {tabs.map((tab) => {
           const isActive = !activePluginPage && activeTab === tab.id;
           const Icon = tab.icon;
+          const badge = badges[tab.id] ?? 0;
           return (
             <button
               key={tab.id}
@@ -130,7 +138,7 @@ export function Sidebar({
               title={collapsed ? tab.label : undefined}
               data-tour={TOUR_ANCHORS[tab.id]}
               className={[
-                'flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-medium transition-colors',
+                'relative flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-medium transition-colors',
                 collapsed ? 'px-0 justify-center' : '',
                 isActive
                   ? 'bg-primary text-primary-foreground shadow-xs'
@@ -139,6 +147,31 @@ export function Sidebar({
             >
               <Icon className="h-[18px] w-[18px] shrink-0" aria-hidden="true" />
               {!collapsed && <span className="min-w-0 flex-1 text-left leading-snug">{tab.label}</span>}
+              {!collapsed && badge > 0 && (
+                <span
+                  className={[
+                    'shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold tabular-nums forced-colors:border forced-colors:border-[CanvasText]',
+                    // On the active row the accent is behind the chip, and an accent can be any
+                    // colour (a custom yellow keeps white text), so the chip takes the page's own
+                    // surface and text colours instead, which every theme keeps readable together.
+                    isActive ? 'bg-background text-foreground shadow-xs' : 'bg-primary text-primary-foreground',
+                  ].join(' ')}
+                  aria-label={`${badge} new`}
+                  data-testid={`nav-badge-${tab.id}`}
+                >
+                  {badge > 99 ? '99+' : badge}
+                </span>
+              )}
+              {collapsed && badge > 0 && (
+                <span
+                  className={[
+                    'absolute right-1 top-1 h-2 w-2 rounded-full',
+                    isActive ? 'bg-background ring-1 ring-foreground/60' : 'bg-primary',
+                  ].join(' ')}
+                  aria-label={`${badge} new`}
+                  data-testid={`nav-badge-${tab.id}`}
+                />
+              )}
             </button>
           );
         })}

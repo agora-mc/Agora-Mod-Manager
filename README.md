@@ -1,8 +1,8 @@
-# Agora Minecraft Launcher
+# Agora Mod Manager
 
 > This is not a warehouse. This is a boutique.
 
-Agora is a decentralized, ad-free, open-source Minecraft launcher and discovery platform. Agora uses community-curated manifests compiled into a signed catalog to provide a community managed, curated list of mods from any source. 
+Agora is a decentralized, ad-free, open-source mod manager and discovery platform for games. Minecraft is included as the default, other games come as plugins; Skyrim Special Edition is the first, shipped as an official plugin you install from the "More games" card on Home or in Settings > Game support. Agora uses community-curated manifests compiled into a signed catalog to provide a community managed, curated list of mods from any source. The catalog is mostly Minecraft today. 
 
 If you aren't a contributor or developer, I recommend visiting Agora's website, https://agoramc.com/.
 
@@ -19,7 +19,7 @@ Windows is tested and signed, I don't have macOS or Linux right now so they are 
 - [Website](https://agoramc.com/) - if you aren't a contributor or developer, this is the place to go!
 - [Documentation home](https://agoramc.com/docs) - start here; it routes you by what you are trying to do.
 - [Task guides](https://agoramc.com/docs/guides) - every workflow, written both as steps and as an explanation.
-- [Desktop and CLI releases](https://github.com/agora-mc/Agora-Launcher/releases) - choose the newest published `v*` release, not a `registry-*` data release.
+- [Desktop and CLI releases](https://github.com/agora-mc/Agora-Mod-Manager/releases) - choose the newest published `v*` release, not a `registry-*` data release.
 - [Troubleshooting and support](https://agoramc.com/docs/troubleshooting)
 - [CLI reference](https://agoramc.com/docs/cli)
 - [How the documentation is organized](./docs/README.md)
@@ -98,7 +98,7 @@ npm run build
 
 cd ../web
 npm install
-NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Launcher npm run build
+NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Mod-Manager npm run build
 ```
 
 See [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) for prerequisites, environment boundaries, disposable profiles, and the full validation matrix.

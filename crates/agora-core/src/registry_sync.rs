@@ -16,14 +16,14 @@ use std::path::Path;
 /// Resolve the registry repository with priority:
 /// 1. CLI override (passed as parameter)
 /// 2. `AGORA_REGISTRY_REPO` environment variable
-/// 3. Built-in default: `"agora-mc/Agora-Launcher"`
+/// 3. Built-in default: `"agora-mc/Agora-Mod-Manager"`
 pub fn resolve_registry_repo(cli_override: Option<&str>) -> String {
     cli_override
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("AGORA_REGISTRY_REPO").ok())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "agora-mc/Agora-Launcher".into())
+        .unwrap_or_else(|| "agora-mc/Agora-Mod-Manager".into())
 }
 
 /// Ed25519 public key (hex) for verifying registry.db signatures.
@@ -173,12 +173,15 @@ pub async fn check_and_download_update(
     // valid forever, so an older release republished as "latest" (or promoted
     // by release pruning) would otherwise be installed over a newer registry,
     // reinstating entries that curation has since quarantined.
-    let update_available = match cached_tag.as_deref() {
-        Some(cached) if has_cached_db => tag_is_newer(cached, &latest.tag_name),
-        // No cached tag, or a tag with no database behind it: nothing to
-        // roll back from.
-        _ => true,
-    };
+    let latest_asset = latest.find_asset("registry.db");
+    let cached_asset = get_cached_asset_id(local_state_path)?;
+    let update_available = update_is_available(
+        cached_tag.as_deref(),
+        has_cached_db,
+        cached_asset,
+        &latest.tag_name,
+        latest_asset,
+    );
 
     if !update_available && has_cached_db {
         return Ok(RegistryStatus {
@@ -253,6 +256,7 @@ pub async fn check_and_download_update(
         paths::registry_sig_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
     atomic_replace_db(&db_path, &sig_path, &db_bytes, &sig_bytes)?;
     set_cached_tag(local_state_path, &latest.tag_name)?;
+    set_cached_asset_id(local_state_path, Some(db_id))?;
 
     if let Some(op) = _op {
         op.complete();
@@ -279,6 +283,33 @@ pub enum CachedRegistryIntegrity {
     /// The cached db failed verification and was quarantined. The payload is a
     /// human-readable reason suitable for a startup warning.
     Quarantined(String),
+    /// The cached db failed verification and could not be moved aside, so it is
+    /// still on disk. The payload is a human-readable reason; nothing may open
+    /// the file in this run.
+    Error(String),
+}
+
+/// Move `path` to `<name>.untrusted`, or to a numbered variant when that name
+/// is already taken. Quarantine preserves the file for inspection; it never
+/// deletes something at the target.
+fn quarantine_aside(path: &Path, kind: &str) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut last_error = None;
+    for suffix in std::iter::once(kind.to_string()).chain((1..=100).map(|n| format!("{kind}-{n}")))
+    {
+        let target = path.with_extension(suffix);
+        match std::fs::rename(path, &target) {
+            Ok(()) => return Ok(()),
+            // Something else moved it; the untrusted file is no longer here.
+            Err(_) if !path.exists() => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free quarantine name")
+    }))
 }
 
 /// Verify the cached `registry.db` against the `registry.db.sig` sidecar that
@@ -307,8 +338,18 @@ pub fn verify_cached_registry(app_data_dir: &Path) -> CachedRegistryIntegrity {
     };
 
     let quarantine = |reason: String| -> CachedRegistryIntegrity {
-        let _ = std::fs::rename(&db_path, db_path.with_extension("db.untrusted"));
-        let _ = std::fs::rename(&sig_path, sig_path.with_extension("sig.untrusted"));
+        // A failed move is an error, not a quarantine: the unverified file is
+        // still where a later reader would find it.
+        if let Err(error) = quarantine_aside(&db_path, "db.untrusted") {
+            return CachedRegistryIntegrity::Error(format!(
+                "{reason} It could not be moved aside ({error}), so it will not be used this run."
+            ));
+        }
+        if let Err(error) = quarantine_aside(&sig_path, "sig.untrusted") {
+            return CachedRegistryIntegrity::Error(format!(
+                "{reason} The database was moved aside, but its signature could not be ({error})."
+            ));
+        }
         CachedRegistryIntegrity::Quarantined(reason)
     };
 
@@ -316,8 +357,9 @@ pub fn verify_cached_registry(app_data_dir: &Path) -> CachedRegistryIntegrity {
         Ok(bytes) => bytes,
         // Unreadable is not the same as untrusted — leave it in place and let
         // the caller fall back rather than destroying a file we cannot inspect.
+        // It still must not be opened: report a failure, not a quarantine.
         Err(error) => {
-            return CachedRegistryIntegrity::Quarantined(format!(
+            return CachedRegistryIntegrity::Error(format!(
                 "Cached registry could not be read ({error}); it will not be used."
             ))
         }
@@ -553,15 +595,115 @@ async fn download_file(url: &str, token: Option<&str>) -> LauncherResult<Vec<u8>
 }
 
 // ---------------------------------------------------------------------------
+// Reading the cached registry as trusted data
+// ---------------------------------------------------------------------------
+
+/// The cached registry, read only after its signature was checked.
+///
+/// `verify_cached_registry` runs once at startup, but the cached file sits in a
+/// user-writable folder and can change afterwards. A caller that is about to
+/// act on what the registry says (download this URL, trust this hash) calls
+/// [`open_verified_registry`] instead: it verifies the bytes it is about to read,
+/// then opens a private copy of exactly those bytes, so the file cannot be
+/// swapped between the check and the read.
+pub struct VerifiedRegistry {
+    conn: Option<rusqlite::Connection>,
+    copy: std::path::PathBuf,
+}
+
+impl VerifiedRegistry {
+    pub fn connection(&self) -> &rusqlite::Connection {
+        self.conn
+            .as_ref()
+            .expect("the connection is only taken when the registry is dropped")
+    }
+}
+
+impl Drop for VerifiedRegistry {
+    fn drop(&mut self) {
+        // The connection must close before Windows lets the file go.
+        self.conn = None;
+        let _ = std::fs::remove_file(&self.copy);
+    }
+}
+
+/// Verify the cached `registry.db` against the compiled-in key and open it.
+///
+/// Fails closed: a missing registry, a missing or wrong signature, or an
+/// unreadable file is an error, never an empty registry.
+pub fn open_verified_registry(app_data_dir: &Path) -> LauncherResult<VerifiedRegistry> {
+    open_verified_registry_with_key(app_data_dir, REGISTRY_PUBKEY_HEX)
+}
+
+/// [`open_verified_registry`] against an explicit key.
+///
+/// Public so integration tests can sign a registry of their own. Production
+/// adapters call [`open_verified_registry`]; no setting or environment variable
+/// reaches this function.
+pub fn open_verified_registry_with_key(
+    app_data_dir: &Path,
+    pubkey_hex: &str,
+) -> LauncherResult<VerifiedRegistry> {
+    static COPY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // An empty key would reach the debug-build "skip verification" branch.
+    if pubkey_hex.trim().is_empty() {
+        return Err(LauncherError::RegistrySignatureInvalid);
+    }
+    let db_path =
+        paths::registry_db_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    let sig_path =
+        paths::registry_sig_path(app_data_dir).map_err(|_| LauncherError::RegistryMissing)?;
+    if !db_path.exists() {
+        return Err(LauncherError::RegistryMissing);
+    }
+    let db_bytes = std::fs::read(&db_path).map_err(|_| LauncherError::RegistryMissing)?;
+    // A registry with no signature sidecar is unsigned, which is not trusted.
+    let sig_bytes =
+        std::fs::read(&sig_path).map_err(|_| LauncherError::RegistrySignatureInvalid)?;
+    verify_signature_with_key(pubkey_hex, &db_bytes, &sig_bytes)?;
+
+    let copy = app_data_dir.join(format!(
+        "registry_verified-{}-{}.tmp",
+        std::process::id(),
+        COPY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&copy, &db_bytes).map_err(|_| LauncherError::RegistryMissing)?;
+    match db::registry_connection(&copy) {
+        Ok(conn) => Ok(VerifiedRegistry {
+            conn: Some(conn),
+            copy,
+        }),
+        Err(e) => {
+            let _ = std::fs::remove_file(&copy);
+            Err(LauncherError::Generic {
+                code: "ERR_REGISTRY_UNREADABLE".into(),
+                message: format!("The verified catalog could not be opened: {e}"),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers â€” Ed25519 signature verification
 // ---------------------------------------------------------------------------
 
 fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
+    verify_signature_with_key(REGISTRY_PUBKEY_HEX, db_bytes, sig_bytes)
+}
+
+/// [`verify_signature`] against an explicit key, so a caller that is handed a
+/// different trust anchor (a test, never a user setting) shares the one check.
+fn verify_signature_with_key(
+    pubkey_hex: &str,
+    db_bytes: &[u8],
+    sig_bytes: &[u8],
+) -> LauncherResult<()> {
     // In debug builds only, allow skipping verification when no pubkey is set.
     // Release builds must have AGORA_REGISTRY_PUBKEY compiled in.
     #[cfg(not(debug_assertions))]
     {
-        if REGISTRY_PUBKEY_HEX.is_empty() {
+        if pubkey_hex.is_empty() {
             return Err(LauncherError::Generic {
                 code: "ERR_REGISTRY_PUBKEY_NOT_CONFIGURED".to_string(),
                 message: "Catalog public key not compiled in; refusing to verify. \
@@ -576,7 +718,7 @@ fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
 
     #[cfg(debug_assertions)]
     {
-        if REGISTRY_PUBKEY_HEX.is_empty() {
+        if pubkey_hex.is_empty() {
             eprintln!(
                 "WARNING: AGORA_REGISTRY_PUBKEY not set; skipping signature verification (debug build only).\n\
                  Set `$env:AGORA_REGISTRY_PUBKEY` (Ed25519 public key, hex) before `npm run tauri:dev` to enable verification.\n\
@@ -589,7 +731,7 @@ fn verify_signature(db_bytes: &[u8], sig_bytes: &[u8]) -> LauncherResult<()> {
         }
     }
 
-    let pubkey_bytes = hex::decode(REGISTRY_PUBKEY_HEX).map_err(|_| LauncherError::Generic {
+    let pubkey_bytes = hex::decode(pubkey_hex).map_err(|_| LauncherError::Generic {
         code: "ERR_REGISTRY_PUBKEY".to_string(),
         message: "Invalid compiled-in registry public key.".to_string(),
     })?;
@@ -739,6 +881,46 @@ fn tag_is_newer(cached: &str, latest: &str) -> bool {
     }
 }
 
+/// Whether the latest release is worth downloading.
+///
+/// The tag is the date, so two releases published the same UTC day carry the
+/// same tag, and `deploy_release_assets.py` re-publishes into it by deleting and
+/// re-uploading the assets. A same-day re-publish is how a bad official plugin
+/// is revoked within the day, so a client that already synced today must still
+/// notice it. The tag cannot show it, but the `registry.db` asset's id does: a
+/// re-upload gets a new id. A client with no recorded id (one that synced before
+/// this was recorded) downloads once to learn it.
+///
+/// This is only a filter on unsigned API metadata. What decides whether a
+/// downloaded registry is installed is the signed `built_at` stamp
+/// ([`is_rollback`]); a forged id can at worst cost one wasted download per check.
+fn update_is_available(
+    cached_tag: Option<&str>,
+    has_cached_db: bool,
+    cached_asset: Option<u64>,
+    latest_tag: &str,
+    latest_asset: Option<u64>,
+) -> bool {
+    let Some(cached_tag) = cached_tag.filter(|_| has_cached_db) else {
+        // No cached tag, or a tag with no database behind it: nothing to
+        // roll back from.
+        return true;
+    };
+    if tag_is_newer(cached_tag, latest_tag) {
+        return true;
+    }
+    // Same release tag (same UTC day): newer only if its database was re-uploaded.
+    match (
+        parse_registry_tag(cached_tag),
+        parse_registry_tag(latest_tag),
+    ) {
+        (Some(cached), Some(latest)) if cached == latest => {
+            latest_asset.is_some() && latest_asset != cached_asset
+        }
+        _ => false,
+    }
+}
+
 /// Parse `registry-YYYY-MM-DD` into a comparable tuple.
 fn parse_registry_tag(tag: &str) -> Option<(u16, u8, u8)> {
     let mut parts = tag.strip_prefix("registry-")?.split('-');
@@ -758,12 +940,15 @@ fn parse_registry_tag(tag: &str) -> Option<(u16, u8, u8)> {
 /// the release tag they cannot be forged without the signing key. ISO-8601 UTC
 /// timestamps from the compiler compare correctly as strings.
 ///
-/// Unknown is not treated as older: a cached database predating the stamp has
-/// no value to compare, and refusing every update in that state would strand
-/// clients on exactly the registry we want them to move off.
+/// An unstamped candidate over a stamped cache is a rollback: it predates the stamp, so it is
+/// older than anything stamped. Refusing it keeps the stamped registry. A *cached* database
+/// predating the stamp has no value to compare, and refusing every update in that state would
+/// strand clients on exactly the registry we want them to move off, so that direction still
+/// allows the update.
 fn is_rollback(cached_built_at: Option<&str>, candidate_built_at: Option<&str>) -> bool {
     match (cached_built_at, candidate_built_at) {
         (Some(cached), Some(candidate)) => candidate < cached,
+        (Some(_), None) => true,
         _ => false,
     }
 }
@@ -814,16 +999,76 @@ fn atomic_replace_db(
 ) -> LauncherResult<()> {
     let db_tmp = db_path.with_extension("db.tmp");
     let sig_tmp = sig_path.with_extension("sig.tmp");
+    let db_old = db_path.with_extension("db.old");
+    let sig_old = sig_path.with_extension("sig.old");
+
+    // A folder (or anything else that is not a file) at either path is not a
+    // registry pair we can replace safely. Fail before touching the signature:
+    // the old pair stays exactly as it was.
+    for path in [db_path, sig_path] {
+        if path.exists() && !path.is_file() {
+            return Err(LauncherError::RegistryDownloadFailed);
+        }
+    }
 
     std::fs::write(&db_tmp, db_bytes).map_err(|_| LauncherError::RegistryDownloadFailed)?;
     std::fs::write(&sig_tmp, sig_bytes).map_err(|_| LauncherError::RegistryDownloadFailed)?;
 
-    // Rename sig first, then db. If the sig rename fails, the old db is still
-    // intact. If the sig rename succeeds but db rename fails, old-db + new-sig
-    // still verifies against the old db and allows a clean retry on next check.
-    std::fs::rename(sig_tmp, sig_path).map_err(|_| LauncherError::RegistryDownloadFailed)?;
-    std::fs::rename(db_tmp, db_path).map_err(|_| LauncherError::RegistryDownloadFailed)?;
+    let cleanup_tmp = || {
+        let _ = std::fs::remove_file(&db_tmp);
+        let _ = std::fs::remove_file(&sig_tmp);
+    };
 
+    // Replace the database first, keeping the previous pair aside until the new
+    // signature is in place. A rename is atomic, so a reader never sees a half
+    // file, and a failure at any step puts the previous pair back: the sidecar
+    // always describes the database beside it.
+    let had_old_db = db_path.exists();
+    if had_old_db {
+        let _ = std::fs::remove_file(&db_old);
+        if std::fs::rename(db_path, &db_old).is_err() {
+            cleanup_tmp();
+            return Err(LauncherError::RegistryDownloadFailed);
+        }
+    }
+    if std::fs::rename(&db_tmp, db_path).is_err() {
+        if had_old_db {
+            let _ = std::fs::rename(&db_old, db_path);
+        }
+        cleanup_tmp();
+        return Err(LauncherError::RegistryDownloadFailed);
+    }
+
+    let had_old_sig = sig_path.exists();
+    if had_old_sig {
+        let _ = std::fs::remove_file(&sig_old);
+        if std::fs::rename(sig_path, &sig_old).is_err() {
+            let _ = std::fs::remove_file(db_path);
+            if had_old_db {
+                let _ = std::fs::rename(&db_old, db_path);
+            }
+            cleanup_tmp();
+            return Err(LauncherError::RegistryDownloadFailed);
+        }
+    }
+    if std::fs::rename(&sig_tmp, sig_path).is_err() {
+        let _ = std::fs::remove_file(db_path);
+        if had_old_db {
+            let _ = std::fs::rename(&db_old, db_path);
+        }
+        if had_old_sig {
+            let _ = std::fs::rename(&sig_old, sig_path);
+        }
+        cleanup_tmp();
+        return Err(LauncherError::RegistryDownloadFailed);
+    }
+
+    if had_old_db {
+        let _ = std::fs::remove_file(&db_old);
+    }
+    if had_old_sig {
+        let _ = std::fs::remove_file(&sig_old);
+    }
     Ok(())
 }
 
@@ -848,6 +1093,29 @@ fn set_cached_tag(local_state_path: &std::path::Path, tag: &str) -> LauncherResu
         &serde_json::Value::String(tag.to_string()),
     )
     .map_err(|_| LauncherError::LocalStateFailed)
+}
+
+/// The id of the `registry.db` release asset the cached registry came from.
+fn get_cached_asset_id(local_state_path: &std::path::Path) -> LauncherResult<Option<u64>> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    db::get_setting(&conn, "cached_registry_asset_id")
+        .map_err(|_| LauncherError::LocalStateFailed)
+        .map(|v| v.and_then(|v| v.as_u64()))
+}
+
+fn set_cached_asset_id(
+    local_state_path: &std::path::Path,
+    asset_id: Option<u64>,
+) -> LauncherResult<()> {
+    let conn = db::local_state_connection(local_state_path)
+        .map_err(|_| LauncherError::LocalStateFailed)?;
+    let value = match asset_id {
+        Some(id) => serde_json::Value::from(id),
+        None => serde_json::Value::Null,
+    };
+    db::set_setting(&conn, "cached_registry_asset_id", &value)
+        .map_err(|_| LauncherError::LocalStateFailed)
 }
 
 fn get_last_check_time(local_state_path: &std::path::Path) -> LauncherResult<Option<i64>> {
@@ -917,7 +1185,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_from_bytes() {
-        let tmp_dir = std::env::temp_dir().join("agora-test-schema-version");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("agora-test-schema-version-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -941,7 +1210,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_missing_table() {
-        let tmp_dir = std::env::temp_dir().join("agora-test-schema-missing");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("agora-test-schema-missing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -961,7 +1231,8 @@ mod tests {
 
     #[test]
     fn test_schema_version_from_cached() {
-        let tmp_dir = std::env::temp_dir().join("agora-test-schema-cached");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("agora-test-schema-cached-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -988,7 +1259,8 @@ mod tests {
 
     #[test]
     fn test_atomic_replace_creates_files() {
-        let tmp_dir = std::env::temp_dir().join("agora-test-atomic");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("agora-test-atomic-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -1009,7 +1281,8 @@ mod tests {
 
     #[test]
     fn test_registry_status_default() {
-        let tmp_dir = std::env::temp_dir().join("agora-test-status");
+        let tmp_dir =
+            std::env::temp_dir().join(format!("agora-test-status-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
 
@@ -1086,6 +1359,71 @@ mod tests {
 
     /// The binding check: both stamps come from inside signature-verified
     /// bytes, so unlike the tag they cannot be forged without the signing key.
+    /// Same-day revocation: `deploy_release_assets.py` re-publishes into the day's
+    /// tag by deleting and re-uploading the assets, so the tag does not change but
+    /// the `registry.db` asset's id does.
+    #[test]
+    fn a_same_day_republish_is_noticed_by_its_new_asset_id() {
+        let today = "registry-2026-10-31";
+        // Re-uploaded: a new id.
+        assert!(update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            today,
+            Some(9)
+        ));
+        // Same bytes, same id: nothing to do.
+        assert!(!update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            today,
+            Some(7)
+        ));
+        // Synced before ids were recorded: download once to learn it.
+        assert!(update_is_available(Some(today), true, None, today, Some(9)));
+        // The release names no database asset: nothing to download.
+        assert!(!update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            today,
+            None
+        ));
+        // A different asset id never beats the date ordering.
+        assert!(!update_is_available(
+            Some("registry-2026-11-01"),
+            true,
+            Some(7),
+            today,
+            Some(9)
+        ));
+        assert!(!update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            "v0.9.0",
+            Some(9)
+        ));
+        // Newer day, or nothing cached, behaves as before.
+        assert!(update_is_available(
+            Some(today),
+            true,
+            Some(7),
+            "registry-2026-11-01",
+            Some(7)
+        ));
+        assert!(update_is_available(None, false, None, today, Some(9)));
+        assert!(update_is_available(
+            Some(today),
+            false,
+            Some(7),
+            today,
+            Some(7)
+        ));
+    }
+
     #[test]
     fn is_rollback_compares_signed_build_stamps() {
         let older = "2026-08-26T03:19:02+00:00";
@@ -1093,10 +1431,10 @@ mod tests {
         assert!(is_rollback(Some(newer), Some(older)));
         assert!(!is_rollback(Some(older), Some(newer)));
         assert!(!is_rollback(Some(newer), Some(newer)));
-        // Absent stamps are not "older": a cached db predating the stamp must
-        // not block every future update.
+        // A cached db predating the stamp must not block every future update...
         assert!(!is_rollback(None, Some(newer)));
-        assert!(!is_rollback(Some(newer), None));
+        // ...but an unstamped candidate predates every stamped cache, so it is a rollback.
+        assert!(is_rollback(Some(newer), None));
         assert!(!is_rollback(None, None));
     }
 
@@ -1199,5 +1537,55 @@ mod tests {
     fn test_app_schema_version_constant() {
         // Sanity check: the expected schema version should be >= 1.
         const { assert!(APP_REGISTRY_SCHEMA_VERSION >= 1) };
+    }
+
+    /// A candidate with no `built_at` predates the stamp, so it is older than any stamped registry.
+    /// Treating "unknown" as "not older" lets a replayed old signed registry (the thing the stamp is
+    /// for) replace a stamped one.
+    #[test]
+    fn an_unstamped_candidate_is_a_rollback_over_a_stamped_cache() {
+        assert!(is_rollback(Some("2026-10-30T00:00:00+00:00"), None));
+    }
+
+    /// A quarantine whose documented target is occupied must still move the tampered
+    /// `registry.db` away: leaving it at `registry.db` lets later readers open it.
+    #[test]
+    fn a_failed_quarantine_does_not_leave_the_unsigned_db_in_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = paths::registry_db_path(dir.path()).unwrap();
+        let sig_path = paths::registry_sig_path(dir.path()).unwrap();
+        std::fs::write(&db_path, b"tampered registry contents").unwrap();
+        std::fs::write(&sig_path, [0u8; SIGNATURE_LENGTH]).unwrap();
+        let blocker = db_path.with_extension("db.untrusted");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), b"x").unwrap();
+
+        let result = verify_cached_registry(dir.path());
+        assert!(matches!(result, CachedRegistryIntegrity::Quarantined(_)));
+        assert!(
+            !db_path.exists(),
+            "reported as quarantined, but the tampered db is still at registry.db"
+        );
+    }
+
+    /// A replace that cannot install the database must not install the signature either: the
+    /// sidecar must always describe the database beside it.
+    #[test]
+    fn a_failed_replace_leaves_the_old_signature_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let sig_path = dir.path().join("registry.db.sig");
+        // A directory where the db should be makes the final rename fail on every platform.
+        let db_path = dir.path().join("registry.db");
+        std::fs::create_dir(&db_path).unwrap();
+        std::fs::write(db_path.join("keep"), b"x").unwrap();
+        std::fs::write(&sig_path, b"old signature").unwrap();
+
+        let result = atomic_replace_db(&db_path, &sig_path, b"new db", b"new signature");
+        assert!(result.is_err(), "the db rename must fail in this setup");
+        assert_eq!(
+            std::fs::read(&sig_path).unwrap(),
+            b"old signature",
+            "a failed replace must leave the signature that matches the surviving db"
+        );
     }
 }

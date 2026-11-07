@@ -42,5 +42,5 @@ export const GITHUB_API_RELEASES_URL =
  * occupies the same box either way, so nothing shifts.
  */
 export const TRAILER_SRC: string | null =
-  'https://github.com/agora-mc/Agora-Launcher/releases/download/site-assets/agora-trailer.mp4';
+  'https://github.com/agora-mc/Agora-Mod-Manager/releases/download/site-assets/agora-trailer.mp4';
 export const TRAILER_POSTER: string | null = '/trailer-poster.jpg';

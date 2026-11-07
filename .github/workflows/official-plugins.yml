@@ -1,0 +1,65 @@
+name: Official plugins
+
+# Skyrim support ships as an official plugin, separately from the app. This
+# workflow builds the package zip reproducibly, checks that the signed-registry
+# entry pins exactly those bytes, and attaches the zip to a release tagged
+# `official-<name>-v<version>`. That is the URL the registry names.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "packages/official/**"
+      - "registry/official-plugins/**"
+      - "scripts/build_official_plugin.py"
+      - ".github/workflows/official-plugins.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: official-plugins
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build and verify every official plugin
+        run: |
+          set -euo pipefail
+          for folder in packages/official/*/; do
+            name="$(basename "$folder")"
+            python scripts/build_official_plugin.py "$name" \
+              --out dist/official-plugins --verify-registry >/dev/null
+          done
+
+      - name: Upload changed plugin versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for folder in packages/official/*/; do
+            name="$(basename "$folder")"
+            python scripts/build_official_plugin.py "$name" \
+              --out dist/official-plugins > "$RUNNER_TEMP/$name.json"
+            tag="$(jq -r .tag "$RUNNER_TEMP/$name.json")"
+            version="$(jq -r .version "$RUNNER_TEMP/$name.json")"
+            zip="$(jq -r .zip "$RUNNER_TEMP/$name.json")"
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release upload "$tag" "$zip" --repo "$GITHUB_REPOSITORY" --clobber
+            else
+              gh release create "$tag" "$zip" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "Official plugin: $name $version" \
+                --notes "Official Agora plugin package for $name, version $version."
+            fi
+          done

@@ -31,6 +31,6 @@ describe('LivingBackground reset scene', () => {
     expect(ambience.setWeatherLocked).toHaveBeenLastCalledWith(false);
     expect(ambience.setClearBackground).toHaveBeenLastCalledWith(false);
     expect(ambience.setBuddy).toHaveBeenLastCalledWith(true);
-    expect((screen.getByLabelText('Cursor companion') as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByLabelText('Cursor companion')).toHaveAttribute('aria-checked', 'true');
   });
 });

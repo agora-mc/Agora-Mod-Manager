@@ -26,7 +26,9 @@ import {
 import {
   TOUR_STEPS,
   tourReducer,
+  visibleTourSteps,
   type TourAnchor,
+  type TourConditions,
   type TourEvent,
   type TourState,
   type TourStep,
@@ -55,7 +57,7 @@ export interface TourContextValue {
 
 const TourContext = createContext<TourContextValue | null>(null);
 
-function initialState(): TourState {
+function initialState(steps: readonly TourStep[]): TourState {
   const record = loadTourRecord();
   // A tour interrupted by an app restart resumes where it stopped; anything
   // else (never run, ended, finished) starts idle.
@@ -64,10 +66,12 @@ function initialState(): TourState {
     // back-reached step survives the restart unpinned, because nothing about
     // the user's session state reliably survives either. The transient pin is
     // for the live session only.
-    return { status: 'running', index: Math.min(record.index, TOUR_STEPS.length - 1), manual: false };
+    return { status: 'running', index: Math.min(record.index, steps.length - 1), manual: false };
   }
   return { status: 'idle', index: 0, manual: false };
 }
+
+const NO_CONDITIONS: TourConditions = { multipleGames: false };
 
 interface TourProviderProps {
   children: ReactNode;
@@ -79,14 +83,25 @@ interface TourProviderProps {
   onStart?: () => void;
   /** Overridable for tests. */
   steps?: readonly TourStep[];
+  /** The app's current situations, used to drop conditional steps. */
+  conditions?: TourConditions;
 }
 
-export function TourProvider({ children, onStart, steps = TOUR_STEPS }: TourProviderProps) {
-  const reduce = useCallback(
-    (state: TourState, event: TourEvent) => tourReducer(state, event, steps),
-    [steps],
+export function TourProvider({
+  children,
+  onStart,
+  steps = TOUR_STEPS,
+  conditions = NO_CONDITIONS,
+}: TourProviderProps) {
+  const visibleSteps = useMemo(
+    () => visibleTourSteps(steps, conditions),
+    [steps, conditions],
   );
-  const [state, dispatch] = useReducer(reduce, undefined, initialState);
+  const reduce = useCallback(
+    (state: TourState, event: TourEvent) => tourReducer(state, event, visibleSteps),
+    [visibleSteps],
+  );
+  const [state, dispatch] = useReducer(reduce, visibleSteps, initialState);
   const [completed, setCompleted] = useState(() => loadTourRecord().completed);
   const running = state.status === 'running';
 
@@ -165,9 +180,9 @@ export function TourProvider({ children, onStart, steps = TOUR_STEPS }: TourProv
 
   const value = useMemo<TourContextValue>(() => ({
     state,
-    step: running ? steps[state.index] ?? null : null,
+    step: running ? visibleSteps[state.index] ?? null : null,
     stepNumber: state.index + 1,
-    totalSteps: steps.length,
+    totalSteps: visibleSteps.length,
     running,
     completed,
     start: () => dispatch({ type: 'start' }),
@@ -176,7 +191,7 @@ export function TourProvider({ children, onStart, steps = TOUR_STEPS }: TourProv
     skip: () => dispatch({ type: 'skip' }),
     end: () => dispatch({ type: 'end' }),
     reportPresent: (anchor: TourAnchor) => dispatch({ type: 'anchor-present', anchor }),
-  }), [state, running, completed, steps]);
+  }), [state, running, completed, visibleSteps]);
 
   return <TourContext.Provider value={value}>{children}</TourContext.Provider>;
 }

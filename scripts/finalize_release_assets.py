@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Normalize desktop release assets and publish a full SHA256SUMS.
 
-Tauri names its bundles after the product — `Agora.Launcher_<version>_<arch>.<ext>`
-— which does not say desktop or CLI, mixes `x64`/`x86_64`/`amd64`, and sorts the
+Tauri names its bundles after the product — `Agora Mod Manager_<version>_<arch>.<ext>`,
+which GitHub stores as `Agora.Mod.Manager_<version>_<arch>.<ext>` — which does not
+say desktop or CLI, mixes `x64`/`x86_64`/`amd64`, and sorts the
 main Windows installer into the middle of the release's asset list (GitHub lists
 assets alphabetically). This script runs once the draft release holds every
 artifact and leaves it in one scheme:
@@ -14,8 +15,8 @@ where `<kind>` is `desktop` or `cli` and `<arch>` is `x64` or `arm64`.
 In order, it:
 
   1. fails before mutating anything if the release is missing an expected
-     artifact, carries an unexpected one, or holds an `Agora.Launcher*` asset
-     whose embedded version disagrees with the tag;
+     artifact, carries an unexpected one, or holds an `Agora.Mod.Manager*` (or
+     pre-rename `Agora.Launcher*`) asset whose embedded version disagrees with the tag;
   2. deletes the updater `*.sig` sidecar assets (the signature text also lives
      inline in `latest.json`, which is what the updater actually reads);
   3. renames the Tauri bundles in place through the asset-rename API;
@@ -51,12 +52,19 @@ TAG_PATTERN = re.compile(r"v(?P<version>\d+\.\d+\.\d+)")
 # Assets that describe the release rather than being downloadable artifacts.
 METADATA_ASSET_NAMES = ("latest.json", "SHA256SUMS")
 
+# Tauri's productName is "Agora Mod Manager". GitHub stores the spaces in an
+# asset name as dots, so the bundles arrive as `Agora.Mod.Manager...`. The
+# pre-rename `Agora.Launcher...` stems stay accepted, so a re-run over a draft
+# published before the rename still finalizes.
+_TAURI_PRODUCT = r"Agora\.(?:Mod\.Manager|Launcher)"
+_TAURI_PRODUCT_PREFIXES = ("Agora.Mod.Manager", "Agora.Launcher")
+
 # Tauri's bundle suffixes (and their one locale-carrying variant) mapped to the
 # unified `<platform>-<arch>` vocabulary. Ordered so no suffix pattern can
-# shadow another; each pattern captures the shared `Agora.Launcher...` stem
-# unless the third field is False, which marks names Tauri does not version
-# (the updater archives). Those two stay strict on purpose: a drifted name
-# there means Tauri changed its naming and this table needs a matching update.
+# shadow another; each pattern captures the shared product stem unless the
+# third field is False, which marks names Tauri does not version (the updater
+# archives). Those two stay strict on purpose: a drifted name there means Tauri
+# changed its naming and this table needs a matching update.
 _DESKTOP_SUFFIXES: tuple[tuple[re.Pattern[str], str, bool], ...] = (
     (re.compile(r"(?P<stem>.+)_x64-setup\.exe$"), "-windows-x64-setup.exe", True),
     (re.compile(r"(?P<stem>.+)_x64_[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?\.msi$"), "-windows-x64.msi", True),
@@ -65,12 +73,17 @@ _DESKTOP_SUFFIXES: tuple[tuple[re.Pattern[str], str, bool], ...] = (
     (re.compile(r"(?P<stem>.+)_amd64\.AppImage$"), "-linux-x64.AppImage", True),
     (re.compile(r"(?P<stem>.+)_amd64\.deb$"), "-linux-x64.deb", True),
     (re.compile(r"(?P<stem>.+)-1\.x86_64\.rpm$"), "-linux-x64.rpm", True),
-    (re.compile(r"Agora\.Launcher_aarch64\.app\.tar\.gz$"), "-macos-arm64.app.tar.gz", False),
-    (re.compile(r"Agora\.Launcher_x64\.app\.tar\.gz$"), "-macos-x64.app.tar.gz", False),
+    (re.compile(rf"{_TAURI_PRODUCT}_aarch64\.app\.tar\.gz$"), "-macos-arm64.app.tar.gz", False),
+    (re.compile(rf"{_TAURI_PRODUCT}_x64\.app\.tar\.gz$"), "-macos-x64.app.tar.gz", False),
 )
 
-# Both `Agora.Launcher_0.9.3` and the RPM stem `Agora.Launcher-0.9.3` start here.
-_TAURI_STEM = re.compile(r"Agora\.Launcher[_-](?P<version>.+)$")
+# Both `Agora.Mod.Manager_0.9.3` and the RPM stem `Agora.Mod.Manager-0.9.3` start here.
+_TAURI_STEM = re.compile(rf"{_TAURI_PRODUCT}[_-](?P<version>.+)$")
+
+
+def is_tauri_bundle_name(name: str) -> bool:
+    """True for a name Tauri gave a bundle, under either product stem."""
+    return name.startswith(_TAURI_PRODUCT_PREFIXES)
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
@@ -110,7 +123,7 @@ def desktop_asset_rename(name: str, version: str) -> str:
                 )
         return f"agora-desktop-v{version}{new_suffix}"
     raise ReleaseAssetError(
-        f"Unrecognized Agora.Launcher asset name: {name!r}. "
+        f"Unrecognized Tauri bundle name: {name!r}. "
         "Teach scripts/finalize_release_assets.py the new name before re-running."
     )
 
@@ -123,7 +136,7 @@ def plan_desktop_renames(names: Iterable[str], version: str) -> dict[str, str]:
     renames: dict[str, str] = {}
     targets: dict[str, str] = {}
     for name in names:
-        if not name.startswith("Agora.Launcher") or name.endswith(".sig"):
+        if not is_tauri_bundle_name(name) or name.endswith(".sig"):
             continue
         new_name = desktop_asset_rename(name, version)
         if new_name in targets:
@@ -189,7 +202,7 @@ def rewrite_latest_urls(latest: dict, renames: Mapping[str, str]) -> dict:
     """Point every `latest.json` updater URL at its renamed asset.
 
     Returns a new object; the input is not mutated. URLs that already name the
-    unified scheme (a re-run) pass through unchanged, while an `Agora.Launcher*`
+    unified scheme (a re-run) pass through unchanged, while an `Agora.Mod.Manager*` or `Agora.Launcher*`
     URL missing from `renames` is an error rather than a dead updater link.
     """
     platforms = latest.get("platforms")
@@ -207,7 +220,7 @@ def rewrite_latest_urls(latest: dict, renames: Mapping[str, str]) -> dict:
             basename = url.rsplit("/", 1)[-1]
             if basename in renames:
                 platform["url"] = url[: len(url) - len(basename)] + renames[basename]
-            elif basename.startswith("Agora.Launcher"):
+            elif is_tauri_bundle_name(basename):
                 raise ReleaseAssetError(
                     f"latest.json points {key!r} at {basename!r}, which no rename covers."
                 )
@@ -285,7 +298,7 @@ def plan_and_apply(repo: str, tag: str, version: str) -> None:
     assets = fetch_assets(repo, tag)
     names = [asset["name"] for asset in assets]
     renames = plan_desktop_renames(names, version)
-    sigs = sorted(name for name in names if name.startswith("Agora.Launcher") and name.endswith(".sig"))
+    sigs = sorted(name for name in names if is_tauri_bundle_name(name) and name.endswith(".sig"))
 
     final = (set(names) - set(renames) - set(sigs)) | set(renames.values())
     missing = sorted((set(expected_asset_names(tag)) | {"latest.json"}) - final)

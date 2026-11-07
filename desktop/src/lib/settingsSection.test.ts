@@ -40,6 +40,26 @@ describe('matchSettingsSections', () => {
     expect(labels('zzz-no-such-setting')).toEqual([]);
   });
 
+  it("adds the selected game's own Settings pages, found by the game or the page", () => {
+    const forGame = (query: string) => matchSettingsSections(query, 'Skyrim SE').map((entry) => entry.label);
+    expect(forGame('Skyrim')).toEqual([
+      'Skyrim SE settings: Instances',
+      'Skyrim SE settings: Installs',
+      'Skyrim SE settings: Bases',
+      'Skyrim SE settings: Recovery',
+    ]);
+    expect(forGame('bases')).toEqual(['Skyrim SE settings: Bases']);
+    expect(forGame('repair')).toEqual(['Skyrim SE settings: Recovery']);
+    expect(matchSettingsSections('', 'Skyrim SE').slice(2).map((entry) => entry.target)).toEqual([
+      { tab: 'game', page: 'new-instances' },
+      { tab: 'game', page: 'installs' },
+      { tab: 'game', page: 'bases' },
+      { tab: 'game', page: 'recovery' },
+    ]);
+    // Minecraft has no pages there, so none are offered without a game.
+    expect(labels('bases')).toEqual([]);
+  });
+
   it('each section opens a real Settings tab and page', () => {
     const targets = matchSettingsSections('').map((entry) => entry.target);
     expect(targets).toEqual([

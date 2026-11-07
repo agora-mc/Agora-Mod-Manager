@@ -6,6 +6,7 @@ import {
   type ProviderDescriptor,
 } from '../lib/tauri';
 import { showToast } from './Toast';
+import { Switch } from './ui/switch';
 
 /**
  * Content sources contributed by plugins, each with the one switch that
@@ -63,7 +64,7 @@ export function ContentProvidersList() {
         <ul className="space-y-2">
           {pluginProviders.map((provider) => (
             <li key={provider.id}>
-              <label className="flex items-start justify-between gap-3">
+              <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <span className="text-sm">{provider.title}</span>
                   <p className="text-xs text-muted-foreground">
@@ -81,15 +82,14 @@ export function ContentProvidersList() {
                     </p>
                   )}
                 </div>
-                <input
-                  type="checkbox"
+                <Switch
                   aria-label={`${provider.title} content source`}
+                  size="sm"
                   checked={provider.enabled}
                   disabled={busy === provider.id}
-                  onChange={(e) => toggle(provider, e.target.checked)}
-                  className="mt-0.5 h-5 w-5 shrink-0 accent-primary"
+                  onCheckedChange={(checked) => toggle(provider, checked)}
                 />
-              </label>
+              </div>
             </li>
           ))}
         </ul>

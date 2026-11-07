@@ -552,6 +552,8 @@ impl PluginManifest {
         }
 
         self.validate_providers()?;
+        self.validate_game_packages()?;
+        self.validate_crash_packs()?;
 
         for check in &self.contributions.launch_checks {
             if check.timeout_ms == 0 {
@@ -560,6 +562,40 @@ impl PluginManifest {
                     check.id
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_game_packages(&self) -> PluginResult<()> {
+        let has_game_define = self
+            .capabilities
+            .required
+            .iter()
+            .any(|n| n == "game:define");
+        if !self.contributions.game_packages.is_empty() && !has_game_define {
+            return Err(PluginError::invalid_manifest(
+                "`gamePackages` requires the `game:define` capability under `capabilities.required`",
+            ));
+        }
+        for pkg in &self.contributions.game_packages {
+            validate_package_path("game package path", &pkg.path)?;
+        }
+        Ok(())
+    }
+
+    fn validate_crash_packs(&self) -> PluginResult<()> {
+        let has_capability = self
+            .capabilities
+            .required
+            .iter()
+            .any(|n| n == "crash:contribute");
+        if !self.contributions.crash_packs.is_empty() && !has_capability {
+            return Err(PluginError::invalid_manifest(
+                "`crashPacks` requires the `crash:contribute` capability under `capabilities.required`",
+            ));
+        }
+        for pack in &self.contributions.crash_packs {
+            validate_package_path("crash pack path", &pack.path)?;
         }
         Ok(())
     }
@@ -937,6 +973,115 @@ mod tests {
     fn an_unrecognised_activation_event_names_what_was_expected() {
         let err = ActivationEvent::parse("whenever").unwrap_err();
         assert!(err.message.contains("onStartup"), "{}", err.message);
+    }
+
+    #[test]
+    fn crash_packs_require_their_capability_and_stay_in_the_package() {
+        let mut value = minimal_json();
+        value["contributions"] = serde_json::json!({
+            "crashPacks": [{ "path": "crash/pack.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("crash:contribute"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        value["capabilities"] = serde_json::json!({ "required": ["crash:contribute"] });
+        PluginManifest::parse(&value.to_string()).unwrap();
+
+        value["contributions"]["crashPacks"][0]["path"] = serde_json::json!("../outside.json");
+        assert!(PluginManifest::parse(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn game_packages_requires_game_define_capability() {
+        let mut value = minimal_json();
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "games/package.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("game:define"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        value["capabilities"] = serde_json::json!({
+            "required": ["game:define"]
+        });
+        assert!(PluginManifest::parse(&value.to_string()).is_ok());
+    }
+
+    #[test]
+    fn game_packages_rejects_escaping_or_absolute_paths() {
+        let mut value = minimal_json();
+        value["capabilities"] = serde_json::json!({
+            "required": ["game:define"]
+        });
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "../games/package.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("climbs out of the package"),
+            "{}",
+            error.message
+        );
+
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "/games/package.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("must be relative"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn game_packages_is_declarative_only_without_entrypoint() {
+        let mut value = minimal_json();
+        value.as_object_mut().unwrap().remove("entrypoint");
+        value["capabilities"] = serde_json::json!({
+            "required": ["game:define"]
+        });
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "games/package.json" }]
+        });
+        let manifest = PluginManifest::parse(&value.to_string()).unwrap();
+        assert!(manifest.is_declarative_only());
+    }
+
+    #[test]
+    fn tracer_manifests_parse_successfully() {
+        let tracers_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/tracers");
+        let entries = std::fs::read_dir(&tracers_dir).expect("read tracers dir");
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let manifest_path = path.join("agora-plugin.json");
+                let content = std::fs::read_to_string(&manifest_path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+                let manifest = PluginManifest::parse(&content)
+                    .unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest_path.display()));
+                assert!(manifest
+                    .capabilities
+                    .required
+                    .iter()
+                    .any(|c| c == "game:define"));
+                assert!(!manifest.contributions.game_packages.is_empty());
+                count += 1;
+            }
+        }
+        assert!(
+            count >= 4,
+            "expected at least 4 tracer plugins, found {count}"
+        );
     }
 }
 

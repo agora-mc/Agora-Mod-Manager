@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "governance_repository": "agora-mc/Agora-Launcher",
+  "governance_repository": "agora-mc/Agora-Mod-Manager",
   "policy": "production",
   "events": []
 }

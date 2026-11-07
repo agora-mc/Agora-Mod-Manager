@@ -40,6 +40,7 @@ export function AiAssistantCard() {
 
   return (
     <SettingsSection
+      card="ai-assistant"
       icon={Sparkles}
       title="Use with an AI assistant"
       description="Let an assistant app on your computer read crash logs and fix problems through Agora. It asks before it changes anything."

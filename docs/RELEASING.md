@@ -1,13 +1,41 @@
 # Releasing Agora
 
-Agora has two independent release streams:
+Agora has three independent release streams:
 
 | Stream | Typical tag | Contents |
 | --- | --- | --- |
 | Catalog | `registry-YYYY-MM-DD` | Signed catalog database and web export |
 | Desktop | `vX.Y.Z` | Platform installers and application bundles |
+| Official plugin | `official-<name>-v<version>` | One plugin package zip, such as Skyrim SE |
 
 Do not treat a successful catalog release as proof that a desktop package was built correctly, or vice versa.
+
+## Official plugin releases
+
+Skyrim SE is an official plugin (`packages/official/skyrim-se/`, plugin id
+`agora.creation-engine`), not part of the app build. The `Official plugins` workflow
+([`.github/workflows/official-plugins.yml`](../.github/workflows/official-plugins.yml)) runs when
+`packages/official/**` or `registry/official-plugins/**` changes. It builds each package zip
+reproducibly, verifies that `registry/official-plugins/<plugin-id>.json` pins those exact bytes, and
+attaches the zip to the `official-<name>-v<version>` release. That release URL is the one the signed
+registry names, so the asset must be published before a catalog that lists it. The catalog compile
+now enforces this: it downloads every `package_url` in `registry/official-plugins/`. A missing,
+private or unreachable asset leaves that plugin entry out of the catalog and logs a warning (shown
+as a GitHub Actions `::warning::` annotation in the nightly run); the rest of the catalog still
+compiles. A package whose bytes do not match the pinned `size` or `sha256` is a hard failure,
+because that means the registry entry itself is wrong. Publishing the asset before the entry is
+still the order that gets the plugin into the catalog.
+
+To release a new plugin version:
+
+1. bump `version` in the package's `agora-plugin.json`;
+2. run `python scripts/build_official_plugin.py <name> --update-registry`, which rebuilds the zip,
+   rotates the old `current` entry to `previous`, and rewrites the registry entry;
+3. commit both files. The workflow creates the new tag and uploads the asset; do not reuse a tag for
+   different bytes.
+
+`python scripts/build_official_plugin.py <name> --verify-registry` is the check to run before
+committing: it rebuilds the zip and refuses a registry entry whose hash, size or URL does not match.
 
 ## Desktop release checklist
 
@@ -17,7 +45,7 @@ The Windows desktop job also publishes
 `agora-desktop-vX.Y.Z-windows-x64-portable.zip` and its `.zip.sha256` checksum.
 This is distinct from the standalone CLI ZIP. The archive contains the signed desktop
 executable, `portable.txt`, and instructions; extract it into a writable folder and run
-`Agora Launcher.exe`. WebView2 Runtime must already be installed. The normal MSI/NSIS
+`Agora Mod Manager.exe`. WebView2 Runtime must already be installed. The normal MSI/NSIS
 installers remain installed applications; portable mode is distributed separately.
 
 Data and WebView preferences live in the adjacent `data` folder unless `AGORA_DATA_DIR`
@@ -36,6 +64,24 @@ Authenticode signature and the ZIP checksum.
 Fresh appearance preferences and **Reset appearance** use **Civic Gold (default)**.
 Existing saved appearance choices are preserved; the previous blue preset is **Agora Blue**.
 
+### Windows VFS files
+
+Games start under `agora_vfs.dll` (MASTER_SPEC §26.5). The Windows desktop installers and the
+portable ZIP carry the 64-bit `agora_vfs.dll` and `agora-vfs-helper.exe` beside the application,
+and the 32-bit pair in an `x86\` folder beside them, which 32-bit tools such as Nemesis need.
+The Windows release job builds both pairs from `agora-vfs` (the second for
+`i686-pc-windows-msvc`), signs each file, and stages them with `scripts/stage_vfs_files.py`,
+which refuses a file of the wrong bitness. `desktop/src-tauri/tauri.bundle-vfs.conf.json` names
+them as bundle resources; it is merged only into the Windows matrix entry. The Windows CLI
+archive (`agora-cli-*-windows-x64.zip`) carries the same layout beside `agora.exe`, built and
+signed in its own job, so a CLI-only install can start games. That archive now has `agora.exe`
+at its root, as the Unix archives do; before, it held the `target\...\release` path. Placement:
+Tauri's `resource_dir` on Windows is the executable's directory, and NSIS installs resources
+under `$INSTDIR` at their target paths, so `x86\` sits beside the executable (see
+[Tauri resources](https://v2.tauri.app/develop/resources/)). A 32-bit game started without its
+x86 files is refused, and the reason names both expected paths. Check that on the packaged build
+before publishing.
+
 ### Windows code signing
 
 Windows releases use Azure Artifact Signing with GitHub OIDC. The shared setup is
@@ -50,7 +96,7 @@ uses issuer `https://token.actions.githubusercontent.com`, audience
 `api://AzureADTokenExchange`, and this immutable GitHub subject:
 
 ```text
-repo:agora-mc@309633368/Agora-Launcher@1272711399:environment:windows-signing
+repo:agora-mc@309633368/Agora-Mod-Manager@1272711399:environment:windows-signing
 ```
 
 Enable immutable subjects in the repository's GitHub Actions OIDC settings so the
@@ -176,12 +222,14 @@ Every release publishes the same asset scheme:
 | `desktop` | `windows-x64-setup.exe` (NSIS), `windows-x64.msi`, `windows-x64-portable.zip` (+ `.sha256`), `macos-arm64.dmg`, `macos-x64.dmg`, `macos-arm64.app.tar.gz` and `macos-x64.app.tar.gz` (updater archives), `linux-x64.AppImage`, `linux-x64.deb`, `linux-x64.rpm` |
 | `cli` | `windows-x64.zip`, `linux-x64.tar.gz`, `macos-arm64.tar.gz`, `macos-x64.tar.gz` |
 
-Tauri names its bundles `Agora.Launcher_<version>_<arch>.<ext>`, which says nothing
-about desktop vs CLI and mixes `x64`, `x86_64`, and `amd64`. The
-`assemble-release` job post-processes the draft with
+Tauri names its bundles `Agora Mod Manager_<version>_<arch>.<ext>` after the product
+name, and GitHub stores the spaces as dots, so the uploaded names start
+`Agora.Mod.Manager`. (Drafts published before the rename start `Agora.Launcher`, and
+the script still accepts them.) The names say nothing about desktop vs CLI and mix
+`x64`, `x86_64`, and `amd64`. The `assemble-release` job post-processes the draft with
 `scripts/finalize_release_assets.py` before verification:
 
-- it renames each `Agora.Launcher*` bundle in place and fails on a name or an
+- it renames each `Agora.Mod.Manager*` bundle in place and fails on a name or an
   embedded version it does not recognize;
 - it deletes the updater `*.sig` sidecar assets — the signatures also live
   inline in `latest.json`, which is what the updater consumes;
@@ -239,7 +287,7 @@ The workflow leaves the release as a draft after all build jobs succeed. The des
 After the packaged smoke test passes, publish the draft:
 
 - click **Publish release** on the draft's GitHub page, or
-- run `gh release edit "$TAG" --draft=false --repo agora-mc/Agora-Launcher`.
+- run `gh release edit "$TAG" --draft=false --repo agora-mc/Agora-Mod-Manager`.
 
 After publishing:
 

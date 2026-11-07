@@ -48,10 +48,13 @@ import { InstanceIcon, LoaderChip, MetaChip } from '../components/InstanceIcon';
 import { formatInstalledDate } from '../components/installed-content/contentTableState';
 import { LauncherImportWizard } from '../components/LauncherImportWizard';
 import { RecentlyDeleted, deleteDialogBody } from '../components/RecentlyDeleted';
+import { readRecentlyDeletedDays } from '../lib/recentlyDeletedDays';
 import { LaunchFailedBanner } from '../components/LaunchFailedBanner';
 import { HealthNotice, ReviewBeforeLaunchButtons } from '../components/HealthLaunchControls';
 import { PackInstallProgressBar, usePackInstall, type PackInstallTask } from '../components/PackInstallProgress';
 import { useConfirm } from '@/components/ui/confirm';
+import { CloneDialog } from '@/components/instance-kit';
+import { Switch } from '@/components/ui/switch';
 import { formatPlayTime } from '@/lib/utils';
 import {
   Dialog,
@@ -690,7 +693,7 @@ function InstanceCard({
   const remove = async () => {
     if (!await confirm({
       title: `Delete instance "${instance.name}"?`,
-      body: deleteDialogBody(instance),
+      body: deleteDialogBody(instance, await readRecentlyDeletedDays()),
       confirmLabel: 'Delete',
       tone: 'danger',
     })) return;
@@ -1409,12 +1412,10 @@ function CreateInstanceDialog({
               </select>
               {loader === 'vanilla' && (
                 <span className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-                  <input
-                    type="checkbox"
+                  <Switch
                     aria-label="Show snapshots"
                     checked={showSnapshots}
-                    onChange={async (e) => {
-                      const on = e.target.checked;
+                    onCheckedChange={async (on) => {
                       setShowSnapshots(on);
                       setSnapshotError(null);
                       if (on && snapshotVersions.length === 0) {
@@ -1427,7 +1428,6 @@ function CreateInstanceDialog({
                       }
                       if (!on && !mcVersions.includes(mcVersion) && mcVersions[0]) setMcVersion(mcVersions[0]);
                     }}
-                    className="h-3.5 w-3.5 accent-primary"
                   />
                   Show snapshots (test builds; back up worlds first)
                 </span>
@@ -1490,20 +1490,21 @@ function CreateInstanceDialog({
             </label>
           )}
 
-          <label className="block">
-            <span className="flex items-center justify-between text-sm font-medium">
+          <div className="block">
+            <div className="flex items-center justify-between text-sm font-medium">
               <span>JVM memory: {memoryMode === 'auto' ? 'Auto' : `${memoryMb} MB`}</span>
               <span className="flex items-center gap-2 text-xs text-muted-foreground">
                 Automatic
-                <input
-                  type="checkbox"
+                <Switch
+                  aria-label="Automatic memory allocation"
                   checked={memoryMode === 'auto'}
-                  onChange={(event) => setMemoryMode(event.target.checked ? 'auto' : 'manual')}
+                  onCheckedChange={(checked) => setMemoryMode(checked ? 'auto' : 'manual')}
                 />
               </span>
-            </span>
+            </div>
             <input
               type="range"
+              aria-label="JVM memory"
               min={1024}
               max={16384}
               step={512}
@@ -1517,7 +1518,7 @@ function CreateInstanceDialog({
                 Agora will estimate memory from enabled pack content and system headroom.
               </span>
             )}
-          </label>
+          </div>
         </div>
 
         {progressMessage && (
@@ -1572,62 +1573,21 @@ function CloneInstanceDialog({
   onClose: () => void;
   onCloned: () => void;
 }) {
-  const [name, setName] = useState(`Copy of ${instance.name}`);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const submit = async () => {
-    if (!name.trim()) {
-      setError('Enter a name for the clone.');
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      await cloneInstance(instance.instance_id, name.trim(), DEFAULT_CLONE_PREFS);
-      onCloned();
-    } catch (e) {
-      setError(formatError(e));
-      setBusy(false);
-    }
-  };
-
   return (
-    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="max-w-md">
-        <DialogTitle>Clone Instance</DialogTitle>
-        <DialogDescription>
+    <CloneDialog
+      sourceName={instance.name}
+      description={
+        <>
           Creates a full copy of "{instance.name}" including saves, mods, resource packs,
           shaders, config, and options. The original instance is not modified.
-        </DialogDescription>
-        <div className="space-y-4">
-          <label className="block">
-            <span className="text-sm font-medium">New instance name</span>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-            />
-          </label>
-          {error && <p className="text-xs text-destructive">{error}</p>}
-        </div>
-        <div className="mt-6 flex justify-end gap-2">
-          <button
-            onClick={onClose}
-            disabled={busy}
-            className="rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={submit}
-            disabled={busy}
-            className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {busy ? 'Cloning…' : 'Clone'}
-          </button>
-        </div>
-      </DialogContent>
-    </Dialog>
+        </>
+      }
+      onClose={onClose}
+      errorText={formatError}
+      onSubmit={async (name) => {
+        await cloneInstance(instance.instance_id, name, DEFAULT_CLONE_PREFS);
+        onCloned();
+      }}
+    />
   );
 }

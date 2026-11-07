@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 17;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 23;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -113,10 +113,10 @@ pub fn init_local_state_db(db_path: &std::path::Path) -> anyhow::Result<()> {
         "ai_mcp_enabled",
         "install_auto_confirm_clean",
         "install_always_auto_confirm",
-        // Community plugins, and their outbound network access, are both
-        // opt-in. Neither is a prerequisite for using Agora, and a default-on
-        // extension system is a default-on attack surface.
-        "plugins_enabled",
+        // A plugin's outbound network access is opt-in. (The old `plugins_enabled`
+        // key is no longer seeded or read: it meant "community plugins on", the
+        // opposite of the emergency stop that replaced it. A stored value is
+        // ignored, so it cannot engage or release the stop by accident.)
         "network_plugins_enabled",
         // This governs automatic background checking only. A manual check
         // works whenever plugins are on.
@@ -701,6 +701,208 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (17)",
+            [],
+        )?;
+    }
+
+    if current < 18 {
+        // Instances of games other than Minecraft (MASTER_SPEC section 26). Created here, after
+        // master's versions 16 and 17, so a database that already ran this branch's earlier
+        // version 16 still gets master's pack-gap table and play-time column; both statements are
+        // idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS game_instances (
+                 instance_id TEXT PRIMARY KEY,
+                 game TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 base_json TEXT NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 last_launched_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS instance_pack_gaps (
+                 instance_id TEXT NOT NULL,
+                 filename TEXT NOT NULL,
+                 display_name TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 reason TEXT,
+                 FOREIGN KEY (instance_id) REFERENCES user_instances(instance_id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_instance_pack_gaps_instance
+                 ON instance_pack_gaps (instance_id);",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (18)",
+            [],
+        )?;
+    }
+
+    if current < 19 {
+        // Which installed plugins were installed from a signed registry entry
+        // (official plugins). A table beside `plugin_installs` rather than
+        // columns on it, so the manifest-derived record stays exactly what the
+        // package said and "official" is only ever what the installer wrote
+        // here. A plain install replaces the plugin's row and clears this one.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plugin_official (
+                 plugin_id TEXT PRIMARY KEY,
+                 entry_id TEXT NOT NULL,
+                 entry_version TEXT NOT NULL,
+                 entry_sha256 TEXT NOT NULL,
+                 tree_sha256 TEXT NOT NULL,
+                 recorded_at TEXT NOT NULL,
+                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+             );",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (19)",
+            [],
+        )?;
+    }
+
+    if current < 20 {
+        // Whether the user allowed an installed plugin's code to run. One row per
+        // plugin with code; no row means never allowed. Beside `plugin_installs`
+        // rather than in it, so the manifest-derived record stays exactly what
+        // the package said and permission is only what the user chose.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plugin_script_consent (
+                 plugin_id TEXT PRIMARY KEY,
+                 allowed INTEGER NOT NULL,
+                 decided_at TEXT NOT NULL,
+                 FOREIGN KEY (plugin_id) REFERENCES plugin_installs(plugin_id) ON DELETE CASCADE
+             );",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (20)",
+            [],
+        )?;
+    }
+
+    if current < 21 {
+        // Which code the consent was given for. Without it a code-less version
+        // in between would let a later version inherit an answer given for
+        // different code. A digest of the manifest's entrypoint is enough to
+        // tell "the code the user allowed" from "new code".
+        // The table may already carry the column when an older schema_version
+        // row was lost (the migration tests delete rows to replay history), so
+        // add it only when it is missing.
+        let has_code_hash: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('plugin_script_consent') WHERE name = 'code_hash'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_code_hash == 0 {
+            conn.execute(
+                "ALTER TABLE plugin_script_consent ADD COLUMN code_hash TEXT",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (21)",
+            [],
+        )?;
+    }
+
+    if current < 22 {
+        // How long the player has spent in a generic game instance, and when it last ended.
+        // `last_launched_at` (v18) is when the session began; the total is summed on a normal or
+        // stopped exit, so a crash does not count a night of idle time. The columns are added only
+        // when missing, because a migration test can replay history over a table that already has
+        // them.
+        let has_total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'total_play_ms'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_total == 0 {
+            conn.execute(
+                "ALTER TABLE game_instances ADD COLUMN total_play_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let has_played: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('game_instances') WHERE name = 'last_played_at'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_played == 0 {
+            conn.execute(
+                "ALTER TABLE game_instances ADD COLUMN last_played_at TEXT",
+                [],
+            )?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (22)",
+            [],
+        )?;
+    }
+
+    if current < 23 {
+        // The session ledger (MASTER_SPEC section 30.4). `launch_history` was Minecraft-only, tied
+        // to `user_instances` by a foreign key, so a game instance could not have a row. The table
+        // is rebuilt without that key and gains the ledger columns; two triggers keep the old
+        // promise that history cannot outlive the instance (deleting either kind of instance
+        // deletes its rows and manifests). Manifests are stored once per distinct manifest.
+        // The triggers go first: replaying this step over a database that already has them would
+        // otherwise fail when the table they name is dropped.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+             DROP TABLE IF EXISTS launch_history_v23;
+             CREATE TABLE launch_history_v23 (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 instance_id TEXT NOT NULL,
+                 started_at TEXT NOT NULL,
+                 prep_ms INTEGER,
+                 duration_ms INTEGER,
+                 outcome TEXT,
+                 enabled_mod_count INTEGER NOT NULL DEFAULT 0,
+                 minecraft_version TEXT NOT NULL DEFAULT '',
+                 loader TEXT NOT NULL DEFAULT '',
+                 peak_memory_mb INTEGER,
+                 session_id TEXT,
+                 ended_at TEXT,
+                 exit_json TEXT,
+                 stop_requested INTEGER NOT NULL DEFAULT 0,
+                 verdict TEXT,
+                 manifest_hash TEXT,
+                 owner_pid INTEGER,
+                 owner_start INTEGER
+             );
+             INSERT INTO launch_history_v23
+                 (id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
+                  minecraft_version, loader, peak_memory_mb)
+             SELECT id, instance_id, started_at, prep_ms, duration_ms, outcome, enabled_mod_count,
+                    minecraft_version, loader, peak_memory_mb
+               FROM launch_history;
+             DROP TABLE launch_history;
+             ALTER TABLE launch_history_v23 RENAME TO launch_history;
+             CREATE INDEX IF NOT EXISTS idx_launch_history_instance
+                 ON launch_history (instance_id, started_at DESC);
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_launch_history_session
+                 ON launch_history (session_id) WHERE session_id IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS launch_manifests (
+                 instance_id TEXT NOT NULL,
+                 hash TEXT NOT NULL,
+                 data BLOB NOT NULL,
+                 raw_len INTEGER NOT NULL,
+                 PRIMARY KEY (instance_id, hash)
+             ) WITHOUT ROWID;
+             CREATE TRIGGER IF NOT EXISTS launch_history_minecraft_instance_gone
+                 AFTER DELETE ON user_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS launch_history_game_instance_gone
+                 AFTER DELETE ON game_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+             END;",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (23)",
             [],
         )?;
     }
@@ -1800,7 +2002,7 @@ mod tests {
     /// Helper: create a unique temp-file-backed test database with migrations applied.
     fn test_db() -> (Connection, PathBuf) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("agora-test-{}.db", n));
+        let path = std::env::temp_dir().join(format!("agora-test-{}-{}.db", std::process::id(), n));
         let _ = std::fs::remove_file(&path);
         init_local_state_db(&path).expect("failed to init test db");
         let conn = Connection::open(&path).expect("failed to open test db");

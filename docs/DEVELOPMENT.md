@@ -6,9 +6,14 @@ This page covers local builds and validation. Player instructions belong in the 
 
 | Path | Purpose |
 | --- | --- |
-| `crates/agora-core/` | Shared business logic |
+| `crates/agora-core/` | Shared, game-agnostic business logic |
+| `crates/agora-game-minecraft/` | Minecraft support, as a game package that registers into core |
+| `crates/agora-game-creation/` | Test helper that loads the Skyrim definition from its official plugin |
+| `packages/official/` | Official plugin packages released separately from the app (Skyrim SE) |
 | `crates/agora/` | Standalone CLI |
 | `crates/agora-plugin-api/`, `crates/agora-plugin-host/` | Plugin contract, and the QuickJS host that runs plugin scripts |
+| `crates/agora-vfs/`, `crates/agora-vfs-inject/` | Windows copy-on-write VFS injected into games, and the import-table injector it shares with the launcher |
+| `crates/agora-game-api/` | Experimental game package/host contract; [manifest v3 design](architecture/game-api.md) |
 | `sdk/`, `examples/plugins/`, `docs/plugins/` | Plugin author types, runnable examples (exercised by core's end-to-end tests), and the author guide |
 | `desktop/` | Tauri desktop application and React UI |
 | `web/` | Public static directory |
@@ -17,10 +22,10 @@ This page covers local builds and validation. Player instructions belong in the 
 | `loader-manifests/` | Pinned loader catalog inputs |
 | `scripts/` | Validation and maintenance helpers |
 | `docs/` | User, developer, release, and operator reference |
-| `.kilo/` | AI tooling configuration; `.kilo/plans/MASTER_SPEC.md` is the engineering blueprint |
+| `.kilo/` | AI tooling configuration; `MASTER_SPEC.md` is the engineering blueprint |
 | `BACKLOG.md` | Phase-by-phase task tracker |
 
-Keep reusable behavior in `agora-core`. Desktop, CLI, and MCP hosts should adapt the same services rather than implement parallel business rules.
+Keep reusable behavior in `agora-core`, and game-specific behavior in that game's package. Desktop, CLI, and MCP hosts should adapt the same services rather than implement parallel business rules.
 
 ## Prerequisites
 
@@ -59,7 +64,7 @@ Generate the root `registry-web.json` through the local compiler procedure below
 ```powershell
 cd web
 npm install
-$env:NEXT_PUBLIC_GITHUB_REPOSITORY = "agora-mc/Agora-Launcher"
+$env:NEXT_PUBLIC_GITHUB_REPOSITORY = "agora-mc/Agora-Mod-Manager"
 npm run build
 ```
 
@@ -78,11 +83,28 @@ Activate the environment, then:
 
 ```bash
 pip install -r requirements.txt
-python compile.py --skip-sign --no-governance-write --governance-mode off --out ../registry.db
+python compile.py --skip-sign --skip-official-asset-check --no-governance-write --governance-mode off --out ../registry.db
 python ../scripts/verify_db.py
 ```
 
 Use `--skip-sign` only for local development. Production clients must not trust unsigned catalog output.
+Use `--skip-official-asset-check` only for local development or tests: the release compile downloads
+every official plugin package, leaves out an entry whose asset is missing and warns, and refuses an
+entry whose bytes do not match its pinned size or sha256.
+
+## Official plugin packages
+
+Skyrim SE ships as an official plugin in `packages/official/skyrim-se/`, not as a compiled package.
+The desktop and CLI register only Minecraft; Skyrim arrives from the installed plugin. To use it
+locally, install the folder as a development plugin and turn community plugins on, as described in
+[plugins/README.md](plugins/README.md#official-plugins-in-this-repository).
+
+Build the release zip with `python scripts/build_official_plugin.py skyrim-se`. Entries are sorted,
+stored uncompressed and given a fixed timestamp and mode, so the SHA-256 is the same across builds
+and checkouts. `--verify-registry` checks that
+`registry/official-plugins/agora.creation-engine.json` pins those exact bytes;
+`--update-registry` rewrites the entry from the build. The `Official plugins` workflow attaches the
+zip to an `official-skyrim-se-v<version>` release.
 
 ## Environment boundaries
 
@@ -129,18 +151,32 @@ all of them before calling a substantial change done.
 Repository root, hermetic and fast:
 
 ```bash
-python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_tauri_bindings.py --check
+python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check
 ```
 
 Rust:
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p agora-core -p agora-cli --all-targets --all-features -- -D warnings
+cargo clippy -p agora-core -p agora-game-api -p agora-game-minecraft -p agora-game-creation -p agora-plugin-host -p agora-cli --all-targets --all-features -- -D warnings
 cargo test -p agora-core --lib --tests
+cargo test -p agora-game-api -p agora-game-minecraft -p agora-game-creation --lib --tests
+cargo test -p agora-plugin-host --lib --tests
 cargo test -p agora-cli
 cargo check -p agora-desktop
 ```
+
+On Windows, also build and lint the VFS crates. The ignored matrix and real-injection tests
+run in the `vfs-injection` CI job; they need no administrator rights and start only Agora's
+test fixtures, never a real game:
+
+```bash
+cargo clippy -p agora-vfs -p agora-vfs-inject --all-targets -- -D warnings
+cargo test -p agora-vfs -p agora-vfs-inject --lib --tests
+```
+
+The commands for the ignored tests, and what each needs, are in
+[`crates/agora-vfs/README.md`](../crates/agora-vfs/README.md#tests).
 
 Desktop frontend (from `desktop/`): `npm run build && npm run typecheck:e2e && npm run test:unit`.
 `npm run build` runs the boundary checks, `tsc` and `vite build`. `typecheck:e2e` checks the
@@ -192,13 +228,13 @@ For a user-visible change:
 6. verify links;
 7. avoid copying secret-bearing operator commands into player documentation.
 
-Run the hermetic documentation gate:
+Run the hermetic documentation gates:
 
 ```bash
-python scripts/check_docs.py
+python scripts/check_docs.py && python scripts/check_package_docs.py
 ```
 
-It checks current internal Markdown links, website routes, guide-topic mappings, product spelling, and known stale claims without making network requests or rewriting files. CLI help-contract checks run under `cargo test -p agora-cli`.
+`check_docs.py` checks current internal Markdown links, website routes, guide-topic mappings, product spelling, and known stale claims. `check_package_docs.py` checks that every key in the official and tracer game packages, and every field on the package types, is documented in `docs/plugins/game-packages.md`. Neither makes network requests or rewrites files. CLI help-contract checks run under `cargo test -p agora-cli`.
 
 ### Documentation screenshots
 

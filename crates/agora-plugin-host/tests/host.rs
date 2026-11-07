@@ -25,6 +25,8 @@ struct TestBridge {
     logs: Mutex<Vec<(LogLevel, String)>>,
     /// Methods that should be refused, to exercise the error path.
     denied: Mutex<Vec<String>>,
+    event_begins: AtomicU64,
+    event_ends: AtomicU64,
 }
 
 impl TestBridge {
@@ -74,6 +76,14 @@ impl HostBridge for TestBridge {
 
     fn log(&self, _plugin_id: &PluginId, level: LogLevel, message: &str) {
         self.logs.lock().unwrap().push((level, message.to_string()));
+    }
+
+    fn begin_event(&self, _plugin_id: &PluginId) {
+        self.event_begins.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn end_event(&self, _plugin_id: &PluginId) {
+        self.event_ends.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -598,6 +608,9 @@ fn a_subscriber_receives_events_and_can_act_on_them() {
         }
     }
     assert_eq!(seen, serde_json::json!(["sodium"]));
+    // Each handler call opens and closes a budget scope, so one call cannot spend another's.
+    assert!(bridge.event_begins.load(Ordering::SeqCst) >= 1);
+    assert!(bridge.event_ends.load(Ordering::SeqCst) >= 1);
     assert!(bridge
         .logs()
         .iter()

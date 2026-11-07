@@ -14,6 +14,7 @@ import {
 import { pinnedMotion } from '../../components/presentation-capabilities';
 import { useAmbience } from '../../features/ambience/AmbienceProvider';
 import { SettingsSection } from './SettingsSection';
+import { Switch } from '../../components/ui/switch';
 
 const selectClass = 'rounded-md border border-input bg-background px-2.5 py-1.5 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring';
 
@@ -33,6 +34,7 @@ export function AppearanceThemeSettings() {
 
   return (
     <SettingsSection
+      card="appearance-theme"
       id="settings-appearance"
       icon={Palette}
       title="Theme"
@@ -133,13 +135,13 @@ export function AppearanceThemeSettings() {
         </summary>
         <div className="grid gap-4 border-t border-border p-3 lg:grid-cols-2">
           <div className="space-y-3 rounded-lg border border-border bg-card p-3">
-          <label className="flex items-center justify-between gap-3 text-sm">
+          <div className="flex items-center justify-between gap-3 text-sm">
             <span>
               <span className="block font-medium">Custom block color</span>
               <span className="text-xs text-muted-foreground">Cards, panels, dialogs, and content blocks.</span>
             </span>
-            <input type="checkbox" aria-label="Use custom block color" checked={preferences.surfaceMode === 'custom'} onChange={(event) => setPreferences({ surfaceMode: event.target.checked ? 'custom' : 'theme' })} className="h-5 w-5 accent-primary" />
-          </label>
+            <Switch aria-label="Use custom block color" checked={preferences.surfaceMode === 'custom'} onCheckedChange={(checked) => setPreferences({ surfaceMode: checked ? 'custom' : 'theme' })} />
+          </div>
           {preferences.surfaceMode === 'custom' && (
             <input type="color" aria-label="Block color" value={preferences.customSurface} onChange={(event) => setPreferences({ customSurface: event.target.value })} className="h-9 w-full cursor-pointer rounded-sm border border-input bg-background p-1" />
           )}
@@ -149,13 +151,13 @@ export function AppearanceThemeSettings() {
           </label>
           </div>
           <div className="space-y-3 rounded-lg border border-border bg-card p-3">
-          <label className="flex items-center justify-between gap-3 text-sm">
+          <div className="flex items-center justify-between gap-3 text-sm">
             <span>
               <span className="block font-medium">Custom navigation color</span>
               <span className="text-xs text-muted-foreground">Sidebar background and translucency.</span>
             </span>
-            <input type="checkbox" aria-label="Use custom navigation color" checked={preferences.navMode === 'custom'} onChange={(event) => setPreferences({ navMode: event.target.checked ? 'custom' : 'theme' })} className="h-5 w-5 accent-primary" />
-          </label>
+            <Switch aria-label="Use custom navigation color" checked={preferences.navMode === 'custom'} onCheckedChange={(checked) => setPreferences({ navMode: checked ? 'custom' : 'theme' })} />
+          </div>
           {preferences.navMode === 'custom' && (
             <input type="color" aria-label="Navigation color" value={preferences.customNav} onChange={(event) => setPreferences({ customNav: event.target.value })} className="h-9 w-full cursor-pointer rounded-sm border border-input bg-background p-1" />
           )}
@@ -165,49 +167,49 @@ export function AppearanceThemeSettings() {
           </label>
           </div>
           <div className="space-y-2 rounded-lg border border-border bg-muted p-3">
-          <label className="flex items-center justify-between gap-3 text-sm">
+          <div className="flex items-center justify-between gap-3 text-sm">
             <span>
               <span className="block font-medium">Custom background</span>
               <span className="text-xs text-muted-foreground">Override the page background color.</span>
             </span>
-            <input type="checkbox" aria-label="Use custom background" checked={preferences.backgroundMode === 'custom'} onChange={(event) => setPreferences({ backgroundMode: event.target.checked ? 'custom' : 'theme' })} className="h-5 w-5 accent-primary" />
-          </label>
+            <Switch aria-label="Use custom background" checked={preferences.backgroundMode === 'custom'} onCheckedChange={(checked) => setPreferences({ backgroundMode: checked ? 'custom' : 'theme' })} />
+          </div>
           {preferences.backgroundMode === 'custom' && (
             <input type="color" aria-label="Background color" value={preferences.customBackground} onChange={(event) => setPreferences({ customBackground: event.target.value })} className="h-9 w-full cursor-pointer rounded-sm border border-input bg-background p-1" />
           )}
           </div>
           <div className="space-y-2 rounded-lg border border-border bg-muted p-3">
-          <label className="flex items-center justify-between gap-3 text-sm">
+          <div className="flex items-center justify-between gap-3 text-sm">
             <span>
               <span className="block font-medium">Custom block text</span>
               <span className="text-xs text-muted-foreground">Primary text inside cards and controls.</span>
             </span>
-            <input type="checkbox" aria-label="Use custom text color" checked={preferences.textMode === 'custom'} onChange={(event) => setPreferences({ textMode: event.target.checked ? 'custom' : 'theme' })} className="h-5 w-5 accent-primary" />
-          </label>
+            <Switch aria-label="Use custom text color" checked={preferences.textMode === 'custom'} onCheckedChange={(checked) => setPreferences({ textMode: checked ? 'custom' : 'theme' })} />
+          </div>
           {preferences.textMode === 'custom' && (
             <input type="color" aria-label="Block text color" value={preferences.customText} onChange={(event) => setPreferences({ customText: event.target.value })} className="h-9 w-full cursor-pointer rounded-sm border border-input bg-background p-1" />
           )}
           </div>
           <div className="space-y-2 rounded-lg border border-border bg-muted p-3 lg:col-span-2">
-          <label className="flex items-center justify-between gap-3 text-sm">
+          <div className="flex items-center justify-between gap-3 text-sm">
             <span>
               <span className="block font-medium">Custom background text</span>
               <span className="text-xs text-muted-foreground">Headings and text directly on the page background.</span>
             </span>
-            <input type="checkbox" aria-label="Use custom background text color" checked={preferences.backgroundTextMode === 'custom'} onChange={(event) => setPreferences({ backgroundTextMode: event.target.checked ? 'custom' : 'theme' })} className="h-5 w-5 accent-primary" />
-          </label>
+            <Switch aria-label="Use custom background text color" checked={preferences.backgroundTextMode === 'custom'} onCheckedChange={(checked) => setPreferences({ backgroundTextMode: checked ? 'custom' : 'theme' })} />
+          </div>
           {preferences.backgroundTextMode === 'custom' && (
             <input type="color" aria-label="Background text color" value={preferences.customBackgroundText} onChange={(event) => setPreferences({ customBackgroundText: event.target.value })} className="h-9 w-full cursor-pointer rounded-sm border border-input bg-background p-1" />
           )}
           </div>
           <div className="space-y-2 rounded-lg border border-border bg-muted p-3 lg:col-span-2">
-          <label className="flex items-center justify-between gap-3 text-sm">
+          <div className="flex items-center justify-between gap-3 text-sm">
             <span>
               <span className="block font-medium">Custom border color</span>
               <span className="text-xs text-muted-foreground">Outlines of cards, inputs, and panels. Defaults to your accent color.</span>
             </span>
-            <input type="checkbox" aria-label="Use custom border color" checked={preferences.borderMode === 'custom'} onChange={(event) => setPreferences({ borderMode: event.target.checked ? 'custom' : 'theme' })} className="h-5 w-5 accent-primary" />
-          </label>
+            <Switch aria-label="Use custom border color" checked={preferences.borderMode === 'custom'} onCheckedChange={(checked) => setPreferences({ borderMode: checked ? 'custom' : 'theme' })} />
+          </div>
           {preferences.borderMode === 'custom' && (
             <input type="color" aria-label="Border color" value={preferences.customBorder} onChange={(event) => setPreferences({ customBorder: event.target.value })} className="h-9 w-full cursor-pointer rounded-sm border border-input bg-background p-1" />
           )}
@@ -247,6 +249,7 @@ export function AppearanceInterfaceSettings() {
   return (
     <>
       <SettingsSection
+        card="appearance-type"
         icon={Type}
         title="Type & spacing"
         description="Font, density, corners, border thickness, and text size apply across every page."
@@ -319,6 +322,7 @@ export function AppearanceInterfaceSettings() {
       </SettingsSection>
 
       <SettingsSection
+        card="appearance-motion"
         icon={Zap}
         title="Motion & interaction"
         description="Animation preferences, including how instances are presented."
@@ -419,6 +423,7 @@ export function LivingBackgroundSettings({ onOpenLivingBackground }: { onOpenLiv
 
   return (
     <SettingsSection
+      card="appearance-living-background"
       id="settings-living-background"
       icon={Mountain}
       title="Living background"
@@ -467,15 +472,7 @@ export function LivingBackgroundSettings({ onOpenLivingBackground }: { onOpenLiv
         </div>
       )}
 
-      <label className="flex items-start gap-3 text-sm">
-        <input
-          type="checkbox"
-          aria-label="Living background"
-          checked={enabled}
-          disabled={suppressed}
-          onChange={(event) => setEnabled(event.target.checked)}
-          className="mt-0.5 h-5 w-5 accent-primary disabled:opacity-50"
-        />
+      <div className="flex items-start justify-between gap-3 text-sm">
         <span>
           <span className="block font-medium">Living background</span>
           <span className="block text-xs text-muted-foreground">
@@ -489,22 +486,26 @@ export function LivingBackgroundSettings({ onOpenLivingBackground }: { onOpenLiv
             </span>
           ) : null}
         </span>
-      </label>
+        <Switch
+          aria-label="Living background"
+          checked={enabled}
+          disabled={suppressed}
+          onCheckedChange={setEnabled}
+        />
+      </div>
 
       {enabled && (
         <>
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-1 text-sm">
-              <label className="flex items-center gap-3">
-                <input
-                  type="checkbox"
+              <div className="flex items-center gap-3">
+                <Switch
                   aria-label="Ambient sounds"
                   checked={soundOn}
-                  onChange={(event) => setSoundOn(event.target.checked)}
-                  className="h-5 w-5 accent-primary"
+                  onCheckedChange={setSoundOn}
                 />
                 <span>Ambient sounds</span>
-              </label>
+              </div>
               <div className="flex items-center gap-2">
                 <input
                   type="range"
@@ -552,14 +553,7 @@ export function LivingBackgroundSettings({ onOpenLivingBackground }: { onOpenLiv
             </div>
           </div>
 
-          <label className="flex items-start gap-3 text-sm">
-            <input
-              type="checkbox"
-              aria-label="Hide the standard background"
-              checked={clearBackground}
-              onChange={(event) => setClearBackground(event.target.checked)}
-              className="mt-0.5 h-5 w-5 accent-primary"
-            />
+          <div className="flex items-start justify-between gap-3 text-sm">
             <span>
               <span className="block font-medium">Hide the standard background</span>
               <span className="block text-xs text-muted-foreground">
@@ -568,7 +562,12 @@ export function LivingBackgroundSettings({ onOpenLivingBackground }: { onOpenLiv
                 with it.
               </span>
             </span>
-          </label>
+            <Switch
+              aria-label="Hide the standard background"
+              checked={clearBackground}
+              onCheckedChange={setClearBackground}
+            />
+          </div>
 
           <p className="text-xs text-muted-foreground">
             With Reduce motion on, the living background holds still as one picture instead of moving.

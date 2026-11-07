@@ -1,0 +1,36 @@
+{
+  "contract": 1,
+  "producer": { "format": "jvm_log", "version": "1" },
+  "facts": [
+    {
+      "kind": "core.exception",
+      "attrs": { "class": "example.InjectionError", "category": "managed", "depth": 2, "message": "patch check failed" },
+      "span": { "section": "exception", "line_start": 12, "line_end": 12 }
+    },
+    {
+      "kind": "minecraft.mixin_failure",
+      "attrs": { "severity": "critical", "config": "examplemod.mixins.json", "target": "net.minecraft.example.Thing" },
+      "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "exec_top" }],
+      "span": { "section": "exception", "line_start": 14 }
+    },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 0, "kind": "managed", "symbol_scheme": "jvm", "symbol": "org.spongepowered.example.Applier.apply" },
+      "refs": [{ "kind": "class", "value": "org.spongepowered.example.Applier", "strength": "exec_top" }]
+    },
+    {
+      "kind": "core.frame",
+      "attrs": { "index": 1, "kind": "managed", "symbol_scheme": "jvm", "symbol": "net.minecraft.example.Thing.tick", "source_file": "Thing.java", "line": 42 },
+      "refs": [{ "kind": "class", "value": "net.minecraft.example.Thing", "strength": "exec" }]
+    },
+    {
+      "kind": "core.log_line",
+      "attrs": { "level": "error", "section": "exception", "text": "Could not initialize class com.example.widgets.Registry" }
+    }
+  ],
+  "bucket": [{ "scheme": "jvm", "value": "example.InjectionError@examplemod.mixins.json" }],
+  "coverage": [
+    { "kind": "core.module", "state": "not_applicable" },
+    { "kind": "core.system", "state": "absent", "why": "This report has no system section." }
+  ]
+}

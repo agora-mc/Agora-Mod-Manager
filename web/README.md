@@ -28,7 +28,7 @@ guide content directly from source.
 
 3. Build the static site:
    ```bash
-   NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Launcher npm run build
+   NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Mod-Manager npm run build
    ```
 
 This produces a static export in `dist/` that can be deployed to Vercel or GitHub Pages.
@@ -36,7 +36,7 @@ This produces a static export in `dist/` that can be deployed to Vercel or GitHu
 ## Development
 
 ```bash
-NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Launcher npm run dev
+NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Mod-Manager npm run dev
 ```
 
 `NEXT_PUBLIC_GITHUB_REPOSITORY` (or `GITHUB_REPOSITORY`) is required — `src/lib/site.ts`

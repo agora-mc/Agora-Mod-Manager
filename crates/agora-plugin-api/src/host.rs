@@ -28,6 +28,13 @@ pub trait HostBridge: Send + Sync {
 
     /// Record a line in the plugin's own log.
     fn log(&self, plugin_id: &PluginId, level: LogLevel, message: &str);
+
+    /// An event handler is about to run for this plugin. The core opens a fresh
+    /// budget for it, so one handler's reads and writes never spend another's.
+    fn begin_event(&self, _plugin_id: &PluginId) {}
+
+    /// The event handler has finished, however it finished.
+    fn end_event(&self, _plugin_id: &PluginId) {}
 }
 
 /// Everything the script host needs in order to start a plugin.
@@ -63,6 +70,74 @@ impl ActivationRequest {
     pub const DEFAULT_STACK_LIMIT: usize = 512 * 1024;
 }
 
+/// What a script may read during one call, and nothing else.
+///
+/// The crash doctor hands a parser one artifact and lets it pull bytes or lines
+/// from that artifact and its children. A generic trait rather than a
+/// crash-specific one because a WebAssembly host will implement it too: bytes
+/// and JSON cross the boundary, never a file handle or a path.
+pub trait ScriptReads: Send + Sync {
+    /// At most `len` bytes from `offset`. A short reply at the end of the file
+    /// is normal, not an error.
+    fn read_bytes(&self, artifact: &str, offset: u64, len: u64)
+        -> Result<Vec<u8>, ScriptReadError>;
+
+    /// Lines decoded as text, as a [`serde_json::Value`] shaped like the crash
+    /// contract's `LinesReply`: `lines`, an optional `next_line`, and `cut`.
+    fn read_lines(
+        &self,
+        artifact: &str,
+        from_line: u64,
+        max_lines: u32,
+    ) -> Result<serde_json::Value, ScriptReadError>;
+}
+
+/// Read an instance's merged view by game path, and nothing else.
+///
+/// The literals a script passes are game paths, never filesystem paths: a
+/// reply, an error and a log line may name the path the script asked for, and
+/// no host path is ever revealed. The scope is one instance and one call
+/// (MASTER_SPEC §30.12).
+pub trait GameReads: Send + Sync {
+    /// The instance this scope is bound to, when it is bound to one. A hook's
+    /// `game.*` calls use it to refuse a different instance id.
+    fn instance(&self) -> Option<&str> {
+        None
+    }
+
+    /// At most `len` bytes from `offset`, or an error that says why.
+    fn read_bytes(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ScriptReadError>;
+
+    /// Lines as text, shaped like the crash contract's `LinesReply`.
+    fn read_lines(
+        &self,
+        path: &str,
+        from_line: u64,
+        max_lines: u32,
+    ) -> Result<serde_json::Value, ScriptReadError>;
+
+    /// The direct children of a game path. Directories are marked so a script
+    /// can tell them apart without guessing from an extension.
+    fn list(&self, path: &str) -> Result<serde_json::Value, ScriptReadError>;
+}
+
+/// Why a scoped read was refused. `code` is a stable token the script can
+/// branch on; `message` is for the author and the plugin log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptReadError {
+    pub code: String,
+    pub message: String,
+}
+
+impl ScriptReadError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 /// A runtime that can load and run plugin code.
 ///
 /// Implementations must isolate plugins from each other: a plugin that throws,
@@ -92,6 +167,32 @@ pub trait ScriptHost: Send + Sync {
         export: &str,
         args: serde_json::Value,
         timeout: Duration,
+    ) -> PluginResult<serde_json::Value>;
+
+    /// Like [`ScriptHost::invoke`], but the call sees `reads` and nothing else.
+    ///
+    /// The scope lasts exactly as long as this invocation. A script cannot use
+    /// it to reach another artifact, and it cannot keep it after the export
+    /// returns. Same isolation and timeout rules as `invoke`.
+    fn invoke_with_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn ScriptReads>,
+    ) -> PluginResult<serde_json::Value>;
+
+    /// Like [`ScriptHost::invoke`], but the call sees one instance's merged
+    /// view through `reads` (MASTER_SPEC §30.12). The scope lasts exactly as
+    /// long as this invocation and cannot be kept afterwards.
+    fn invoke_with_game_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn GameReads>,
     ) -> PluginResult<serde_json::Value>;
 
     /// Deliver an event to a plugin's subscribers.

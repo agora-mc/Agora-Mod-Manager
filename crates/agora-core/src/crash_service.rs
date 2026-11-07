@@ -154,7 +154,6 @@ impl CrashService {
         }
 
         let _ = crate::snapshot::mark_instance_mutated(&dir);
-        self.sync_world_datapacks_after_toggle(&sanitized, &dir, filename);
 
         Ok(())
     }
@@ -192,37 +191,8 @@ impl CrashService {
         }
 
         let _ = crate::snapshot::mark_instance_mutated(&dir);
-        self.sync_world_datapacks_after_toggle(&sanitized, &dir, filename);
 
         Ok(())
-    }
-
-    /// Enabling or disabling a data pack changes what its worlds should hold;
-    /// bring them in line now rather than at the next launch. Best effort: the
-    /// toggle has already succeeded and sync problems are only logged.
-    fn sync_world_datapacks_after_toggle(
-        &self,
-        instance_id: &str,
-        dir: &std::path::Path,
-        filename: &str,
-    ) {
-        let Ok(manifest_path) = self.ctx.paths.instance_manifest(instance_id) else {
-            return;
-        };
-        let Ok(manifest) = crate::helpers::read_manifest(&manifest_path) else {
-            return;
-        };
-        if !manifest
-            .datapacks
-            .iter()
-            .any(|entry| entry.filename == filename)
-            || crate::instance_runtime::check_idle(&self.ctx.paths, instance_id).is_err()
-        {
-            return;
-        }
-        for warning in crate::datapack_sync::sync_instance_datapacks(dir, &manifest).warnings {
-            eprintln!("[datapacks] {instance_id}: {warning}");
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -392,11 +362,29 @@ pub struct SuspectScore {
 // parse_crash_log — extract CrashFingerprint from crash text
 // -----------------------------------------------------------------------
 
+/// The exception class named on an error line, with or without `Caused by:`.
+///
+/// A real line ends the class with a colon (`java.lang.NullPointerException:`)
+/// or a message (`java.lang.NoSuchMethodError: '...'`), so match the word
+/// rather than requiring the line to end with `Exception` or `Error`.
+fn exception_class_from_line(line: &str) -> Option<String> {
+    let rest = line.split_once("Caused by:").map_or(line, |(_, rest)| rest);
+    rest.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| c == ':' || c == '"' || c == '\''))
+        .find(|word| {
+            (word.ends_with("Exception") || word.ends_with("Error"))
+                && *word != "Exception"
+                && *word != "Error"
+        })
+        .map(String::from)
+}
+
 /// Parse a crash log text and extract a `CrashFingerprint`.
 ///
 /// Finds the root cause exception by looking for the LAST `Caused by:` line
 /// (which is the deepest/primary cause), then extracts the exception class and
 /// up to 3 top stack frames (lines starting with `\t at <package.Class>.<method>`).
+/// Without a `Caused by:` line, the first error line is used.
 ///
 /// Returns `None` if no exception is found. Never panics on malformed logs.
 pub fn parse_crash_log(text: &str) -> Option<CrashFingerprint> {
@@ -410,42 +398,21 @@ pub fn parse_crash_log(text: &str) -> Option<CrashFingerprint> {
         }
     }
 
-    let cause_line = match last_cause_idx {
-        Some(idx) => lines[idx],
+    let (cause_idx, cause_line) = match last_cause_idx {
+        Some(idx) => (idx, lines[idx]),
         None => {
-            let first_exc = lines.iter().position(|line| {
-                line.contains("java.lang.")
-                    || (line.contains(" at ")
-                        && line
-                            .split(' ')
-                            .any(|w| w.ends_with("Exception") || w.ends_with("Error")))
-            });
-            lines[first_exc?]
+            let idx = lines
+                .iter()
+                .position(|line| exception_class_from_line(line).is_some())?;
+            (idx, lines[idx])
         }
     };
 
-    let exception_class = cause_line
-        .split("Caused by:")
-        .nth(1)
-        .and_then(|rest| rest.split(':').next())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            cause_line
-                .split_whitespace()
-                .find(|w| w.ends_with("Exception") || w.ends_with("Error"))
-        })
-        .map(String::from);
-
-    let exception_class = exception_class?;
-    if exception_class.is_empty() {
-        return None;
-    }
+    let exception_class = exception_class_from_line(cause_line)?;
 
     let mut top_frames: Vec<String> = Vec::new();
-    let start_idx = last_cause_idx.unwrap_or(0);
 
-    for line in lines.iter().skip(start_idx + 1) {
+    for line in lines.iter().skip(cause_idx + 1) {
         let trimmed = line.trim_start();
         if trimmed.starts_with("at ") {
             top_frames.push(trimmed.to_string());
@@ -537,10 +504,18 @@ impl CrashService {
         &self,
         instance_id: &str,
         fingerprint: &CrashFingerprint,
-        mod_ids: &[String],
+        suspects: &[SuspectScore],
         signature_name: Option<&str>,
     ) -> LauncherResult<i64> {
         let conn = self.connection()?;
+        // Co-crash evidence is only meaningful for mods that actually scored.
+        // A zero-score mod is in `suspects` only because it is installed, and
+        // pairing every installed mod per crash turns the table into noise.
+        let mod_ids: Vec<String> = suspects
+            .iter()
+            .filter(|s| s.total_score > 0.0)
+            .map(|s| s.mod_id.clone())
+            .collect();
 
         let top_frames_json =
             serde_json::to_string(&fingerprint.top_frames).map_err(|_| LauncherError::Generic {
@@ -559,10 +534,10 @@ impl CrashService {
         .map_err(|_| LauncherError::LocalStateFailed)?;
 
         // Wire the co-crash table for every pair.
-        for a in mod_ids {
-            for b in mod_ids {
+        for a in &mod_ids {
+            for b in &mod_ids {
                 if a < b {
-                    let _ = crate::db::record_co_crash(&conn, a, b);
+                    let _ = crate::db::record_co_crash(&conn, a.as_str(), b.as_str());
                 }
             }
         }
@@ -575,6 +550,23 @@ impl CrashService {
         let conn = self.connection()?;
         crate::db::insert_survival(&conn, instance_id, mod_ids)
             .map_err(|_| LauncherError::LocalStateFailed)
+    }
+
+    /// Record a survival only when the launch ended cleanly.
+    ///
+    /// A crash, a user stop, or an unknown ending is not evidence that the
+    /// installed mods are fine, so none of them count as a survival.
+    pub fn record_survival_if_clean(
+        &self,
+        instance_id: &str,
+        mod_ids: &[String],
+        outcome: &crate::lkg::LaunchOutcome,
+    ) -> LauncherResult<bool> {
+        if !matches!(outcome, crate::lkg::LaunchOutcome::Success) {
+            return Ok(false);
+        }
+        self.record_survival(instance_id, mod_ids)?;
+        Ok(true)
     }
 
     /// Increment the confirmation count for a mod_id matching a fingerprint.
@@ -774,9 +766,11 @@ pub fn continue_investigation(
         .get_ruled_out_mods(&fingerprint.fingerprint_str())
         .unwrap_or_default();
 
-    // Filter out ruled-out mods.
+    // Filter out ruled-out mods, and mods with no evidence at all. A score of
+    // zero means "installed", not "suspicious"; suggesting a disable on that
+    // would just name the alphabetically first mod.
     let ruled_out_set: std::collections::HashSet<String> = ruled_out.iter().cloned().collect();
-    suspects.retain(|s| !ruled_out_set.contains(&s.mod_id));
+    suspects.retain(|s| s.total_score > 0.0 && !ruled_out_set.contains(&s.mod_id));
 
     // Build the ruled_out list for the result (sorted for determinism).
     let mut ruled_out_sorted = ruled_out.clone();
@@ -869,9 +863,7 @@ pub fn compute_mod_score(
         .iter()
         .filter(|pkg_mod| {
             crashed_packages.iter().any(|pkg_crash| {
-                pkg_crash == pkg_mod.as_str()
-                    || pkg_mod.starts_with(pkg_crash.as_str())
-                    || pkg_crash.starts_with(pkg_mod.as_str())
+                package_covers(pkg_mod, pkg_crash) || package_covers(pkg_crash, pkg_mod)
             })
         })
         .count() as f64;
@@ -993,6 +985,31 @@ pub fn compute_mod_score(
 // score_suspects — full scoring pipeline
 // ---------------------------------------------------------------------------
 
+/// Package that owns the class in a stack frame.
+///
+/// Fabric writes `at knot//com.foo.Bar.tick(...)` and Forge writes
+/// `at TRANSFORMER/name@version/com.foo.Bar.tick(...)`; the loader prefix is
+/// not part of the package. An unknown prefix is not guessed at: it yields
+/// `None` rather than a bogus package.
+fn crashed_package_from_frame(line: &str) -> Option<String> {
+    let after_at = line.trim_start().strip_prefix("at ")?;
+    let class_part = match after_at.find('(') {
+        Some(idx) => &after_at[..idx],
+        None => after_at,
+    };
+    let class_path = if let Some(rest) = class_part.strip_prefix("knot//") {
+        rest
+    } else if let Some(rest) = class_part.strip_prefix("TRANSFORMER/") {
+        rest.split_once('/')?.1
+    } else if class_part.contains('/') {
+        return None;
+    } else {
+        class_part
+    };
+    let (package, _class) = class_path.rsplit_once('.')?;
+    (!package.is_empty()).then(|| package.replace('/', "."))
+}
+
 /// Dynamic-weighted suspicion-scoring algorithm.
 ///
 /// For each installed mod, computes a `total_score` from five signals (G, E,
@@ -1028,20 +1045,10 @@ pub fn score_suspects(
     };
 
     // Collect package prefixes from crash stack frames.
-    let mut crashed_packages: HashSet<String> = HashSet::new();
-    for line in crash_text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(after_at) = trimmed.strip_prefix("at ") {
-            let class_part = match after_at.find('(') {
-                Some(idx) => &after_at[..idx],
-                None => after_at,
-            };
-            if let Some(dot_pos) = class_part.rfind('.') {
-                let pkg = class_part[..dot_pos].replace('/', ".");
-                crashed_packages.insert(pkg);
-            }
-        }
-    }
+    let crashed_packages: HashSet<String> = crash_text
+        .lines()
+        .filter_map(crashed_package_from_frame)
+        .collect();
 
     // -----------------------------------------------------------------------
     // Step 2 — gather priors via services
@@ -1646,7 +1653,11 @@ mod tests {
     /// Initializes the local state database so connection-based methods work.
     fn setup_ctx() -> (CoreContext, PathBuf) {
         let seq = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("agora-crash-svc-test-{}", seq));
+        let tmp = std::env::temp_dir().join(format!(
+            "agora-crash-svc-test-{}-{}",
+            std::process::id(),
+            seq
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let ctx = CoreContext::for_testing(tmp.clone());
@@ -1665,6 +1676,7 @@ mod tests {
 
         let manifest = crate::models::InstanceManifest {
             manifest_version: crate::models::CURRENT_MANIFEST_VERSION,
+            game_data: Default::default(),
             pack_origin: None,
             instance_id: instance_id.to_string(),
             name: instance_id.to_string(),
@@ -1687,6 +1699,7 @@ mod tests {
                     source_url: None,
                     version: Some("1.0.0".into()),
                     sha256: "abc".into(),
+                    hash_verified: true,
                     installed_at: "2024-01-01T00:00:00Z".into(),
                     java_packages: vec![],
                     mod_jar_id: None,
@@ -1696,6 +1709,9 @@ mod tests {
                     depends_on: vec![],
                     optional_deps: vec![],
                     incompatible_deps: vec![],
+
+                    content_item_id: None,
+                    object_sha256: None,
                 })
                 .collect(),
             resourcepacks: vec![],
@@ -2182,11 +2198,15 @@ mod tests {
             top_frames: vec![],
         };
 
-        // record_crash_event wires co-crash for all pairs
+        // record_crash_event wires co-crash for all pairs with evidence
         svc.record_crash_event(
             "test-instance",
             &fp,
-            &["mod-a".into(), "mod-b".into(), "mod-c".into()],
+            &[
+                suspect("mod-a", 1.0),
+                suspect("mod-b", 1.0),
+                suspect("mod-c", 1.0),
+            ],
             None,
         )
         .unwrap();
@@ -2228,6 +2248,7 @@ mod tests {
             source_url: None,
             version: Some("1.0.0".into()),
             sha256: "abc".into(),
+            hash_verified: true,
             installed_at: "2024-01-01T00:00:00Z".into(),
             java_packages: packages.iter().map(|p| p.to_string()).collect(),
             mod_jar_id: None,
@@ -2237,6 +2258,8 @@ mod tests {
             depends_on: vec![],
             optional_deps: vec![],
             incompatible_deps: vec![],
+            content_item_id: None,
+            object_sha256: None,
         }
     }
 
@@ -2945,5 +2968,271 @@ Caused by: java.lang.NullPointerException
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("NoSuspects"));
         assert!(json.contains("mod-a"));
+    }
+
+    // ------------------------------------------------------------------
+    // Real-log regressions (D1, D2, D4, D5, D6, D7)
+    // ------------------------------------------------------------------
+
+    /// Real Fabric 1.18.2 crash report (Aternos fixtures, MIT): the root error
+    /// is not a `Caused by:` line and its class name carries a colon.
+    const REAL_NPE_CRASH: &str = r#"---- Minecraft Crash Report ----
+// Why did you do that?
+
+Time: 5/15/22, 8:09 PM
+Description: Exception ticking world
+
+java.lang.NullPointerException: Cannot invoke "java.util.List.forEach(java.util.function.Consumer)" because "currentEnchantments" is null
+	at net.minecraft.class_1890.handler$zlm000$getPossibleEntriesMixin(class_1890.java:545)
+	at net.minecraft.class_1890.method_8229(class_1890.java)
+	at io.github.flemmli97.improvedmobs.utils.Utils.enchantGear(Utils.java:106)
+"#;
+
+    fn score_for_crash_text(text: &str, packages: &[&str]) -> f64 {
+        let (ctx, tmp) = setup_ctx();
+        let installed = vec![mod_with_packages("foo.jar", true, packages)];
+        let suspects = score_suspects(&ctx, text, &installed).unwrap();
+        let score = suspects
+            .iter()
+            .find(|s| s.mod_id == "foo")
+            .map(|s| s.total_score)
+            .unwrap_or(0.0);
+        let _ = std::fs::remove_dir_all(&tmp);
+        score
+    }
+
+    fn suspect(mod_id: &str, total_score: f64) -> SuspectScore {
+        SuspectScore {
+            mod_id: mod_id.into(),
+            filename: format!("{mod_id}.jar"),
+            total_score,
+            breakdown: serde_json::json!({}),
+            is_dependent_of: None,
+        }
+    }
+
+    #[test]
+    fn test_d1_parses_error_line_without_caused_by() {
+        let fp = parse_crash_log(REAL_NPE_CRASH)
+            .expect("a root error without 'Caused by:' must still parse");
+        assert_eq!(fp.exception_class, "java.lang.NullPointerException");
+        assert_eq!(
+            fp.top_frames.first().map(String::as_str),
+            Some("at net.minecraft.class_1890.handler$zlm000$getPossibleEntriesMixin(class_1890.java:545)")
+        );
+    }
+
+    #[test]
+    fn test_d1_parses_error_types_and_empty_messages() {
+        let no_such_method = parse_crash_log(
+            "java.lang.NoSuchMethodError: 'net.minecraft.class_2540 net.minecraft.class_2540.method_10794(net.minecraft.class_2487)'\n\tat com.example.mod.Main.tick(Main.java:1)\n",
+        )
+        .expect("an Error type without 'Caused by:' must parse");
+        assert_eq!(
+            no_such_method.exception_class,
+            "java.lang.NoSuchMethodError"
+        );
+
+        let empty_message = parse_crash_log(
+            "java.lang.NullPointerException:\n\tat com.example.mod.Main.tick(Main.java:1)\n",
+        )
+        .expect("an error line with no message after the colon must parse");
+        assert_eq!(
+            empty_message.exception_class,
+            "java.lang.NullPointerException"
+        );
+    }
+
+    #[test]
+    fn test_d1_hostile_empty_logs_stay_none() {
+        assert!(parse_crash_log("").is_none());
+        assert!(parse_crash_log("   \n\t\n").is_none());
+        assert!(parse_crash_log("\r\n  \r\n").is_none());
+    }
+
+    #[test]
+    fn test_d2_strips_class_loader_prefixes() {
+        for frame in [
+            "\tat knot//com.foo.bar.Baz.tick(Baz.java:1)",
+            "\tat TRANSFORMER/foobar@1.0/com.foo.bar.Baz.tick(Baz.java:1)",
+            "\tat com.foo.bar.Baz.tick(Baz.java:1)",
+        ] {
+            let text = format!("java.lang.RuntimeException: boom\n{frame}\n");
+            let score = score_for_crash_text(&text, &["com.foo.bar"]);
+            assert!(
+                score > 0.0,
+                "Signal A must match {frame}, score was {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_d2_unknown_prefix_never_matches_by_accident() {
+        let text =
+            "java.lang.RuntimeException: boom\n\tat weird//com.foo.bar.Baz.tick(Baz.java:1)\n";
+        let score = score_for_crash_text(text, &["com.foo.bar", "com.foo.bar.Baz"]);
+        assert_eq!(score, 0.0, "an unknown loader prefix must not score");
+        assert_eq!(
+            score_for_crash_text("", &["com.foo.bar"]),
+            0.0,
+            "an empty log must not score"
+        );
+        assert_eq!(
+            score_for_crash_text("   \n\t\n", &["com.foo.bar"]),
+            0.0,
+            "a whitespace-only log must not score"
+        );
+    }
+
+    #[test]
+    fn test_d4_signal_a_requires_a_dot_boundary() {
+        let no_boundary = compute_mod_score(
+            "mod".into(),
+            "mod.jar".into(),
+            &["com.foo".into()],
+            &["com.foobar.Baz".into()],
+            &[],
+            &[],
+            0,
+            0,
+            0,
+            &[],
+            &[],
+        );
+        assert!(
+            approx(no_boundary.total_score, 0.0),
+            "com.foo must not cover com.foobar, got {}",
+            no_boundary.total_score
+        );
+
+        let boundary = compute_mod_score(
+            "mod".into(),
+            "mod.jar".into(),
+            &["com.foo".into()],
+            &["com.foo.bar.Baz".into()],
+            &[],
+            &[],
+            0,
+            0,
+            0,
+            &[],
+            &[],
+        );
+        assert!(
+            boundary.total_score > 0.0,
+            "com.foo must cover com.foo.bar, got {}",
+            boundary.total_score
+        );
+
+        let empty_package = compute_mod_score(
+            "mod".into(),
+            "mod.jar".into(),
+            &["".into()],
+            &["com.foo.Bar".into()],
+            &[],
+            &[],
+            0,
+            0,
+            0,
+            &[],
+            &[],
+        );
+        assert!(
+            approx(empty_package.total_score, 0.0),
+            "an empty package must not match everything, got {}",
+            empty_package.total_score
+        );
+    }
+
+    #[test]
+    fn test_d5_survival_only_after_a_clean_exit() {
+        let (ctx, tmp) = setup_ctx();
+        let svc = CrashService::new(ctx.clone());
+        let mods = vec!["mod-a".to_string()];
+
+        for outcome in [
+            crate::lkg::LaunchOutcome::Crash,
+            crate::lkg::LaunchOutcome::Cancelled,
+            crate::lkg::LaunchOutcome::Unknown,
+        ] {
+            let recorded = svc
+                .record_survival_if_clean("test-instance", &mods, &outcome)
+                .unwrap();
+            assert!(!recorded, "{outcome:?} is not a survival");
+        }
+        assert_eq!(svc.get_total_survival_count().unwrap(), 0);
+
+        let recorded = svc
+            .record_survival_if_clean("test-instance", &mods, &crate::lkg::LaunchOutcome::Success)
+            .unwrap();
+        assert!(recorded);
+        assert_eq!(svc.get_total_survival_count().unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_d6_co_crash_pairs_only_suspects_with_evidence() {
+        let (ctx, tmp) = setup_ctx();
+        let svc = CrashService::new(ctx);
+        let fp = CrashFingerprint {
+            exception_class: "java.lang.TestException".into(),
+            top_frames: vec![],
+        };
+
+        let mixed = vec![
+            suspect("zero-a", 0.0),
+            suspect("real", 2.0),
+            suspect("zero-b", 0.0),
+        ];
+        svc.record_crash_event("test-instance", &fp, &mixed, None)
+            .unwrap();
+        assert_eq!(svc.get_pair_crash_count("real", "zero-a").unwrap(), 0);
+        assert_eq!(svc.get_pair_crash_count("zero-a", "zero-b").unwrap(), 0);
+        assert_eq!(svc.get_pair_crash_count("real", "zero-b").unwrap(), 0);
+
+        let none = vec![suspect("zero-a", 0.0), suspect("zero-b", 0.0)];
+        svc.record_crash_event("test-instance", &fp, &none, None)
+            .unwrap();
+        assert_eq!(svc.get_pair_crash_count("zero-a", "zero-b").unwrap(), 0);
+
+        let two_real = vec![suspect("real-a", 1.0), suspect("real-b", 0.5)];
+        svc.record_crash_event("test-instance", &fp, &two_real, None)
+            .unwrap();
+        assert_eq!(svc.get_pair_crash_count("real-a", "real-b").unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_d7_no_evidence_means_no_suggestion() {
+        let (ctx, tmp) = setup_ctx();
+        create_instance(&ctx, "no-evidence", &["alpha.jar", "beta.jar"]);
+        let manifest = read_manifest(&ctx, "no-evidence");
+        let fp = CrashFingerprint {
+            exception_class: "java.lang.NullPointerException".into(),
+            top_frames: vec![],
+        };
+        let crash_text =
+            "java.lang.NullPointerException:\n\tat com.unrelated.Thing.tick(Thing.java:1)\n";
+
+        let result = continue_investigation(&ctx, &fp, &manifest.mods, crash_text).unwrap();
+        assert!(
+            matches!(result.suggested_action, SuggestedAction::NoSuspects),
+            "no mod scored above zero, so there must be no suggestion"
+        );
+        assert!(
+            result.suspects.iter().all(|s| s.total_score > 0.0),
+            "zero-score mods must not be presented as suspects"
+        );
+
+        let empty = continue_investigation(&ctx, &fp, &[], crash_text).unwrap();
+        assert!(matches!(
+            empty.suggested_action,
+            SuggestedAction::NoSuspects
+        ));
+        assert!(empty.suspects.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

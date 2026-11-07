@@ -288,6 +288,7 @@ mod tests {
                 pid,
                 start_time: 1000,
                 expected_exe: None,
+                job: None,
             },
             snapshot_id: "snap-1".into(),
             start_time: SystemTime::now(),

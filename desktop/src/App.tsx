@@ -1,10 +1,11 @@
-﻿import { useCallback, useEffect, useRef, useState, type ComponentProps } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react';
 import { isTextEntryTarget } from '@/lib/keyboardTargets';
 import { listen } from '@tauri-apps/api/event';
 import { Sidebar } from './components/Sidebar';
 import { CommandPalette } from './components/command-palette';
 import { Home } from './pages/Home';
 import { Browse } from './pages/Browse';
+import { LibraryPage } from './features/library/LibraryPage';
 import { requestBrowseSearch } from './lib/browseSearchRequest';
 import { Instances } from './pages/Instances';
 import { Governance } from './pages/Governance';
@@ -37,7 +38,19 @@ import { ControlifyOfferDialog } from './components/controller/ControlifyOfferDi
 import { InstallFlow } from './components/InstallFlow';
 import { CrashInvestigator } from './components/CrashInvestigator';
 import { showToast, ToastContainer } from './components/Toast';
-import { useDestination, type Destination, type Tab } from './lib/useDestination';
+import { useDestination, type Destination, type GameTabId, type Tab } from './lib/useDestination';
+import { MINECRAFT_GAME_ID } from './features/games/shared/types';
+import { useGameShell } from './features/games/shared/useGameShell';
+import { useGameSwitch } from './features/games/shared/useGameSwitch';
+import { GameSwitcher } from './features/games/shell/GameSwitcher';
+import { DownloadsNotifier } from './features/downloads/DownloadsNotifier';
+import { useNewDownloads } from './features/downloads/useNewDownloads';
+import { downloadsForGame } from './features/downloads/api';
+import { GameTabPage } from './features/games/shell/GameTabPage';
+import { GameInstancePage } from './features/games/shell/GameInstancePage';
+import { gameTabForSidebarTab, sidebarTabForGameTab } from './features/games/shell/gameNav';
+import { gameShortName } from './features/games/shared/gameNames';
+import { gameDisplayName, isMinecraftSelected } from './pages/settings/gameScope';
 import { useProcessController } from './lib/useProcessController';
 import { useInstanceHealthMonitor } from './lib/useInstanceHealthMonitor';
 import { useRegistryState } from './lib/useRegistryState';
@@ -62,11 +75,12 @@ import { ControllerRootBindings, cycleTab } from './features/controller/Controll
 import { focusMemoryKey, useFocusMemory } from './features/controller/useFocusMemory';
 import { moveFocusForRoute, routeFocusTarget } from './lib/routeFocus';
 import { focusSkipTarget } from './lib/skipLink';
-import { BookOpen, Boxes, Compass, HomeIcon, Info, Landmark, Mountain, NotebookPen, SettingsIcon } from 'lucide-react';
+import { BookOpen, Boxes, Compass, HomeIcon, Info, Landmark, Library as LibraryIcon, Mountain, NotebookPen, SettingsIcon } from 'lucide-react';
 
 const BASE_TABS = [
   { id: 'home' as Tab, label: 'Home', icon: HomeIcon },
   { id: 'browse' as Tab, label: 'Browse', icon: Compass },
+  { id: 'library' as Tab, label: 'Library', icon: LibraryIcon },
   { id: 'instances' as Tab, label: 'My Instances', icon: Boxes },
   { id: 'governance' as Tab, label: 'Community Governance', icon: Landmark },
   { id: 'guide' as Tab, label: 'Help & Guide', icon: BookOpen },
@@ -202,9 +216,40 @@ function BrandedSplash() {
 function destToTab(dest: Destination): Tab {
   if (dest.type === 'tab') return dest.tab;
   if (dest.type === 'instance-detail') return 'instances';
+  if (dest.type === 'game-tab') return sidebarTabForGameTab(dest.tab);
+  if (dest.type === 'game-instance') return 'instances';
   // A plugin page is not one of the built-in tabs, so none of them is
   // highlighted while it is open; the sidebar marks the plugin entry instead.
   return 'home'; // mod-detail doesn't change the tab
+}
+
+/**
+ * Pages that belong to the app rather than to one game. They keep whichever game is selected:
+ * opening Help & Guide while Skyrim is selected leaves Skyrim selected and its sidebar in place.
+ */
+const APP_WIDE_TABS: ReadonlySet<Tab> = new Set<Tab>([
+  'governance',
+  'guide',
+  'field-guide',
+  'living-background',
+  'lab',
+  'about',
+  'settings',
+]);
+
+function isAppWideDestination(dest: Destination): boolean {
+  return dest.type === 'tab' && APP_WIDE_TABS.has(dest.tab);
+}
+
+/**
+ * The game a destination belongs to. App-wide pages (Settings, Help & Guide, ...) are shared by
+ * every game, so they name none (null). Everything else that is not a game's own page is
+ * Minecraft's.
+ */
+function destinationGame(dest: Destination): string | null {
+  if (dest.type === 'game-tab' || dest.type === 'game-instance') return dest.gameId;
+  if (isAppWideDestination(dest)) return null;
+  return MINECRAFT_GAME_ID;
 }
 
 /** Deliberate recoverable not-found view for unrecognized destinations. */
@@ -237,7 +282,7 @@ function NotFoundView({ canGoBack, onGoHome, onGoBack }: { canGoBack: boolean; o
 }
 
 /** The three known destination types used for validation. */
-const KNOWN_DEST_TYPES = new Set(['tab', 'mod-detail', 'instance-detail', 'plugin-page']);
+const KNOWN_DEST_TYPES = new Set(['tab', 'mod-detail', 'instance-detail', 'plugin-page', 'game-tab', 'game-instance']);
 
 interface PendingControlifyLaunch {
   instanceId: string;
@@ -266,6 +311,9 @@ function AppContent() {
     navigateToModDetail,
     navigateToInstanceDetail,
     navigateToPluginPage,
+    navigateToGameTab,
+    navigateToGameInstance,
+    replaceWithGameTab,
     goBack,
   } = useDestination();
 
@@ -312,6 +360,19 @@ function AppContent() {
   const controlifyAskedRef = useRef<Set<string>>(new Set());
   const healthMonitor = useInstanceHealthMonitor(onboardingComplete === true);
   const registry = useRegistryState();
+  // Which game the shell shows, and the header switcher's list (MASTER_SPEC 26.14).
+  const gameShell = useGameShell();
+  const newDownloads = useNewDownloads();
+  const { activeGame, shownGame, ready: gameShellReady, setActiveGame, turnedOffGames } = gameShell;
+  // Short names by game id, for pages that name a game ("Skyrim SE").
+  const gameNames = useMemo<Record<string, string>>(
+    () => Object.fromEntries([
+      [MINECRAFT_GAME_ID, 'Minecraft'],
+      ...gameShell.foundGames.map((game) => [game.gameId, gameShortName(game.name)]),
+    ]),
+    [gameShell.foundGames],
+  );
+  const startupGameCheckedRef = useRef(false);
 
   // The background interval is only a backstop. Content changes made anywhere
   // (an install in Browse, a removal in the editor) must show up the moment
@@ -436,7 +497,7 @@ function AppContent() {
     if (instanceId) {
       navigateToInstanceDetail(instanceId);
     } else {
-      navigateToTab(tab);
+      selectShellTab(tab);
     }
   };
 
@@ -469,6 +530,66 @@ function AppContent() {
     window.addEventListener('agora-navigate', handler);
     return () => window.removeEventListener('agora-navigate', handler);
   }, [navigateToTab]);
+
+  // Game navigation. Every game shares one sidebar: while a non-Minecraft game is shown, its
+  // entries (and the shared ones that stand in for a page it lacks) open that game's pages.
+  const selectShellTab = useCallback((tab: Tab) => {
+    const gameTab = shownGame === MINECRAFT_GAME_ID ? null : gameTabForSidebarTab(tab);
+    if (gameTab) {
+      navigateToGameTab(shownGame, gameTab);
+    } else {
+      navigateToTab(tab);
+    }
+  }, [shownGame, navigateToGameTab, navigateToTab]);
+
+  const switchGame = useGameSwitch({ setActiveGame, navigateToTab, navigateToGameTab });
+
+  // Turning off the game being viewed must not leave its page on screen: the switcher has already
+  // moved to Minecraft, so remember that choice too and say once why the page changed. Settings and
+  // the other app-wide pages are shared by every game, so they stay open (Settings simply shows
+  // Minecraft's cards).
+  const turnedOffNoticeRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!gameShellReady) return;
+    const openGame = destinationGame(destination)
+      ?? (isAppWideDestination(destination) ? activeGame : null);
+    if (openGame === null || openGame === MINECRAFT_GAME_ID) return;
+    const turnedOff = turnedOffGames.find((game) => game.gameId === openGame);
+    if (!turnedOff) {
+      turnedOffNoticeRef.current = null;
+      return;
+    }
+    switchGame(MINECRAFT_GAME_ID, { navigate: false });
+    if (destinationGame(destination) !== null) navigateToTab('home');
+    if (turnedOffNoticeRef.current !== turnedOff.gameId) {
+      turnedOffNoticeRef.current = turnedOff.gameId;
+      showToast(`${turnedOff.name} is turned off, so Agora switched to Minecraft.`);
+    }
+  }, [activeGame, destination, gameShellReady, navigateToTab, switchGame, turnedOffGames]);
+
+  // Keep the remembered game in step with where the user is. The first time discovery and the
+  // stored choice have both answered, a fresh launch opens the game the user last chose rather
+  // than Minecraft's Home. After that, going Back into Minecraft's pages makes Minecraft the
+  // remembered game, and going into a game's pages remembers that game. The startup check never
+  // rewrites the stored choice, so a failed discovery cannot forget it.
+  useEffect(() => {
+    if (!gameShellReady) return;
+    if (!startupGameCheckedRef.current) {
+      startupGameCheckedRef.current = true;
+      const onFirstPage = destination.type === 'tab' && destination.tab === 'home' && !canGoBack;
+      if (onFirstPage && shownGame !== MINECRAFT_GAME_ID) {
+        // In place of Home, not after it: the saved game is where the app starts.
+        replaceWithGameTab(shownGame, 'home' satisfies GameTabId);
+      }
+      return;
+    }
+    const target = destinationGame(destination);
+    if (target === null || target === activeGame) return;
+    // A remembered game that is not found (or a discovery that failed) is not forgotten just
+    // because the user is on a Minecraft page: it is simply not shown.
+    if (target === MINECRAFT_GAME_ID && shownGame === MINECRAFT_GAME_ID) return;
+    setActiveGame(target);
+  }, [gameShellReady, destination, canGoBack, shownGame, activeGame, setActiveGame, replaceWithGameTab]);
 
   // The walkthrough opens on Home, whatever page the user started it from.
   // Every step after that is driven by the user, never by the tour. Declared
@@ -506,10 +627,15 @@ function AppContent() {
   // Agora Lab is intentionally absent: it is the high-interaction entry point
   // for the guide's "New to modding" tier, reached from Help & Guide rather
   // than owning a permanent sidebar slot. `'lab'` remains a valid destination.
-  const [tabHome, tabBrowse, tabInstances, tabGovernance, tabGuide, tabFieldGuide, tabAbout, tabSettings] = BASE_TABS;
+  const [tabHome, tabBrowse, tabLibrary, tabInstances, tabGovernance, tabGuide, tabFieldGuide, tabAbout, tabSettings] = BASE_TABS;
+  // One sidebar for every game (2026-11-03). Minecraft's list is the reference; another game uses
+  // the same entries in the same places, and adds none: its import is a dialog on My Instances and
+  // its installs, bases and recovery live in Settings. Shared entries a game has no page for yet
+  // open its closest page (see gameNav).
   const tabs = [
     tabHome,
     tabBrowse,
+    tabLibrary,
     tabInstances,
     tabGovernance,
     tabGuide,
@@ -546,8 +672,10 @@ function AppContent() {
 
   const showModDetail = destination.type === 'mod-detail';
   const previousDestination = previousDestinationRef.current;
+  // A game's Browse is its own page (`game-tab`), highlighted under the same sidebar entry: only
+  // Minecraft's Browse mounts Minecraft's Browse.
   const shouldRenderBrowse =
-    effectiveTab === 'browse'
+    (effectiveTab === 'browse' && destination.type === 'tab')
     || (browseVisited
       && showModDetail
       && previousDestination.type === 'tab'
@@ -861,7 +989,10 @@ function AppContent() {
           onSuccess={handleControlifyInstallSuccess}
         />
       )}
-      <TourProvider onStart={handleTourStart}>
+      <TourProvider
+        onStart={handleTourStart}
+        conditions={{ multipleGames: gameShell.switcherVisible }}
+      >
       <AmbienceProvider>
       <AmbienceEnabledBridge onChange={setAmbienceEnabled} />
       <QueuedTourStarter />
@@ -880,7 +1011,7 @@ function AppContent() {
         <ControllerRootBindings
           rootRef={appShellRef}
           onOpenPalette={() => setCommandPaletteOpen(true)}
-          onCyclePage={(direction) => navigateToTab(
+          onCyclePage={(direction) => selectShellTab(
             cycleTab(tabs.map((tab) => tab.id), effectiveTab, direction),
           )}
           // Already guarded against stepping off the app's own history, so a
@@ -895,8 +1026,24 @@ function AppContent() {
           onSelectPluginPage={navigateToPluginPage}
           tabs={tabs}
           activeTab={sidebarTab}
-          onSelectTab={navigateToTab}
+          badges={{ library: downloadsForGame(newDownloads.rows, shownGame).length }}
+          onSelectTab={selectShellTab}
           onOpenCommandPalette={() => setCommandPaletteOpen(true)}
+          switcher={gameShell.switcherVisible ? (
+            <GameSwitcher
+              options={[
+                { gameId: MINECRAFT_GAME_ID, label: 'Minecraft' },
+                ...gameShell.foundGames.map((game) => ({
+                  gameId: game.gameId,
+                  label: game.name,
+                  shortLabel: gameShortName(game.name),
+                })),
+              ]}
+              shownGame={shownGame}
+              onSwitch={switchGame}
+              collapsed={shellLayout.sidebar.collapsed}
+            />
+          ) : null}
           collapsed={shellLayout.sidebar.collapsed}
           width={shellLayout.sidebar.width}
           onCollapsedChange={(collapsed) => {
@@ -979,6 +1126,23 @@ function AppContent() {
                 onGoHome={() => navigateToTab('home')}
                 onGoBack={goBack}
               />
+            ) : destination.type === 'game-tab' ? (
+              <GameTabPage
+                gameId={destination.gameId}
+                tab={destination.tab}
+                gameNames={gameNames}
+                onOpenInstance={(instanceId) => navigateToGameInstance(destination.gameId, instanceId)}
+                onOpenTab={(tab) => navigateToGameTab(destination.gameId, tab)}
+                onOpenGuide={() => navigateToTab('guide')}
+              />
+            ) : destination.type === 'game-instance' ? (
+              <GameInstancePage
+                gameId={destination.gameId}
+                instanceId={destination.instanceId}
+                page={destination.page}
+                onNavigatePage={(page) => navigateToGameInstance(destination.gameId, destination.instanceId, page)}
+                onBack={() => navigateToGameTab(destination.gameId, 'instances' satisfies GameTabId)}
+              />
             ) : destination.type === 'plugin-page' ? (
               <PluginPage contributionId={destination.contributionId} onGoHome={() => navigateToTab('home')} />
             ) : showModDetail ? (
@@ -1028,6 +1192,7 @@ function AppContent() {
                     }
                   />
                 )}
+                {effectiveTab === 'library' && <LibraryPage key={MINECRAFT_GAME_ID} gameNames={gameNames} />}
                 {effectiveTab === 'instances' && (
                   <Instances
                     onEditInstance={(id) => navigateToInstanceDetail(id)}
@@ -1069,6 +1234,9 @@ function AppContent() {
                 {effectiveTab === 'about' && <About />}
                 {effectiveTab === 'settings' && (
                   <Settings
+                    activeGame={activeGame}
+                    activeGameName={gameShell.foundGames.find((game) => game.gameId === activeGame)?.name}
+                    onSwitchToMinecraft={() => switchGame(MINECRAFT_GAME_ID, { navigate: false })}
                     onNavigateTab={navigateToTab}
                     onResetLayout={() => {
                       const reset = {
@@ -1089,6 +1257,7 @@ function AppContent() {
                 <Browse
                   onSelectMod={handleBrowseSelectMod}
                   onOpenInstance={navigateToInstanceDetail}
+                  onOpenLibrary={() => navigateToTab('library')}
                   initialInstanceId={browseInstanceId}
                   initialContentType={browseContentType}
                 />
@@ -1123,7 +1292,15 @@ function AppContent() {
           open={commandPaletteOpen}
           onOpenChange={setCommandPaletteOpen}
           onNavigate={handleNavigate}
+          switchGameItems={gameShell.switcherVisible
+            ? gameShell.foundGames.map((game) => ({ gameId: game.gameId, label: game.name }))
+            : undefined}
+          onSwitchGame={switchGame}
+          gameSettingsName={isMinecraftSelected(activeGame)
+            ? null
+            : gameShortName(gameDisplayName(activeGame ?? MINECRAFT_GAME_ID, gameShell.foundGames.find((game) => game.gameId === activeGame)?.name))}
         />
+        <DownloadsNotifier />
         <ToastContainer />
         {crashInvestigation && (
           <CrashInvestigator

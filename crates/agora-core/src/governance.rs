@@ -292,7 +292,7 @@ pub fn resolve_governance_environment() -> GovernanceEnvironment {
 /// Priority (production / non-debug):
 /// 1. Compile-time `AGORA_GOVERNANCE_REPO` (via `option_env!`)
 /// 2. Compile-time `AGORA_REGISTRY_REPO` (via `option_env!`)
-/// 3. Built-in default `"agora-mc/Agora-Launcher"`
+/// 3. Built-in default `"agora-mc/Agora-Mod-Manager"`
 ///
 /// In debug builds, runtime env vars `AGORA_GOVERNANCE_REPO` and
 /// `AGORA_REGISTRY_REPO` take priority before compile-time values.
@@ -318,7 +318,7 @@ pub fn resolve_governance_repo() -> String {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         })
-        .unwrap_or_else(|| "agora-mc/Agora-Launcher".into())
+        .unwrap_or_else(|| "agora-mc/Agora-Mod-Manager".into())
 }
 
 /// Resolve the GitHub App slug.
@@ -1224,7 +1224,7 @@ pub async fn run_network_diagnostics(ctx: &Ctx) -> Vec<DiagnosticCheck> {
 pub fn github_headers(token: &str, accept: Option<&str>) -> Vec<(String, String)> {
     let mut headers = vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
-        ("User-Agent".to_string(), "agora-launcher".to_string()),
+        ("User-Agent".to_string(), "agora-mod-manager".to_string()),
     ];
     if let Some(accept) = accept {
         headers.push(("Accept".to_string(), accept.to_string()));
@@ -1446,6 +1446,7 @@ async fn check_template_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_root::RemoveOnDrop;
 
     fn seed_schema7_registry(reg_path: &std::path::Path) {
         let conn = rusqlite::Connection::open(reg_path).unwrap();
@@ -1869,7 +1870,7 @@ mod tests {
         .unwrap();
 
         let config = GovernanceConfig {
-            repository: "agora-mc/Agora-Launcher".into(),
+            repository: "agora-mc/Agora-Mod-Manager".into(),
             environment: GovernanceEnvironment::Production,
             github_app_slug: None,
             development_registry: false,
@@ -1916,7 +1917,7 @@ mod tests {
 
         // governance JSON files not created — checks should report Warning
         let config = GovernanceConfig {
-            repository: "agora-mc/Agora-Launcher".into(),
+            repository: "agora-mc/Agora-Mod-Manager".into(),
             environment: GovernanceEnvironment::Production,
             github_app_slug: None,
             development_registry: false,
@@ -2062,11 +2063,14 @@ mod tests {
     // GovernanceService tests
     // -----------------------------------------------------------------------
 
-    fn make_registry_svc(reg_path: &std::path::Path) -> RegistryService {
+    /// The guard that removes the data root, then the service. The guard comes first so that it
+    /// drops last, after the database handle the service holds.
+    fn make_registry_svc(reg_path: &std::path::Path) -> (RemoveOnDrop, RegistryService) {
         let root = std::env::temp_dir().join(format!("agora-gov-svc-{}", uuid::Uuid::new_v4()));
+        let guard = RemoveOnDrop::new(root.clone());
         let ctx = crate::ctx::Ctx::for_testing(root.clone());
         std::fs::copy(reg_path, ctx.paths.registry_db()).unwrap();
-        RegistryService::new(ctx)
+        (guard, RegistryService::new(ctx))
     }
 
     #[test]
@@ -2077,7 +2081,7 @@ mod tests {
         let reg_path = root.join("registry.db");
         seed_schema7_registry(&reg_path);
 
-        let reg_svc = make_registry_svc(&reg_path);
+        let (_root, reg_svc) = make_registry_svc(&reg_path);
         let svc = GovernanceService::new(reg_svc);
         let summary = svc.get_governance_summary("test-mod").unwrap();
         assert!(summary.is_some());
@@ -2094,7 +2098,7 @@ mod tests {
         let reg_path = root.join("registry.db");
         seed_schema7_registry(&reg_path);
 
-        let reg_svc = make_registry_svc(&reg_path);
+        let (_root, reg_svc) = make_registry_svc(&reg_path);
         let svc = GovernanceService::new(reg_svc);
         let events = svc.list_governance_events(Some("test-mod"), 10).unwrap();
         assert_eq!(events.len(), 2);
@@ -2109,7 +2113,7 @@ mod tests {
         let reg_path = root.join("registry.db");
         seed_schema6_registry(&reg_path);
 
-        let reg_svc = make_registry_svc(&reg_path);
+        let (_root, reg_svc) = make_registry_svc(&reg_path);
         let svc = GovernanceService::new(reg_svc);
 
         let summary = svc.get_governance_summary("test-mod").unwrap();

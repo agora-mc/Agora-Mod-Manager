@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 """Unit tests for pure functions in Agora utility scripts."""
 
-import hashlib
+import contextlib
 import http.client
+import io
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
 import unittest
 import urllib.error
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import build_official_plugin as bop
 import fetch_loader_manifests
-import fetch_registry_db
 import deploy_release_assets
 import finalize_release_assets as fra
 import refresh_loader_manifests
 import validate_loader_catalog_delta
 import build_docs_web as bdw
+import check_package_docs as cpd
+import pin_hashes
 import stage_cli_sidecar
+import stage_vfs_files
 
 
 def _response(read_side_effect=None, read_value=b"data"):
@@ -654,16 +661,144 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         )
         self.assertEqual(entries[0]["release_channel"], "stable")
 
+    def _quilt_maven_jar(
+        self, directory: str, loader_version: str, provided: str | None
+    ) -> Path:
+        if provided is None:
+            payload = {
+                "schema_version": 1,
+                "quilt_loader": {
+                    "id": "quilt_loader",
+                    "version": loader_version,
+                    "provides": [{"id": "other", "version": "1.0"}],
+                },
+            }
+        else:
+            payload = {
+                "schema_version": 1,
+                "quilt_loader": {
+                    "id": "quilt_loader",
+                    "version": loader_version,
+                    "provides": [{"id": "fabricloader", "version": provided}],
+                },
+            }
+        path = Path(directory) / f"quilt-loader-{loader_version}.jar"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("quilt.mod.json", json.dumps(payload))
+        return path
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
     @mock.patch("fetch_loader_manifests._fetch_profile_json")
     @mock.patch("fetch_loader_manifests._fetch_json")
-    def test_quilt_new_entry_writes_capabilities(self, fetch_json, fetch_profile):
+    def test_quilt_new_entry_writes_capabilities(
+        self, fetch_json, fetch_profile, download
+    ):
         fetch_json.return_value = [{"loader": {"version": "0.28.0-beta.5"}}]
         fetch_profile.return_value = b'{"loader": {"version": "0.28.0-beta.5"}}'
-        entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.28.0-beta.5", "0.16.0"
+            )
+            entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
         self.assertEqual(
-            entries[0]["provided_versions"], {"quilt_loader": "0.28.0-beta.5"}
+            entries[0]["provided_versions"],
+            {"quilt_loader": "0.28.0-beta.5", "fabricloader": "0.16.0"},
         )
         self.assertEqual(entries[0]["release_channel"], "prerelease")
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_fabricloader_is_read_per_loader_version(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [
+            {"loader": {"version": "0.30.1"}},
+            {"loader": {"version": "0.26.3"}},
+        ]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            jars = {
+                "0.30.1": self._quilt_maven_jar(directory, "0.30.1", "0.19.3"),
+                "0.26.3": self._quilt_maven_jar(directory, "0.26.3", "0.15.11"),
+            }
+
+            def served(url: str, _name: str, **_kw: Any) -> Path:
+                version = url.split("/quilt-loader/")[1].split("/", 1)[0]
+                return jars[version]
+
+            download.side_effect = served
+            entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
+
+        by_version = {entry["loader_version"]: entry for entry in entries}
+        self.assertEqual(
+            by_version["0.30.1"]["provided_versions"],
+            {"quilt_loader": "0.30.1", "fabricloader": "0.19.3"},
+        )
+        self.assertEqual(
+            by_version["0.26.3"]["provided_versions"],
+            {"quilt_loader": "0.26.3", "fabricloader": "0.15.11"},
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_unreadable_fabricloader_is_left_out_not_guessed(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.30.1", None
+            )
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_unreadable_jar_is_left_out(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quilt-loader-0.30.1.jar"
+            path.write_text("not a zip", encoding="utf-8")
+            download.return_value = path
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_placeholder_fabricloader_is_left_out(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.30.1", "${fabric_loader_version}"
+            )
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
 
     @mock.patch("fetch_loader_manifests._download_to_cache")
     @mock.patch("fetch_loader_manifests._fetch_bytes")
@@ -754,6 +889,49 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         self.assertEqual(
             merged[0]["provided_versions"], {"fabricloader": "0.1.0"}
         )
+
+    def test_merge_adds_a_newly_declared_capability(self):
+        # Existing Quilt entries were published with only their own loader; a
+        # refresh that now reads fabricloader must enrich them, not fail.
+        existing = self._entry(
+            provided_versions={"quilt_loader": "0.30.1"}
+        )
+        fresh = dict(existing)
+        fresh["provided_versions"] = {
+            "quilt_loader": "0.30.1",
+            "fabricloader": "0.19.3",
+        }
+
+        merged = fetch_loader_manifests._merge_entries(
+            [existing], [fresh], loader="quilt"
+        )
+
+        self.assertEqual(
+            merged[0]["provided_versions"],
+            {"quilt_loader": "0.30.1", "fabricloader": "0.19.3"},
+        )
+        # A second refresh, with the same data, is unchanged.
+        rerun = fetch_loader_manifests._merge_entries(
+            merged, [fresh], loader="quilt"
+        )
+        self.assertEqual(rerun, merged)
+
+    def test_merge_rejects_removed_capability(self):
+        existing = self._entry(
+            provided_versions={
+                "quilt_loader": "0.30.1",
+                "fabricloader": "0.19.3",
+            }
+        )
+        fresh = dict(existing)
+        fresh["provided_versions"] = {"quilt_loader": "0.30.1"}
+
+        with self.assertRaises(fetch_loader_manifests.ExistingEntryMutationError) as raised:
+            fetch_loader_manifests._merge_entries(
+                [existing], [fresh], loader="quilt"
+            )
+
+        self.assertIn("provided_versions", raised.exception.mutations[0]["fields"])
 
     def test_merge_rejects_changed_capability(self):
         existing = self._entry(provided_versions={"fabricloader": "0.1.0"})
@@ -922,75 +1100,6 @@ class TestStableJsonSha256(unittest.TestCase):
         hash1 = fetch_loader_manifests._stable_json_sha256(b'{"a":1}')
         hash2 = fetch_loader_manifests._stable_json_sha256(b'{"a":2}')
         self.assertNotEqual(hash1, hash2)
-
-
-class TestSha256File(unittest.TestCase):
-    """Tests for fetch_registry_db.sha256_file."""
-
-    def test_known_content(self):
-        """SHA-256 of a temp file with known content matches expected hash."""
-        expected = (
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        )
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(b"hello")
-            tmp_path = tmp.name
-        try:
-            self.assertEqual(fetch_registry_db.sha256_file(Path(tmp_path)), expected)
-        finally:
-            os.unlink(tmp_path)
-
-    def test_empty_file(self):
-        """SHA-256 of an empty file matches the known empty-hash constant."""
-        expected = (
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        )
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            self.assertEqual(fetch_registry_db.sha256_file(Path(tmp_path)), expected)
-        finally:
-            os.unlink(tmp_path)
-
-
-class TestVerifySha256AgainstDigest(unittest.TestCase):
-    """Tests for fetch_registry_db.verify_sha256_against_digest."""
-
-    def test_no_digest_skips(self):
-        """When digest_field is None, no verification is performed (no exit)."""
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(b"hello")
-            tmp_path = tmp.name
-        try:
-            # Should not raise or call sys.exit
-            fetch_registry_db.verify_sha256_against_digest(Path(tmp_path), None)
-        except SystemExit:
-            self.fail("verify_sha256_against_digest called sys.exit with no digest")
-        finally:
-            os.unlink(tmp_path)
-
-    def test_hex_digest_matches(self):
-        """When digest is a hex string matching the file's SHA-256, no exit occurs."""
-        expected = hashlib.sha256(b"hello").hexdigest()
-        digest_field = f"sha256:{expected}"
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(b"hello")
-            tmp_path = tmp.name
-        try:
-            fetch_registry_db.verify_sha256_against_digest(Path(tmp_path), digest_field)
-        except SystemExit:
-            self.fail("verify_sha256_against_digest called sys.exit on matching digest")
-        finally:
-            os.unlink(tmp_path)
-
-
-
-
-
-
-
-
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1793,7 +1902,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [],
             }, tmp)
@@ -1811,7 +1920,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 2,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [],
             }, tmp)
@@ -1851,7 +1960,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "sandbox",
                 "events": [],
             }, tmp)
@@ -1871,7 +1980,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": "not a list",
             }, tmp)
@@ -1906,7 +2015,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": ["not an object"],
             }, tmp)
@@ -1926,7 +2035,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [
                     {
@@ -1952,7 +2061,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [
                     {
@@ -1983,7 +2092,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [
                     {
@@ -2008,7 +2117,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [
                     {
@@ -2033,7 +2142,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [
                     {
@@ -2084,7 +2193,7 @@ class TestGovernanceStateValidator(unittest.TestCase):
         ) as tmp:
             json.dump({
                 "schema_version": 1,
-                "governance_repository": "agora-mc/Agora-Launcher",
+                "governance_repository": "agora-mc/Agora-Mod-Manager",
                 "policy": "production",
                 "events": [],
             }, tmp)
@@ -2249,6 +2358,47 @@ class TestBuildDocsWebStripTitle(unittest.TestCase):
         self.assertEqual(bdw.strip_title(""), "")
 
 
+class TestPinHashesOtherGames(unittest.TestCase):
+    """pin_hashes accepts a direct_hash entry for another game (MASTER_SPEC §26.8)."""
+
+    def _entry(self, **overrides):
+        entry = {
+            "id": "skyrim-archive-mod",
+            "game": "skyrim-se",
+            "content_type": "mod",
+            "download_strategy": "direct_hash",
+            "source_identifier": "https://example.com/files/Mod-1.0.7z",
+            "sha256": "0" * 64,
+            "game_compatibility": [{"stores": ["steam"], "game_versions": ["1.6.1170.0"]}],
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_other_game_entry_passes_without_compatible_versions(self):
+        self.assertEqual(
+            pin_hashes._validate_direct_hash_contract(self._entry()),
+            "https://example.com/files/Mod-1.0.7z",
+        )
+
+    def test_other_game_entry_needs_game_compatibility(self):
+        entry = self._entry()
+        del entry["game_compatibility"]
+        with self.assertRaises(SystemExit) as caught:
+            pin_hashes._validate_direct_hash_contract(entry)
+        self.assertIn("game_compatibility", str(caught.exception.code))
+
+    def test_other_game_entry_still_needs_an_https_filename(self):
+        with self.assertRaises(SystemExit):
+            pin_hashes._validate_direct_hash_contract(
+                self._entry(source_identifier="https://example.com/download?id=12")
+            )
+
+    def test_minecraft_entry_still_needs_compatible_versions(self):
+        entry = self._entry(game="minecraft", source_identifier="https://example.com/files/m-1.0.jar")
+        del entry["game_compatibility"]
+        with self.assertRaises(SystemExit) as caught:
+            pin_hashes._validate_direct_hash_contract(entry)
+        self.assertIn("compatible_versions", str(caught.exception.code))
 class TestFinalizeReleaseAssetsNames(unittest.TestCase):
     """Tests for finalize_release_assets tag, rename, and plan helpers."""
 
@@ -2274,25 +2424,75 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
             with self.subTest(old_name=old_name):
                 self.assertEqual(fra.desktop_asset_rename(old_name, "0.9.3"), new_name)
 
+    def test_desktop_asset_rename_covers_the_product_stem_names(self):
+        # GitHub turns the spaces in "Agora Mod Manager" into dots on upload.
+        cases = {
+            "Agora.Mod.Manager_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+            "Agora.Mod.Manager_0.9.3_x64_en-US.msi": "agora-desktop-v0.9.3-windows-x64.msi",
+            "Agora.Mod.Manager_0.9.3_aarch64.dmg": "agora-desktop-v0.9.3-macos-arm64.dmg",
+            "Agora.Mod.Manager_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg",
+            "Agora.Mod.Manager_0.9.3_amd64.AppImage": "agora-desktop-v0.9.3-linux-x64.AppImage",
+            "Agora.Mod.Manager_0.9.3_amd64.deb": "agora-desktop-v0.9.3-linux-x64.deb",
+            "Agora.Mod.Manager-0.9.3-1.x86_64.rpm": "agora-desktop-v0.9.3-linux-x64.rpm",
+            "Agora.Mod.Manager_aarch64.app.tar.gz": "agora-desktop-v0.9.3-macos-arm64.app.tar.gz",
+            "Agora.Mod.Manager_x64.app.tar.gz": "agora-desktop-v0.9.3-macos-x64.app.tar.gz",
+        }
+        for old_name, new_name in cases.items():
+            with self.subTest(old_name=old_name):
+                self.assertEqual(fra.desktop_asset_rename(old_name, "0.9.3"), new_name)
+
     def test_desktop_asset_rename_accepts_any_msi_locale(self):
         self.assertEqual(
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64_pt-BR.msi", "0.9.3"),
+            "agora-desktop-v0.9.3-windows-x64.msi",
+        )
+        self.assertEqual(
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.9.3_x64_pt-BR.msi", "0.9.3"),
             "agora-desktop-v0.9.3-windows-x64.msi",
         )
 
     def test_desktop_asset_rename_rejects_mismatched_version(self):
         with self.assertRaisesRegex(fra.ReleaseAssetError, "0.1.0"):
             fra.desktop_asset_rename("Agora.Launcher_0.1.0_x64-setup.exe", "0.9.3")
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "0.1.0"):
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.1.0_x64-setup.exe", "0.9.3")
 
     def test_desktop_asset_rename_rejects_unknown_bundle(self):
         with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64.snap", "0.9.3")
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.9.3_x64.snap", "0.9.3")
+
+    def test_desktop_asset_rename_rejects_unknown_product_stems(self):
+        # Hostile near-misses: a mixed stem, a wrong case, a raw spaced name
+        # (GitHub never stores one), and an empty product before the version.
+        for name in (
+            "Agora.Mod.Launcher_0.9.3_x64-setup.exe",
+            "Agora.Modmanager_0.9.3_x64-setup.exe",
+            "agora.mod.manager_0.9.3_x64-setup.exe",
+            "Agora Mod Manager_0.9.3_x64-setup.exe",
+            "_0.9.3_x64-setup.exe",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+                    fra.desktop_asset_rename(name, "0.9.3")
 
     def test_desktop_asset_rename_rejects_drifted_updater_archive(self):
         # Tauri does not version .app.tar.gz names; if that ever changes, the
         # table must be updated rather than silently mis-renaming the archive.
         with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64.app.tar.gz", "0.9.3")
+        # No arch suffix: which macOS build it belongs to cannot be told, so it is refused.
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+            fra.desktop_asset_rename("Agora.Mod.Manager.app.tar.gz", "0.9.3")
+
+    def test_is_tauri_bundle_name_matches_both_product_stems_only(self):
+        for name in ("Agora.Launcher_0.9.3_x64.dmg", "Agora.Mod.Manager_0.9.3_x64.dmg"):
+            with self.subTest(name=name):
+                self.assertTrue(fra.is_tauri_bundle_name(name))
+        for name in ("", "agora-desktop-v0.9.3-windows-x64.msi", "Agora Mod Manager_0.9.3.msi", "Agora.Modmanager_0.9.3.msi", "agora.mod.manager_0.9.3.msi"):
+            with self.subTest(name=name):
+                self.assertFalse(fra.is_tauri_bundle_name(name))
 
     def test_plan_desktop_renames_skips_signature_sidecars(self):
         names = [
@@ -2305,6 +2505,20 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
             {"Agora.Launcher_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg"},
         )
 
+    def test_plan_desktop_renames_skips_signature_sidecars_of_product_stem_names(self):
+        names = [
+            "Agora.Mod.Manager_0.9.3_x64.dmg",
+            "Agora.Mod.Manager_0.9.3_x64.dmg.sig",
+            "Agora.Mod.Manager_x64.app.tar.gz.sig",
+        ]
+        self.assertEqual(
+            fra.plan_desktop_renames(names, "0.9.3"),
+            {"Agora.Mod.Manager_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg"},
+        )
+
+    def test_plan_desktop_renames_handles_an_empty_release(self):
+        self.assertEqual(fra.plan_desktop_renames([], "0.9.3"), {})
+
     def test_plan_desktop_renames_rejects_colliding_targets(self):
         names = [
             "Agora.Launcher_0.9.3_x64_en-US.msi",
@@ -2312,6 +2526,26 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
         ]
         with self.assertRaises(fra.ReleaseAssetError):
             fra.plan_desktop_renames(names, "0.9.3")
+        product_names = [
+            "Agora.Mod.Manager_0.9.3_x64_en-US.msi",
+            "Agora.Mod.Manager_0.9.3_x64_pt-BR.msi",
+        ]
+        with self.assertRaises(fra.ReleaseAssetError):
+            fra.plan_desktop_renames(product_names, "0.9.3")
+
+    def test_plan_desktop_renames_maps_a_mixed_old_and_new_release(self):
+        # A draft published before the rename can hold old names beside new ones.
+        names = [
+            "Agora.Launcher_0.9.3_x64-setup.exe",
+            "Agora.Mod.Manager_0.9.3_aarch64.dmg",
+        ]
+        self.assertEqual(
+            fra.plan_desktop_renames(names, "0.9.3"),
+            {
+                "Agora.Launcher_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+                "Agora.Mod.Manager_0.9.3_aarch64.dmg": "agora-desktop-v0.9.3-macos-arm64.dmg",
+            },
+        )
 
 
 class TestFinalizeReleaseAssetsChecksums(unittest.TestCase):
@@ -2411,6 +2645,32 @@ class TestFinalizeReleaseAssetsLatestJson(unittest.TestCase):
         latest = {
             "platforms": {
                 "windows-x86_64": {"url": "https://example.test/Agora.Launcher_0.9.3_x64.msi"}
+            }
+        }
+        with self.assertRaises(fra.ReleaseAssetError):
+            fra.rewrite_latest_urls(latest, {})
+
+    def test_rewrites_product_stem_urls(self):
+        latest = {
+            "platforms": {
+                "windows-x86_64-nsis": {
+                    "url": "https://github.com/o/r/releases/download/v0.9.3/Agora.Mod.Manager_0.9.3_x64-setup.exe",
+                },
+            }
+        }
+        renames = {
+            "Agora.Mod.Manager_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+        }
+        rewritten = fra.rewrite_latest_urls(latest, renames)
+        self.assertEqual(
+            rewritten["platforms"]["windows-x86_64-nsis"]["url"],
+            "https://github.com/o/r/releases/download/v0.9.3/agora-desktop-v0.9.3-windows-x64-setup.exe",
+        )
+
+    def test_uncovered_product_stem_url_is_an_error(self):
+        latest = {
+            "platforms": {
+                "windows-x86_64": {"url": "https://example.test/Agora.Mod.Manager_0.9.3_x64.msi"}
             }
         }
         with self.assertRaises(fra.ReleaseAssetError):
@@ -2531,6 +2791,63 @@ class TestFinalizeReleaseAssetsApply(unittest.TestCase):
             self.assertEqual(fra.main(["--repo", "o/r", "--tag", self.TAG]), 0)
         plan.assert_called_once_with("o/r", self.TAG, "0.9.3")
 
+    def test_plan_and_apply_renames_product_stem_bundles(self):
+        new_names = tuple(name.replace("Agora.Launcher", "Agora.Mod.Manager") for name in self.OLD_NAMES)
+        expected = fra.expected_asset_names(self.TAG)
+        bundle_targets = {fra.desktop_asset_rename(name, "0.9.3") for name in new_names}
+        # Everything the release must hold that no bundle rename produces (CLI, portable, checksum).
+        non_bundle = [name for name in expected if name not in bundle_targets]
+        before = [
+            *(self._asset(name, index + 1) for index, name in enumerate(new_names)),
+            *(self._asset(name + ".sig", 100 + index) for index, name in enumerate(new_names)),
+            *(self._asset(name, 300 + index) for index, name in enumerate(non_bundle)),
+            self._asset("latest.json", 600),
+        ]
+        after = [self._asset(name, 200 + index) for index, name in enumerate(expected)]
+        after.append(self._asset("latest.json", 600))
+        latest = {
+            "platforms": {
+                "windows-x86_64-nsis": {
+                    "url": f"https://github.com/o/r/releases/download/{self.TAG}/Agora.Mod.Manager_0.9.3_x64-setup.exe",
+                },
+            }
+        }
+        uploads: dict[str, str] = {}
+
+        def fake_download(repo, tag, name, directory):
+            path = Path(directory) / name
+            path.write_text(json.dumps(latest), encoding="utf-8")
+            return path
+
+        def fake_upload(repo, tag, path):
+            uploads[Path(path).name] = Path(path).read_text(encoding="utf-8")
+
+        manager = mock.Mock()
+        with (
+            mock.patch.object(fra, "fetch_assets", side_effect=[before, after]),
+            mock.patch.object(fra, "delete_asset", manager.delete),
+            mock.patch.object(fra, "rename_asset", manager.rename),
+            mock.patch.object(fra, "download_asset", side_effect=fake_download),
+            mock.patch.object(fra, "upload_asset", side_effect=fake_upload),
+            mock.patch.object(fra, "asset_digest", return_value="a" * 64),
+        ):
+            fra.plan_and_apply("o/r", self.TAG, "0.9.3")
+
+        renamed = {call.args[1]["name"]: call.args[2] for call in manager.rename.call_args_list}
+        self.assertEqual(set(renamed), set(new_names))
+        self.assertEqual(
+            renamed["Agora.Mod.Manager_0.9.3_x64-setup.exe"],
+            "agora-desktop-v0.9.3-windows-x64-setup.exe",
+        )
+        deleted = sorted(call.args[1]["name"] for call in manager.delete.call_args_list)
+        self.assertEqual(deleted, sorted(name + ".sig" for name in new_names))
+        rewritten = json.loads(uploads["latest.json"])
+        self.assertTrue(
+            rewritten["platforms"]["windows-x86_64-nsis"]["url"].endswith(
+                "/agora-desktop-v0.9.3-windows-x64-setup.exe"
+            )
+        )
+
 
 class TestStageCliSidecar(unittest.TestCase):
     """Tests for stage_cli_sidecar's path rules, which must match Tauri's."""
@@ -2556,6 +2873,322 @@ class TestStageCliSidecar(unittest.TestCase):
             stage_cli_sidecar.built_cli_path(t, "x86_64-apple-darwin", explicit_target=True),
             t / "x86_64-apple-darwin" / "release" / "agora",
         )
+
+
+def fake_pe(machine: int) -> bytes:
+    """The smallest bytes pe_machine reads: MZ, the PE offset at 0x3C, the PE signature, the machine."""
+    data = bytearray(0x88)
+    data[0:2] = b"MZ"
+    data[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    data[0x80:0x84] = b"PE\0\0"
+    data[0x84:0x86] = machine.to_bytes(2, "little")
+    return bytes(data)
+
+
+class TestStageVfsFiles(unittest.TestCase):
+    """stage_vfs_files builds the x86-folder layout and refuses a file of the wrong bitness."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.x64 = root / "release"
+        self.x86 = root / "i686" / "release"
+        self.stage_dir = root / "stage"
+        self.x64.mkdir(parents=True)
+        self.x86.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, folder, name, machine):
+        (folder / name).write_bytes(fake_pe(machine))
+
+    def write_all(self, x64_machine=0x8664, x86_machine=0x014C):
+        self.write(self.x64, "agora_vfs.dll", x64_machine)
+        self.write(self.x64, "agora-vfs-helper.exe", x64_machine)
+        self.write(self.x86, "agora_vfs.dll", x86_machine)
+        self.write(self.x86, "agora-vfs-helper.exe", x86_machine)
+
+    def test_pe_machine_reads_the_machine_type(self):
+        path = self.x64 / "probe.dll"
+        path.write_bytes(fake_pe(0x014C))
+        self.assertEqual(stage_vfs_files.pe_machine(path), 0x014C)
+
+    def test_pe_machine_refuses_a_file_that_is_not_a_pe_image(self):
+        path = self.x64 / "text.dll"
+        path.write_bytes(b"not a dll at all, just some text padding out to be long enough")
+        with self.assertRaises(ValueError):
+            stage_vfs_files.pe_machine(path)
+
+    def test_stages_the_64_bit_pair_and_the_x86_folder(self):
+        self.write_all()
+        staged = stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertEqual(
+            sorted(p.relative_to(self.stage_dir).as_posix() for p in staged),
+            [
+                "agora-vfs-helper.exe",
+                "agora_vfs.dll",
+                "x86/agora-vfs-helper.exe",
+                "x86/agora_vfs.dll",
+            ],
+        )
+        self.assertEqual(
+            stage_vfs_files.pe_machine(self.stage_dir / "x86" / "agora_vfs.dll"), 0x014C
+        )
+        self.assertEqual(
+            stage_vfs_files.pe_machine(self.stage_dir / "agora_vfs.dll"), 0x8664
+        )
+
+    def test_a_64_bit_build_in_the_x86_folder_is_refused_and_nothing_is_staged(self):
+        self.write_all(x86_machine=0x8664)
+        with self.assertRaises(SystemExit) as caught:
+            stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertIn("expected 0x014c", str(caught.exception))
+        self.assertFalse(self.stage_dir.exists())
+
+    def test_a_missing_file_is_refused_and_named(self):
+        self.write_all()
+        (self.x86 / "agora-vfs-helper.exe").unlink()
+        with self.assertRaises(SystemExit) as caught:
+            stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertIn("agora-vfs-helper.exe", str(caught.exception))
+        self.assertFalse(self.stage_dir.exists())
+
+    def test_main_takes_the_build_folders_and_stage_folder_as_arguments(self):
+        self.write_all()
+        out = self.stage_dir.parent / "cli-vfs"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = stage_vfs_files.main(
+                [
+                    "--x64-build", str(self.x64),
+                    "--x86-build", str(self.x86),
+                    "--stage-dir", str(out),
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertTrue((out / "x86" / "agora-vfs-helper.exe").is_file())
+        self.assertFalse(self.stage_dir.exists())
+
+    def test_an_earlier_stage_is_replaced_not_merged(self):
+        self.write_all()
+        stale = self.stage_dir / "x86" / "old-helper.exe"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"stale")
+        stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertFalse(stale.exists())
+
+
+class OfficialPluginPackageTests(unittest.TestCase):
+    """The official plugin zip and the registry entry that pins it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.out = self.root / "out"
+        self.folder = self.root / "skyrim-se"
+        shutil.copytree(bop.OFFICIAL_ROOT / "skyrim-se", self.folder)
+
+    def test_the_skyrim_plugin_declares_one_game_and_game_define(self):
+        manifest = bop.plugin_manifest(bop.OFFICIAL_ROOT / "skyrim-se")
+        self.assertEqual(manifest["id"], "agora.creation-engine")
+        self.assertIn("game:define", manifest["capabilities"]["required"])
+        self.assertEqual(
+            bop.game_ids(bop.OFFICIAL_ROOT / "skyrim-se", manifest), ["skyrim-se"]
+        )
+
+    def test_the_zip_is_identical_across_builds_and_mtimes(self):
+        first = bop.build_zip(self.folder, self.out, "0.1.0").read_bytes()
+        for path in self.folder.rglob("*"):
+            os.utime(path, (1_234_567_890, 1_234_567_890))
+        second = bop.build_zip(self.folder, self.out, "0.1.0").read_bytes()
+        self.assertEqual(first, second)
+
+    def test_entries_are_sorted_stored_and_fixed(self):
+        archive = bop.build_zip(self.folder, self.out, "0.1.0")
+        with zipfile.ZipFile(archive) as bundle:
+            infos = bundle.infolist()
+        names = [info.filename for info in infos]
+        self.assertEqual(names, sorted(names))
+        for info in infos:
+            self.assertEqual(info.date_time, bop.FIXED_DATE)
+            self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(info.external_attr, bop.FIXED_MODE << 16)
+
+    def test_the_registry_entry_is_derived_from_the_built_zip(self):
+        built = bop.describe(bop.OFFICIAL_ROOT / "skyrim-se", self.out)
+        entry = bop.read_json(bop.registry_path(built["id"]))
+        self.assertEqual(entry["current"]["sha256"], built["sha256"])
+        self.assertEqual(entry["current"]["size"], built["size"])
+        self.assertEqual(entry["current"]["package_url"], built["package_url"])
+        self.assertEqual(
+            entry, bop.registry_entry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+        )
+        bop.verify_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+
+    def test_verify_refuses_a_stale_hash(self):
+        built = bop.describe(bop.OFFICIAL_ROOT / "skyrim-se", self.out)
+        registry = self.root / "registry"
+        with mock.patch.object(bop, "REGISTRY_ROOT", registry):
+            path = bop.update_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["current"]["sha256"] = "0" * 64
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                bop.verify_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+        self.assertIn("current.sha256", str(caught.exception))
+
+
+class TestPackageDocsSurfaceCheck(unittest.TestCase):
+    """Tests for the game-package documentation surface check."""
+
+    def test_documented_names_are_inline_code_spans(self):
+        names = cpd.documented_names("Use `foo` and `bar`, not `baz qux`.")
+        self.assertEqual(names, {"foo", "bar", "baz qux"})
+
+    def test_map_values_are_not_schema_keys(self):
+        data = {
+            "game_templates": {"engine": {"content_layout": {"data_path": "Data"}}},
+            "environment": {"LD_PRELOAD": {"kind": "literal", "value": "x"}},
+            "behaviours": {"classify": "classifyItem"},
+        }
+        keys = {key for key, _ in cpd.iter_json_keys(data)}
+
+        self.assertIn("game_templates", keys)
+        self.assertIn("content_layout", keys)
+        self.assertIn("data_path", keys)
+        self.assertIn("environment", keys)
+        self.assertIn("kind", keys)
+        self.assertIn("value", keys)
+        self.assertIn("behaviours", keys)
+        self.assertIn("classify", keys)
+
+        self.assertNotIn("engine", keys)
+        self.assertNotIn("LD_PRELOAD", keys)
+        self.assertNotIn("classifyItem", keys)
+
+    def test_rust_fields_honour_serde_rename_and_skip_type_paths(self):
+        source = """
+pub struct ContentRule {
+    pub kind: String,
+    #[serde(rename = "match")]
+    pub matching: ContentMatch,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub when: Option<Condition>,
+}
+
+pub enum LoadOrderRule {
+    Before {
+        first: String,
+        second: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+    },
+    Requires {
+        item: String,
+        master: String,
+    },
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / f"game-{os.getpid()}.rs"
+            path.write_text(source, encoding="utf-8")
+            fields = cpd.rust_fields(path)
+
+        self.assertEqual(
+            fields,
+            {
+                "kind",
+                "match",
+                "when",
+                "first",
+                "second",
+                "optional",
+                "item",
+                "master",
+            },
+        )
+        self.assertNotIn("std", fields)
+        self.assertNotIn("ops", fields)
+        self.assertNotIn("Not", fields)
+
+    def test_this_repository_documents_every_key_and_field(self):
+        self.assertEqual(cpd.check(), [])
+
+    def test_both_package_roots_are_checked(self):
+        files = cpd.package_files()
+        self.assertEqual(len(files), 6, [str(path) for path in files])
+        self.assertTrue(any("official" in path.parts for path in files))
+        self.assertTrue(any("tracers" in path.parts for path in files))
+
+
+class TestGamePackageGuideExamples(unittest.TestCase):
+    """The guide's complete package examples must parse into a package."""
+
+    GUIDE = (
+        Path(__file__).resolve().parent.parent
+        / "docs"
+        / "plugins"
+        / "game-packages.md"
+    )
+    REQUIRED_PACKAGE = {
+        "id",
+        "version",
+        "api_range",
+        "games",
+    }
+    REQUIRED_GAME = {
+        "id",
+        "name",
+        "stores",
+        "version_sources",
+        "deployment",
+    }
+    REQUIRED_LAUNCH = {
+        "executable",
+        "working_directory",
+    }
+
+    def _json_blocks(self):
+        text = self.GUIDE.read_text(encoding="utf-8")
+        return re.findall(r"```json\n(.*?)```", text, re.DOTALL)
+
+    def test_complete_package_examples_have_the_required_fields(self):
+        complete = []
+        for block in self._json_blocks():
+            try:
+                value = json.loads(block)
+            except json.JSONDecodeError:
+                # A fragment such as `"load_orders": [...]` is not a document.
+                continue
+            if isinstance(value, dict) and {
+                "games",
+                "version",
+                "api_range",
+            } <= value.keys():
+                complete.append(value)
+
+        self.assertTrue(complete, "the guide has no complete package example")
+        for package in complete:
+            self.assertEqual(
+                self.REQUIRED_PACKAGE - package.keys(),
+                set(),
+                f"package example is missing {self.REQUIRED_PACKAGE - package.keys()}",
+            )
+            for game in package["games"]:
+                self.assertEqual(
+                    self.REQUIRED_GAME - game.keys(),
+                    set(),
+                    f"game example is missing {self.REQUIRED_GAME - game.keys()}",
+                )
+                launch = game.get("launch")
+                if launch is not None:
+                    self.assertEqual(
+                        self.REQUIRED_LAUNCH - launch.keys(),
+                        set(),
+                        "launch example is missing "
+                        f"{self.REQUIRED_LAUNCH - launch.keys()}",
+                    )
 
 
 if __name__ == "__main__":

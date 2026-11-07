@@ -1,12 +1,10 @@
-use crate::crash_investigator;
 use crate::error::{LauncherError, LauncherResult};
 use crate::models::InstanceRow;
 use crate::mojang;
-use crate::paths;
 use std::path::Path;
 
-pub use agora_core::instance_service::{CreateInstanceRequest, InstanceDetail};
-pub use agora_core::loader_service::LoaderVersionSummary;
+pub use agora_game_minecraft::instance_service::{CreateInstanceRequest, InstanceDetail};
+pub use agora_game_minecraft::loader_service::LoaderVersionSummary;
 
 /// Create an isolated instance directory, persist metadata, and ensure loader install.
 ///
@@ -27,7 +25,7 @@ pub async fn create_instance<R: tauri::Runtime>(
             app: app.clone(),
             instance_id,
         }));
-    agora_core::instance_service::InstanceService::new(ctx)
+    agora_game_minecraft::instance_service::InstanceService::new(ctx)
         .create(req)
         .await
 }
@@ -97,9 +95,9 @@ pub async fn ensure_loader_installed<R: tauri::Runtime>(
     loader_version: &str,
     force_reinstall: bool,
     _minecraft_root: &Path,
-) -> LauncherResult<agora_core::installed_profile::InstallReceiptSummary> {
+) -> LauncherResult<agora_game_minecraft::installed_profile::InstallReceiptSummary> {
     let ctx = crate::core_context(app)?;
-    agora_core::loader_service::LoaderService::new(ctx)
+    agora_game_minecraft::loader_service::LoaderService::new(ctx)
         .ensure_installed(loader, mc_version, loader_version, force_reinstall)
         .await
 }
@@ -113,9 +111,9 @@ pub async fn ensure_loader_installed<R: tauri::Runtime>(
 pub async fn repair_instance_loader<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     instance_id: &str,
-) -> LauncherResult<agora_core::installed_profile::InstallReceiptSummary> {
+) -> LauncherResult<agora_game_minecraft::installed_profile::InstallReceiptSummary> {
     let ctx = crate::core_context(app)?;
-    agora_core::loader_service::LoaderService::new(ctx)
+    agora_game_minecraft::loader_service::LoaderService::new(ctx)
         .repair(instance_id)
         .await
 }
@@ -129,7 +127,7 @@ pub fn list_instances<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> LauncherResult<Vec<InstanceRow>> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx).list()
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).list()
 }
 
 /// Fetch a single instance and its on-disk manifest.
@@ -138,7 +136,7 @@ pub fn get_instance_detail<R: tauri::Runtime>(
     instance_id: &str,
 ) -> LauncherResult<Option<InstanceDetail>> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx).get(instance_id)
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).get(instance_id)
 }
 
 /// Delete an instance: delegates to core `InstanceService::delete`, which
@@ -148,23 +146,25 @@ pub fn delete_instance<R: tauri::Runtime>(
     instance_id: &str,
 ) -> LauncherResult<()> {
     let ctx = crate::core_context(app)?;
-    let service = agora_core::instance_service::InstanceService::new(ctx);
+    let service = agora_game_minecraft::instance_service::InstanceService::new(ctx);
     service.delete(instance_id)
 }
 
 pub fn list_recently_deleted<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-) -> LauncherResult<Vec<agora_core::recently_deleted::RecentlyDeletedEntry>> {
+) -> LauncherResult<Vec<agora_game_minecraft::recently_deleted::RecentlyDeletedEntry>> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx).list_recently_deleted()
+    // One window for every game: the setting the games' own Recently deleted reads.
+    let days = agora_core::game_instance::trash::retention_days(&ctx);
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).list_recently_deleted(days)
 }
 
 pub fn restore_deleted_instance<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     entry_id: &str,
-) -> LauncherResult<agora_core::recently_deleted::RestoreOutcome> {
+) -> LauncherResult<agora_game_minecraft::recently_deleted::RestoreOutcome> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx).restore_deleted(entry_id)
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).restore_deleted(entry_id)
 }
 
 /// "Delete now": hand the entry to the OS trash.
@@ -173,13 +173,13 @@ pub fn purge_deleted_instance<R: tauri::Runtime>(
     entry_id: &str,
 ) -> LauncherResult<()> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx)
+    agora_game_minecraft::instance_service::InstanceService::new(ctx)
         .purge_deleted(entry_id, &trash_adapter())
 }
 
 /// Build the OS-trash adapter that core calls when an entry leaves
 /// "Recently deleted".
-pub fn trash_adapter() -> agora_core::instance_service::TrashFn {
+pub fn trash_adapter() -> agora_game_minecraft::instance_service::TrashFn {
     std::sync::Arc::new(|path| {
         trash::delete(path).map_err(|e| LauncherError::Generic {
             code: "ERR_INSTANCE_DELETE".into(),
@@ -194,7 +194,7 @@ pub async fn unlock_instance<R: tauri::Runtime>(
     instance_id: &str,
 ) -> LauncherResult<()> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx).unlock(instance_id)
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).unlock(instance_id)
 }
 
 /// Lock an unlocked pack instance, discarding the lock snapshot.
@@ -203,7 +203,7 @@ pub async fn lock_instance<R: tauri::Runtime>(
     instance_id: &str,
 ) -> LauncherResult<()> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx).lock(instance_id)
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).lock(instance_id)
 }
 
 /// Rename an instance in the local state DB.
@@ -213,7 +213,7 @@ pub async fn rename_instance<R: tauri::Runtime>(
     new_name: &str,
 ) -> LauncherResult<()> {
     let ctx = crate::core_context(app)?;
-    agora_core::instance_service::InstanceService::new(ctx).rename(instance_id, new_name)
+    agora_game_minecraft::instance_service::InstanceService::new(ctx).rename(instance_id, new_name)
 }
 
 /// Revert an unlocked instance to its lock snapshot (§6.5). Restores through
@@ -249,12 +249,12 @@ pub fn launch_instance<R: tauri::Runtime>(
     restart_launcher: bool,
 ) -> LauncherResult<()> {
     let ctx = crate::core_context(app)?;
-    let service = agora_core::instance_service::InstanceService::new(ctx);
+    let service = agora_game_minecraft::instance_service::InstanceService::new(ctx);
     let mut preparation = service.prepare_delegated_launch(instance_id)?;
 
     if preparation.launcher_running && restart_launcher {
         let resolved = mojang::resolve_launcher_path(preparation.launcher_path.as_deref()).ok();
-        if !agora_core::official_launcher::close_running(
+        if !agora_game_minecraft::official_launcher::close_running(
             resolved.as_deref(),
             std::time::Duration::from_secs(15),
         ) {
@@ -289,9 +289,7 @@ pub fn launch_instance<R: tauri::Runtime>(
         .spawn()
         .map_err(|_| LauncherError::LaunchFailed)?;
 
-    // Signal D: record which mods survived this launch for survival baseline learning.
-    let sanitized = paths::sanitize_id(instance_id);
-    let _ = crash_investigator::record_survival(app, &sanitized, &preparation.mod_ids);
-
+    // Survival is recorded when the launch ends cleanly, not when it starts:
+    // see the delegated monitor and the direct launch's `finished` callback.
     Ok(())
 }

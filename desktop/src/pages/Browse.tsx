@@ -44,6 +44,7 @@ import type { BazaarItem } from '../components/browse/bazaar-model';
 import { InstallFlow } from '../components/InstallFlow';
 import { usePackInstall } from '../components/PackInstallProgress';
 import { showToast } from '../components/Toast';
+import { Switch } from '../components/ui/switch';
 import {
   saveBrowseSnapshot,
   peekBrowseSnapshot,
@@ -390,7 +391,7 @@ function RegistryRecoveryShell({
   );
 }
 
-export function Browse({ onSelectMod, onOpenInstance, initialInstanceId, initialContentType }: { onSelectMod?: (id: string, instanceId?: string, contentType?: string) => void; onOpenInstance?: (instanceId: string) => void; initialInstanceId?: string; initialContentType?: string }) {
+export function Browse({ onSelectMod, onOpenInstance, onOpenLibrary, initialInstanceId, initialContentType }: { onSelectMod?: (id: string, instanceId?: string, contentType?: string) => void; onOpenInstance?: (instanceId: string) => void; onOpenLibrary?: () => void; initialInstanceId?: string; initialContentType?: string }) {
   // Catalog availability — show the recovery panel when there is nothing left
   // to browse. These are the ONLY hook calls in this component, and both are
   // unconditional, so the hook count is stable.
@@ -433,12 +434,13 @@ export function Browse({ onSelectMod, onOpenInstance, initialInstanceId, initial
 
   // Remount when catalog availability flips (e.g. the first download lands) so
   // every value derived from it — sort options, category metadata — is rebuilt.
-  return <BrowseContent key={catalogAvailable ? 'with-catalog' : 'live-only'} onSelectMod={onSelectMod} onOpenInstance={onOpenInstance} initialInstanceId={initialInstanceId} initialContentType={initialContentType} catalogAvailable={catalogAvailable} registryState={registry.state} registryStatus={registry.status} registryError={registry.error} registryActions={registry.actions} />;
+  return <BrowseContent key={catalogAvailable ? 'with-catalog' : 'live-only'} onSelectMod={onSelectMod} onOpenInstance={onOpenInstance} onOpenLibrary={onOpenLibrary} initialInstanceId={initialInstanceId} initialContentType={initialContentType} catalogAvailable={catalogAvailable} registryState={registry.state} registryStatus={registry.status} registryError={registry.error} registryActions={registry.actions} />;
 }
 
 function BrowseContent({
   onSelectMod,
   onOpenInstance,
+  onOpenLibrary,
   initialInstanceId,
   initialContentType,
   catalogAvailable,
@@ -449,6 +451,7 @@ function BrowseContent({
 }: {
   onSelectMod?: (id: string, instanceId?: string, contentType?: string) => void;
   onOpenInstance?: (instanceId: string) => void;
+  onOpenLibrary?: () => void;
   initialInstanceId?: string;
   initialContentType?: string;
   /** False when the curated catalog is not on disk; live sources carry the page. */
@@ -1453,10 +1456,21 @@ function BrowseContent({
         subtitle="Curated mods, packs, shaders, resource packs, and more."
         note={simpleBrowse ? null : 'The Bazaar is a playful, browse-by-stalls view of the same catalog.'}
         actions={
-          /* Simple mode has exactly one Browse. Offering a door to the Bazaar
-             from it would put the thing the mode exists to avoid one click
-             away - the interaction mode is changed in Settings, not here. */
-          simpleBrowse ? null : (
+          <>
+            {onOpenLibrary && (
+              <button
+                type="button"
+                onClick={onOpenLibrary}
+                className="rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-accent"
+                data-testid="open-library"
+              >
+                Your Library
+              </button>
+            )}
+            {/* Simple mode has exactly one Browse. Offering a door to the Bazaar
+               from it would put the thing the mode exists to avoid one click
+               away - the interaction mode is changed in Settings, not here. */}
+            {simpleBrowse ? null : (
             <button
               type="button"
               onClick={() => setBazaarMode(true)}
@@ -1465,7 +1479,8 @@ function BrowseContent({
             >
               The Bazaar 🎡
             </button>
-          )
+          )}
+          </>
         }
       />
 
@@ -1629,15 +1644,14 @@ function BrowseContent({
           ))}
         </select>
         {activeInstance && (
-          <label className="flex items-center gap-2 text-sm" title={`Leave out what ${activeInstance.row.name} already has`}>
-            <input
-              type="checkbox"
+          <div className="flex items-center gap-2 text-sm" title={`Leave out what ${activeInstance.row.name} already has`}>
+            <Switch
+              aria-label="Hide installed"
               checked={hideInstalled}
-              onChange={(e) => setHideInstalled(e.target.checked)}
-              className="h-4 w-4 accent-primary"
+              onCheckedChange={setHideInstalled}
             />
             Hide installed
-          </label>
+          </div>
         )}
       </div>
 

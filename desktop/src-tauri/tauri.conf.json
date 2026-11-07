@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Agora Launcher",
-  "version": "0.1.0",
+  "productName": "Agora Mod Manager",
+  "version": "0.9.5",
   "identifier": "com.agoramc.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Agora Launcher",
+        "title": "Agora Mod Manager",
         "width": 1280,
         "height": 800,
         "minWidth": 900,
@@ -33,7 +33,7 @@
     },
     "updater": {
       "endpoints": [
-        "https://github.com/agora-mc/Agora-Launcher/releases/latest/download/latest.json"
+        "https://github.com/agora-mc/Agora-Mod-Manager/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY0RURFOTU4MzkzQ0VENjMKUldSajdUdzVXT250OUQwSEFWREVIam5pUlduY3dIUkhRa2lObUMyY1ZEa2dYREtUNUMvUEhVY2UK",
       "windows": {
