@@ -2611,18 +2611,23 @@ fn real_injection_a_32_bit_tool_runs_under_the_vfs_and_its_write_is_promoted() {
         .join("agora-vfs-probe.exe");
     assert!(probe.is_file(), "{} does not exist", probe.display());
     // The probe's results go to a folder outside the view; it writes its files into the game's Data.
+    // The folder is a player input, not a declared literal: the player chose that path.
     let out = std::env::temp_dir().join(format!("agora-tool32-out-{}", std::process::id()));
     std::fs::create_dir_all(&out).unwrap();
-    let f = fixture_with_exe(
-        vec![tool(
-            "probe32",
-            "Probe",
-            &["--root", ".", "--out", out.to_str().unwrap()],
-        )],
-        false,
-        false,
-        probe.to_str().unwrap(),
-    );
+    let mut probe32 = tool("probe32", "Probe", &["--root", "."]);
+    let mut out_input = input("out", ToolInputKind::Folder, "--out");
+    out_input.required = true;
+    probe32.inputs = vec![out_input];
+    let f = fixture_with_exe(vec![probe32], false, false, probe.to_str().unwrap());
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("probe32").unwrap(),
+        "out",
+        out.to_str().unwrap(),
+    )
+    .unwrap();
     let launcher = RealLauncher::new(&[]);
 
     let run = f.run_as("probe32", &launcher, CaptureMode::Vfs);
@@ -6869,6 +6874,141 @@ fn an_item_scoped_tool_gets_only_that_item() {
         ]
     );
     assert!(game_tools::tool_input_arguments(&t, &Default::default(), None).is_err());
+}
+
+#[test]
+fn a_folder_input_with_an_absolute_path_runs() {
+    let mut t = writes_or_fails("folder-in");
+    let mut folder = input("out", ToolInputKind::Folder, "--out");
+    folder.required = true;
+    t.inputs = vec![folder];
+    let f = fixture(vec![t]);
+    let out = TempDir::new().unwrap();
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("folder-in").unwrap(),
+        "out",
+        out.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let run = f.run_ok("folder-in", &StagingLauncher::new());
+    assert!(run.written.iter().any(|path| path == "Data/nemesis.txt"));
+}
+
+#[test]
+fn a_user_tool_with_a_relative_exe_may_pass_an_absolute_argument() {
+    let f = fixture(Vec::new());
+    let cmd = std::fs::read(r"C:\Windows\System32\cmd.exe").unwrap();
+    f.add_mod("Tools", &[("Data/tools/My.exe", &cmd)]);
+    let out = TempDir::new().unwrap();
+    let user = game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: "Absolute argument".into(),
+            exe: "Data/tools/My.exe".into(),
+            args: vec![
+                "/c".into(),
+                "exit".into(),
+                "0".into(),
+                "--out".into(),
+                out.path().to_string_lossy().into_owned(),
+            ],
+            output_is_mod: false,
+            output_folder: None,
+            keeps_output: false,
+        },
+    )
+    .unwrap();
+    let run = run_user_tool(&f, &user.id, &StagingLauncher::new(), false)
+        .expect("the player's absolute argument must not be refused");
+    assert!(run.promoted, "{run:?}");
+}
+
+#[test]
+fn an_item_scoped_tool_with_an_absolute_item_path_runs() {
+    let mut t = writes_or_fails("item-abs");
+    t.scope = ToolScope::Item;
+    let mut target = input("target", ToolInputKind::Text, "--target");
+    target.default = Some("{item}".into());
+    let mut out = input("out", ToolInputKind::Folder, "--out");
+    out.required = true;
+    t.inputs = vec![target, out];
+    let f = fixture(vec![t]);
+    let item = item_named(&f, "A", Some("mods/A"), &[("a.txt", b"a")]);
+    let folder = TempDir::new().unwrap();
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("item-abs").unwrap(),
+        "out",
+        folder.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let run = game_tools::run_for_item(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("item-abs").unwrap(),
+        &item,
+        CaptureMode::Auto,
+        false,
+        &StagingLauncher::new(),
+        &CancellationToken::new(),
+    )
+    .expect("the item's path and the player's absolute folder must run");
+    assert!(run.promoted, "{run:?}");
+}
+
+#[test]
+fn a_declared_literal_outside_the_view_is_still_refused() {
+    let t = tool(
+        "declared-abs",
+        "Declared",
+        &["/c", "exit", "0", r"C:\Users\someone\outside.txt"],
+    );
+    let f = fixture(vec![t]);
+    let error = f.run("declared-abs", &StagingLauncher::new()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ToolError::Launch(agora_core::game_launch::LaunchError::UnsafeRecipe { .. })
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_declared_literal_cannot_hide_inside_a_player_input_default() {
+    let mut t = tool("default-abs", "Default", &["/c", "exit", "0"]);
+    let mut folder = input("out", ToolInputKind::Folder, "--out");
+    folder.default = Some(r"C:\Users\someone\outside".into());
+    t.inputs = vec![folder];
+    let f = fixture(vec![t]);
+    let error = f.run("default-abs", &StagingLauncher::new()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ToolError::Launch(agora_core::game_launch::LaunchError::UnsafeRecipe { .. })
+        ),
+        "a package's default is a declared literal: {error}"
+    );
+
+    // Once the player has set the value, it is theirs and is not judged.
+    let chosen = TempDir::new().unwrap();
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("default-abs").unwrap(),
+        "out",
+        chosen.path().to_str().unwrap(),
+    )
+    .unwrap();
+    f.run_ok("default-abs", &StagingLauncher::new());
 }
 
 fn before_launch_tool(id: &str, mode: BeforeLaunchMode) -> ToolDefinition {

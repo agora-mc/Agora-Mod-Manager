@@ -1391,10 +1391,24 @@ pub fn validate_launch_recipe(
     recipe: &LaunchRecipe,
     roots: &RecipeRoots<'_>,
 ) -> Result<(), String> {
+    validate_launch_recipe_with(recipe, roots, true)
+}
+
+/// [`validate_launch_recipe`] with the argument check optional.
+///
+/// A user's own tool arguments, tool input values and `{item}` are the player's choices and are
+/// never checked. Their recipe still gets the executable, working-folder and environment checks.
+pub fn validate_launch_recipe_with(
+    recipe: &LaunchRecipe,
+    roots: &RecipeRoots<'_>,
+    check_arguments: bool,
+) -> Result<(), String> {
     check_recipe_path(&recipe.executable, roots, "the executable")?;
     check_recipe_path(&recipe.working_directory, roots, "the working folder")?;
-    for argument in &recipe.arguments {
-        check_recipe_value(argument, roots)?;
+    if check_arguments {
+        for argument in &recipe.arguments {
+            check_recipe_value(argument, roots)?;
+        }
     }
     for (key, value) in &recipe.environment {
         if let Some(blocked) = blocked_environment_key(key) {
@@ -1407,7 +1421,6 @@ pub fn validate_launch_recipe(
     }
     Ok(())
 }
-
 /// A user-data root a script may not redirect a recipe to.
 ///
 /// Kept explicit so the list of roots a script can name stays visibly small.

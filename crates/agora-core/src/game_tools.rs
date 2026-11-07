@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use agora_game_api::{
     fold_path_case, glob_match, BaseReference, BeforeLaunchMode, DeploymentStrategy,
-    GameDefinition, GamePath, InputFingerprint, Layer, LayerId, LayerSource, LayerStack, RelPath,
-    StoreId, ToolDefinition, ToolId, ToolInputKind, ToolOutput, ToolScope,
+    GameDefinition, GamePath, InputFingerprint, LaunchRecipe, Layer, LayerId, LayerSource,
+    LayerStack, RelPath, StoreId, ToolDefinition, ToolId, ToolInputKind, ToolOutput, ToolScope,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -886,24 +886,70 @@ fn external_program(program: Option<&Path>) -> Result<Option<PathBuf>, ToolError
     Ok(Some(program.to_path_buf()))
 }
 
+/// The recipe the literal check judges: the declared launch, plus the input arguments whose value
+/// is a declared default. Placeholders for player choices (`{item}`) and generated paths
+/// (`{output}`) are neutralised, so only the declared part of a literal is judged.
+fn declared_tool_launch(tool: &ToolDefinition, stored: &BTreeMap<String, String>) -> LaunchRecipe {
+    let mut recipe = tool.launch.clone();
+    for input in &tool.inputs {
+        // A value the player set is theirs, not declared.
+        if stored.get(&input.id).is_some_and(|value| !value.is_empty()) {
+            continue;
+        }
+        let Some(value) = input.default.clone().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let Some(arg) = &input.arg else {
+            continue;
+        };
+        let used = match input.kind {
+            ToolInputKind::Flag => parse_flag(&value) == Some(true),
+            _ => true,
+        };
+        if !used {
+            continue;
+        }
+        recipe
+            .arguments
+            .push(agora_game_api::LaunchValue::Literal { value: arg.clone() });
+        if input.kind != ToolInputKind::Flag {
+            recipe
+                .arguments
+                .push(agora_game_api::LaunchValue::Literal { value });
+        }
+    }
+    for argument in &mut recipe.arguments {
+        if let agora_game_api::LaunchValue::Literal { value } = argument {
+            *value = value.replace("{item}", "").replace("{output}", "");
+        }
+    }
+    recipe
+}
+
 /// Resolve a tool's launch, using the user's absolute executable when there is one.
+///
+/// `declared` is the recipe checked against the view and `check_arguments` says whether its
+/// arguments are declared (a package's tool) or the player's own (a user tool, input values and
+/// `{item}`). The final command line is never parsed: player values are simply not in `declared`.
 fn resolve_tool_launch(
     tool: &ToolDefinition,
     roots: &LaunchRoots,
     external: Option<&Path>,
+    declared: &LaunchRecipe,
+    check_arguments: bool,
 ) -> Result<crate::game_launch::ResolvedLaunch, LaunchError> {
     let Some(program) = external else {
-        // A package's tool recipe gets the same check as a launch recipe: its
-        // executable, working folder and argument paths stay in the view, and
-        // no loader environment key is set. A user's own tool is exempt: the
-        // player chose that program themselves.
-        crate::game_script::validate_launch_recipe(
-            &tool.launch,
+        // A package's tool recipe gets the same check as a launch recipe: its declared literals
+        // stay in the view, and no loader environment key is set. The player's own program and
+        // arguments are exempt: they chose them.
+        crate::game_script::validate_launch_recipe_with(
+            declared,
             &crate::game_script::RecipeRoots {
                 runtime: &roots.runtime,
                 install: roots.install.as_deref(),
                 base: roots.base.as_deref(),
             },
+            check_arguments,
         )
         .map_err(|message| LaunchError::UnsafeRecipe { message })?;
         return game_launch::resolve_recipe(&tool.launch, roots);
@@ -2371,6 +2417,7 @@ pub fn run(
         None,
         false,
         None,
+        false,
     )
 }
 
@@ -2423,6 +2470,7 @@ pub fn run_for_item(
         None,
         false,
         Some(item_id),
+        false,
     )
 }
 
@@ -2506,6 +2554,7 @@ pub fn run_after_vfs_refusal(
             None,
             false,
             None,
+            false,
         ),
         CaptureMode::Vfs | CaptureMode::Auto => Err(ToolError::Other(
             "only link capture or the full-copy swap can follow a refused virtual file system run"
@@ -2618,6 +2667,7 @@ fn run_user_inner(
                     None,
                     move_aside,
                     None,
+                    false,
                 );
             }
         }
@@ -2642,6 +2692,7 @@ fn run_user_inner(
         external.as_deref(),
         move_aside,
         None,
+        true,
     )
 }
 
@@ -2668,6 +2719,7 @@ fn run_inner(
     external: Option<&Path>,
     move_aside: bool,
     scope_item: Option<&str>,
+    player_authored: bool,
 ) -> Result<RunOutcome, ToolError> {
     if capture == CaptureMode::Swap && !swap_costs_acknowledged {
         return Err(ToolError::SwapNotConfirmed);
@@ -2689,6 +2741,13 @@ fn run_inner(
         .instance_dir(instance_id)
         .map_err(|e| ToolError::Other(e.to_string()))?;
     let external = external_program(external)?;
+    let stored = read_tool_inputs(ctx, instance_id)?
+        .get(tool.id.as_str())
+        .cloned()
+        .unwrap_or_default();
+    // Check the declared recipe before any player value (`{item}`, input values) is substituted
+    // into it. What the player chose is theirs; a package's literals and input defaults are not.
+    let declared = declared_tool_launch(tool, &stored);
     let mut effective = tool.clone();
     let (output_dir, configured) = match &tool.output {
         ToolOutput::GeneratedLayer => (None, None),
@@ -2751,10 +2810,6 @@ fn run_inner(
             tool: tool_id.to_string(),
         });
     }
-    let stored = read_tool_inputs(ctx, instance_id)?
-        .get(effective.id.as_str())
-        .cloned()
-        .unwrap_or_default();
     for argument in tool_input_arguments(&effective, &stored, item_path.as_deref())? {
         effective
             .launch
@@ -2841,6 +2896,8 @@ fn run_inner(
                 output_dir.as_deref(),
                 configured.as_ref(),
                 scope_item,
+                &declared,
+                !player_authored,
             )?;
             Ok(with_offers(
                 ctx,
@@ -2867,6 +2924,8 @@ fn run_inner(
                 output_dir.as_deref(),
                 configured.as_ref(),
                 scope_item,
+                &declared,
+                !player_authored,
             ) {
                 Ok(found) => found,
                 // The program would not start under the VFS, after the instance was deployed: nothing ran,
@@ -2910,6 +2969,8 @@ fn run_inner(
                 output_dir.as_deref(),
                 configured.as_ref(),
                 scope_item,
+                &declared,
+                !player_authored,
             )?;
             Ok(with_offers(
                 ctx,
@@ -2981,6 +3042,8 @@ fn run_under_vfs(
     output_dir: Option<&Path>,
     configured: Option<&ConfiguredOutput>,
     scope_item: Option<&str>,
+    declared: &LaunchRecipe,
+    check_arguments: bool,
 ) -> Result<(RunOutcome, bool), ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -2998,7 +3061,7 @@ fn run_under_vfs(
         install: Some(base.source_location.clone()),
         base: Some(base.location.clone()),
     };
-    let resolved = resolve_tool_launch(tool, &roots, external)?;
+    let resolved = resolve_tool_launch(tool, &roots, external, declared, check_arguments)?;
 
     let dir = tool_dir(&instance_dir, tool_id.as_str());
     let run = new_run_id();
@@ -3135,6 +3198,8 @@ fn run_from_links(
     output_dir: Option<&Path>,
     configured: Option<&ConfiguredOutput>,
     scope_item: Option<&str>,
+    declared: &LaunchRecipe,
+    check_arguments: bool,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -3163,7 +3228,7 @@ fn run_from_links(
         install: Some(base.source_location.clone()),
         base: Some(base.location.clone()),
     };
-    let resolved = resolve_tool_launch(tool, &roots, external)?;
+    let resolved = resolve_tool_launch(tool, &roots, external, declared, check_arguments)?;
 
     let dir = tool_dir(&instance_dir, tool_id.as_str());
     let run = new_run_id();
@@ -3253,6 +3318,8 @@ fn run_by_swap(
     output_dir: Option<&Path>,
     configured: Option<&ConfiguredOutput>,
     scope_item: Option<&str>,
+    declared: &LaunchRecipe,
+    check_arguments: bool,
 ) -> Result<RunOutcome, ToolError> {
     let store = base.runtime.store.clone();
     let instance_dir = ctx
@@ -3318,7 +3385,7 @@ fn run_by_swap(
         install: Some(install.clone()),
         base: Some(base.location.clone()),
     };
-    let resolved = match resolve_tool_launch(tool, &roots, external) {
+    let resolved = match resolve_tool_launch(tool, &roots, external, declared, check_arguments) {
         Ok(resolved) => resolved,
         Err(e) => {
             return Err(put_back_after(
@@ -4545,7 +4612,7 @@ mod tests {
             install: None,
             base: None,
         };
-        let error = resolve_tool_launch(&tool, &roots, None).unwrap_err();
+        let error = resolve_tool_launch(&tool, &roots, None, &tool.launch, true).unwrap_err();
         assert!(
             matches!(error, crate::game_launch::LaunchError::UnsafeRecipe { .. }),
             "{error}"
