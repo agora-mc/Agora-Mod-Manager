@@ -151,7 +151,7 @@ fn no_rule_falls_through_to_the_layout_then_classify_then_unknown() {
         &[],
         Some(&Facts::none()),
         "Notes",
-        Some(&|_| {
+        Some(&|_name, _files| {
             Some(Suggestion::Place {
                 source_path: RelPath::default(),
                 mount_path: RelPath::new("classified").unwrap(),
@@ -165,6 +165,51 @@ fn no_rule_falls_through_to_the_layout_then_classify_then_unknown() {
         place(&["notes.txt"], &[], "Notes"),
         Suggestion::Unknown { .. }
     ));
+}
+
+#[test]
+fn classify_gets_the_item_name_and_its_folder_placeholder_is_checked() {
+    let files = paths(&["init.reds"]);
+    let classified = agora_game_api::suggest_placement_with_rules(
+        &files,
+        &layout(),
+        &[],
+        Some(&Facts::none()),
+        "CoolRedscript",
+        Some(&|name, _files| {
+            Some(Suggestion::Place {
+                source_path: RelPath::default(),
+                mount_path: RelPath::new("r6/scripts/{folder}").unwrap(),
+                reason: format!("classified from the hint {name}"),
+            })
+        }),
+    );
+    assert_eq!(
+        suggestion_mount(&classified),
+        Some("r6/scripts/CoolRedscript")
+    );
+
+    // A name that cannot be a folder is refused, never used as a path.
+    let hostile = agora_game_api::suggest_placement_with_rules(
+        &files,
+        &layout(),
+        &[],
+        Some(&Facts::none()),
+        "CON",
+        Some(&|_name, _files| {
+            Some(Suggestion::Place {
+                source_path: RelPath::default(),
+                mount_path: RelPath::new("r6/scripts/{folder}").unwrap(),
+                reason: "classified".into(),
+            })
+        }),
+    );
+    match hostile {
+        Suggestion::Unknown {
+            note: Some(note), ..
+        } => assert!(note.contains("folder"), "{note}"),
+        other => panic!("a hostile name must be refused, got {other:?}"),
+    }
 }
 
 fn suggestion_mount(suggestion: &Suggestion) -> Option<&str> {

@@ -463,25 +463,26 @@ impl ConditionFacts for LaunchRootsFacts<'_> {
 }
 
 /// Whether a recipe or the game's launch alternatives ask something the roots cannot answer: a
-/// framework's version or the game's version. A `present` check is answered by the roots, so it
-/// does not force a read of the whole instance view.
+/// framework's version, the game's version, or a `present` glob. A plain `present` name is
+/// answered by the roots; a glob needs the instance's merged view, because a filesystem check has
+/// no wildcard meaning (MASTER_SPEC §30.12, `{ "present": "r6/scripts/*" }`).
 pub fn needs_instance_facts(
     definition: &GameDefinition,
     recipe: &LaunchRecipe,
     plain: bool,
 ) -> bool {
-    fn asks_about_versions(condition: &Condition) -> bool {
+    fn asks_about_instance(condition: &Condition) -> bool {
         match condition {
             Condition::Framework { .. } | Condition::Version(_) => true,
+            Condition::Present(path) => path.as_str().contains('*'),
             Condition::All(conditions) | Condition::Any(conditions) => {
-                conditions.iter().any(asks_about_versions)
+                conditions.iter().any(asks_about_instance)
             }
-            Condition::Not(condition) => asks_about_versions(condition),
-            Condition::Present(_) => false,
+            Condition::Not(condition) => asks_about_instance(condition),
         }
     }
     let value_asks = |value: &LaunchValue| match value {
-        LaunchValue::Conditional { when, .. } => asks_about_versions(when),
+        LaunchValue::Conditional { when, .. } => asks_about_instance(when),
         _ => false,
     };
     recipe.arguments.iter().any(value_asks)
@@ -490,7 +491,7 @@ pub fn needs_instance_facts(
             && definition
                 .launch_alternatives
                 .iter()
-                .any(|alternative| asks_about_versions(&alternative.when)))
+                .any(|alternative| asks_about_instance(&alternative.when)))
 }
 
 /// Whether a condition applies. Only a known true applies; an unknown answer leaves the thing out,

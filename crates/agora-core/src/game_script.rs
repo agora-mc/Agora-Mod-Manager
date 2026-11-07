@@ -810,7 +810,7 @@ pub fn instance_reads_with_budget(
         )
         .with_instance(instance_id));
     };
-    let plan = crate::game_deploy::plan(
+    let plan = crate::game_deploy::plan_for_reads(
         ctx,
         instance_id,
         &definition,

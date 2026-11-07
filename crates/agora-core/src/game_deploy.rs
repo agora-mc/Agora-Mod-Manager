@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use agora_game_api::{
     fold_path_case, BaseReference, CompiledGlob, GameDefinition, GameError, Layer, LayerId,
-    LayerSource, LayerStack, RelPath, Suggestion, DEFAULT_COPY_PATTERNS,
+    LayerSource, LayerStack, LoadOrderDestination, RelPath, Suggestion, ToolId,
+    DEFAULT_COPY_PATTERNS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -412,7 +413,18 @@ pub fn plan(
     definition: &GameDefinition,
     mode: DeployMode,
 ) -> Result<DeploymentPlan, DeployError> {
-    plan_with_copy(ctx, instance_id, definition, mode, None)
+    plan_inner(ctx, instance_id, definition, mode, None, None, true)
+}
+
+/// A plan for a script's `game:read` scope. It leaves `view` load orders out: rendering one runs
+/// the package's format hook, whose game scope would plan again.
+pub(crate) fn plan_for_reads(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    mode: DeployMode,
+) -> Result<DeploymentPlan, DeployError> {
+    plan_inner(ctx, instance_id, definition, mode, None, None, false)
 }
 
 /// [`plan`], with one content layer deployed as if its `own_copy` were on: its files are copies in
@@ -424,7 +436,7 @@ pub(crate) fn plan_with_copy(
     mode: DeployMode,
     copy_layer: Option<&str>,
 ) -> Result<DeploymentPlan, DeployError> {
-    plan_inner(ctx, instance_id, definition, mode, copy_layer, None)
+    plan_inner(ctx, instance_id, definition, mode, copy_layer, None, true)
 }
 
 /// A run's would-be output, planned in place of one tool's current output (MASTER_SPEC §26.9). The
@@ -451,6 +463,7 @@ pub(crate) fn plan_would_be(
         DeployMode::Links,
         None,
         Some(would_be),
+        true,
     )
 }
 
@@ -466,6 +479,7 @@ fn plan_inner(
     mode: DeployMode,
     copy_layer: Option<&str>,
     would_be: Option<WouldBe<'_>>,
+    render_views: bool,
 ) -> Result<DeploymentPlan, DeployError> {
     PLAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let manifest = match &would_be {
@@ -663,6 +677,43 @@ fn plan_inner(
                 .iter()
                 .map(|w| fold_path_case(w.as_str()))
                 .collect(),
+        });
+    }
+
+    // 3b. A `view` load order is a generated layer of the instance (MASTER_SPEC §30.12): core
+    // renders it from the instance copy and places it above content and tool output, so a mod's
+    // own copy of the same file never wins. It is planned, not added to the manifest, so no tool
+    // screen or session record mistakes it for a tool's output.
+    for rule in &definition.load_orders {
+        if !render_views || rule.destination != LoadOrderDestination::View {
+            continue;
+        }
+        let rendered =
+            crate::game_plugins::render_view_load_order(ctx, instance_id, definition, rule)
+                .map_err(|e| {
+                    DeployError::Other(format!("cannot render load order '{}': {e}", rule.id))
+                })?;
+        let Some((path, bytes)) = rendered else {
+            continue;
+        };
+        let meta = std::fs::metadata(&path)?;
+        let generation = format!("{:x}", Sha256::digest(&bytes))[..16].to_string();
+        layers.push(LayerContribution {
+            layer_id: format!("view:{}", rule.id),
+            files: vec![LayerFileEntry {
+                path: rule.file.clone(),
+                source: FileSource::Generated {
+                    tool: ToolId::new("agora-view-files")
+                        .expect("a fixed tool id")
+                        .to_string(),
+                    generation,
+                    path,
+                },
+                size: meta.len(),
+                modified_unix_ms: get_modified_unix_ms(&meta),
+            }],
+            own_copy: false,
+            whiteouts: Vec::new(),
         });
     }
 
@@ -1557,6 +1608,11 @@ fn deploy_locked_checked<E>(
         }
     }
 
+    // A `view` list is written before the plan so the plan can carry its rendered file.
+    if let Err(e) = sync_view_orders_locked(ctx, instance_id, definition, &target) {
+        return Ok(Err(e));
+    }
+
     let plan = match plan_with_copy(ctx, instance_id, definition, mode, copy_layer) {
         Ok(plan) => plan,
         Err(e) => return Ok(Err(e)),
@@ -2018,6 +2074,95 @@ impl PathRules {
         Self::normalized(path)
             .is_some_and(|normalized| self.declared.iter().any(|glob| glob.matches(&normalized)))
     }
+}
+
+/// Bring every `view` load order up to date before a launch plans anything. The caller holds the
+/// instance lock. `instance` lists are left to `activate_plugins`, which needs the deployment plan.
+fn sync_view_orders_locked(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    target: &DeployTarget,
+) -> Result<(), DeployError> {
+    if !definition
+        .load_orders
+        .iter()
+        .any(|rule| rule.destination == LoadOrderDestination::View)
+    {
+        return Ok(());
+    }
+    // A plan without the freshly synced view files still names every content file, which is all
+    // `desired_plugins` reads.
+    let plan = plan_with_copy(ctx, instance_id, definition, DeployMode::Links, None)?;
+    sync_view_orders_from(ctx, instance_id, definition, target, &plan)
+}
+
+fn sync_view_orders_from(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    target: &DeployTarget,
+    plan: &DeploymentPlan,
+) -> Result<(), DeployError> {
+    let content_layer_items: Vec<String> = target
+        .manifest
+        .layers
+        .layers()
+        .iter()
+        .filter_map(|layer| match &layer.source {
+            LayerSource::Content { content } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    let base_paths: Vec<&str> = target
+        .base_manifest
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    for rule in &definition.load_orders {
+        if rule.destination != LoadOrderDestination::View {
+            continue;
+        }
+        let desired = crate::game_plugins::desired_plugins(
+            rule,
+            &content_layer_items,
+            plan,
+            base_paths.iter().copied(),
+        );
+        crate::game_plugins::sync_locked_in_with_view(
+            ctx,
+            instance_id,
+            definition,
+            Some(&rule.id),
+            &target.base_manifest.runtime.store,
+            &desired,
+            Some(plan),
+        )
+        .map_err(|e| DeployError::Other(format!("cannot sync load order '{}': {e}", rule.id)))?;
+    }
+    Ok(())
+}
+
+/// [`sync_view_orders_locked`] for a caller without the lock: a launch preparation.
+pub(crate) fn sync_view_orders(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<(), DeployError> {
+    if !definition
+        .load_orders
+        .iter()
+        .any(|rule| rule.destination == LoadOrderDestination::View)
+    {
+        return Ok(());
+    }
+    let _lock = ctx.lock_manager.acquire(
+        LockResource::Instance(instance_id.to_string()),
+        "view-load-order",
+    )?;
+    let target = deploy_target(ctx, instance_id)?;
+    sync_view_orders_locked(ctx, instance_id, definition, &target)
 }
 
 /// Name the plugins the content layers deploy in the instance's plugin list (when the game
@@ -3098,7 +3243,7 @@ impl<'a> PlacementClassifier<'a> {
         }
     }
 
-    pub(crate) fn run(&self, files: &[RelPath]) -> Option<Suggestion> {
+    pub(crate) fn run(&self, item_name: &str, files: &[RelPath]) -> Option<Suggestion> {
         let package = self.ctx.games.package_for(&self.definition.id).cloned()?;
         let manifest = match crate::game_instance::get_manifest(self.ctx, self.instance_id) {
             Ok(manifest) => manifest,
@@ -3115,7 +3260,11 @@ impl<'a> PlacementClassifier<'a> {
             &manifest,
             self.definition,
         );
-        match crate::game_registry::block_on_hook(package.classify(context, files.to_vec())) {
+        match crate::game_registry::block_on_hook(package.classify(
+            context,
+            item_name,
+            files.to_vec(),
+        )) {
             Ok(suggestion) => suggestion,
             Err(error) => {
                 *self.error.borrow_mut() = Some(error);
@@ -3247,12 +3396,12 @@ pub fn add_to_instance(
         .package_for(&game.id)
         .map(|_| PlacementClassifier::new(ctx, instance_id, game));
     let decision = {
-        let classify = classifier
-            .as_ref()
-            .map(|classifier| |files: &[RelPath]| classifier.run(files));
+        let classify = classifier.as_ref().map(|classifier| {
+            |item_name: &str, files: &[RelPath]| classifier.run(item_name, files)
+        });
         let classify_ref: Option<agora_game_api::PlacementClassify<'_>> = classify
             .as_ref()
-            .map(|classify| classify as &dyn Fn(&[RelPath]) -> Option<Suggestion>);
+            .map(|classify| classify as &dyn Fn(&str, &[RelPath]) -> Option<Suggestion>);
         decide_placement_with(
             &item,
             &layout,

@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "api_range": ">=0.1, <0.2",
   "parents": [],
+  "behaviours": {
+    "classify": "classifyItem",
+    "load_order_rules": "redmodRules",
+    "diagnostics": "diagnose"
+  },
   "games": [
     {
       "id": "cyberpunk-2077",
@@ -23,7 +28,22 @@
         }
       ],
       "deployment": "virtual_file_system",
-      "content_rules": [],
+      "content_rules": [
+        {
+          "kind": "REDmod",
+          "match": {
+            "marker": "info.json"
+          },
+          "mount": "mods/{folder}"
+        },
+        {
+          "kind": "Archive mod",
+          "match": {
+            "all_files": "*.archive"
+          },
+          "mount": "archive/pc/mod"
+        }
+      ],
       "content_layout": {
         "data_path": "",
         "data_markers": [],
@@ -36,31 +56,73 @@
           "mods"
         ]
       },
-      "framework_ids": [],
-      "tool_ids": [],
+      "framework_ids": [
+        "red4ext",
+        "cyber-engine-tweaks"
+      ],
+      "tool_ids": [
+        "redmod-deploy"
+      ],
       "launch": {
         "executable": {
           "root": "runtime",
           "path": "bin/x64/Cyberpunk2077.exe"
         },
-        "arguments": [],
+        "arguments": [
+          {
+            "value": "-modded",
+            "when": {
+              "present": "mods/*/info.json"
+            }
+          }
+        ],
         "environment": {},
         "working_directory": {
           "root": "runtime",
           "path": ""
         }
       },
-      "log_paths": [],
+      "log_paths": [
+        {
+          "root": "runtime",
+          "path": "r6/logs"
+        },
+        {
+          "root": "runtime",
+          "path": "red4ext/logs"
+        }
+      ],
       "crash_paths": [],
-      "user_files": [],
-      "save_paths": [],
+      "user_files": [
+        {
+          "source": {
+            "root": "user_data",
+            "location": "local_app_data",
+            "path": "CD Projekt Red/Cyberpunk 2077/UserSettings.json"
+          },
+          "instance_path": "user/UserSettings.json",
+          "strategy": "journaled_swap",
+          "stores": []
+        }
+      ],
+      "save_paths": [
+        {
+          "root": "user_data",
+          "location": "home",
+          "path": "Saved Games/CD Projekt Red/Cyberpunk 2077"
+        }
+      ],
       "linked_archive_patterns": [
         "archive/pc/content/*.archive",
         "archive/pc/ep1/*.archive"
       ],
       "declared_writes": [
         "r6/cache/**",
-        "r6/logs/**"
+        "r6/logs/**",
+        "red4ext/config.ini",
+        "red4ext/**/*.log",
+        "bin/x64/plugins/cyber_engine_tweaks/*.log",
+        "bin/x64/plugins/cyber_engine_tweaks/*.json"
       ],
       "excluded_paths": [
         "archive/pc/mod/**",
@@ -69,9 +131,113 @@
         "r6/tweaks/**",
         "red4ext/**",
         "bin/x64/plugins/**"
+      ],
+      "load_orders": [
+        {
+          "id": "redmod-mods",
+          "name": "REDmod mods",
+          "file": "mods/modlist.txt",
+          "items": {
+            "folder": "mods",
+            "patterns": [
+              "*"
+            ],
+            "folders": true
+          },
+          "format": {
+            "type": "script",
+            "parse": "parseModlist",
+            "render": "renderModlist"
+          },
+          "rules": {
+            "kind": "script",
+            "entry": "redmodRules"
+          },
+          "destination": "view"
+        }
       ]
     }
   ],
-  "frameworks": [],
-  "tools": []
+  "frameworks": [
+    {
+      "id": "red4ext",
+      "game": "cyberpunk-2077",
+      "name": "RED4ext",
+      "version": "1.31.0",
+      "supported_runtimes": [],
+      "required_frameworks": [],
+      "content": [],
+      "launch": null,
+      "detection": {
+        "marker": "red4ext/RED4ext.dll",
+        "version": "pe_file_version"
+      }
+    },
+    {
+      "id": "cyber-engine-tweaks",
+      "game": "cyberpunk-2077",
+      "name": "Cyber Engine Tweaks",
+      "version": "1.38.1",
+      "supported_runtimes": [],
+      "required_frameworks": [
+        "red4ext"
+      ],
+      "content": [],
+      "launch": null,
+      "detection": {
+        "marker": "bin/x64/plugins/cyber_engine_tweaks.asi"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "id": "redmod-deploy",
+      "game": "cyberpunk-2077",
+      "name": "REDmod deploy",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "tools/redmod/bin/redMod.exe"
+        },
+        "arguments": [
+          "deploy",
+          {
+            "kind": "path",
+            "path": {
+              "root": "runtime",
+              "path": ""
+            },
+            "prefix": "-root=",
+            "suffix": ""
+          },
+          {
+            "kind": "path",
+            "path": {
+              "root": "runtime",
+              "path": "mods/modlist.txt"
+            },
+            "prefix": "-modlist=",
+            "suffix": ""
+          }
+        ],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": ""
+        }
+      },
+      "output": {
+        "kind": "generated_layer"
+      },
+      "input_files": [
+        "mods/**"
+      ],
+      "before_launch": {
+        "mode": "run",
+        "when": {
+          "present": "mods/*/info.json"
+        }
+      }
+    }
+  ]
 }

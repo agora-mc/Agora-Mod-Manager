@@ -1573,6 +1573,10 @@ pub fn prepare_launch_with(
     let definition = &definition_owned;
 
     if matches!(record.base, BaseReference::Pinned { .. }) {
+        // A `view` load order is synced before the tools run, so a deploy tool sees the player's
+        // list even on the first launch after a mod arrived.
+        crate::game_deploy::sync_view_orders(ctx, id, definition)
+            .map_err(|e| InstanceError::Other(e.to_string()))?;
         answer_before_launch(ctx, id, definition, &options, launcher)?;
     }
     match record.base {

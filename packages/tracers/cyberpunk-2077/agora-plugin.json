@@ -5,8 +5,9 @@
   "version": "0.1.0",
   "license": "GPL-3.0-only",
   "apiRange": ">=0.1, <0.2",
+  "entrypoint": "main.js",
   "capabilities": {
-    "required": ["game:define"]
+    "required": ["game:define", "game:read"]
   },
   "contributions": {
     "gamePackages": [

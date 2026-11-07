@@ -250,13 +250,18 @@ impl GamePackage for ScriptedPackage {
     fn classify<'a>(
         &'a self,
         context: GameContext,
+        item_name: &'a str,
         files: Vec<RelPath>,
     ) -> GameFuture<'a, Option<Suggestion>> {
         Box::pin(async move {
             let Some(export) = self.behaviours.classify.as_deref() else {
                 return Ok(None);
             };
-            let args = serde_json::json!({ "context": context, "files": files });
+            let args = serde_json::json!({
+                "context": context,
+                "itemName": item_name,
+                "files": files,
+            });
             let Some(value) = self.call_required(export, args)? else {
                 return Ok(None);
             };

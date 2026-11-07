@@ -300,6 +300,57 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, PluginListError> {
     }
 }
 
+/// The instance folder holding the rendered files of `view` load orders. It is a generated
+/// layer of the instance: the deployment plan injects it above content and tool output, so the
+/// player's order wins without writing the game's real folder (MASTER_SPEC §30.12).
+fn view_root(instance_dir: &Path) -> PathBuf {
+    instance_dir.join("view-files")
+}
+
+fn view_path(instance_dir: &Path, rule: &LoadOrderDefinition) -> PathBuf {
+    view_root(instance_dir).join(rule.file.as_str())
+}
+
+/// Write a view list's file when its bytes changed. Returns whether it was written.
+fn write_view_file(
+    instance_dir: &Path,
+    rule: &LoadOrderDefinition,
+    bytes: &[u8],
+) -> Result<bool, PluginListError> {
+    if rule.destination != agora_game_api::LoadOrderDestination::View {
+        return Ok(false);
+    }
+    let path = view_path(instance_dir, rule);
+    if read_optional(&path)?.as_deref() == Some(bytes) {
+        return Ok(false);
+    }
+    write_atomic(&path, bytes)?;
+    Ok(true)
+}
+
+/// Render a `view` list into the generated layer the plan deploys. `None` for an `instance` list,
+/// which is swapped in through its user file as before. An unreadable list is an error, never an
+/// empty file.
+pub(crate) fn render_view_load_order(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+) -> Result<Option<(PathBuf, Vec<u8>)>, PluginListError> {
+    if rule.destination != agora_game_api::LoadOrderDestination::View {
+        return Ok(None);
+    }
+    let dir = instance_dir(ctx, instance_id)?;
+    let source = dir.join(rule.file.as_str());
+    let doc = match read_optional(&source)? {
+        Some(bytes) => parse_doc(ctx, instance_id, definition, rule, bytes)?,
+        None => blank_doc(rule),
+    };
+    let bytes = render_doc(ctx, instance_id, definition, rule, &doc)?;
+    write_view_file(&dir, rule, &bytes)?;
+    Ok(Some((view_path(&dir, rule), bytes)))
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PluginListError> {
     let Some(parent) = path.parent() else {
         return Err(PluginListError::Other(format!(
@@ -727,35 +778,45 @@ pub(crate) fn sync_locked_in_with_view(
     let old = state_of(read_state_file(&dir)?, &rule.id);
     let mut report = PluginSyncReport::default();
 
-    let Some(mapping) = user_file_mapping(definition, rule, store) else {
-        if !desired.is_empty() || !old.managed.is_empty() {
-            report.warnings.push(format!(
-                "the plugin list is not swapped in for the '{store}' store, so its plugins \
-                 will not be activated"
-            ));
-        }
-        return Ok(Some(report));
+    let view = rule.destination == agora_game_api::LoadOrderDestination::View;
+    let mapping = if view {
+        None
+    } else {
+        let Some(mapping) = user_file_mapping(definition, rule, store) else {
+            if !desired.is_empty() || !old.managed.is_empty() {
+                report.warnings.push(format!(
+                    "the plugin list is not swapped in for the '{store}' store, so its plugins                      will not be activated"
+                ));
+            }
+            return Ok(Some(report));
+        };
+        Some(mapping)
     };
 
     let existing = read_optional(&copy_path)?;
-    if existing.is_none() && desired.is_empty() && old.managed.is_empty() {
+    if existing.is_none() && desired.is_empty() && old.managed.is_empty() && !view {
         return Ok(Some(report));
     }
-    recover_stale_session(ctx, definition, store)?;
+    if !view {
+        recover_stale_session(ctx, definition, store)?;
+    }
     // Recovery rewrites the instance copy from the session's file.
     let existing = read_optional(&copy_path)?;
     let have_copy = existing.is_some();
     let mut doc = match existing {
         Some(bytes) => parse_doc(ctx, instance_id, definition, rule, bytes)?,
-        None => starting_contents(
-            ctx,
-            instance_id,
-            definition,
-            store,
-            mapping,
-            rule,
-            &mut report,
-        )?,
+        None => match mapping {
+            Some(mapping) => starting_contents(
+                ctx,
+                instance_id,
+                definition,
+                store,
+                mapping,
+                rule,
+                &mut report,
+            )?,
+            None => blank_doc(rule),
+        },
     };
 
     // A plugin the game loads itself is never Agora's, whatever an earlier sync recorded for it.
@@ -781,10 +842,13 @@ pub(crate) fn sync_locked_in_with_view(
     // The list goes first: a state file that is behind only delays a removal, one that is
     // ahead would forget lines Agora still owns.
     if changed || (!have_copy && !wanted.is_empty()) {
-        write_atomic(
-            &copy_path,
-            &render_doc(ctx, instance_id, definition, rule, &doc)?,
-        )?;
+        let rendered = render_doc(ctx, instance_id, definition, rule, &doc)?;
+        write_atomic(&copy_path, &rendered)?;
+        write_view_file(&dir, rule, &rendered)?;
+    } else if view {
+        // A hand-edited list whose view file was never written still reaches the plan.
+        let rendered = render_doc(ctx, instance_id, definition, rule, &doc)?;
+        write_view_file(&dir, rule, &rendered)?;
     }
     if !same_names(&old.managed, &wanted) {
         store_state(
@@ -1022,10 +1086,9 @@ pub fn set_active_in(
         return Err(PluginListError::NotInList(name.to_string()));
     }
     if changed {
-        write_atomic(
-            &path,
-            &render_doc(ctx, instance_id, definition, rule, &doc)?,
-        )?;
+        let rendered = render_doc(ctx, instance_id, definition, rule, &doc)?;
+        write_atomic(&path, &rendered)?;
+        write_view_file(&dir, rule, &rendered)?;
     }
     Ok(changed)
 }
@@ -1105,10 +1168,9 @@ pub fn import_list_in(
                 .collect(),
         ),
     };
-    write_atomic(
-        &path,
-        &render_doc(ctx, instance_id, definition, rule, &doc)?,
-    )?;
+    let rendered = render_doc(ctx, instance_id, definition, rule, &doc)?;
+    write_atomic(&path, &rendered)?;
+    write_view_file(&dir, rule, &rendered)?;
     store_state(
         &dir,
         &rule.id,
@@ -1288,10 +1350,9 @@ pub fn write_order_locked_in(
     if !changed {
         return Ok(false);
     }
-    write_atomic(
-        &path,
-        &render_doc(ctx, instance_id, definition, rule, &doc)?,
-    )?;
+    let rendered = render_doc(ctx, instance_id, definition, rule, &doc)?;
+    write_atomic(&path, &rendered)?;
+    write_view_file(&dir, rule, &rendered)?;
     Ok(true)
 }
 
@@ -1305,6 +1366,7 @@ mod tests {
             id: "plugins".into(),
             name: "Plugins".into(),
             file: RelPath::new("user/Plugins.txt").unwrap(),
+            destination: Default::default(),
             items: agora_game_api::LoadOrderItems {
                 folder: RelPath::new("Data").unwrap(),
                 patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],

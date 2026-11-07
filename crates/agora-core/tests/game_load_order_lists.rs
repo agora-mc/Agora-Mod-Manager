@@ -151,6 +151,7 @@ fn lines_rule(id: &str, file: &str) -> LoadOrderDefinition {
         id: id.into(),
         name: id.into(),
         file: RelPath::new(format!("user/{file}")).unwrap(),
+        destination: Default::default(),
         items: agora_game_api::LoadOrderItems {
             folder: RelPath::new("Data").unwrap(),
             patterns: vec!["*.esp".into(), "*.esm".into(), "*.esl".into()],
@@ -175,6 +176,7 @@ fn script_rule(id: &str, file: &str, kind: &str) -> LoadOrderDefinition {
         id: id.into(),
         name: id.into(),
         file: RelPath::new(format!("user/{file}")).unwrap(),
+        destination: Default::default(),
         items: agora_game_api::LoadOrderItems {
             folder: RelPath::new("Data").unwrap(),
             patterns: vec!["*.esp".into(), "*.esm".into(), "*.esl".into()],
@@ -588,10 +590,12 @@ fn script_rules_with_a_cycle_are_reported_like_creation_engine_cycles() {
                 LoadOrderRule::Requires {
                     item: "A.esp".into(),
                     master: "B.esp".into(),
+                    optional: false,
                 },
                 LoadOrderRule::Requires {
                     item: "B.esp".into(),
                     master: "A.esp".into(),
+                    optional: false,
                 },
             ],
             ..ScriptHooks::default()
@@ -622,6 +626,7 @@ fn a_rule_naming_a_missing_item_is_reported_not_ignored() {
             rules: vec![LoadOrderRule::Before {
                 first: "Ghost.esp".into(),
                 second: "A.esp".into(),
+                optional: false,
             }],
             ..ScriptHooks::default()
         },
@@ -637,6 +642,68 @@ fn a_rule_naming_a_missing_item_is_reported_not_ignored() {
         order.findings.iter().any(|finding| matches!(
             finding,
             Finding::MissingRuleItem { item, .. } if item == "Ghost.esp"
+        )),
+        "{:?}",
+        order.findings
+    );
+}
+
+#[test]
+fn an_optional_rule_stays_silent_when_one_item_is_absent() {
+    let h = Harness::with_hooks(
+        vec![script_rule("plugins", "Script.txt", "script")],
+        ScriptHooks {
+            rules: vec![LoadOrderRule::Before {
+                first: "Ghost.esp".into(),
+                second: "A.esp".into(),
+                optional: true,
+            }],
+            ..ScriptHooks::default()
+        },
+    );
+    let inst = h.instance("optional-absent");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let order =
+        game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, Some("plugins")).unwrap();
+    assert!(order.findings.is_empty(), "{:?}", order.findings);
+}
+
+#[test]
+fn an_optional_rule_applies_when_both_items_are_present() {
+    let h = Harness::with_hooks(
+        vec![script_rule("plugins", "Script.txt", "script")],
+        ScriptHooks {
+            rules: vec![LoadOrderRule::Before {
+                first: "A.esp".into(),
+                second: "B.esp".into(),
+                optional: true,
+            }],
+            ..ScriptHooks::default()
+        },
+    );
+    let inst = h.instance("optional-present");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    game_plugins::write_order_locked_in(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        Some("plugins"),
+        &[("B.esp".into(), true), ("A.esp".into(), true)],
+    )
+    .unwrap();
+
+    let order =
+        game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, Some("plugins")).unwrap();
+    assert!(
+        order.findings.iter().any(|finding| matches!(
+            finding,
+            Finding::MasterNotEarlier { plugin, master, .. }
+                if plugin == "B.esp" && master == "A.esp"
         )),
         "{:?}",
         order.findings
