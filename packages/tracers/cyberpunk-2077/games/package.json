@@ -118,7 +118,11 @@
       ],
       "declared_writes": [
         "r6/cache/**",
-        "r6/logs/**"
+        "r6/logs/**",
+        "red4ext/config.ini",
+        "red4ext/**/*.log",
+        "bin/x64/plugins/cyber_engine_tweaks/*.log",
+        "bin/x64/plugins/cyber_engine_tweaks/*.json"
       ],
       "excluded_paths": [
         "archive/pc/mod/**",

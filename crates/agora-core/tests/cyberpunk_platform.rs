@@ -7,6 +7,7 @@
 
 #![cfg(windows)]
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -311,6 +312,16 @@ fn mount_of(added: AddToInstance) -> (String, String) {
     }
 }
 
+fn base_log_path(h: &Harness, instance: &str) -> PathBuf {
+    let manifest = get_manifest(&h.ctx, instance).unwrap();
+    let BaseReference::Pinned { id, .. } = manifest.base else {
+        panic!("the test instance is pinned");
+    };
+    let text = std::fs::read_to_string(h.ctx.paths.base_manifest_path(&id)).unwrap();
+    let base: agora_core::game_base::BaseManifest = serde_json::from_str(&text).unwrap();
+    base.location.join("red4ext/logs/red4ext.log")
+}
+
 fn generated_layer(h: &Harness, instance: &str) -> Option<(String, String)> {
     get_manifest(&h.ctx, instance)
         .unwrap()
@@ -446,7 +457,17 @@ fn the_shipped_package_places_orders_deploys_and_launches() {
             && matches!(&file.source, FileSource::Generated { tool, .. } if tool == "redmod-deploy")
     }));
 
-    // A second launch does not run it again while nothing it reads changed.
+    // A second launch does not run it again while nothing it reads changed. A log the game
+    // wrote in the base is a declared write, so it neither blocks the launch nor stales the tool.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(base_log_path(&h, id))
+        .unwrap()
+        .write_all(
+            b"second run
+",
+        )
+        .unwrap();
     assert!(needs(&h, id).is_empty());
     prepare(&h, id).expect("the second launch prepares");
     assert_eq!(
