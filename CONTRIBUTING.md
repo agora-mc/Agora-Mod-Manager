@@ -26,7 +26,7 @@ build commands, disposable-profile setup, and the full validation matrix. Run th
 covering what you touched before opening a pull request:
 
 ```bash
-python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_tauri_bindings.py --check
+python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check
 ```
 
 Business logic belongs in `agora-core`; the desktop, CLI, and MCP hosts are adapters

@@ -151,7 +151,7 @@ all of them before calling a substantial change done.
 Repository root, hermetic and fast:
 
 ```bash
-python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_tauri_bindings.py --check
+python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check
 ```
 
 Rust:
@@ -228,13 +228,13 @@ For a user-visible change:
 6. verify links;
 7. avoid copying secret-bearing operator commands into player documentation.
 
-Run the hermetic documentation gate:
+Run the hermetic documentation gates:
 
 ```bash
-python scripts/check_docs.py
+python scripts/check_docs.py && python scripts/check_package_docs.py
 ```
 
-It checks current internal Markdown links, website routes, guide-topic mappings, product spelling, and known stale claims without making network requests or rewriting files. CLI help-contract checks run under `cargo test -p agora-cli`.
+`check_docs.py` checks current internal Markdown links, website routes, guide-topic mappings, product spelling, and known stale claims. `check_package_docs.py` checks that every key in the official and tracer game packages, and every field on the package types, is documented in `docs/plugins/game-packages.md`. Neither makes network requests or rewrites files. CLI help-contract checks run under `cargo test -p agora-cli`.
 
 ### Documentation screenshots
 

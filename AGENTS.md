@@ -48,7 +48,7 @@ Run the gates for what you touched. They are listed, with their gotchas, in
 ones take seconds:
 
 ```bash
-python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_tauri_bindings.py --check
+python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check
 ```
 
 ## Boundaries that are enforced by scripts
