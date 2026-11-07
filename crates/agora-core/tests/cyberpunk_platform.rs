@@ -153,11 +153,11 @@ impl Harness {
         let helper = PathBuf::from(env!("CARGO_BIN_EXE_agora-tool-test-helper"));
         std::fs::copy(&helper, install_dir.join("bin/x64/Cyberpunk2077.exe")).unwrap();
         std::fs::copy(&helper, install_dir.join("tools/redmod/bin/redMod.exe")).unwrap();
-        // A RED4ext install without its loader: the diagnostics check has something to say.
-        std::fs::copy(&helper, install_dir.join("red4ext/RED4ext.dll")).unwrap();
+        // A log the game owns, in the base, for the declared-write check.
         std::fs::write(
-            install_dir.join("red4ext/logs/red4ext.log"),
-            b"RED4ext initialized successfully\n",
+            install_dir.join("r6/logs/redscript_rCURRENT.log"),
+            b"previous run
+",
         )
         .unwrap();
 
@@ -319,7 +319,7 @@ fn base_log_path(h: &Harness, instance: &str) -> PathBuf {
     };
     let text = std::fs::read_to_string(h.ctx.paths.base_manifest_path(&id)).unwrap();
     let base: agora_core::game_base::BaseManifest = serde_json::from_str(&text).unwrap();
-    base.location.join("red4ext/logs/red4ext.log")
+    base.location.join("r6/logs/redscript_rCURRENT.log")
 }
 
 fn generated_layer(h: &Harness, instance: &str) -> Option<(String, String)> {
@@ -450,7 +450,32 @@ fn the_shipped_package_places_orders_deploys_and_launches() {
     )
     .unwrap();
     let recorded = std::fs::read_to_string(generation_dir.join("redmod-deploy-args.txt")).unwrap();
-    assert!(recorded.starts_with("deploy\n-root="), "{recorded}");
+    assert!(
+        recorded.lines().next() == Some("deploy")
+            && recorded
+                .lines()
+                .nth(1)
+                .is_some_and(|arg| arg.starts_with("-root=")),
+        "the deploy tool ran with its arguments: {recorded}"
+    );
+    let modlist_arg = recorded
+        .lines()
+        .find(|line| line.starts_with("-modlist="))
+        .expect("the deploy tool is given the load order");
+    let deployed_list = PathBuf::from(modlist_arg.trim_start_matches("-modlist="));
+    assert_eq!(
+        std::fs::read(&deployed_list).unwrap(),
+        b"!Patch\nAlpha\n",
+        "the tool reads the rendered order from the view"
+    );
+    assert!(
+        !h.install
+            .discovered
+            .location
+            .join("mods/modlist.txt")
+            .exists(),
+        "the view file never reaches the real game folder"
+    );
     let plan = game_deploy::plan(&h.ctx, id, &h.definition, DeployMode::Links).unwrap();
     assert!(plan.files.iter().any(|file| {
         file.path.as_str() == "r6/cache/modded/final.redscripts"
@@ -477,6 +502,24 @@ fn the_shipped_package_places_orders_deploys_and_launches() {
         1
     );
 
+    // Reordering the view list changes the tool's fingerprint.
+    game_plugins::write_order_locked_in(
+        &h.ctx,
+        id,
+        &h.definition,
+        Some("redmod-mods"),
+        &[("Alpha".into(), true), ("!Patch".into(), true)],
+    )
+    .unwrap();
+    assert_eq!(needs(&h, id).len(), 1);
+    prepare(&h, id).expect("the reordered launch prepares");
+    assert_eq!(
+        log(&h, id)
+            .matches("Before launch: ran REDmod deploy.")
+            .count(),
+        2
+    );
+
     // A legacy archive does not need a REDmod deploy...
     h.add(id, "LegacyTwo", &[("Other.archive", b"archive")]);
     assert!(needs(&h, id).is_empty());
@@ -488,7 +531,7 @@ fn the_shipped_package_places_orders_deploys_and_launches() {
         log(&h, id)
             .matches("Before launch: ran REDmod deploy.")
             .count(),
-        2
+        3
     );
 
     // With no REDmod at all, neither the deploy nor -modded happens.
@@ -507,18 +550,22 @@ fn the_shipped_package_places_orders_deploys_and_launches() {
 #[test]
 fn diagnostics_reads_the_red4ext_log_and_flags_a_missing_loader() {
     let h = Harness::new(None);
-    // The base copy is made when the instance is created, so the error is in the log first.
-    std::fs::write(
-        h.install
-            .discovered
-            .location
-            .join("red4ext/logs/red4ext.log"),
-        b"RED4ext initialized
+    let instance = h.create("Diagnostics");
+    // The framework is content now, not a file in the base.
+    let dll = std::fs::read(PathBuf::from(env!("CARGO_BIN_EXE_agora-tool-test-helper"))).unwrap();
+    h.add(
+        &instance.instance_id,
+        "Red4ext",
+        &[
+            ("red4ext/RED4ext.dll", &dll),
+            (
+                "red4ext/logs/red4ext.log",
+                b"RED4ext initialized
 Failed to load plugin Foo
 ",
-    )
-    .unwrap();
-    let instance = h.create("Diagnostics");
+            ),
+        ],
+    );
     let game_id = GameId::new(GAME).unwrap();
     let package = h.ctx.games.package_for(&game_id).unwrap().clone();
     let context = GameContext {
@@ -539,22 +586,14 @@ Failed to load plugin Foo
         settings: Default::default(),
     };
 
-    let diagnostics = block_on(package.diagnostics(context.clone())).expect("diagnostics run");
+    let diagnostics = block_on(package.diagnostics(context)).expect("diagnostics run");
     assert!(
         diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "RED4EXT_NO_LOADER"),
         "{diagnostics:?}"
     );
-
     // A log line that reports an error is visible, and reading it proves game:read works.
-    let log_path = h._tmp.path().join("game/red4ext/logs/red4ext.log");
-    std::fs::write(
-        &log_path,
-        b"RED4ext initialized\nFailed to load plugin Foo\n",
-    )
-    .unwrap();
-    let diagnostics = block_on(package.diagnostics(context)).expect("diagnostics run");
     assert!(
         diagnostics
             .iter()
@@ -604,4 +643,216 @@ fn a_throwing_rules_hook_is_a_warning_not_a_crash() {
         .load_order_findings
         .iter()
         .any(|finding| matches!(finding, game_load_order::Finding::RulesFailed { .. })));
+}
+
+#[test]
+fn a_root_reds_set_uses_its_name_and_a_hostile_name_is_refused() {
+    let h = Harness::new(None);
+    let instance = h.create("Reds");
+    let id = &instance.instance_id;
+
+    let (_, added) = h.add(id, "CoolRedscript", &[("init.reds", b"// redscript")]);
+    let (mount, reason) = mount_of(added);
+    assert_eq!(mount, "r6/scripts/CoolRedscript", "{reason}");
+
+    // The name is only a hint: a Windows device name is refused as a mount folder.
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("init.reds"), b"// a different redscript").unwrap();
+    let outcome = content_store::add_folder(&h.ctx, dir.path(), Some("CON")).unwrap();
+    let item = outcome.item().item_id.clone();
+    let error = add_to_instance(&h.ctx, id, &item).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            agora_core::game_deploy::AddToInstanceError::PlacementUnknown { .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn frameworks_arrive_as_content_and_are_not_in_the_base() {
+    let h = Harness::new(None);
+    let instance = h.create("Frameworks");
+    let id = &instance.instance_id;
+
+    // A real PE with a FileVersion resource stands in for RED4ext.dll.
+    let dll = std::fs::read(r"C:\Windows\System32\cmd.exe").unwrap();
+    h.add(
+        id,
+        "Red4ext",
+        &[
+            ("red4ext/RED4ext.dll", &dll),
+            ("bin/x64/winmm.dll", b"loader"),
+        ],
+    );
+
+    let game = GameId::new(GAME).unwrap();
+    let definition = h.ctx.games.game(&game).unwrap();
+    let declared = h
+        .ctx
+        .games
+        .framework(&game, &agora_game_api::FrameworkId::new("red4ext").unwrap())
+        .expect("the package declares RED4ext");
+    match agora_core::game_frameworks::framework_status(&h.ctx, id, definition, declared).unwrap() {
+        agora_core::game_frameworks::FrameworkStatus::Present {
+            version: Some(version),
+            ..
+        } => assert!(!version.is_empty()),
+        other => panic!("RED4ext should be present with its PE version, got {other:?}"),
+    }
+
+    assert!(
+        !h.install
+            .discovered
+            .location
+            .join("red4ext/RED4ext.dll")
+            .exists(),
+        "frameworks never pollute the base"
+    );
+    let plan = game_deploy::plan(&h.ctx, id, &h.definition, DeployMode::Links).unwrap();
+    assert!(plan.files.iter().any(|file| {
+        file.path.as_str() == "red4ext/RED4ext.dll"
+            && matches!(file.source, FileSource::Content { .. })
+    }));
+}
+
+#[test]
+fn a_view_load_order_reaches_the_tool_through_the_view() {
+    let h = Harness::new(None);
+    let instance = h.create("View tool");
+    let id = &instance.instance_id;
+    h.add(id, "Alpha", &[("Alpha/info.json", b"{}")]);
+    game_plugins::import_list_in(
+        &h.ctx,
+        id,
+        &h.definition,
+        Some("redmod-mods"),
+        &[("Alpha".into(), true)],
+        &[],
+        &[],
+    )
+    .unwrap();
+
+    prepare(&h, id).expect("the launch prepares");
+    let (generation, _) = generated_layer(&h, id).expect("the deploy ran");
+    let recorded = std::fs::read_to_string(
+        game_tools::generation_dir(
+            &h.ctx.paths.instance_dir(id).unwrap(),
+            "redmod-deploy",
+            &generation,
+        )
+        .unwrap()
+        .join("redmod-deploy-args.txt"),
+    )
+    .unwrap();
+    let arg = recorded
+        .lines()
+        .find(|line| line.starts_with("-modlist="))
+        .expect("the tool is given -modlist");
+    assert_eq!(
+        std::fs::read(arg.trim_start_matches("-modlist=")).unwrap(),
+        b"Alpha\n"
+    );
+}
+
+#[test]
+fn a_view_load_order_never_writes_to_the_real_game_folder() {
+    let h = Harness::new(None);
+    let instance = h.create("View writes");
+    let id = &instance.instance_id;
+    h.add(id, "Alpha", &[("Alpha/info.json", b"{}")]);
+    game_plugins::import_list_in(
+        &h.ctx,
+        id,
+        &h.definition,
+        Some("redmod-mods"),
+        &[("Alpha".into(), true)],
+        &[],
+        &[],
+    )
+    .unwrap();
+
+    prepare(&h, id).expect("the launch prepares");
+    assert!(
+        !h.install
+            .discovered
+            .location
+            .join("mods/modlist.txt")
+            .exists(),
+        "the real game folder is untouched"
+    );
+    let view = h
+        .ctx
+        .paths
+        .instance_dir(id)
+        .unwrap()
+        .join("view-files/mods/modlist.txt");
+    assert_eq!(std::fs::read(view).unwrap(), b"Alpha\n");
+    let deployed = game_deploy::deployment_dir(&h.ctx, id)
+        .unwrap()
+        .unwrap()
+        .join("mods/modlist.txt");
+    assert_eq!(std::fs::read(deployed).unwrap(), b"Alpha\n");
+}
+
+#[test]
+fn reordering_a_view_load_order_makes_redmod_stale() {
+    let h = Harness::new(None);
+    let instance = h.create("View stale");
+    let id = &instance.instance_id;
+    h.add(id, "!Patch", &[("!Patch/info.json", b"{}")]);
+    h.add(id, "Alpha", &[("Alpha/info.json", b"{}")]);
+    game_plugins::import_list_in(
+        &h.ctx,
+        id,
+        &h.definition,
+        Some("redmod-mods"),
+        &[("Alpha".into(), true), ("!Patch".into(), true)],
+        &[],
+        &[],
+    )
+    .unwrap();
+    prepare(&h, id).expect("the first launch prepares");
+    assert!(needs(&h, id).is_empty());
+
+    game_plugins::write_order_locked_in(
+        &h.ctx,
+        id,
+        &h.definition,
+        Some("redmod-mods"),
+        &[("!Patch".into(), true), ("Alpha".into(), true)],
+    )
+    .unwrap();
+    assert_eq!(needs(&h, id).len(), 1, "the reordered list is a tool input");
+    prepare(&h, id).expect("the reordered launch prepares");
+    assert_eq!(
+        log(&h, id)
+            .matches("Before launch: ran REDmod deploy.")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_view_load_order_file_that_escapes_is_refused() {
+    let text = std::fs::read_to_string(real_package_dir().join("games/package.json")).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    json["games"][0]["load_orders"][0]["file"] = serde_json::json!("../mods/modlist.txt");
+    assert!(
+        serde_json::from_value::<agora_game_api::PackageDefinition>(json).is_err(),
+        "a view file that climbs out of the instance is refused"
+    );
+
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    json["games"][0]["load_orders"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("destination");
+    let package: agora_game_api::PackageDefinition = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        package.games[0].load_orders[0].destination,
+        agora_game_api::LoadOrderDestination::Instance,
+        "instance is the default destination"
+    );
 }

@@ -14,8 +14,8 @@ The package that proves MASTER_SPEC §30.12: a working modded Cyberpunk 2077 usi
 
 ## The tool
 
-`redmod-deploy` runs `tools/redmod/bin/redMod.exe deploy -root=<game>` before a launch when
-the instance has a REDmod. The tool's output is the existing `generated_layer` model: whatever
+`redmod-deploy` runs `tools/redmod/bin/redMod.exe deploy -root=<game> -modlist=<game>/mods/modlist.txt`
+before a launch when the instance has a REDmod. The tool's output is the existing `generated_layer` model: whatever
 the run writes is kept as the tool's own layer in the instance stack, so the next deployment
 shows it above the base and the game reads it. REDmod writes the staged result under
 `r6/cache` (the wiki below shows `r6/cache/modded/final.redscripts`).
@@ -39,12 +39,17 @@ precedence and that the first mod to change a file wins
 (<https://wiki.redmodding.org/cyberpunk-2077-modding/for-mod-users/users-modding-cyberpunk-2077/load-order>).
 
 **Unverified:** the `-modlist` option is named on the deploy page above, but its file layout is
-not documented there. One name per line is this package's choice.
+not documented there. One name per line is this package's choice; the owner's real game will
+settle it.
 
-**Gap:** the list is rendered into the instance, but the deploy tool cannot pass it to REDmod.
-Tool recipes may only name runtime/install/base paths (an `instance` path is refused), and the
-list file does not live in the game view. So `-modlist` is not on the command line; REDmod falls
-back to its documented ASCII folder order. See the hand-back.
+The list declares `"destination": "view"`. Core renders it from the instance copy into the
+instance's own generated layer, and the deployment puts that file in the game view above content
+and tool output. The tool reads it as the ordinary runtime path `mods/modlist.txt`, so the real
+game folder is never written and no `user_files` mapping is needed. Reordering the list changes
+the view file and the tool's fingerprint, so the next launch deploys again.
+
+`redmodRules` returns optional rules where both names are present: with `optional: true`, a rule
+that names a mod the player does not have says nothing instead of reporting a missing item.
 
 ## Frameworks
 
@@ -55,6 +60,9 @@ back to its documented ASCII folder order. See the hand-back.
   `bin/x64/plugins/cyber_engine_tweaks/` and `cyber_engine_tweaks.log`:
   <https://wiki.redmodding.org/cyber-engine-tweaks/getting-started/installing>. It requires
   RED4ext: <https://wiki.redmodding.org/cyberpunk-2077-modding/for-mod-creators-theory/core-mods-explained>.
+- Frameworks are content in the instance: the base excludes them, so a framework arrives as a
+  content item and its marker is read from the merged view. A framework left in the real game
+  folder by another manager is **not handled yet**; the Vortex importer is the later job for that.
 - `diagnose` warns when `red4ext/RED4ext.dll` is there but `bin/x64/winmm.dll` is not, and reads
   `red4ext/logs/red4ext.log` through `game:read` to surface a last line that reports an error.
   Log path: <https://wiki.redmodding.org/cyberpunk-2077-modding/for-mod-users/user-guide-troubleshooting/finding-and-reading-log-files>.
@@ -67,13 +75,11 @@ back to its documented ASCII folder order. See the hand-back.
   per instance: <https://steamcommunity.com/sharedfiles/filedetails/?id=2316174052>.
 - Crash paths are not declared yet.
 
-`red4ext/**` and `bin/x64/plugins/**` are deliberately not in `excluded_paths`: the base
-must keep a pre-installed framework so its marker and PE version can be read. Keeping
-`mods/**` and `r6/scripts/**` excluded means files already in the game folder are not baked
-into the base as unmanaged content; they must be added to an instance to be seen.
+`red4ext/**`, `bin/x64/plugins/**`, `mods/**` and `r6/scripts/**` stay excluded from the base:
+a base is never polluted with mods or frameworks. Framework detection reads the merged view, so a
+framework is visible when it is content in the instance.
 
 ## What is not wired down
 
-`redmodRules` names only folders that are in the list. That is why it reads the list from the
-hook's `context.load_order` instead of returning a fixed pair: a fixed pair would report a
-missing-mod warning for every player who does not have both.
+`redmodRules` names only folders that are in the list, and it marks its pairs optional. That is
+why it reads the list from the hook's `context.load_order` instead of returning a fixed pair.

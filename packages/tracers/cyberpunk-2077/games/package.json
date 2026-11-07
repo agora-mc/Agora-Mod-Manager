@@ -128,7 +128,9 @@
         "archive/pc/mod/**",
         "mods/**",
         "r6/scripts/**",
-        "r6/tweaks/**"
+        "r6/tweaks/**",
+        "red4ext/**",
+        "bin/x64/plugins/**"
       ],
       "load_orders": [
         {
@@ -150,7 +152,8 @@
           "rules": {
             "kind": "script",
             "entry": "redmodRules"
-          }
+          },
+          "destination": "view"
         }
       ]
     }
@@ -205,6 +208,15 @@
               "path": ""
             },
             "prefix": "-root=",
+            "suffix": ""
+          },
+          {
+            "kind": "path",
+            "path": {
+              "root": "runtime",
+              "path": "mods/modlist.txt"
+            },
+            "prefix": "-modlist=",
             "suffix": ""
           }
         ],

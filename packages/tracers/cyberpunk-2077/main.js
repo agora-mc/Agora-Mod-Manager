@@ -9,32 +9,43 @@ import { game } from "agora";
 
 // A place for a loose set of `*.reds` files. The game reads redscript from `r6/scripts`,
 // not from `archive/pc/mod`, so no data rule can name it: the folder has no marker file.
-// `<Mod>/init.reds` becomes `r6/scripts/<Mod>/init.reds`. A set with no single folder is
-// left to the Unknown prompt, because a script is never told the item's name.
+// `<Mod>/init.reds` becomes `r6/scripts/<Mod>/init.reds`. A set at the archive root uses
+// `{folder}`; core fills it from the item's name and runs the same checks a content rule's
+// `{folder}` gets, so the hint is never trusted as a path.
 // Source for `r6/scripts`: https://wiki.redmodding.org/cyberpunk-2077-modding/for-mod-users/users-modding-cyberpunk-2077
 export function classifyItem(args) {
   const files = (args.files || []).map((path) => String(path).replace(/\\/g, "/"));
   if (files.length === 0 || !files.every((path) => path.toLowerCase().endsWith(".reds"))) {
     return null;
   }
-  if (files.some((path) => path.split("/").length < 2)) {
-    return null;
+  const roots = files.map((path) => path.split("/")[0]);
+  if (
+    roots.every((root) => root === roots[0]) &&
+    files.every((path) => path.split("/").length > 1)
+  ) {
+    const folder = roots[0];
+    return {
+      type: "place",
+      source_path: folder,
+      mount_path: "r6/scripts/" + folder,
+      reason:
+        "loose `*.reds` files for `" +
+        folder +
+        "` go in `r6/scripts/" +
+        folder +
+        "` (redscript is read from `r6/scripts`), not in an archive",
+    };
   }
-  const folder = files[0].split("/")[0];
-  if (files.some((path) => path.split("/")[0] !== folder)) {
-    return null;
+  if (files.every((path) => path.split("/").length === 1)) {
+    return {
+      type: "place",
+      source_path: "",
+      mount_path: "r6/scripts/{folder}",
+      reason:
+        "loose `*.reds` files go in `r6/scripts/{folder}` (redscript is read from `r6/scripts`), not in an archive",
+    };
   }
-  return {
-    type: "place",
-    source_path: folder,
-    mount_path: "r6/scripts/" + folder,
-    reason:
-      "loose `*.reds` files for `" +
-      folder +
-      "` go in `r6/scripts/" +
-      folder +
-      "` (redscript is read from `r6/scripts`), not in an archive",
-  };
+  return null;
 }
 
 // REDmod's order is written as one mod folder per line, highest precedence first.
