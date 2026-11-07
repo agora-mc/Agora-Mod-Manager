@@ -5,12 +5,12 @@ Minecraft has not moved out of core. There is no package registry, host implemen
 discovery, base provisioning or VFS in this slice. The contract remains experimental until
 Minecraft and a tracer from another family exercise it, and the write-isolation spike completes.
 
-[`agora-game-api`](../../crates/agora-game-api/src/lib.rs) contains data and object-safe async
-`GamePackage`/`GameHost` interfaces. Its only direct dependencies, including test/build/target
-dependencies, may be `serde`, `semver` and `thiserror`. Packages describe behaviour; core owns
-policy, paths, network checks, archive/FOMOD/load-order algorithms and process/transaction lifetimes.
-Host operations use typed requests and managed identifiers; declaring a path or tool does not grant
-permission to access or execute it. A future script bridge must expose these same operation names.
+[`agora-game-api`](../../crates/agora-game-api/src/lib.rs) contains data and the object-safe async
+`GamePackage` interface. Its only direct dependencies, including test/build/target dependencies, may
+be `serde`, `semver` and `thiserror`. Packages describe behaviour; core owns policy, paths, network
+checks, archive/FOMOD/load-order algorithms and process/transaction lifetimes. A package reaches
+game data only through the arguments core supplies — a scoped game-path read view for scripts,
+never a real filesystem path.
 Launch arguments/environment can contain literals, managed paths or platform-separated path lists,
 so Redirect folders and Java classpaths need no unspecified string interpolation language. Named
 user-data roots also cover logs, profile files and saves outside a store install.

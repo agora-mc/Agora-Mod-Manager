@@ -90,23 +90,3 @@ pub struct GameEvent {
     pub name: String,
     pub fields: BTreeMap<String, String>,
 }
-
-/// Core supplies a host scoped to the calling package/instance and its grants.
-/// Every operation checks that scope (including relative paths), cancellation
-/// and policy. Tool execution owns snapshots, staging, promotion and process
-/// tracking; extraction and load-order algorithms stay in core.
-/// These method names are also the future script HostBridge method table.
-pub trait GameHost: Send + Sync {
-    /// Verify the source hash when present; surface missing source hashes to the
-    /// user through the host's download/provenance flow when absent.
-    fn download(&self, request: DownloadRequest) -> GameFuture<'_, DownloadedArtifact>;
-    fn read_install_file(&self, request: InstallReadRequest) -> GameFuture<'_, Vec<u8>>;
-    /// Metadata downloads must be readable by a package without giving it a
-    /// cache path or unchecked network access (e.g. Minecraft version JSON).
-    fn read_artifact(&self, request: ArtifactReadRequest) -> GameFuture<'_, Vec<u8>>;
-    fn extract_archive(&self, request: ArchiveRequest) -> GameFuture<'_, ExtractedArchive>;
-    fn run_fomod(&self, request: FomodRequest) -> GameFuture<'_, FomodResult>;
-    fn sort_load_order(&self, request: SortLoadOrderRequest) -> GameFuture<'_, LoadOrder>;
-    fn run_tool(&self, request: ToolRunRequest) -> GameFuture<'_, ToolRunResult>;
-    fn emit_event(&self, event: GameEvent) -> GameResult<()>;
-}

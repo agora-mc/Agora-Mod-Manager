@@ -49,7 +49,6 @@ impl GamePackage for TestPackage {
 
     fn load_order_rules<'a>(
         &'a self,
-        _host: &'a dyn agora_game_api::GameHost,
         _context: GameContext,
         _list_id: &'a str,
     ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
@@ -67,7 +66,6 @@ impl GamePackage for TestPackage {
 
     fn parse_load_order<'a>(
         &'a self,
-        _host: &'a dyn agora_game_api::GameHost,
         _context: GameContext,
         _list_id: &'a str,
         bytes: Vec<u8>,
@@ -98,7 +96,6 @@ impl GamePackage for TestPackage {
 
     fn render_load_order<'a>(
         &'a self,
-        _host: &'a dyn agora_game_api::GameHost,
         _context: GameContext,
         _list_id: &'a str,
         lines: Vec<LoadOrderLine>,

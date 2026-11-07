@@ -64,13 +64,6 @@ pub struct GameContext {
     pub settings: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContentClassification {
-    pub file: RelPath,
-    pub destination: RelPath,
-    pub content_kind: String,
-}
-
 /// How a recognised download enters Agora's content system.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -116,7 +109,6 @@ pub trait GamePackage: Send + Sync {
 
     fn detect_runtime<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         _install: GameInstall,
     ) -> GameFuture<'a, Option<RuntimeIdentity>> {
         Box::pin(async { Ok(None) })
@@ -124,10 +116,9 @@ pub trait GamePackage: Send + Sync {
 
     fn classify<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         _context: GameContext,
-        _archive: ExtractedArchive,
-    ) -> GameFuture<'a, Option<Vec<ContentClassification>>> {
+        _files: Vec<RelPath>,
+    ) -> GameFuture<'a, Option<Suggestion>> {
         Box::pin(async { Ok(None) })
     }
 
@@ -149,7 +140,6 @@ pub trait GamePackage: Send + Sync {
     /// error is a failure to report, never "no rules, so any order is fine".
     fn load_order_rules<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         _context: GameContext,
         _list_id: &'a str,
     ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
@@ -160,7 +150,6 @@ pub trait GamePackage: Send + Sync {
     /// implement the format; core reports that instead of treating the file as empty.
     fn parse_load_order<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         _context: GameContext,
         _list_id: &'a str,
         _bytes: Vec<u8>,
@@ -172,7 +161,6 @@ pub trait GamePackage: Send + Sync {
     /// the list's declared file; the hook cannot choose a path. `None` is a failure to report.
     fn render_load_order<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         _context: GameContext,
         _list_id: &'a str,
         _lines: Vec<LoadOrderLine>,
@@ -180,49 +168,14 @@ pub trait GamePackage: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    fn diagnostics<'a>(
-        &'a self,
-        _host: &'a dyn GameHost,
-        _context: GameContext,
-    ) -> GameFuture<'a, Vec<Diagnostic>> {
+    fn diagnostics<'a>(&'a self, _context: GameContext) -> GameFuture<'a, Vec<Diagnostic>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn prepare_launch<'a>(
-        &'a self,
-        _host: &'a dyn GameHost,
-        _context: GameContext,
-    ) -> GameFuture<'a, Option<LaunchRecipe>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    /// Read a `script` load order file (MASTER_SPEC §30.12). `None` means the
-    /// package does not implement the format; core reports that instead of
-    /// treating the file as empty.
-    fn parse_load_order<'a>(
-        &'a self,
-        _host: &'a dyn GameHost,
-        _context: GameContext,
-        _list_id: &'a str,
-        _bytes: Vec<u8>,
-    ) -> GameFuture<'a, Option<Vec<LoadOrderLine>>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    /// Render a `script` load order file (MASTER_SPEC §30.12). Core writes the
-    /// bytes it returns to the list's declared file; the hook cannot choose a
-    /// path. `None` is a failure to report.
-    fn render_load_order<'a>(
-        &'a self,
-        _host: &'a dyn GameHost,
-        _context: GameContext,
-        _list_id: &'a str,
-        _lines: Vec<LoadOrderLine>,
-    ) -> GameFuture<'a, Option<Vec<u8>>> {
+    fn prepare_launch<'a>(&'a self, _context: GameContext) -> GameFuture<'a, Option<LaunchRecipe>> {
         Box::pin(async { Ok(None) })
     }
 }
 
-// These signatures fail to compile if either interface stops being object-safe.
-const _: Option<&dyn GameHost> = None;
+// This signature fails to compile if the interface stops being object-safe.
 const _: Option<&dyn GamePackage> = None;

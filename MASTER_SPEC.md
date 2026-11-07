@@ -5032,7 +5032,7 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
 { "kind": "Archive mod", "match": { "all_files": "*.archive" }, "mount": "archive/pc/mod" }
 ```
 
-`marker` finds a file at any depth up to the layout's limit, and `source_path` becomes the folder holding it. `{folder}` is that folder's name, or the item's when it's the root. A rule whose mount leaves the instance is refused at registration, and `{folder}` is checked again at placement, since it comes from an archive. No match falls through to `content_layout`, then a script `classify` hook, then the existing Unknown prompt.
+`marker` finds a file at any depth up to the layout's limit, and `source_path` becomes the folder holding it. `{folder}` is that folder's name, or the item's when it's the root. A rule whose mount leaves the instance is refused at registration, and `{folder}` is checked again at placement, since it comes from an archive. No match falls through to `content_layout`, then a script `classify` hook, then the existing Unknown prompt. If a rule's `when` could not be judged and nothing places the item, the Unknown prompt says so in words.
 
 **Tools.** `ToolDefinition` gains:
 
@@ -5043,7 +5043,7 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
 "before_launch": { "mode": "run|ask", "when": null }
 ```
 
-- Input values are stored per instance. `scope: "item"` runs once per content item the user picks.
+- Input values are stored per instance. `scope: "item"` runs once per content item the user picks; its staleness fingerprint covers only that item, and `{item}` in an argument is replaced by the item's path in the instance view.
 - `input_files` narrows the staleness fingerprint when present. Absent keeps today's fingerprint of all content.
 - `before_launch` turns on when the tool has never run, or is stale, and `when` is true. `run` runs it visibly before launch; `ask` offers it. **Either way the player can launch anyway**, because every protection has an override (§26). A failed `run` stops and offers the same choice.
 

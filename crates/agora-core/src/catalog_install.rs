@@ -489,13 +489,28 @@ pub async fn install(
         .expect("checked above: the game has a content layout");
     let facts =
         crate::game_conditions::InstanceFacts::for_instance(ctx, request.instance_id, definition);
-    let state = match game_deploy::decide_placement_with(
-        &content_item,
-        layout,
-        &definition.content_rules,
-        Some(&facts),
-        None,
-    ) {
+    let classifier = ctx
+        .games
+        .package_for(&definition.id)
+        .map(|_| game_deploy::PlacementClassifier::new(ctx, request.instance_id, definition));
+    let decision = {
+        let classify = classifier
+            .as_ref()
+            .map(|classifier| |files: &[agora_game_api::RelPath]| classifier.run(files));
+        let classify_ref: Option<agora_game_api::PlacementClassify<'_>> =
+            classify.as_ref().map(|classify| {
+                classify
+                    as &dyn Fn(&[agora_game_api::RelPath]) -> Option<agora_game_api::Suggestion>
+            });
+        game_deploy::decide_placement_with(
+            &content_item,
+            layout,
+            &definition.content_rules,
+            Some(&facts),
+            classify_ref,
+        )
+    };
+    let state = match decision {
         PlacementDecision::Place {
             mount_path,
             source_path,
@@ -503,8 +518,13 @@ pub async fn install(
         } => {
             let mount = (!mount_path.is_empty()).then_some(mount_path.as_str());
             let source = (!source_path.is_empty()).then_some(source_path.as_str());
-            match game_deploy::add_content(ctx, request.instance_id, &content_item.item_id, mount, source)
-            {
+            match game_deploy::add_content(
+                ctx,
+                request.instance_id,
+                &content_item.item_id,
+                mount,
+                source,
+            ) {
                 Ok(_) => InstallState::Placed {
                     content_item_id: content_item.item_id.clone(),
                     mount_path,
@@ -532,18 +552,31 @@ pub async fn install(
             reason,
             top_level,
         },
-        PlacementDecision::Unknown { top_level } => {
+        PlacementDecision::Unknown { top_level, note } => {
+            if let Some(error) = classifier.and_then(game_deploy::PlacementClassifier::take_error) {
+                return Err(LauncherError::Generic {
+                    code: "ERR_CATALOG_CLASSIFY".into(),
+                    message: format!(
+                        "Cannot determine where '{}' goes, because the game's classify check could not run: {}. It is in the content store as {}.",
+                        request.item.id, error.message, content_item.item_id
+                    ),
+                });
+            }
+            let note = note
+                .as_deref()
+                .map(|note| format!(" {note}"))
+                .unwrap_or_default();
             return Err(LauncherError::Generic {
                 code: "ERR_CATALOG_UNPLACEABLE".into(),
                 message: format!(
-                    "Cannot determine where '{}' goes; top-level entries: {}. It is in the content store as {}. Place it with `agora games instance content add {} {} --into <path>`.",
+                    "Cannot determine where '{}' goes; top-level entries: {}.{note} It is in the content store as {}. Place it with `agora games instance content add {} {} --into <path>`.",
                     request.item.id,
                     top_level.join(", "),
                     content_item.item_id,
                     request.instance_id,
                     content_item.item_id
                 ),
-            })
+            });
         }
     };
     Ok(InstallReport { plan, state })

@@ -16,9 +16,9 @@
 //!   a launch.
 
 use agora_game_api::{
-    Behaviours, ContentClassification, Diagnostic, DownloadRecognition, GameContext, GameError,
-    GameFuture, GameHost, GameInstall, GamePackage, LoadOrderLine, LoadOrderRule,
-    PackageDefinition as PackageDefinitionType, RuntimeIdentity,
+    Behaviours, Diagnostic, DownloadRecognition, GameContext, GameError, GameFuture, GameInstall,
+    GamePackage, LoadOrderLine, LoadOrderRule, PackageDefinition as PackageDefinitionType, RelPath,
+    RuntimeIdentity, Suggestion,
 };
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
 use agora_plugin_api::host::GameReads;
@@ -233,7 +233,6 @@ impl GamePackage for ScriptedPackage {
 
     fn detect_runtime<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         install: GameInstall,
     ) -> GameFuture<'a, Option<RuntimeIdentity>> {
         Box::pin(async move {
@@ -250,15 +249,14 @@ impl GamePackage for ScriptedPackage {
 
     fn classify<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         context: GameContext,
-        archive: agora_game_api::ExtractedArchive,
-    ) -> GameFuture<'a, Option<Vec<ContentClassification>>> {
+        files: Vec<RelPath>,
+    ) -> GameFuture<'a, Option<Suggestion>> {
         Box::pin(async move {
             let Some(export) = self.behaviours.classify.as_deref() else {
                 return Ok(None);
             };
-            let args = serde_json::json!({ "context": context, "archive": archive });
+            let args = serde_json::json!({ "context": context, "files": files });
             let Some(value) = self.call_required(export, args)? else {
                 return Ok(None);
             };
@@ -334,7 +332,6 @@ impl GamePackage for ScriptedPackage {
 
     fn load_order_rules<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         context: GameContext,
         list_id: &'a str,
     ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
@@ -358,11 +355,7 @@ impl GamePackage for ScriptedPackage {
         })
     }
 
-    fn diagnostics<'a>(
-        &'a self,
-        _host: &'a dyn GameHost,
-        context: GameContext,
-    ) -> GameFuture<'a, Vec<Diagnostic>> {
+    fn diagnostics<'a>(&'a self, context: GameContext) -> GameFuture<'a, Vec<Diagnostic>> {
         Box::pin(async move {
             let Some(export) = self.behaviours.diagnostics.as_deref() else {
                 return Ok(Vec::new());
@@ -381,7 +374,6 @@ impl GamePackage for ScriptedPackage {
 
     fn prepare_launch<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         context: GameContext,
     ) -> GameFuture<'a, Option<agora_game_api::LaunchRecipe>> {
         Box::pin(async move {
@@ -398,7 +390,6 @@ impl GamePackage for ScriptedPackage {
 
     fn parse_load_order<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         context: GameContext,
         list_id: &'a str,
         bytes: Vec<u8>,
@@ -421,7 +412,6 @@ impl GamePackage for ScriptedPackage {
 
     fn render_load_order<'a>(
         &'a self,
-        _host: &'a dyn GameHost,
         context: GameContext,
         list_id: &'a str,
         lines: Vec<LoadOrderLine>,
@@ -508,7 +498,6 @@ impl ScriptedPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agora_game_api::LoadOrder;
     use std::sync::Mutex;
 
     /// A fake engine: it answers with whatever the test told it to, and records
@@ -632,87 +621,6 @@ mod tests {
         .unwrap()
     }
 
-    struct NoHost;
-    impl GameHost for NoHost {
-        fn download(
-            &self,
-            _: agora_game_api::DownloadRequest,
-        ) -> GameFuture<'_, agora_game_api::DownloadedArtifact> {
-            Box::pin(async {
-                Err(GameError {
-                    code: "no".into(),
-                    message: "no".into(),
-                })
-            })
-        }
-        fn read_install_file(
-            &self,
-            _: agora_game_api::InstallReadRequest,
-        ) -> GameFuture<'_, Vec<u8>> {
-            Box::pin(async {
-                Err(GameError {
-                    code: "no".into(),
-                    message: "no".into(),
-                })
-            })
-        }
-        fn read_artifact(&self, _: agora_game_api::ArtifactReadRequest) -> GameFuture<'_, Vec<u8>> {
-            Box::pin(async {
-                Err(GameError {
-                    code: "no".into(),
-                    message: "no".into(),
-                })
-            })
-        }
-        fn extract_archive(
-            &self,
-            _: agora_game_api::ArchiveRequest,
-        ) -> GameFuture<'_, agora_game_api::ExtractedArchive> {
-            Box::pin(async {
-                Err(GameError {
-                    code: "no".into(),
-                    message: "no".into(),
-                })
-            })
-        }
-        fn run_fomod(
-            &self,
-            _: agora_game_api::FomodRequest,
-        ) -> GameFuture<'_, agora_game_api::FomodResult> {
-            Box::pin(async {
-                Err(GameError {
-                    code: "no".into(),
-                    message: "no".into(),
-                })
-            })
-        }
-        fn sort_load_order(
-            &self,
-            _: agora_game_api::SortLoadOrderRequest,
-        ) -> GameFuture<'_, LoadOrder> {
-            Box::pin(async {
-                Err(GameError {
-                    code: "no".into(),
-                    message: "no".into(),
-                })
-            })
-        }
-        fn run_tool(
-            &self,
-            _: agora_game_api::ToolRunRequest,
-        ) -> GameFuture<'_, agora_game_api::ToolRunResult> {
-            Box::pin(async {
-                Err(GameError {
-                    code: "no".into(),
-                    message: "no".into(),
-                })
-            })
-        }
-        fn emit_event(&self, _: agora_game_api::GameEvent) -> agora_game_api::GameResult<()> {
-            Ok(())
-        }
-    }
-
     fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
         use std::task::{Context, Poll, Wake, Waker};
         struct ThreadWaker(std::thread::Thread);
@@ -736,7 +644,7 @@ mod tests {
     fn a_malformed_hook_reply_is_an_error_not_none() {
         let invoker = FakeInvoker::answer(serde_json::json!({ "not": "a runtime identity" }));
         let package = package(invoker);
-        let error = block_on(package.detect_runtime(&NoHost, install())).unwrap_err();
+        let error = block_on(package.detect_runtime(install())).unwrap_err();
         assert_eq!(error.code, "ERR_GAME_HOOK_REPLY");
     }
 
@@ -747,7 +655,7 @@ mod tests {
             "`detect` did not finish within 5000ms",
         ));
         let package = package(invoker);
-        let result = block_on(package.detect_runtime(&NoHost, install())).unwrap();
+        let result = block_on(package.detect_runtime(install())).unwrap();
         assert!(result.is_none(), "a timeout carries on");
     }
 
@@ -758,7 +666,7 @@ mod tests {
             "TypeError: boom",
         ));
         let package = package(fake.clone());
-        let result = block_on(package.detect_runtime(&NoHost, install())).unwrap();
+        let result = block_on(package.detect_runtime(install())).unwrap();
         assert!(result.is_none());
         let reports = fake.reports.lock().unwrap();
         assert_eq!(reports.len(), 1);
@@ -769,7 +677,7 @@ mod tests {
     fn a_hook_is_given_a_time_limit() {
         let fake = FakeInvoker::answer(serde_json::Value::Null);
         let package = package(fake.clone());
-        block_on(package.detect_runtime(&NoHost, install())).unwrap();
+        block_on(package.detect_runtime(install())).unwrap();
         let timeouts = fake.timeouts.lock().unwrap();
         assert_eq!(timeouts.as_slice(), &[HOOK_TIMEOUT]);
     }
@@ -802,7 +710,7 @@ mod tests {
                 FakeInvoker::fail(error),
                 serde_json::json!({ "diagnostics": "diagnose" }),
             );
-            match block_on(package.diagnostics(&NoHost, game_context())) {
+            match block_on(package.diagnostics(game_context())) {
                 Err(_) => {}
                 Ok(found) => assert!(
                     !found.is_empty(),
@@ -821,7 +729,7 @@ mod tests {
         );
         // Before the plugin service exists the answer is unknown, not "no
         // version", and nothing caches it.
-        let early = block_on(package.detect_runtime(&NoHost, install())).unwrap_err();
+        let early = block_on(package.detect_runtime(install())).unwrap_err();
         assert_eq!(early.code, "ERR_GAME_SCRIPT_HOST");
 
         // Once the service starts, the same package asks again and gets a
@@ -831,7 +739,7 @@ mod tests {
             "store": "steam",
             "version": "2.0"
         })));
-        let later = block_on(package.detect_runtime(&NoHost, install()))
+        let later = block_on(package.detect_runtime(install()))
             .unwrap()
             .expect("a version once the runtime is available");
         assert_eq!(later.version, "2.0");

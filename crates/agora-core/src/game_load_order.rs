@@ -17,11 +17,8 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    fold_path_case, glob_match, ArchiveRequest, ArtifactReadRequest, DownloadRequest,
-    DownloadedArtifact, ExtractedArchive, FomodRequest, FomodResult, GameContext, GameDefinition,
-    GameError, GameEvent, GameFuture, GameHost, GamePackage, GameResult, InstallReadRequest,
-    LoadOrderDefinition, LoadOrderLine, LoadOrderRule, SortLoadOrderRequest, ToolRunRequest,
-    ToolRunResult,
+    fold_path_case, glob_match, GameContext, GameDefinition, GamePackage, LoadOrderDefinition,
+    LoadOrderLine, LoadOrderRule,
 };
 use serde::{Deserialize, Serialize};
 
@@ -440,61 +437,6 @@ pub fn any_needs_plan(definition: &GameDefinition) -> bool {
 // Script hooks
 // ---------------------------------------------------------------------------
 
-/// A host for a load-order hook that asks for nothing. Script rules and formats return their
-/// answer without touching the game; a script that tries to use a host operation is told, plainly,
-/// that this step has none. The scripts slice supplies the real host later.
-struct HooklessHost;
-
-fn hookless<T>(what: &str) -> GameFuture<'_, T> {
-    let message = format!("{what} is not available while reading a load order");
-    Box::pin(async move {
-        Err(GameError {
-            code: "host_unavailable".into(),
-            message,
-        })
-    })
-}
-
-impl GameHost for HooklessHost {
-    fn download(&self, _request: DownloadRequest) -> GameFuture<'_, DownloadedArtifact> {
-        hookless("downloading")
-    }
-
-    fn read_install_file(&self, _request: InstallReadRequest) -> GameFuture<'_, Vec<u8>> {
-        hookless("reading the game's files")
-    }
-
-    fn read_artifact(&self, _request: ArtifactReadRequest) -> GameFuture<'_, Vec<u8>> {
-        hookless("reading an artifact")
-    }
-
-    fn extract_archive(&self, _request: ArchiveRequest) -> GameFuture<'_, ExtractedArchive> {
-        hookless("extracting an archive")
-    }
-
-    fn run_fomod(&self, _request: FomodRequest) -> GameFuture<'_, FomodResult> {
-        hookless("running a FOMOD installer")
-    }
-
-    fn sort_load_order(
-        &self,
-        _request: SortLoadOrderRequest,
-    ) -> GameFuture<'_, agora_game_api::LoadOrder> {
-        hookless("sorting another load order")
-    }
-
-    fn run_tool(&self, _request: ToolRunRequest) -> GameFuture<'_, ToolRunResult> {
-        hookless("running a tool")
-    }
-
-    fn emit_event(&self, _event: GameEvent) -> GameResult<()> {
-        Err(GameError {
-            code: "host_unavailable".into(),
-            message: "events are not available while reading a load order".into(),
-        })
-    }
-}
-
 /// Drive a package hook from core's synchronous code. Called on a blocking thread under the
 /// desktop's multi-thread runtime, or on a plain thread in the CLI and tests.
 fn block_on_hook<F: Future>(future: F) -> F::Output {
@@ -572,8 +514,7 @@ pub(crate) fn call_load_order_rules(
     let package = package_of(ctx, definition).map_err(|error| error.to_string())?;
     let context = hook_context(ctx, instance_id, definition, rule, entries)
         .map_err(|error| error.to_string())?;
-    let host = HooklessHost;
-    let result = block_on_hook(package.load_order_rules(&host, context, &rule.id))
+    let result = block_on_hook(package.load_order_rules(context, &rule.id))
         .map_err(|error| error.message)?;
     result.ok_or_else(|| {
         format!(
@@ -594,8 +535,7 @@ pub(crate) fn call_parse_format(
     let package = package_of(ctx, definition).map_err(|error| error.to_string())?;
     let context =
         hook_context(ctx, instance_id, definition, rule, &[]).map_err(|error| error.to_string())?;
-    let host = HooklessHost;
-    let result = block_on_hook(package.parse_load_order(&host, context, &rule.id, bytes))
+    let result = block_on_hook(package.parse_load_order(context, &rule.id, bytes))
         .map_err(|error| error.message)?;
     result.ok_or_else(|| {
         format!(
@@ -617,8 +557,7 @@ pub(crate) fn call_render_format(
     let package = package_of(ctx, definition).map_err(|error| error.to_string())?;
     let context =
         hook_context(ctx, instance_id, definition, rule, &[]).map_err(|error| error.to_string())?;
-    let host = HooklessHost;
-    let result = block_on_hook(package.render_load_order(&host, context, &rule.id, lines))
+    let result = block_on_hook(package.render_load_order(context, &rule.id, lines))
         .map_err(|error| error.message)?;
     result.ok_or_else(|| {
         format!(

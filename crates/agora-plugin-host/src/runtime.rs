@@ -266,7 +266,10 @@ async fn plugin_main(
                 };
                 // A failing handler is the plugin's problem, not the
                 // launcher's: log it and keep the subscription alive.
-                if let Err(error) = dispatch_event(&context, &deadline, &json).await {
+                bridge.begin_event(&plugin_id);
+                let outcome = dispatch_event(&context, &deadline, &json).await;
+                bridge.end_event(&plugin_id);
+                if let Err(error) = outcome {
                     bridge.log(
                         &plugin_id,
                         LogLevel::Error,

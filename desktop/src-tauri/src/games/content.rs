@@ -412,12 +412,22 @@ fn add_error(error: AddToInstanceError) -> GamesError {
         AddToInstanceError::Content(error) => content_error(error),
         AddToInstanceError::Thunderstore(error) => GamesError::new(CORE_FAILED, error.to_string()),
         AddToInstanceError::Deploy(error) => deploy_error(error),
-        AddToInstanceError::PlacementUnknown { top_level } => GamesError::new(
+        AddToInstanceError::PlacementUnknown { top_level, note } => GamesError::new(
             PLACEMENT_UNKNOWN,
-            format!(
-                "Agora cannot tell where these files go (top-level entries: {}), and this game has no rule for them.",
-                top_level.join(", ")
-            ),
+            match note {
+                Some(note) => format!(
+                    "Agora cannot tell where these files go (top-level entries: {}), and this game has no rule for them. {note}",
+                    top_level.join(", ")
+                ),
+                None => format!(
+                    "Agora cannot tell where these files go (top-level entries: {}), and this game has no rule for them.",
+                    top_level.join(", ")
+                ),
+            },
+        ),
+        AddToInstanceError::Classify(message) => GamesError::new(
+            CORE_FAILED,
+            format!("Agora cannot place the content: {message}"),
         ),
     }
 }
@@ -744,6 +754,7 @@ mod tests {
     fn a_placement_that_cannot_happen_keeps_the_words_and_codes_the_screen_knows() {
         let unknown = add_error(AddToInstanceError::PlacementUnknown {
             top_level: vec!["stuff".into(), "docs".into()],
+            note: None,
         });
         assert_eq!(unknown.code, PLACEMENT_UNKNOWN);
         assert_eq!(

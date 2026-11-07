@@ -431,6 +431,10 @@ pub enum Suggestion {
     },
     Unknown {
         top_level: Vec<String>,
+        /// Why no rule could place it, when a rule's `when` could not be judged. Shown to the
+        /// player as words (MASTER_SPEC §30.12).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
 }
 
@@ -1064,17 +1068,31 @@ pub fn suggest_placement_with_rules(
         match rule_placement(rule, files, item_name) {
             RulePlacement::Placed(suggestion) => return suggestion,
             RulePlacement::NoMatch => {}
-            RulePlacement::Ambiguous(top_level) => return Suggestion::Unknown { top_level },
+            RulePlacement::Ambiguous(top_level) => {
+                return Suggestion::Unknown {
+                    top_level,
+                    note: None,
+                }
+            }
         }
     }
 
+    let unknown_note = (!skipped_unknown.is_empty()).then(|| {
+        format!(
+            "Could not tell whether the rule for {} applied, so none of those rules placed it.",
+            skipped_unknown.join(", ")
+        )
+    });
     let finish = |top_level: Vec<String>| -> Suggestion {
         if let Some(classify) = classify {
             if let Some(suggestion) = classify(files) {
                 return suggestion;
             }
         }
-        Suggestion::Unknown { top_level }
+        Suggestion::Unknown {
+            top_level,
+            note: unknown_note.clone(),
+        }
     };
 
     let mut current_source_components: Vec<String> = Vec::new();
@@ -2837,7 +2855,7 @@ mod tests {
         // 8. readme.txt alone -> Unknown
         let files = vec![RelPath::new("readme.txt").unwrap()];
         match suggest_placement(&files, &skyrim) {
-            Suggestion::Unknown { top_level } => {
+            Suggestion::Unknown { top_level, .. } => {
                 assert_eq!(top_level, vec!["readme.txt"]);
             }
             other => panic!("expected Unknown, got {other:?}"),

@@ -28,6 +28,13 @@ pub trait HostBridge: Send + Sync {
 
     /// Record a line in the plugin's own log.
     fn log(&self, plugin_id: &PluginId, level: LogLevel, message: &str);
+
+    /// An event handler is about to run for this plugin. The core opens a fresh
+    /// budget for it, so one handler's reads and writes never spend another's.
+    fn begin_event(&self, _plugin_id: &PluginId) {}
+
+    /// The event handler has finished, however it finished.
+    fn end_event(&self, _plugin_id: &PluginId) {}
 }
 
 /// Everything the script host needs in order to start a plugin.

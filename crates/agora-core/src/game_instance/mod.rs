@@ -557,7 +557,7 @@ fn write_launch_notes(ctx: &Ctx, id: &str, notes: &[String]) -> Result<(), Insta
 }
 
 /// The facts a scripted package's hooks ask about one instance (MASTER_SPEC §30.12).
-fn hook_context(
+pub(crate) fn hook_context(
     ctx: &Ctx,
     record: &GameInstanceRecord,
     definition: &GameDefinition,
@@ -1284,9 +1284,7 @@ pub fn launch_checks(
     let diagnostics = match ctx.games.package_for(&definition.id).cloned() {
         Some(package) => {
             let context = hook_context(ctx, record, definition)?;
-            match crate::game_registry::block_on_hook(
-                package.diagnostics(crate::game_registry::null_game_host(), context),
-            ) {
+            match crate::game_registry::block_on_hook(package.diagnostics(context)) {
                 Ok(diagnostics) => diagnostics,
                 Err(error) => vec![agora_game_api::Diagnostic {
                     code: "ERR_GAME_HOOK_FAILED".to_string(),
@@ -1544,9 +1542,7 @@ pub fn prepare_launch_with(
     if definition_owned.launch.is_none() {
         if let Some(package) = ctx.games.package_for(&definition_owned.id).cloned() {
             let context = hook_context(ctx, &record, &definition_owned)?;
-            match crate::game_registry::block_on_hook(
-                package.prepare_launch(crate::game_registry::null_game_host(), context),
-            ) {
+            match crate::game_registry::block_on_hook(package.prepare_launch(context)) {
                 Ok(Some(recipe)) => {
                     definition_owned.launch = Some(recipe);
                 }

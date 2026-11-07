@@ -387,6 +387,22 @@ impl HostBridge for CoreBridge {
     fn log(&self, plugin_id: &PluginId, level: LogLevel, message: &str) {
         logs::append(&self.inner.logs_root, plugin_id, level, message);
     }
+
+    fn begin_event(&self, plugin_id: &PluginId) {
+        self.inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default)
+            .start_handler(plugin_id.as_str());
+    }
+
+    fn end_event(&self, plugin_id: &PluginId) {
+        self.inner
+            .ctx
+            .extensions
+            .get_or_insert_with(crate::game_script::GameBudgets::default)
+            .end_handler(plugin_id.as_str());
+    }
 }
 
 /// What a scripted game package calls. It is deliberately a thin wrapper: the

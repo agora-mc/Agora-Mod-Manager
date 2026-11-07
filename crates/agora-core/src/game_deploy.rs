@@ -9,8 +9,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use agora_game_api::{
-    fold_path_case, BaseReference, CompiledGlob, GameDefinition, Layer, LayerId, LayerSource,
-    LayerStack, RelPath, DEFAULT_COPY_PATTERNS,
+    fold_path_case, BaseReference, CompiledGlob, GameDefinition, GameError, Layer, LayerId,
+    LayerSource, LayerStack, RelPath, Suggestion, DEFAULT_COPY_PATTERNS,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3025,8 +3025,12 @@ pub enum PlacementDecision {
         reason: String,
         top_level: Vec<String>,
     },
-    /// No rule places these files; the caller must say where they go.
-    Unknown { top_level: Vec<String> },
+    /// No rule places these files; the caller must say where they go. `note` explains a rule
+    /// whose `when` could not be judged, in words for the player.
+    Unknown {
+        top_level: Vec<String>,
+        note: Option<String>,
+    },
 }
 
 pub fn decide_placement(
@@ -3068,9 +3072,72 @@ pub fn decide_placement_with(
             top_level.dedup();
             PlacementDecision::Installer { reason, top_level }
         }
-        agora_game_api::Suggestion::Unknown { top_level } => {
-            PlacementDecision::Unknown { top_level }
+        agora_game_api::Suggestion::Unknown { top_level, note } => {
+            PlacementDecision::Unknown { top_level, note }
         }
+    }
+}
+
+/// Runs a package's `classify` hook only when neither a content rule nor the layout placed the
+/// item (MASTER_SPEC §30.12). A hook failure is kept so the caller reports it instead of showing
+/// the Unknown prompt as though the hook had nothing to say.
+pub(crate) struct PlacementClassifier<'a> {
+    ctx: &'a Ctx,
+    instance_id: &'a str,
+    definition: &'a GameDefinition,
+    error: std::cell::RefCell<Option<GameError>>,
+}
+
+impl<'a> PlacementClassifier<'a> {
+    pub(crate) fn new(ctx: &'a Ctx, instance_id: &'a str, definition: &'a GameDefinition) -> Self {
+        Self {
+            ctx,
+            instance_id,
+            definition,
+            error: std::cell::RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn run(&self, files: &[RelPath]) -> Option<Suggestion> {
+        let package = self.ctx.games.package_for(&self.definition.id).cloned()?;
+        let record = match crate::game_instance::get(self.ctx, self.instance_id) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                *self.error.borrow_mut() = Some(GameError {
+                    code: "ERR_INSTANCE_MISSING".into(),
+                    message: format!("there is no instance '{}'", self.instance_id),
+                });
+                return None;
+            }
+            Err(error) => {
+                *self.error.borrow_mut() = Some(GameError {
+                    code: "ERR_INSTANCE_FAILED".into(),
+                    message: error.to_string(),
+                });
+                return None;
+            }
+        };
+        let context = match crate::game_instance::hook_context(self.ctx, &record, self.definition) {
+            Ok(context) => context,
+            Err(error) => {
+                *self.error.borrow_mut() = Some(GameError {
+                    code: "ERR_INSTANCE_FAILED".into(),
+                    message: error.to_string(),
+                });
+                return None;
+            }
+        };
+        match crate::game_registry::block_on_hook(package.classify(context, files.to_vec())) {
+            Ok(suggestion) => suggestion,
+            Err(error) => {
+                *self.error.borrow_mut() = Some(error);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn take_error(self) -> Option<GameError> {
+        self.error.into_inner()
     }
 }
 
@@ -3129,8 +3196,15 @@ pub enum AddToInstanceError {
     Thunderstore(#[from] crate::content_thunderstore::ThunderstoreInstallError),
     #[error(transparent)]
     Deploy(#[from] DeployError),
-    #[error("no rule says where these files go (top-level entries: {})", .top_level.join(", "))]
-    PlacementUnknown { top_level: Vec<String> },
+    /// The package's `classify` hook ran but failed. The placement is unknown, but saying so as
+    /// though the hook had answered would hide a broken plugin.
+    #[error("the game's classify check could not run: {0}")]
+    Classify(String),
+    #[error("no rule says where these files go (top-level entries: {}){note}", .top_level.join(", "), note = .note.as_deref().map(|note| format!(". {note}")).unwrap_or_default())]
+    PlacementUnknown {
+        top_level: Vec<String>,
+        note: Option<String>,
+    },
 }
 
 /// Add a stored item to an instance where the game's content rules put it: the one placement path
@@ -3180,7 +3254,26 @@ pub fn add_to_instance(
 
     let item = crate::content_store::get_item(ctx, item_id)?;
     let facts = crate::game_conditions::InstanceFacts::for_instance(ctx, instance_id, game);
-    match decide_placement_with(&item, &layout, &game.content_rules, Some(&facts), None) {
+    let classifier = ctx
+        .games
+        .package_for(&game.id)
+        .map(|_| PlacementClassifier::new(ctx, instance_id, game));
+    let decision = {
+        let classify = classifier
+            .as_ref()
+            .map(|classifier| |files: &[RelPath]| classifier.run(files));
+        let classify_ref: Option<agora_game_api::PlacementClassify<'_>> = classify
+            .as_ref()
+            .map(|classify| classify as &dyn Fn(&[RelPath]) -> Option<Suggestion>);
+        decide_placement_with(
+            &item,
+            &layout,
+            &game.content_rules,
+            Some(&facts),
+            classify_ref,
+        )
+    };
+    match decision {
         PlacementDecision::Place {
             mount_path,
             source_path,
@@ -3201,8 +3294,11 @@ pub fn add_to_instance(
             reason,
             top_level,
         }),
-        PlacementDecision::Unknown { top_level } => {
-            Err(AddToInstanceError::PlacementUnknown { top_level })
+        PlacementDecision::Unknown { top_level, note } => {
+            if let Some(error) = classifier.and_then(PlacementClassifier::take_error) {
+                return Err(AddToInstanceError::Classify(error.message));
+            }
+            Err(AddToInstanceError::PlacementUnknown { top_level, note })
         }
     }
 }

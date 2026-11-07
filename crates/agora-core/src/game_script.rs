@@ -202,6 +202,11 @@ pub struct BudgetSession {
 #[derive(Clone, Default)]
 pub struct GameBudgets {
     sessions: Arc<Mutex<HashMap<String, BudgetSession>>>,
+    /// How many event handlers are running per plugin. An event handler opens a
+    /// fresh session when the first one starts and closes it when the last one
+    /// ends, so one handler's `game.*` calls never share another handler's
+    /// budget (MASTER_SPEC §30.12).
+    handlers: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl GameBudgets {
@@ -215,6 +220,40 @@ impl GameBudgets {
         BudgetGuard {
             budgets: self.clone(),
             plugin_id: plugin_id.to_string(),
+        }
+    }
+
+    /// Start one event handler call. The first handler for a plugin opens a
+    /// fresh budget session; nested handlers share it.
+    pub fn start_handler(&self, plugin_id: &str) {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let depth = handlers.entry(plugin_id.to_string()).or_insert(0);
+        *depth += 1;
+        if *depth == 1 {
+            if let Ok(mut sessions) = self.sessions.lock() {
+                sessions.insert(plugin_id.to_string(), BudgetSession::default());
+            }
+        }
+    }
+
+    /// End one event handler call, closing the session when the last one ends.
+    pub fn end_handler(&self, plugin_id: &str) {
+        let mut handlers = self
+            .handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(depth) = handlers.get_mut(plugin_id) else {
+            return;
+        };
+        *depth = depth.saturating_sub(1);
+        if *depth == 0 {
+            handlers.remove(plugin_id);
+            if let Ok(mut sessions) = self.sessions.lock() {
+                sessions.remove(plugin_id);
+            }
         }
     }
 
@@ -1384,6 +1423,34 @@ pub fn user_data_root(location: &UserDataLocation) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use agora_plugin_api::host::GameReads;
+
+    #[test]
+    fn each_event_handler_call_gets_a_fresh_budget_session() {
+        let budgets = GameBudgets::default();
+        budgets.start_handler("acme.events");
+        let first = budgets.session("acme.events").reads;
+        budgets.end_handler("acme.events");
+
+        budgets.start_handler("acme.events");
+        let second = budgets.session("acme.events").reads;
+        budgets.end_handler("acme.events");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a second handler call must not spend the first one's budget"
+        );
+
+        // Nested calls for one handler share, and the session closes with the last.
+        budgets.start_handler("acme.events");
+        budgets.start_handler("acme.events");
+        let shared = budgets.session("acme.events").reads;
+        budgets.end_handler("acme.events");
+        assert!(Arc::ptr_eq(&shared, &budgets.session("acme.events").reads));
+        budgets.end_handler("acme.events");
+        assert!(
+            !Arc::ptr_eq(&shared, &budgets.session("acme.events").reads),
+            "the handler's session must close when it ends"
+        );
+    }
 
     fn unique_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

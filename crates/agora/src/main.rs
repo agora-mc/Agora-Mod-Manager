@@ -7779,21 +7779,33 @@ async fn run_command(
                                         std::process::exit(1);
                                     }
                                 }
-                                Err(AddToInstanceError::PlacementUnknown { top_level }) => {
+                                Err(AddToInstanceError::PlacementUnknown { top_level, note }) => {
                                     if json {
-                                        let out = serde_json::json!({
+                                        let mut out = serde_json::json!({
                                             "status": "error",
                                             "error": "Cannot determine placement for content",
                                             "top_level": top_level,
                                             "exitCode": 1,
                                         });
+                                        if let Some(note) = &note {
+                                            out["note"] = serde_json::json!(note);
+                                        }
                                         eprintln!("{}", serde_json::to_string_pretty(&out)?);
                                     } else {
                                         eprintln!("Error: Cannot determine placement for content.");
+                                        if let Some(note) = &note {
+                                            eprintln!("{note}");
+                                        }
                                         eprintln!("Top-level entries: {}", top_level.join(", "));
                                         eprintln!("Specify --into (and --from) to place manually.");
                                     }
                                     std::process::exit(1);
+                                }
+                                Err(AddToInstanceError::Classify(message)) => {
+                                    exit_with_error(
+                                        json,
+                                        &format!("Cannot place the content: {message}"),
+                                    );
                                 }
                                 Err(e) => exit_with_error(json, &e.to_string()),
                             }

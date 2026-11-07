@@ -537,9 +537,10 @@ mod add_to_instance {
                 assert_eq!(content_layers(&ctx, &instance_id), 1);
             }
             (
-                Err(AddToInstanceError::PlacementUnknown { top_level }),
+                Err(AddToInstanceError::PlacementUnknown { top_level, .. }),
                 PlacementDecision::Unknown {
                     top_level: expected,
+                    ..
                 },
             ) => {
                 assert_eq!(top_level, expected);

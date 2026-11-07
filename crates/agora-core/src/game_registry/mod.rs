@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agora_game_api::{
-    Condition, FrameworkId, GameDefinition, GameHost, GameId, GameInstall, GamePackage, GamePath,
-    InstallId, InstallKind, LoadOrderFormat, RelPath, RuntimeIdentity, StoreId, ToolId,
-    UserFileStrategy, GAME_API_VERSION,
+    Condition, FrameworkId, GameDefinition, GameId, GameInstall, GamePackage, GamePath, InstallId,
+    InstallKind, LoadOrderFormat, RelPath, RuntimeIdentity, StoreId, ToolId, UserFileStrategy,
+    GAME_API_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -739,73 +739,6 @@ pub fn identify_installs(
     }
 }
 
-/// A game host that offers nothing. `detect_runtime` is called before a
-/// launch host exists; a package that needs one there is told so.
-pub(crate) struct NoGameHost;
-
-/// A game host that offers nothing, for hook call sites that have no launch
-/// host yet. Scripted hooks use `game:read` through the plugin bridge instead.
-pub(crate) fn null_game_host() -> &'static dyn GameHost {
-    &NoGameHost
-}
-
-fn no_host<T>() -> agora_game_api::GameFuture<'static, T> {
-    Box::pin(async {
-        Err(agora_game_api::GameError {
-            code: "ERR_NO_GAME_HOST".into(),
-            message: "no game host is available while identifying an install".into(),
-        })
-    })
-}
-
-impl agora_game_api::GameHost for NoGameHost {
-    fn download(
-        &self,
-        _: agora_game_api::DownloadRequest,
-    ) -> agora_game_api::GameFuture<'_, agora_game_api::DownloadedArtifact> {
-        no_host()
-    }
-    fn read_install_file(
-        &self,
-        _: agora_game_api::InstallReadRequest,
-    ) -> agora_game_api::GameFuture<'_, Vec<u8>> {
-        no_host()
-    }
-    fn read_artifact(
-        &self,
-        _: agora_game_api::ArtifactReadRequest,
-    ) -> agora_game_api::GameFuture<'_, Vec<u8>> {
-        no_host()
-    }
-    fn extract_archive(
-        &self,
-        _: agora_game_api::ArchiveRequest,
-    ) -> agora_game_api::GameFuture<'_, agora_game_api::ExtractedArchive> {
-        no_host()
-    }
-    fn run_fomod(
-        &self,
-        _: agora_game_api::FomodRequest,
-    ) -> agora_game_api::GameFuture<'_, agora_game_api::FomodResult> {
-        no_host()
-    }
-    fn sort_load_order(
-        &self,
-        _: agora_game_api::SortLoadOrderRequest,
-    ) -> agora_game_api::GameFuture<'_, agora_game_api::LoadOrder> {
-        no_host()
-    }
-    fn run_tool(
-        &self,
-        _: agora_game_api::ToolRunRequest,
-    ) -> agora_game_api::GameFuture<'_, agora_game_api::ToolRunResult> {
-        no_host()
-    }
-    fn emit_event(&self, _: agora_game_api::GameEvent) -> agora_game_api::GameResult<()> {
-        Ok(())
-    }
-}
-
 /// Drive a hook future to completion. The hooks themselves only wait on the
 /// plugin thread's synchronous bridge, so parking this thread is enough and no
 /// Tokio runtime is created here.
@@ -920,7 +853,7 @@ fn resolve_runtime(
                     volume: discovered.volume.clone(),
                     capabilities: discovered.capabilities.clone(),
                 };
-                match block_on_hook(package.detect_runtime(&NoGameHost, install)) {
+                match block_on_hook(package.detect_runtime(install)) {
                     Ok(Some(identity)) => {
                         return RuntimeResolution::Identified {
                             runtime: identity,
