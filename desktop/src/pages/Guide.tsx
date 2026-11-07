@@ -22,6 +22,7 @@ import {
   TriangleAlert,
   X,
 } from 'lucide-react';
+import { PageHero } from '../components/PageHero';
 import {
   GUIDE_CATEGORIES,
   GUIDE_TOPICS,
@@ -235,24 +236,12 @@ export function Guide({ onNavigateTab, initialTopicId }: { onNavigateTab: (tab: 
 
   return (
     <div className="space-y-6" data-testid="guide-page">
-      <header className="relative overflow-hidden agora-hero">
-        <div className="absolute -right-16 -top-20 h-56 w-56 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="absolute -bottom-28 right-20 h-64 w-64 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="relative grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem] lg:items-end">
-          <div className="max-w-3xl">
-            <div className="mb-4 flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/10 ring-1 ring-white/20">
-                <BookOpen className="h-4 w-4" aria-hidden="true" />
-              </div>
-              <p className="text-xs font-bold uppercase tracking-[0.2em] text-white/65">Agora Guide</p>
-            </div>
-            <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Learn the launcher. Understand your modded game.</h1>
-            <p className="mt-3 max-w-2xl text-sm leading-6 text-white/75 sm:text-base">
-              {GUIDE_TOPICS.length} topics, each with a beginner-friendly walkthrough and a separate advanced guide.
-              Start anywhere and move at your own pace.
-            </p>
-          </div>
-          <div className="rounded-xl border border-white/15 bg-black/15 p-4 backdrop-blur-xs">
+      <PageHero
+        icon={BookOpen}
+        title="Learn the launcher."
+        subtitle={`${GUIDE_TOPICS.length} topics, each with a beginner-friendly walkthrough and a separate advanced guide. Start anywhere and move at your own pace.`}
+        actions={
+          <div className="w-full rounded-xl border border-white/15 bg-black/15 p-4 backdrop-blur-xs sm:w-[22rem]">
             <div className="flex items-center justify-between text-xs font-semibold">
               <span>Guide progress</span>
               <span>{completedCount} of {totalPages} pages</span>
@@ -277,8 +266,8 @@ export function Guide({ onNavigateTab, initialTopicId }: { onNavigateTab: (tab: 
               )}
             </div>
           </div>
-        </div>
-      </header>
+        }
+      />
 
       <section className="flex flex-col gap-3 rounded-xl border border-primary/30 bg-card p-4 sm:flex-row sm:items-center sm:justify-between">
         <div>

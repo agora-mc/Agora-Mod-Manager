@@ -10,7 +10,8 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { BookOpen, RotateCcw } from 'lucide-react';
+import { NotebookPen, RotateCcw } from 'lucide-react';
+import { PageHero } from '../components/PageHero';
 import { useAmbience } from '../features/ambience/AmbienceProvider';
 import {
   journalFromSaved,
@@ -125,28 +126,21 @@ export function FieldGuide() {
 
   return (
     <div className="space-y-6" data-testid="field-guide-page">
-      <header className="relative overflow-hidden agora-hero">
-        <div className="absolute -right-16 -top-20 h-56 w-56 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="absolute -bottom-28 right-20 h-64 w-64 rounded-full border border-white/10" aria-hidden="true" />
-        <div className="relative grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-          <div>
-            <div className="mb-3 flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/10 ring-1 ring-white/20">
-                <BookOpen className="h-4 w-4" aria-hidden="true" />
-              </div>
-              <p className="text-xs font-bold uppercase tracking-[0.2em] text-white/65">Agora field guide</p>
-            </div>
-            <h2 className="text-2xl font-bold">Field Guide</h2>
-            <p className="mt-1 max-w-2xl text-sm text-white/75">
-              Every discovery hidden in the living background, plus the achievements you've earned.
-              {!enabled
-                ? ' Turn the living background on to find more.'
-                : reducedMotion
-                  ? ' Reduce motion is on, so the background holds still as one picture.'
-                  : ' The background is running — keep an eye out.'}
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
+      <PageHero
+        icon={NotebookPen}
+        title="Field Guide"
+        subtitle={
+          <>
+            Every discovery hidden in the living background, plus the achievements you've earned.
+            {!enabled
+              ? ' Turn the living background on to find more.'
+              : reducedMotion
+                ? ' Reduce motion is on, so the background holds still as one picture.'
+                : ' The background is running — keep an eye out.'}
+          </>
+        }
+        actions={
+          <>
             <div className="rounded-xl bg-white/10 px-4 py-2 text-center ring-1 ring-white/15">
               <div className="text-xl font-bold leading-none">{earnedCount}<span className="text-sm font-normal text-white/60">/{ACHIEVEMENTS.length}</span></div>
               <div className="mt-0.5 text-[11px] uppercase tracking-wide text-white/55">achievements</div>
@@ -160,9 +154,9 @@ export function FieldGuide() {
               <RotateCcw className="h-4 w-4" aria-hidden="true" />
               Refresh
             </button>
-          </div>
-        </div>
-      </header>
+          </>
+        }
+      />
 
       {/* Achievements — completion is persisted locally (agora-world-journal). */}
       <section className="rounded-xl border border-border bg-card p-4">
