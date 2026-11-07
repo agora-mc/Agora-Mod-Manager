@@ -35,6 +35,9 @@ const row = {
   exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
   fromMod: 'Nemesis Unlimited Behavior Engine',
   runOnly: false,
+  scope: 'instance',
+  inputs: [],
+  inputValues: {},
 };
 
 const costs = {
@@ -125,6 +128,7 @@ describe('runGameTool', () => {
       capture: 'auto',
       refusal: null,
       confirmSwap: false,
+      itemId: null,
     });
   });
 
@@ -137,6 +141,7 @@ describe('runGameTool', () => {
       capture: 'swap',
       refusal: 'injection failed',
       confirmSwap: true,
+      itemId: null,
     });
   });
 

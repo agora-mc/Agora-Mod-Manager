@@ -181,6 +181,7 @@ function RowActionsMenu({ row, props }: { row: InstalledContentRow; props: Insta
         {props.onChooseGroup ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onChooseGroup?.([row])}>Set group…</DropdownMenuItem> : null}
         {props.onSetCustomIcon ? <DropdownMenuItem disabled={props.locked} onSelect={() => props.onSetCustomIcon?.(row)}>Set custom image</DropdownMenuItem> : null}
         {row.registry_id || row.modrinth_id || row.mod_jar_id ? <DropdownMenuItem onSelect={() => props.onOpenDetails?.(row)}>View details</DropdownMenuItem> : null}
+        {props.extraRowMenuItems?.(row)}
       </DropdownMenuContent>
     </DropdownMenu>
   );

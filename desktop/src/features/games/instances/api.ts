@@ -94,7 +94,24 @@ export interface InstanceCheck {
   passed: PassedCheck[];
 }
 
-export type LaunchStatus = 'launched' | 'refused' | 'vfs_unavailable';
+export type LaunchStatus = 'launched' | 'refused' | 'vfs_unavailable' | 'before_launch_needed' | 'before_launch_failed';
+
+/** One tool a launch should run first (MASTER_SPEC §30.12). */
+export interface BeforeLaunchNeed {
+  tool: string;
+  name: string;
+  /** `run` runs it before the launch; `ask` offers it first. */
+  mode: 'run' | 'ask';
+  /** Why the tool is needed, in core's words. */
+  reason: string;
+}
+
+/** A before-launch run that did not finish. */
+export interface BeforeLaunchFailure {
+  tool: string;
+  name: string;
+  message: string;
+}
 
 export interface LaunchReply {
   status: LaunchStatus;
@@ -104,6 +121,8 @@ export interface LaunchReply {
   findings: CheckFinding[];
   reason: string | null;
   next: DeploymentMode | null;
+  beforeLaunch: BeforeLaunchNeed[];
+  beforeLaunchFailure: BeforeLaunchFailure | null;
 }
 
 export interface CreatedInstance {
@@ -190,7 +209,7 @@ const CREATE_PROGRESS_EVENT = 'games-instance-create-progress';
 const INSTANCE_EXITED_EVENT = 'games-instance-exited';
 
 const DEPLOYMENTS: readonly string[] = ['virtual', 'links', 'copies'];
-const LAUNCH_STATUSES: readonly string[] = ['launched', 'refused', 'vfs_unavailable'];
+const LAUNCH_STATUSES: readonly string[] = ['launched', 'refused', 'vfs_unavailable', 'before_launch_needed', 'before_launch_failed'];
 const FINDING_KINDS: readonly string[] = ['framework', 'load_order', 'tool', 'base'];
 const CHECK_STATUSES: readonly string[] = ['ok', 'warnings', 'findings'];
 
@@ -271,6 +290,21 @@ function isPassed(value: unknown): value is PassedCheck {
     && typeof value.detail === 'string';
 }
 
+function isBeforeLaunchNeed(value: unknown): value is BeforeLaunchNeed {
+  return isRecord(value)
+    && typeof value.tool === 'string'
+    && typeof value.name === 'string'
+    && (value.mode === 'run' || value.mode === 'ask')
+    && typeof value.reason === 'string';
+}
+
+function isBeforeLaunchFailure(value: unknown): value is BeforeLaunchFailure {
+  return isRecord(value)
+    && typeof value.tool === 'string'
+    && typeof value.name === 'string'
+    && typeof value.message === 'string';
+}
+
 function isLaunchReply(value: unknown): value is LaunchReply {
   if (!isRecord(value)) return false;
   return typeof value.status === 'string'
@@ -281,7 +315,12 @@ function isLaunchReply(value: unknown): value is LaunchReply {
     && isDeployment(value.deployment)
     && isOptionalString(value.notice)
     && isOptionalString(value.reason)
-    && isDeployment(value.next);
+    && isDeployment(value.next)
+    && (value.beforeLaunch === undefined
+      || (Array.isArray(value.beforeLaunch) && value.beforeLaunch.every(isBeforeLaunchNeed)))
+    && (value.beforeLaunchFailure === undefined
+      || value.beforeLaunchFailure === null
+      || isBeforeLaunchFailure(value.beforeLaunchFailure));
 }
 
 function shapeError(command: string): Error {
@@ -484,12 +523,21 @@ export async function setGameInstanceDeployment(instanceId: string, mode: Deploy
  */
 export async function launchGameInstance(
   instanceId: string,
-  options: { launchAnyway: boolean; deployment?: DeploymentMode },
+  options: {
+    launchAnyway: boolean;
+    deployment?: DeploymentMode;
+    /** How to answer each before-launch tool; leave out to be asked. */
+    beforeLaunch?: Record<string, 'run' | 'launch_anyway'>;
+    /** Launch without running any before-launch tool. */
+    skipBeforeLaunch?: boolean;
+  },
 ): Promise<LaunchReply> {
   const reply: unknown = await invoke<unknown>('games_instance_launch', {
     instanceId,
     launchAnyway: options.launchAnyway,
     deployment: options.deployment ?? null,
+    skipBeforeLaunch: options.skipBeforeLaunch ?? false,
+    beforeLaunch: options.beforeLaunch ?? null,
   });
   if (!isLaunchReply(reply)) throw shapeError('games_instance_launch');
   return reply;

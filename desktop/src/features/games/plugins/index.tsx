@@ -20,6 +20,7 @@ import {
   checkGamePlugins,
   describeFailure,
   listGamePlugins,
+  listLoadOrderLists,
   moveGamePlugin,
   setGamePluginActive,
   setGamePluginLocked,
@@ -28,6 +29,7 @@ import {
   type PluginChange,
   type PluginFinding,
   type PluginRow,
+  type LoadOrderListRow,
   type PluginsView,
   type SortReport,
 } from './api';
@@ -49,30 +51,52 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [sortPreview, setSortPreview] = useState<SortReport | null>(null);
   const [askingForMasterlist, setAskingForMasterlist] = useState(false);
+  const [lists, setLists] = useState<LoadOrderListRow[] | null>(null);
+  const [listId, setListId] = useState<string | null>(null);
   // Counts the reads, so a reply for an instance the tab no longer shows is dropped.
   const requestId = useRef(0);
 
-  const fetchList = useCallback(() => {
-    const id = ++requestId.current;
+  const fetchList = useCallback((id: string | null) => {
+    const request = ++requestId.current;
     setLoad({ status: 'loading' });
     setError(null);
     setNotice(null);
     setSortPreview(null);
-    listGamePlugins(instanceId)
+    listGamePlugins(instanceId, id ?? undefined)
       .then((view) => {
-        if (id === requestId.current) setLoad({ status: 'loaded', view });
+        if (request === requestId.current) setLoad({ status: 'loaded', view });
       })
       .catch((failure: unknown) => {
-        if (id === requestId.current) setLoad({ status: 'failed', message: describeFailure(failure) });
+        if (request === requestId.current) setLoad({ status: 'failed', message: describeFailure(failure) });
       });
   }, [instanceId]);
 
   useEffect(() => {
-    fetchList();
+    let current = true;
+    setLists(null);
+    setListId(null);
+    listLoadOrderLists(instanceId)
+      .then((view) => {
+        if (!current) return;
+        setLists(view.lists);
+        setListId(view.lists[0]?.id ?? null);
+      })
+      .catch((failure: unknown) => {
+        if (!current) return;
+        // A game with no list metadata still gets the list's own answer (and its wording).
+        setLists([]);
+        setError(describeFailure(failure));
+      });
     return () => {
+      current = false;
       requestId.current++;
     };
-  }, [fetchList]);
+  }, [instanceId]);
+
+  useEffect(() => {
+    if (lists === null) return;
+    fetchList(listId);
+  }, [fetchList, listId, lists]);
 
   const view = load.status === 'loaded' ? load.view : null;
 
@@ -99,14 +123,14 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
       setNotice(saved);
       return;
     }
-    fetchList();
+    fetchList(listId);
     setNotice(`Saved, but the list could not be read back. ${change.reloadError ?? ''}`.trim());
   };
 
   const toggleActive = (row: PluginRow) =>
     run(
       `active:${row.name}`,
-      () => setGamePluginActive(instanceId, row.name, !row.active),
+      () => setGamePluginActive(instanceId, row.name, !row.active, listId ?? undefined),
       (change) => {
         const now = row.active ? 'off' : 'on';
         applyChange(change, change.changed ? `${row.name} is now ${now}.` : `${row.name} was already ${now}.`);
@@ -116,7 +140,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const toggleLock = (row: PluginRow) =>
     run(
       `lock:${row.name}`,
-      () => setGamePluginLocked(instanceId, row.name, !row.locked),
+      () => setGamePluginLocked(instanceId, row.name, !row.locked, listId ?? undefined),
       (change) => {
         const now = row.locked ? 'unlocked' : 'locked';
         applyChange(change, change.changed ? `${row.name} is ${now}.` : `${row.name} was already ${now}.`);
@@ -126,7 +150,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const movePlugin = (row: PluginRow, to: number) =>
     run(
       `move:${row.name}`,
-      () => moveGamePlugin(instanceId, row.name, to),
+      () => moveGamePlugin(instanceId, row.name, to, listId ?? undefined),
       (change) => {
         showView(change.plugins);
         setNotice(
@@ -138,7 +162,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
     );
 
   const checkAgain = () =>
-    run('check', () => checkGamePlugins(instanceId), (result) => {
+    run('check', () => checkGamePlugins(instanceId, listId ?? undefined), (result) => {
       setLoad((current) =>
         current.status === 'loaded' ? { status: 'loaded', view: { ...current.view, findings: result.findings } } : current,
       );
@@ -152,10 +176,11 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
     });
 
   const previewSort = () =>
-    run('sort-preview', () => sortGamePlugins(instanceId, true), (change) => setSortPreview(change.report));
+    run('sort-preview', () => sortGamePlugins(instanceId, true, listId ?? undefined), (change) => setSortPreview(change.report));
 
   const askOrPreviewSort = () => {
-    if (!view || view.masterlist === null) {
+    if (!view) return;
+    if (view.rulesKind === 'creation_engine' && view.hasLoot && view.masterlist === null) {
       setAskingForMasterlist(true);
       return;
     }
@@ -167,12 +192,12 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
     setError(null);
     setNotice(null);
     try {
-      const masterlist = await updateGameMasterlist(instanceId);
+      const masterlist = await updateGameMasterlist(instanceId, listId ?? undefined);
       setLoad((current) =>
         current.status === 'loaded' ? { status: 'loaded', view: { ...current.view, masterlist } } : current,
       );
       setAskingForMasterlist(false);
-      const change = await sortGamePlugins(instanceId, true);
+      const change = await sortGamePlugins(instanceId, true, listId ?? undefined);
       setSortPreview(change.report);
     } catch (failure: unknown) {
       setError(describeFailure(failure));
@@ -182,7 +207,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   };
 
   const updateMasterlistOnly = () =>
-    run('masterlist', () => updateGameMasterlist(instanceId), (masterlist) => {
+    run('masterlist', () => updateGameMasterlist(instanceId, listId ?? undefined), (masterlist) => {
       setLoad((current) =>
         current.status === 'loaded' ? { status: 'loaded', view: { ...current.view, masterlist } } : current,
       );
@@ -190,7 +215,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
     });
 
   const applySort = () =>
-    run('sort-apply', () => sortGamePlugins(instanceId, false), (change) => {
+    run('sort-apply', () => sortGamePlugins(instanceId, false, listId ?? undefined), (change) => {
       showView(change.plugins);
       setSortPreview(null);
       const count = change.report.moves.length;
@@ -207,7 +232,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
         <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
           {load.status === 'failed' ? load.message : 'The plugin list did not load.'}
         </p>
-        <Button variant="outline" size="sm" onClick={fetchList}>
+        <Button variant="outline" size="sm" onClick={() => fetchList(listId)}>
           Try again
         </Button>
       </section>
@@ -217,15 +242,18 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const hasRows = view.rows.length > 0;
   const showTable = view.supported && view.listExists && hasRows;
   const anyBusy = busy !== null;
+  const heading = lists !== null && lists.length > 1 ? 'Load order' : (view.listName || 'Plugins');
+  const engine = view.rulesKind === 'creation_engine';
 
   return (
     <section className="space-y-4" aria-labelledby="plugins-heading" data-testid="plugins-tab">
       <header className="flex flex-wrap items-start justify-between gap-3">
         <div className="max-w-2xl space-y-1">
-          <h2 id="plugins-heading" className="text-lg font-semibold">Plugins</h2>
+          <h2 id="plugins-heading" className="text-lg font-semibold">{heading}</h2>
           <p className="text-sm text-muted-foreground">
-            The game reads plugins from the top of this list down. When two plugins change the same thing,
-            the one lower down wins. A plugin's masters must load above it.
+            {engine
+              ? "The game reads plugins from the top of this list down. When two plugins change the same thing, the one lower down wins. A plugin's masters must load above it."
+              : 'The game reads these from the top of this list down. When two change the same thing, the lower one wins.'}
           </p>
           {view.masterlist && (
             <p className="text-xs text-muted-foreground" data-testid="plugins-masterlist">
@@ -239,18 +267,43 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
               <RefreshCw />
               Check again
             </Button>
-            {view.rulesApply && (
+            {engine && view.hasLoot && (
               <Button variant="outline" size="sm" onClick={updateMasterlistOnly} disabled={anyBusy}>
                 <Download />
                 Update masterlist
               </Button>
             )}
-            <Button variant="outline" size="sm" onClick={askOrPreviewSort} disabled={anyBusy || !view.rulesApply}>
-              Sort…
-            </Button>
+            {view.rulesKind !== 'none' && (
+              <Button variant="outline" size="sm" onClick={askOrPreviewSort} disabled={anyBusy}>
+                Sort…
+              </Button>
+            )}
           </div>
         )}
       </header>
+
+      {lists !== null && lists.length > 1 && (
+        <div role="tablist" aria-label="Load order lists" className="flex flex-wrap gap-1 rounded-lg bg-muted p-1" data-testid="load-order-tabs">
+          {lists.map((list) => {
+            const selected = list.id === listId;
+            return (
+              <button
+                key={list.id}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                onClick={() => setListId(list.id)}
+                className={[
+                  'rounded-md px-3 py-1.5 text-sm font-medium transition-colors',
+                  selected ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
+                ].join(' ')}
+              >
+                {list.name}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {error && (
         <p role="alert" className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
@@ -295,7 +348,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
             <thead className="bg-muted/40 text-left text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
                 <th scope="col" className="w-16 px-3 py-2">#</th>
-                <th scope="col" className="px-3 py-2">Plugin</th>
+                <th scope="col" className="px-3 py-2">{engine ? 'Plugin' : 'Name'}</th>
                 <th scope="col" className="px-3 py-2 text-right">Change it</th>
               </tr>
             </thead>

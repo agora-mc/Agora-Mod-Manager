@@ -255,6 +255,57 @@ test('an instance’s content lists its load order and says where each item goes
   await expect(row.getByRole('switch', { name: 'Disable Odin Patch' })).toBeVisible();
 });
 
+test('an item-scoped tool runs from the content row’s menu, with its form', async ({ page }) => {
+  await boot(page, {
+    games_instance_content_list: { instanceId: 'inst-1', items: [oneRow] },
+    games_library_list: { items: [], damaged: [], warnings: [] },
+    games_tools_list: {
+      instanceId: 'inst-1',
+      known: ['Patcher'],
+      tools: [{
+        toolId: 'patcher',
+        name: 'Patcher',
+        declared: true,
+        current: null,
+        previous: null,
+        status: null,
+        conflicts: false,
+        outputKind: 'generated_layer',
+        outputFolder: null,
+        installed: true,
+        exe: 'Data/patcher.exe',
+        fromMod: 'Patcher mod',
+        runOnly: true,
+        scope: 'item',
+        inputs: [{ id: 'profile', label: 'Profile', kind: 'text', required: true, default: null, choices: [], arg: '--profile' }],
+        inputValues: {},
+      }],
+    },
+    games_tools_save_inputs: null,
+    games_tools_run: {
+      status: 'finished',
+      outcome: {
+        toolId: 'patcher', name: 'Patcher', run: 'run-1', capture: 'links', captureReason: null,
+        promoted: true, current: '1', previous: null, written: [], deleted: [], exitCode: 0,
+        cancelled: false, failedFolder: null, failure: null, copiedLayer: null,
+        installChanges: { created: [], changed: [], deleted: [], mayBeIncomplete: false, unavailable: null },
+        swap: null, offers: [], unchangedDropped: 0,
+      },
+    },
+  });
+  await openInstanceContent(page);
+  await page.goto('/');
+
+  await page.getByRole('button', { name: 'More actions for Odin Patch' }).click();
+  await page.getByRole('menuitem', { name: 'Run Patcher on this' }).click();
+  const dialog = page.getByTestId('item-tool-dialog');
+  await expect(dialog).toContainText('Run Patcher on Odin Patch');
+  await expect(dialog.getByRole('button', { name: 'Run Patcher' })).toBeDisabled();
+  await dialog.getByLabel('Profile (required)').fill('main');
+  await dialog.getByRole('button', { name: 'Run Patcher' }).click();
+  await expect(page.getByText('Ran Patcher on Odin Patch.')).toBeVisible();
+});
+
 test('the content list sorts and filters, and only reorders in load order', async ({ page }) => {
   const secondRow = {
     ...oneRow,

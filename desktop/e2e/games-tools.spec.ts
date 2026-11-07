@@ -47,7 +47,7 @@ const nemesisRow = {
   installed: true,
   exe: 'Data/Nemesis_Engine/Nemesis Unlimited Behavior Engine.exe',
   fromMod: 'Nemesis Unlimited Behavior Engine',
-  runOnly: false,
+  runOnly: false, scope: 'instance', inputs: [], inputValues: {},
 };
 const pandoraRow = {
   toolId: 'pandora',
@@ -62,7 +62,7 @@ const pandoraRow = {
   installed: true,
   exe: 'Data/Pandora Behaviour Engine+/Pandora Behaviour Engine+.exe',
   fromMod: 'Pandora Behaviour Engine+',
-  runOnly: false,
+  runOnly: false, scope: 'instance', inputs: [], inputValues: {},
 };
 const bodyslideRow = {
   toolId: 'bodyslide',
@@ -77,7 +77,7 @@ const bodyslideRow = {
   installed: true,
   exe: 'Data/CalienteTools/BodySlide/BodySlide x64.exe',
   fromMod: 'BodySlide and Outfit Studio',
-  runOnly: false,
+  runOnly: false, scope: 'instance', inputs: [], inputValues: {},
 };
 
 const KNOWN_TOOLS = ['Nemesis', 'BodySlide', 'Pandora Behaviour Engine', 'TexGen', 'DynDOLOD', 'PGPatcher'];
@@ -175,6 +175,7 @@ async function boot(page: Page, tools: ToolsTable = {}) {
       games_tools_remove: tools.remove ?? { removedGenerations: ['1', '2'], view: { instanceId: INSTANCE_ID, known: KNOWN_TOOLS, tools: [{ ...nemesisRow, current: null, previous: null, status: null, conflicts: false }, pandoraRow, bodyslideRow] } },
       games_tools_swap_restore: tools.restore ?? { restoredTools: ['bodyslide'] },
       games_tools_rollback: toolsView,
+      games_tools_save_inputs: null,
     },
     settings: { active_game: 'skyrim-se' },
   });
@@ -237,6 +238,38 @@ test('the installed tools show where they came from, their output, a stale badge
   await expect(page.getByTestId('tool-conflict').first()).toContainText('Nemesis and Pandora both have output here');
 });
 
+test('a tool that asks for values shows its form first, and a required value blocks the run', async ({ page }) => {
+  const deployer = {
+    ...nemesisRow,
+    toolId: 'deployer',
+    name: 'Deployer',
+    runOnly: true,
+    current: null,
+    previous: null,
+    status: null,
+    conflicts: false,
+    scope: 'instance',
+    inputs: [{ id: 'profile', label: 'Profile', kind: 'text', required: true, default: null, choices: [], arg: '--profile' }],
+    inputValues: {},
+  };
+  await boot(page, { list: { instanceId: INSTANCE_ID, tools: [deployer], known: ['Deployer'] } });
+  await openToolsPage(page);
+
+  await card(page, 'Deployer').getByRole('button', { name: 'Run Deployer' }).click();
+  const form = card(page, 'Deployer').getByTestId('tool-inputs-form');
+  await expect(form).toBeVisible();
+  await expect(form.getByTestId('tool-input-hint')).toHaveText('Fill in Profile to run this.');
+  await expect(form.getByRole('button', { name: 'Run Deployer' })).toBeDisabled();
+
+  await form.getByLabel('Profile (required)').fill('main');
+  await form.getByRole('button', { name: 'Run Deployer' }).click();
+  await expect.poll(async () => (await toolCalls(page)).map((call) => call.command)).toEqual(
+    expect.arrayContaining(['games_tools_save_inputs', 'games_tools_run']),
+  );
+  const run = (await toolCalls(page)).find((call) => call.command === 'games_tools_run');
+  expect(run?.args).toMatchObject({ instanceId: INSTANCE_ID, toolId: 'deployer', itemId: null });
+});
+
 test('a run that finishes says it is the next generation, and the page asks nothing more', async ({ page }) => {
   await boot(page);
   await openToolsPage(page);
@@ -249,7 +282,7 @@ test('a run that finishes says it is the next generation, and the page asks noth
 
   const calls = await toolCalls(page);
   expect(calls.filter((call) => call.command === 'games_tools_run')).toEqual([
-    { command: 'games_tools_run', args: { instanceId: INSTANCE_ID, toolId: 'nemesis', capture: 'auto', refusal: null, confirmSwap: false } },
+    { command: 'games_tools_run', args: { instanceId: INSTANCE_ID, toolId: 'nemesis', capture: 'auto', refusal: null, confirmSwap: false, itemId: null } },
   ]);
 });
 
@@ -292,6 +325,7 @@ test('a virtual file system that cannot start asks before any other tier runs', 
     instanceId: INSTANCE_ID,
     toolId: 'nemesis',
     capture: 'links',
+    itemId: null,
     refusal: 'injection failed on this install',
     confirmSwap: false,
   });
@@ -314,7 +348,7 @@ test('a full-copy swap is never run on the first click: its costs are shown and 
   await expect(page.getByTestId('tool-outcome')).toContainText('generation 3');
   const runs = (await toolCalls(page)).filter((call) => call.command === 'games_tools_run');
   expect(runs).toEqual([
-    { command: 'games_tools_run', args: { instanceId: INSTANCE_ID, toolId: 'nemesis', capture: 'swap', refusal: null, confirmSwap: true } },
+    { command: 'games_tools_run', args: { instanceId: INSTANCE_ID, toolId: 'nemesis', capture: 'swap', refusal: null, confirmSwap: true, itemId: null } },
   ]);
 });
 

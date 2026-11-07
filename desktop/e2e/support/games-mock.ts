@@ -51,6 +51,10 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
         // A verified registry that lists no official plugins. Specs that need a
         // card pass their own entry; an unanswered command would fail the test.
         list_official_plugins: { plugins: [], unavailableReason: null },
+        // A game with no load order lists keeps the single-list wording, and a game page's
+        // content tab asks for the tools that run on one item. Specs that need rows pass their own.
+        games_plugins_lists: { lists: [] },
+        games_tools_list: { instanceId: '', tools: [], known: [] },
         // The sharing setting lives on the Minecraft Settings page; a game-page
         // spec never changes it, but answering it keeps an errant visit honest.
         get_content_sharing: 'link',

@@ -44,6 +44,8 @@ const reply = (status: LaunchReply['status'], extra: Partial<LaunchReply> = {}):
   findings: [],
   reason: null,
   next: null,
+  beforeLaunch: [],
+  beforeLaunchFailure: null,
   ...extra,
 });
 

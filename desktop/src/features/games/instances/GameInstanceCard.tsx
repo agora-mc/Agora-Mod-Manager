@@ -65,6 +65,10 @@ export function GameInstanceCard({
     if (answer?.status === 'launched' && answer.notice === null && answer.findings.length === 0) {
       dismissGameLaunch(card.instanceId);
     }
+    // A before-launch question is answered on the instance page, where the dialog lives.
+    if (answer?.status === 'before_launch_needed' || answer?.status === 'before_launch_failed') {
+      onOpen();
+    }
     onLaunchSettled();
   };
 

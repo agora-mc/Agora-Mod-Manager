@@ -7,6 +7,7 @@ import {
   checkGamePlugins,
   describeFailure,
   listGamePlugins,
+  listLoadOrderLists,
   moveGamePlugin,
   setGamePluginActive,
   setGamePluginLocked,
@@ -32,12 +33,34 @@ const row = {
 
 const view: PluginsView = {
   supported: true,
+  listId: 'plugins',
+  listName: 'Plugins',
+  rulesKind: 'creation_engine',
+  hasLoot: true,
   rulesApply: true,
   listExists: true,
   rows: [row],
   findings: [],
   masterlist: null,
 };
+
+describe('load order lists', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it('reads every list the game declares', async () => {
+    const lists = { lists: [{ id: 'mods', name: 'Mods', rulesKind: 'none' }] };
+    invokeMock.mockResolvedValueOnce(lists);
+    await expect(listLoadOrderLists('inst-1')).resolves.toEqual(lists);
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_lists', { instanceId: 'inst-1' });
+  });
+
+  it('rejects a reply that is not a list of lists', async () => {
+    invokeMock.mockResolvedValueOnce({ lists: [{ id: 'x' }] });
+    await expect(listLoadOrderLists('inst-1')).rejects.toThrow('games_plugins_lists did not return the expected plugin data.');
+  });
+});
 
 describe('plugin commands', () => {
   beforeEach(() => {
@@ -47,7 +70,7 @@ describe('plugin commands', () => {
   it('lists the plugins with the arguments the backend takes', async () => {
     invokeMock.mockResolvedValueOnce(view);
     await expect(listGamePlugins('inst-1')).resolves.toEqual(view);
-    expect(invokeMock).toHaveBeenCalledWith('games_plugins_list', { instanceId: 'inst-1' });
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_list', { instanceId: 'inst-1', listId: null });
   });
 
   it('passes the 1-based target position as `to`, the name the backend declares', async () => {
@@ -56,20 +79,20 @@ describe('plugin commands', () => {
       plugins: view,
     });
     await moveGamePlugin('inst-1', 'SkyUI.esp', 2);
-    expect(invokeMock).toHaveBeenCalledWith('games_plugins_move', { instanceId: 'inst-1', plugin: 'SkyUI.esp', to: 2 });
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_move', { instanceId: 'inst-1', plugin: 'SkyUI.esp', to: 2, listId: null });
   });
 
   it('sends a sort as a dry run or for real, as it is asked', async () => {
     invokeMock.mockResolvedValueOnce({ report: { moves: [], blocked: [], written: false, mode: 'loot', message: null }, plugins: view });
     await sortGamePlugins('inst-1', true);
-    expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_sort', { instanceId: 'inst-1', dryRun: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_sort', { instanceId: 'inst-1', dryRun: true, listId: null });
   });
 
   it('downloads the masterlist and reads its date back', async () => {
     const masterlist = { fetchedAt: '2026-01-02T03:04:05Z', source: 'https://api.github.com/repos/loot/skyrimse' };
     invokeMock.mockResolvedValueOnce(masterlist);
     await expect(updateGameMasterlist('inst-1')).resolves.toEqual(masterlist);
-    expect(invokeMock).toHaveBeenCalledWith('games_plugins_update_masterlist', { instanceId: 'inst-1' });
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_update_masterlist', { instanceId: 'inst-1', listId: null });
   });
 
   it('sends the lock and active flags as they are asked', async () => {
@@ -79,12 +102,14 @@ describe('plugin commands', () => {
       instanceId: 'inst-1',
       plugin: 'SkyUI.esp',
       active: false,
+      listId: null,
     });
     await setGamePluginLocked('inst-1', 'SkyUI.esp', true);
     expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_set_locked', {
       instanceId: 'inst-1',
       plugin: 'SkyUI.esp',
       locked: true,
+      listId: null,
     });
   });
 

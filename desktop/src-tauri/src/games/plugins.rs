@@ -78,6 +78,14 @@ pub struct PluginsView {
     /// Whether the game keeps a plugin list at all. When false the tab says so, and there is
     /// nothing for Agora to order.
     pub supported: bool,
+    /// The list's id within the game.
+    pub list_id: String,
+    /// The list's name as a person reads it.
+    pub list_name: String,
+    /// The list's rule kind: `none`, `script` or `creation_engine`.
+    pub rules_kind: String,
+    /// Whether this list declares a LOOT masterlist source.
+    pub has_loot: bool,
     /// Whether the game's load order rules (masters, light and full limits) apply.
     pub rules_apply: bool,
     /// Whether the instance has a copy of the plugin list yet. It is created at deploy time.
@@ -147,6 +155,10 @@ impl PluginsView {
     fn unsupported() -> Self {
         Self {
             supported: false,
+            list_id: String::new(),
+            list_name: String::new(),
+            rules_kind: String::new(),
+            has_loot: false,
             rules_apply: false,
             list_exists: false,
             rows: Vec::new(),
@@ -158,6 +170,10 @@ impl PluginsView {
     fn from_order(order: &LoadOrder) -> Self {
         Self {
             supported: true,
+            list_id: order.list_id.clone(),
+            list_name: order.list_name.clone(),
+            rules_kind: order.rules_kind.clone(),
+            has_loot: false,
             rules_apply: order.engine,
             list_exists: order.exists,
             rows: order
@@ -289,6 +305,46 @@ pub struct SortChange {
     pub plugins: PluginsView,
 }
 
+/// One load order list a game declares, for the tab row above the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadOrderListRow {
+    pub id: String,
+    pub name: String,
+    /// `none`, `script` or `creation_engine`.
+    pub rules_kind: String,
+}
+
+/// Every load order list the game declares, in the order it declares them. Empty when the game
+/// keeps no list, which is not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadOrderListsView {
+    pub lists: Vec<LoadOrderListRow>,
+}
+
+#[tauri::command]
+pub async fn games_plugins_lists(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<LoadOrderListsView, GamesError> {
+    run_blocking(app, "Reading the load order lists", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        Ok(LoadOrderListsView {
+            lists: definition
+                .load_orders
+                .iter()
+                .map(|rule| LoadOrderListRow {
+                    id: rule.id.clone(),
+                    name: rule.name.clone(),
+                    rules_kind: rule.rules.kind.clone(),
+                })
+                .collect(),
+        })
+    })
+    .await
+}
+
 /// The instance's plugins in load order, with the findings the game's rules give.
 #[tauri::command]
 pub async fn games_plugins_list(
@@ -305,6 +361,7 @@ pub async fn games_plugins_list(
             .map_err(core_failed)?;
         let mut view = PluginsView::from_order(&order);
         let rule = load_order::list_by_id(definition, list_id.as_deref()).map_err(core_failed)?;
+        view.has_loot = rule.rules.loot.is_some();
         if rule.rules.loot.is_some() {
             view.masterlist = loot_masterlist::cached_in(&ctx, definition, Some(&rule.id))
                 .map_err(core_failed)?
@@ -522,6 +579,9 @@ mod tests {
         ));
 
         assert!(view.supported && view.rules_apply && view.list_exists);
+        assert_eq!(view.list_id, "plugins");
+        assert_eq!(view.list_name, "Plugins");
+        assert_eq!(view.rules_kind, "creation_engine");
         let numbered: Vec<(usize, &str)> = view
             .rows
             .iter()

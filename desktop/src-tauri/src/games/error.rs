@@ -22,6 +22,9 @@ pub struct GamesError {
     /// The agora-core code (`ERR_...`) when the failure came from core.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core_code: Option<String>,
+    /// Extra facts a page needs to show the right words, such as a placement note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl GamesError {
@@ -30,7 +33,14 @@ impl GamesError {
             code: code.to_string(),
             message: message.into(),
             core_code: None,
+            details: None,
         }
+    }
+
+    /// Attach the facts a page needs beyond the message.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     /// The failure a stub returns. Names the command so a caller can see which one.
@@ -48,6 +58,7 @@ impl From<agora_core::error::LauncherError> for GamesError {
             code: CORE_FAILED.to_string(),
             message: error.to_string(),
             core_code: Some(error.code()),
+            details: None,
         }
     }
 }

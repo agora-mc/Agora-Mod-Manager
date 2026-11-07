@@ -15,6 +15,21 @@ export type OutputStatus = 'current' | 'stale' | 'unknown' | 'conflict';
 /** The capture a person picks on the screen. `swap` is never the default. */
 export type CaptureChoice = 'auto' | 'vfs' | 'links' | 'swap';
 
+/** How an input is filled in. */
+export type ToolInputKind = 'file' | 'folder' | 'choice' | 'text' | 'flag';
+
+/** One value a tool asks the player for before it runs (MASTER_SPEC §30.12). */
+export interface ToolInput {
+  id: string;
+  label: string;
+  kind: ToolInputKind;
+  required: boolean;
+  default: string | null;
+  choices: string[];
+  /** The command-line argument the value is passed as. */
+  arg: string | null;
+}
+
 /** What captured a run that ran. */
 export type CaptureMethod = 'vfs' | 'links' | 'swap';
 
@@ -41,6 +56,12 @@ export interface ToolRow {
   fromMod: string | null;
   /** The tool has nothing to build (an editor, a sorter): the screen offers "Run", with no build status. */
   runOnly: boolean;
+  /** Whether the tool runs once for the instance or once per content item the player picks. */
+  scope: 'instance' | 'item';
+  /** The values the tool asks for before it runs. */
+  inputs: ToolInput[];
+  /** Values already saved for this instance, by input id. */
+  inputValues: Record<string, string>;
 }
 
 /** The tools present in an instance: the ones installed here, and the ones with output here. */
@@ -211,7 +232,24 @@ function isToolRow(value: unknown): value is ToolRow {
     && typeof value.installed === 'boolean'
     && isNullableString(value.exe)
     && isNullableString(value.fromMod)
-    && typeof value.runOnly === 'boolean';
+    && typeof value.runOnly === 'boolean'
+    && (value.scope === 'instance' || value.scope === 'item')
+    && Array.isArray(value.inputs)
+    && value.inputs.every(isToolInput)
+    && isObject(value.inputValues)
+    && Object.values(value.inputValues).every(isString);
+}
+
+function isToolInput(value: unknown): value is ToolInput {
+  if (!isObject(value)) return false;
+  return isString(value.id)
+    && isString(value.label)
+    && (value.kind === 'file' || value.kind === 'folder' || value.kind === 'choice'
+      || value.kind === 'text' || value.kind === 'flag')
+    && typeof value.required === 'boolean'
+    && isNullableString(value.default)
+    && isStringArray(value.choices)
+    && isNullableString(value.arg);
 }
 
 export function isToolsView(value: unknown): value is ToolsView {
@@ -374,7 +412,7 @@ export async function runGameTool(
   instanceId: string,
   toolId: string,
   capture: CaptureChoice,
-  options: { refusal?: string; confirmSwap?: boolean } = {},
+  options: { refusal?: string; confirmSwap?: boolean; itemId?: string } = {},
 ): Promise<RunResult> {
   const reply = await invoke<unknown>('games_tools_run', {
     instanceId,
@@ -382,8 +420,30 @@ export async function runGameTool(
     capture,
     refusal: options.refusal ?? null,
     confirmSwap: options.confirmSwap ?? false,
+    itemId: options.itemId ?? null,
   });
   return expectReply('games_tools_run', reply, isRunResult);
+}
+
+/** Save the values a tool's form was filled in with. A blank value removes the saved one. */
+export async function saveGameToolInputs(
+  instanceId: string,
+  toolId: string,
+  values: Record<string, string>,
+): Promise<void> {
+  await invoke<unknown>('games_tools_save_inputs', { instanceId, toolId, values });
+}
+
+/** Ask the person for a file. Uses the app's picker command; null when they cancel. */
+export async function pickToolFile(title: string): Promise<string | null> {
+  const picked = await invoke<unknown>('pick_open_file', { title, extensions: [] });
+  return isString(picked) && picked.trim() !== '' ? picked : null;
+}
+
+/** Ask the person for a folder. Uses the app's picker command; null when they cancel. */
+export async function pickToolFolder(title: string): Promise<string | null> {
+  const picked = await invoke<unknown>('pick_directory', { title });
+  return isString(picked) && picked.trim() !== '' ? picked : null;
 }
 
 /** Roll the tool's output back to its previous generation. Returns the instance's tools as they now are. */

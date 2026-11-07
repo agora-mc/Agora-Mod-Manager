@@ -300,6 +300,9 @@ export function InstanceToolsTab({ instanceId }: { gameId: string; instanceId: s
           exe: row.exe,
           fromMod: null,
           runOnly: !row.keepsOutput && !row.outputIsMod,
+          scope: 'instance',
+          inputs: [],
+          inputValues: {},
         };
         const details = [
           row.args.length > 0 ? `starts with ${row.args.join(' ')}` : null,

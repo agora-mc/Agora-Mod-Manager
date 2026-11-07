@@ -25,6 +25,14 @@ import {
 } from './api';
 import { clearGameLaunches, dismissGameLaunch, gameLaunchState, startGameLaunch, useGameLaunch } from './launchController';
 
+/** What the page says about the tools a launch needs first. */
+export interface BeforeLaunchAnswerOptions {
+  beforeLaunch?: Record<string, 'run' | 'launch_anyway'>;
+  skipBeforeLaunch?: boolean;
+  runningTool?: string;
+  runningTools?: number;
+}
+
 export interface InstanceSnapshot {
   detail: InstanceDetail;
   check: InstanceCheck | null;
@@ -43,6 +51,10 @@ export interface InstanceSession {
   page: InstancePageState;
   busy: 'deployment' | 'launch' | null;
   launchStartedAt: number | null;
+  /** The before-launch tool being run now, when exactly one is. */
+  runningTool: string | null;
+  /** How many before-launch tools the launch is running. */
+  runningTools: number;
   reply: LaunchReply | null;
   actionError: string | null;
   launchAnyway: boolean;
@@ -52,7 +64,7 @@ export interface InstanceSession {
   /** Read the instance again (name, running, play time) without re-running the checks. */
   refreshInstance: () => void;
   changeDeployment: (choice: DeploymentChoice) => Promise<void>;
-  launch: (deployment?: DeploymentMode) => Promise<void>;
+  launch: (deployment?: DeploymentMode, before?: BeforeLaunchAnswerOptions) => Promise<void>;
   answerFallback: (next: DeploymentMode, always: boolean) => Promise<void>;
   dismissReply: () => void;
 }
@@ -90,6 +102,8 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
   const busy: InstanceSession['busy'] = launchState.busy ? 'launch' : changing ? 'deployment' : null;
   const launchStartedAt = launchState.startedAt;
   const reply = launchState.reply;
+  const runningTool = launchState.runningTool;
+  const runningTools = launchState.runningTools;
   const actionError = ownError ?? launchState.error;
   const [launchAnyway, setLaunchAnyway] = useState(false);
   // An answer that arrives after the user moved to another instance is remembered, not shown.
@@ -202,11 +216,19 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
     refreshDetail();
   }, [instanceId, refreshDetail]);
 
-  const launch = useCallback(async (deployment?: DeploymentMode) => {
+  const launch = useCallback(async (deployment?: DeploymentMode, before: BeforeLaunchAnswerOptions = {}) => {
     setActionError(null);
-    const answer = await startGameLaunch(instanceId, { launchAnyway, deployment });
+    const answer = await startGameLaunch(instanceId, {
+      launchAnyway,
+      deployment,
+      beforeLaunch: before.beforeLaunch,
+      skipBeforeLaunch: before.skipBeforeLaunch,
+      runningTool: before.runningTool,
+      runningTools: before.runningTools,
+    });
+    if (answer === null) return;
     // Launched, or failed outright: either way the header's running state may have changed.
-    if (answer === null || answer.status === 'launched') refreshDetail();
+    if (answer.status === 'launched') refreshDetail();
   }, [instanceId, launchAnyway, refreshDetail]);
 
   // The question the virtual file system raises: run once from the next rung, always from it, or
@@ -236,6 +258,8 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
     page,
     busy,
     launchStartedAt,
+    runningTool,
+    runningTools,
     reply,
     actionError,
     launchAnyway,
@@ -246,7 +270,7 @@ export function InstanceSessionProvider({ instanceId, children }: { instanceId: 
     launch,
     answerFallback,
     dismissReply,
-  }), [instanceId, page, busy, launchStartedAt, reply, actionError, launchAnyway, reload, refreshDetail, changeDeployment, launch, answerFallback, dismissReply]);
+  }), [instanceId, page, busy, launchStartedAt, runningTool, runningTools, reply, actionError, launchAnyway, reload, refreshDetail, changeDeployment, launch, answerFallback, dismissReply]);
 
   return <InstanceSessionContext.Provider value={session}>{children}</InstanceSessionContext.Provider>;
 }

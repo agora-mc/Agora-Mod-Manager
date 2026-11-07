@@ -11,6 +11,8 @@ export interface GamesError {
   message: string;
   /** The agora-core `ERR_...` code, when the failure came from core. */
   coreCode?: string;
+  /** Extra facts a page needs to show the right words, such as a placement note. */
+  details?: unknown;
 }
 
 /** The game id Minecraft is listed under. It is never "found" by discovery. */

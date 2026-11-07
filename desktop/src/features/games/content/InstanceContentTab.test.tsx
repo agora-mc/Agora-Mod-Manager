@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -88,6 +89,7 @@ describe('the "Add from your library" list', () => {
     invokeMock.mockReset();
     replies = {
       games_instance_content_list: () => ({ instanceId: 'inst-1', items: [] }),
+      games_tools_list: () => ({ instanceId: 'inst-1', tools: [], known: [] }),
     };
     route();
   });
@@ -134,6 +136,7 @@ describe('InstanceContentTab', () => {
     replies = {
       games_instance_content_list: () => ({ instanceId: 'inst-1', items: [rowA, rowB] }),
       games_library_list: () => libraryReply(storeOther),
+      games_tools_list: () => ({ instanceId: 'inst-1', tools: [], known: [] }),
     };
     route();
   });
@@ -217,6 +220,74 @@ describe('InstanceContentTab', () => {
     await screen.findAllByTestId('instance-content-row');
     const options = Array.from(screen.getByLabelText<HTMLSelectElement>('Choose an item to add').querySelectorAll('option')).map((o) => o.textContent);
     expect(options).toEqual(['Choose an item…', 'Sky Mod']);
+  });
+
+  it('shows the note under the Unknown placement prompt when a rule could not be judged', async () => {
+    replies.games_instance_content_add = () => Promise.reject({
+      code: 'placement_unknown',
+      message: 'Agora cannot tell where these files go.',
+      details: { topLevel: ['Data'], note: 'A rule could not be judged.' },
+    });
+    mountTab();
+    await screen.findAllByTestId('instance-content-row');
+    fireEvent.change(screen.getByLabelText('Choose an item to add'), { target: { value: 'cccc3333' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Add to instance' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent('Agora cannot tell where these files go');
+    expect(dialog).toHaveTextContent('Top-level entries: Data');
+    expect(within(dialog).getByText('A rule could not be judged.')).toHaveClass('text-muted-foreground');
+  });
+
+  it('runs an item-scoped tool from the content row’s menu, after its inputs are filled in', async () => {
+    const tool = {
+      toolId: 'patcher',
+      name: 'Patcher',
+      declared: true,
+      current: null,
+      previous: null,
+      status: null,
+      conflicts: false,
+      outputKind: 'generated_layer',
+      outputFolder: null,
+      installed: true,
+      exe: 'Data/patcher.exe',
+      fromMod: 'Patcher mod',
+      runOnly: true,
+      scope: 'item',
+      inputs: [{ id: 'profile', label: 'Profile', kind: 'text', required: true, default: null, choices: [], arg: '--profile' }],
+      inputValues: {},
+    };
+    replies.games_tools_list = () => ({ instanceId: 'inst-1', tools: [tool], known: ['Patcher'] });
+    replies.games_tools_save_inputs = () => null;
+    replies.games_tools_run = () => ({
+      status: 'finished',
+      outcome: {
+        toolId: 'patcher', name: 'Patcher', run: 'run-1', capture: 'links', captureReason: null,
+        promoted: true, current: '1', previous: null, written: [], deleted: [], exitCode: 0,
+        cancelled: false, failedFolder: null, failure: null, copiedLayer: null,
+        installChanges: { created: [], changed: [], deleted: [], mayBeIncomplete: false, unavailable: null },
+        swap: null, offers: [], unchangedDropped: 0,
+      },
+    });
+    mountTab();
+    await screen.findAllByTestId('instance-content-row');
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_tools_list', { instanceId: 'inst-1' }));
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'More actions for Odin Patch' }));
+    await user.click(await screen.findByRole('menuitem', { name: /Run Patcher on this/ }));
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent('Run Patcher on Odin Patch');
+    fireEvent.change(within(dialog).getByLabelText('Profile (required)'), { target: { value: 'main' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run Patcher' }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('games_tools_run', {
+      instanceId: 'inst-1',
+      toolId: 'patcher',
+      capture: 'auto',
+      refusal: null,
+      confirmSwap: false,
+      itemId: 'aaaa1111',
+    }));
+    expect(await screen.findByText('Ran Patcher on Odin Patch.')).toBeInTheDocument();
   });
 
   it('opens the installer when an added archive needs one, rather than adding it silently', async () => {

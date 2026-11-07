@@ -17,6 +17,7 @@ import {
   listUserToolOutputs,
   runGameTool,
   runUserTool,
+  saveGameToolInputs,
   useToolOutput,
   useUserToolOutput,
   type CaptureChoice,
@@ -29,6 +30,7 @@ import {
   type ToolRow,
   type ToolsView,
 } from './api';
+import { ToolInputsForm } from './ToolInputsForm';
 import {
   CAPTURE_CHOICES,
   messageOf,
@@ -116,6 +118,7 @@ export function ToolCard({
   const [moveAside, setMoveAside] = useState<{ folder: string; aside: string } | null>(null);
   const [outputs, setOutputs] = useState<ToolOutput[] | null>(null);
   const [outputsError, setOutputsError] = useState<string | null>(null);
+  const [askingForInputs, setAskingForInputs] = useState(false);
 
   const runOnly = row.runOnly;
   const runLabel = runOnly
@@ -179,8 +182,34 @@ export function ToolCard({
 
   const startRun = () => {
     setActionError(null);
+    if (row.inputs.length > 0) {
+      // A tool that asks for values shows its form first; nothing runs until it is filled in.
+      setAskingForInputs(true);
+      return;
+    }
     if (capture === 'swap') {
       // A swap is never run on the first click: its costs are shown, and the person confirms them.
+      setOutcome(null);
+      openSwap(null, SWAP_WHY_CHOSEN);
+      return;
+    }
+    void run(capture);
+  };
+
+  /** Save the form's values, then run with them. A value that did not save stops the run. */
+  const runWithInputs = async (values: Record<string, string>) => {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await saveGameToolInputs(instanceId, row.toolId, values);
+    } catch (error) {
+      setActionError(messageOf(error));
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
+    setAskingForInputs(false);
+    if (capture === 'swap') {
       setOutcome(null);
       openSwap(null, SWAP_WHY_CHOSEN);
       return;
@@ -334,8 +363,19 @@ export function ToolCard({
         <p className="rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 text-sm" data-testid="tool-unavailable">{unavailable}</p>
       )}
 
+      {askingForInputs && !unavailable && (
+        <ToolInputsForm
+          inputs={row.inputs}
+          initialValues={row.inputValues}
+          busy={busy}
+          submitLabel={runLabel}
+          onSubmit={runWithInputs}
+          onCancel={() => setAskingForInputs(false)}
+        />
+      )}
+
       <div className="flex flex-wrap items-end gap-3">
-        {!unavailable && (
+        {!unavailable && !askingForInputs && (
           <>
             {!runOnly && (
               <label className="flex flex-col gap-1 text-sm">

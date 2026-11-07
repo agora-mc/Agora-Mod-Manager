@@ -190,6 +190,8 @@ describe('launchGameInstance', () => {
       instanceId: 'grounded-1',
       launchAnyway: false,
       deployment: null,
+      skipBeforeLaunch: false,
+      beforeLaunch: null,
     });
 
     invokeMock.mockResolvedValueOnce({ status: 'launched', pid: 4243, deployment: 'copies', notice: null, findings: [], reason: null, next: null });
@@ -198,6 +200,8 @@ describe('launchGameInstance', () => {
       instanceId: 'grounded-1',
       launchAnyway: true,
       deployment: 'copies',
+      skipBeforeLaunch: false,
+      beforeLaunch: null,
     });
   });
 

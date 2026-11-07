@@ -136,9 +136,10 @@ const BOOT_REPLIES = {
 };
 
 /** Starts the app on Skyrim (its Home), then opens its Instances tab, with the given command answers. */
-async function boot(page: Page, replies: Record<string, unknown>) {
+async function boot(page: Page, replies: Record<string, unknown>, sequences?: Record<string, unknown[]>) {
   await installGamesMock(page, {
     replies: { ...BOOT_REPLIES, games_list: { games: [skyrim] }, ...replies },
+    sequences,
     settings: { active_game: 'skyrim-se' },
   });
   await page.goto('/');
@@ -363,6 +364,64 @@ test('a clean check says so, and a launch the checks refused starts nothing and 
   const anyway = page.getByRole('checkbox', { name: /Launch anyway/ });
   await expect(anyway).not.toBeChecked();
   await expect(page.getByText('Use this only when you know why a check is wrong.')).toBeVisible();
+});
+
+test('an ask-mode before-launch tool is offered first, and Run and launch answers it', async ({ page }) => {
+  const asked = {
+    status: 'before_launch_needed',
+    pid: null,
+    deployment: null,
+    notice: null,
+    findings: [],
+    reason: null,
+    next: null,
+    beforeLaunch: [{ tool: 'deploy', name: 'REDmod deploy', mode: 'ask', reason: 'it has never run here' }],
+    beforeLaunchFailure: null,
+  };
+  const launched = {
+    status: 'launched',
+    pid: 4242,
+    deployment: 'links',
+    notice: null,
+    findings: [],
+    reason: null,
+    next: null,
+    beforeLaunch: [],
+    beforeLaunchFailure: null,
+  };
+  await boot(
+    page,
+    {
+      games_instance_list: { instances: [grounded] },
+      games_instance_get: groundedDetail,
+      games_instance_check: cleanCheck,
+    },
+    { games_instance_launch: [asked, launched] },
+  );
+  await page.evaluate(() => {
+    const target = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+      __launchCalls?: Record<string, unknown>[];
+    };
+    const inner = target.__TAURI_INTERNALS__.invoke;
+    target.__launchCalls = [];
+    target.__TAURI_INTERNALS__.invoke = (command: string, args: Record<string, unknown> = {}) => {
+      if (command === 'games_instance_launch') target.__launchCalls?.push(args);
+      return inner(command, args);
+    };
+  });
+
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Edit Grounded' }).click();
+  await page.getByRole('button', { name: 'Launch Grounded' }).click();
+
+  const dialog = page.getByTestId('before-launch-question');
+  await expect(dialog).toContainText('REDmod deploy should run first');
+  await expect(dialog).toContainText('It hasn’t run for this instance yet.');
+  await dialog.getByRole('button', { name: 'Run and launch' }).click();
+
+  await expect(page.getByRole('status').filter({ hasText: 'The game is starting (process 4242)' })).toBeVisible();
+  const calls = await page.evaluate(() => (window as unknown as { __launchCalls: Record<string, unknown>[] }).__launchCalls);
+  expect(calls[calls.length - 1]?.beforeLaunch).toEqual({ deploy: 'run' });
 });
 
 test('when the virtual file system will not start, the page asks before it runs from linked files', async ({ page }) => {
