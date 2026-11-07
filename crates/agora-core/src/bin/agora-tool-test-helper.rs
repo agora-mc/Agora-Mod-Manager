@@ -13,6 +13,11 @@
 //!   --stderr <text>       print a line to stderr
 //!   --sleep-ms <ms>       sleep before exiting
 //!   --exit <code>         exit with this code (default: 0)
+//!
+//! It is also a stand-in for `redMod.exe`: when the first argument is `deploy` it records the
+//! arguments in `redmod-deploy-args.txt` and writes the staged script blob
+//! `r6/cache/modded/final.redscripts` beside its working folder, which is what a run captured
+//! into a staging folder needs. A real REDmod deploy does the same under `-root=`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -28,7 +33,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<u8, String> {
-    let mut args = std::env::args().skip(1);
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    if all.first().map(String::as_str) == Some("deploy") {
+        return fake_redmod(&all);
+    }
+    let mut args = all.into_iter();
     let mut writes: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<PathBuf> = Vec::new();
     let mut sleep_ms = 0u64;
@@ -96,4 +105,25 @@ fn run() -> Result<u8, String> {
         std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
     }
     Ok(code)
+}
+
+/// The test double for `redmod deploy -root=<game>`: keep the arguments for the test to read, and
+/// write the staged script blob the game would read.
+fn fake_redmod(args: &[String]) -> Result<u8, String> {
+    std::fs::write(
+        "redmod-deploy-args.txt",
+        args.join(
+            "
+",
+        ),
+    )
+    .map_err(|e| format!("could not record the deploy arguments: {e}"))?;
+    let blob = PathBuf::from("r6/cache/modded/final.redscripts");
+    if let Some(parent) = blob.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&blob, b"fake deployed scripts")
+        .map_err(|e| format!("could not write {}: {e}", blob.display()))?;
+    Ok(0)
 }
