@@ -3,14 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageDefinition {
     pub id: String,
     pub version: semver::Version,
     pub api_range: semver::VersionReq,
     /// Optional toolchain parents; games can stand alone.
+    #[serde(default)]
     pub parents: Vec<String>,
+    #[serde(default)]
     pub games: Vec<GameDefinition>,
+    #[serde(default)]
     pub frameworks: Vec<FrameworkDefinition>,
+    #[serde(default)]
     pub tools: Vec<ToolDefinition>,
     /// Partial games a game may start from with `extends` (MASTER_SPEC §30.12). They are merged on
     /// raw JSON before a game is parsed.

@@ -1150,10 +1150,10 @@ enum PluginCmd {
         #[command(subcommand)]
         source: PluginSourceCmd,
     },
-    /// Check a development folder's manifest and crash packs without installing.
+    /// Check a development folder's manifest, crash packs and game packages without installing.
     ///
-    /// Prints every lint problem with the file it came from and, for a rule,
-    /// the rule's id. Exits non-zero if anything is wrong.
+    /// Prints every lint problem with the file it came from and, for a rule or a
+    /// field, its name. Exits non-zero if anything is wrong.
     Validate {
         /// Path to the plugin's development folder (the one holding agora-plugin.json).
         path: PathBuf,
@@ -2865,29 +2865,36 @@ async fn run_plugin_command(
             print_plugin_preview(&preview, json, false)?;
         }
         PluginCmd::Validate { path } => {
-            let report = agora_core::crash_packs::validate_plugin_folder(&path)?;
+            let report = agora_core::plugins::validate::validate_folder(&path)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                for problem in &report.problems {
+                for problem in &report.crash.problems {
                     println!("{problem}");
                 }
-                for pack in &report.packs {
+                for pack in &report.crash.packs {
                     println!("{}: ok", pack.file);
+                }
+                for note in &report.game_packages.notes {
+                    println!("Note: {note}");
+                }
+                for problem in &report.game_packages.problems {
+                    println!("{problem}");
+                }
+                for package in &report.game_packages.packages {
+                    println!("{}: ok (game package {})", package.file, package.id);
                 }
                 if report.is_clean() {
                     println!(
-                        "Validated {} crash pack(s) in {}.",
-                        report.packs.len(),
+                        "Validated {} crash pack(s) and {} game package(s) in {}.",
+                        report.crash.packs.len(),
+                        report.game_packages.packages.len(),
                         path.display()
                     );
                 }
             }
             if !report.is_clean() {
-                anyhow::bail!(
-                    "{} problem(s) in the plugin's crash packs",
-                    report.problems.len()
-                );
+                anyhow::bail!("{} problem(s) in the plugin", report.problem_count());
             }
         }
         PluginCmd::Install {

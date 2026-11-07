@@ -3135,10 +3135,7 @@ class TestGamePackageGuideExamples(unittest.TestCase):
         "id",
         "version",
         "api_range",
-        "parents",
         "games",
-        "frameworks",
-        "tools",
     }
     REQUIRED_GAME = {
         "id",
@@ -3146,18 +3143,9 @@ class TestGamePackageGuideExamples(unittest.TestCase):
         "stores",
         "version_sources",
         "deployment",
-        "framework_ids",
-        "tool_ids",
-        "log_paths",
-        "crash_paths",
-        "user_files",
-        "save_paths",
-        "linked_archive_patterns",
     }
     REQUIRED_LAUNCH = {
         "executable",
-        "arguments",
-        "environment",
         "working_directory",
     }
 

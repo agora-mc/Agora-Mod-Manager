@@ -90,6 +90,46 @@ fn a_mount_with_dotdot_or_an_absolute_path_is_refused() {
 }
 
 #[test]
+fn the_guide_minimum_example_parses() {
+    // The example in docs/plugins/game-packages.md, "Start with the game". It names only what a
+    // game must say; everything else has a sensible default.
+    let package: PackageDefinition = serde_json::from_value(json!({
+        "id": "example.my-game",
+        "version": "0.1.0",
+        "api_range": ">=0.1, <0.2",
+        "games": [{
+            "id": "my-game",
+            "name": "My Game",
+            "stores": [{ "store": "gog", "product": "1234567890" }],
+            "version_sources": [{ "kind": "executable", "path": "bin/game.exe" }],
+            "deployment": "virtual_file_system",
+            "launch": {
+                "executable": { "root": "runtime", "path": "bin/game.exe" },
+                "working_directory": { "root": "runtime", "path": "" }
+            }
+        }]
+    }))
+    .expect("the guide's minimum example parses");
+
+    assert_eq!(package.games.len(), 1);
+    assert!(package.frameworks.is_empty());
+    assert!(package.tools.is_empty());
+    assert!(package.games[0].log_paths.is_empty());
+}
+
+#[test]
+fn a_misspelled_game_field_fails_to_parse() {
+    let mut misspelled = game("typo-game");
+    misspelled["deploymnet"] = json!("redirect");
+    let json = package("typo", json!([misspelled]), json!({}));
+    let error = serde_json::from_value::<PackageDefinition>(json).unwrap_err();
+    assert!(
+        error.to_string().contains("deploymnet"),
+        "the error must name the misspelled field: {error}"
+    );
+}
+
+#[test]
 fn a_rule_kind_of_anything_else_is_refused() {
     let json = package("rule-test", json!([game("rule-game")]), json!({}));
     let mut package: PackageDefinition = serde_json::from_value(json).expect("the package parses");

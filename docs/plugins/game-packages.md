@@ -31,45 +31,33 @@ The manifest declares the package and what it needs. The [author guide](README.m
 }
 ```
 
-Check your manifest at any time, with no game installed:
+Check the whole plugin at any time, with no game installed:
 
 ```bash
 agora plugin validate path/to/my-game
 ```
 
-It checks the manifest and the crash packs, not `games/package.json`. Agora parses the game when the plugin loads, so to see whether it registers, install the folder as a development plugin in a disposable data root and run `agora games list` (see the [author guide](README.md#official-plugins-in-this-repository)).
+It checks the manifest, the crash packs and the game packages. Every contributed package is parsed, its `parents` and `extends` are resolved as far as this folder allows, and the same registration checks the app runs are applied. A parent that lives in another plugin is reported as a note rather than an error, because it cannot be read here. Every script function the package names is checked against the entrypoint when its exports can be read without running it; when they cannot, the command says so. It exits non-zero on a problem and names the file and, when it can, the field. It runs no code and writes nothing.
 
 ## Start with the game
 
-A package holds `games`, `frameworks` and `tools`, and all three keys must be there even when empty. The minimum for a game is who it is, how to find it, and how to run it. It carries a few empty lists because Agora asks for them, which is more ceremony than a minimum should need:
+A package holds `games`, `frameworks` and `tools`. Only the parts you use need to be written; an empty list can be left out. The minimum for a game is who it is, how to find it, and how to run it:
 
 ```json
 {
   "id": "example.my-game",
   "version": "0.1.0",
   "api_range": ">=0.1, <0.2",
-  "parents": [],
-  "frameworks": [],
-  "tools": [],
   "games": [{
     "id": "my-game",
     "name": "My Game",
     "stores": [{ "store": "gog", "product": "1234567890" }],
     "version_sources": [{ "kind": "executable", "path": "bin/game.exe" }],
     "deployment": "virtual_file_system",
-    "framework_ids": [],
-    "tool_ids": [],
     "launch": {
       "executable": { "root": "runtime", "path": "bin/game.exe" },
-      "arguments": [],
-      "environment": {},
       "working_directory": { "root": "runtime", "path": "" }
-    },
-    "log_paths": [],
-    "crash_paths": [],
-    "user_files": [],
-    "save_paths": [],
-    "linked_archive_patterns": []
+    }
   }]
 }
 ```
@@ -152,7 +140,7 @@ A game can have any number of ordered lists, or none:
 
 | `kind` | Meaning |
 |---|---|
-| `none` | Any order works |
+| `none` | Any order works, and the player sees no Sort button |
 | `script` | Your script returns rules, and Agora checks them and reports cycles |
 | `creation_engine` | Masters, light plugins and limits. It's the one built-in, and it's moving into a plugin |
 
@@ -309,10 +297,10 @@ official package, or a field on a package type, isn't documented below.
 | `id` | string | required | The package's id, in `publisher.name` form |
 | `version` | string | required | The package's semver version |
 | `api_range` | string | required | The plugin API range it was written for, as a semver range |
-| `parents` | list of strings | required | Package ids it inherits from |
-| `games` | list of games | required | The games it defines; may be empty |
-| `frameworks` | list of frameworks | required | The frameworks it defines; may be empty |
-| `tools` | list of tools | required | The tools it defines; may be empty |
+| `parents` | list of strings | optional | Package ids it inherits from |
+| `games` | list of games | optional | The games it defines; may be empty when a parent supplies them |
+| `frameworks` | list of frameworks | optional | The frameworks it defines; may be empty |
+| `tools` | list of tools | optional | The tools it defines; may be empty |
 | `game_templates` | map of id to partial game | optional | Partial games a game can start from with `extends` |
 | `behaviours` | object | optional | The script function names below |
 
@@ -341,14 +329,14 @@ Each value is a function name in your script. Every field is optional.
 | `deployment` | string | required | `redirect` or `virtual_file_system` |
 | `content_rules` | list of content rules | optional | Placement rules, tried in order |
 | `content_layout` | content layout | optional | The fallback shape of the game's content |
-| `framework_ids` | list of strings | required | Framework ids the game may use; may be empty |
-| `tool_ids` | list of strings | required | Tool ids the game may use; may be empty |
+| `framework_ids` | list of strings | optional | Framework ids the game may use; may be empty |
+| `tool_ids` | list of strings | optional | Tool ids the game may use; may be empty |
 | `launch` | launch recipe | optional | How to launch it; leave it out when `prepare_launch` supplies one |
-| `log_paths` | list of game paths | required | Where its logs are; may be empty |
-| `crash_paths` | list of game paths | required | Where crash evidence is; may be empty |
-| `user_files` | list of user file mappings | required | Per-user files kept in the instance; may be empty |
-| `save_paths` | list of game paths | required | Where its saves are; may be empty |
-| `linked_archive_patterns` | list of globs | required | Archives linked rather than copied; may be empty |
+| `log_paths` | list of game paths | optional | Where its logs are; may be empty |
+| `crash_paths` | list of game paths | optional | Where crash evidence is; may be empty |
+| `user_files` | list of user file mappings | optional | Per-user files kept in the instance; may be empty |
+| `save_paths` | list of game paths | optional | Where its saves are; may be empty |
+| `linked_archive_patterns` | list of globs | optional | Archives linked rather than copied; may be empty |
 | `declared_writes` | list of globs | optional | Paths the game may write outside its folder |
 | `copy_patterns` | list of globs | optional | Extra small text files copied in Links mode |
 | `excluded_paths` | list of globs | optional | Paths never taken from the game folder |
@@ -376,8 +364,8 @@ or `{ "kind": "package_behaviour" }`. Only `executable` needs `path`.
 | `marker` | string | optional | A file at any depth; write it or `all_files` |
 | `all_files` | glob | optional | Matches only when every file in the item does |
 | `data_path` | path | required | Where data-folder content mounts; empty means the game root |
-| `data_markers` | list of globs | required | Top-level names that mean data-folder content |
-| `root_markers` | list of globs | required | Top-level names that mean game-root content |
+| `data_markers` | list of globs | optional | Top-level names that mean data-folder content |
+| `root_markers` | list of globs | optional | Top-level names that mean game-root content |
 | `thunderstore_bepinex` | boolean | optional | Lay out Thunderstore BepInEx packages |
 
 ### Launch recipe and values
@@ -385,8 +373,8 @@ or `{ "kind": "package_behaviour" }`. Only `executable` needs `path`.
 | Field | Type | Required | Meaning |
 |---|---|---|---|
 | `executable` | game path | required | The program to run |
-| `arguments` | list of launch values | required | Its arguments |
-| `environment` | map of string to launch value | required | Environment variables it gets |
+| `arguments` | list of launch values | optional | Its arguments |
+| `environment` | map of string to launch value | optional | Environment variables it gets |
 | `working_directory` | game path | required | Where it runs |
 | `value` | string or launch value | required | A literal, or the value inside a conditional |
 | `kind` | string | optional | `literal`, `path` or `path_list` for the old-shaped form |
@@ -511,16 +499,16 @@ selected runtime; `user_data` means a known user folder, resolved by Agora.
 | `game` | string | required | The game it belongs to |
 | `name` | string | required | What the player sees |
 | `version` | string | required | The version this definition describes |
-| `supported_runtimes` | list of runtime constraints | required | Alternatives it supports; may be empty |
-| `required_frameworks` | list of strings | required | Frameworks it needs; may be empty |
-| `content` | list of strings | required | Content it ships; may be empty |
-| `launch` | launch recipe | required | Its own launcher, or `null` |
+| `supported_runtimes` | list of runtime constraints | optional | Alternatives it supports; may be empty |
+| `required_frameworks` | list of strings | optional | Frameworks it needs; may be empty |
+| `content` | list of strings | optional | Content it ships; may be empty |
+| `launch` | launch recipe | optional | Its own launcher, or `null` |
 | `detection` | framework detection | optional | How Agora finds it and reads its version |
 | `marker` | path | required for detection | A file whose presence means it is installed |
 | `version` | string | optional for detection | `pe_file_version`, or absent when presence is all Agora knows |
 
 A runtime constraint is `{ "game": "...", "stores": [...], "versions": { ... }, "builds": [...] }`.
-`stores` and `builds` are lists, and `versions` is `{ "kind": "any" }`,
+`stores` and `builds` are lists and may be empty, and `versions` is `{ "kind": "any" }`,
 `{ "kind": "exact", "value": ["1.0"] }` or `{ "kind": "semver", "value": ">=1.0, <2" }`.
 
 ### User files, saves and sessions

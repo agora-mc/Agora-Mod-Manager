@@ -7035,3 +7035,366 @@ fn downloads_scan_recognises_a_jar_by_its_contents() {
     assert_eq!(rows[0]["alreadyInLibrary"], false);
     assert!(jar.is_file(), "the scan leaves the download alone");
 }
+
+// ---------------------------------------------------------------------------
+// agora plugin validate: the game package too, not only the manifest and crash packs
+// ---------------------------------------------------------------------------
+
+fn plugin_manifest(entrypoint: Option<&str>) -> String {
+    let entry = entrypoint
+        .map(|path| format!(r#""entrypoint": "{path}","#))
+        .unwrap_or_default();
+    format!(
+        r#"{{
+  "manifest": 1,
+  "id": "acme.validate-test",
+  "name": "Validate test",
+  "version": "0.1.0",
+  "license": "MIT",
+  "apiRange": ">=0.1, <0.2",
+  {entry}
+  "capabilities": {{ "required": ["game:define"] }},
+  "contributions": {{ "gamePackages": [{{ "path": "games/package.json" }}] }}
+}}"#
+    )
+}
+
+fn write_validate_plugin(dir: &Path, entrypoint: Option<&str>, package: &str) {
+    std::fs::create_dir_all(dir.join("games")).unwrap();
+    std::fs::write(dir.join("agora-plugin.json"), plugin_manifest(entrypoint)).unwrap();
+    std::fs::write(dir.join("games/package.json"), package).unwrap();
+    if let Some(entrypoint) = entrypoint {
+        std::fs::write(
+            dir.join(entrypoint),
+            "export function classifyItem() { return null; }\n",
+        )
+        .unwrap();
+    }
+}
+
+fn minimal_game_package(extra_game: &str) -> String {
+    format!(
+        r#"{{
+  "id": "acme.validate-test",
+  "version": "0.1.0",
+  "api_range": ">=0.1, <0.2",
+  "games": [{{
+    "id": "validate-game",
+    "name": "Validate Game",
+    "stores": [],
+    "version_sources": [],
+    "deployment": "redirect"{extra_game}
+  }}]
+}}"#
+    )
+}
+
+#[test]
+fn plugin_validate_accepts_a_good_game_package() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    write_validate_plugin(
+        plugin.path(),
+        None,
+        &minimal_game_package(
+            r#", "launch": {
+            "executable": {"root": "runtime", "path": "game.exe"},
+            "working_directory": {"root": "runtime", "path": ""}
+        }"#,
+        ),
+    );
+    let output = run_agora(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("game package acme.validate-test"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn plugin_validate_names_a_misspelled_game_field() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    let package = minimal_game_package(r#", "deploymnet": "redirect""#);
+    write_validate_plugin(plugin.path(), None, &package);
+
+    let output = run_agora_json(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(!output.status.success(), "a misspelled field must fail");
+    let parsed = assert_json_stdout(&output);
+    let problem = &parsed["gamePackages"]["problems"][0];
+    assert_eq!(problem["file"], "games/package.json", "{parsed}");
+    assert_eq!(problem["field"], "deploymnet", "{parsed}");
+    assert!(
+        problem["message"].as_str().unwrap().contains("deploymnet"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn plugin_validate_refuses_a_mount_with_dotdot() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    write_validate_plugin(
+        plugin.path(),
+        None,
+        &minimal_game_package(
+            r#", "content_rules": [{
+                "kind": "mod",
+                "match": {"marker": "info.json"},
+                "mount": "../outside"
+            }]"#,
+        ),
+    );
+    let output = run_agora(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(!output.status.success(), "a climbing mount must fail");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("../outside"), "{combined}");
+    assert!(combined.contains("games/package.json"), "{combined}");
+}
+
+#[test]
+fn plugin_validate_refuses_a_behaviour_with_no_entrypoint() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    let package = r#"{
+  "id": "acme.validate-test",
+  "version": "0.1.0",
+  "api_range": ">=0.1, <0.2",
+  "behaviours": { "classify": "classifyItem" },
+  "games": [{
+    "id": "validate-game",
+    "name": "Validate Game",
+    "stores": [],
+    "version_sources": [],
+    "deployment": "redirect"
+  }]
+}"#
+    .to_string();
+    write_validate_plugin(plugin.path(), None, &package);
+    let output = run_agora(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(
+        !output.status.success(),
+        "a script behaviour without an entrypoint must fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("entrypoint"), "{combined}");
+}
+
+#[test]
+fn plugin_validate_refuses_a_missing_template() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    write_validate_plugin(
+        plugin.path(),
+        None,
+        &minimal_game_package(r#", "extends": "missing-template""#),
+    );
+    let output = run_agora(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(
+        !output.status.success(),
+        "a missing game template must fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("missing-template"), "{combined}");
+}
+
+#[test]
+fn plugin_validate_accepts_the_official_and_tracer_packages() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the repository root");
+    for package in [
+        repo.join("packages/tracers/cyberpunk-2077"),
+        repo.join("packages/official/skyrim-se"),
+    ] {
+        let output = run_agora(
+            &data_dir,
+            &["plugin", "validate", package.to_str().unwrap()],
+        );
+        assert!(
+            output.status.success(),
+            "{} did not validate:\n{}\n{}",
+            package.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn plugin_validate_refuses_a_behaviour_the_entrypoint_does_not_export() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    let package = r#"{
+  "id": "acme.validate-test",
+  "version": "0.1.0",
+  "api_range": ">=0.1, <0.2",
+  "behaviours": { "classify": "missingFunction" },
+  "games": [{
+    "id": "validate-game",
+    "name": "Validate Game",
+    "stores": [],
+    "version_sources": [],
+    "deployment": "redirect"
+  }]
+}"#
+    .to_string();
+    write_validate_plugin(plugin.path(), Some("main.js"), &package);
+    let output = run_agora_json(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(
+        !output.status.success(),
+        "a script function the entrypoint does not export must fail"
+    );
+    let parsed = assert_json_stdout(&output);
+    let problem = &parsed["gamePackages"]["problems"][0];
+    assert_eq!(problem["field"], "behaviours.classify", "{parsed}");
+    assert!(
+        problem["message"]
+            .as_str()
+            .unwrap()
+            .contains("missingFunction"),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn plugin_validate_says_when_script_exports_cannot_be_checked() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    let package = r#"{
+  "id": "acme.validate-test",
+  "version": "0.1.0",
+  "api_range": ">=0.1, <0.2",
+  "behaviours": { "classify": "classifyItem" },
+  "games": [{
+    "id": "validate-game",
+    "name": "Validate Game",
+    "stores": [],
+    "version_sources": [],
+    "deployment": "redirect"
+  }]
+}"#
+    .to_string();
+    write_validate_plugin(plugin.path(), Some("main.js"), &package);
+    std::fs::write(
+        plugin.path().join("main.js"),
+        "export * from './impl.js';\n",
+    )
+    .unwrap();
+    let output = run_agora(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("not checked"), "{stdout}");
+}
+
+#[test]
+fn plugin_validate_notes_a_parent_in_another_plugin() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    let package = r#"{
+  "id": "acme.validate-test",
+  "version": "0.1.0",
+  "api_range": ">=0.1, <0.2",
+  "parents": ["external.parent"],
+  "games": [{
+    "id": "validate-game",
+    "name": "Validate Game",
+    "stores": [],
+    "version_sources": [],
+    "deployment": "redirect"
+  }]
+}"#
+    .to_string();
+    write_validate_plugin(plugin.path(), None, &package);
+    let output = run_agora(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(
+        output.status.success(),
+        "a parent in another plugin is not this folder's error:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("not in this plugin"), "{stdout}");
+}
+
+#[test]
+fn plugin_validate_notes_a_package_that_needs_an_absent_parent() {
+    let (_tmp_data, data_dir) = temp_data_dir();
+    let plugin = tempdir();
+    // `deployment` would come from the parent. Without it the package cannot parse alone, so the
+    // command must say it cannot be checked here instead of calling it the author's mistake.
+    let package = r#"{
+  "id": "acme.validate-test",
+  "version": "0.1.0",
+  "api_range": ">=0.1, <0.2",
+  "parents": ["external.parent"],
+  "games": [{
+    "id": "validate-game",
+    "name": "Validate Game",
+    "stores": [],
+    "version_sources": []
+  }]
+}"#;
+    write_validate_plugin(plugin.path(), None, package);
+    let output = run_agora(
+        &data_dir,
+        &["plugin", "validate", plugin.path().to_str().unwrap()],
+    );
+    assert!(
+        output.status.success(),
+        "a package that needs a parent in another plugin is not this folder's error:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cannot be checked here"), "{stdout}");
+}

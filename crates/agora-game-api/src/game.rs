@@ -55,12 +55,15 @@ impl Support {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConstraint {
     pub game: GameId,
     /// Empty means any store/build. Multiple constraints are alternatives (OR);
     /// fields within a constraint are conjunctive (AND).
+    #[serde(default)]
     pub stores: Vec<StoreId>,
     pub versions: VersionConstraint,
+    #[serde(default)]
     pub builds: Vec<String>,
 }
 
@@ -180,6 +183,7 @@ pub struct GameInstall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreIdentifier {
     pub store: StoreId,
     pub product: String,
@@ -211,6 +215,7 @@ pub enum UserFileStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UserFileMapping {
     pub source: GamePath,
     pub instance_path: RelPath,
@@ -246,6 +251,7 @@ impl UserFileMapping {
 /// relative to `relative_to`; `{instance}` in it is the instance's save folder name. The shared
 /// folder, `shared_dir`, is where the game keeps its saves when the setting is not there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SaveLocationRule {
     /// The per-user file (an `instance_path`, such as `user/Skyrim.ini`) holding the setting.
     pub ini: RelPath,
@@ -402,17 +408,23 @@ impl<'de> Deserialize<'de> for LaunchValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchRecipe {
     pub executable: GamePath,
+    #[serde(default)]
     pub arguments: Vec<LaunchValue>,
+    #[serde(default)]
     pub environment: BTreeMap<String, LaunchValue>,
     pub working_directory: GamePath,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentLayout {
     pub data_path: RelPath, // "Data" for Skyrim, "" when content goes in the game root
+    #[serde(default)]
     pub data_markers: Vec<String>, // globs on top-level names that mean "this is data-folder content"
+    #[serde(default)]
     pub root_markers: Vec<String>, // globs on top-level names that mean "this is game-root content"
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thunderstore_bepinex: bool,
@@ -441,6 +453,7 @@ pub enum Suggestion {
 /// A rule that places a whole content item by what it holds (MASTER_SPEC §30.12). The first rule
 /// that matches decides the item's mount; no match falls through to `content_layout`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentRule {
     /// The kind in the game's own words, shown to the player.
     pub kind: String,
@@ -466,6 +479,7 @@ pub struct ContentMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GameDefinition {
     pub id: GameId,
     pub name: String,
@@ -480,7 +494,9 @@ pub struct GameDefinition {
     pub content_rules: Vec<ContentRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_layout: Option<ContentLayout>,
+    #[serde(default)]
     pub framework_ids: Vec<FrameworkId>,
+    #[serde(default)]
     pub tool_ids: Vec<ToolId>,
     /// Declarative launch recipe for this game, if any.
     ///
@@ -489,10 +505,15 @@ pub struct GameDefinition {
     /// recipe would be fiction).
     #[serde(default)]
     pub launch: Option<LaunchRecipe>,
+    #[serde(default)]
     pub log_paths: Vec<GamePath>,
+    #[serde(default)]
     pub crash_paths: Vec<GamePath>,
+    #[serde(default)]
     pub user_files: Vec<UserFileMapping>,
+    #[serde(default)]
     pub save_paths: Vec<GamePath>,
+    #[serde(default)]
     pub linked_archive_patterns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_writes: Vec<String>,
@@ -526,6 +547,7 @@ pub struct GameDefinition {
 /// Both are data because they are measured per game: Skyrim's normal quit exits 0, and that rests
 /// on one launch.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRules {
     /// Image names (`SkyrimSE.exe`) of the process whose exit ends the session. A launcher such as
     /// `skse64_loader.exe` exits at once, so the recipe's own executable is not always what runs.
@@ -569,6 +591,7 @@ pub enum LoadOrderDestination {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoadOrderDefinition {
     /// Local to the game; refused when two lists share one.
     pub id: String,
@@ -587,6 +610,7 @@ pub struct LoadOrderDefinition {
 
 /// What a load order lists.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoadOrderItems {
     /// The game folder the items are in, e.g. `Data`.
     pub folder: RelPath,
@@ -641,6 +665,7 @@ impl LoadOrderFormat {
 
 /// How a list's order is judged.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoadOrderRules {
     /// `none` (any order works), `script` or `creation_engine`. Any other value is refused at
     /// registration.
@@ -667,6 +692,7 @@ impl LoadOrderRules {
 
 /// Where a game's LOOT masterlist comes from (MASTER_SPEC §26.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LootRule {
     /// The masterlist repository in `owner/repo` form, e.g. `loot/skyrimse`.
     pub masterlist_repo: String,
@@ -682,6 +708,7 @@ pub struct LootRule {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchAlternative {
     pub id: String,
     /// When the alternative applies. A framework's loader is
@@ -695,6 +722,7 @@ pub struct LaunchAlternative {
 /// some of the family but not the one this runtime needs, the launch is refused with a
 /// [`RuntimeFileFinding`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeFileRule {
     /// Stable identifier, e.g. `address-library`.
     pub id: String,
@@ -2056,15 +2084,20 @@ pub fn map_thunderstore_bepinex(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrameworkDefinition {
     pub id: FrameworkId,
     pub game: GameId,
     pub name: String,
     pub version: String,
     /// Alternatives, not a semver range over an assumed game version scheme.
+    #[serde(default)]
     pub supported_runtimes: Vec<RuntimeConstraint>,
+    #[serde(default)]
     pub required_frameworks: Vec<FrameworkId>,
+    #[serde(default)]
     pub content: Vec<String>,
+    #[serde(default)]
     pub launch: Option<LaunchRecipe>,
     /// How an instance is checked for this framework and its version (MASTER_SPEC §26.8). Absent
     /// means core cannot tell whether the framework is installed.
@@ -2075,6 +2108,7 @@ pub struct FrameworkDefinition {
 /// How core finds a framework in an instance: a file at the game root whose presence means the
 /// framework is installed, and optionally where its version is read from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrameworkDetection {
     /// A path relative to the game root, matched case-insensitively, e.g. `skse64_loader.exe`.
     pub marker: RelPath,
@@ -2134,6 +2168,7 @@ impl ToolOutput {
 /// The tool reads whatever the instance's stack shows it, so there is no list of input layers. Its
 /// output is always a generated layer named by its id, so there is no output layer either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolDefinition {
     pub id: ToolId,
     pub game: GameId,
@@ -2211,6 +2246,7 @@ pub struct ToolDefinition {
 
 /// One value a tool asks the player for before it runs (MASTER_SPEC §30.12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolInput {
     pub id: String,
     pub label: String,
@@ -2254,6 +2290,7 @@ impl ToolScope {
 /// Whether a new or stale tool runs, or is offered, before a launch (MASTER_SPEC §30.12). Either
 /// way the player can launch anyway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BeforeLaunch {
     pub mode: BeforeLaunchMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2269,6 +2306,7 @@ pub enum BeforeLaunchMode {
 
 /// A file a tool writes to report a failure, and the text that says so.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FailureMarker {
     /// The file, relative to the runtime root (e.g. `Data/Nemesis_Engine/PatchLog.txt`).
     pub file: RelPath,
@@ -2278,6 +2316,7 @@ pub struct FailureMarker {
 
 /// The first bytes a file a tool writes must have (MASTER_SPEC §26.9).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequiredMagic {
     /// The file, relative to the runtime root (e.g. `Data/meshes/actors/character/behaviors/0_master.hkx`).
     pub file: RelPath,

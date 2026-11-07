@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod inherit;
 pub mod scripted;
+pub mod validate;
 pub use inherit::{PackageInput, ResolvedPackage};
 
 use crate::app_paths::AppPaths;

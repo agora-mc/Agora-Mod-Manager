@@ -38,13 +38,33 @@ pub struct ResolvedPackage {
 /// Resolve every package that can be resolved. Returns the survivors and one warning per package
 /// that could not be, each naming its chain. Resolution never stops the others.
 pub fn resolve(inputs: Vec<PackageInput>) -> (Vec<ResolvedPackage>, Vec<String>) {
-    let mut warnings = Vec::new();
+    let (resolved, warnings, _) = resolve_inner(inputs, false);
+    (resolved, warnings)
+}
+
+/// Resolve what can be resolved when some parents may live in another plugin (the `agora plugin
+/// validate` check). A parent that is not among `inputs` is a note saying it cannot be checked
+/// here, not an error; a cycle, a missing template or an unparsable package is still an error.
+///
+/// Returns the packages that resolved, the problems, and the notes.
+pub fn resolve_partial(
+    inputs: Vec<PackageInput>,
+) -> (Vec<ResolvedPackage>, Vec<String>, Vec<String>) {
+    resolve_inner(inputs, true)
+}
+
+fn resolve_inner(
+    inputs: Vec<PackageInput>,
+    lenient: bool,
+) -> (Vec<ResolvedPackage>, Vec<String>, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut notes = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut resolvable = vec![false; inputs.len()];
 
     for (i, input) in inputs.iter().enumerate() {
         let Some(id) = input.json.get("id").and_then(Value::as_str) else {
-            warnings.push(format!(
+            problems.push(format!(
                 "{}: the package has no string id; skipped",
                 input.label
             ));
@@ -58,15 +78,25 @@ pub fn resolve(inputs: Vec<PackageInput>) -> (Vec<ResolvedPackage>, Vec<String>)
         resolvable[i] = true;
     }
 
-    let mut lineage_memo: HashMap<usize, Result<Vec<usize>, String>> = HashMap::new();
+    let mut lineage_memo: HashMap<usize, Result<(Vec<usize>, bool), String>> = HashMap::new();
     let mut resolved = Vec::new();
     for (i, input) in inputs.iter().enumerate() {
         if !resolvable[i] {
             continue;
         }
         let mut visiting = Vec::new();
+        let mut missing_parent = false;
         let result: Result<PackageDefinition, String> = (|| {
-            let order = lineage_of(i, &inputs, &index, &mut lineage_memo, &mut visiting)?;
+            let (order, missing) = lineage_of(
+                i,
+                &inputs,
+                &index,
+                &mut lineage_memo,
+                &mut visiting,
+                lenient,
+                &mut notes,
+            )?;
+            missing_parent = missing;
             let mut merged = Value::Object(Map::new());
             for ancestor in order {
                 merged = merge_json(&merged, &inputs[ancestor].json);
@@ -94,11 +124,16 @@ pub fn resolve(inputs: Vec<PackageInput>) -> (Vec<ResolvedPackage>, Vec<String>)
                 label: input.label.clone(),
                 definition,
             }),
-            Err(reason) => warnings.push(format!("{}: {reason}; skipped", input.label)),
+            // A package that needs an absent parent may not even parse alone. That is not the
+            // author's mistake to fix in this folder, so it is a note, not a problem.
+            Err(reason) if lenient && missing_parent => {
+                notes.push(format!("{}: cannot be checked here: {reason}", input.label));
+            }
+            Err(reason) => problems.push(format!("{}: {reason}; skipped", input.label)),
         }
     }
 
-    (resolved, warnings)
+    (resolved, problems, notes)
 }
 
 fn package_id(input: &PackageInput) -> String {
@@ -132,9 +167,11 @@ fn lineage_of(
     i: usize,
     inputs: &[PackageInput],
     index: &HashMap<String, usize>,
-    memo: &mut HashMap<usize, Result<Vec<usize>, String>>,
+    memo: &mut HashMap<usize, Result<(Vec<usize>, bool), String>>,
     visiting: &mut Vec<usize>,
-) -> Result<Vec<usize>, String> {
+    lenient: bool,
+    notes: &mut Vec<String>,
+) -> Result<(Vec<usize>, bool), String> {
     if let Some(cached) = memo.get(&i) {
         return cached.clone();
     }
@@ -151,16 +188,28 @@ fn lineage_of(
         let own_id = package_id(&inputs[i]);
         let mut order = Vec::new();
         let mut seen = HashSet::new();
+        let mut missing = false;
         for parent in parent_ids(&inputs[i].json)? {
             if parent == own_id {
                 return Err(format!("package '{own_id}' names itself as a parent"));
             }
             let Some(&parent_index) = index.get(&parent) else {
+                if lenient {
+                    notes.push(format!(
+                        "{}: parent '{parent}' is not in this plugin, so it cannot be checked here",
+                        inputs[i].label
+                    ));
+                    missing = true;
+                    continue;
+                }
                 return Err(format!(
                     "parent '{parent}' is not installed (chain: {own_id} -> {parent})"
                 ));
             };
-            for ancestor in lineage_of(parent_index, inputs, index, memo, visiting)? {
+            let (ancestors, ancestor_missing) =
+                lineage_of(parent_index, inputs, index, memo, visiting, lenient, notes)?;
+            missing |= ancestor_missing;
+            for ancestor in ancestors {
                 if seen.insert(ancestor) {
                     order.push(ancestor);
                 }
@@ -169,7 +218,7 @@ fn lineage_of(
                 order.push(parent_index);
             }
         }
-        Ok(order)
+        Ok((order, missing))
     })();
     visiting.pop();
     memo.insert(i, result.clone());
@@ -348,6 +397,52 @@ mod tests {
     fn null_removes_a_parent_field() {
         let merged = merge_json(&json!({"keep": 1, "drop": 2}), &json!({"drop": null}));
         assert_eq!(merged, json!({"keep": 1}));
+    }
+
+    #[test]
+    fn an_omitted_list_inherits_rather_than_clearing() {
+        let mut parent_game = game("g");
+        parent_game["linked_archive_patterns"] = json!(["Data/*.bsa"]);
+        let parent = package("parent", json!([parent_game]), json!({}));
+
+        let mut child_game = game("g");
+        child_game
+            .as_object_mut()
+            .unwrap()
+            .remove("linked_archive_patterns");
+        let mut child = package("child", json!([child_game]), json!({}));
+        child["parents"] = json!(["parent"]);
+
+        let (resolved, warnings) = resolve(vec![input("parent", parent), input("child", child)]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let child = resolved
+            .iter()
+            .find(|package| package.definition.id == "child")
+            .expect("child resolves");
+        assert_eq!(
+            child.definition.games[0].linked_archive_patterns,
+            vec!["Data/*.bsa".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_null_list_in_a_child_still_removes_the_inherited_one() {
+        let mut parent_game = game("g");
+        parent_game["linked_archive_patterns"] = json!(["Data/*.bsa"]);
+        let parent = package("parent", json!([parent_game]), json!({}));
+
+        let mut child_game = game("g");
+        child_game["linked_archive_patterns"] = Value::Null;
+        let mut child = package("child", json!([child_game]), json!({}));
+        child["parents"] = json!(["parent"]);
+
+        let (resolved, warnings) = resolve(vec![input("parent", parent), input("child", child)]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let child = resolved
+            .iter()
+            .find(|package| package.definition.id == "child")
+            .expect("child resolves");
+        assert!(child.definition.games[0].linked_archive_patterns.is_empty());
     }
 
     #[test]

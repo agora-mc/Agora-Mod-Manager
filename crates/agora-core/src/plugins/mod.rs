@@ -48,6 +48,7 @@ pub mod registry;
 pub mod service;
 pub mod store;
 pub mod updates;
+pub mod validate;
 
 pub use dispatch::{MethodRequirement, NoopUiSink, PluginUiSink};
 pub use events::{EventSubscriptions, PluginEventBus};
