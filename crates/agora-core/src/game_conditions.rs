@@ -71,8 +71,7 @@ impl<'a> InstanceFacts<'a> {
 impl ConditionFacts for InstanceFacts<'_> {
     fn present(&self, path: &RelPath) -> Option<bool> {
         let visible = self.visible.as_ref()?;
-        let wanted = fold_path_case(path.as_str());
-        Some(visible.iter().any(|known| known == &wanted))
+        Some(present_in_view(visible, path))
     }
 
     fn framework(&self, framework: &FrameworkId) -> Option<Option<String>> {
@@ -106,6 +105,31 @@ impl ConditionFacts for InstanceFacts<'_> {
     }
 }
 
+/// Whether `path` is in the folded `visible` view. A path with no `*` is an exact name. A glob
+/// also matches a folder that holds a matching file, so `r6/scripts/*` finds `r6/scripts/a.reds`
+/// and `r6/scripts/Mod/a.reds`, as MASTER_SPEC §30.12's own example asks.
+fn present_in_view(visible: &[String], path: &RelPath) -> bool {
+    let wanted = fold_path_case(path.as_str());
+    if !wanted.contains('*') {
+        return visible.iter().any(|known| known == &wanted);
+    }
+    visible.iter().any(|known| {
+        agora_game_api::glob_match(&wanted, known)
+            || known
+                .split('/')
+                .scan(String::new(), |prefix, part| {
+                    if prefix.is_empty() {
+                        prefix.push_str(part);
+                    } else {
+                        prefix.push('/');
+                        prefix.push_str(part);
+                    }
+                    Some(prefix.clone())
+                })
+                .any(|prefix| agora_game_api::glob_match(&wanted, &prefix))
+    })
+}
+
 /// The game version an instance records: its base's runtime version when pinned, else the version
 /// discovery found for its install. `None` when it cannot be told.
 pub fn detected_game_version(ctx: &Ctx, instance_id: &str) -> Option<String> {
@@ -127,5 +151,49 @@ pub fn detected_game_version(ctx: &Ctx, instance_id: &str) -> Option<String> {
                 })
                 .and_then(|found| found.store_version)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visible(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| fold_path_case(p)).collect()
+    }
+
+    #[test]
+    fn a_literal_present_name_is_still_exact() {
+        let view = visible(&["mods/Alpha/info.json"]);
+        assert!(present_in_view(
+            &view,
+            &RelPath::new("mods/Alpha/info.json").unwrap()
+        ));
+        assert!(!present_in_view(&view, &RelPath::new("mods").unwrap()));
+    }
+
+    #[test]
+    fn a_glob_present_matches_files_under_the_named_folder() {
+        let view = visible(&[
+            "mods/Alpha/info.json",
+            "r6/scripts/Cool/init.reds",
+            "archive/pc/mod/x.archive",
+        ]);
+        for path in [
+            "mods/*",
+            "mods/*/info.json",
+            "r6/scripts/*",
+            "r6/scripts/*/init.reds",
+        ] {
+            assert!(
+                present_in_view(&view, &RelPath::new(path).unwrap()),
+                "{path} should match"
+            );
+        }
+        assert!(!present_in_view(
+            &view,
+            &RelPath::new("mods/*/missing.json").unwrap()
+        ));
+        assert!(!present_in_view(&view, &RelPath::new("red4ext/*").unwrap()));
     }
 }

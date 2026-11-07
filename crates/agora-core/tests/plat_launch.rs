@@ -145,3 +145,46 @@ fn a_version_gate_on_an_unknown_game_version_is_unknown() {
         "{notes:?}"
     );
 }
+
+fn test_definition() -> agora_game_api::GameDefinition {
+    serde_json::from_value(serde_json::json!({
+        "id": "test-game",
+        "name": "Test Game",
+        "stores": [],
+        "version_sources": [],
+        "deployment": "redirect",
+        "framework_ids": [],
+        "tool_ids": [],
+        "log_paths": [],
+        "crash_paths": [],
+        "user_files": [],
+        "save_paths": [],
+        "linked_archive_patterns": []
+    }))
+    .unwrap()
+}
+
+fn conditional_on(path: &str) -> LaunchValue {
+    LaunchValue::Conditional {
+        value: Box::new(literal("-modded")),
+        when: Condition::Present(RelPath::new(path).unwrap()),
+    }
+}
+
+#[test]
+fn a_present_glob_reads_the_instance_view_but_a_plain_name_does_not() {
+    let definition = test_definition();
+    let glob = recipe(vec![conditional_on("mods/*")]);
+    assert!(agora_core::game_launch::needs_instance_facts(
+        &definition,
+        &glob,
+        false
+    ));
+
+    let plain = recipe(vec![conditional_on("mods/Alpha/info.json")]);
+    assert!(!agora_core::game_launch::needs_instance_facts(
+        &definition,
+        &plain,
+        false
+    ));
+}
