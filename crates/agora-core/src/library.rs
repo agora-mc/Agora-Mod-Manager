@@ -821,9 +821,9 @@ fn plugin_files(ctx: &Ctx, item: &ContentItem, games: &[String]) -> Vec<String> 
         .flat_map(|definition| {
             definition
                 .load_orders
-                .first()
-                .map(|rule| rule.items.patterns.clone())
-                .unwrap_or_default()
+                .iter()
+                .flat_map(|rule| rule.items.patterns.clone())
+                .collect::<Vec<_>>()
         })
         .map(|pattern| pattern.to_ascii_lowercase())
         .collect();

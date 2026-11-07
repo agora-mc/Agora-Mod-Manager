@@ -132,11 +132,39 @@ pub trait GamePackage: Send + Sync {
         None
     }
 
+    /// The rules a `script` load order follows (MASTER_SPEC §30.12). `list_id` names the list the
+    /// rules are for; a game with several lists may judge each differently. Returning `None` or an
+    /// error is a failure to report, never "no rules, so any order is fine".
     fn load_order_rules<'a>(
         &'a self,
         _host: &'a dyn GameHost,
         _context: GameContext,
+        _list_id: &'a str,
     ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Read a `script` load order file (MASTER_SPEC §30.12). `None` means the package does not
+    /// implement the format; core reports that instead of treating the file as empty.
+    fn parse_load_order<'a>(
+        &'a self,
+        _host: &'a dyn GameHost,
+        _context: GameContext,
+        _list_id: &'a str,
+        _bytes: Vec<u8>,
+    ) -> GameFuture<'a, Option<Vec<LoadOrderLine>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Render a `script` load order file (MASTER_SPEC §30.12). Core writes the bytes it returns to
+    /// the list's declared file; the hook cannot choose a path. `None` is a failure to report.
+    fn render_load_order<'a>(
+        &'a self,
+        _host: &'a dyn GameHost,
+        _context: GameContext,
+        _list_id: &'a str,
+        _lines: Vec<LoadOrderLine>,
+    ) -> GameFuture<'a, Option<Vec<u8>>> {
         Box::pin(async { Ok(None) })
     }
 
