@@ -555,6 +555,10 @@ enum GameInstanceCmd {
         /// without asking.
         #[arg(long)]
         fall_back: bool,
+        /// Launch without running tools the game says should run first, even when their output is
+        /// missing or stale.
+        #[arg(long)]
+        skip_before_launch: bool,
     },
     /// Choose how an instance's game folder is deployed and run: virtual (under the virtual file
     /// system), links, copies, or auto (let Agora pick and announce any step down).
@@ -6908,6 +6912,7 @@ async fn run_command(
                     deployment,
                     plain,
                     fall_back,
+                    skip_before_launch,
                 } => {
                     let on_vfs_failure = if fall_back {
                         agora_core::game_instance::VfsFailure::FallBack
@@ -6920,12 +6925,22 @@ async fn run_command(
                             plain,
                             deployment: None,
                             on_vfs_failure,
+                            before_launch: if skip_before_launch {
+                                agora_core::game_instance::BeforeLaunchChoice::Skip
+                            } else {
+                                agora_core::game_instance::BeforeLaunchChoice::Run
+                            },
                         },
                         Some(Ok(deployment)) => agora_core::game_instance::LaunchOptions {
                             launch_anyway,
                             plain,
                             deployment,
                             on_vfs_failure,
+                            before_launch: if skip_before_launch {
+                                agora_core::game_instance::BeforeLaunchChoice::Skip
+                            } else {
+                                agora_core::game_instance::BeforeLaunchChoice::Run
+                            },
                         },
                         Some(Err(e)) => {
                             eprintln!("Error: {e}");
@@ -6974,7 +6989,7 @@ async fn run_command(
                             ctx,
                             &instance_id,
                             game_def,
-                            launch_options,
+                            launch_options.clone(),
                             &|| agora_core::game_discovery::discover_with_folders(&ctx.paths),
                             &agora_core::game_launch::SystemLauncher,
                         ) {
@@ -7057,6 +7072,62 @@ async fn run_command(
                                     print_load_order_findings(&findings);
                                     eprintln!(
                                         "Run 'agora games instance plugins sort {instance_id}' to fix master order, or pass --launch-anyway to start the game anyway."
+                                    );
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(agora_core::game_instance::InstanceError::BeforeLaunchNeeded {
+                                tools,
+                                ..
+                            }) => {
+                                if json {
+                                    let out = serde_json::json!({
+                                        "status": "error",
+                                        "error": "before_launch_needed",
+                                        "instance_id": instance_id,
+                                        "tools": tools,
+                                        "exitCode": 1,
+                                    });
+                                    eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                                } else {
+                                    eprintln!(
+                                        "Instance '{instance_id}' needs these tools run before launch:"
+                                    );
+                                    for tool in &tools {
+                                        eprintln!(
+                                            "  {} ({}) - {}",
+                                            tool.name,
+                                            match tool.mode {
+                                                agora_game_api::BeforeLaunchMode::Run => "run",
+                                                agora_game_api::BeforeLaunchMode::Ask => "ask",
+                                            },
+                                            tool.reason
+                                        );
+                                    }
+                                    eprintln!(
+                                        "Pass --skip-before-launch to launch without running them."
+                                    );
+                                }
+                                std::process::exit(1);
+                            }
+                            Err(agora_core::game_instance::InstanceError::BeforeLaunchFailed {
+                                name,
+                                message,
+                                ..
+                            }) => {
+                                if json {
+                                    let out = serde_json::json!({
+                                        "status": "error",
+                                        "error": "before_launch_failed",
+                                        "tool": name,
+                                        "message": message,
+                                        "exitCode": 1,
+                                    });
+                                    eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                                } else {
+                                    eprintln!("{name} could not run before launch: {message}");
+                                    eprintln!(
+                                        "Fix it, or pass --skip-before-launch to start the game anyway."
                                     );
                                 }
                                 std::process::exit(1);
@@ -7211,7 +7282,7 @@ async fn run_command(
                                 &instance_id,
                                 game_def,
                                 prepared,
-                                launch_options,
+                                launch_options.clone(),
                                 &agora_core::game_launch::SystemLauncher,
                             ) {
                                 Ok(l) => l,

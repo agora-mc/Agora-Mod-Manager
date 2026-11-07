@@ -487,7 +487,15 @@ pub async fn install(
         .content_layout
         .as_ref()
         .expect("checked above: the game has a content layout");
-    let state = match game_deploy::decide_placement(&content_item, layout) {
+    let facts =
+        crate::game_conditions::InstanceFacts::for_instance(ctx, request.instance_id, definition);
+    let state = match game_deploy::decide_placement_with(
+        &content_item,
+        layout,
+        &definition.content_rules,
+        Some(&facts),
+        None,
+    ) {
         PlacementDecision::Place {
             mount_path,
             source_path,

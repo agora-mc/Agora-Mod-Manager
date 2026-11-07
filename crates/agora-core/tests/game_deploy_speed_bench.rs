@@ -367,7 +367,7 @@ fn deploy_and_launch_timings() {
     // Launch preparation on the up-to-date deployment (the common case).
     let (prep_same, plans_same) = plans_during(|| {
         timed(|| {
-            prepare_launch_with(&ctx, &id_a, &def, options, &no_discovery, &launcher)
+            prepare_launch_with(&ctx, &id_a, &def, options.clone(), &no_discovery, &launcher)
                 .expect("prepare launch on the deployed instance")
         })
     });
@@ -393,7 +393,7 @@ fn deploy_and_launch_timings() {
                 &ctx,
                 &inst_b.instance_id,
                 &def,
-                options,
+                options.clone(),
                 &no_discovery,
                 &launcher,
             )

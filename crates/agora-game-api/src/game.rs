@@ -1,4 +1,4 @@
-use crate::condition::Condition;
+use crate::condition::{Condition, ConditionFacts, Truth};
 use crate::id::{FrameworkId, GameId, InstallId, LayerId, RelPath, StoreId, ToolId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1015,10 +1015,71 @@ impl GameDefinition {
     }
 }
 
+/// The most folder levels a placement marker is looked through (MASTER_SPEC §30.12).
+pub const PLACEMENT_MAX_DEPTH: usize = 8;
+
+/// A package's fallback classification of an item, when neither a content rule nor the layout
+/// places it (MASTER_SPEC §30.12).
+pub type PlacementClassify<'a> = &'a dyn Fn(&[RelPath]) -> Option<Suggestion>;
+
+/// Where a content item goes by its game's `content_layout` alone.
 pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestion {
+    suggest_placement_with_rules(files, layout, &[], None, "", None)
+}
+
+/// Where a content item goes: the game's content rules first (first match wins), then its
+/// `content_layout`, then the package's `classify` hook, then the Unknown prompt
+/// (MASTER_SPEC §30.12). A rule whose `when` cannot be judged does not match, and the reason for
+/// a later decision says so.
+pub fn suggest_placement_with_rules(
+    files: &[RelPath],
+    layout: &ContentLayout,
+    rules: &[ContentRule],
+    facts: Option<&dyn ConditionFacts>,
+    item_name: &str,
+    classify: Option<PlacementClassify<'_>>,
+) -> Suggestion {
+    let mut skipped_unknown: Vec<String> = Vec::new();
+    for rule in rules {
+        let applies = match &rule.when {
+            None => true,
+            Some(when) => match facts {
+                Some(facts) => match when.evaluate(facts) {
+                    Truth::True => true,
+                    Truth::False => false,
+                    Truth::Unknown => {
+                        skipped_unknown.push(rule.kind.clone());
+                        false
+                    }
+                },
+                None => {
+                    skipped_unknown.push(rule.kind.clone());
+                    false
+                }
+            },
+        };
+        if !applies {
+            continue;
+        }
+        match rule_placement(rule, files, item_name) {
+            RulePlacement::Placed(suggestion) => return suggestion,
+            RulePlacement::NoMatch => {}
+            RulePlacement::Ambiguous(top_level) => return Suggestion::Unknown { top_level },
+        }
+    }
+
+    let finish = |top_level: Vec<String>| -> Suggestion {
+        if let Some(classify) = classify {
+            if let Some(suggestion) = classify(files) {
+                return suggestion;
+            }
+        }
+        Suggestion::Unknown { top_level }
+    };
+
     let mut current_source_components: Vec<String> = Vec::new();
 
-    for level in 0..=8 {
+    for level in 0..=PLACEMENT_MAX_DEPTH {
         let mut files_at_level = BTreeSet::new();
         let mut folders_at_level = BTreeSet::new();
 
@@ -1055,7 +1116,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
         top_level_names.dedup();
 
         if top_level_names.is_empty() {
-            return Suggestion::Unknown { top_level: vec![] };
+            return finish(Vec::new());
         }
 
         let unwrapped_prefix = if current_source_components.is_empty() {
@@ -1073,7 +1134,10 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
             .any(|f| fold_path_case(f) == fold_path_case("fomod"))
         {
             return Suggestion::Installer {
-                reason: format!("{unwrapped_prefix}archive contains a FOMOD installer (`fomod/`)"),
+                reason: append_skipped(
+                    format!("{unwrapped_prefix}archive contains a FOMOD installer (`fomod/`)"),
+                    &skipped_unknown,
+                ),
             };
         }
 
@@ -1107,7 +1171,7 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
             return Suggestion::Place {
                 source_path: current_source_rel,
                 mount_path: RelPath::default(),
-                reason,
+                reason: append_skipped(reason, &skipped_unknown),
             };
         }
 
@@ -1136,24 +1200,194 @@ pub fn suggest_placement(files: &[RelPath], layout: &ContentLayout) -> Suggestio
             return Suggestion::Place {
                 source_path: current_source_rel,
                 mount_path: layout.data_path.clone(),
-                reason,
+                reason: append_skipped(reason, &skipped_unknown),
             };
         }
 
         // 4. Else, if the level holds exactly one folder and no files, descend into it and repeat (at most 8 levels)
-        if files_at_level.is_empty() && folders_at_level.len() == 1 && level < 8 {
+        if files_at_level.is_empty() && folders_at_level.len() == 1 && level < PLACEMENT_MAX_DEPTH {
             let only_folder = folders_at_level.into_iter().next().unwrap();
             current_source_components.push(only_folder);
             continue;
         }
 
         // 5. Else Unknown
-        return Suggestion::Unknown {
-            top_level: top_level_names,
-        };
+        return finish(top_level_names);
     }
 
-    Suggestion::Unknown { top_level: vec![] }
+    finish(Vec::new())
+}
+
+fn append_skipped(reason: String, skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        return reason;
+    }
+    let rules = skipped
+        .iter()
+        .map(|kind| format!("`{kind}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{reason}; the {rules} rule did not apply because Agora could not tell whether its when holds"
+    )
+}
+
+enum RulePlacement {
+    Placed(Suggestion),
+    NoMatch,
+    /// More than one place could be meant, or the name it would use is not safe. The player is
+    /// asked where the item goes instead of Agora guessing.
+    Ambiguous(Vec<String>),
+}
+
+/// Whether `name` may become a path component taken from an archive (MASTER_SPEC §30.12): not
+/// `.` or `..`, no separator or drive, no Windows device name, and no trailing dot or space.
+pub fn safe_folder_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("the folder name is empty".into());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("'{name}' is not a folder name"));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(format!("'{name}' contains a path separator"));
+    }
+    if name.contains(':') {
+        return Err(format!("'{name}' contains a drive or stream separator"));
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err(format!("'{name}' ends in a dot or space"));
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    let device = matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if device {
+        return Err(format!("'{name}' is a Windows device name"));
+    }
+    Ok(())
+}
+
+/// The top-level names a rule's ambiguity is reported with.
+fn top_level_of(files: &[RelPath]) -> Vec<String> {
+    let mut names: Vec<String> = files
+        .iter()
+        .filter_map(|file| file.as_str().split('/').find(|part| !part.is_empty()))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn rule_placement(rule: &ContentRule, files: &[RelPath], item_name: &str) -> RulePlacement {
+    let (source_path, folder) = if let Some(marker) = &rule.matching.marker {
+        let mut folders: Vec<String> = Vec::new();
+        for file in files {
+            let parts: Vec<&str> = file.as_str().split('/').filter(|p| !p.is_empty()).collect();
+            let Some(name) = parts.last() else {
+                continue;
+            };
+            let depth = parts.len().saturating_sub(1);
+            if depth > PLACEMENT_MAX_DEPTH {
+                continue;
+            }
+            if !glob_match(&fold_path_case(marker), &fold_path_case(name)) {
+                continue;
+            }
+            let parent = parts[..parts.len() - 1].join("/");
+            if !folders
+                .iter()
+                .any(|known| fold_path_case(known) == fold_path_case(&parent))
+            {
+                folders.push(parent);
+            }
+        }
+        match folders.as_slice() {
+            [] => return RulePlacement::NoMatch,
+            [only] => {
+                let folder = if only.is_empty() {
+                    item_name.to_string()
+                } else {
+                    only.rsplit('/').next().unwrap_or(only).to_string()
+                };
+                (only.clone(), folder)
+            }
+            _ => return RulePlacement::Ambiguous(top_level_of(files)),
+        }
+    } else if let Some(pattern) = &rule.matching.all_files {
+        if files.is_empty()
+            || !files
+                .iter()
+                .all(|file| glob_match(&fold_path_case(pattern), &fold_path_case(file.as_str())))
+        {
+            return RulePlacement::NoMatch;
+        }
+        (String::new(), item_name.to_string())
+    } else {
+        return RulePlacement::NoMatch;
+    };
+
+    if safe_folder_name(&folder).is_err() {
+        return RulePlacement::Ambiguous(top_level_of(files));
+    }
+    let mount = rule.mount.as_str().replace("{folder}", &folder);
+    let Ok(mount) = RelPath::new(mount) else {
+        return RulePlacement::Ambiguous(top_level_of(files));
+    };
+    let reason = match (&rule.matching.marker, &rule.matching.all_files) {
+        (Some(marker), _) => format!(
+            "the `{}` rule matched `{marker}` in `{}`, so it goes in `{}`",
+            rule.kind,
+            if source_path.is_empty() {
+                folder.as_str()
+            } else {
+                source_path.as_str()
+            },
+            mount.as_str()
+        ),
+        (_, Some(pattern)) => format!(
+            "the `{}` rule matched: every file is `{pattern}`, so it goes in `{}`",
+            rule.kind,
+            mount.as_str()
+        ),
+        _ => format!(
+            "the `{}` rule matched, so it goes in `{}`",
+            rule.kind,
+            mount.as_str()
+        ),
+    };
+    RulePlacement::Placed(Suggestion::Place {
+        source_path: RelPath::new(source_path).unwrap_or_default(),
+        mount_path: if mount.as_str().is_empty() {
+            RelPath::default()
+        } else {
+            mount
+        },
+        reason,
+    })
 }
 
 pub fn glob_match(pattern: &str, path: &str) -> bool {

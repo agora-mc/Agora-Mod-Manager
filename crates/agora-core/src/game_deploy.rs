@@ -3033,8 +3033,22 @@ pub fn decide_placement(
     item: &crate::content_store::ContentItem,
     layout: &agora_game_api::ContentLayout,
 ) -> PlacementDecision {
+    decide_placement_with(item, layout, &[], None, None)
+}
+
+/// [`decide_placement`] with the game's content rules (first match wins) and the facts their
+/// `when` asks about, then the layout, then `classify` (MASTER_SPEC §30.12).
+pub fn decide_placement_with(
+    item: &crate::content_store::ContentItem,
+    layout: &agora_game_api::ContentLayout,
+    rules: &[agora_game_api::ContentRule],
+    facts: Option<&dyn agora_game_api::ConditionFacts>,
+    classify: Option<agora_game_api::PlacementClassify<'_>>,
+) -> PlacementDecision {
     let files: Vec<RelPath> = item.files.iter().map(|file| file.path.clone()).collect();
-    match agora_game_api::suggest_placement(&files, layout) {
+    match agora_game_api::suggest_placement_with_rules(
+        &files, layout, rules, facts, &item.name, classify,
+    ) {
         agora_game_api::Suggestion::Place {
             source_path,
             mount_path,
@@ -3134,13 +3148,16 @@ pub fn add_to_instance(
         .games
         .game(&manifest.game)
         .ok_or_else(|| AddToInstanceError::UnknownGame(manifest.game.to_string()))?;
-    let layout =
-        game.content_layout
-            .as_ref()
-            .ok_or_else(|| AddToInstanceError::NoContentLayout {
-                game_id: game.id.to_string(),
-                game_name: game.name.clone(),
-            })?;
+    if game.content_layout.is_none() && game.content_rules.is_empty() {
+        return Err(AddToInstanceError::NoContentLayout {
+            game_id: game.id.to_string(),
+            game_name: game.name.clone(),
+        });
+    }
+    let layout = game
+        .content_layout
+        .clone()
+        .unwrap_or_else(agora_game_api::ContentLayout::default);
 
     if layout.thunderstore_bepinex {
         if let Some(package) = crate::content_thunderstore::parse_manifest(ctx, item_id)? {
@@ -3162,7 +3179,8 @@ pub fn add_to_instance(
     }
 
     let item = crate::content_store::get_item(ctx, item_id)?;
-    match decide_placement(&item, layout) {
+    let facts = crate::game_conditions::InstanceFacts::for_instance(ctx, instance_id, game);
+    match decide_placement_with(&item, &layout, &game.content_rules, Some(&facts), None) {
         PlacementDecision::Place {
             mount_path,
             source_path,
