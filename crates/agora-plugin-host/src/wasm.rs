@@ -16,7 +16,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasmtime::{
     Cache, CacheConfig, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
     Trap,
@@ -195,6 +195,9 @@ fn run_inner(
     options_json: &str,
     game_reads: Option<Arc<dyn GameReads>>,
 ) -> Result<WasmRunResult, WasmError> {
+    // The deadline covers the whole run, not just the module's call. Work
+    // before the module starts (staging, reading the file) spends it too.
+    let started = Instant::now();
     let module_path = crate::modules::resolve_package_file(package_root, module)
         .map_err(|message| WasmError::new("not_found", message))?;
     let options: RawOptions = serde_json::from_str(options_json).map_err(|e| {
@@ -252,6 +255,11 @@ fn run_inner(
 
     let wasm = read_module(&module_path, module)?;
 
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(timeout_error(timeout));
+    }
+
     // Run on a current-thread runtime so the wall-clock deadline can drop an
     // in-flight host call. The outer thread already isolates this from the
     // plugin runtime, so creating a runtime here cannot nest one.
@@ -268,6 +276,7 @@ fn run_inner(
         preopens,
         memory_limit,
         timeout,
+        remaining,
         data_root,
     ))
 }
@@ -306,6 +315,7 @@ fn module_too_large(module: &str, bytes: u64) -> WasmError {
 /// a repeat cheap), and the call itself runs under `timeout_at`, which drops
 /// the in-flight future — including a host call such as `poll_oneoff` or a
 /// blocked `fd_read` — instead of waiting for it.
+#[allow(clippy::too_many_arguments)]
 async fn execute<S: StdinStream + 'static>(
     wasm: &[u8],
     module_arg: &str,
@@ -313,11 +323,12 @@ async fn execute<S: StdinStream + 'static>(
     preopens: Vec<(PathBuf, String)>,
     memory_limit: u64,
     timeout: Duration,
+    remaining: Duration,
     data_root: &Path,
 ) -> Result<WasmRunResult, WasmError> {
     let engine = engine(data_root);
     start_ticker(&engine);
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + remaining;
 
     let engine_for_compile = engine.clone();
     let wasm_for_compile = wasm.to_vec();
@@ -766,13 +777,15 @@ mod tests {
             .build()
             .expect("test runtime");
         let started = std::time::Instant::now();
+        let limit = Duration::from_millis(200);
         let result = runtime.block_on(execute(
             include_bytes!("../tests/wasm-fixtures/wasm/fs_probe.wasm"),
             "fs_probe.wasm",
             StallingStdin,
             Vec::new(),
             64 * 1024 * 1024,
-            Duration::from_millis(200),
+            limit,
+            limit,
             data.path(),
         ));
         let elapsed = started.elapsed();
