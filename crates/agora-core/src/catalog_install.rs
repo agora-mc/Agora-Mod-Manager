@@ -24,7 +24,7 @@
 //! Network access goes through [`CatalogTransport`], so the steps above can be tested with a fake.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agora_game_api::{
@@ -90,9 +90,9 @@ impl CatalogTransport for HttpTransport<'_> {
 pub struct InstallRequest<'a> {
     pub instance_id: &'a str,
     pub item: &'a GameCatalogItem,
-    /// Accept a hash that differs from a curator pin or an earlier install. Never accepts a
-    /// published hash that differs, and never overrides a framework refusal: that is
-    /// `allow_missing_frameworks`.
+    /// Accept a hash that differs from a curator pin or an earlier install, and a file name that
+    /// does not match the entry's `asset` pattern. Never accepts a published hash that differs, and
+    /// never overrides a framework refusal: that is `allow_missing_frameworks`.
     pub install_anyway: bool,
     /// Install although a framework the entry requires is unmet, as the user chose. The plan names
     /// every such requirement. It changes nothing about how the file's hash is checked.
@@ -100,6 +100,12 @@ pub struct InstallRequest<'a> {
     /// Plan only: nothing is downloaded or stored. An unmet framework does not refuse a dry run; the
     /// plan names it.
     pub dry_run: bool,
+    /// A file the player chose for a `manual_link` entry. It is copied into the content store and
+    /// never moved, changed or deleted.
+    pub file: Option<&'a Path>,
+    /// The player has seen that the page publishes no checksum Agora can read, and chose to install
+    /// the file anyway. A non-interactive caller (the CLI) sets it after printing the notice.
+    pub confirm_no_checksum: bool,
 }
 
 /// The compatibility entry that was chosen, the frameworks checked, and the file to fetch.
@@ -296,6 +302,17 @@ pub enum PlannedSource {
         pinned_host: String,
         size: Option<u64>,
     },
+    /// A page the player downloads from themselves. Agora never fetches it; it takes the file the
+    /// player chose, after checking the name and the hashes it has.
+    ManualLink {
+        url: String,
+        /// The file-name pattern the chosen file must match.
+        asset: String,
+        /// One short line for the player, such as which file on the page to pick.
+        hint: Option<String>,
+        /// Exact file names the curator has pinned, with their hashes.
+        pins: Vec<crate::registry::SourcePin>,
+    },
 }
 
 impl PlannedSource {
@@ -304,14 +321,15 @@ impl PlannedSource {
         match self {
             PlannedSource::GithubRelease { asset, .. } => asset,
             PlannedSource::DirectHash { file, .. } => file,
+            PlannedSource::ManualLink { asset, .. } => asset,
         }
     }
 
-    /// The release tag, for a GitHub file. `None` for a `direct_hash` file.
+    /// The release tag, for a GitHub file. `None` for a `direct_hash` or `manual_link` file.
     pub fn release(&self) -> Option<&str> {
         match self {
             PlannedSource::GithubRelease { tag, .. } => Some(tag),
-            PlannedSource::DirectHash { .. } => None,
+            PlannedSource::DirectHash { .. } | PlannedSource::ManualLink { .. } => None,
         }
     }
 
@@ -322,6 +340,28 @@ impl PlannedSource {
                 format!("GitHub {repo} release {tag}")
             }
             PlannedSource::DirectHash { url, .. } => format!("direct download {url}"),
+            PlannedSource::ManualLink { url, .. } => format!("the page at {url}"),
+        }
+    }
+
+    /// Whether this file is one the player downloads themselves.
+    pub fn is_manual_link(&self) -> bool {
+        matches!(self, PlannedSource::ManualLink { .. })
+    }
+
+    /// The page a `manual_link` entry sends the player to, when it is one.
+    pub fn page_url(&self) -> Option<&str> {
+        match self {
+            PlannedSource::ManualLink { url, .. } => Some(url),
+            _ => None,
+        }
+    }
+
+    /// The hint a `manual_link` entry carries, when it carries one.
+    pub fn download_hint(&self) -> Option<&str> {
+        match self {
+            PlannedSource::ManualLink { hint, .. } => hint.as_deref(),
+            _ => None,
         }
     }
 }
@@ -369,6 +409,29 @@ pub enum InstallState {
         top_level: Vec<String>,
         /// The command that runs the installer, as `content add` words it.
         installer_command: String,
+    },
+    /// A `manual_link` entry with no chosen file yet. Nothing was downloaded or stored: the caller
+    /// shows the page, the hint and the pattern, and asks the player for the file.
+    ManualDownload {
+        page_url: String,
+        asset: String,
+        hint: Option<String>,
+    },
+    /// The chosen file's name does not match the entry's `asset` pattern. Nothing was stored; the
+    /// caller may retry with `install_anyway` if the player says it is the right file.
+    WrongFileName {
+        page_url: String,
+        asset: String,
+        file_name: String,
+        hint: Option<String>,
+    },
+    /// The entry pins no checksum and this is the first choice of the file. Nothing was stored;
+    /// the caller says so and retries with `confirm_no_checksum` if the player agrees.
+    NeedsChecksum {
+        page_url: String,
+        asset: String,
+        file_name: String,
+        hint: Option<String>,
     },
 }
 
@@ -419,12 +482,24 @@ pub async fn install(
         ));
     }
 
+    // A manual_link is used when the player chose a file for it, or when the
+    // entry has no automatic source at all. Otherwise the automatic source is
+    // preferred and the manual page is only a fallback.
+    let manual = request.item.download_sources.iter().rev().find(|source| {
+        source.strategy == "manual_link"
+            && (request.file.is_some()
+                || !request.item.download_sources.iter().any(|other| {
+                    matches!(other.strategy.as_str(), "github_release" | "direct_hash")
+                }))
+    });
+
     let mut plan = plan(
         ctx,
         &manifest,
         definition,
         request.item,
         request.instance_id,
+        manual,
         transport,
         request.dry_run || request.allow_missing_frameworks,
     )
@@ -445,6 +520,128 @@ pub async fn install(
             plan,
             state: InstallState::DryRun,
         });
+    }
+
+    if plan.source.is_manual_link() {
+        let page_url = plan.source.page_url().unwrap_or_default().to_string();
+        let asset = plan.source.file_name().to_string();
+        let hint = plan.source.download_hint().map(str::to_string);
+        let Some(file) = request.file else {
+            return Ok(InstallReport {
+                plan,
+                state: InstallState::ManualDownload {
+                    page_url,
+                    asset,
+                    hint,
+                },
+            });
+        };
+        let file_name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                generic(
+                    "ERR_CATALOG_NO_FILE_NAME",
+                    format!("The chosen file '{}' has no usable name.", file.display()),
+                )
+            })?;
+        // A name that does not match is a question, not a refusal: the player
+        // may have a differently named build of the right file.
+        if !agora_game_api::glob_match(&asset.to_ascii_lowercase(), &file_name.to_ascii_lowercase())
+            && !request.install_anyway
+        {
+            return Ok(InstallReport {
+                plan,
+                state: InstallState::WrongFileName {
+                    page_url,
+                    asset,
+                    file_name,
+                    hint,
+                },
+            });
+        }
+        let Some(pin) = manual_pin(&plan.source, &file_name) else {
+            // No pin: the page published nothing Agora can read. Ask before
+            // taking the file, unless the player (or the CLI) already agreed.
+            if !request.confirm_no_checksum {
+                return Ok(InstallReport {
+                    plan,
+                    state: InstallState::NeedsChecksum {
+                        page_url,
+                        asset,
+                        file_name,
+                        hint,
+                    },
+                });
+            }
+            let mut expectations = Vec::new();
+            if let Some(remembered) = remembered_hash(ctx, &request.item.id, None, &file_name)? {
+                expectations.push(ConfirmableHash {
+                    origin: HashOrigin::PreviousInstall,
+                    sha256: remembered,
+                });
+            }
+            let bytes = std::fs::read(file).map_err(|e| {
+                generic(
+                    "ERR_CATALOG_READ",
+                    format!(
+                        "The chosen file '{}' could not be read: {e}",
+                        file.display()
+                    ),
+                )
+            })?;
+            let hash = manual_hash_report(
+                plan.source.page_url(),
+                &bytes,
+                &expectations,
+                request.install_anyway,
+                &file_name,
+            )?;
+            return import_and_place(
+                ctx,
+                &request,
+                definition,
+                plan,
+                file,
+                &file_name,
+                size_of(&bytes),
+                hash,
+            );
+        };
+        let mut expectations = vec![pin.clone()];
+        if let Some(remembered) = remembered_hash(ctx, &request.item.id, None, &file_name)? {
+            expectations.push(ConfirmableHash {
+                origin: HashOrigin::PreviousInstall,
+                sha256: remembered,
+            });
+        }
+        let bytes = std::fs::read(file).map_err(|e| {
+            generic(
+                "ERR_CATALOG_READ",
+                format!(
+                    "The chosen file '{}' could not be read: {e}",
+                    file.display()
+                ),
+            )
+        })?;
+        let hash = manual_hash_report(
+            plan.source.page_url(),
+            &bytes,
+            &expectations,
+            request.install_anyway,
+            &file_name,
+        )?;
+        return import_and_place(
+            ctx,
+            &request,
+            definition,
+            plan,
+            file,
+            &file_name,
+            size_of(&bytes),
+            hash,
+        );
     }
 
     // The store's own copy is used when it holds this release file under a hash known before the
@@ -483,6 +680,162 @@ pub async fn install(
         }
     };
 
+    let state = place(ctx, &request, definition, &plan, &content_item, size, hash)?;
+    Ok(InstallReport { plan, state })
+}
+
+/// Copy a file the player chose for a `manual_link` entry into the content store, then place it
+/// the same way a downloaded catalog file is placed: the same catalog identity, the same rules.
+#[allow(clippy::too_many_arguments)]
+fn import_and_place(
+    ctx: &Ctx,
+    request: &InstallRequest<'_>,
+    definition: &GameDefinition,
+    plan: CatalogPlan,
+    file: &Path,
+    asset: &str,
+    size: u64,
+    hash: HashReport,
+) -> LauncherResult<InstallReport> {
+    // `add_archive_replacing` reads the archive and copies its files into the
+    // store. It never writes to `file`, so the player's download is untouched.
+    let outcome = content_store::add_archive_replacing(
+        ctx,
+        file,
+        Some(&request.item.name),
+        &HashSet::new(),
+        |sha256, _display_path| ContentSource::Catalog {
+            item_id: request.item.id.clone(),
+            game: request.item.game.clone(),
+            release: None,
+            asset: asset.to_string(),
+            sha256: sha256.to_string(),
+            verified: hash.verified,
+            added_at_unix_ms: now_unix_ms(),
+        },
+    )
+    .map_err(|e| generic("ERR_CATALOG_IMPORT", e))?;
+    let content_item = outcome.item().clone();
+    let state = place(ctx, request, definition, &plan, &content_item, size, hash)?;
+    Ok(InstallReport { plan, state })
+}
+
+/// Store a file the watcher recognised as the file of a `manual_link` entry, without placing it in
+/// an instance. The Library's "Add to instance" does that later. The file is copied; it is never
+/// moved, changed or deleted. Returns the stored item's id and the hash report.
+pub fn import_manual_file(
+    ctx: &Ctx,
+    item: &GameCatalogItem,
+    file: &Path,
+) -> LauncherResult<(String, HashReport)> {
+    let source = item
+        .download_sources
+        .iter()
+        .rev()
+        .find(|source| source.strategy == "manual_link")
+        .ok_or_else(|| {
+            generic(
+                "ERR_CATALOG_NO_MANUAL_SOURCE",
+                format!("'{}' has no manual_link source.", item.id),
+            )
+        })?;
+    let compatibility = item
+        .game_compatibility
+        .iter()
+        .find(|compat| compat.asset.is_some())
+        .ok_or_else(|| {
+            generic(
+                "ERR_CATALOG_NO_ASSET_PATTERN",
+                format!(
+                    "'{}' names no file pattern for this manual download.",
+                    item.id
+                ),
+            )
+        })?;
+    let asset = compatibility
+        .asset
+        .clone()
+        .expect("filtered for an asset above");
+    let file_name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            generic(
+                "ERR_CATALOG_NO_FILE_NAME",
+                format!("The chosen file '{}' has no usable name.", file.display()),
+            )
+        })?;
+    if !agora_game_api::glob_match(&asset.to_ascii_lowercase(), &file_name.to_ascii_lowercase()) {
+        return Err(generic(
+            "ERR_CATALOG_WRONG_FILE_NAME",
+            format!(
+                "'{file_name}' does not look like {item_name}'s file; Agora expected a name like {asset}.",
+                item_name = item.name
+            ),
+        ));
+    }
+    let planned = PlannedSource::ManualLink {
+        url: source.identifier.clone(),
+        asset,
+        hint: compatibility.download_hint.clone(),
+        pins: source.pins.clone(),
+    };
+    let mut expectations = Vec::new();
+    if let Some(pin) = manual_pin(&planned, &file_name) {
+        expectations.push(pin);
+    }
+    if let Some(remembered) = remembered_hash(ctx, &item.id, None, &file_name)? {
+        expectations.push(ConfirmableHash {
+            origin: HashOrigin::PreviousInstall,
+            sha256: remembered,
+        });
+    }
+    let bytes = std::fs::read(file).map_err(|e| {
+        generic(
+            "ERR_CATALOG_READ",
+            format!(
+                "The chosen file '{}' could not be read: {e}",
+                file.display()
+            ),
+        )
+    })?;
+    let hash = manual_hash_report(
+        Some(&source.identifier),
+        &bytes,
+        &expectations,
+        false,
+        &file_name,
+    )?;
+    let outcome = content_store::add_archive_replacing(
+        ctx,
+        file,
+        Some(&item.name),
+        &HashSet::new(),
+        |sha256, _display_path| ContentSource::Catalog {
+            item_id: item.id.clone(),
+            game: item.game.clone(),
+            release: None,
+            asset: file_name,
+            sha256: sha256.to_string(),
+            verified: hash.verified,
+            added_at_unix_ms: now_unix_ms(),
+        },
+    )
+    .map_err(|e| generic("ERR_CATALOG_IMPORT", e))?;
+    Ok((outcome.item().item_id.clone(), hash))
+}
+
+/// Place an imported content item according to the game's layout, or say what stops it.
+fn place(
+    ctx: &Ctx,
+    request: &InstallRequest<'_>,
+    definition: &GameDefinition,
+    plan: &CatalogPlan,
+    content_item: &ContentItem,
+    size: u64,
+    hash: HashReport,
+) -> LauncherResult<InstallState> {
     let layout = definition
         .content_layout
         .as_ref()
@@ -506,7 +859,7 @@ pub async fn install(
                     ) -> Option<agora_game_api::Suggestion>
             });
         game_deploy::decide_placement_with(
-            &content_item,
+            content_item,
             layout,
             &definition.content_rules,
             Some(&facts),
@@ -582,17 +935,70 @@ pub async fn install(
             });
         }
     };
-    Ok(InstallReport { plan, state })
+    Ok(state)
+}
+
+fn size_of(bytes: &[u8]) -> u64 {
+    bytes.len() as u64
+}
+
+/// The hash report for a file the player chose for a `manual_link` entry. The page published no
+/// digest, so `verified` stays false; a curator pin still means the bytes matched what was
+/// reviewed.
+fn manual_hash_report(
+    page_url: Option<&str>,
+    bytes: &[u8],
+    expectations: &[ConfirmableHash],
+    install_anyway: bool,
+    file_name: &str,
+) -> LauncherResult<HashReport> {
+    let actual = crate::download::sha256_hex(bytes);
+    let unmet = first_unmet(&actual, expectations).map(|expected| expected.origin);
+    let confirmed_past = if install_anyway { unmet } else { None };
+    let check = verify_download(
+        bytes,
+        None,
+        None,
+        expectations,
+        install_anyway,
+        file_name,
+        None,
+    )?;
+    let host = page_url
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "the page".into());
+    let mut basis = if expectations.first().map(|e| e.origin) == Some(HashOrigin::CuratorPin) {
+        format!("not verified: {host} publishes no checksum Agora can read, so the file matches the curator's pin for this exact name")
+    } else {
+        format!(
+            "not verified: {host} publishes no checksum Agora can read, so Agora could not verify {file_name}"
+        )
+    };
+    if let Some(origin) = confirmed_past {
+        basis.push_str(&format!(
+            "; installed anyway although the bytes differ from {}",
+            describe_origin(origin)
+        ));
+    }
+    Ok(HashReport {
+        sha256: check.sha256,
+        verified: check.verified,
+        basis,
+        confirmed_past,
+    })
 }
 
 /// The plan: the compatibility entry, the frameworks, and the file. Makes no change. An unmet
 /// framework refuses here, before any network access, unless `keep_unmet`.
+#[allow(clippy::too_many_arguments)]
 async fn plan(
     ctx: &Ctx,
     manifest: &GameInstanceManifest,
     definition: &GameDefinition,
     item: &GameCatalogItem,
     instance_id: &str,
+    manual: Option<&DownloadSource>,
     transport: &dyn CatalogTransport,
     keep_unmet: bool,
 ) -> LauncherResult<CatalogPlan> {
@@ -632,7 +1038,7 @@ async fn plan(
         link_catalog_entries(ctx, &manifest.game, Some(&item.id), &mut unmet_frameworks);
     }
 
-    let source = plan_source(item, &compatibility, transport).await?;
+    let source = plan_source(item, &compatibility, manual, transport).await?;
     Ok(CatalogPlan {
         item_id: item.id.clone(),
         item_name: item.name.clone(),
@@ -808,10 +1214,13 @@ fn link_catalog_entries(
     }
 }
 
-/// The one entry that is this framework: its id is the framework's id, optionally followed by a
-/// number (`skse` and `skse64`), or its name is the framework's name, ignoring case. A manifest says
-/// which frameworks an entry needs, not which it provides, so this matches narrowly, and two
-/// candidates give no link rather than a guess.
+/// The one entry that provides this framework.
+///
+/// A manifest says `provides_framework` when it installs a framework, which is
+/// the exact answer. Older entries have no such field, so the fallback matches
+/// narrowly: the id is the framework's id optionally followed by a number
+/// (`skse` and `skse64`), or the name is the framework's name, ignoring case.
+/// Two candidates give no link rather than a guess.
 fn framework_catalog_entry(
     entries: &[GameCatalogItem],
     exclude: Option<&str>,
@@ -819,16 +1228,32 @@ fn framework_catalog_entry(
 ) -> Option<CatalogEntryRef> {
     let id = framework.framework.to_lowercase();
     let name = framework.name.to_lowercase();
-    let mut candidates = entries.iter().filter(|entry| {
-        let entry_id = entry.id.to_lowercase();
-        Some(entry.id.as_str()) != exclude
-            && (entry_id
-                .strip_prefix(&id)
-                .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
-                || entry.name.to_lowercase() == name)
-    });
-    let only = candidates.next()?;
-    candidates.next().is_none().then(|| CatalogEntryRef {
+    // An explicit `provides_framework` is the answer, so it wins over the name/id guess. Only
+    // when no entry declares it does the narrow fallback look at ids and names.
+    let declared: Vec<&GameCatalogItem> = entries
+        .iter()
+        .filter(|entry| Some(entry.id.as_str()) != exclude)
+        .filter(|entry| entry.provides_framework.as_deref() == Some(framework.framework.as_str()))
+        .collect();
+    let candidates: Vec<&GameCatalogItem> = if declared.is_empty() {
+        entries
+            .iter()
+            .filter(|entry| Some(entry.id.as_str()) != exclude)
+            .filter(|entry| {
+                entry.provides_framework.is_none()
+                    && (entry
+                        .id
+                        .to_lowercase()
+                        .strip_prefix(&id)
+                        .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+                        || entry.name.to_lowercase() == name)
+            })
+            .collect()
+    } else {
+        declared
+    };
+    let only = candidates.first()?;
+    (candidates.len() == 1).then(|| CatalogEntryRef {
         id: only.id.clone(),
         name: only.name.clone(),
     })
@@ -1077,8 +1502,12 @@ pub fn version_matches(pattern: &str, version: &str) -> bool {
 async fn plan_source(
     item: &GameCatalogItem,
     compatibility: &GameCompatibility,
+    manual: Option<&DownloadSource>,
     transport: &dyn CatalogTransport,
 ) -> LauncherResult<PlannedSource> {
+    if let Some(source) = manual {
+        return manual_source(item, source, compatibility);
+    }
     let chosen = item
         .download_sources
         .iter()
@@ -1096,6 +1525,44 @@ async fn plan_source(
         "github_release" => github_source(item, source, compatibility, transport).await,
         _ => direct_source(item, source),
     }
+}
+
+/// The page a `manual_link` entry sends the player to, and the pattern their file must match.
+/// Nothing is fetched.
+fn manual_source(
+    item: &GameCatalogItem,
+    source: &DownloadSource,
+    compatibility: &GameCompatibility,
+) -> LauncherResult<PlannedSource> {
+    let asset = compatibility.asset.clone().ok_or_else(|| {
+        generic(
+            "ERR_CATALOG_NO_ASSET_PATTERN",
+            format!(
+                "'{}' names no file pattern for this manual download.",
+                item.id
+            ),
+        )
+    })?;
+    Ok(PlannedSource::ManualLink {
+        url: source.identifier.clone(),
+        asset,
+        hint: compatibility.download_hint.clone(),
+        pins: source.pins.clone(),
+    })
+}
+
+/// The curator's pin for a player's file, matched by exact file name (ignoring case, for file
+/// systems that do).
+fn manual_pin(source: &PlannedSource, file_name: &str) -> Option<ConfirmableHash> {
+    let PlannedSource::ManualLink { pins, .. } = source else {
+        return None;
+    };
+    pins.iter()
+        .find(|pin| pin.asset.eq_ignore_ascii_case(file_name))
+        .map(|pin| ConfirmableHash {
+            origin: HashOrigin::CuratorPin,
+            sha256: pin.sha256.clone(),
+        })
 }
 
 async fn github_source(
@@ -1236,6 +1703,12 @@ async fn fetch_bytes(
         PlannedSource::DirectHash {
             url, pinned_host, ..
         } => transport.fetch(url, Some(pinned_host)).await,
+        // A manual_link file is chosen by the player, never fetched. Reaching
+        // this is a caller bug, and it is not turned into a silent empty file.
+        PlannedSource::ManualLink { .. } => Err(generic(
+            "ERR_CATALOG_MANUAL_NO_FILE",
+            "This entry is downloaded by the player, so Agora has no file to fetch.",
+        )),
     }
 }
 
@@ -1251,6 +1724,7 @@ fn check_bytes(
             published_sha256, ..
         } => published_sha256.clone(),
         PlannedSource::DirectHash { sha256, .. } => Some(sha256.clone()),
+        PlannedSource::ManualLink { .. } => None,
     };
     let mut expectations = Vec::new();
     if let PlannedSource::GithubRelease { pin: Some(pin), .. } = &plan.source {
@@ -1288,6 +1762,9 @@ fn check_bytes(
             }
             PlannedSource::DirectHash { .. } => {
                 "verified by the SHA-256 in the curator's manifest".to_string()
+            }
+            PlannedSource::ManualLink { .. } => {
+                "verified by the curator's pin for this file".to_string()
             }
         }
     } else {
@@ -1341,6 +1818,8 @@ fn trusted_hash(source: &PlannedSource) -> Option<String> {
             pin.as_ref().map(|pin| pin.sha256.as_str()),
         ),
         PlannedSource::DirectHash { sha256, .. } => (Some(sha256.as_str()), None),
+        // A manual_link file comes from the player, not a stored release.
+        PlannedSource::ManualLink { .. } => (None, None),
     };
     let mut trusted = Vec::new();
     for hash in published.into_iter().chain(pin) {
@@ -1431,12 +1910,16 @@ fn stored_copy(
                 .as_deref()
                 .is_some_and(|hash| !hash.trim().is_empty()),
             PlannedSource::DirectHash { .. } => true,
+            PlannedSource::ManualLink { .. } => false,
         };
         let verified_by = match &plan.source {
             PlannedSource::GithubRelease { .. } => {
                 "verified by the SHA-256 GitHub published for this file"
             }
             PlannedSource::DirectHash { .. } => "verified by the SHA-256 in the curator's manifest",
+            PlannedSource::ManualLink { .. } => {
+                "verified by the curator's pin for this exact file name"
+            }
         };
         let basis = if published {
             verified_by.to_string()
@@ -1608,6 +2091,44 @@ mod tests {
         assert_eq!(safe_file_name("../../evil.7z"), "download.._.._evil.7z");
         assert_eq!(safe_file_name(""), "download");
         assert!(!safe_file_name("a\\b:c").contains('\\'));
+    }
+
+    #[test]
+    fn a_provided_framework_names_its_catalog_entry_even_when_the_id_differs() {
+        let entry = |id: &str, name: &str, provides: Option<&str>| GameCatalogItem {
+            id: id.into(),
+            game: "skyrim-se".into(),
+            name: name.into(),
+            author: None,
+            content_type: "mod".into(),
+            download_strategy: "manual_link".into(),
+            source_identifier: String::new(),
+            sha256: None,
+            download_sources: Vec::new(),
+            game_compatibility: Vec::new(),
+            provides_framework: provides.map(str::to_string),
+            description: None,
+            license_id: None,
+            page_url: None,
+            icon_url: None,
+            status: "active".into(),
+            date_added: None,
+        };
+        let entries = vec![
+            entry("script-extender", "The Script Extender", Some("skse")),
+            entry("skse64", "SKSE64", None),
+        ];
+        let unmet = UnmetFramework::new(
+            &FrameworkRequirement {
+                framework: "skse".into(),
+                min_version: None,
+            },
+            "Skyrim Script Extender".into(),
+            FrameworkProblem::Absent,
+        );
+        let link = framework_catalog_entry(&entries, None, &unmet).expect("the provider");
+        assert_eq!(link.id, "script-extender");
+        assert_eq!(link.name, "The Script Extender");
     }
 
     #[test]

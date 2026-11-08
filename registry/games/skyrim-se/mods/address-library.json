@@ -1,0 +1,22 @@
+{
+  "id": "address-library",
+  "name": "Address Library for SKSE Plugins",
+  "content_type": "mod",
+  "author": "meh321",
+  "license": "LicenseRef-Proprietary",
+  "game": "skyrim-se",
+  "download_strategy": "manual_link",
+  "source_identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+  "provides_framework": "address-library",
+  "page_url": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+  "description": "Version files that let SKSE plugins work across Skyrim versions.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.5.*", "1.6.*", "1.7.*"],
+      "asset": "*-32444-*.zip",
+      "download_hint": "Main file: All in one (1.7.104.0)"
+    }
+  ],
+  "curator_note": "The archive's .bin files belong in Data/SKSE/Plugins. The Nexus page publishes no checksum Agora can read."
+}

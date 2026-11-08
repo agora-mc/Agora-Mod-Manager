@@ -25,6 +25,7 @@ const first: LibraryItem = {
   iconSha256: null,
   sourceKind: 'file',
   sourceLabel: 'File: first.jar',
+  catalogStrategy: null,
   instances: [],
   fileCount: 1,
   totalSize: 1024,

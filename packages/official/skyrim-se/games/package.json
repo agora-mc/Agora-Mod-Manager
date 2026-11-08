@@ -72,7 +72,8 @@
         ]
       },
       "framework_ids": [
-        "skse"
+        "skse",
+        "address-library"
       ],
       "tool_ids": [
         "nemesis",
@@ -83,7 +84,8 @@
         "pgpatcher",
         "sseedit",
         "loot",
-        "synthesis"
+        "synthesis",
+        "skyrim-together"
       ],
       "launch": {
         "executable": {
@@ -341,6 +343,20 @@
       "detection": {
         "marker": "skse64_loader.exe",
         "version": "pe_file_version"
+      }
+    },
+    {
+      "id": "address-library",
+      "game": "skyrim-se",
+      "name": "Address Library for SKSE Plugins",
+      "version": "1.7.104.0",
+      "supported_runtimes": [],
+      "required_frameworks": [],
+      "content": [],
+      "launch": null,
+      "detection": {
+        "marker": "Data/SKSE/Plugins/version*-*.bin",
+        "version": "file_name"
       }
     }
   ],
@@ -642,6 +658,27 @@
       "output_patterns": [
         "Data/Synthesis.esp"
       ]
+    },
+    {
+      "id": "skyrim-together",
+      "game": "skyrim-se",
+      "name": "Skyrim Together Reborn",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "SkyrimTogether.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": ""
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "run_only": true
     }
   ]
 }

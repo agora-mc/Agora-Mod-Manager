@@ -89,6 +89,7 @@ Curators do not hash files by hand for catalog entries. Each file is checked aga
 | `modrinth_id` | The hashes Modrinth publishes for that version's file | Optional | The same, with "Modrinth" in the notice. |
 | `direct_hash` | The manifest `sha256`, which names the one file this entry is for | **Required** | Not possible: the hash is always there, and a mismatch blocks the install. |
 | `technic_pack`, `provider_pack` | The manifest `sha256` (a provider pack's is its plan digest) | **Required** | Not possible, as above. |
+| `manual_link` (other games) | A curator `pins` entry for that exact file, when present; otherwise nothing: the page publishes no checksum Agora can read | Optional | The player is told "{host} doesn't publish a checksum, so Agora couldn't check this file" before installing a file they chose, then its SHA-256 is recorded as not verified. |
 
 A published hash that does not match the download always blocks the install, and no override lets it through.
 
@@ -118,7 +119,9 @@ A `github_release` source may carry `pins`, which name exact release files. Pins
 - A pin is compared only with the file it names. A pin for `v1.2.0` says nothing about `v1.3.0`, nor about another asset in the same release.
 - `tag` and `asset` must be non-empty. `asset` is a file name, without a `/` or `\`.
 - `sha256` must be 64 hex characters. The same tag and asset may not be pinned twice.
-- Pins are allowed only on `github_release` sources.
+- Pins are allowed only on `github_release` sources, plus a `manual_link` source for another game. A
+  `manual_link` pin has no release tag: it is `{ "asset": "<exact file name>", "sha256": "<hash>" }`,
+  and names the file the player is expected to download from the page.
 
 Use a pin when you have reviewed one release file and want a changed copy of it to stop the install.
 
@@ -766,9 +769,15 @@ array. Each element has these fields:
 | `stores` | Yes | Non-empty. Each store must be one the game declares (for `skyrim-se`: `steam` and `gog`). |
 | `game_versions` | Yes | Non-empty. Each entry is an exact version such as `1.6.1179.0`, or a `*` glob on whole dot-separated components such as `1.6.1170.*`. Versions are opaque, so there are no ranges. |
 | `requires` | No | Frameworks the game declares, each `{"framework": "<id>", "min_version": "<dotted numbers>"}`. `min_version` is optional, and every component must be a number. |
-| `asset` | For `github_release` | The release asset to pick, as a name pattern such as `CrashLogger-*.7z`. Required whenever the entry has a `github_release` source, and forbidden on a `direct_hash`-only entry. |
+| `asset` | For `github_release` and `manual_link` | For `github_release`, the release asset to pick, as a name pattern such as `CrashLogger-*.7z`. For `manual_link`, the file-name pattern that recognises the player's download, such as `*-32444-*.zip`. Required whenever the entry has either source, and forbidden on a `direct_hash`-only entry. |
+| `download_hint` | No | Only for `manual_link`: one short line shown to the player, such as `Main file: All in one (1.6.x)`. It must be a single line of at most 200 characters. |
 
 Unknown keys are refused, so a misspelt field fails the build instead of being ignored.
+
+An optional top-level `provides_framework` names the framework this entry installs (for example
+`"provides_framework": "skse"`). It must be a framework the game declares. Agora uses it to offer
+the entry, by name, when another mod says it needs a missing framework. It says nothing about the
+file; `requires` still lists what the entry itself needs.
 
 An entry for another game must not carry `compatible_versions`, `mod_dependencies`,
 `package_signatures`, `mod_jar_aliases` or `modrinth_id`. A Minecraft entry must not carry
@@ -776,8 +785,9 @@ An entry for another game must not carry `compatible_versions`, `mod_dependencie
 
 ### Strategies
 
-Only `github_release` and `direct_hash` are available for another game. `modrinth_id`, `technic_pack`,
-`curated_pack` and `provider_pack` are Minecraft-only, and using one is a compile error.
+`github_release`, `direct_hash` and `manual_link` are available for another game. `modrinth_id`,
+`technic_pack`, `curated_pack` and `provider_pack` are Minecraft-only, and using one is a compile
+error. Minecraft cannot use `manual_link`; that strategy is planned for Minecraft but not enabled.
 
 - **`direct_hash`** keeps the Minecraft contract: an `https://` URL whose last path segment is the
   file name (`.jar`, `.zip`, `.7z` and `.rar` are all accepted), a mandatory `sha256`, and no
@@ -785,6 +795,15 @@ Only `github_release` and `direct_hash` are available for another game. `modrint
 - **`github_release`** takes `owner/repo` as its identifier and needs `asset` on every compatibility
   entry. `sha256` is optional: the install checks the file against the GitHub asset's digest, as Minecraft's
   does, and tells the user when GitHub published none. `pins` work as they do for Minecraft.
+- **`manual_link`** is for a mod Agora may not download itself, such as a Nexus Mods page. Its
+  identifier is the page's `https://` URL (an `http://` URL is refused), and every compatibility
+  entry needs an `asset` pattern that recognises the file the player downloads. `sha256` is
+  optional. `pins` may name exact file names with their hashes. The install never downloads
+  anything: it sends the player to the page, then takes a file the player chooses, copies it into
+  the content store, and never moves, changes or deletes the original. `manual_link` may be listed
+  in `download_sources` only as the last fallback, after an automatic source; a `manual_link`
+  before a `github_release` or `direct_hash` is a compile error. A list with only `manual_link` is
+  the normal case for an entry that has no automatic source at all.
 - `scripts/pin_hashes.py` accepts these manifests, and pins the hash of a `direct_hash` entry in
   place, as it does for Minecraft.
 
@@ -841,15 +860,50 @@ published no digest for the asset, the user is told that Agora could not verify 
 A `direct_hash` entry names no `asset`, because its URL already names the file. The hash is pinned
 by hand, as for Minecraft, and must stay the same for every mirror.
 
+### Example: a `manual_link` entry
+
+```json
+{
+  "id": "address-library",
+  "name": "Address Library for SKSE Plugins",
+  "content_type": "mod",
+  "author": "meh321",
+  "license": "MIT",
+  "game": "skyrim-se",
+  "download_strategy": "manual_link",
+  "source_identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+  "provides_framework": "address-library",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.6.*"],
+      "requires": [{ "framework": "skse" }],
+      "asset": "*-32444-*.zip",
+      "download_hint": "Main file: Address Library for SKSE Plugins"
+    }
+  ]
+}
+```
+
+Nexus names downloads `<name>-<mod id>-<version>-<timestamp>.<ext>`, so an `asset` such as
+`*-32444-*.zip` recognises the right file without pinning a version. The player is shown "Get from
+www.nexusmods.com" instead of Install, then chooses the file they downloaded. Agora cannot see new
+versions of a `manual_link` mod, so an installed one reports "updates unknown" rather than
+"up to date". A curator may add an exact `pins` entry when a particular download has been reviewed.
+
 ### Frameworks
 
 A framework in `requires` must be declared by the game's package: a top-level `frameworks` entry
 whose `game` is that game, and listed in the game's `framework_ids`. An undeclared framework is a
 compile error.
 
-The Skyrim SE package declares `skse` (Skyrim Script Extender, version 2.2.6). Its
-`supported_runtimes` is empty, because the game's `runtime_files` already enforce which SKSE build
-matches which Skyrim runtime. The example above compiles against the real package.
+The Skyrim SE package declares `skse` (Skyrim Script Extender, version 2.2.6) and
+`address-library` (Address Library for SKSE Plugins, version 1.7.104.0). Their `supported_runtimes`
+are empty, because the game's `runtime_files` already enforce which SKSE build matches which
+Skyrim runtime, and Address Library is detected by the `version*-*.bin` files it installs into
+`Data/SKSE/Plugins`. A catalog entry can `requires` either one; an entry that installs one should
+also say `provides_framework` so the missing-framework message can offer it by name. The example
+above compiles against the real package.
 
 ---
 

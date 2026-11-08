@@ -469,7 +469,7 @@ class TestOtherGamesLeavePreExistingTablesAlone(unittest.TestCase):
             shutil.copytree(REPO_ROOT / "registry", without)
             shutil.copytree(REPO_ROOT / "registry", with_skyrim)
             entry_dir = with_skyrim / "games" / "skyrim-se" / "mods"
-            entry_dir.mkdir(parents=True)
+            entry_dir.mkdir(parents=True, exist_ok=True)
             (entry_dir / "crash-logger.json").write_text(
                 json.dumps(SKYRIM_FIXTURE), encoding="utf-8"
             )
@@ -482,8 +482,10 @@ class TestOtherGamesLeavePreExistingTablesAlone(unittest.TestCase):
             if table == "game_catalog_items":
                 continue
             self.assertEqual(before[table], after[table], f"{table} changed")
-        self.assertEqual(before["game_catalog_items"], [])
-        self.assertEqual([row[0] for row in after["game_catalog_items"]], ["crash-logger"])
+        before_entries = {row[0] for row in before["game_catalog_items"]}
+        after_entries = {row[0] for row in after["game_catalog_items"]}
+        self.assertEqual(after_entries - before_entries, {"crash-logger"})
+        self.assertEqual(before_entries - after_entries, set())
 
     def test_registry_items_keeps_its_schema_9_columns(self):
         compile_module = self._compile_module()

@@ -535,6 +535,15 @@ fn critical_command_flags_remain_in_help() {
             &["--remove-anyway", "--abort-conflicts"][..],
         ),
         (&["mod", "enable"][..], &["--with-deps"][..]),
+        (
+            &["games", "catalog", "install"][..],
+            &[
+                "--file",
+                "--install-anyway",
+                "--allow-missing-frameworks",
+                "--dry-run",
+            ][..],
+        ),
         (&["mcp", "serve"][..], &["--stdio"][..]),
     ] {
         let mut args = command.to_vec();
@@ -569,6 +578,7 @@ fn documentation_examples_use_public_command_names() {
         "--remove-anyway",
         "--allow-replace",
         "--skip-health-scan",
+        "--file",
         "--stdio",
     ] {
         assert!(

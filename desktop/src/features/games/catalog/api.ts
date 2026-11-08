@@ -21,6 +21,8 @@ export interface CatalogCompatibility {
   gameVersions: string[];
   requires: CatalogRequirement[];
   asset: string | null;
+  /** One short line shown with a manual download, such as which file to pick. */
+  downloadHint: string | null;
 }
 
 export interface CatalogEntry {
@@ -88,6 +90,39 @@ export interface CatalogPlan {
   warnings: string[];
 }
 
+/** A `manual_link` entry that needs the player's file. Nothing changed. */
+export interface CatalogManualDownload {
+  state: 'manual_download';
+  itemId: string;
+  itemName: string;
+  pageUrl: string;
+  /** The file-name pattern the chosen file must match. */
+  asset: string;
+  hint: string | null;
+}
+
+/** The chosen file's name does not match the entry's pattern. Nothing changed. */
+export interface CatalogWrongFileName {
+  state: 'wrong_file_name';
+  itemId: string;
+  itemName: string;
+  pageUrl: string;
+  asset: string;
+  fileName: string;
+  hint: string | null;
+}
+
+/** The page publishes no checksum Agora can read. Nothing changed until the player confirms. */
+export interface CatalogNeedsChecksum {
+  state: 'needs_checksum';
+  itemId: string;
+  itemName: string;
+  pageUrl: string;
+  asset: string;
+  fileName: string;
+  hint: string | null;
+}
+
 export type CatalogInstallReply =
   | ({ state: 'dry_run' } & CatalogPlan)
   | ({ state: 'already_installed'; installedRelease: string | null; sameRelease: boolean } & CatalogPlan)
@@ -99,7 +134,10 @@ export type CatalogInstallReply =
       hash: CatalogHash;
       reason: string;
       topLevel: string[];
-    } & CatalogPlan);
+    } & CatalogPlan)
+  | CatalogManualDownload
+  | CatalogWrongFileName
+  | CatalogNeedsChecksum;
 
 export interface CatalogInstallRequest {
   gameId: string;
@@ -110,6 +148,10 @@ export interface CatalogInstallRequest {
   /** Install although a required framework is unmet, as the user chose. */
   allowMissingFrameworks: boolean;
   dryRun: boolean;
+  /** The file the player chose for a `manual_link` entry. */
+  filePath?: string | null;
+  /** The player has seen the no-checksum notice and chose to install. */
+  confirmNoChecksum?: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -145,11 +187,15 @@ export async function listCatalogEntries(gameId: string): Promise<CatalogListing
 /** Plan (`dryRun`) or install one entry into an instance. */
 export async function installCatalogEntry(request: CatalogInstallRequest): Promise<CatalogInstallReply> {
   const reply: unknown = await invoke<unknown>('games_catalog_install', { request });
+  if (!isRecord(reply) || typeof reply.state !== 'string' || typeof reply.itemId !== 'string') {
+    throw new Error('games_catalog_install did not return an install result.');
+  }
+  // A manual-link question carries no plan; every other state carries one.
   if (
-    !isRecord(reply)
-    || typeof reply.state !== 'string'
-    || typeof reply.itemId !== 'string'
-    || !Array.isArray(reply.unmetFrameworks)
+    reply.state !== 'manual_download'
+    && reply.state !== 'wrong_file_name'
+    && reply.state !== 'needs_checksum'
+    && !Array.isArray(reply.unmetFrameworks)
   ) {
     throw new Error('games_catalog_install did not return an install result.');
   }

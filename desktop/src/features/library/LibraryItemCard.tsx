@@ -61,6 +61,16 @@ function LibraryIcon({ item }: { item: LibraryItem }) {
 
 const CHIP = 'inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground';
 
+/** The host of an item's page, or "its page" when none was recorded. */
+function pageHost(url: string | null): string {
+  if (!url) return 'its page';
+  try {
+    return (new URL(url).host || 'its page').replace(/^www\./i, '');
+  } catch {
+    return 'its page';
+  }
+}
+
 export interface LibraryItemCardProps {
   item: LibraryItem;
   /** The game whose Library shows the card. Other games the item is tied to are named. */
@@ -102,6 +112,15 @@ export function LibraryItemCard({
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="text-sm font-semibold">{item.name}</h3>
             {item.version && <span className={CHIP}>{item.version}</span>}
+            {item.catalogStrategy === 'manual_link' && (
+              <span
+                className={CHIP}
+                title={`Agora can't check ${pageHost(item.pageUrl)} for new versions. Visit the page to see if there's an update.`}
+                data-testid="updates-unknown"
+              >
+                Updates unknown
+              </span>
+            )}
             {item.hasInstaller && (
               <span className={CHIP} title="It asks a few questions when you add it to an instance.">
                 <Wand2 className="h-3 w-3" aria-hidden="true" />

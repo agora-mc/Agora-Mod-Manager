@@ -50,12 +50,28 @@ pub fn framework_status(
                 message: e.to_string(),
             }
         })?;
-    if !visible
+    // A marker without a `*` is one exact file. A marker with one is a family (Address Library's
+    // version files), and the highest version found is reported.
+    let is_glob = marker.contains('*');
+    let lower_marker = fold_path_case(marker);
+    let mut matches: Vec<&String> = visible
         .iter()
-        .any(|path| fold_path_case(path) == fold_path_case(marker))
-    {
+        .filter(|path| {
+            if is_glob {
+                agora_game_api::glob_match(&lower_marker, &fold_path_case(path))
+            } else {
+                fold_path_case(path) == lower_marker
+            }
+        })
+        .collect();
+    if matches.is_empty() {
         return Ok(FrameworkStatus::Absent);
     }
+    matches.sort_by(|left, right| {
+        let left_version = version_from_file_name(left.as_str());
+        let right_version = version_from_file_name(right.as_str());
+        right_version.cmp(&left_version)
+    });
 
     let Some(version_source) = detection.version else {
         return Ok(FrameworkStatus::Present {
@@ -63,13 +79,14 @@ pub fn framework_status(
             unreadable: Some("the game definition says nowhere to read its version".into()),
         });
     };
+    let chosen = matches[0].as_str();
     let source =
-        crate::game_deploy::visible_file_source(ctx, instance_id, definition, mode, marker)
+        crate::game_deploy::visible_file_source(ctx, instance_id, definition, mode, chosen)
             .map_err(|e| LauncherError::Generic {
                 code: "ERR_FRAMEWORK_CHECK".into(),
                 message: e.to_string(),
             })?;
-    Ok(match read_version(version_source, source) {
+    Ok(match read_version(version_source, source, chosen) {
         Ok(version) => FrameworkStatus::Present {
             version: Some(version),
             unreadable: None,
@@ -82,18 +99,39 @@ pub fn framework_status(
 }
 
 /// The version of the marker file at `source`, as the manifests write it, or why it cannot be read.
-fn read_version(source: FrameworkVersionSource, path: Option<PathBuf>) -> Result<String, String> {
-    let Some(path) = path else {
-        return Err("the marker file's bytes could not be located".into());
-    };
-    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+fn read_version(
+    source: FrameworkVersionSource,
+    path: Option<PathBuf>,
+    marker: &str,
+) -> Result<String, String> {
     match source {
+        FrameworkVersionSource::FileName => version_from_file_name(marker)
+            .ok_or_else(|| format!("the version file name '{marker}' has no version numbers")),
         FrameworkVersionSource::PeFileVersion => {
+            let Some(path) = path else {
+                return Err("the marker file's bytes could not be located".into());
+            };
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
             let components =
                 crate::pe_version::read_file_version(&bytes).map_err(|e| e.to_string())?;
             Ok(display_pe_version(components))
         }
     }
+}
+
+/// The dotted version encoded in a version file's name, such as `versionlib-1-6-1170-0.bin` ->
+/// `1.6.1170.0`. `None` when the name has no number groups.
+fn version_from_file_name(name: &str) -> Option<String> {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    let parts: Vec<&str> = stem
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("."))
 }
 
 /// A PE `FileVersion` as a framework manifest writes it. A leading zero component is dropped, so
@@ -146,6 +184,23 @@ mod tests {
     fn the_skse_loader_version_reads_as_the_manifest_writes_it() {
         assert_eq!(display_pe_version([0, 2, 2, 6]), "2.2.6");
         assert_eq!(display_pe_version([1, 6, 1170, 0]), "1.6.1170.0");
+    }
+
+    #[test]
+    fn address_library_version_files_name_the_game_version_they_cover() {
+        assert_eq!(
+            version_from_file_name("Data/SKSE/Plugins/versionlib-1-7-104-0.bin").as_deref(),
+            Some("1.7.104.0")
+        );
+        assert_eq!(
+            version_from_file_name("Data/SKSE/Plugins/versionlib-1-6-1170-0.bin").as_deref(),
+            Some("1.6.1170.0")
+        );
+        assert_eq!(
+            version_from_file_name("version-1-5-97-0.bin").as_deref(),
+            Some("1.5.97.0")
+        );
+        assert_eq!(version_from_file_name("readme.txt"), None);
     }
 
     #[test]

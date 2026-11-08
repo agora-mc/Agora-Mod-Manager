@@ -57,6 +57,9 @@ pub struct LibraryItem {
     pub source_kind: &'static str,
     /// Where the item came from, in a sentence a person can read.
     pub source_label: String,
+    /// The catalog strategy behind the item, when it came from a catalog entry. `manual_link`
+    /// means Agora cannot check the page for new versions.
+    pub catalog_strategy: Option<String>,
     /// The instances that have this item, by name.
     pub instances: Vec<LibraryInstanceRef>,
     pub file_count: usize,
@@ -175,6 +178,8 @@ pub fn list(ctx: &Ctx) -> Result<LibraryListing, ContentError> {
                     .or_else(|| catalog_game(&item))
                     .or_else(|| (game_ids.len() == 1).then(|| game_ids[0].clone()));
                 let description = resolve_description(&item, &mut registry, &mut warnings);
+                let catalog_strategy =
+                    resolve_catalog_strategy(&item, &mut registry, &mut warnings);
                 let (source_kind, source_label) = source_of(&item);
                 let plugin_files = plugin_files(ctx, &item, &game_ids);
                 items.push(LibraryItem {
@@ -188,6 +193,7 @@ pub fn list(ctx: &Ctx) -> Result<LibraryListing, ContentError> {
                     icon_sha256: item.icon_sha256.clone(),
                     source_kind,
                     source_label,
+                    catalog_strategy,
                     instances: using,
                     file_count: item.files.len(),
                     total_size: item.total_size,
@@ -913,6 +919,17 @@ impl RegistryLookup {
             .flatten()
             .and_then(|item| non_empty(item.description))
     }
+
+    fn game_strategy(&mut self, warnings: &mut Vec<String>, id: &str) -> Option<String> {
+        if !self.available(warnings) {
+            return None;
+        }
+        self.service
+            .get_game_item(id)
+            .ok()
+            .flatten()
+            .map(|item| item.download_strategy)
+    }
 }
 
 fn resolve_description(
@@ -938,6 +955,27 @@ fn resolve_description(
             }
             if let Some(description) = registry.item_description(warnings, item_id) {
                 return Some(description);
+            }
+        }
+    }
+    None
+}
+
+/// The download strategy of the catalog entry this item came from, if it came from one.
+fn resolve_catalog_strategy(
+    item: &ContentItem,
+    registry: &mut RegistryLookup,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    if let Some(catalog_id) = &item.catalog_id {
+        if let Some(strategy) = registry.game_strategy(warnings, catalog_id) {
+            return Some(strategy);
+        }
+    }
+    for source in &item.sources {
+        if let ContentSource::Catalog { item_id, .. } = source {
+            if let Some(strategy) = registry.game_strategy(warnings, item_id) {
+                return Some(strategy);
             }
         }
     }

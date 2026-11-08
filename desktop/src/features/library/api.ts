@@ -28,6 +28,8 @@ export interface LibraryItem {
   iconSha256: string | null;
   sourceKind: string;
   sourceLabel: string;
+  /** The catalog strategy behind the item, when it came from a catalog entry. */
+  catalogStrategy: string | null;
   instances: LibraryInstance[];
   fileCount: number;
   totalSize: number;
@@ -105,6 +107,7 @@ function isLibraryItem(value: unknown): value is LibraryItem {
     && (row.iconSha256 === null || typeof row.iconSha256 === 'string')
     && typeof row.sourceKind === 'string'
     && typeof row.sourceLabel === 'string'
+    && (row.catalogStrategy === null || typeof row.catalogStrategy === 'string')
     && Array.isArray(row.instances)
     && row.instances.every(isLibraryInstance)
     && typeof row.fileCount === 'number'

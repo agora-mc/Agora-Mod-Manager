@@ -22,8 +22,9 @@ import { CuratedBadge } from '@/components/browse/BrowseContextLabels';
 import '@/components/browse/browse-cards.css';
 import { formatBytes } from '@/components/installed-content/contentTableState';
 import { Switch } from '@/components/ui/switch';
-import { formatError, openExternalUrl } from '@/lib/tauri';
+import { formatError, getSetting, openExternalUrl } from '@/lib/tauri';
 import { openSettingsSection } from '@/lib/settingsSection';
+import { SETTINGS } from '@/lib/useTypedSettings';
 import { isGamesError } from '../shared/types';
 import { runtimeText } from '../instances/instanceIdentity';
 import { FomodWizard } from '../fomod';
@@ -37,6 +38,7 @@ import {
   type CatalogUnmetFramework,
 } from './api';
 import { hashOutcome } from './hashOutcome';
+import { ManualDownloadDialog, pageHost } from './ManualDownloadDialog';
 
 /** The core's code for a file that differs from the curator's pin or an earlier install. */
 const NEEDS_INSTALL_ANYWAY = 'ERR_HASH_CONFIRMATION_REQUIRED';
@@ -114,6 +116,10 @@ export function GameBrowsePage({ gameId, gameName, onOpenLibrary, onOpenInstance
   const [results, setResults] = useState<Record<string, EntryState>>({});
   const [revealed, setRevealed] = useState<RevealedEntry | null>(null);
   const [query, setQuery] = useState('');
+  // The manual_link entry whose "download it yourself" dialog is open.
+  const [manualEntry, setManualEntry] = useState<CatalogEntry | null>(null);
+  // Whether the Library will spot the downloaded file, for the dialog's offer.
+  const [watching, setWatching] = useState(false);
   // Only the newest list request may answer: a slow reply for the previous game must not land.
   const latest = useRef(0);
 
@@ -135,10 +141,25 @@ export function GameBrowsePage({ gameId, gameName, onOpenLibrary, onOpenInstance
     // The selection belongs to the game: a game switch must not keep the previous game's instance.
     setInstanceId('');
     setResults({});
+    setManualEntry(null);
     load();
     // Loaded again only when the game changes; "Retry" calls load().
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gameId]);
+
+  useEffect(() => {
+    // Read once when the page opens. Turning the setting on elsewhere updates
+    // the next time this page is shown, which is enough for a sentence of help.
+    let cancelled = false;
+    void getSetting(SETTINGS.noticeModDownloads.key)
+      .then((raw) => {
+        if (!cancelled) setWatching(SETTINGS.noticeModDownloads.parse(raw));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const act = (
     entry: CatalogEntry,
@@ -347,6 +368,7 @@ export function GameBrowsePage({ gameId, gameName, onOpenLibrary, onOpenInstance
                   revealRequest={revealed?.id === entry.id ? revealed.request : null}
                   onPreview={() => act(entry, true)}
                   onInstall={() => act(entry, false)}
+                  onGet={() => setManualEntry(entry)}
                   onInstallAnyway={() =>
                     act(entry, false, {
                       anyway: true,
@@ -363,6 +385,21 @@ export function GameBrowsePage({ gameId, gameName, onOpenLibrary, onOpenInstance
           </ul>
         </div>
       ) : null}
+
+      {manualEntry && (
+        <ManualDownloadDialog
+          entry={manualEntry}
+          open
+          onOpenChange={(open) => {
+            if (!open) setManualEntry(null);
+          }}
+          gameId={gameId}
+          instanceId={instanceId}
+          watching={watching}
+          installAnyway={installAnyway}
+          onInstalled={load}
+        />
+      )}
     </div>
   );
 }
@@ -373,6 +410,8 @@ interface CatalogCardProps {
   result: EntryState | undefined;
   onPreview: () => void;
   onInstall: () => void;
+  /** Open the "download it yourself" dialog for a manual_link entry. */
+  onGet: () => void;
   /** Set when the page asked to bring this card into view; changes with each request. */
   revealRequest: number | null;
   /** Install this one past a changed file (the answer to "it differs from the curator's pin"). */
@@ -391,7 +430,11 @@ function resultKey(instanceId: string, entryId: string): string {
 
 /** Where an entry's file comes from, in a player's words. */
 function sourceText(entry: CatalogEntry): string {
-  const from = entry.downloadStrategy === 'github_release' ? 'Downloads from GitHub' : 'Direct download';
+  const from = entry.downloadStrategy === 'github_release'
+    ? 'Downloads from GitHub'
+    : entry.downloadStrategy === 'manual_link'
+      ? `You download it from ${entry.pageUrl ? pageHost(entry.pageUrl) : 'its page'}`
+      : 'Direct download';
   return entry.author ? `by ${entry.author} · ${from}` : from;
 }
 
@@ -413,6 +456,7 @@ function CatalogCard({
   revealRequest,
   onPreview,
   onInstall,
+  onGet,
   onInstallAnyway,
   onInstallWithoutFrameworks,
   onDismiss,
@@ -461,9 +505,21 @@ function CatalogCard({
         <aside className="browse-list-card__side">
           <div className="browse-list-card__actions">
             <div className="browse-card-action-row browse-card-action-row--pair">
-              <button ref={primary} type="button" className="browse-primary-action" onClick={onInstall} disabled={!canInstall || busy}>
-                {installing ? 'Installing…' : 'Install'}
-              </button>
+              {entry.downloadStrategy === 'manual_link' ? (
+                <button
+                  ref={primary}
+                  type="button"
+                  className="browse-primary-action browse-primary-action--manual"
+                  onClick={onGet}
+                  disabled={!canInstall || busy || !entry.pageUrl}
+                >
+                  Get from {entry.pageUrl ? pageHost(entry.pageUrl) : 'the page'}
+                </button>
+              ) : (
+                <button ref={primary} type="button" className="browse-primary-action" onClick={onInstall} disabled={!canInstall || busy}>
+                  {installing ? 'Installing…' : 'Install'}
+                </button>
+              )}
               <button type="button" className="browse-secondary-action" onClick={onPreview} disabled={!canInstall || busy}>
                 {previewing ? 'Checking…' : 'Preview'}
               </button>
@@ -553,7 +609,7 @@ function UnmetFrameworks({ unmet, onInstallAnyway, onDismiss, onOpenEntry, insta
             onClick={() => onOpenEntry(link.id)}
             className="rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
           >
-            Go to {link.name}
+            Get {link.name}
           </button>
         ))}
         {onInstallAnyway && (
@@ -590,6 +646,18 @@ function CatalogResult({ reply, onInstallWithoutFrameworks, onDismiss, onOpenEnt
   // The wizard's state. This component only renders once the install is done, and a new install
   // unmounts it first, so each run starts with the wizard open.
   const [wizard, setWizard] = useState<'open' | 'closed' | 'installed'>('open');
+  // A manual-link question is answered in its own dialog; a card never gets one.
+  if (
+    reply.state === 'manual_download'
+    || reply.state === 'wrong_file_name'
+    || reply.state === 'needs_checksum'
+  ) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Choose the downloaded file in the download dialog.
+      </p>
+    );
+  }
   const size = reply.size !== null ? ` (${formatBytes(reply.size)})` : '';
   const frameworkNotes = reply.frameworks.map((framework) =>
     framework.foundVersion

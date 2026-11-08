@@ -1,0 +1,24 @@
+{
+  "id": "skyui",
+  "name": "SkyUI",
+  "content_type": "mod",
+  "author": "SkyUI Team",
+  "license": "LicenseRef-Proprietary",
+  "game": "skyrim-se",
+  "download_strategy": "manual_link",
+  "source_identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/12604",
+  "page_url": "https://www.nexusmods.com/skyrimspecialedition/mods/12604",
+  "description": "A PC-friendly interface, including the Mod Configuration Menu that many mods use.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.5.*", "1.6.*", "1.7.*"],
+      "requires": [
+        { "framework": "skse" }
+      ],
+      "asset": "*-12604-*",
+      "download_hint": "Main file: SkyUI for Skyrim Special Edition"
+    }
+  ],
+  "curator_note": "Requires SKSE. Supports all Steam and GOG game versions."
+}
