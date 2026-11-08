@@ -1,5 +1,11 @@
 import { test, expect, type Page } from '@playwright/test';
-import { expectNoUnmockedCommands, instanceHeaderReplies, installGamesMock, OTHER_SLICES_REPLIES } from './support/games-mock';
+import {
+  expectNoUnmockedCommands,
+  instanceHeaderReplies,
+  installGamesMock,
+  OTHER_SLICES_REPLIES,
+  storedSetting,
+} from './support/games-mock';
 
 /**
  * The Plugins and INI & saves tabs of a non-Minecraft game's instance (MASTER_SPEC §26.6, §26.7).
@@ -118,11 +124,12 @@ async function openPage(
   replies: Record<string, unknown>,
   fail?: { command: string; error: unknown },
   sequences?: Record<string, unknown[]>,
+  settings?: Record<string, unknown>,
 ) {
   await installGamesMock(page, {
     replies: { ...BOOT_REPLIES, ...instanceHeaderReplies(INSTANCE_ID), ...replies },
     sequences,
-    settings: { active_game: 'skyrim-se' },
+    settings: { active_game: 'skyrim-se', ...settings },
   });
   // Added after the mock, so the failing wrapper sees the mock's invoke and not the other way round.
   if (fail) await failCommand(page, fail.command, fail.error);
@@ -167,6 +174,27 @@ test.describe('Plugins tab', () => {
     await expect(rows.nth(2)).toContainText("loads before its master");
     await expect(rows.nth(0)).toContainText('Always loaded');
     await expect(page.getByTestId('plugins-masterlist')).toContainText('Masterlist from');
+  });
+
+  test('an update whose network is off offers to turn it on beside the button', async ({ page }) => {
+    await openPage(page, 'plugins', { games_plugins_list: listed }, undefined, undefined, {
+      network_plugins_enabled: false,
+      network_lockdown_enabled: false,
+    });
+
+    const update = page.getByRole('button', { name: 'Update masterlist' });
+    await expect(update).toBeDisabled();
+    await expect(
+      page.getByText('Update masterlist needs plugins to reach the network, which is turned off.'),
+    ).toBeVisible();
+
+    await page.getByRole('button', { name: 'Turn on network for plugins' }).click();
+    await expect(page.getByRole('status')).toHaveText(
+      'Network for plugins is on. You can turn it off in Settings > Plugins.',
+    );
+    await expect(update).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Turn on network for plugins' })).toHaveCount(0);
+    expect(await storedSetting(page, 'network_plugins_enabled')).toBe(true);
   });
 
   test('turning a plugin off shows the list as the backend returns it', async ({ page }) => {

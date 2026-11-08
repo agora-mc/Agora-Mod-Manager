@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AlertTriangle, ArrowDown, ArrowUp, CheckCircle2, Download, Lock, RefreshCw, Unlock } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { formatError, getSetting, setSetting } from '@/lib/tauri';
 import {
   Dialog,
   DialogContent,
@@ -40,10 +41,20 @@ interface InstancePluginsTabProps {
   instanceId: string;
 }
 
+const NETWORK_PLUGINS_ENABLED = 'network_plugins_enabled';
+const LOCKDOWN_MODE_ENABLED = 'network_lockdown_enabled';
+
 type Load =
   | { status: 'loading' }
   | { status: 'failed'; message: string }
   | { status: 'loaded'; view: PluginsView };
+
+/** What the tab learned about whether plugin code may reach the network. */
+interface NetworkAccess {
+  /** `unknown` when the setting could not be read; the update is then left enabled. */
+  network: 'on' | 'off' | 'unknown';
+  lockdown: 'on' | 'off';
+}
 
 export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const [load, setLoad] = useState<Load>({ status: 'loading' });
@@ -53,6 +64,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const [sortPreview, setSortPreview] = useState<SortReport | null>(null);
   const [lists, setLists] = useState<LoadOrderListRow[] | null>(null);
   const [listId, setListId] = useState<string | null>(null);
+  const [networkAccess, setNetworkAccess] = useState<NetworkAccess | null>(null);
   // Counts the reads, so a reply for an instance the tab no longer shows is dropped.
   const requestId = useRef(0);
   // Counts the background notes fetches, so a result for a view that has since changed is dropped.
@@ -123,6 +135,31 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
 
   const view = load.status === 'loaded' ? load.view : null;
   const allFindings = view ? [...view.findings, ...view.notes] : [];
+
+  // A sorter update runs plugin code, so the tab reads the same two settings
+  // Settings > Plugins and Settings > Privacy use. A failed read leaves the
+  // update enabled: it reports its own failure, and guessing "off" would hide
+  // a working update behind a switch we could not read.
+  const hasSorterUpdate = view?.hasSorterUpdate === true;
+  useEffect(() => {
+    if (!hasSorterUpdate) {
+      setNetworkAccess(null);
+      return;
+    }
+    let current = true;
+    Promise.allSettled([getSetting(NETWORK_PLUGINS_ENABLED), getSetting(LOCKDOWN_MODE_ENABLED)]).then(
+      ([network, lockdown]) => {
+        if (!current) return;
+        setNetworkAccess({
+          network: network.status === 'fulfilled' ? (network.value === true ? 'on' : 'off') : 'unknown',
+          lockdown: lockdown.status === 'fulfilled' && lockdown.value === true ? 'on' : 'off',
+        });
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [hasSorterUpdate, instanceId]);
 
   /** Runs one command. Only one runs at a time; a failure is shown as the backend's own words. */
   const run = async <T,>(label: string, work: () => Promise<T>, done: (value: T) => void) => {
@@ -214,6 +251,22 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
       setNotice('Updated.');
     });
 
+  // The same setting Settings > Plugins writes; nothing else changes if it fails.
+  const turnOnPluginNetwork = async () => {
+    setBusy('network');
+    setError(null);
+    setNotice(null);
+    try {
+      await setSetting(NETWORK_PLUGINS_ENABLED, true);
+      setNetworkAccess((current) => (current === null ? current : { ...current, network: 'on' }));
+      setNotice('Network for plugins is on. You can turn it off in Settings > Plugins.');
+    } catch (failure: unknown) {
+      setError(formatError(failure));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const applySort = () =>
     run('sort-apply', () => sortGamePlugins(instanceId, false, listId ?? undefined), (change) => {
       showView(change.plugins);
@@ -243,6 +296,11 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const showTable = view.supported && view.listExists && hasRows;
   const anyBusy = busy !== null;
   const heading = lists !== null && lists.length > 1 ? 'Load order' : (view.listName || 'Plugins');
+  const sorterUpdateLabel = view.sorterUpdateLabel ?? 'Update';
+  const lockdownOn = networkAccess?.lockdown === 'on';
+  const networkOff = networkAccess?.network === 'off';
+  const updateBlocked = lockdownOn || networkOff;
+  const showNetworkGate = showTable && view.hasSorterUpdate && networkAccess !== null && updateBlocked;
 
   return (
     <section className="space-y-4" aria-labelledby="plugins-heading" data-testid="plugins-tab">
@@ -265,9 +323,9 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
               Check again
             </Button>
             {view.hasSorterUpdate && (
-              <Button variant="outline" size="sm" onClick={updateMasterlistOnly} disabled={anyBusy}>
+              <Button variant="outline" size="sm" onClick={updateMasterlistOnly} disabled={anyBusy || updateBlocked}>
                 <Download />
-                {busy === 'masterlist' ? 'Updating…' : (view.sorterUpdateLabel ?? 'Update')}
+                {busy === 'masterlist' ? 'Updating…' : sorterUpdateLabel}
               </Button>
             )}
             {view.rulesApply && (
@@ -278,6 +336,25 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
           </div>
         )}
       </header>
+
+      {showNetworkGate && (
+        <div className="space-y-2" data-testid="plugins-network-gate">
+          {lockdownOn ? (
+            <p className="text-sm text-muted-foreground">
+              Lockdown Mode is on, so plugins can&apos;t reach the network. Turn it off in Settings &gt; Privacy to use {sorterUpdateLabel}.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-muted-foreground">
+                {sorterUpdateLabel} needs plugins to reach the network, which is turned off.
+              </p>
+              <Button variant="outline" size="sm" onClick={() => void turnOnPluginNetwork()} disabled={anyBusy}>
+                {busy === 'network' ? 'Turning on…' : 'Turn on network for plugins'}
+              </Button>
+            </>
+          )}
+        </div>
+      )}
 
       {lists !== null && lists.length > 1 && (
         <div role="tablist" aria-label="Load order lists" className="flex flex-wrap gap-1 rounded-lg bg-muted p-1" data-testid="load-order-tabs">
