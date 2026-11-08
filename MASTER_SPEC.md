@@ -5071,3 +5071,17 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
 **Proof.** The Cyberpunk tracer package must give a working modded game using only this section: REDmod placement, a before-launch `redmod deploy`, a script-parsed framework version. A test walks it through with no real game, and the author guide documents exactly the fields official plugins use, checked by script.
 
 **Known gaps.** A game whose saves are chosen by an INI setting can get per-instance saves through `save_location`; a game that keeps them in JSON or another format cannot yet. Cyberpunk 2077 is the first case: its saves live under `Saved Games` and its settings are `UserSettings.json`, so Agora lists the saves but cannot redirect them per instance.
+
+### 30.13 WebAssembly modules
+
+A plugin script can run a WebAssembly module it ships, for work too slow or too complex for a script. LOOT is the first user (§30.2).
+
+- **The shape is a WASI command.** The module reads its request from stdin and writes its answer to stdout. A script calls `agora.wasm.run(module, { stdin, mounts, limits })` and gets `{ exitCode, stdout, stderr }` back. The module is a path inside the plugin's own package, so it is hash-pinned with the rest of the plugin.
+- **Running a module needs no capability of its own.** It's pure computation in a sandbox:
+  - no network, no environment, no threads, and no writable folder;
+  - a clock and randomness;
+  - a memory cap and a time limit, with fuel or an epoch deadline, so a stuck module is stopped and reported.
+- **Mounts are read-only and staged.** A mount names files from the instance's merged view (a folder plus patterns), or bytes the script hands over. Agora hardlinks the view files into a fresh staging folder, falling back to copying, and preopens that folder read-only. It never preopens a real game, instance or layer folder. View mounts need `game:read` and are bound to the hook's instance, like `game.*`. The staging folder is deleted afterwards.
+- **The engine is wasmtime,** with trimmed features, plus its compile cache under the data root. It adds about 13 MB to the app. Interpreters were measured: wasmi took 9.4 s and Pulley 25 s on LOOT's job, against 2.4 s. Ahead-of-time compilation can't serve third-party modules.
+- **A list can have a plugin-provided sorter.** `rules.sorter` names a hook that returns a whole order plus notes. Core checks that the order is a permutation of the list, and keeps locked and always-loaded items where they are. `rules.sorter.update` optionally names a hook behind an update button (LOOT's masterlist). With that, `rules.loot` and libloot leave core.
+- **Vendored patches** to a third-party library carry a comment saying they might be worth offering upstream, and are not offered without the owner's say.

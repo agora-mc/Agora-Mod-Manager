@@ -90,6 +90,34 @@ const ui = {
   notify: (tone, message) => call("ui.notify", { tone, message }),
 };
 
+// A WebAssembly module the plugin ships. It is a WASI command: the request
+// goes in on stdin, the answer comes back on stdout. `stdout` and `stderr` are
+// plain byte arrays so the result survives JSON, and the `*Text` fields are the
+// same bytes decoded as UTF-8.
+const wasm = {
+  run: (module, options) => {
+    const opts = options || {};
+    const encode = (value) => (typeof value === "string" ? value : Array.from(value || []));
+    const mounts = (opts.mounts || []).map((mount) => {
+      const out = { guest: mount.guest };
+      if (mount.view) {
+        out.view = { folder: mount.view.folder, patterns: mount.view.patterns || [] };
+      }
+      if (mount.files) {
+        out.files = {};
+        for (const [name, value] of Object.entries(mount.files)) {
+          out.files[name] = encode(value);
+        }
+      }
+      return out;
+    });
+    const payload = { mounts };
+    if (opts.stdin !== undefined) payload.stdin = encode(opts.stdin);
+    if (opts.limits) payload.limits = opts.limits;
+    return JSON.parse(__agora_wasm_run(module, JSON.stringify(payload)));
+  },
+};
+
 // Scoped reads for crash parsers and inspectors. They reach only the artifact
 // the host put in scope for this call, and throw when there is none.
 const crash = {
@@ -183,8 +211,8 @@ const apiVersion = __agora_api_version;
 const pluginId = __agora_plugin_id;
 const settings = JSON.parse(__agora_settings);
 
-export { call, log, instances, content, launch, storage, net, ui, crash, game, on, off, apiVersion, pluginId, settings };
-export default { call, log, instances, content, launch, storage, net, ui, crash, game, on, off, apiVersion, pluginId, settings };
+export { call, log, instances, content, launch, storage, net, ui, wasm, crash, game, on, off, apiVersion, pluginId, settings };
+export default { call, log, instances, content, launch, storage, net, ui, wasm, crash, game, on, off, apiVersion, pluginId, settings };
 "#;
 
 /// Name plugins import: `import { instances } from "agora"`.

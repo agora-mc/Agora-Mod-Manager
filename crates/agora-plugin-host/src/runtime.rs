@@ -26,6 +26,7 @@ use rquickjs::{
     ArrayBuffer, AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module, Object, Value,
 };
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
@@ -46,6 +47,11 @@ thread_local! {
     /// The instance a hook is bound to, so a `game.*` call from the script
     /// cannot name a different one.
     static CURRENT_BOUND_INSTANCE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Where this plugin's own files live. A module path is resolved against
+    /// it and may never leave it.
+    static CURRENT_PACKAGE_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// Agora's data root, for the module compile cache and staging.
+    static CURRENT_DATA_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 fn current_reads() -> Option<Arc<dyn ScriptReads>> {
@@ -58,6 +64,49 @@ fn current_game_reads() -> Option<Arc<dyn GameReads>> {
 
 fn current_bound_instance() -> Option<String> {
     CURRENT_BOUND_INSTANCE.with(|slot| slot.borrow().clone())
+}
+
+fn current_package_root() -> Option<PathBuf> {
+    CURRENT_PACKAGE_ROOT.with(|slot| slot.borrow().clone())
+}
+
+fn current_data_root() -> Option<PathBuf> {
+    CURRENT_DATA_ROOT.with(|slot| slot.borrow().clone())
+}
+
+/// The QuickJS side of `agora.wasm.run`. The run happens on its own thread,
+/// so the answer comes back as JSON; the SDK turns the byte arrays into
+/// typed views.
+fn wasm_run(module: String, options_json: String) -> rquickjs::Result<String> {
+    let (Some(package_root), Some(data_root)) = (current_package_root(), current_data_root())
+    else {
+        return Err(rquickjs::Error::new_into_js_message(
+            "agora.wasm.run",
+            "WasmRunResult",
+            "this plugin runtime has no data root, so it cannot run a module",
+        ));
+    };
+    let result = crate::wasm::run(
+        &module,
+        &package_root,
+        &data_root,
+        &options_json,
+        current_game_reads(),
+    )
+    .map_err(|error| {
+        rquickjs::Error::new_into_js_message(
+            "agora.wasm.run",
+            "WasmRunResult",
+            format!("{}: {}", error.code, error.message),
+        )
+    })?;
+    serde_json::to_string(&result).map_err(|e| {
+        rquickjs::Error::new_into_js_message(
+            "agora.wasm.run",
+            "WasmRunResult",
+            format!("the module result could not be read: {e}"),
+        )
+    })
 }
 
 /// How many events may queue for one plugin before the oldest are dropped.
@@ -369,6 +418,8 @@ async fn install_host_api(
     let api_version = request.api_version.clone();
     let settings = serde_json::to_string(&request.settings).unwrap_or_else(|_| "{}".into());
     let plugin_id_string = plugin_id.to_string();
+    CURRENT_PACKAGE_ROOT.with(|slot| *slot.borrow_mut() = Some(request.package_root.clone()));
+    CURRENT_DATA_ROOT.with(|slot| *slot.borrow_mut() = Some(request.data_root.clone()));
 
     let log_bridge = bridge.clone();
     let log_plugin = plugin_id.clone();
@@ -521,6 +572,11 @@ async fn install_host_api(
             .map_err(js_internal)?;
             globals
                 .set("__agora_game_list", game_list_fn)
+                .map_err(js_internal)?;
+
+            let wasm_run_fn = Function::new(ctx.clone(), wasm_run).map_err(js_internal)?;
+            globals
+                .set("__agora_wasm_run", wasm_run_fn)
                 .map_err(js_internal)?;
 
             globals

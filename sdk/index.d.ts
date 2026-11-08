@@ -86,6 +86,54 @@ export const net: {
    */
   fetchJson(url: string, options?: Record<string, Json>): Promise<{ status: number; body: Json }>;
 };
+/** A mount taken from the instance view the current hook is bound to. */
+export interface WasmViewMount {
+  /** Absolute guest path, like `/data`. Cannot nest or repeat another mount. */
+  guest: string;
+  view: {
+    /** Game path of the folder in the instance's merged view. */
+    folder: string;
+    /** Glob patterns for files below `folder`. Empty means every file. */
+    patterns?: string[];
+  };
+}
+/** A mount of bytes your script hands over. */
+export interface WasmFilesMount {
+  /** Absolute guest path, like `/input`. Cannot nest or repeat another mount. */
+  guest: string;
+  files: Record<string, string | Uint8Array>;
+}
+export type WasmMount = WasmViewMount | WasmFilesMount;
+/** Limits a script may lower, never raise. */
+export interface WasmLimits {
+  /** Defaults to 1 GiB; a larger value is refused. */
+  memoryBytes?: number;
+  /** Defaults to 120000 ms; a larger value is refused. */
+  timeoutMs?: number;
+}
+export interface WasmRunOptions {
+  /** A string is sent as UTF-8. */
+  stdin?: string | Uint8Array;
+  mounts?: WasmMount[];
+  limits?: WasmLimits;
+}
+export interface WasmRunResult {
+  exitCode: number;
+  /** Raw stdout bytes, so the result can be returned from an export as JSON. */
+  stdout: number[];
+  stderr: number[];
+  /** `stdout` decoded as UTF-8, with invalid sequences replaced. */
+  stdoutText: string;
+  stderrText: string;
+}
+export const wasm: {
+  /**
+   * Run a WASI command module shipped inside your package. Needs no capability
+   * of its own. A `view` mount needs `game:read` and a hook bound to an
+   * instance, exactly like `game.readBytes`.
+   */
+  run(module: string, options?: WasmRunOptions): WasmRunResult;
+};
 /** The lines reply a crash parser gets from `crash.readLines`. */
 export interface CrashLinesReply {
   lines: string[];
