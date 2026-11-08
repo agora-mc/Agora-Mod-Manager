@@ -245,18 +245,26 @@ mod tests {
 
         // Empty lists
         assert!(game.content_rules.is_empty());
-        // SKSE is the one framework Skyrim SE declares (MASTER_SPEC §26.11).
+        // SKSE and Address Library are the frameworks Skyrim SE declares (MASTER_SPEC §26.11).
         assert_eq!(
             game.framework_ids,
-            vec![agora_game_api::FrameworkId::new("skse").unwrap()]
+            vec![
+                agora_game_api::FrameworkId::new("skse").unwrap(),
+                agora_game_api::FrameworkId::new("address-library").unwrap(),
+            ]
         );
-        assert_eq!(def.frameworks.len(), 1);
+        assert_eq!(def.frameworks.len(), 2);
         assert_eq!(
             def.frameworks[0].id,
             agora_game_api::FrameworkId::new("skse").unwrap()
         );
         assert_eq!(def.frameworks[0].game, GameId::new("skyrim-se").unwrap());
         assert_eq!(def.frameworks[0].name, "Skyrim Script Extender");
+        assert_eq!(
+            def.frameworks[1].id,
+            agora_game_api::FrameworkId::new("address-library").unwrap()
+        );
+        assert_eq!(def.frameworks[1].name, "Address Library for SKSE Plugins");
         // Nemesis, BodySlide and Pandora are the tools Skyrim SE declares (MASTER_SPEC §26.9): Nemesis's
         // engine sits in the deployed Nemesis mod folder and runs from there. All three read the install
         // path, so all three run by the real-path view or, failing that, the swap (MASTER_SPEC §26.9, slice 4c).

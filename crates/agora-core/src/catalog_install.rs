@@ -859,7 +859,7 @@ fn place(
                     ) -> Option<agora_game_api::Suggestion>
             });
         game_deploy::decide_placement_with(
-            &content_item,
+            content_item,
             layout,
             &definition.content_rules,
             Some(&facts),
@@ -991,6 +991,7 @@ fn manual_hash_report(
 
 /// The plan: the compatibility entry, the frameworks, and the file. Makes no change. An unmet
 /// framework refuses here, before any network access, unless `keep_unmet`.
+#[allow(clippy::too_many_arguments)]
 async fn plan(
     ctx: &Ctx,
     manifest: &GameInstanceManifest,

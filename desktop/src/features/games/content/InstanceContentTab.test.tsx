@@ -56,6 +56,7 @@ function libraryRow(itemId: string, name: string, gameIds: string[] = []) {
     iconSha256: null,
     sourceKind: 'archive',
     sourceLabel: 'Archive: sky.7z',
+    catalogStrategy: null,
     instances: [],
     fileCount: 4,
     totalSize: 2048,

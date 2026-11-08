@@ -15,6 +15,8 @@ const download = {
   kind: 'mod',
   reason: 'has fabric.mod.json',
   nexusModId: '32274',
+  catalogItemId: null,
+  catalogItemName: null,
   alreadyInLibrary: false,
 };
 

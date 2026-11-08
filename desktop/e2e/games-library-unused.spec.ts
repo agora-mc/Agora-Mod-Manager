@@ -18,6 +18,7 @@ const item = {
   iconSha256: null,
   sourceKind: 'file',
   sourceLabel: 'File: saved.jar',
+  catalogStrategy: null,
   instances: [],
   fileCount: 1,
   totalSize: 2048,

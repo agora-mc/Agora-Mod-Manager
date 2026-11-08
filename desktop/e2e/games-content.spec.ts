@@ -89,6 +89,7 @@ function libraryRow(item: typeof odin, extra: Record<string, unknown> = {}) {
     iconSha256: null,
     sourceKind: item.sourceKind,
     sourceLabel: item.sourceLabel,
+    catalogStrategy: null,
     instances: [],
     fileCount: item.fileCount,
     totalSize: item.totalSize,
