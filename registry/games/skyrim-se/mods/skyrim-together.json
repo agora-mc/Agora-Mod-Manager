@@ -1,0 +1,23 @@
+{
+  "id": "skyrim-together",
+  "name": "Skyrim Together Reborn",
+  "content_type": "mod",
+  "author": "Tilted Phoques",
+  "license": "GPL-3.0",
+  "game": "skyrim-se",
+  "download_strategy": "github_release",
+  "source_identifier": "tiltedphoques/TiltedEvolution",
+  "page_url": "https://github.com/tiltedphoques/TiltedEvolution/releases",
+  "description": "Multiplayer for Skyrim Special Edition, started from its own launcher.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.6.1170.*"],
+      "requires": [
+        { "framework": "address-library" }
+      ],
+      "asset": "SkyrimTogether-*-windows-x64-sse1.6.1170.zip"
+    }
+  ],
+  "curator_note": "The current release is 1.8.4 and supports Skyrim Special Edition 1.6.1170 on Steam and GOG only. It has its own launcher (SkyrimTogether.exe) and needs Address Library; it does not need SKSE. The asset pattern names the 1.6.1170 build and never matches a debug-symbols asset; a new game version needs a new pattern."
+}

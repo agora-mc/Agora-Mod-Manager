@@ -442,3 +442,74 @@ fn a_baseline_file_replaced_with_new_content_is_offered() {
     let found = scan_until_stable(&mut state, &ctx);
     assert_eq!(found.len(), 1, "the replaced file is new content");
 }
+
+/// A catalog entry for another game, in a registry database the watcher can read.
+fn write_manual_link_catalog(ctx: &Ctx, id: &str, name: &str, asset: &str) {
+    let path = ctx.paths.registry_db();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE game_catalog_items (
+            id TEXT PRIMARY KEY,
+            game TEXT NOT NULL,
+            name TEXT NOT NULL,
+            author TEXT,
+            content_type TEXT NOT NULL,
+            download_strategy TEXT NOT NULL,
+            source_identifier TEXT NOT NULL,
+            sha256 TEXT,
+            download_sources_json TEXT NOT NULL DEFAULT '[]',
+            game_compatibility_json TEXT NOT NULL,
+            provides_framework TEXT,
+            description TEXT,
+            license_id TEXT,
+            page_url TEXT,
+            icon_url TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            date_added TEXT
+        );",
+    )
+    .unwrap();
+    let compatibility = serde_json::json!([{
+        "stores": ["steam"],
+        "game_versions": ["1.6.*"],
+        "asset": asset,
+    }]);
+    let sources = serde_json::json!([{
+        "strategy": "manual_link",
+        "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/30379",
+    }]);
+    conn.execute(
+        "INSERT INTO game_catalog_items
+         (id, game, name, content_type, download_strategy, source_identifier,
+          download_sources_json, game_compatibility_json)
+         VALUES (?1, 'skyrim-se', ?2, 'mod', 'manual_link',
+                 'https://www.nexusmods.com/skyrimspecialedition/mods/30379', ?3, ?4)",
+        rusqlite::params![id, name, sources.to_string(), compatibility.to_string()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_download_matching_a_manual_link_asset_names_its_catalog_entry() {
+    let (_tmp, ctx) = test_ctx();
+    write_manual_link_catalog(&ctx, "skse", "SKSE64", "*-30379-*.7z");
+    let downloads = tempfile::tempdir().unwrap();
+    watch_folder(&ctx, downloads.path());
+    turn_on(&ctx);
+    let mut state = WatchState::start(&ctx).unwrap();
+
+    // Contents no game package recognises: the catalog entry's asset pattern decides.
+    create_7z(
+        &downloads.path().join("SKSE64-30379-2-3-1-1700000000.7z"),
+        &[("readme.txt", b"not game content")],
+    );
+
+    let added = scan_until_stable(&mut state, &ctx);
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert_eq!(added[0].game_id, "skyrim-se");
+    assert_eq!(added[0].kind, "manual download");
+    assert_eq!(added[0].catalog_item_id.as_deref(), Some("skse"));
+    assert_eq!(added[0].catalog_item_name.as_deref(), Some("SKSE64"));
+    assert!(added[0].reason.contains("SKSE64"), "{}", added[0].reason);
+}

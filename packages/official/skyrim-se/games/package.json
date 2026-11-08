@@ -72,7 +72,8 @@
         ]
       },
       "framework_ids": [
-        "skse"
+        "skse",
+        "address-library"
       ],
       "tool_ids": [
         "nemesis",
@@ -339,6 +340,20 @@
       "detection": {
         "marker": "skse64_loader.exe",
         "version": "pe_file_version"
+      }
+    },
+    {
+      "id": "address-library",
+      "game": "skyrim-se",
+      "name": "Address Library for SKSE Plugins",
+      "version": "1.7.104.0",
+      "supported_runtimes": [],
+      "required_frameworks": [],
+      "content": [],
+      "launch": null,
+      "detection": {
+        "marker": "Data/SKSE/Plugins/version*-*.bin",
+        "version": "file_name"
       }
     }
   ],

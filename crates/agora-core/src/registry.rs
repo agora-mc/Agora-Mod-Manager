@@ -96,8 +96,12 @@ pub struct DownloadSource {
 
 /// One curator pin on a `github_release` source: the expected SHA-256 of the
 /// asset `asset` in the release tagged `tag`.
+///
+/// A `manual_link` pin has no release tag; it names the exact file the player
+/// downloads from the page. `tag` is therefore empty for those pins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePin {
+    #[serde(default)]
     pub tag: String,
     pub asset: String,
     pub sha256: String,
@@ -738,9 +742,14 @@ pub struct GameCompatibility {
     pub game_versions: Vec<String>,
     #[serde(default)]
     pub requires: Vec<FrameworkRequirement>,
-    /// The release asset to pick. Present only for `github_release` entries.
+    /// The release asset to pick (`github_release`), or the file-name pattern a
+    /// player's download must match (`manual_link`).
     #[serde(default)]
     pub asset: Option<String>,
+    /// One short line shown to the player with a `manual_link` entry, such as
+    /// which file on the page to download.
+    #[serde(default)]
+    pub download_hint: Option<String>,
 }
 
 /// A framework an entry needs, with an optional minimum version.
@@ -771,6 +780,9 @@ pub struct GameCatalogItem {
     /// Ordered download sources, best first.
     pub download_sources: Vec<DownloadSource>,
     pub game_compatibility: Vec<GameCompatibility>,
+    /// The framework this entry installs, when it says so. Used to offer the
+    /// entry when another mod needs that framework.
+    pub provides_framework: Option<String>,
     pub description: Option<String>,
     pub license_id: Option<String>,
     pub page_url: Option<String>,
@@ -793,6 +805,33 @@ fn has_game_catalog(conn: &Connection) -> LauncherResult<bool> {
         code: "ERR_INVALID_QUERY".to_string(),
         message: format!("The catalog could not be read: {error}"),
     })
+}
+
+/// Whether `table` has `column`. Older registries are missing columns added
+/// after they were compiled, and an optional column must not make them unreadable.
+fn has_column(conn: &Connection, table: &str, column: &str) -> LauncherResult<bool> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_INVALID_QUERY".to_string(),
+            message: e.to_string(),
+        })?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_INVALID_QUERY".to_string(),
+            message: e.to_string(),
+        })?;
+    for name in names {
+        let name = name.map_err(|e| LauncherError::Generic {
+            code: "ERR_INVALID_QUERY".to_string(),
+            message: e.to_string(),
+        })?;
+        if name.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The catalog entries for `game`, by name. `"minecraft"` yields nothing here,
@@ -821,18 +860,27 @@ fn query_game_items(
     filter: &str,
     param: &str,
 ) -> LauncherResult<Vec<GameCatalogItem>> {
+    // A registry compiled before `provides_framework` existed is still readable:
+    // the column is optional data, and the name/id fallback still finds entries.
+    let has_provides = has_column(conn, "game_catalog_items", "provides_framework")?;
+    let provides_column = if has_provides {
+        "provides_framework, "
+    } else {
+        ""
+    };
     let mut stmt = conn
         .prepare(&format!(
             "SELECT id, game, name, author, content_type, download_strategy,
                     source_identifier, sha256, download_sources_json,
-                    game_compatibility_json, description, license_id, page_url,
-                    icon_url, status, date_added
+                    game_compatibility_json, {provides_column}description, license_id,
+                    page_url, icon_url, status, date_added
              FROM game_catalog_items WHERE {filter} ORDER BY name ASC, id ASC"
         ))
         .map_err(|e| LauncherError::Generic {
             code: "ERR_INVALID_QUERY".to_string(),
             message: e.to_string(),
         })?;
+    let description_index = if has_provides { 11 } else { 10 };
     let rows = stmt
         .query_map([param], |row| {
             Ok((
@@ -847,12 +895,13 @@ fn query_game_items(
                     sha256: row.get(7)?,
                     download_sources: Vec::new(),
                     game_compatibility: Vec::new(),
-                    description: row.get(10)?,
-                    license_id: row.get(11)?,
-                    page_url: row.get(12)?,
-                    icon_url: row.get(13)?,
-                    status: row.get(14)?,
-                    date_added: row.get(15)?,
+                    provides_framework: if has_provides { row.get(10)? } else { None },
+                    description: row.get(description_index)?,
+                    license_id: row.get(description_index + 1)?,
+                    page_url: row.get(description_index + 2)?,
+                    icon_url: row.get(description_index + 3)?,
+                    status: row.get(description_index + 4)?,
+                    date_added: row.get(description_index + 5)?,
                 },
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,

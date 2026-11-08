@@ -305,7 +305,7 @@ describe('GameBrowsePage', () => {
       const warning = await within(card).findByTestId('catalog-unmet-frameworks');
       expect(warning).toHaveTextContent('Skyrim Script Extender');
       expect(warning).toHaveTextContent('Address Library');
-      expect(within(warning).getAllByRole('button', { name: /^Go to / })).toHaveLength(1);
+      expect(within(warning).getAllByRole('button', { name: /^Get / })).toHaveLength(1);
     });
 
     it('the link clears the search and takes the user to the framework', async () => {
@@ -318,7 +318,7 @@ describe('GameBrowsePage', () => {
       fireEvent.change(search, { target: { value: 'unofficial' } });
       expect(screen.getAllByTestId('catalog-entry')).toHaveLength(1);
 
-      fireEvent.click(within(screen.getByTestId('catalog-unmet-frameworks')).getByRole('button', { name: 'Go to SKSE64' }));
+      fireEvent.click(within(screen.getByTestId('catalog-unmet-frameworks')).getByRole('button', { name: 'Get SKSE64' }));
       expect(search).toHaveValue('');
       const [framework] = screen.getAllByTestId('catalog-entry');
       await waitFor(() => expect(within(framework).getByRole('button', { name: 'Install' })).toHaveFocus());

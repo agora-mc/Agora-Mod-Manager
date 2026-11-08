@@ -17,6 +17,9 @@ export interface NewDownload {
   reason: string;
   /** A Nexus mod id the file name suggests. A label only; it decides nothing. */
   nexusModId: string | null;
+  /** The `manual_link` catalog entry this download's name matches, if any. */
+  catalogItemId: string | null;
+  catalogItemName: string | null;
   /** The store already holds these bytes, so the row is a note, not an offer. */
   alreadyInLibrary: boolean;
 }
@@ -38,6 +41,8 @@ function isNewDownload(value: unknown): value is NewDownload {
     && typeof row.kind === 'string'
     && typeof row.reason === 'string'
     && (row.nexusModId === null || typeof row.nexusModId === 'string')
+    && (row.catalogItemId === null || typeof row.catalogItemId === 'string')
+    && (row.catalogItemName === null || typeof row.catalogItemName === 'string')
     && typeof row.alreadyInLibrary === 'boolean'
   );
 }

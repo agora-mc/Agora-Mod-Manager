@@ -196,6 +196,11 @@ export function NewDownloadsSection({ gameId, onLibraryChanged }: NewDownloadsSe
                       )}
                     </p>
                     <p className="text-xs text-muted-foreground">{recognisedBecause(row.reason)}</p>
+                    {row.catalogItemName && (
+                      <p className="text-xs text-muted-foreground">
+                        Matches the catalog entry {row.catalogItemName}.
+                      </p>
+                    )}
                   </div>
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
@@ -207,7 +212,11 @@ export function NewDownloadsSection({ gameId, onLibraryChanged }: NewDownloadsSe
                     </Button>
                   ) : (
                     <Button size="sm" onClick={() => void add(row)} disabled={busy !== null}>
-                      {busy === row.sha256 ? 'Adding…' : 'Add to library'}
+                      {busy === row.sha256
+                        ? 'Adding…'
+                        : row.catalogItemName
+                          ? `Install ${row.catalogItemName}`
+                          : 'Add to library'}
                     </Button>
                   )}
                   <Button

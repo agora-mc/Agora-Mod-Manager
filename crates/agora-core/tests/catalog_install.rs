@@ -343,6 +343,29 @@ fn fixture(loader: Option<Vec<u8>>, frameworks: bool) -> Fixture {
     fixture_declaring(loader, declared)
 }
 
+/// A fixture whose game has the given root markers, as Skyrim does (`*.exe`, `*.dll`).
+fn fixture_with_root_markers(root_markers: Vec<String>) -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let mut definition = test_definition();
+    definition.framework_ids = Vec::new();
+    if let Some(layout) = definition.content_layout.as_mut() {
+        layout.root_markers = root_markers;
+    }
+    let registry = register(definition.clone(), Vec::new());
+    let ctx = Ctx::for_testing(tmp.path().join("app_data")).with_games(registry);
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(install_dir.join("Data")).unwrap();
+    std::fs::write(install_dir.join("Game.exe"), b"fake game binary").unwrap();
+    std::fs::write(install_dir.join("Data").join("Skyrim.bsa"), b"BSA DATA").unwrap();
+    Fixture {
+        _tmp: tmp,
+        ctx,
+        install_dir,
+        definition,
+    }
+}
+
 /// [`fixture`], with the game declaring exactly `declared`.
 fn fixture_declaring(loader: Option<Vec<u8>>, declared: Vec<FrameworkDefinition>) -> Fixture {
     let tmp = TempDir::new().unwrap();
@@ -461,6 +484,7 @@ fn compat(
         game_versions: versions.iter().map(|v| v.to_string()).collect(),
         requires,
         asset: asset.map(str::to_string),
+        download_hint: None,
     }
 }
 
@@ -491,6 +515,7 @@ fn entry(
         sha256: None,
         download_sources: sources,
         game_compatibility: compats,
+        provides_framework: None,
         description: None,
         license_id: Some("MIT".into()),
         page_url: None,
@@ -532,6 +557,8 @@ async fn run(
             install_anyway,
             allow_missing_frameworks: false,
             dry_run,
+            file: None,
+            confirm_no_checksum: false,
         },
         &mut |_: &CatalogPlan| {},
     )
@@ -556,6 +583,8 @@ async fn run_past_frameworks(
             install_anyway,
             allow_missing_frameworks: true,
             dry_run,
+            file: None,
+            confirm_no_checksum: false,
         },
         &mut |_: &CatalogPlan| {},
     )
@@ -2820,6 +2849,8 @@ async fn the_install_names_its_source_before_a_download_starts() {
             install_anyway: false,
             allow_missing_frameworks: false,
             dry_run: false,
+            file: None,
+            confirm_no_checksum: false,
         },
         &mut |plan: &CatalogPlan| {
             announced.push(format!(
@@ -2834,4 +2865,314 @@ async fn the_install_names_its_source_before_a_download_starts() {
     assert_eq!(announced.len(), 1);
     assert!(announced[0].contains("CrashLogger-1.zip"), "{announced:?}");
     assert!(announced[0].contains(REPO), "{announced:?}");
+}
+
+// ---------------------------------------------------------------------------
+// manual_link: the player downloads the file
+// ---------------------------------------------------------------------------
+
+const MANUAL_PAGE: &str = "https://www.example.com/mods/42";
+
+fn manual_entry(asset: &str, pins: Vec<SourcePin>) -> GameCatalogItem {
+    let mut item = entry(
+        "manual-mod",
+        "test-game",
+        vec![DownloadSource {
+            strategy: "manual_link".into(),
+            identifier: MANUAL_PAGE.into(),
+            pins,
+        }],
+        vec![compat(&["steam"], &["1.0.*"], Some(asset), vec![])],
+    );
+    item.name = "Manual Mod".into();
+    item.game_compatibility[0].download_hint = Some("Main file: Manual Mod".into());
+    item
+}
+
+async fn run_file(
+    fixture: &Fixture,
+    item: &GameCatalogItem,
+    instance_id: &str,
+    file: &std::path::Path,
+    install_anyway: bool,
+    confirm_no_checksum: bool,
+) -> LauncherResult<InstallReport> {
+    install(
+        &fixture.ctx,
+        &FakeTransport::silent(),
+        InstallRequest {
+            instance_id,
+            item,
+            install_anyway,
+            allow_missing_frameworks: false,
+            dry_run: false,
+            file: Some(file),
+            confirm_no_checksum,
+        },
+        &mut |_: &CatalogPlan| {},
+    )
+    .await
+}
+
+/// A player's download on disk, with the bytes of `plain_archive`.
+fn chosen_file(name: &str) -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join(name);
+    std::fs::write(&path, plain_archive()).unwrap();
+    (dir, path)
+}
+
+#[tokio::test]
+async fn a_manual_link_without_a_file_says_where_to_go_and_stores_nothing() {
+    let f = fixture(None, false);
+    let instance = f.instance("manual-no-file");
+    let report = run(
+        &f,
+        &FakeTransport::silent(),
+        &manual_entry("Manual-*-*.zip", vec![]),
+        &instance.instance_id,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    match &report.state {
+        InstallState::ManualDownload {
+            page_url,
+            asset,
+            hint,
+        } => {
+            assert_eq!(page_url, MANUAL_PAGE);
+            assert_eq!(asset, "Manual-*-*.zip");
+            assert_eq!(hint.as_deref(), Some("Main file: Manual Mod"));
+        }
+        other => panic!("expected a manual download, got {other:?}"),
+    }
+    assert!(f.content_items().is_empty(), "nothing is stored");
+}
+
+#[tokio::test]
+async fn a_matching_file_with_no_pin_asks_before_it_is_stored() {
+    let f = fixture(None, false);
+    let instance = f.instance("manual-ask");
+    let (_dir, file) = chosen_file("Manual-1.0-1700000000.zip");
+    let before = std::fs::read(&file).unwrap();
+
+    let report = run_file(
+        &f,
+        &manual_entry("Manual-*-*.zip", vec![]),
+        &instance.instance_id,
+        &file,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(report.state, InstallState::NeedsChecksum { .. }));
+    assert!(
+        f.content_items().is_empty(),
+        "nothing is stored before the answer"
+    );
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        before,
+        "the player's file is untouched"
+    );
+
+    let report = run_file(
+        &f,
+        &manual_entry("Manual-*-*.zip", vec![]),
+        &instance.instance_id,
+        &file,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    let InstallState::Placed { hash, .. } = &report.state else {
+        panic!("expected a placed install, got {:?}", report.state);
+    };
+    assert!(!hash.verified, "the page published no checksum");
+    assert!(hash.basis.contains("no checksum"), "{}", hash.basis);
+    assert!(hash.basis.contains("example.com"), "{}", hash.basis);
+    let items = f.content_items();
+    assert_eq!(items.len(), 1);
+    assert!(
+        items[0].sources.iter().any(|source| matches!(
+            source,
+            ContentSource::Catalog { item_id, release: None, asset, verified: false, .. }
+                if item_id == "manual-mod" && asset == "Manual-1.0-1700000000.zip"
+        )),
+        "the same catalog identity is recorded: {:?}",
+        items[0].sources
+    );
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        before,
+        "the file was copied, not moved"
+    );
+    assert_eq!(f.layer_count(&instance.instance_id), 1);
+}
+
+#[tokio::test]
+async fn a_wrong_file_name_is_a_question_and_install_anyway_takes_it() {
+    let f = fixture(None, false);
+    let instance = f.instance("manual-wrong-name");
+    let (_dir, file) = chosen_file("Something Else.zip");
+
+    let report = run_file(
+        &f,
+        &manual_entry("Manual-*-*.zip", vec![]),
+        &instance.instance_id,
+        &file,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    match &report.state {
+        InstallState::WrongFileName {
+            file_name, asset, ..
+        } => {
+            assert_eq!(file_name, "Something Else.zip");
+            assert_eq!(asset, "Manual-*-*.zip");
+        }
+        other => panic!("expected the wrong-name question, got {other:?}"),
+    }
+    assert!(
+        f.content_items().is_empty(),
+        "nothing is stored before the answer"
+    );
+
+    let report = run_file(
+        &f,
+        &manual_entry("Manual-*-*.zip", vec![]),
+        &instance.instance_id,
+        &file,
+        true,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(report.state, InstallState::Placed { .. }));
+}
+
+#[tokio::test]
+async fn a_curator_pin_is_checked_and_a_different_pin_stops_the_install() {
+    let f = fixture(None, false);
+    let instance = f.instance("manual-pin");
+    let (_dir, file) = chosen_file("Manual-1.0-1700000000.zip");
+    let bytes = std::fs::read(&file).unwrap();
+    let good = SourcePin {
+        tag: String::new(),
+        asset: "Manual-1.0-1700000000.zip".into(),
+        sha256: sha256_hex(&bytes),
+    };
+    let bad = SourcePin {
+        tag: String::new(),
+        asset: "Manual-1.0-1700000000.zip".into(),
+        sha256: "e".repeat(64),
+    };
+
+    let error = run_file(
+        &f,
+        &manual_entry("Manual-*-*.zip", vec![bad]),
+        &instance.instance_id,
+        &file,
+        false,
+        // A pin is present, so the no-checksum question is not asked; the pin is what decides.
+        false,
+    )
+    .await
+    .expect_err("a different pin must stop");
+    assert_eq!(error.code(), "ERR_HASH_CONFIRMATION_REQUIRED");
+
+    let report = run_file(
+        &f,
+        &manual_entry("Manual-*-*.zip", vec![good]),
+        &instance.instance_id,
+        &file,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let InstallState::Placed { hash, .. } = &report.state else {
+        panic!("expected a placed install, got {:?}", report.state);
+    };
+    assert!(hash.basis.contains("curator's pin"), "{}", hash.basis);
+}
+
+#[tokio::test]
+async fn a_manual_link_dry_run_names_the_page_without_touching_anything() {
+    let f = fixture(None, false);
+    let instance = f.instance("manual-dry");
+    let report = install(
+        &f.ctx,
+        &FakeTransport::silent(),
+        InstallRequest {
+            instance_id: &instance.instance_id,
+            item: &manual_entry("Manual-*-*.zip", vec![]),
+            install_anyway: false,
+            allow_missing_frameworks: false,
+            dry_run: true,
+            file: None,
+            confirm_no_checksum: false,
+        },
+        &mut |_: &CatalogPlan| {},
+    )
+    .await
+    .unwrap();
+    assert!(matches!(report.state, InstallState::DryRun));
+    assert_eq!(report.plan.source.page_url(), Some(MANUAL_PAGE));
+    assert!(f.content_items().is_empty());
+}
+
+#[tokio::test]
+async fn an_skse_shaped_archive_puts_the_loader_at_the_root_and_scripts_under_data() {
+    // SKSE's Nexus archive wraps everything in one top-level folder: the loader and its DLLs
+    // belong at the game root, and the Data folder's contents under Data. No SKSE special case.
+    let f = fixture_with_root_markers(vec!["*.exe".into(), "*.dll".into()]);
+    let instance = f.instance("skse-layout");
+    let bytes = zip_bytes(&[
+        ("SKSE64/skse64_loader.exe", b"loader".as_slice()),
+        ("SKSE64/skse64_1_6_1170.dll", b"dll".as_slice()),
+        ("SKSE64/Data/Scripts/Actor.pex", b"pex".as_slice()),
+    ]);
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("SKSE64-30379-2-3-1-1700000000.zip");
+    std::fs::write(&file, bytes).unwrap();
+
+    let report = run_file(
+        &f,
+        &manual_entry("*-30379-*.zip", vec![]),
+        &instance.instance_id,
+        &file,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    let InstallState::Placed { .. } = &report.state else {
+        panic!("expected a placed install, got {:?}", report.state);
+    };
+
+    // The wrapper folder is the item's source; mounting it at the game root is what puts the
+    // loader and DLLs beside SkyrimSE.exe and keeps Data/Scripts under Data.
+    let item = f.content_items().remove(0);
+    let layout = f.definition.content_layout.as_ref().unwrap();
+    match game_deploy::decide_placement(&item, layout) {
+        PlacementDecision::Place {
+            mount_path,
+            source_path,
+            reason,
+        } => {
+            assert!(
+                mount_path.is_empty(),
+                "mount_path was {mount_path}: {reason}"
+            );
+            assert_eq!(source_path.to_ascii_lowercase(), "skse64", "{reason}");
+        }
+        other => panic!("the SKSE shape was not placed: {other:?}"),
+    }
 }

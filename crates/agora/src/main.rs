@@ -917,6 +917,10 @@ enum CatalogCmd {
         /// stored.
         #[arg(long)]
         dry_run: bool,
+        /// The file you downloaded for a manual_link entry. Agora copies it into the content
+        /// store; it never moves, changes or deletes the file.
+        #[arg(long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -6316,6 +6320,7 @@ async fn run_command(
                     install_anyway,
                     allow_missing_frameworks,
                     dry_run,
+                    file,
                 } => {
                     let svc = RegistryService::new(ctx.clone());
                     let item = svc.get_game_item_for_install(&item_id)?.ok_or_else(|| {
@@ -6333,6 +6338,10 @@ async fn run_command(
                         install_anyway,
                         allow_missing_frameworks,
                         dry_run,
+                        file: file.as_deref(),
+                        // The command line has no dialog: the file was named on purpose, so the
+                        // report says the page published no checksum and records the hash.
+                        confirm_no_checksum: true,
                     };
                     let report = agora_core::catalog_install::install(
                         ctx,
@@ -6367,6 +6376,9 @@ async fn run_command(
                     if matches!(
                         report.state,
                         agora_core::catalog_install::InstallState::NeedsInstaller { .. }
+                            | agora_core::catalog_install::InstallState::ManualDownload { .. }
+                            | agora_core::catalog_install::InstallState::WrongFileName { .. }
+                            | agora_core::catalog_install::InstallState::NeedsChecksum { .. }
                     ) {
                         // Not installed, and not a failure of the install: a decision is needed
                         // (exit 71, docs/CLI.md), so a script can tell it did not install.
@@ -11188,6 +11200,7 @@ fn plan_size_text(source: &agora_core::catalog_install::PlannedSource) -> String
         PlannedSource::GithubRelease { size, .. } | PlannedSource::DirectHash { size, .. } => {
             size_text(*size)
         }
+        PlannedSource::ManualLink { .. } => "the file you download".to_string(),
     }
 }
 
@@ -11245,6 +11258,15 @@ fn print_catalog_report(report: &agora_core::catalog_install::InstallReport) {
         PlannedSource::DirectHash {
             file, url, size, ..
         } => println!("File: {file}, from {url}, {}.", size_text(*size)),
+        PlannedSource::ManualLink {
+            url, asset, hint, ..
+        } => {
+            println!("Page: {url}");
+            println!("File: one matching {asset}, which you download yourself.");
+            if let Some(hint) = hint {
+                println!("Hint: {hint}");
+            }
+        }
     }
     match &report.state {
         InstallState::DryRun => println!("Dry run: nothing was downloaded or stored."),
@@ -11297,6 +11319,48 @@ fn print_catalog_report(report: &agora_core::catalog_install::InstallReport) {
             for line in installer_guidance_lines(reason, content_item_id, installer_command) {
                 println!("{line}");
             }
+        }
+        InstallState::ManualDownload {
+            page_url,
+            asset,
+            hint,
+        } => {
+            println!("This mod is downloaded from {page_url}, by you.");
+            println!("Download a file matching {asset}, then run the same command with --file <path>.");
+            if let Some(hint) = hint {
+                println!("Hint: {hint}");
+            }
+            println!("Agora never downloads it, and never moves or changes the file you choose.");
+        }
+        InstallState::WrongFileName {
+            page_url,
+            asset,
+            file_name,
+            hint,
+        } => {
+            println!(
+                "The file '{file_name}' does not look like this entry's file: Agora expected a name like {asset}."
+            );
+            println!("Page: {page_url}");
+            if let Some(hint) = hint {
+                println!("Hint: {hint}");
+            }
+            println!("If it is the right file, run the same command again with --install-anyway.");
+        }
+        InstallState::NeedsChecksum {
+            page_url,
+            file_name,
+            hint,
+            ..
+        } => {
+            println!(
+                "No checksum: {page_url} publishes none Agora can read, so Agora could not check {file_name}."
+            );
+            if let Some(hint) = hint {
+                println!("Hint: {hint}");
+            }
+            println!("Only install a file you downloaded from the page above.");
+            println!("To install it anyway, run the same command again with --file and --install-anyway.");
         }
     }
 }

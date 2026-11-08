@@ -18,6 +18,8 @@ const mod = {
   kind: 'mod',
   reason: 'has fabric.mod.json',
   nexusModId: '32274',
+  catalogItemId: null,
+  catalogItemName: null,
   alreadyInLibrary: false,
 };
 
@@ -31,6 +33,8 @@ const already = {
   kind: 'game content',
   reason: '`Cool.esp` matches the game\'s content layout',
   nexusModId: null,
+  catalogItemId: null,
+  catalogItemName: null,
   alreadyInLibrary: true,
 };
 
@@ -93,6 +97,8 @@ describe('NewDownloadsSection', () => {
       kind: 'modpack',
       reason: 'has modrinth.index.json',
       nexusModId: null,
+      catalogItemId: null,
+      catalogItemName: null,
     };
     route([pack]);
     render(<NewDownloadsSection gameId="minecraft" />);

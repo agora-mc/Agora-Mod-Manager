@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
 
@@ -1982,6 +1983,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             sha256 TEXT,
             download_sources_json TEXT NOT NULL DEFAULT '[]',
             game_compatibility_json TEXT NOT NULL,
+            provides_framework TEXT,
             description TEXT,
             license_id TEXT,
             page_url TEXT,
@@ -2153,8 +2155,12 @@ def canonical_source_pins(item_id: str, strategy: str, raw: Any) -> list[dict[st
     """
     if raw is None:
         return []
-    if strategy != "github_release":
-        logger.error("%s: pins are only for github_release sources, not %s", item_id, strategy)
+    if strategy not in ("github_release", "manual_link"):
+        logger.error(
+            "%s: pins are only for github_release and manual_link sources, not %s",
+            item_id,
+            strategy,
+        )
         raise SystemExit(1)
     if not isinstance(raw, list):
         logger.error("%s: pins must be an array of {tag, asset, sha256} objects", item_id)
@@ -2166,13 +2172,22 @@ def canonical_source_pins(item_id: str, strategy: str, raw: Any) -> list[dict[st
         if not isinstance(pin, dict):
             logger.error("%s must be an object, got %r", where, pin)
             raise SystemExit(1)
-        unknown = sorted(str(key) for key in set(pin) - {"tag", "asset", "sha256"})
+        allowed = {"tag", "asset", "sha256"} if strategy == "github_release" else {
+            "asset",
+            "sha256",
+        }
+        unknown = sorted(str(key) for key in set(pin) - allowed)
         if unknown:
             logger.error("%s has unknown key(s): %s", where, ", ".join(unknown))
             raise SystemExit(1)
-        tag = pin.get("tag")
-        if not isinstance(tag, str) or not tag.strip():
+        # A GitHub release has a tag; a manual_link names its file, so its pin
+        # is the exact asset name and the hash, with no release tag.
+        tag = pin.get("tag", "")
+        if strategy == "github_release" and (not isinstance(tag, str) or not tag.strip()):
             logger.error("%s.tag must be a non-empty release tag", where)
+            raise SystemExit(1)
+        if not isinstance(tag, str):
+            logger.error("%s.tag must be a string", where)
             raise SystemExit(1)
         asset = pin.get("asset")
         if not isinstance(asset, str) or not asset.strip() or "/" in asset or "\\" in asset:
@@ -2187,7 +2202,10 @@ def canonical_source_pins(item_id: str, strategy: str, raw: Any) -> list[dict[st
             logger.error("%s repeats the pin for release %s, asset %s", where, key[0], key[1])
             raise SystemExit(1)
         seen.add(key)
-        pins.append({"tag": key[0], "asset": key[1], "sha256": sha.lower()})
+        if strategy == "github_release":
+            pins.append({"tag": key[0], "asset": key[1], "sha256": sha.lower()})
+        else:
+            pins.append({"asset": key[1], "sha256": sha.lower()})
     return pins
 
 
@@ -2246,6 +2264,13 @@ def validate_download_strategy(item: dict[str, Any]) -> str:
     """
     item_id = item.get("id", "<unknown>")
     strategy = item.get("download_strategy")
+    if strategy == "manual_link":
+        logger.error(
+            "%s: download_strategy manual_link is only for entries for other games; a Minecraft "
+            "entry downloads its file itself",
+            item_id,
+        )
+        raise SystemExit(1)
     if strategy not in VALID_DOWNLOAD_STRATEGIES:
         logger.error(
             "%s: download_strategy must be one of %s, got %r",
@@ -2264,6 +2289,31 @@ def validate_download_strategy(item: dict[str, Any]) -> str:
         item.get("compatible_versions"),
     )
     return strategy
+
+
+def _validate_manual_link_url(item_id: str, source: str) -> None:
+    """A manual_link identifier is the https page the player downloads from.
+
+    It is not a file URL: it names a page, so the file-name rule that pinned
+    sources obey does not apply. Plain ``http://`` is refused because the page
+    is opened in the player's browser and must not be downgraded.
+    """
+    parsed = urlparse(source)
+    if parsed.scheme != "https" or not parsed.netloc:
+        reason = "must be an https:// URL" if parsed.scheme != "http" else (
+            "must be https://, not http://"
+        )
+        logger.error(
+            "%s: manual_link source_identifier %s, got %r", item_id, reason, source
+        )
+        raise SystemExit(1)
+    if any(ch.isspace() for ch in source):
+        logger.error(
+            "%s: manual_link source_identifier must not contain spaces, got %r",
+            item_id,
+            source,
+        )
+        raise SystemExit(1)
 
 
 def _validate_pinned_url(item_id: str, strategy: str, source: str) -> None:
@@ -2460,6 +2510,13 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
                 )
                 raise SystemExit(1)
             strategy = entry.get("strategy")
+            if strategy == "manual_link":
+                logger.error(
+                    "%s: download_sources strategy manual_link is only for entries for other "
+                    "games; a Minecraft entry downloads its file itself",
+                    item_id,
+                )
+                raise SystemExit(1)
             if strategy not in VALID_DOWNLOAD_STRATEGIES:
                 logger.error(
                     "%s: download_sources strategy must be one of %s, got %r",
@@ -2566,7 +2623,9 @@ MINECRAFT_GAME = "minecraft"
 
 # Strategies an entry for another game may use. The Minecraft-only strategies
 # (modrinth_id, technic_pack, curated_pack, provider_pack) do not apply.
-OTHER_GAME_STRATEGIES = frozenset({"github_release", "direct_hash"})
+# manual_link is the player-downloads-it-themselves strategy: the entry links
+# to the page and names the file pattern Agora recognises.
+OTHER_GAME_STRATEGIES = frozenset({"github_release", "direct_hash", "manual_link"})
 
 # Fields that only mean something for Minecraft. An entry for another game
 # states its compatibility in game_compatibility instead. modrinth_id is
@@ -2592,8 +2651,9 @@ GAME_PACKAGE_GLOBS = (
 _GAME_VERSION_RE = re.compile(r"(?:[0-9]+|\*)(?:\.(?:[0-9]+|\*))*")
 _NUMERIC_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
 _OWNER_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+")
-_GAME_COMPAT_KEYS = frozenset({"stores", "game_versions", "requires", "asset"})
+_GAME_COMPAT_KEYS = frozenset({"stores", "game_versions", "requires", "asset", "download_hint"})
 _GAME_REQUIRE_KEYS = frozenset({"framework", "min_version"})
+_MAX_DOWNLOAD_HINT = 200
 
 
 @dataclass(frozen=True)
@@ -2738,6 +2798,13 @@ def check_game_scope(
             )
     if item.get("content_type") != "mod":
         raise SystemExit(f'{path}: an entry for {game} must have content_type "mod"')
+    provides = item.get("provides_framework")
+    if provides is not None:
+        if not isinstance(provides, str) or provides not in decl.frameworks:
+            raise SystemExit(
+                f'{path}: "provides_framework" names {provides!r}, which {decl.id} does not '
+                f"declare (declared: {', '.join(sorted(decl.frameworks)) or 'none'})"
+            )
     validate_optional_sha256(item.get("sha256"), str(path))
     item["_manifest_path"] = str(path)
     # Strategies first, so a Modrinth or unknown strategy is named as such
@@ -2758,13 +2825,16 @@ def _validate_game_compatibility(path: Path, item: dict[str, Any], decl: GameDec
         raw_sources = [{"strategy": item.get("download_strategy")}]
     if not isinstance(raw_sources, list):
         raise SystemExit(f"{path}: download_sources must be an array")
-    # An asset picks one file out of a GitHub release, so any GitHub source
-    # needs it. A direct_hash mirror serves the same bytes and names its file
-    # in the URL, so it never takes one.
-    needs_asset = any(
-        isinstance(source, dict) and source.get("strategy") == "github_release"
+    # An asset picks one file out of a GitHub release, or names the file a
+    # matching manual_link download must look like, so either source needs it.
+    # A direct_hash mirror serves the same bytes and names its file in the URL,
+    # so it never takes one.
+    strategy_names = {
+        str(source.get("strategy"))
         for source in raw_sources
-    )
+        if isinstance(source, dict)
+    }
+    needs_asset = bool(strategy_names & {"github_release", "manual_link"})
 
     for index, entry in enumerate(entries):
         label = f"{where}[{index}]"
@@ -2822,14 +2892,32 @@ def _validate_game_compatibility(path: Path, item: dict[str, Any], decl: GameDec
             asset = entry.get("asset")
             if not isinstance(asset, str) or not asset.strip() or "/" in asset or "\\" in asset:
                 raise SystemExit(
-                    f"{label}.asset is required for github_release: the release asset to pick, "
-                    "such as CrashLogger-*.7z"
+                    f"{label}.asset is required for github_release or manual_link: the release "
+                    "asset to pick, or the file-name pattern a download must match, such as "
+                    "CrashLogger-*.7z"
                 )
         elif "asset" in entry:
             raise SystemExit(
-                f"{label}.asset is only for github_release; a direct_hash entry names its file "
-                "in the URL"
+                f"{label}.asset is only for github_release or manual_link; a direct_hash entry "
+                "names its file in the URL"
             )
+
+        # A manual_link page can tell the player which file to pick. The hint
+        # is one short line in the dialog, so it is kept short and single-line.
+        if "download_hint" in entry:
+            hint = entry.get("download_hint")
+            if not isinstance(hint, str) or not hint.strip():
+                raise SystemExit(f"{label}.download_hint must be a non-empty string")
+            if "\n" in hint or "\r" in hint or len(hint) > _MAX_DOWNLOAD_HINT:
+                raise SystemExit(
+                    f"{label}.download_hint must be one line of at most "
+                    f"{_MAX_DOWNLOAD_HINT} characters"
+                )
+            if "manual_link" not in strategy_names:
+                raise SystemExit(
+                    f"{label}.download_hint is only for manual_link; an automatic source "
+                    "picks the file itself"
+                )
 
 
 def _canonical_other_game_sources(item: dict[str, Any]) -> list[dict[str, str]]:
@@ -2861,6 +2949,8 @@ def _canonical_other_game_sources(item: dict[str, Any]) -> list[dict[str, str]]:
             raise SystemExit(f"{label}: download_sources entry {entry!r} has no identifier")
         if strategy == "direct_hash":
             _validate_pinned_url(label, strategy, identifier)
+        elif strategy == "manual_link":
+            _validate_manual_link_url(label, identifier)
         elif not _OWNER_REPO_RE.fullmatch(identifier):
             raise SystemExit(f"{label}: github_release identifier must be owner/repo, got {identifier!r}")
         source: dict[str, Any] = {"strategy": strategy, "identifier": identifier}
@@ -2868,6 +2958,19 @@ def _canonical_other_game_sources(item: dict[str, Any]) -> list[dict[str, str]]:
         if pins:
             source["pins"] = pins
         sources.append(source)
+
+    # A manual_link is a fallback, not a source Agora can fetch from. It is
+    # allowed only last, after at least one automatic source, so the install
+    # never treats "ask the player to download it" as the primary answer.
+    manual_indexes = [
+        index for index, source in enumerate(sources) if source["strategy"] == "manual_link"
+    ]
+    if manual_indexes and manual_indexes != [len(sources) - 1]:
+        index = manual_indexes[0]
+        raise SystemExit(
+                f"{label}: download_sources[{index}].strategy is manual_link, which may only be "
+                "the last fallback, never before an automatic source"
+            )
 
     if item.get("download_sources") is not None:
         legacy_strategy = item.get("download_strategy")
@@ -3244,9 +3347,9 @@ def insert_game_catalog_item(conn: sqlite3.Connection, item: dict[str, Any], pat
         """
         INSERT INTO game_catalog_items (
             id, game, name, author, content_type, download_strategy, source_identifier,
-            sha256, download_sources_json, game_compatibility_json, description,
-            license_id, page_url, icon_url, status, date_added
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+            sha256, download_sources_json, game_compatibility_json, provides_framework,
+            description, license_id, page_url, icon_url, status, date_added
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
         """,
         (
             item["id"],
@@ -3259,6 +3362,7 @@ def insert_game_catalog_item(conn: sqlite3.Connection, item: dict[str, Any], pat
             sha256,
             json.dumps(download_sources, separators=(",", ":")),
             json.dumps(item["game_compatibility"], separators=(",", ":")),
+            item.get("provides_framework"),
             item.get("description"),
             item.get("license"),
             item.get("page_url"),

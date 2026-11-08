@@ -1528,6 +1528,31 @@ def _skyrim_direct_entry(item_id="skyrim-archive-mod", url="https://example.com/
     }
 
 
+def _skyrim_manual_entry(
+    item_id="address-library",
+    url="https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+):
+    return {
+        "id": item_id,
+        "name": "Address Library for SKSE Plugins",
+        "content_type": "mod",
+        "author": "meh321",
+        "license": "MIT",
+        "game": "skyrim-se",
+        "download_strategy": "manual_link",
+        "source_identifier": url,
+        "game_compatibility": [
+            {
+                "stores": ["steam", "gog"],
+                "game_versions": ["1.6.*"],
+                "requires": [{"framework": "skse", "min_version": "2.2.6"}],
+                "asset": "*-32444-*.zip",
+                "download_hint": "Main file: Address Library for SKSE Plugins",
+            }
+        ],
+    }
+
+
 def _minecraft_direct_entry(item_id="minecraft-pinned-mod"):
     return {
         "id": item_id,
@@ -1899,6 +1924,135 @@ class OtherGameEntryTests(unittest.TestCase):
         self.skyrim_entry_at(_skyrim_github_entry("shared-id"))
         message = self.assertRefused("Duplicate catalog id 'shared-id'", "shared-id.json")
         self.assertEqual(message.count("shared-id.json"), 2)
+
+
+class ManualLinkEntryTests(OtherGameEntryTests):
+    """Entries whose file the player downloads themselves. Minecraft keeps its
+    own strategies, so a manual_link page is for another game only."""
+
+    def test_a_valid_manual_link_entry_compiles_and_keeps_its_page_and_hint(self):
+        self.skyrim_entry_at(_skyrim_manual_entry())
+        out = self.compile()
+        row = self.game_rows(out)["address-library"]
+        self.assertEqual(row["download_strategy"], "manual_link")
+        self.assertEqual(
+            row["source_identifier"],
+            "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+        )
+        self.assertIsNone(row["sha256"])
+        compat = json.loads(row["game_compatibility_json"])
+        self.assertEqual(compat[0]["asset"], "*-32444-*.zip")
+        self.assertEqual(
+            compat[0]["download_hint"], "Main file: Address Library for SKSE Plugins"
+        )
+        self.assertEqual(
+            json.loads(row["download_sources_json"]),
+            [
+                {
+                    "strategy": "manual_link",
+                    "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+                }
+            ],
+        )
+
+    def test_a_manual_link_url_must_be_https_and_the_refusal_names_the_field(self):
+        entry = _skyrim_manual_entry(url="http://www.nexusmods.com/skyrimspecialedition/mods/32444")
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "source_identifier", "http://")
+
+    def test_a_manual_link_entry_needs_an_asset(self):
+        entry = _skyrim_manual_entry()
+        del entry["game_compatibility"][0]["asset"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "game_compatibility[0].asset", "required")
+
+    def test_a_manual_link_entry_may_carry_pins_without_a_release_tag(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+                "pins": [{"asset": "Address Library-32444-1.0-1700000000.zip", "sha256": "E" * 64}],
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual(
+            sources[0]["pins"],
+            [{"asset": "Address Library-32444-1.0-1700000000.zip", "sha256": "e" * 64}],
+        )
+
+    def test_a_manual_link_may_only_be_the_last_fallback(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            },
+            {"strategy": "github_release", "identifier": "example/address-library"},
+        ]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "download_sources[0]", "last fallback")
+
+    def test_a_manual_link_alone_is_the_entrys_only_source(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual([source["strategy"] for source in sources], ["manual_link"])
+
+    def test_a_manual_link_fallback_after_a_github_source_compiles(self):
+        entry = _skyrim_manual_entry()
+        entry["download_strategy"] = "github_release"
+        entry["source_identifier"] = "example/address-library"
+        entry["download_sources"] = [
+            {"strategy": "github_release", "identifier": "example/address-library"},
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            },
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual([source["strategy"] for source in sources], ["github_release", "manual_link"])
+
+    def test_minecraft_cannot_use_manual_link(self):
+        entry = _minecraft_direct_entry("manual-in-minecraft")
+        entry["download_strategy"] = "manual_link"
+        entry["source_identifier"] = "https://example.com/files/mod-page"
+        del entry["sha256"]
+        self.write("mods/manual-in-minecraft.json", entry)
+        self.assertRefused("manual-in-minecraft.json", "manual_link")
+
+    def test_a_download_hint_must_be_one_short_line(self):
+        for bad in ("", "line one\nline two", "x" * 201):
+            with self.subTest(hint=bad):
+                self.reset_registry()
+                entry = _skyrim_manual_entry()
+                entry["game_compatibility"][0]["download_hint"] = bad
+                self.skyrim_entry_at(entry)
+                self.assertRefused("address-library.json", "download_hint")
+
+    def test_provides_framework_is_stored_and_must_be_declared(self):
+        entry = _skyrim_manual_entry()
+        entry["provides_framework"] = "skse"
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        self.assertEqual(self.game_rows(out)["address-library"]["provides_framework"], "skse")
+
+        self.reset_registry()
+        bad = _skyrim_manual_entry("bad-provider")
+        bad["provides_framework"] = "nvse"
+        self.skyrim_entry_at(bad)
+        self.assertRefused("bad-provider.json", "provides_framework", "'nvse'")
 
 
 class RealSkyrimPackageEntryTests(unittest.TestCase):

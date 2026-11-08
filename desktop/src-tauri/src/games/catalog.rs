@@ -41,9 +41,11 @@ pub struct CatalogEntryDto {
     pub name: String,
     pub author: Option<String>,
     pub description: Option<String>,
-    /// `github_release` or `direct_hash`: where the file comes from.
+    /// `github_release`, `direct_hash` or `manual_link`: where the file comes from.
     pub download_strategy: String,
     pub status: String,
+    /// The page the player opens. For a `manual_link` entry this is its
+    /// source URL even when the manifest left `page_url` out.
     pub page_url: Option<String>,
     pub compatibility: Vec<CompatibilityDto>,
 }
@@ -54,8 +56,11 @@ pub struct CompatibilityDto {
     pub stores: Vec<String>,
     pub game_versions: Vec<String>,
     pub requires: Vec<RequirementDto>,
-    /// The release asset this entry picks, for a GitHub release.
+    /// The release asset this entry picks, or the file-name pattern a
+    /// manual download must match.
     pub asset: Option<String>,
+    /// One short line shown with a manual download, such as which file to pick.
+    pub download_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,7 +88,9 @@ impl CatalogEntryDto {
             description: item.description.clone(),
             download_strategy: item.download_strategy.clone(),
             status: item.status.clone(),
-            page_url: item.page_url.clone(),
+            page_url: item.page_url.clone().or_else(|| {
+                (item.download_strategy == "manual_link").then(|| item.source_identifier.clone())
+            }),
             compatibility: item
                 .game_compatibility
                 .iter()
@@ -108,6 +115,7 @@ impl CompatibilityDto {
                 })
                 .collect(),
             asset: compat.asset.clone(),
+            download_hint: compat.download_hint.clone(),
         }
     }
 }
@@ -173,6 +181,12 @@ pub struct CatalogInstallRequest {
     pub allow_missing_frameworks: bool,
     /// Plan only: nothing is downloaded or stored. An unmet framework is named, not refused.
     pub dry_run: bool,
+    /// The file the player chose for a `manual_link` entry, or `None`.
+    #[serde(default)]
+    pub file_path: Option<String>,
+    /// The player has seen the "no checksum" notice and chose to install anyway.
+    #[serde(default)]
+    pub confirm_no_checksum: bool,
 }
 
 /// What the install did, as a tagged reply the screen can read without parsing words.
@@ -183,6 +197,9 @@ pub enum CatalogInstallReply {
     AlreadyInstalled(AlreadyInstalledDto),
     Placed(PlacedDto),
     NeedsInstaller(NeedsInstallerDto),
+    ManualDownload(ManualDownloadDto),
+    WrongFileName(WrongFileNameDto),
+    NeedsChecksum(NeedsChecksumDto),
 }
 
 /// The plan: the file that would be fetched, and the checks made before it.
@@ -287,6 +304,42 @@ pub struct NeedsInstallerDto {
     pub top_level: Vec<String>,
 }
 
+/// A `manual_link` entry that needs the player's file. Nothing changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualDownloadDto {
+    pub item_id: String,
+    pub item_name: String,
+    pub page_url: String,
+    /// The file-name pattern the chosen file must match.
+    pub asset: String,
+    pub hint: Option<String>,
+}
+
+/// The chosen file's name does not match the entry's pattern. Nothing changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrongFileNameDto {
+    pub item_id: String,
+    pub item_name: String,
+    pub page_url: String,
+    pub asset: String,
+    pub file_name: String,
+    pub hint: Option<String>,
+}
+
+/// The page publishes no checksum Agora can read. Nothing changed until the player confirms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeedsChecksumDto {
+    pub item_id: String,
+    pub item_name: String,
+    pub page_url: String,
+    pub asset: String,
+    pub file_name: String,
+    pub hint: Option<String>,
+}
+
 /// Plan, and unless it is a dry run or already installed, fetch, check, store and place the entry.
 /// The download is the slow part; the screen shows a working state until it returns.
 #[tauri::command]
@@ -319,12 +372,15 @@ pub async fn games_catalog_install(
             clients: &ctx.http_clients,
             auth: GitHubAuth::default(),
         };
+        let file = request.file_path.as_deref().map(std::path::Path::new);
         let core_request = InstallRequest {
             instance_id: &request.instance_id,
             item: &item,
             install_anyway: request.install_anyway,
             allow_missing_frameworks: request.allow_missing_frameworks,
             dry_run: request.dry_run,
+            file,
+            confirm_no_checksum: request.confirm_no_checksum,
         };
         // The install is async (it may download). It runs to completion on this blocking thread
         // through the runtime's handle: its future borrows a non-`Send` callback, which a command
@@ -383,6 +439,43 @@ impl From<&InstallReport> for CatalogInstallReply {
                 hash: HashDto::from(hash),
                 reason: reason.clone(),
                 top_level: top_level.clone(),
+            }),
+            InstallState::ManualDownload {
+                page_url,
+                asset,
+                hint,
+            } => CatalogInstallReply::ManualDownload(ManualDownloadDto {
+                item_id: report.plan.item_id.clone(),
+                item_name: report.plan.item_name.clone(),
+                page_url: page_url.clone(),
+                asset: asset.clone(),
+                hint: hint.clone(),
+            }),
+            InstallState::WrongFileName {
+                page_url,
+                asset,
+                file_name,
+                hint,
+            } => CatalogInstallReply::WrongFileName(WrongFileNameDto {
+                item_id: report.plan.item_id.clone(),
+                item_name: report.plan.item_name.clone(),
+                page_url: page_url.clone(),
+                asset: asset.clone(),
+                file_name: file_name.clone(),
+                hint: hint.clone(),
+            }),
+            InstallState::NeedsChecksum {
+                page_url,
+                asset,
+                file_name,
+                hint,
+            } => CatalogInstallReply::NeedsChecksum(NeedsChecksumDto {
+                item_id: report.plan.item_id.clone(),
+                item_name: report.plan.item_name.clone(),
+                page_url: page_url.clone(),
+                asset: asset.clone(),
+                file_name: file_name.clone(),
+                hint: hint.clone(),
             }),
         }
     }
@@ -460,6 +553,7 @@ impl From<&HashReport> for HashDto {
 fn source_size(source: &PlannedSource) -> Option<u64> {
     match source {
         PlannedSource::GithubRelease { size, .. } | PlannedSource::DirectHash { size, .. } => *size,
+        PlannedSource::ManualLink { .. } => None,
     }
 }
 

@@ -78,6 +78,11 @@ pub struct StoredDownload {
     /// The Nexus mod id a matching file name suggests. A label only: it decides nothing.
     #[serde(default)]
     pub nexus_mod_id: Option<String>,
+    /// The `manual_link` catalog entry this download's name matches, if any.
+    #[serde(default)]
+    pub catalog_item_id: Option<String>,
+    #[serde(default)]
+    pub catalog_item_name: Option<String>,
     pub found_at_unix_ms: i64,
 }
 
@@ -93,6 +98,10 @@ pub struct DownloadRow {
     pub kind: String,
     pub reason: String,
     pub nexus_mod_id: Option<String>,
+    /// The `manual_link` catalog entry this download's name matches, if any. The Library names it
+    /// in the offer ("Install SKSE"); it is never installed on its own.
+    pub catalog_item_id: Option<String>,
+    pub catalog_item_name: Option<String>,
     /// The store already holds these bytes, so the row is a note, not an offer.
     pub already_in_library: bool,
 }
@@ -119,6 +128,16 @@ pub struct ClassifiedDownload {
     pub kind: String,
     pub reason: String,
     pub add: DownloadAdd,
+    /// A `manual_link` catalog entry whose `asset` pattern matches this file's name.
+    pub catalog_item: Option<CatalogDownloadMatch>,
+}
+
+/// The catalog entry a download's name matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogDownloadMatch {
+    pub item_id: String,
+    pub item_name: String,
+    pub game_id: String,
 }
 
 /// One file a one-off scan (the CLI) would offer.
@@ -133,6 +152,8 @@ pub struct ScannedDownload {
     pub kind: String,
     pub reason: String,
     pub nexus_mod_id: Option<String>,
+    pub catalog_item_id: Option<String>,
+    pub catalog_item_name: Option<String>,
     pub already_in_library: bool,
 }
 
@@ -261,6 +282,14 @@ impl WatchState {
                 kind: classified.kind,
                 reason: classified.reason,
                 nexus_mod_id,
+                catalog_item_id: classified
+                    .catalog_item
+                    .as_ref()
+                    .map(|item| item.item_id.clone()),
+                catalog_item_name: classified
+                    .catalog_item
+                    .as_ref()
+                    .map(|item| item.item_name.clone()),
                 found_at_unix_ms: content_store::now_unix_ms(),
             };
             // One file has one notice: replace any older row for the same path (including
@@ -306,15 +335,70 @@ pub fn classify_path(ctx: &Ctx, path: &Path) -> Result<Option<ClassifiedDownload
             continue;
         };
         if let Some(recognition) = package.recognize_download(&game.id, file_name, &entries) {
+            let catalog_item = manual_link_match(ctx, game.id.as_str(), file_name);
             return Ok(Some(ClassifiedDownload {
                 game_id: game.id.as_str().to_string(),
                 kind: recognition.kind,
                 reason: recognition.reason,
                 add: recognition.add,
+                catalog_item,
+            }));
+        }
+    }
+
+    // A manual_link entry names the file it expects by its `asset` pattern. That is a stronger
+    // identification than the game's content layout, so a download no package recognises by its
+    // contents is still offered when a catalog entry's pattern matches its name.
+    for game in ctx.games.games() {
+        if !enabled.contains(game.id.as_str()) {
+            continue;
+        }
+        if let Some(catalog_item) = manual_link_match(ctx, game.id.as_str(), file_name) {
+            return Ok(Some(ClassifiedDownload {
+                game_id: game.id.as_str().to_string(),
+                kind: "manual download".into(),
+                reason: format!(
+                    "Its name matches the catalog entry {}.",
+                    catalog_item.item_name
+                ),
+                add: DownloadAdd::Archive,
+                catalog_item: Some(catalog_item),
             }));
         }
     }
     Ok(None)
+}
+
+/// The `manual_link` catalog entry, for `game`, whose file-name pattern matches `file_name`.
+/// A registry that is missing or unreadable simply matches nothing: the watcher must keep working
+/// offline, and the file's contents still identify it.
+fn manual_link_match(ctx: &Ctx, game: &str, file_name: &str) -> Option<CatalogDownloadMatch> {
+    let entries = crate::registry::RegistryService::new(ctx.clone())
+        .list_game_items(game)
+        .ok()?;
+    let lower = file_name.to_ascii_lowercase();
+    for entry in entries {
+        let is_manual = entry
+            .download_sources
+            .iter()
+            .any(|source| source.strategy == "manual_link");
+        if !is_manual {
+            continue;
+        }
+        let matches = entry.game_compatibility.iter().any(|compat| {
+            compat.asset.as_deref().is_some_and(|asset| {
+                agora_game_api::glob_match(&asset.to_ascii_lowercase(), &lower)
+            })
+        });
+        if matches {
+            return Some(CatalogDownloadMatch {
+                item_id: entry.id,
+                item_name: entry.name,
+                game_id: game.to_string(),
+            });
+        }
+    }
+    None
 }
 
 /// A declarative game package's recognition, from its declared content layout. This is generic:
@@ -426,6 +510,8 @@ pub fn list(ctx: &Ctx) -> Result<Vec<DownloadRow>, DownloadsError> {
             kind: notice.kind,
             reason: notice.reason,
             nexus_mod_id: notice.nexus_mod_id,
+            catalog_item_id: notice.catalog_item_id,
+            catalog_item_name: notice.catalog_item_name,
             already_in_library,
         });
     }
@@ -466,6 +552,20 @@ pub fn add(ctx: &Ctx, sha256: &str) -> Result<AddDownloadOutcome, DownloadsError
     let Some(classified) = classify_path(ctx, &path)? else {
         return Err(DownloadsError::Changed(notice.path));
     };
+
+    // A file whose name matches a manual_link entry is stored as that catalog entry, so the
+    // Library shows the entry and "updates unknown". The offer itself was never automatic.
+    if let Some(catalog_id) = notice.catalog_item_id.as_deref() {
+        let verified = crate::registry::RegistryService::new(ctx.clone())
+            .get_game_item_for_install(catalog_id);
+        if let Ok(Some(item)) = verified {
+            let (item_id, _hash) = crate::catalog_install::import_manual_file(ctx, &item, &path)
+                .map_err(DownloadsError::Settings)?;
+            notices.retain(|stored| stored.sha256 != notice.sha256);
+            save_notices(ctx, &notices)?;
+            return Ok(AddDownloadOutcome::Added { item_id });
+        }
+    }
 
     let name = path
         .file_stem()
@@ -548,6 +648,14 @@ pub fn scan_folder_now(ctx: &Ctx, folder: &Path) -> Result<Vec<ScannedDownload>,
             kind: classified.kind,
             reason: classified.reason,
             nexus_mod_id: nexus_mod_id(&entry.name),
+            catalog_item_id: classified
+                .catalog_item
+                .as_ref()
+                .map(|item| item.item_id.clone()),
+            catalog_item_name: classified
+                .catalog_item
+                .as_ref()
+                .map(|item| item.item_name.clone()),
             already_in_library,
         });
     }

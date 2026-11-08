@@ -180,6 +180,40 @@ const catalogPlan = {
   warnings: [],
 };
 
+const manualEntry = {
+  id: 'address-library',
+  name: 'Address Library for SKSE Plugins',
+  author: 'meh321',
+  description: 'Version files for SKSE plugins.',
+  downloadStrategy: 'manual_link',
+  status: 'active',
+  pageUrl: 'https://www.nexusmods.com/skyrimspecialedition/mods/32444',
+  compatibility: [
+    {
+      stores: ['steam'],
+      gameVersions: ['1.6.1170'],
+      requires: [],
+      asset: '*-32444-*.zip',
+      downloadHint: 'Main file: All in one (1.6.x)',
+    },
+  ],
+};
+
+const manualPlan = {
+  itemId: 'address-library',
+  itemName: 'Address Library for SKSE Plugins',
+  instanceId: 'inst-1',
+  source: 'the page at https://www.nexusmods.com/skyrimspecialedition/mods/32444',
+  fileName: 'Address Library-32444-1.6.1170-1700000000.zip',
+  release: null,
+  size: 1024,
+  frameworks: [],
+  unmetFrameworks: [],
+  warnings: [],
+};
+
+const DOWNLOADED_FILE = 'D:/Downloads/Address Library-32444-1.6.1170-1700000000.zip';
+
 const verifiedHash = {
   sha256: 'ab'.repeat(32),
   verified: true,
@@ -398,6 +432,112 @@ test.describe('Browse curated items', () => {
     await expect(page.getByTestId('catalog-hash')).toContainText('GitHub published this SHA-256');
   });
 
+  test('downloads a manual_link file itself: chooses it, sees no checksum, then installs', async ({ page }) => {
+    await boot(
+      page,
+      [
+        {
+          command: 'games_catalog_install',
+          match: { confirmNoChecksum: false },
+          reply: {
+            state: 'needs_checksum',
+            itemId: manualEntry.id,
+            itemName: manualEntry.name,
+            pageUrl: manualEntry.pageUrl,
+            asset: '*-32444-*.zip',
+            fileName: 'Address Library-32444-1.6.1170-1700000000.zip',
+            hint: 'Main file: All in one (1.6.x)',
+          },
+        },
+        {
+          command: 'games_catalog_install',
+          match: { confirmNoChecksum: true },
+          reply: {
+            state: 'placed',
+            ...manualPlan,
+            contentItemId: 'content-manual',
+            mountPath: 'Data/SKSE/Plugins',
+            storedSize: 1024,
+            hash: unverifiedHash,
+          },
+        },
+      ],
+      {
+        games_catalog_list: { entries: [manualEntry], instances: [{ instanceId: 'inst-1', name: 'Skyrim Main' }] },
+        pick_open_file: DOWNLOADED_FILE,
+      },
+    );
+
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
+    const row = page.getByTestId('catalog-entry');
+    await expect(row).toContainText('Address Library for SKSE Plugins');
+    await row.getByRole('button', { name: 'Get from www.nexusmods.com' }).click();
+
+    const dialog = page.getByTestId('manual-download-dialog');
+    await expect(dialog).toContainText('Download Address Library for SKSE Plugins yourself');
+    await expect(dialog).toContainText('which Agora doesn');
+    await expect(dialog).toContainText('Main file: All in one (1.6.x)');
+    await page.screenshot({ path: '.shots/manual-download-dialog.png' });
+
+    await dialog.getByRole('button', { name: 'Choose downloaded file…' }).click();
+    const notice = page.getByTestId('manual-no-checksum');
+    await expect(notice).toContainText("doesn't publish a checksum");
+    await page.screenshot({ path: '.shots/manual-no-checksum.png' });
+
+    await dialog.getByRole('button', { name: 'Install', exact: true }).click();
+    await expect(page.getByTestId('manual-installed')).toContainText('Installed Address Library for SKSE Plugins.');
+  });
+
+  test('a manually chosen file with the wrong name asks first, and installs anyway when told', async ({ page }) => {
+    await boot(
+      page,
+      [
+        {
+          command: 'games_catalog_install',
+          match: { confirmNoChecksum: false },
+          reply: {
+            state: 'wrong_file_name',
+            itemId: manualEntry.id,
+            itemName: manualEntry.name,
+            pageUrl: manualEntry.pageUrl,
+            asset: '*-32444-*.zip',
+            fileName: 'Something Else.zip',
+            hint: null,
+          },
+        },
+        {
+          command: 'games_catalog_install',
+          match: { installAnyway: true },
+          reply: {
+            state: 'placed',
+            ...manualPlan,
+            fileName: 'Something Else.zip',
+            contentItemId: 'content-manual',
+            mountPath: 'Data',
+            storedSize: 1024,
+            hash: unverifiedHash,
+          },
+        },
+      ],
+      {
+        games_catalog_list: { entries: [manualEntry], instances: [{ instanceId: 'inst-1', name: 'Skyrim Main' }] },
+        pick_open_file: 'D:/Downloads/Something Else.zip',
+      },
+    );
+
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
+    await page.getByRole('button', { name: 'Get from www.nexusmods.com' }).click();
+    await page.getByRole('button', { name: 'Choose downloaded file…' }).click();
+
+    const notice = page.getByTestId('manual-wrong-name');
+    await expect(notice).toContainText("This doesn't look like Address Library for SKSE Plugins's file.");
+    await expect(notice).toContainText('Agora expected a name like *-32444-*.zip.');
+    await page.screenshot({ path: '.shots/manual-wrong-name.png' });
+
+    await page.getByRole('button', { name: 'Install anyway' }).click();
+    await expect(page.getByTestId('manual-installed')).toContainText('Installed Address Library for SKSE Plugins.');
+  });
+
   test('a missing framework stops the install, names it, and goes on only when asked', async ({ page }) => {
     const unmet = {
       framework: 'skse',
@@ -444,7 +584,7 @@ test.describe('Browse curated items', () => {
     await expect(warning).toContainText("It probably won't work until you add it.");
     await expect(row.getByTestId('catalog-placed')).toHaveCount(0);
 
-    await warning.getByRole('button', { name: 'Go to SKSE64' }).click();
+    await warning.getByRole('button', { name: 'Get SKSE64' }).click();
     await expect(page.getByTestId('catalog-entry').filter({ has: page.getByRole('heading', { name: 'SKSE64' }) }).getByRole('button', { name: 'Install', exact: true })).toBeFocused();
 
     await warning.getByRole('button', { name: 'Install anyway' }).click();

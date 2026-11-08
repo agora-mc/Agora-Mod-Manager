@@ -2129,6 +2129,9 @@ pub enum FrameworkVersionSource {
     /// The marker's PE `FileVersion` resource. Its leading zero component is dropped, so the
     /// `0.2.2.6` that SKSE's loader carries reads as `2.2.6`, the version its manifests use.
     PeFileVersion,
+    /// The marker file's name, whose dash-separated number groups are joined with dots. Address
+    /// Library's `versionlib-1-6-1170-0.bin` reads as `1.6.1170.0`.
+    FileName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
