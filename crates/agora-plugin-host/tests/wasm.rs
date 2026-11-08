@@ -4,8 +4,8 @@
 //! handed it, cannot see anything else, and is stopped when it misbehaves.
 
 use agora_plugin_api::host::{
-    path_matches_any, ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
-    StageBudget, StageLimits,
+    path_matches_any, validate_blob_key, ActivationRequest, GameReads, HostBridge, ScriptHost,
+    ScriptReadError, StageBudget, StageLimits, StoredBlobs,
 };
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
@@ -235,6 +235,62 @@ fn a_view_mount_sees_only_the_matching_files() {
     )
     .expect("the module runs");
     assert_eq!(value["stdoutText"], "LIST:a.esp,c.esp\n");
+}
+
+/// A plugin's blob store, with one blob.
+struct OneBlob;
+
+impl StoredBlobs for OneBlob {
+    fn plugin(&self) -> Option<&str> {
+        Some("acme.wasm-test")
+    }
+
+    fn stage(
+        &self,
+        key: &str,
+        destination: &Path,
+        limits: &StageLimits,
+        budget: &StageBudget,
+    ) -> Result<u64, ScriptReadError> {
+        validate_blob_key(key)
+            .map_err(|message| ScriptReadError::new("invalid_arguments", message))?;
+        if key != "notes.txt" {
+            return Err(ScriptReadError::new(
+                "not_found",
+                format!("there is no stored blob named `{key}`"),
+            ));
+        }
+        let bytes = b"stored bytes";
+        budget.spend(limits, bytes.len() as u64)?;
+        std::fs::write(destination, bytes)
+            .map_err(|error| ScriptReadError::new("staging_failed", error.to_string()))?;
+        Ok(bytes.len() as u64)
+    }
+}
+
+#[test]
+fn a_stored_mount_reaches_the_module() {
+    let fixture = fixture(&["fs_probe.wasm"]);
+    let host = activate(&fixture);
+    let value = host
+        .invoke_with_scopes(
+            &fixture.id,
+            "run",
+            serde_json::json!({
+                "module": "fs_probe.wasm",
+                "stdin": "read /input/notes.txt",
+                "mounts": [{ "guest": "/input", "stored": ["notes.txt"] }],
+            }),
+            Duration::from_secs(30),
+            None,
+            Some(Arc::new(OneBlob)),
+        )
+        .expect("the module runs");
+    assert_eq!(
+        value["stdoutText"],
+        "READ:stored bytes
+"
+    );
 }
 
 #[test]
