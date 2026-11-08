@@ -14,26 +14,34 @@ Do not treat a successful catalog release as proof that a desktop package was bu
 
 Skyrim SE is two official plugins (`packages/official/creation-engine/`, plugin id
 `agora.creation-engine`, and `packages/official/skyrim-se/`, plugin id `agora.skyrim-se`), not part
-of the app build. The workflow builds each folder separately, in any order. The `Official plugins` workflow
-([`.github/workflows/official-plugins.yml`](../.github/workflows/official-plugins.yml)) runs when
-`packages/official/**` or `registry/official-plugins/**` changes. It builds each package zip
-reproducibly, verifies that `registry/official-plugins/<plugin-id>.json` pins those exact bytes, and
-attaches the zip to the `official-<name>-v<version>` release. That release URL is the one the signed
-registry names, so the asset must be published before a catalog that lists it. The catalog compile
-now enforces this: it downloads every `package_url` in `registry/official-plugins/`. A missing,
-private or unreachable asset leaves that plugin entry out of the catalog and logs a warning (shown
-as a GitHub Actions `::warning::` annotation in the nightly run); the rest of the catalog still
-compiles. A package whose bytes do not match the pinned `size` or `sha256` is a hard failure,
-because that means the registry entry itself is wrong. Publishing the asset before the entry is
-still the order that gets the plugin into the catalog.
+of the app build. Like the desktop app, they are released by hand: the `Official plugins` workflow
+([`.github/workflows/official-plugins.yml`](../.github/workflows/official-plugins.yml)) runs when a
+tag `official-<name>-v<version>` is pushed (for example `official-skyrim-se-v0.1.0`), or when it is
+run by hand from the Actions tab with a package folder name. Merging a change to
+`packages/official/**` publishes nothing, so a half-finished update never reaches players. The
+workflow builds that one package zip reproducibly, verifies that
+`registry/official-plugins/<plugin-id>.json` pins those exact bytes, refuses a tag that does not
+match the package's version, and attaches the zip to the `official-<name>-v<version>` release. If
+that release already holds the same bytes it does nothing; if it holds different bytes it fails,
+because a published package is never replaced.
+
+That release URL is the one the signed registry names, so the asset must be published before a
+catalog that lists it. The catalog compile enforces this: it downloads every `package_url` in
+`registry/official-plugins/`. A missing, private or unreachable asset leaves that plugin entry out
+of the catalog and logs a warning (shown as a GitHub Actions `::warning::` annotation in the
+nightly run); the rest of the catalog still compiles. A package whose bytes do not match the pinned
+`size` or `sha256` is a hard failure, because that means the registry entry itself is wrong.
 
 To release a new plugin version:
 
 1. bump `version` in the package's `agora-plugin.json`;
 2. run `python scripts/build_official_plugin.py <name> --update-registry`, which rebuilds the zip,
    rotates the old `current` entry to `previous`, and rewrites the registry entry;
-3. commit both files. The workflow creates the new tag and uploads the asset; do not reuse a tag for
-   different bytes.
+3. commit both files and merge them to master;
+4. push the tag `official-<name>-v<version>` on that commit (or run the workflow by hand on
+   master). A plugin whose parent changed too, such as `skyrim-se` on top of `creation-engine`,
+   needs the parent released first;
+5. the next catalog compile (nightly, or run it by hand) lists the new version.
 
 `python scripts/build_official_plugin.py <name> --verify-registry` is the check to run before
 committing: it rebuilds the zip and refuses a registry entry whose hash, size or URL does not match.

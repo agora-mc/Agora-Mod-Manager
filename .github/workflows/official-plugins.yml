@@ -1,18 +1,22 @@
 name: Official plugins
 
-# Skyrim support ships as an official plugin, separately from the app. This
-# workflow builds the package zip reproducibly, checks that the signed-registry
-# entry pins exactly those bytes, and attaches the zip to a release tagged
-# `official-<name>-v<version>`. That is the URL the registry names.
+# Skyrim support ships as official plugins, separately from the app. Like the
+# desktop release, publishing is manual: push a tag `official-<name>-v<version>`
+# (for example `official-skyrim-se-v0.1.0`) on the commit to release, or run
+# this workflow by hand on a branch with the plugin name. It builds that one
+# package zip reproducibly, checks that the signed-registry entry pins exactly
+# those bytes, and attaches the zip to the release named by the tag. That is the
+# URL the registry names. A published asset is never replaced with different
+# bytes: a changed package needs a new version.
 on:
   push:
-    branches: [main, master]
-    paths:
-      - "packages/official/**"
-      - "registry/official-plugins/**"
-      - "scripts/build_official_plugin.py"
-      - ".github/workflows/official-plugins.yml"
+    tags:
+      - "official-*-v*"
   workflow_dispatch:
+    inputs:
+      plugin:
+        description: "Package folder under packages/official (e.g. skyrim-se, creation-engine)"
+        required: true
 
 permissions:
   contents: write
@@ -33,33 +37,65 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Build and verify every official plugin
+      - name: Work out which plugin to publish
+        id: pick
+        env:
+          INPUT_PLUGIN: ${{ inputs.plugin }}
         run: |
           set -euo pipefail
-          for folder in packages/official/*/; do
-            name="$(basename "$folder")"
-            python scripts/build_official_plugin.py "$name" \
-              --out dist/official-plugins --verify-registry >/dev/null
-          done
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            name="${GITHUB_REF_NAME#official-}"
+            name="${name%-v*}"
+          else
+            name="$INPUT_PLUGIN"
+          fi
+          if ! printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9-]*$' || [ ! -d "packages/official/$name" ]; then
+            echo "::error::'$name' is not a package folder under packages/official"
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
 
-      - name: Upload changed plugin versions
+      - name: Build and verify against the registry pin
+        env:
+          NAME: ${{ steps.pick.outputs.name }}
+        run: |
+          set -euo pipefail
+          python scripts/build_official_plugin.py "$NAME" \
+            --out dist/official-plugins --verify-registry > "$RUNNER_TEMP/plugin.json"
+          cat "$RUNNER_TEMP/plugin.json"
+          tag="$(jq -r .tag "$RUNNER_TEMP/plugin.json")"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the package version, which would be released as $tag"
+            exit 1
+          fi
+
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for folder in packages/official/*/; do
-            name="$(basename "$folder")"
-            python scripts/build_official_plugin.py "$name" \
-              --out dist/official-plugins > "$RUNNER_TEMP/$name.json"
-            tag="$(jq -r .tag "$RUNNER_TEMP/$name.json")"
-            version="$(jq -r .version "$RUNNER_TEMP/$name.json")"
-            zip="$(jq -r .zip "$RUNNER_TEMP/$name.json")"
-            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              gh release upload "$tag" "$zip" --repo "$GITHUB_REPOSITORY" --clobber
-            else
-              gh release create "$tag" "$zip" \
-                --repo "$GITHUB_REPOSITORY" \
-                --title "Official plugin: $name $version" \
-                --notes "Official Agora plugin package for $name, version $version."
+          tag="$(jq -r .tag "$RUNNER_TEMP/plugin.json")"
+          version="$(jq -r .version "$RUNNER_TEMP/plugin.json")"
+          name="$(jq -r .name "$RUNNER_TEMP/plugin.json")"
+          zip="$(jq -r .zip "$RUNNER_TEMP/plugin.json")"
+          sha="$(jq -r .sha256 "$RUNNER_TEMP/plugin.json")"
+          asset="$(basename "$zip")"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing="$RUNNER_TEMP/existing"
+            mkdir -p "$existing"
+            if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$existing" 2>/dev/null; then
+              if [ "$(sha256sum "$existing/$asset" | cut -d' ' -f1)" = "$sha" ]; then
+                echo "$tag already has these exact bytes; nothing to do."
+                exit 0
+              fi
+              echo "::error::$tag already holds a different $asset. Bump the version in the plugin manifest instead of replacing a published package."
+              exit 1
             fi
-          done
+            gh release upload "$tag" "$zip" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "$zip" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Official plugin: $name $version" \
+              --notes "Official Agora plugin package for $name, version $version."
+          fi
