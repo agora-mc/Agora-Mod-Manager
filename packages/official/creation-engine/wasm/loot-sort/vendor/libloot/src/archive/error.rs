@@ -1,0 +1,104 @@
+use std::{ops::Range, path::PathBuf};
+
+use crate::escape_ascii;
+
+#[derive(Debug)]
+pub(crate) struct ArchivePathParsingError {
+    path: PathBuf,
+    error: ArchiveParsingError,
+}
+
+impl ArchivePathParsingError {
+    pub(crate) fn new(path: PathBuf, error: ArchiveParsingError) -> Self {
+        Self { path, error }
+    }
+
+    pub(crate) fn from_io_error(path: PathBuf, error: std::io::Error) -> Self {
+        Self {
+            path,
+            error: ArchiveParsingError::IoError(error),
+        }
+    }
+}
+
+impl std::fmt::Display for ArchivePathParsingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to parse the archive at \"{}\"",
+            escape_ascii(&self.path)
+        )
+    }
+}
+
+impl std::error::Error for ArchivePathParsingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ArchiveParsingError {
+    IoError(std::io::Error),
+    UnsupportedHeaderVersion(u32),
+    UnsupportedHeaderArchiveType([u8; 4]),
+    UnsupportedArchiveTypeId([u8; 4]),
+    InvalidRecordsOffset(u32),
+    InvalidFolderNameLengthOffset(usize),
+    InvalidFolderNameRange(Range<usize>),
+    UsesBigEndianNumbers,
+    DirectoryNamesNotIncluded,
+    FileNamesNotIncluded,
+}
+
+impl std::fmt::Display for ArchiveParsingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IoError(_) => write!(f, "an I/O error occurred"),
+            Self::UnsupportedHeaderVersion(v) => write!(f, "unsupported archive version {v}"),
+            Self::UnsupportedHeaderArchiveType(a) => {
+                write!(f, "unsupported archive type {}", a.escape_ascii())
+            }
+            Self::UnsupportedArchiveTypeId(t) => {
+                write!(f, "unsupported archive type ID {}", t.escape_ascii())
+            }
+            Self::InvalidRecordsOffset(o) => write!(f, "invalid records offset {o}"),
+            Self::InvalidFolderNameLengthOffset(o) => {
+                write!(f, "invalid folder name length offset {o}")
+            }
+            Self::InvalidFolderNameRange(r) => {
+                write!(f, "invalid folder name range {:#x}..{:#x}", r.start, r.end)
+            }
+            Self::UsesBigEndianNumbers => {
+                write!(f, "archive uses big-endian numbers, which is unsupported")
+            }
+            Self::DirectoryNamesNotIncluded => {
+                write!(
+                    f,
+                    "archive does not include directory names, which is unsupported"
+                )
+            }
+            Self::FileNamesNotIncluded => {
+                write!(
+                    f,
+                    "archive does not include file names, which is unsupported"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ArchiveParsingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IoError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for ArchiveParsingError {
+    fn from(value: std::io::Error) -> Self {
+        ArchiveParsingError::IoError(value)
+    }
+}
