@@ -206,7 +206,7 @@ fn print_code_question(preview: &InstallPreview) {
     }
     match (preview.official, manifest.without_code.as_deref()) {
         (true, Some(text)) => {
-            println!("  Without its code, {name} will be missing features: {text}");
+            println!("  Without its code, {name} will be missing features. {text}");
         }
         (false, Some(text)) => {
             println!(

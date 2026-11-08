@@ -68,7 +68,7 @@ function CodeQuestion({
   let withoutItsCode = `Without its code, ${name} will be missing the features its code provides.`;
   if (missing) {
     withoutItsCode = official
-      ? `Without its code, ${name} will be missing features: ${missing}`
+      ? `Without its code, ${name} will be missing features. ${missing}`
       : `Without its code, ${name} will be missing features. The plugin says: “${missing}”`;
   }
   return (

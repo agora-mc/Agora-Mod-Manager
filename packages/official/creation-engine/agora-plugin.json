@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "description": "Shared rules for games built on Bethesda's Creation Engine.",
   "license": "GPL-3.0-only",
+  "source": "https://github.com/agora-mc/Agora-Mod-Manager/tree/master/packages/official/creation-engine",
   "apiRange": ">=0.1, <0.2",
   "entrypoint": "main.js",
   "withoutCode": "Sort, masterlist updates and the plugin list's checks won't work.",

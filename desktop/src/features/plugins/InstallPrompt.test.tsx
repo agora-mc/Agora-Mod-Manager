@@ -67,7 +67,7 @@ describe('the install prompt code question', () => {
       ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText('Without its code, One will be missing features: Sorting will not work.'),
+      screen.getByText('Without its code, One will be missing features. Sorting will not work.'),
     ).toBeInTheDocument();
     expect(screen.getByText('You can allow it later in Settings > Plugins.')).toBeInTheDocument();
     expect(
