@@ -14,7 +14,7 @@
 //! [`validate_launch_recipe`] before core runs anything.
 
 use agora_game_api::{GamePath, LaunchRecipe, LaunchValue, RelPath, UserDataLocation};
-use agora_plugin_api::host::{GameReads, ScriptReadError};
+use agora_plugin_api::host::{path_matches_any, GameReads, ScriptReadError};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead as _, Write};
 use std::path::{Path, PathBuf};
@@ -729,6 +729,137 @@ impl GameReads for GameViewReads {
             .collect();
         Ok(serde_json::json!({ "entries": entries, "cut": cut }))
     }
+
+    fn stage_view(
+        &self,
+        folder: &str,
+        patterns: &[String],
+        destination: &Path,
+    ) -> Result<u64, ScriptReadError> {
+        let folder = parse_game_path(folder)?;
+        let folder = folder.as_str().trim_matches('/');
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+
+        if let Some(entries) = &self.entries {
+            let folded_folder = agora_game_api::fold_path_case(folder);
+            let prefix = if folded_folder.is_empty() {
+                String::new()
+            } else {
+                format!("{folded_folder}/")
+            };
+            for (folded, entry) in entries {
+                let Some(rest) = folded.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if rest.is_empty() {
+                    continue;
+                }
+                let Some(relative) = relative_below(&entry.game_path, folder) else {
+                    continue;
+                };
+                // The chosen source is checked exactly as a read would check
+                // it, so a link put in the way is refused rather than staged.
+                let from_root = entry
+                    .source
+                    .strip_prefix(&entry.trusted_root)
+                    .unwrap_or(&entry.source);
+                reject_reparse_chain(
+                    &entry.trusted_root,
+                    &from_root.to_string_lossy().replace('\\', "/"),
+                )?;
+                candidates.push((relative, entry.source.clone()));
+            }
+        } else {
+            for root in &self.roots {
+                reject_reparse_chain(root, folder)?;
+                let base = folder
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .fold(root.clone(), |path, part| path.join(part));
+                walk_view(&base, "", 0, &mut candidates)?;
+            }
+        }
+
+        let mut staged = 0u64;
+        for (relative, source) in candidates {
+            // No patterns means the whole folder, which is the useful reading
+            // of `{ folder: "Data" }` with nothing else said.
+            if !patterns.is_empty() && !path_matches_any(patterns, &relative) {
+                continue;
+            }
+            if relative
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                continue;
+            }
+            let dest = relative
+                .split('/')
+                .fold(destination.to_path_buf(), |path, part| path.join(part));
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|_| {
+                    refusal("staging_failed", "could not create a folder for the module")
+                })?;
+            }
+            match std::fs::hard_link(&source, &dest) {
+                Ok(()) => {}
+                Err(_) => {
+                    std::fs::copy(&source, &dest).map_err(|_| {
+                        refusal("staging_failed", "could not stage a file for the module")
+                    })?;
+                }
+            }
+            staged += 1;
+        }
+        Ok(staged)
+    }
+}
+
+/// The part of `full` below `folder`, keeping the real spelling. `None` when
+/// the path names the folder itself or sits outside it.
+fn relative_below(full: &str, folder: &str) -> Option<String> {
+    let folder_parts = folder.split('/').filter(|part| !part.is_empty()).count();
+    let parts: Vec<&str> = full.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() <= folder_parts {
+        return None;
+    }
+    Some(parts[folder_parts..].join("/"))
+}
+
+/// Collect the ordinary files below `dir`, skipping reparse points, with paths
+/// relative to the staged folder.
+fn walk_view(
+    dir: &Path,
+    prefix: &str,
+    depth: usize,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), ScriptReadError> {
+    if depth > 64 {
+        return Ok(());
+    }
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in read_dir.flatten() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if is_reparse_point(&meta) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let relative = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if meta.is_dir() {
+            walk_view(&entry.path(), &relative, depth + 1, out)?;
+        } else if meta.is_file() {
+            out.push((relative, entry.path()));
+        }
+    }
+    Ok(())
 }
 
 /// The physical root a base's files come from, when the instance has one.
@@ -1958,5 +2089,26 @@ mod tests {
                 "write {path}"
             );
         }
+    }
+
+    #[test]
+    fn a_view_mount_stages_only_the_matching_files() {
+        let root = unique_root("stage-view");
+        write(&root.join("Data/a.esp"), b"a");
+        write(&root.join("Data/b.esm"), b"b");
+        write(&root.join("Data/nested/c.esp"), b"c");
+        let reads = reader(&root);
+        let destination = unique_root("stage-dest");
+
+        let staged = reads
+            .stage_view("Data", &["*.esp".to_string()], &destination)
+            .expect("the view stages");
+
+        assert_eq!(staged, 2);
+        assert!(destination.join("a.esp").exists());
+        assert!(destination.join("nested/c.esp").exists());
+        assert!(!destination.join("b.esm").exists());
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&destination).ok();
     }
 }

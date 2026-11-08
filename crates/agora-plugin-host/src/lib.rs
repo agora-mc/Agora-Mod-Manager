@@ -19,6 +19,7 @@
 mod modules;
 mod runtime;
 mod sdk;
+mod wasm;
 
 use agora_plugin_api::error::{PluginError, PluginErrorCode, PluginResult};
 use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReads};

@@ -201,6 +201,23 @@ Scripts run in QuickJS through `rquickjs 0.13`, with separate bounded runtimes o
 
 View and command calls have a ten-second host deadline. Diagnostic calls use their host deadline, and launch checks clamp the manifest timeout. Exceptions, timeouts, and allocation limits produce errors. These controls do not establish protection against native engine defects. Windows/MSVC was tested locally; other platform packaging remains an acceptance gate.
 
+### WebAssembly modules
+
+A plugin can ship a WebAssembly module and run it with `agora.wasm.run(module, options)`. A module is a WASI command: it reads a request from stdin and writes its answer to stdout. `module` is a path inside your package, so it is hash-pinned with the rest of the plugin.
+
+Running a module needs no capability. It gets a clock, randomness, stdin, stdout and stderr, and nothing else: no network, no environment variables, no arguments beyond the module name, and no writable folder. A module that traps or overruns its limits returns an error.
+
+`options.stdin` is a string or bytes. The result is `{ exitCode, stdout, stderr, stdoutText, stderrText }`. `stdout` and `stderr` are byte arrays; the `*Text` fields are the same bytes decoded as UTF-8.
+
+Mounts are read-only and staged into a temporary folder that is deleted afterwards:
+
+- `{ guest: "/data", view: { folder: "Data", patterns: ["*.esp"] } }` stages matching files from the current hook's instance view. It needs `game:read` and a hook bound to an instance, exactly like `game.readBytes`.
+- `{ guest: "/input", files: { "name.yaml": "..." } }` stages bytes your script supplies.
+
+Guest paths are absolute and cannot nest or repeat. `patterns` is a glob list; an empty list means every file below `folder`.
+
+A module gets 1 GiB of memory and 120 seconds unless you ask for less with `limits: { memoryBytes, timeoutMs }`. You cannot raise either limit. The engine is wasmtime, and its compile cache lives under the data root.
+
 ## Service API
 
 | SDK | Capability | Behavior |
@@ -221,6 +238,7 @@ View and command calls have a ten-second host deadline. Diagnostic calls use the
 | Crash packs | `crash:contribute` | Read the crash evidence Agora gives them and add rules to its diagnosis; every finding names the plugin |
 | `game.readBytes/readLines/list` | `game:read` | Scoped reads of one instance's merged view by game path, with a byte budget; a script never sees a real path |
 | `game.writeBytes/writeText` | `game:write` | Write into this plugin's own generated layer for one instance, with byte and file budgets; it cannot change the game, a save, or another layer |
+| `wasm.run` | No extra capability | Run a shipped WASI command in a sandbox; a view mount needs `game:read` |
 | `behaviours` in a game package | `game:define` | `detect_runtime`, `classify`, `recognize_download`, `load_order_rules`, `diagnostics`, `prepare_launch` and script load-order parsing/rendering, each time- and memory-limited by the plugin runtime |
 
 All service failures reject the promise with a structured error code and message. Treat errors as failures; never display a successful mutation after a rejection. The low-level `call` function exposes the same capability checks, not an escape hatch. There is no shell or arbitrary executable API. Current method definitions are in `agora-core/src/plugins/dispatch.rs`.

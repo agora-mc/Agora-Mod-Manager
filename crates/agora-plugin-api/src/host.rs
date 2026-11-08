@@ -13,7 +13,7 @@
 use crate::error::PluginResult;
 use crate::manifest::PluginId;
 use crate::protocol::{HostRequest, HostResponse, LogLevel, PluginEventEnvelope};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +44,9 @@ pub struct ActivationRequest {
     /// Directory the plugin's files live in. The script host must refuse any
     /// module specifier that resolves outside it.
     pub package_root: PathBuf,
+    /// Agora's data root. The host may put a WebAssembly compile cache and
+    /// short-lived staging folders here, and nowhere else.
+    pub data_root: PathBuf,
     /// Package-relative path to the bundled entrypoint.
     pub entrypoint: String,
     /// Ceiling for this plugin's runtime, in bytes.
@@ -119,6 +122,28 @@ pub trait GameReads: Send + Sync {
     /// The direct children of a game path. Directories are marked so a script
     /// can tell them apart without guessing from an extension.
     fn list(&self, path: &str) -> Result<serde_json::Value, ScriptReadError>;
+
+    /// Stage the files under `folder` that match `patterns` into
+    /// `destination`, preserving their paths below `folder`, and return how
+    /// many were staged.
+    ///
+    /// This exists only for the trusted WebAssembly host, which needs real
+    /// bytes to preopen read-only for a module. It resolves every source with
+    /// the same merged-view rules as [`GameReads::read_bytes`] and never
+    /// returns a source path to a script. The default refuses, so a scope that
+    /// has no merged view cannot stage one by accident.
+    fn stage_view(
+        &self,
+        folder: &str,
+        patterns: &[String],
+        destination: &Path,
+    ) -> Result<u64, ScriptReadError> {
+        let _ = (folder, patterns, destination);
+        Err(ScriptReadError::new(
+            "unsupported",
+            "this read scope cannot stage files for a module",
+        ))
+    }
 }
 
 /// Why a scoped read was refused. `code` is a stable token the script can
@@ -136,6 +161,51 @@ impl ScriptReadError {
             message: message.into(),
         }
     }
+}
+
+/// Whether `path` matches one of `patterns`, using the glob rules from
+/// MASTER_SPEC §30.12: `*` stays inside one folder, `**` crosses folders, `?`
+/// matches one non-separator character, and matching ignores case. A pattern
+/// with no `/` matches a file name at any depth; one with a `/` matches the
+/// whole relative path.
+pub fn path_matches_any(patterns: &[String], path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    patterns.iter().any(|pattern| {
+        if pattern.contains('/') {
+            glob_matches(pattern, path)
+        } else {
+            glob_matches(pattern, name)
+        }
+    })
+}
+
+/// Match one glob against one path, case-insensitively.
+pub fn glob_matches(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let path: Vec<char> = path.to_lowercase().chars().collect();
+    let mut table = vec![vec![false; path.len() + 1]; pattern.len() + 1];
+    table[0][0] = true;
+    for i in 1..=pattern.len() {
+        if pattern[i - 1] == '*' {
+            // A leading `*` can match an empty prefix; `**` behaves the same
+            // here because the row below is filled from the left.
+            table[i][0] = table[i - 1][0];
+        }
+    }
+    for i in 1..=pattern.len() {
+        for j in 1..=path.len() {
+            table[i][j] = match pattern[i - 1] {
+                '*' => {
+                    let double = i >= 2 && pattern[i - 2] == '*';
+                    let crosses = double || path[j - 1] != '/';
+                    table[i - 1][j] || (crosses && table[i][j - 1])
+                }
+                '?' => path[j - 1] != '/' && table[i - 1][j - 1],
+                other => other == path[j - 1] && table[i - 1][j - 1],
+            };
+        }
+    }
+    table[pattern.len()][path.len()]
 }
 
 /// A runtime that can load and run plugin code.

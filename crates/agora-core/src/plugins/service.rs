@@ -2152,6 +2152,7 @@ impl PluginService {
         let request = ActivationRequest {
             plugin_id: plugin_id.clone(),
             package_root: record.install_dir.clone(),
+            data_root: self.inner.ctx.paths.root().to_path_buf(),
             entrypoint: record.manifest.entrypoint.clone().unwrap_or_default(),
             memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,

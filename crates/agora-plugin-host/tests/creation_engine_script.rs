@@ -79,6 +79,7 @@ fn activate(host: &QuickJsHost, dir: &tempfile::TempDir, id: &PluginId) {
         ActivationRequest {
             plugin_id: id.clone(),
             package_root: dir.path().to_path_buf(),
+            data_root: dir.path().to_path_buf(),
             entrypoint: "main.js".into(),
             memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,

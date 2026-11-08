@@ -109,6 +109,7 @@ fn plugin(id: &str, files: &[(&str, &str)]) -> Fixture {
         request: ActivationRequest {
             plugin_id: PluginId::parse(id).unwrap(),
             package_root: dir.path().to_path_buf(),
+            data_root: dir.path().to_path_buf(),
             entrypoint: "main.js".into(),
             memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,
@@ -715,6 +716,7 @@ fn a_plugin_whose_entrypoint_is_missing_reports_a_package_problem() {
     let request = ActivationRequest {
         plugin_id: id("acme.absent"),
         package_root: dir.path().to_path_buf(),
+        data_root: dir.path().to_path_buf(),
         entrypoint: "main.js".into(),
         memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
         stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,
