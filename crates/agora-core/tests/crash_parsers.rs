@@ -47,6 +47,7 @@ fn start(script: &str, memory_limit_bytes: usize) -> Running {
         ActivationRequest {
             plugin_id: plugin_id(),
             package_root: dir.path().to_path_buf(),
+            data_root: dir.path().to_path_buf(),
             entrypoint: "index.js".into(),
             memory_limit_bytes,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,
