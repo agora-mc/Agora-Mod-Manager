@@ -25,8 +25,9 @@ use agora_core::game_registry::{
 use agora_game_api::{
     Condition, DeploymentStrategy, GameContext, GameDefinition, GameFuture, GameId, GamePackage,
     GamePath, InstallId, InstallKind, LaunchAlternative, LaunchRecipe, LoadOrderDefinition,
-    LoadOrderFormat, LoadOrderRule, LoadOrderRulesReply, LootRule, PackageDefinition, RelPath,
-    RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
+    LoadOrderFormat, LoadOrderRule, LoadOrderRulesReply, PackageDefinition, RelPath,
+    RuntimeIdentity, SorterNote, SorterReply, SorterRequest, SorterRule, StoreId, StoreIdentifier,
+    UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -41,6 +42,7 @@ struct Harness {
     install_dir: PathBuf,
     install: IdentifiedInstall,
     facts: Facts,
+    sorter: SorterReplySlot,
 }
 
 impl Drop for Harness {
@@ -61,7 +63,10 @@ type Facts = Arc<Mutex<HashMap<String, PluginFact>>>;
 struct TestPackage {
     definition: PackageDefinition,
     facts: Facts,
+    sorter: SorterReplySlot,
 }
+
+type SorterReplySlot = Arc<Mutex<Option<SorterReply>>>;
 
 impl GamePackage for TestPackage {
     fn definition(&self) -> &PackageDefinition {
@@ -114,6 +119,15 @@ impl GamePackage for TestPackage {
             }))
         })
     }
+
+    /// The test double answers the sorter hook with whatever a test put in the slot.
+    fn sort_load_order<'a>(
+        &'a self,
+        _request: SorterRequest,
+    ) -> GameFuture<'a, Option<SorterReply>> {
+        let sorter = self.sorter.clone();
+        Box::pin(async move { Ok(sorter.lock().unwrap().clone()) })
+    }
 }
 
 fn package_of(def: &GameDefinition) -> PackageDefinition {
@@ -153,10 +167,19 @@ fn plugin_rule() -> LoadOrderDefinition {
             entry: None,
             implicit: Vec::new(),
             implicit_list_file: None,
-            loot: None,
+            sorter: None,
         },
         intro: None,
         item_heading: None,
+    }
+}
+
+fn sorter_rule() -> SorterRule {
+    SorterRule {
+        hook: "sort".into(),
+        update: None,
+        update_label: None,
+        options: serde_json::Value::Null,
     }
 }
 
@@ -280,6 +303,7 @@ impl Harness {
         let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let facts: Facts = Arc::new(Mutex::new(HashMap::new()));
+        let sorter: SorterReplySlot = Arc::new(Mutex::new(None));
         let mut builder = GameRegistry::builder();
         builder
             .add(
@@ -289,6 +313,7 @@ impl Harness {
                 Arc::new(TestPackage {
                     definition: package_of(&def),
                     facts: facts.clone(),
+                    sorter: sorter.clone(),
                 }),
             )
             .expect("register test package");
@@ -303,6 +328,7 @@ impl Harness {
             install_dir,
             install,
             facts,
+            sorter,
         }
     }
 
@@ -345,6 +371,11 @@ impl Harness {
 
     fn deploy(&self, inst: &GameInstanceRecord) -> DeployOutcome {
         deploy(&self.ctx, &inst.instance_id, &self.def, DeployMode::Links).expect("deploy")
+    }
+
+    /// What the test double's sorter answers on the next call.
+    fn answer_sorting(&self, reply: SorterReply) {
+        *self.sorter.lock().unwrap() = Some(reply);
     }
 
     fn copy_path(&self, inst: &GameInstanceRecord) -> PathBuf {
@@ -892,6 +923,7 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
         Arc::new(TestPackage {
             definition: package_of(def),
             facts: Arc::new(Mutex::new(HashMap::new())),
+            sorter: Arc::new(Mutex::new(None)),
         }),
     )
 }
@@ -1614,107 +1646,193 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
 }
 
 #[test]
-fn a_corrupted_saved_masterlist_sorts_by_masters_and_says_so() {
+fn a_sorter_that_drops_an_item_is_refused() {
     let mut def = definition();
-    let rule = def.load_orders.first_mut().unwrap();
-    rule.rules.kind = "script".into();
-    rule.rules.loot = Some(LootRule {
-        masterlist_repo: "loot/skyrimse".into(),
-        prelude_repo: None,
-        branch: "v0.29".into(),
-        game_type: "SkyrimSE".into(),
-    });
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
     let h = Harness::with_definition(def);
-    let inst = h.instance("corrupt-masterlist");
+    let inst = h.instance("sorter-drops");
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
+    h.add(&inst, &item);
     h.deploy(&inst);
-    let dir = h.ctx.paths.root().join("loot").join("test-game");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("masterlist.yaml"),
-        b"plugins: [unclosed
-",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("masterlist.json"),
-        br#"{"fetched_at":"2026-01-01T00:00:00Z","source_url":"old","commit_sha":"old","blob_sha":"old"}"#,
-    )
-    .unwrap();
+
+    let before = h.plugin_names(&inst);
+    let mut order: Vec<String> = before.iter().map(|(name, ..)| name.clone()).collect();
+    order.pop();
+    h.answer_sorting(SorterReply {
+        order,
+        ..Default::default()
+    });
+
+    let error =
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::SorterOrder { .. }),
+        "{error}"
+    );
+    assert_eq!(h.plugin_names(&inst), before, "nothing was written");
+}
+
+#[test]
+fn a_sorter_that_adds_an_item_is_refused() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("sorter-adds");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let before = h.plugin_names(&inst);
+    let mut order: Vec<String> = before.iter().map(|(name, ..)| name.clone()).collect();
+    order.push("NotInstalled.esp".into());
+    h.answer_sorting(SorterReply {
+        order,
+        ..Default::default()
+    });
+
+    let error =
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::SorterOrder { .. }),
+        "{error}"
+    );
+    assert_eq!(h.plugin_names(&inst), before, "nothing was written");
+}
+
+#[test]
+fn a_sorter_cannot_move_a_locked_item() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("sorter-locked");
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    set_locked(&h.ctx, &inst.instance_id, &h.def, "B.esp", true).unwrap();
+
+    let before = h.plugin_names(&inst);
+    let order = vec![
+        "A.esp".to_string(),
+        "C.esp".to_string(),
+        "B.esp".to_string(),
+    ];
+    h.answer_sorting(SorterReply {
+        order,
+        ..Default::default()
+    });
 
     let (report, _order) =
-        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, true).unwrap();
-    assert_eq!(report.mode, SortMode::Masters);
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+    assert_eq!(report.mode, SortMode::Sorter);
+    assert!(report.moves.is_empty(), "{:?}", report.moves);
     assert_eq!(
-        report.message.as_deref(),
-        Some(game_load_order::CACHED_MASTERLIST_UNREADABLE)
+        h.plugin_names(&inst),
+        before,
+        "the locked item kept its place"
     );
 }
 
 #[test]
-fn loot_messages_appear_on_the_first_list_read_when_a_masterlist_is_saved() {
-    let mut def = engine_definition(&[]);
-    def.load_orders.first_mut().unwrap().rules.loot = Some(LootRule {
-        masterlist_repo: "loot/skyrimse".into(),
-        prelude_repo: None,
-        branch: "v0.29".into(),
-        game_type: "SkyrimSE".into(),
-    });
+fn a_sorter_order_is_applied_and_written() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
     let h = Harness::with_definition(def);
-    let inst = h.instance("loot-notes");
-    let item = h.item("notes", &[("Data/A.esp", &plugin_file(0, &[])[..])]);
+    let inst = h.instance("sorter-applies");
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
     h.add(&inst, &item);
     h.deploy(&inst);
-    let dir = h.ctx.paths.root().join("loot").join("test-game");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("masterlist.yaml"),
-        "plugins:
-  - name: 'A.esp'
-    msg:
-      - type: warn
-        content: '<script>alert(1)</script>'
-",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("masterlist.json"),
-        br#"{"fetched_at":"2026-01-01T00:00:00Z","source_url":"old","commit_sha":"old","blob_sha":"old"}"#,
-    )
-    .unwrap();
 
-    eprintln!(
-        "cached: {:?}",
-        agora_core::loot_masterlist::cached(&h.ctx, &h.def)
+    h.answer_sorting(SorterReply {
+        order: vec![
+            "C.esp".to_string(),
+            "B.esp".to_string(),
+            "A.esp".to_string(),
+        ],
+        notes: vec![SorterNote {
+            item: "C.esp".into(),
+            level: "warn".into(),
+            text: "this plugin is dirty".into(),
+        }],
+        general: vec![SorterNote {
+            item: String::new(),
+            level: "info".into(),
+            text: "the list is up to date".into(),
+        }],
+    });
+
+    let (report, order) =
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+    assert_eq!(report.mode, SortMode::Sorter);
+    assert!(report.written);
+    assert_eq!(
+        h.plugin_names(&inst)
+            .into_iter()
+            .map(|(name, ..)| name)
+            .collect::<Vec<_>>(),
+        ["C.esp", "B.esp", "A.esp"]
     );
+    assert!(order
+        .notes
+        .iter()
+        .any(|note| note.plugin == "C.esp" && note.message == "this plugin is dirty"));
+    assert!(order
+        .notes
+        .iter()
+        .any(|note| note.plugin.is_empty() && note.message == "the list is up to date"));
+}
+
+#[test]
+fn a_sorter_note_reaches_a_plain_list_read() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("sorter-notes");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    h.answer_sorting(SorterReply {
+        order: vec!["A.esp".to_string()],
+        notes: vec![SorterNote {
+            item: "A.esp".into(),
+            level: "error".into(),
+            text: "needs a patch".into(),
+        }],
+        ..Default::default()
+    });
+
     let order = game_load_order::order(&h.ctx, &inst.instance_id, &h.def).unwrap();
-    eprintln!("notes: {:?}", order.notes);
     let note = order
         .notes
         .iter()
         .find(|note| note.plugin == "A.esp")
-        .expect("the masterlist message is on the first read");
-    assert_eq!(note.message, "<script>alert(1)</script>");
-}
-
-#[test]
-fn with_no_masterlist_sort_says_it_used_masters_only() {
-    let mut def = definition();
-    let rule = def.load_orders.first_mut().unwrap();
-    rule.rules.kind = "script".into();
-    rule.rules.loot = Some(LootRule {
-        masterlist_repo: "loot/skyrimse".into(),
-        prelude_repo: None,
-        branch: "v0.29".into(),
-        game_type: "SkyrimSE".into(),
-    });
-    let h = Harness::with_definition(def);
-    let inst = h.instance("no-masterlist");
-    h.deploy(&inst);
-    let (report, _order) =
-        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, true).unwrap();
-    assert_eq!(report.mode, SortMode::Masters);
-    assert_eq!(
-        report.message.as_deref(),
-        Some(game_load_order::MASTERS_ONLY_MESSAGE)
-    );
+        .expect("the sorter's note is on the first read");
+    assert_eq!(note.level, agora_core::game_load_order::NoteLevel::Error);
+    assert_eq!(note.message, "needs a patch");
 }

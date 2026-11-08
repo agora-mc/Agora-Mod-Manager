@@ -155,6 +155,26 @@ pub trait GamePackage: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Sort a list through a plugin-provided sorter (MASTER_SPEC §30.13). `None` means the package
+    /// has no sorter for this list; core reports that rather than treating it as no change. Core
+    /// checks the reply before applying it.
+    fn sort_load_order<'a>(
+        &'a self,
+        _request: SorterRequest,
+    ) -> GameFuture<'a, Option<SorterReply>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Update what a sorter keeps, or report it, for the tab's status line and update button
+    /// (MASTER_SPEC §30.13). `update` false only reads the current status.
+    fn update_sorter<'a>(
+        &'a self,
+        _request: SorterRequest,
+        _update: bool,
+    ) -> GameFuture<'a, Option<SorterStatus>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Read a `script` load order file (MASTER_SPEC §30.12). `None` means the package does not
     /// implement the format; core reports that instead of treating the file as empty.
     fn parse_load_order<'a>(

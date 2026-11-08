@@ -791,7 +791,7 @@ enum InstancePluginsCmd {
         #[arg(long)]
         list: Option<String>,
     },
-    /// Download and verify LOOT's masterlist for the game, if one is not saved yet or it is stale.
+    /// Update what the list's sorter keeps, if the list declares an update hook.
     Masterlist {
         /// Instance ID.
         instance_id: String,
@@ -10876,7 +10876,11 @@ fn plugins_load_order_command(
                             println!("{message}");
                         }
                         for note in &order.notes {
-                            println!("LOOT: '{}': {}", note.plugin, note.message);
+                            if note.plugin.is_empty() {
+                                println!("Note: {}", note.message);
+                            } else {
+                                println!("Note for '{}': {}", note.plugin, note.message);
+                            }
                         }
                     }
                 }
@@ -10884,17 +10888,18 @@ fn plugins_load_order_command(
             }
         }
         InstancePluginsCmd::Masterlist { .. } => {
-            match agora_core::loot_masterlist::update_in(ctx, game_def, list_id.as_deref()) {
-                Ok(status) => {
+            match load_order::update_sorter(ctx, &instance_id, game_def, list_id.as_deref()) {
+                Ok(Some(status)) => {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&status)?);
                     } else {
-                        println!(
-                            "Masterlist updated from {} (commit {}).",
-                            status.source_url, status.commit_sha
-                        );
+                        println!("Updated at {}.", status.fetched_at);
                     }
                 }
+                Ok(None) => fail(
+                    "This list has no sorter with an update, so there is nothing to update."
+                        .to_string(),
+                ),
                 Err(e) => fail(e.to_string()),
             }
         }

@@ -70,10 +70,6 @@ roxmltree = "0.20"
 # LOOT's plugin header reader (GPL-3.0, the licence Agora itself uses). Header only: the
 # Creation Engine load order (MASTER_SPEC §26.6) takes masters and the master and light flags.
 
-# LOOT's load-order sort and masterlist parser (GPL-3.0-or-later; Agora is GPL-3.0-only and
-# GPL-3.0-or-later is compatible with it). Version 0.29.7 is the current Rust port.
-libloot = "0.29.7"
-
 # MicrosoftGame.config, read by Microsoft Store game discovery.
 quick-xml = "0.39"
 

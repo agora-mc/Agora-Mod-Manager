@@ -35,7 +35,8 @@ const view: PluginsView = {
   rulesKind: 'script',
   intro: null,
   itemHeading: null,
-  hasLoot: true,
+  hasSorterUpdate: true,
+  sorterUpdateLabel: 'Update masterlist',
   rulesApply: true,
   listExists: true,
   rows: [row],
@@ -82,7 +83,7 @@ describe('plugin commands', () => {
   });
 
   it('sends a sort as a dry run or for real, as it is asked', async () => {
-    invokeMock.mockResolvedValueOnce({ report: { moves: [], blocked: [], written: false, mode: 'loot', message: null }, plugins: view });
+    invokeMock.mockResolvedValueOnce({ report: { moves: [], blocked: [], written: false, mode: 'sorter', message: null }, plugins: view });
     await sortGamePlugins('inst-1', true);
     expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_sort', { instanceId: 'inst-1', dryRun: true, listId: null });
   });

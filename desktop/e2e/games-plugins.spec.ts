@@ -101,7 +101,8 @@ const listed = {
   rulesKind: 'script',
   intro: 'Read the list from the top down.',
   itemHeading: 'Plugin',
-  hasLoot: true,
+  hasSorterUpdate: true,
+  sorterUpdateLabel: 'Update masterlist',
   rulesApply: true,
   listExists: true,
   rows: [...alwaysLoaded, skyui, requiem],
@@ -227,7 +228,7 @@ test.describe('Plugins tab', () => {
       moves: [{ plugin: 'SkyUI.esp', from: 3, to: 4 }],
       blocked: [],
       written: true,
-      mode: 'loot',
+      mode: 'sorter',
       message: null,
     };
     await openPage(page, 'plugins', {
@@ -246,7 +247,7 @@ test.describe('Plugins tab', () => {
     await expect(page.getByRole('dialog')).toHaveCount(0);
   });
 
-  test('sorting with no masterlist asks before downloading it', async ({ page }) => {
+  test('sorting with nothing saved just previews and leaves the sorter to say so', async ({ page }) => {
     const noMaster = { ...listed, masterlist: null };
     await openPage(page, 'plugins', {
       games_plugins_list: noMaster,
@@ -255,23 +256,21 @@ test.describe('Plugins tab', () => {
           moves: [],
           blocked: [],
           written: false,
-          mode: 'masters',
-          message: "Sorted by masters only. Download LOOT's masterlist for a full sort.",
+          mode: 'sorter',
+          message: null,
         },
         plugins: noMaster,
       },
     });
 
     await page.getByRole('button', { name: 'Sort…' }).click();
-    const ask = page.getByRole('dialog', { name: "Download LOOT's masterlist?" });
-    await expect(ask).toBeVisible();
-    await ask.getByRole('button', { name: 'Sort by masters only' }).click();
     await expect(page.getByRole('dialog', { name: 'Sort plugins' })).toBeVisible();
+    await expect(page.getByRole('dialog', { name: /Download/ })).toHaveCount(0);
   });
 
   test('a list with no plugins yet says what to do', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasLoot: true, rulesApply: true, listExists: true, rows: [], findings: [], masterlist: null },
+      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasSorterUpdate: true, sorterUpdateLabel: 'Update masterlist', rulesApply: true, listExists: true, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText("No plugins are in this instance's list yet.")).toBeVisible();
@@ -280,7 +279,7 @@ test.describe('Plugins tab', () => {
 
   test('an instance with no list yet is told when one appears', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasLoot: true, rulesApply: true, listExists: false, rows: [], findings: [], masterlist: null },
+      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasSorterUpdate: true, sorterUpdateLabel: 'Update masterlist', rulesApply: true, listExists: false, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText('This instance has no plugin list yet.')).toBeVisible();
@@ -294,7 +293,8 @@ test.describe('Plugins tab', () => {
       rulesKind: 'none',
       intro: null,
       itemHeading: null,
-      hasLoot: false,
+      hasSorterUpdate: false,
+      sorterUpdateLabel: null,
       rulesApply: false,
       listExists: true,
       rows: [plugin({ position: 1, name: 'my_mod', managed: true, badges: [] })],
@@ -319,7 +319,7 @@ test.describe('Plugins tab', () => {
   test('a game with no load order lists has no load-order tab', async ({ page }) => {
     await openPage(page, 'plugins', {
       games_plugins_lists: { lists: [] },
-      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasLoot: false, rulesApply: false, listExists: false, rows: [], findings: [], masterlist: null },
+      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, listExists: false, rows: [], findings: [], masterlist: null },
     });
 
     const pages = page.getByRole('navigation', { name: 'Instance pages' });
@@ -330,7 +330,7 @@ test.describe('Plugins tab', () => {
 
   test('a game with no plugin list says so instead of showing an empty list', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasLoot: false, rulesApply: false, listExists: false, rows: [], findings: [], masterlist: null },
+      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, listExists: false, rows: [], findings: [], masterlist: null },
     });
 
     await expect(page.getByText('This game does not keep a plugin list')).toBeVisible();
@@ -366,7 +366,8 @@ test.describe('Plugins tab', () => {
       listId: 'redmods',
       listName: 'REDmods',
       rulesKind: 'none',
-      hasLoot: false,
+      hasSorterUpdate: false,
+      sorterUpdateLabel: null,
       rulesApply: false,
       rows: [plugin({ position: 1, name: 'my_mod', managed: true, badges: [] })],
     };

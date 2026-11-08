@@ -123,7 +123,7 @@ fn definition(plugin_list: u8) -> GameDefinition {
                 entry: None,
                 implicit: vec![],
                 implicit_list_file: None,
-                loot: None,
+                sorter: None,
             },
 
             intro: None,

@@ -232,7 +232,7 @@ Name your script's functions under `behaviours` in the package:
 | `diagnostics` | Launch checks | A list of problems |
 | `prepare_launch` | Launching a game with no `launch` | A launch recipe |
 
-Formats name their own functions: `parse` and `render`. Those are not in `behaviours`; the load order's `format` names them. A list's `rules.entry` names its rule function, and wins over `behaviours.load_order_rules`.
+Formats name their own functions: `parse` and `render`. Those are not in `behaviours`; the load order's `format` names them. A list's `rules.entry` names its rule function, and wins over `behaviours.load_order_rules`. A list's `rules.sorter.hook` names its sort function, and `rules.sorter.update` names the function behind the tab's update button; both are owned by the plugin that declared them, like every other behaviour.
 
 Every hook is called with one object, and its reply is JSON:
 
@@ -246,6 +246,8 @@ Every hook is called with one object, and its reply is JSON:
 | `prepare_launch` | `{ "context": GameContext }` | `LaunchRecipe`, or `null` |
 | `parse` | `{ "context": GameContext, "listId": string, "bytes": [number] }` | `[LoadOrderLine]`, or `null` |
 | `render` | `{ "context": GameContext, "listId": string, "lines": [LoadOrderLine] }` | a string, or `[number]` byte values |
+| `rules.sorter.hook` | `{ "context": GameContext, "listId": string, "options": any, "entries": [SorterEntry], "active": [string], "locked": [string], "implicit": [string] }` | `SorterReply`, or `null` |
+| `rules.sorter.update` | the same, plus `"update": boolean` | `SorterStatus`, or `null` |
 
 - `GameInstall` has `id`, `runtime`, `kind` (`base_game`, `add_on` or `tool`), `location`, `volume` and `capabilities`.
 - `RuntimeIdentity` has `game`, `store`, `version` and optional `build`.
@@ -255,6 +257,10 @@ Every hook is called with one object, and its reply is JSON:
 - `Diagnostic` has `code`, `message`, `severity` (`info`, `warning` or `error`) and `repairs`.
 - `LoadOrderRule` is the `before`, `requires` or `conflicts` object shown above.
 - `LoadOrderLine` has `name` and `active`.
+- `SorterEntry` has `name`, `active`, `locked`, `implicit` and `present`.
+- `SorterReply` has `order` (every present item's name, once, case-insensitively), `notes` and `general`.
+- A `SorterNote` has `item` (empty for the whole list), `level` (`error`, `warn` or `info`) and `text`.
+- `SorterStatus` has `fetchedAt` and `source`, the status line's words.
 
 **Null means "I have no opinion".** A throw is reported, never read as "nothing to say". Some hooks stop the action; a failed `diagnostics` becomes a warning finding, so the check is not shown as clean. A malformed reply counts as an error too. Hooks have time and memory limits. Names the script sees, like an item's, come from archives: treat them as untrusted.
 
@@ -453,11 +459,15 @@ selected runtime; `user_data` means a known user folder, resolved by Agora.
 | `entry` | string | optional | The function that returns rules for a `script` kind; absent uses `behaviours.load_order_rules` |
 | `implicit` | list of strings | optional | Plugins the game always loads first |
 | `implicit_list_file` | path | optional | A file naming more always-loaded plugins |
-| `loot` | object | optional | LOOT masterlist sources |
-| `masterlist_repo` | string | required for `loot` | The masterlist repository, as `owner/repo` |
-| `prelude_repo` | string | optional for `loot` | The shared prelude repository, as `owner/repo` |
-| `branch` | string | required for `loot` | The masterlist branch this libloot expects |
-| `game_type` | string | required for `loot` | The game name libloot knows, such as `SkyrimSE` |
+| `sorter` | object | optional | A plugin-provided sorter for this list |
+| `hook` | string | required for `sorter` | The function that returns a whole order |
+| `update` | string | optional for `sorter` | The function behind the tab's update button |
+| `update_label` | string | optional for `sorter` | The update button's label |
+| `options` | any | optional for `sorter` | Free data handed to both sorter hooks |
+| `masterlist_repo` | string | used by the Creation Engine sorter | The masterlist repository, as `owner/repo` |
+| `prelude_repo` | string | used by the Creation Engine sorter | The shared prelude repository, as `owner/repo` |
+| `branch` | string | used by the Creation Engine sorter | The masterlist branch to fetch |
+| `game_type` | string | used by the Creation Engine sorter | The game name the module knows, such as `SkyrimSE` |
 | `intro` | string | optional | A sentence shown above the list |
 | `item_heading` | string | optional | The column heading for an item's name; default `Name` |
 | `badges` | map of string to list of strings | optional | Short flags shown beside an item, in a rules reply |

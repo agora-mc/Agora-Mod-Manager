@@ -24,7 +24,8 @@ function view(overrides: Record<string, unknown> = {}) {
     rulesKind: 'script',
     intro: 'Read the list from the top down.',
     itemHeading: 'Plugin',
-    hasLoot: true,
+    hasSorterUpdate: true,
+    sorterUpdateLabel: 'Update masterlist',
     rulesApply: true,
     listExists: true,
     rows: [],
@@ -83,7 +84,8 @@ describe('load order lists', () => {
       rulesKind: 'none',
       intro: null,
       itemHeading: null,
-      hasLoot: false,
+      hasSorterUpdate: false,
+      sorterUpdateLabel: null,
       rulesApply: false,
       rows: [{ ...row, name: 'my_mod', badges: [] }],
     });
@@ -104,7 +106,7 @@ describe('load order lists', () => {
       ],
     });
     replies.games_plugins_list = (args) => args.listId === 'redmods'
-      ? view({ listId: 'redmods', listName: 'REDmods', rulesKind: 'none', hasLoot: false, rulesApply: false, rows: [{ ...row, name: 'my_mod' }] })
+      ? view({ listId: 'redmods', listName: 'REDmods', rulesKind: 'none', hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, rows: [{ ...row, name: 'my_mod' }] })
       : view({ rows: [row] });
 
     mountTab();

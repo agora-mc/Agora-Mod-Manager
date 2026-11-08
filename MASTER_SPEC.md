@@ -5017,7 +5017,7 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
   "file": "Plugins.txt",
   "items": { "folder": "Data", "patterns": ["*.esp"], "folders": false },
   "format": { "type": "lines", "active_prefix": "*", "header": [] },
-  "rules": { "kind": "creation_engine", "implicit": [], "implicit_list_file": null, "loot": null } }
+  "rules": { "kind": "creation_engine", "implicit": [], "implicit_list_file": null, "sorter": null } }
 ```
 
 - `format` is `lines` or `{ "type": "script", "parse": "fn", "render": "fn" }`, so an author can target a format Agora has never heard of.
@@ -5082,6 +5082,6 @@ A plugin script can run a WebAssembly module it ships, for work too slow or too 
   - a clock and randomness;
   - a memory cap and a time limit, with fuel or an epoch deadline, so a stuck module is stopped and reported.
 - **Mounts are read-only and staged.** A mount names files from the instance's merged view (a folder plus patterns), or bytes the script hands over. Agora hardlinks the view files into a fresh staging folder, falling back to copying, and preopens that folder read-only. It never preopens a real game, instance or layer folder. View mounts need `game:read` and are bound to the hook's instance, like `game.*`. The staging folder is deleted afterwards.
-- **The engine is wasmtime,** with trimmed features, plus its compile cache under the data root. It adds about 13 MB to the app. Interpreters were measured: wasmi took 9.4 s and Pulley 25 s on LOOT's job, against 2.4 s. Ahead-of-time compilation can't serve third-party modules.
+- **The engine is wasmtime,** with trimmed features, plus its compile cache under the data root. The CLI release binary measured +4.5 MiB on this branch (25,131,520 bytes, against 20,434,432 at the base): wasmtime added, and the native libloot that left core removed. Interpreters were measured: wasmi took 9.4 s and Pulley 25 s on LOOT's job, against 2.4 s. Ahead-of-time compilation can't serve third-party modules.
 - **A list can have a plugin-provided sorter.** `rules.sorter` names a hook that returns a whole order plus notes. Core checks that the order is a permutation of the list, and keeps locked and always-loaded items where they are. `rules.sorter.update` optionally names a hook behind an update button (LOOT's masterlist). With that, `rules.loot` and libloot leave core.
 - **Vendored patches** to a third-party library carry a comment saying they might be worth offering upstream, and are not offered without the owner's say.

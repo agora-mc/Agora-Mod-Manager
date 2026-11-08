@@ -3251,6 +3251,50 @@ class TestBuildLootWasm(unittest.TestCase):
                 hashlib.sha256(b"loot wasm").hexdigest(),
             )
 
+    def test_sources_document_lists_versions_checksums_licences_and_vendored_crates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = root / "crate"
+            crate.mkdir()
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "loot-sort"\n\n'
+                '[patch.crates-io]\nlibloot = { path = "vendor/libloot" }\n',
+                encoding="utf-8",
+            )
+            lock = root / "Cargo.lock"
+            lock.write_text(
+                'version = 4\n\n'
+                '[[package]]\nname = "loot-sort"\nversion = "0.1.0"\n\n'
+                '[[package]]\nname = "adler2"\nversion = "2.0.1"\n'
+                'checksum = "abc123"\n\n'
+                '[[package]]\nname = "libloot"\nversion = "0.29.7"\n',
+                encoding="utf-8",
+            )
+            registry = root / "registry" / "src" / "index.crates.io-test"
+            (registry / "adler2-2.0.1").mkdir(parents=True)
+            (registry / "adler2-2.0.1" / "Cargo.toml").write_text(
+                '[package]\nname = "adler2"\nversion = "2.0.1"\n'
+                'license = "0BSD OR MIT OR Apache-2.0"\n',
+                encoding="utf-8",
+            )
+            (crate / "vendor" / "libloot").mkdir(parents=True)
+            (crate / "vendor" / "libloot" / "Cargo.toml").write_text(
+                '[package]\nname = "libloot"\nversion = "0.29.7"\n'
+                'license = "GPL-3.0-or-later"\n',
+                encoding="utf-8",
+            )
+            document = build_loot_wasm.sources_document(
+                lockfile=lock,
+                manifest=crate / "Cargo.toml",
+                cargo_home=root,
+                crate_dir=crate,
+            )
+        self.assertIn("| `adler2` | 2.0.1 | `abc123` | 0BSD OR MIT OR Apache-2.0 |", document)
+        self.assertIn("https://crates.io/crates/adler2/2.0.1", document)
+        self.assertIn("| `libloot` | 0.29.7 | vendored | GPL-3.0-or-later |", document)
+        self.assertIn("patched sources in `vendor/libloot`", document)
+        self.assertNotIn("`loot-sort`", document)
+
 
 if __name__ == "__main__":
     unittest.main()
