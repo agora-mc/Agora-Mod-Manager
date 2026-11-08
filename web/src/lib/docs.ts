@@ -43,7 +43,7 @@ export const AUDIENCE_LABELS: Record<DocAudience, string> = {
   desktop: 'Desktop App Users',
   user: 'CLI Users',
   developer: 'For contributors and maintainers',
-  internal: 'Working notes and archive',
+  internal: 'Unsorted pages',
 };
 
 const EMPTY_DOCS: WebDocs = {

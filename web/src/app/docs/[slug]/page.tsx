@@ -56,11 +56,10 @@ export default async function DocPage({
 
       {doc.audience === 'internal' && (
         <p className="mb-6 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm leading-6 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
-          This is an engineering working note kept for audit. It records what was
-          planned or reviewed at a point in time and is not a description of
-          current behavior. For how Agora works today, read the{' '}
+          This page has not been sorted into the documentation yet, so it may be
+          out of date. For how Agora works today, read the{' '}
           <Link href="/docs/guides" className="font-semibold underline">
-            task guides
+            Help &amp; guide
           </Link>{' '}
           or the reference documentation.
         </p>

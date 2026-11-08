@@ -48,7 +48,7 @@ export default async function InstallPage() {
             See what Agora looks like first
           </Link>
           <Link href="/docs/guides" className="btn-ghost px-5 py-3">
-            Read the task guides
+            Read Help &amp; guide
           </Link>
         </div>
       </header>

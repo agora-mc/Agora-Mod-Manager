@@ -7,7 +7,7 @@ import { Callout } from '@/components/GuideBody';
 export const metadata = {
   title: 'Documentation - Agora',
   description:
-    'Find the right Agora documentation: install and first run, task guides, troubleshooting, CLI reference, and contributor references.',
+    'Find the right Agora documentation: install and first run, Help & guide, troubleshooting, CLI reference, and contributor references.',
 };
 
 const ROUTES = [
@@ -21,7 +21,7 @@ const ROUTES = [
     href: '/docs/guides',
     heading: 'I want step-by-step guides for everything',
     body: 'Step-by-step guides for common tasks, from installing mods to sharing instances.',
-    cta: 'Task guides',
+    cta: 'Help & guide',
   },
   {
     href: '/docs/desktop-troubleshooting',
@@ -57,7 +57,7 @@ const WAYS_TO_READ = [
   },
   {
     href: '/docs/guides',
-    title: 'Walk me through it (task guides)',
+    title: 'Walk me through it (Help & guide)',
     body: 'Numbered steps for a specific task, assuming no prior modding knowledge. Every guide has this version.',
   },
   // {
@@ -169,7 +169,7 @@ export default async function DocsPage() {
       <section>
         <h2 className="text-2xl font-bold">Common Questions</h2>
         <p className="mt-2 text-gray-600 dark:text-gray-300">
-          Links to the Task Guide section that answers it.
+          Links to the Help &amp; guide topic that answers it.
         </p>
         <ul className="mt-4 grid gap-2 sm:grid-cols-2">
           {COMMON_QUESTIONS.map((question) => (
@@ -187,7 +187,7 @@ export default async function DocsPage() {
           href="/docs/guides"
           className="mt-4 inline-flex font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
         >
-          All {guideCount} task guides
+          All {guideCount} guides
         </Link>
       </section>
 
