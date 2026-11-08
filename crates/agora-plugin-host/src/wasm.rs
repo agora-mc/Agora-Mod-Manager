@@ -9,7 +9,7 @@
 //! resolved by `GameReads` (the same merged view `game.readBytes` uses) and
 //! hardlinked into a staging folder that is deleted when the run ends.
 
-use agora_plugin_api::host::GameReads;
+use agora_plugin_api::host::{GameReads, StageBudget, StageLimits};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -133,6 +133,10 @@ struct RawLimits {
     memory_bytes: Option<u64>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    mount_bytes: Option<u64>,
+    #[serde(default)]
+    mount_files: Option<u64>,
 }
 
 enum Mount {
@@ -208,7 +212,10 @@ fn run_inner(
     })?;
     let stdin = options.stdin.map(RawBytes::into_bytes).unwrap_or_default();
     let mounts = validate_mounts(options.mounts, game_reads.as_ref())?;
-    let (memory_limit, timeout) = limits(options.limits)?;
+    let (memory_limit, timeout, stage_limits) = limits(options.limits)?;
+    // One allowance for every mount in this run. Its bytes stay inside the
+    // sandbox, so they are not charged to the script's `game:read` budget.
+    let stage_budget = StageBudget::default();
 
     let staging = StagingDir::create(data_root)?;
     let mut preopens = Vec::new();
@@ -217,6 +224,7 @@ fn run_inner(
         std::fs::create_dir_all(&host_dir).map_err(|e| {
             WasmError::new("staging_failed", format!("could not stage a mount: {e}"))
         })?;
+        let guest = mount.guest().to_string();
         match mount {
             Mount::View {
                 folder, patterns, ..
@@ -228,11 +236,14 @@ fn run_inner(
                     )
                 })?;
                 reads
-                    .stage_view(folder, patterns, &host_dir)
-                    .map_err(|error| WasmError::new("staging_failed", error.message))?;
+                    .stage_view(folder, patterns, &host_dir, &stage_limits, &stage_budget)
+                    .map_err(|error| mount_error(&guest, error))?;
             }
             Mount::Files { files, .. } => {
                 for (name, bytes) in files {
+                    stage_budget
+                        .spend(&stage_limits, bytes.len() as u64)
+                        .map_err(|error| mount_error(&guest, error))?;
                     let dest = name
                         .split('/')
                         .fold(host_dir.clone(), |path, part| path.join(part));
@@ -240,17 +251,20 @@ fn run_inner(
                         std::fs::create_dir_all(parent).map_err(|e| {
                             WasmError::new(
                                 "staging_failed",
-                                format!("could not stage `{name}`: {e}"),
+                                format!("mount `{guest}`: could not stage `{name}`: {e}"),
                             )
                         })?;
                     }
                     std::fs::write(&dest, bytes).map_err(|e| {
-                        WasmError::new("staging_failed", format!("could not stage `{name}`: {e}"))
+                        WasmError::new(
+                            "staging_failed",
+                            format!("mount `{guest}`: could not stage `{name}`: {e}"),
+                        )
                     })?;
                 }
             }
         }
-        preopens.push((host_dir, mount.guest().to_string()));
+        preopens.push((host_dir, guest));
     }
 
     let wasm = read_module(&module_path, module)?;
@@ -305,6 +319,14 @@ fn module_too_large(module: &str, bytes: u64) -> WasmError {
     WasmError::new(
         "module_too_large",
         format!("`{module}` is {bytes} bytes; a module may be at most {MAX_MODULE_BYTES}"),
+    )
+}
+
+/// A staging failure as the script sees it: it names the guest mount.
+fn mount_error(guest: &str, error: agora_plugin_api::host::ScriptReadError) -> WasmError {
+    WasmError::new(
+        "staging_failed",
+        format!("mount `{guest}`: {}", error.message),
     )
 }
 
@@ -570,10 +592,12 @@ fn start_ticker(engine: &Engine) {
     });
 }
 
-fn limits(raw: Option<RawLimits>) -> Result<(u64, Duration), WasmError> {
+fn limits(raw: Option<RawLimits>) -> Result<(u64, Duration, StageLimits), WasmError> {
     let raw = raw.unwrap_or(RawLimits {
         memory_bytes: None,
         timeout_ms: None,
+        mount_bytes: None,
+        mount_files: None,
     });
     let memory = raw.memory_bytes.unwrap_or(DEFAULT_MEMORY_LIMIT);
     if memory > DEFAULT_MEMORY_LIMIT {
@@ -604,7 +628,35 @@ fn limits(raw: Option<RawLimits>) -> Result<(u64, Duration), WasmError> {
             "a module needs a little time to run",
         ));
     }
-    Ok((memory, Duration::from_millis(timeout_ms)))
+    let defaults = StageLimits::default();
+    let mount_bytes = raw.mount_bytes.unwrap_or(defaults.max_bytes);
+    if mount_bytes > defaults.max_bytes {
+        return Err(WasmError::new(
+            "invalid_arguments",
+            format!(
+                "a script may lower the run's mount byte limit, not raise it above {} bytes",
+                defaults.max_bytes
+            ),
+        ));
+    }
+    let mount_files = raw.mount_files.unwrap_or(defaults.max_files);
+    if mount_files > defaults.max_files {
+        return Err(WasmError::new(
+            "invalid_arguments",
+            format!(
+                "a script may lower the run's mount file limit, not raise it above {}",
+                defaults.max_files
+            ),
+        ));
+    }
+    Ok((
+        memory,
+        Duration::from_millis(timeout_ms),
+        StageLimits {
+            max_bytes: mount_bytes,
+            max_files: mount_files,
+        },
+    ))
 }
 
 fn validate_mounts(

@@ -5,6 +5,7 @@
 
 use agora_plugin_api::host::{
     path_matches_any, ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
+    StageBudget, StageLimits,
 };
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
@@ -70,6 +71,8 @@ impl GameReads for ViewReads {
         folder: &str,
         patterns: &[String],
         destination: &Path,
+        limits: &StageLimits,
+        budget: &StageBudget,
     ) -> Result<u64, ScriptReadError> {
         let base = folder
             .split('/')
@@ -82,6 +85,10 @@ impl GameReads for ViewReads {
             if !patterns.is_empty() && !path_matches_any(patterns, &relative) {
                 continue;
             }
+            let size = std::fs::metadata(&source)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            budget.spend(limits, size)?;
             let dest = relative
                 .split('/')
                 .fold(destination.to_path_buf(), |path, part| path.join(part));
@@ -408,6 +415,8 @@ fn a_script_cannot_raise_the_limits() {
     for limits in [
         serde_json::json!({ "memoryBytes": 2_u64 * 1024 * 1024 * 1024 }),
         serde_json::json!({ "timeoutMs": 999_999 }),
+        serde_json::json!({ "mountBytes": 5_u64 * 1024 * 1024 * 1024 }),
+        serde_json::json!({ "mountFiles": 100_001 }),
     ] {
         let error = invoke(
             &host,
@@ -533,6 +542,59 @@ fn a_module_file_over_the_size_cap_is_refused() {
     assert!(
         error.message.contains("at most") || error.message.to_lowercase().contains("large"),
         "the error names the size cap: {}",
+        error.message
+    );
+}
+
+#[test]
+fn a_view_mount_over_its_cap_names_the_mount() {
+    let fixture = fixture(&["fs_probe.wasm"]);
+    // `stage` writes `a.esp` with five bytes of content.
+    let reads = stage(&fixture, "a.esp");
+    let host = activate(&fixture);
+    let error = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "fs_probe.wasm",
+            "stdin": "list /data",
+            "mounts": [{ "guest": "/data", "view": { "folder": "Data", "patterns": ["*.esp"] } }],
+            "limits": { "mountBytes": 4 },
+        }),
+        Some(reads),
+    )
+    .expect_err("a view mount over its cap is refused");
+    assert!(
+        error.message.contains("mount `/data`"),
+        "the error names the mount: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("more than"),
+        "the error says what cap was passed: {}",
+        error.message
+    );
+}
+
+#[test]
+fn a_files_mount_over_its_cap_names_the_mount() {
+    let fixture = fixture(&["fs_probe.wasm"]);
+    let host = activate(&fixture);
+    let error = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "fs_probe.wasm",
+            "stdin": "list /input",
+            "mounts": [{ "guest": "/input", "files": { "name.yaml": "hello" } }],
+            "limits": { "mountBytes": 4 },
+        }),
+        None,
+    )
+    .expect_err("a files mount over its cap is refused");
+    assert!(
+        error.message.contains("mount `/input`"),
+        "the error names the mount: {}",
         error.message
     );
 }
