@@ -1,0 +1,36 @@
+[package]
+name = "loot-sort"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "LOOT's plugin sort, built as a WASI module for the Creation Engine plugin."
+
+# This crate is deliberately not a member of the repository workspace: it is
+# built for wasm32-wasip1 by scripts/build_loot_wasm.py, with its own lockfile.
+[workspace]
+
+[dependencies]
+libloot = "=0.29.7"
+
+[dev-dependencies]
+crc32fast = "1"
+tempfile = "3"
+
+[patch.crates-io]
+libloot = { path = "vendor/libloot" }
+libloadorder = { path = "vendor/libloadorder" }
+
+[[bin]]
+name = "loot-sort"
+path = "src/main.rs"
+
+[lib]
+name = "loot_sort"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
