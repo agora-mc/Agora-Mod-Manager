@@ -45,7 +45,7 @@ export interface MasterlistView {
 export interface LoadOrderListRow {
   id: string;
   name: string;
-  /** `none`, `script` or `creation_engine`. */
+  /** `none` or `script`. */
   rulesKind: string;
 }
 
