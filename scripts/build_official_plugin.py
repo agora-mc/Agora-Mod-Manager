@@ -120,6 +120,9 @@ def zip_name(name: str, version: str) -> str:
     return f"{name}-{version}.zip"
 
 
+TEXT_SUFFIXES = {".json", ".js", ".mjs", ".md", ".txt", ".yaml", ".yml", ".toml"}
+
+
 def package_files(folder: Path) -> list[Path]:
     files: list[Path] = []
     for path in sorted(folder.rglob("*"), key=lambda p: p.relative_to(folder).as_posix()):
@@ -146,7 +149,16 @@ def build_zip(folder: Path, out_dir: Path, version: str) -> Path:
             info.external_attr = FIXED_MODE << 16
             info.internal_attr = 0
             info.extra = b""
-            archive.writestr(info, path.read_bytes())
+            data = path.read_bytes()
+            if path.suffix.lower() in TEXT_SUFFIXES and b"\r\n" in data:
+                # Git stores these files with LF line endings, and CI builds from that. A
+                # CRLF copy hashes differently, so its registry pin would fail everywhere else.
+                raise SystemExit(
+                    f"{path}: has Windows (CRLF) line endings, but official plugins are pinned "
+                    "with LF. Convert it to LF (for example `git add --renormalize .` then "
+                    "check the file out again) and rebuild."
+                )
+            archive.writestr(info, data)
     temporary.replace(destination)
     return destination
 

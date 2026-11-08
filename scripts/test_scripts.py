@@ -3026,6 +3026,14 @@ class OfficialPluginPackageTests(unittest.TestCase):
             self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
             self.assertEqual(info.external_attr, bop.FIXED_MODE << 16)
 
+    def test_a_crlf_text_file_is_refused_by_name(self):
+        manifest = self.folder / "agora-plugin.json"
+        manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
+        with self.assertRaises(SystemExit) as raised:
+            bop.build_zip(self.folder, self.out, "0.1.0")
+        self.assertIn("agora-plugin.json", str(raised.exception))
+        self.assertIn("CRLF", str(raised.exception))
+
     def test_the_registry_entry_is_derived_from_the_built_zip(self):
         built = bop.describe(bop.OFFICIAL_ROOT / "skyrim-se", self.out)
         entry = bop.read_json(bop.registry_path(built["id"]))
