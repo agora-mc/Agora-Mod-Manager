@@ -1,6 +1,6 @@
 # Troubleshooting Agora
 
-Find what you're seeing below and try the steps in order. If you get stuck, [Getting help](#getting-help) explains where to go next.
+Find what you're seeing below and try the steps in order. If you get stuck, the getting help section at the bottom of this page explains where to look for assistance.
 
 ## Before you change anything
 
@@ -55,7 +55,7 @@ Set Java to **Automatic** in Settings, under Java. Agora then uses a suitable Ja
 
 ### The game runs out of memory or feels slow
 
-Change the memory on the instance's **Java & Args** tab. We suggest giving Minecraft enough for the pack while leaving a few gigabytes for everything else on your computer. More memory helps most when the game actually runs out, and it won't always fix slowness. See [Java, memory, and performance](https://agoramc.com/docs/guides/java-performance).
+Change the memory on the instance's **Java & Args** tab. We suggest giving Minecraft enough for the pack while leaving a few gigabytes for everything else on your computer. Extra memory won't always fix poor perfromance, poor performance can be best fixed by removing demanding mods or adding in optimization mods like Sodium. See [Java, memory, and performance](https://agoramc.com/docs/guides/java-performance).
 
 ## Launching and accounts
 
