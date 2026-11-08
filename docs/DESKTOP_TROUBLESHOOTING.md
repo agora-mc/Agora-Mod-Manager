@@ -144,7 +144,7 @@ The **More games** card installs Agora's official plugins. Read the prompt it sh
 
 A plugin you install from a file in Settings > Plugins works, but it does not get the official badge. Official means the signed catalog lists that exact version and the installed files still match.
 
-A game plugin can build on another, shared plugin. Skyrim's builds on the Creation Engine base plugin, so both need to be installed; if the game does not appear, Settings > Plugins shows the game plugin as needing the missing one.
+Skyrim is built on a shared Creation Engine base plugin. Installing Skyrim installs that base too, and the install prompt lists it. If the game still does not appear after installing, check that both show as installed in Settings > Plugins.
 
 A game that is turned off in Settings > Game support is hidden from the game switcher. Its instances, bases and files are not touched.
 

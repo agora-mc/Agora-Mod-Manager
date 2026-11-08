@@ -28,6 +28,24 @@ function isCapabilityDescription(value: unknown): value is CapabilityDescription
   );
 }
 
+function isInstallPreview(value: unknown): value is InstallPreview {
+  return isRecord(value) && isRecord(value.manifest);
+}
+
+/** Whether the prompt has to ask this package's code question. */
+function asksAboutCode(preview: InstallPreview): boolean {
+  return preview.runsCode === true && (preview.codeChanged ?? !preview.replacesVersion);
+}
+
+function capabilityList(value: unknown): CapabilityDescription[] {
+  return Array.isArray(value) ? value.filter(isCapabilityDescription) : [];
+}
+
+function networkHosts(preview: InstallPreview): string[] {
+  const network: unknown = preview.manifest?.network;
+  return isRecord(network) ? stringArray(network.hosts) : [];
+}
+
 export function InstallPrompt({
   preview,
   development,
@@ -46,13 +64,12 @@ export function InstallPrompt({
   /** `allowCode` is the answer to "<name> runs code. Allow it?"; `false` when not asked. */
   onConfirm: (allowCode: boolean) => void;
 }) {
-  const requiredCapabilities = Array.isArray(preview.requiredCapabilities)
-    ? preview.requiredCapabilities.filter(isCapabilityDescription)
-    : [];
-  const optionalCapabilities = Array.isArray(preview.optionalCapabilities)
-    ? preview.optionalCapabilities.filter(isCapabilityDescription)
-    : [];
+  const requiredCapabilities = capabilityList(preview.requiredCapabilities);
+  const optionalCapabilities = capabilityList(preview.optionalCapabilities);
   const unsupportedCapabilities = stringArray(preview.unsupportedCapabilities);
+  const alsoInstalls = Array.isArray(preview.alsoInstalls)
+    ? preview.alsoInstalls.filter(isInstallPreview)
+    : [];
   // Coerced: an older backend that predates this field would otherwise put
   // `undefined` where a list is expected, in a component whose whole job is
   // telling the user what they are agreeing to.
@@ -77,10 +94,16 @@ export function InstallPrompt({
   const blocked = unsupportedCapabilities.length > 0;
   // Asked when the code is new to this person: a first install, an update that
   // brings code, changed code, or code from a different publisher. An update
-  // that keeps the same code keeps the answer already given.
-  const asksAboutCode =
-    preview.runsCode === true &&
-    (preview.codeChanged ?? !preview.replacesVersion);
+  // that keeps the same code keeps the answer already given. A dependency that
+  // runs code is asked about the same way.
+  const targetAsksAboutCode = asksAboutCode(preview);
+  // A dependency that runs code cannot be installed without allowing it, so the
+  // "without running code" path is not offered when one needs code.
+  const dependencyNeedsCode = alsoInstalls.some(
+    (extra) => extra.runsCode === true && !extra.replacesVersion,
+  );
+  const needsCodeAnswer =
+    targetAsksAboutCode || alsoInstalls.some((extra) => asksAboutCode(extra));
 
   return (
     <div className="rounded-lg border border-border bg-muted/30 p-4">
@@ -170,6 +193,84 @@ export function InstallPrompt({
         <p className="mt-3 text-sm text-muted-foreground">It asks for no permissions.</p>
       ) : null}
 
+      {alsoInstalls.map((extra) => {
+        const extraRequired = capabilityList(extra.requiredCapabilities);
+        const extraOptional = capabilityList(extra.optionalCapabilities);
+        const extraHosts = networkHosts(extra);
+        const extraName =
+          typeof extra.manifest?.name === 'string' ? extra.manifest.name : 'Plugin';
+        const extraVersion =
+          typeof extra.manifest?.version === 'string'
+            ? extra.manifest.version
+            : 'unknown version';
+        return (
+          <div
+            key={`${extra.manifest?.id ?? extraName}-${extraVersion}`}
+            className="mt-3 border-t border-border pt-3"
+            data-testid="also-installs"
+          >
+            <div className="font-medium">
+              {extraName} {extraVersion}
+            </div>
+            <p className="text-xs text-muted-foreground">Needed by {manifestName}</p>
+            {typeof extra.manifest?.description === 'string' ? (
+              <p className="text-sm text-muted-foreground">{extra.manifest.description}</p>
+            ) : null}
+
+            {extraRequired.length > 0 ? (
+              <div className="mt-2">
+                <div className="text-sm font-medium">It needs permission to:</div>
+                <ul className="mt-1 space-y-1 text-sm text-muted-foreground">
+                  {extraRequired.map((capability) => (
+                    <li key={capability.name}>
+                      {capability.summary}
+                      {capability.isMutating ? (
+                        <span className="ml-1 text-amber-600 dark:text-amber-400">
+                          (makes changes)
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            {extraOptional.length > 0 ? (
+              <div className="mt-2">
+                <div className="text-sm font-medium">It will also use, if allowed:</div>
+                <ul className="mt-1 space-y-1 text-sm text-muted-foreground">
+                  {extraOptional.map((capability) => (
+                    <li key={capability.name}>
+                      {capability.summary}
+                      {capability.isMutating ? (
+                        <span className="ml-1 text-amber-600 dark:text-amber-400">
+                          (makes changes)
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            {extraRequired.length === 0 && extraOptional.length === 0 ? (
+              <p className="mt-2 text-sm text-muted-foreground">It asks for no permissions.</p>
+            ) : null}
+
+            {extraHosts.length > 0 ? (
+              <p className="mt-2 text-sm text-muted-foreground">
+                It may contact:{' '}
+                {extraHosts.includes('*') ? 'any website' : extraHosts.join(', ')}
+              </p>
+            ) : null}
+
+            {asksAboutCode(extra) ? (
+              <p className="mt-2 text-sm font-medium">{extraName} runs code. Allow it?</p>
+            ) : null}
+          </div>
+        );
+      })}
+
       {manifestNetwork.length > 0 ? (
         <p className="mt-2 text-sm text-muted-foreground">
           It may contact:{' '}
@@ -197,15 +298,15 @@ export function InstallPrompt({
         </p>
       ) : null}
 
-      {asksAboutCode ? (
+      {targetAsksAboutCode ? (
         <p className="mt-3 text-sm font-medium">{manifestName} runs code. Allow it?</p>
       ) : null}
 
       <div className="mt-4 flex gap-2">
-        <Button size="sm" onClick={() => onConfirm(asksAboutCode)} disabled={busy || blocked}>
-          {busy ? busyLabel : asksAboutCode ? `${confirmLabel} and allow code` : confirmLabel}
+        <Button size="sm" onClick={() => onConfirm(needsCodeAnswer)} disabled={busy || blocked}>
+          {busy ? busyLabel : needsCodeAnswer ? `${confirmLabel} and allow code` : confirmLabel}
         </Button>
-        {asksAboutCode ? (
+        {needsCodeAnswer && !dependencyNeedsCode ? (
           <Button
             size="sm"
             variant="secondary"

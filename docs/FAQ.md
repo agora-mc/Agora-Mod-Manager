@@ -71,11 +71,11 @@ No, not with Java set to Automatic in Settings. Agora uses a suitable Java on yo
 
 ### Which games can Agora manage?
 
-Minecraft is built in. Other games come as plugins, and Skyrim Special Edition is the first official one. Skyrim arrives as two official plugins: the game itself (`agora.skyrim-se`) and the shared Creation Engine base (`agora.creation-engine`) it is built on. Community plugins can add other games too, though that plugin format is still experimental.
+Minecraft is built in. Other games come as plugins, and Skyrim Special Edition is the first official one. Skyrim is built on a shared Creation Engine base plugin (`agora.creation-engine`): installing Skyrim installs that base too, and the install prompt lists it. Community plugins can add other games too, though that plugin format is still experimental.
 
 ### How do I add a game?
 
-On Home, find the **More games** card and select **Install** next to the game. If you dismissed the card, the same card is in Settings > Game support. Read what the plugin asks for, approve it, then choose **Restart now** when Agora asks. Agora looks for the game in Steam, GOG, the Epic Games Store and the Microsoft Store. If it doesn't find your copy, use **Add game folder** in Settings > Game support. A game plugin can build on another, shared plugin: Skyrim's builds on the Creation Engine base plugin, so both have to be installed, and Settings > Plugins names one that is still missing.
+On Home, find the **More games** card and select **Install** next to the game. If you dismissed the card, the same card is in Settings > Game support. Read what the plugin asks for, approve it, then choose **Restart now** when Agora asks. Agora looks for the game in Steam, GOG, the Epic Games Store and the Microsoft Store. If it doesn't find your copy, use **Add game folder** in Settings > Game support. A game plugin can build on another, shared plugin: Skyrim's builds on the Creation Engine base plugin, and installing Skyrim installs that base too. The install prompt lists everything it will add.
 
 ### Can I bring my Mod Organizer 2 setup?
 

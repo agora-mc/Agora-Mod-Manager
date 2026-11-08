@@ -49,10 +49,13 @@ use super::{install, InstallPreview};
 use crate::error::{LauncherError, LauncherResult};
 use agora_plugin_api::manifest::PluginId;
 use rusqlite::Connection;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 /// The version of Agora this build is, compared with an entry's minimum.
 const AGORA_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1106,6 +1109,11 @@ impl PluginService {
     }
 
     /// Install an official plugin that is not installed yet.
+    ///
+    /// Missing or outdated official dependencies named by its manifest are
+    /// installed (or updated) first, from the same signed catalog, under the
+    /// same consent. Nothing is written until every package in the set has been
+    /// fetched, checked and covered by the consent.
     pub async fn install_official(
         &self,
         plugin_id: &str,
@@ -1124,13 +1132,15 @@ impl PluginService {
                 ),
             ));
         }
-        self.install_entry(entry, consent, fetcher).await
+        let plans = self.plan_official_install(entry, &catalog, fetcher).await?;
+        self.finish_official_install(plans, consent)
     }
 
     /// Move an installed plugin to the catalog's current official version.
     ///
     /// A same-id plugin that is not verified official (a community copy, or one
-    /// that lost its standing) is replaced by the official package.
+    /// that lost its standing) is replaced by the official package. Dependencies
+    /// the new version needs are brought up to date first, as on install.
     pub async fn update_official(
         &self,
         plugin_id: &str,
@@ -1154,7 +1164,8 @@ impl PluginService {
                 format!("`{plugin_id}` is already at the current official version {installed}."),
             ));
         }
-        self.install_entry(entry, consent, fetcher).await
+        let plans = self.plan_official_install(entry, &catalog, fetcher).await?;
+        self.finish_official_install(plans, consent)
     }
 
     /// Return an official plugin to the version before the current one.
@@ -1227,14 +1238,12 @@ impl PluginService {
             .map(|record| record.manifest.version.to_string()))
     }
 
-    /// Download one signed entry, verify it, and install it.
-    async fn install_entry(
+    /// Download one signed entry and verify it, writing nothing.
+    async fn fetch_verified_entry(
         &self,
         entry: &OfficialEntry,
-        consent: impl Into<Consent>,
         fetcher: &dyn PackageFetcher,
-    ) -> LauncherResult<UpdateOutcome> {
-        let consent: Consent = consent.into();
+    ) -> LauncherResult<Vec<u8>> {
         entry.check().map_err(|problem| {
             refused(
                 "ERR_OFFICIAL_PLUGIN_ENTRY",
@@ -1276,7 +1285,210 @@ impl PluginService {
                 ),
             ));
         }
+        Ok(bytes)
+    }
+
+    /// Download one signed entry, verify it, and install it.
+    async fn install_entry(
+        &self,
+        entry: &OfficialEntry,
+        consent: impl Into<Consent>,
+        fetcher: &dyn PackageFetcher,
+    ) -> LauncherResult<UpdateOutcome> {
+        let consent: Consent = consent.into();
+        let bytes = self.fetch_verified_entry(entry, fetcher).await?;
         self.install_verified(entry, &bytes, consent)
+    }
+
+    /// Fetch and check every package an official install will write, dependencies
+    /// first, and return them in that order. Nothing is written here.
+    ///
+    /// Dependencies come from each package's own manifest and are resolved
+    /// against the signed catalog: installed and satisfying means untouched;
+    /// installed but too old means the catalog's current version, if it
+    /// satisfies; missing means the catalog's current version, if it satisfies.
+    /// A dependency the catalog cannot offer, a version that does not satisfy,
+    /// or a cycle refuses the whole install before any file is written.
+    async fn plan_official_install(
+        &self,
+        entry: &OfficialEntry,
+        catalog: &OfficialCatalog,
+        fetcher: &dyn PackageFetcher,
+    ) -> LauncherResult<Vec<PlannedInstall>> {
+        let mut state = PlanState::default();
+        self.plan_install(entry, catalog, fetcher, false, &mut state)
+            .await?;
+        Ok(state.plans)
+    }
+
+    fn plan_install<'a>(
+        &'a self,
+        entry: &'a OfficialEntry,
+        catalog: &'a OfficialCatalog,
+        fetcher: &'a dyn PackageFetcher,
+        is_dependency: bool,
+        state: &'a mut PlanState,
+    ) -> Pin<Box<dyn Future<Output = LauncherResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let id = entry.plugin_id.clone();
+            if state.planned.contains(&id) {
+                return Ok(());
+            }
+            state.visiting.insert(id.clone());
+            let bytes = self.fetch_verified_entry(entry, fetcher).await?;
+            let preview = self.preview_package_bytes(&bytes)?;
+            if preview.manifest.id.as_str() != entry.plugin_id
+                || preview.manifest.version.to_string() != entry.version
+            {
+                return Err(refused(
+                    "ERR_OFFICIAL_PLUGIN_MISMATCH",
+                    format!(
+                        "The package for `{}` {} identifies itself as `{}` {}. It was refused.",
+                        entry.plugin_id,
+                        entry.version,
+                        preview.manifest.id,
+                        preview.manifest.version
+                    ),
+                ));
+            }
+            let dependencies: Vec<(PluginId, VersionReq)> = preview
+                .manifest
+                .dependencies
+                .iter()
+                .map(|(dependency, requirement)| (dependency.clone(), requirement.clone()))
+                .collect();
+            for (dependency, requirement) in dependencies {
+                let dependency_id = dependency.as_str().to_string();
+                let installed_satisfies = self
+                    .live_version(&dependency_id)?
+                    .and_then(|version| Version::parse(&version).ok())
+                    .is_some_and(|version| requirement.matches(&version));
+                if installed_satisfies {
+                    continue;
+                }
+                let dependency_entry = catalog.current(&dependency_id).ok_or_else(|| {
+                    dependency_refused(&dependency_id, &requirement, "is not in the signed catalog")
+                })?;
+                let dependency_version =
+                    Version::parse(&dependency_entry.version).map_err(|_| {
+                        dependency_refused(
+                            &dependency_id,
+                            &requirement,
+                            &format!(
+                                "the catalog lists the version `{}`, which cannot be read",
+                                dependency_entry.version
+                            ),
+                        )
+                    })?;
+                if !requirement.matches(&dependency_version) {
+                    return Err(dependency_refused(
+                        &dependency_id,
+                        &requirement,
+                        &format!(
+                            "the catalog's current version {} does not satisfy it",
+                            dependency_entry.version
+                        ),
+                    ));
+                }
+                if state.visiting.contains(&dependency_id) {
+                    return Err(dependency_refused(
+                        &dependency_id,
+                        &requirement,
+                        "forms a dependency cycle",
+                    ));
+                }
+                let dependency_entry = dependency_entry.clone();
+                self.plan_install(&dependency_entry, catalog, fetcher, true, state)
+                    .await?;
+            }
+            state.visiting.remove(&id);
+            state.planned.insert(id);
+            state.plans.push(PlannedInstall {
+                entry: entry.clone(),
+                preview,
+                bytes,
+                is_dependency,
+            });
+            Ok(())
+        })
+    }
+
+    /// Apply a plan the consent covers, dependencies first.
+    fn finish_official_install(
+        &self,
+        plans: Vec<PlannedInstall>,
+        consent: Consent,
+    ) -> LauncherResult<UpdateOutcome> {
+        let Some(target) = plans.last() else {
+            return Err(refused(
+                "ERR_OFFICIAL_PLUGIN_ENTRY",
+                "there is nothing to install",
+            ));
+        };
+        let mut needs_consent = false;
+        for plan in &plans {
+            // A dependency that runs code is a new answer exactly as it would be
+            // on its own: the one consent has to cover running it.
+            let dependency_code = plan.is_dependency
+                && plan.preview.replaces_version.is_none()
+                && plan.preview.runs_code
+                && !consent.scripts;
+            if (plan.preview.requires_capability_consent() && !consent.capabilities)
+                || (plan.preview.replaces_version.is_some()
+                    && plan.preview.adds_code
+                    && !consent.scripts)
+                || dependency_code
+            {
+                needs_consent = true;
+            }
+        }
+        if needs_consent {
+            let mut preview = target.preview.clone();
+            preview.also_installs = plans[..plans.len() - 1]
+                .iter()
+                .map(|plan| plan.preview.clone())
+                .collect();
+            return Ok(UpdateOutcome::NeedsConsent {
+                preview: Box::new(preview),
+            });
+        }
+
+        let mut installed: Vec<String> = Vec::new();
+        let mut target_summary = None;
+        for plan in &plans {
+            match self.install_verified(&plan.entry, &plan.bytes, consent) {
+                Ok(UpdateOutcome::Installed { plugin }) => {
+                    installed.push(plan.entry.plugin_id.clone());
+                    if !plan.is_dependency {
+                        target_summary = Some(plugin);
+                    }
+                }
+                Ok(UpdateOutcome::NeedsConsent { .. }) => {
+                    return Err(partial_failure(
+                        &installed,
+                        &plan.entry.plugin_id,
+                        "it asked for consent again after the install had started",
+                    ));
+                }
+                Err(error) => {
+                    if installed.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(partial_failure(
+                        &installed,
+                        &plan.entry.plugin_id,
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
+        let plugin = target_summary.ok_or_else(|| {
+            refused(
+                "ERR_OFFICIAL_PLUGIN_ENTRY",
+                "the target plugin was not installed",
+            )
+        })?;
+        Ok(UpdateOutcome::Installed { plugin })
     }
 
     /// Install bytes that have been checked against `entry`, from memory.
@@ -1378,6 +1590,52 @@ impl PluginService {
             plugin: Box::new(self.summary(&id)?),
         })
     }
+}
+
+/// One package an official install will write, fetched and checked already.
+struct PlannedInstall {
+    entry: OfficialEntry,
+    preview: InstallPreview,
+    bytes: Vec<u8>,
+    /// True for a dependency of the target, false for the target itself.
+    is_dependency: bool,
+}
+
+#[derive(Default)]
+struct PlanState {
+    /// Packages being resolved right now, to detect a cycle.
+    visiting: BTreeSet<String>,
+    /// Packages already added to the plan, so a shared dependency is planned once.
+    planned: BTreeSet<String>,
+    /// Dependencies before the packages that need them.
+    plans: Vec<PlannedInstall>,
+}
+
+/// A dependency that cannot be resolved: the refusal names it and what it asked for.
+fn dependency_refused(dependency: &str, requirement: &VersionReq, problem: &str) -> LauncherError {
+    refused(
+        "ERR_OFFICIAL_PLUGIN_DEPENDENCY",
+        format!(
+            "The official dependency `{dependency}` (`{requirement}`) {problem}. Nothing was \
+             installed."
+        ),
+    )
+}
+
+/// A failure after at least one package of the set was written.
+///
+/// The installed ones are valid official plugins and are kept, so the error
+/// says which stayed and which failed rather than pretending nothing happened.
+fn partial_failure(installed: &[String], failed: &str, cause: &str) -> LauncherError {
+    let kept = if installed.is_empty() {
+        "nothing was installed".to_string()
+    } else {
+        format!("already installed: {}", installed.join(", "))
+    };
+    refused(
+        "ERR_OFFICIAL_PLUGIN_PARTIAL",
+        format!("`{failed}` failed to install: {cause}. {kept}."),
+    )
 }
 
 fn known_entry<'a>(

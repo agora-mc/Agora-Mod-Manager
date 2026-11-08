@@ -892,7 +892,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Add a game',
-          body: 'Other games arrive as small add-ons that you install once. Your Minecraft instances are not affected. The add-ons on the More games card are official, which means Agora\'s signed catalog vouches for them; a plugin you install yourself can add a game too, but it is community-made and gets no special access. Some game add-ons build on a shared one, as Skyrim\'s builds on the Creation Engine base, so both have to be installed.',
+          body: 'Other games arrive as small add-ons that you install once. Your Minecraft instances are not affected. The add-ons on the More games card are official, which means Agora\'s signed catalog vouches for them; a plugin you install yourself can add a game too, but it is community-made and gets no special access. Some game add-ons build on a shared one, as Skyrim\'s builds on the Creation Engine base: installing Skyrim installs that base too, and the install prompt lists it.',
           steps: [
             'On Home, find the "More games" card and press Install next to the game. The same card is in Settings > Game support, which helps if you dismissed it on Home.',
             'If Agora shows what the add-on wants to do, read it first, and approve it only if you are happy with it.',
