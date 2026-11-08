@@ -462,7 +462,6 @@ fn a_files_mount_hands_bytes_to_the_module_read_only() {
 }
 
 #[test]
-#[ignore = "review: a module blocked in a host call is not stopped by the epoch deadline"]
 fn a_blocking_host_call_is_stopped_by_the_time_limit() {
     let fixture = fixture(&["sleep.wasm"]);
     let host = activate(&fixture);
@@ -493,7 +492,6 @@ fn a_blocking_host_call_is_stopped_by_the_time_limit() {
 }
 
 #[test]
-#[ignore = "review: the memory cap covers linear memory, but not the module's table"]
 fn the_memory_cap_covers_a_module_table() {
     let fixture = fixture(&["table_hog.wasm"]);
     let host = activate(&fixture);
@@ -513,4 +511,28 @@ fn the_memory_cap_covers_a_module_table() {
             "a table larger than the module's memory cap was allocated and the module ran: {value}"
         );
     }
+}
+
+#[test]
+fn a_module_file_over_the_size_cap_is_refused() {
+    let fixture = fixture(&[]);
+    let huge = fixture.package.join("huge.wasm");
+    // A sparse file: the size is over the cap without writing 64 MiB of zeros.
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    let host = activate(&fixture);
+    let error = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({ "module": "huge.wasm" }),
+        None,
+    )
+    .expect_err("a module over the file size cap is refused");
+    assert!(
+        error.message.contains("at most") || error.message.to_lowercase().contains("large"),
+        "the error names the size cap: {}",
+        error.message
+    );
 }
