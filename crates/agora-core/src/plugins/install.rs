@@ -204,6 +204,12 @@ pub struct InstallPreview {
     /// (new, changed, or a changed publisher). The code prompt is asked again,
     /// and until it is answered the scripts do not run.
     pub code_changed: bool,
+    /// Official dependencies this install will write too, dependencies first.
+    ///
+    /// Set on the target's preview in a `needsConsent` reply so the player can
+    /// see everything one consent covers. Empty for a single package.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_installs: Vec<InstallPreview>,
 }
 
 impl InstallPreview {
@@ -570,6 +576,7 @@ fn build_preview(
         file_count,
         uncompressed_bytes,
         manifest,
+        also_installs: Vec::new(),
     }
 }
 

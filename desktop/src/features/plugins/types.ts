@@ -205,6 +205,11 @@ export interface InstallPreview {
   addsCode?: boolean;
   /** The code is new or changed, so "<name> runs code. Allow it?" is asked again. */
   codeChanged?: boolean;
+  /**
+   * Official dependencies this install will write too, dependencies first. The
+   * one consent covers them as well.
+   */
+  alsoInstalls?: InstallPreview[];
 }
 
 export type UpdateVerdict =

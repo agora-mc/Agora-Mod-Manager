@@ -150,6 +150,22 @@ fn report(id: &str, outcome: UpdateOutcome, verb: &str, json: bool) -> anyhow::R
             for host in &preview.added_hosts {
                 println!("  - may contact {host}");
             }
+            for extra in &preview.also_installs {
+                println!();
+                println!(
+                    "It also installs {} v{} (needed by {}):",
+                    extra.manifest.name, extra.manifest.version, preview.manifest.name
+                );
+                for capability in &extra.added_capabilities {
+                    println!("  - {capability}");
+                }
+                for host in &extra.added_hosts {
+                    println!("  - may contact {host}");
+                }
+                if extra.added_capabilities.is_empty() && extra.added_hosts.is_empty() {
+                    println!("  - nothing beyond what it does already");
+                }
+            }
             println!();
             println!(
                 "Re-run with --yes to accept, once the person using this computer has agreed."

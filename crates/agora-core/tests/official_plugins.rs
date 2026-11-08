@@ -145,7 +145,81 @@ fn fixture_zip(version: &str) -> Vec<u8> {
     package_zip(PLUGIN, version, GAME, "game:define", "")
 }
 
+/// A package with its own dependencies, an optional game package, and optionally
+/// a script. Used for the official dependency tests.
+fn dependency_zip(
+    id: &str,
+    version: &str,
+    dependencies: &[(&str, &str)],
+    capability: &str,
+    game: Option<&str>,
+    runs_code: bool,
+) -> Vec<u8> {
+    use std::io::Write;
+    let mut manifest = serde_json::json!({
+        "manifest": 1,
+        "id": id,
+        "name": format!("Fixture {id}"),
+        "version": version,
+        "license": "GPL-3.0-only",
+        "apiRange": ">=0.1, <0.2",
+    });
+    let mut required = Vec::new();
+    if !capability.is_empty() {
+        required.push(capability.to_string());
+    }
+    if game.is_some() && capability != "game:define" {
+        required.push("game:define".to_string());
+    }
+    if !required.is_empty() {
+        manifest["capabilities"] = serde_json::json!({ "required": required });
+    }
+    if !dependencies.is_empty() {
+        let deps: serde_json::Map<String, serde_json::Value> = dependencies
+            .iter()
+            .map(|(dep, requirement)| {
+                (
+                    dep.to_string(),
+                    serde_json::Value::String(requirement.to_string()),
+                )
+            })
+            .collect();
+        manifest["dependencies"] = serde_json::Value::Object(deps);
+    }
+    if game.is_some() {
+        manifest["contributions"] =
+            serde_json::json!({ "gamePackages": [ { "path": "games/package.json" } ] });
+    }
+    if runs_code {
+        manifest["entrypoint"] = serde_json::json!("main.js");
+    }
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("agora-plugin.json", options).unwrap();
+        zip.write_all(manifest.to_string().as_bytes()).unwrap();
+        if let Some(game) = game {
+            zip.start_file("games/package.json", options).unwrap();
+            zip.write_all(
+                serde_json::to_string(&game_package(game))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        }
+        if runs_code {
+            zip.start_file("main.js", options).unwrap();
+            zip.write_all(b"export function noop() { return 1; }\n")
+                .unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buffer.into_inner()
+}
+
 struct Release {
+    plugin_id: &'static str,
     version: &'static str,
     channel: &'static str,
     url: String,
@@ -158,10 +232,20 @@ struct Release {
 
 impl Release {
     fn of(version: &'static str, channel: &'static str, zip: &[u8]) -> Self {
+        Self::of_plugin(PLUGIN, version, channel, zip)
+    }
+
+    fn of_plugin(
+        plugin_id: &'static str,
+        version: &'static str,
+        channel: &'static str,
+        zip: &[u8],
+    ) -> Self {
         Self {
+            plugin_id,
             version,
             channel,
-            url: format!("https://plugins.example.org/{PLUGIN}-{version}.zip"),
+            url: format!("https://plugins.example.org/{plugin_id}-{version}.zip"),
             sha256: sha(zip),
             tree_sha256: zip_tree_digest(zip).unwrap(),
             size: zip.len() as i64,
@@ -200,7 +284,7 @@ fn write_registry(root: &Path, releases: &[Release], key: &SigningKey, sign: boo
         conn.execute(
             "INSERT INTO official_plugins VALUES (?1, ?2, ?3, 'Fixture', 'A test plugin', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
-                PLUGIN,
+                release.plugin_id,
                 release.version,
                 release.channel,
                 format!(r#"["{GAME}"]"#),
@@ -323,6 +407,19 @@ impl World {
 
     fn installed_dir(&self) -> PathBuf {
         self.paths().plugin_packages_root().join(PLUGIN)
+    }
+
+    fn packages_root(&self) -> PathBuf {
+        self.paths().plugin_packages_root()
+    }
+
+    /// The installed version of any plugin id, if it is installed.
+    fn version_of(&self, plugin_id: &str) -> Option<String> {
+        self.service
+            .list()
+            .into_iter()
+            .find(|plugin| plugin.id == plugin_id)
+            .map(|plugin| plugin.version)
     }
 
     /// Start the app against this data folder, trusting the test key.
@@ -1177,6 +1274,396 @@ async fn uninstalling_ends_official_standing() {
         .unwrap()
         .is_empty());
     assert_eq!(world.status(), OfficialStatus::Community);
+}
+
+// ---------------------------------------------------------------------------
+// Official dependencies
+// ---------------------------------------------------------------------------
+
+const BASE: &str = "acme.base";
+const GAME_PLUGIN: &str = "acme.gameplugin";
+
+/// The target as the card offers it, and the shared base it names.
+fn dependency_releases(
+    game_version: &'static str,
+    game_requirement: &str,
+    base_version: &'static str,
+) -> (Vec<u8>, Vec<u8>) {
+    let base = dependency_zip(BASE, base_version, &[], "", None, false);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        game_version,
+        &[(BASE, game_requirement)],
+        "game:define",
+        Some("dep-game"),
+        false,
+    );
+    (base, game)
+}
+
+#[tokio::test]
+async fn installing_a_game_plugin_installs_its_missing_official_dependency_first() {
+    let world = World::new();
+    let (base, game) = dependency_releases("1.0.0", ">=1.0, <2", "1.0.0");
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+        (Release::of_plugin(BASE, "1.0.0", "current", &base), base),
+    ]);
+
+    let plugin = installed(
+        world
+            .service
+            .install_official(GAME_PLUGIN, Consent::without_code(), &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(plugin.id, GAME_PLUGIN);
+    assert_eq!(world.version_of(BASE).as_deref(), Some("1.0.0"));
+    assert_eq!(world.version_of(GAME_PLUGIN).as_deref(), Some("1.0.0"));
+    let target = world
+        .service
+        .list()
+        .into_iter()
+        .find(|installed| installed.id == GAME_PLUGIN)
+        .expect("the game plugin is installed");
+    assert_eq!(
+        target.status,
+        PluginStatus::Ready,
+        "the dependency was installed before the game plugin needed it"
+    );
+}
+
+#[tokio::test]
+async fn consent_is_asked_once_and_lists_the_dependency() {
+    let world = World::new();
+    let base = dependency_zip(BASE, "1.0.0", &[], "", None, false);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <2")],
+        "game:define",
+        Some("dep-game"),
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+        (Release::of_plugin(BASE, "1.0.0", "current", &base), base),
+    ]);
+
+    let outcome = world
+        .service
+        .install_official(GAME_PLUGIN, false, &world.fetcher)
+        .await
+        .unwrap();
+    let UpdateOutcome::NeedsConsent { preview } = outcome else {
+        panic!("expected a consent request");
+    };
+    assert_eq!(preview.manifest.id.as_str(), GAME_PLUGIN);
+    assert_eq!(preview.also_installs.len(), 1);
+    assert_eq!(preview.also_installs[0].manifest.id.as_str(), BASE);
+    assert!(
+        files_under(&world.packages_root()).is_empty(),
+        "nothing is installed before consent covers the whole set"
+    );
+
+    installed(
+        world
+            .service
+            .install_official(GAME_PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(world.version_of(BASE).as_deref(), Some("1.0.0"));
+    assert_eq!(world.version_of(GAME_PLUGIN).as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn a_dependency_not_in_the_signed_catalog_refuses_before_writing_anything() {
+    let world = World::new();
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[("acme.missing", ">=4.0, <5")],
+        "",
+        Some("dep-game"),
+        false,
+    );
+    world.publish(vec![(
+        Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+        game,
+    )]);
+
+    let error = world
+        .service
+        .install_official(GAME_PLUGIN, true, &world.fetcher)
+        .await
+        .expect_err("a missing dependency refuses the install");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_DEPENDENCY");
+    let message = error.to_string();
+    assert!(message.contains("acme.missing"), "{message}");
+    assert!(message.contains(">=4.0, <5"), "{message}");
+    assert!(
+        files_under(&world.packages_root()).is_empty(),
+        "nothing was written"
+    );
+    assert_eq!(world.version_of(GAME_PLUGIN), None);
+}
+
+#[tokio::test]
+async fn an_installed_dependency_that_satisfies_is_left_alone() {
+    let world = World::new();
+    let base_v1 = dependency_zip(BASE, "1.0.0", &[], "", None, false);
+    world.publish(vec![(
+        Release::of_plugin(BASE, "1.0.0", "current", &base_v1),
+        base_v1,
+    )]);
+    installed(
+        world
+            .service
+            .install_official(BASE, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    let calls_after_base = world.fetcher.calls();
+
+    // The catalog now offers a newer base, but the installed one already satisfies.
+    let base_v2 = dependency_zip(BASE, "2.0.0", &[], "", None, false);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <3")],
+        "",
+        Some("dep-game"),
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(BASE, "2.0.0", "current", &base_v2),
+            base_v2,
+        ),
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+    ]);
+
+    installed(
+        world
+            .service
+            .install_official(GAME_PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        world.version_of(BASE).as_deref(),
+        Some("1.0.0"),
+        "the satisfying install is not replaced"
+    );
+    assert_eq!(
+        world.fetcher.calls() - calls_after_base,
+        1,
+        "only the target package was downloaded"
+    );
+}
+
+#[tokio::test]
+async fn an_outdated_dependency_is_updated_when_the_new_version_needs_it() {
+    let world = World::new();
+    let base_v1 = dependency_zip(BASE, "1.0.0", &[], "", None, false);
+    world.publish(vec![(
+        Release::of_plugin(BASE, "1.0.0", "current", &base_v1),
+        base_v1,
+    )]);
+    installed(
+        world
+            .service
+            .install_official(BASE, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+
+    let base_v2 = dependency_zip(BASE, "2.0.0", &[], "", None, false);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=2.0, <3")],
+        "",
+        Some("dep-game"),
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(BASE, "2.0.0", "current", &base_v2),
+            base_v2,
+        ),
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+    ]);
+
+    installed(
+        world
+            .service
+            .install_official(GAME_PLUGIN, true, &world.fetcher)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(world.version_of(BASE).as_deref(), Some("2.0.0"));
+    assert_eq!(world.version_of(GAME_PLUGIN).as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn a_dependency_hash_mismatch_installs_nothing() {
+    let world = World::new();
+    let base = dependency_zip(BASE, "1.0.0", &[], "", None, false);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <2")],
+        "",
+        Some("dep-game"),
+        false,
+    );
+    // Same length as the real package, so only the hash can tell them apart.
+    let mut forged = base.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 0xFF;
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+        (Release::of_plugin(BASE, "1.0.0", "current", &base), forged),
+    ]);
+
+    assert_eq!(
+        error_code(
+            world
+                .service
+                .install_official(GAME_PLUGIN, true, &world.fetcher)
+                .await
+        ),
+        "ERR_OFFICIAL_PLUGIN_HASH"
+    );
+    assert!(
+        files_under(&world.packages_root()).is_empty(),
+        "a dependency that fails its hash installs neither package"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_after_the_dependency_reports_what_was_installed() {
+    let world = World::new();
+    let base = dependency_zip(BASE, "1.0.0", &[], "", None, false);
+    // The target asks for a capability this build cannot provide, so its own
+    // install fails after the dependency has already been written.
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <2")],
+        "not:a-real:capability",
+        Some("dep-game"),
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+        (Release::of_plugin(BASE, "1.0.0", "current", &base), base),
+    ]);
+
+    let error = world
+        .service
+        .install_official(GAME_PLUGIN, true, &world.fetcher)
+        .await
+        .expect_err("the target fails after its dependency");
+    assert_eq!(error.code(), "ERR_OFFICIAL_PLUGIN_PARTIAL");
+    let message = error.to_string();
+    assert!(message.contains(BASE), "{message}");
+    assert!(message.contains(GAME_PLUGIN), "{message}");
+    assert_eq!(
+        world.version_of(BASE).as_deref(),
+        Some("1.0.0"),
+        "the dependency is kept"
+    );
+    assert_eq!(
+        world.version_of(GAME_PLUGIN),
+        None,
+        "the target is not installed"
+    );
+}
+
+#[tokio::test]
+async fn a_dependency_that_runs_code_is_refused_without_allow_code() {
+    let world = World::new();
+    let base = dependency_zip(BASE, "1.0.0", &[], "", None, true);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <2")],
+        "",
+        Some("dep-game"),
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+        (Release::of_plugin(BASE, "1.0.0", "current", &base), base),
+    ]);
+
+    let outcome = world
+        .service
+        .install_official(
+            GAME_PLUGIN,
+            Consent {
+                capabilities: true,
+                scripts: false,
+            },
+            &world.fetcher,
+        )
+        .await
+        .unwrap();
+    let UpdateOutcome::NeedsConsent { preview } = outcome else {
+        panic!("a code dependency needs the code answer first");
+    };
+    assert_eq!(preview.also_installs.len(), 1);
+    assert!(preview.also_installs[0].runs_code);
+    assert!(
+        files_under(&world.packages_root()).is_empty(),
+        "nothing is installed before the code answer"
+    );
+
+    installed(
+        world
+            .service
+            .install_official(
+                GAME_PLUGIN,
+                Consent {
+                    capabilities: true,
+                    scripts: true,
+                },
+                &world.fetcher,
+            )
+            .await
+            .unwrap(),
+    );
+    let base_plugin = world
+        .service
+        .list()
+        .into_iter()
+        .find(|plugin| plugin.id == BASE)
+        .expect("the dependency is installed");
+    assert!(base_plugin.scripts_allowed);
 }
 
 // ---------------------------------------------------------------------------

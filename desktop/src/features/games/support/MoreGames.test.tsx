@@ -252,6 +252,51 @@ describe('More games card', () => {
     });
   });
 
+  it('lists an official dependency the install will also add, and asks about its code', async () => {
+    const dependency = {
+      ...consentPreview,
+      manifest: {
+        manifest: 1,
+        id: 'agora.creation-engine',
+        name: 'Creation Engine',
+        version: '1.0.0',
+        license: 'MIT',
+      },
+      requiredCapabilities: [
+        { name: 'game:read', summary: 'Read game data', isMutating: false },
+      ],
+      runsCode: true,
+      codeChanged: true,
+    };
+    answer({
+      install: (args) => {
+        if (args?.acceptCapabilities === true) {
+          return { outcome: 'installed', plugin: { id: 'agora.skyrim', name: 'Skyrim Special Edition' } };
+        }
+        return { outcome: 'needsConsent', preview: { ...consentPreview, alsoInstalls: [dependency] } };
+      },
+    });
+    render(<MoreGamesCard surface="settings" />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Install Skyrim Special Edition' }));
+
+    expect(await screen.findByText('Creation Engine 1.0.0')).toBeInTheDocument();
+    expect(screen.getByText('Needed by Skyrim Special Edition')).toBeInTheDocument();
+    expect(screen.getByText('Read game data')).toBeInTheDocument();
+    expect(screen.getByText('Creation Engine runs code. Allow it?')).toBeInTheDocument();
+    // A dependency that runs code cannot be installed without allowing it.
+    expect(screen.queryByRole('button', { name: 'Install without running code' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Install and allow code' }));
+
+    expect(await screen.findByText('Restart Agora to finish adding Skyrim Special Edition.')).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
+      pluginId: 'agora.skyrim',
+      acceptCapabilities: true,
+      allowScripts: true,
+    });
+  });
+
   it('lists without consulting a global plugin switch', async () => {
     answer({ plugins: [info()] });
     render(<MoreGamesCard surface="settings" />);
