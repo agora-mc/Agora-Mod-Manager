@@ -2111,4 +2111,33 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&destination).ok();
     }
+
+    #[test]
+    #[ignore = "review: a missing mount source stages an empty folder instead of failing, so the module runs"]
+    fn a_missing_view_folder_is_not_an_empty_mount() {
+        let root = unique_root("stage-missing");
+        let reads = reader(&root);
+        let destination = unique_root("stage-missing-dest");
+
+        // `walk_view` treats an unreadable or absent folder as "no files" and
+        // returns success, and the wasm host turns that into a mount with
+        // nothing in it. A script that asked for a view is then run against an
+        // empty one instead of being told the source is gone.
+        let missing = reads.stage_view("Data", &[], &destination);
+        let not_a_folder = {
+            write(&root.join("File"), b"x");
+            reads.stage_view("File", &[], &destination)
+        };
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&destination).ok();
+        assert!(
+            missing.is_err(),
+            "a missing view folder staged an empty mount: {missing:?}"
+        );
+        assert!(
+            not_a_folder.is_err(),
+            "a file named as a view folder staged an empty mount: {not_a_folder:?}"
+        );
+    }
 }

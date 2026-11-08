@@ -460,3 +460,57 @@ fn a_files_mount_hands_bytes_to_the_module_read_only() {
     .expect("the module runs");
     assert_eq!(value["stdoutText"], "READ:hello: world\n\nWRITE_FAILED\n");
 }
+
+#[test]
+#[ignore = "review: a module blocked in a host call is not stopped by the epoch deadline"]
+fn a_blocking_host_call_is_stopped_by_the_time_limit() {
+    let fixture = fixture(&["sleep.wasm"]);
+    let host = activate(&fixture);
+    let started = Instant::now();
+    let outcome = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "sleep.wasm",
+            "stdin": "3000",
+            "limits": { "timeoutMs": 200 },
+        }),
+        None,
+    );
+    let elapsed = started.elapsed();
+    // `std::thread::sleep` on wasm32-wasip1 is one `poll_oneoff` clock call,
+    // which the host runs on its own thread. The epoch deadline is only checked
+    // when wasm executes again, so the module outlives its 200 ms limit by the
+    // whole sleep. A sandbox that promises a time limit must not allow this.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the time limit was missed while the module was blocked in a host call: {elapsed:?}"
+    );
+    assert!(
+        outcome.is_err(),
+        "the module should have been stopped at its deadline: {outcome:?}"
+    );
+}
+
+#[test]
+#[ignore = "review: the memory cap covers linear memory, but not the module's table"]
+fn the_memory_cap_covers_a_module_table() {
+    let fixture = fixture(&["table_hog.wasm"]);
+    let host = activate(&fixture);
+    // table_hog declares a 4,000,000-entry funcref table (tens of megabytes of
+    // host memory) and no linear memory at all.
+    let outcome = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "table_hog.wasm",
+            "limits": { "memoryBytes": 1024 * 1024 },
+        }),
+        None,
+    );
+    if let Ok(value) = outcome {
+        panic!(
+            "a table larger than the module's memory cap was allocated and the module ran: {value}"
+        );
+    }
+}
