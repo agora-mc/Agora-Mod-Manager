@@ -13,6 +13,7 @@ import {
   gamesErrorCode,
   gamesErrorMessage,
   launchGameInstance,
+  onInstanceExited,
   type DeploymentMode,
   type LaunchReply,
 } from './api';
@@ -65,6 +66,25 @@ function subscribe(listener: () => void): () => void {
   };
 }
 
+/**
+ * "The game is starting" describes a run in progress, so it goes away by itself when that run
+ * ends. The store listens for the exit itself, once for the app session, so the answer clears even
+ * when no page showing it was open at the time. Other answers (refusals, errors, questions) stay
+ * until they are dismissed: they still need the player.
+ */
+let exitWatch: Promise<unknown> | null = null;
+
+function watchExits(): void {
+  if (exitWatch !== null) return;
+  exitWatch = onInstanceExited((exited) => {
+    const current = gameLaunchState(exited.instanceId);
+    if (!current.busy && current.reply?.status === 'launched') update(exited.instanceId, IDLE);
+  }).catch(() => {
+    // No event channel (not running in the app): answers stay until dismissed, as before.
+    exitWatch = null;
+  });
+}
+
 /** The launch state of one instance (the same object until it changes). */
 export function gameLaunchState(instanceId: string): GameLaunchState {
   return states.get(instanceId) ?? IDLE;
@@ -76,6 +96,7 @@ export function gameLaunchState(instanceId: string): GameLaunchState {
  */
 export async function startGameLaunch(instanceId: string, options: LaunchOptions = {}): Promise<LaunchReply | null> {
   if (gameLaunchState(instanceId).busy) return null;
+  watchExits();
   update(instanceId, {
     busy: true,
     startedAt: Date.now(),
@@ -141,6 +162,7 @@ export function dismissGameLaunch(instanceId: string): void {
 /** Forget every launch state. Tests use it; nothing else needs to. */
 export function clearGameLaunches(): void {
   states.clear();
+  exitWatch = null;
   for (const listener of listeners) listener();
 }
 

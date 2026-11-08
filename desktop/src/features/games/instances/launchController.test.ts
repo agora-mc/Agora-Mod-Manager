@@ -1,13 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const invokeMock = vi.hoisted(() => vi.fn());
+const exitHandlers = vi.hoisted(() => [] as Array<(exited: { instanceId: string; restoreError: string | null }) => void>);
 vi.mock('./api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./api')>();
   return {
     ...actual,
     launchGameInstance: invokeMock,
+    onInstanceExited: (handler: (exited: { instanceId: string; restoreError: string | null }) => void) => {
+      exitHandlers.push(handler);
+      return Promise.resolve(() => undefined);
+    },
   };
 });
+
+function exit(instanceId: string): void {
+  for (const handler of exitHandlers) handler({ instanceId, restoreError: null });
+}
 
 import { clearGameLaunches, gameLaunchState, startGameLaunch } from './launchController';
 import type { LaunchReply } from './api';
@@ -75,5 +84,34 @@ describe('before-launch progress', () => {
     expect(gameLaunchState('inst-1').runningTool).toBe('Deploy');
     finish(reply({}));
     await done;
+  });
+});
+
+describe('the starting notice ends with the run', () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    clearGameLaunches();
+    exitHandlers.length = 0;
+  });
+
+  it('clears "the game is starting" when that instance exits, and only that one', async () => {
+    invokeMock.mockResolvedValue(reply({ findings: [{ id: 'f', severity: 'warning', title: 't', detail: 'd' }] as never }));
+    await startGameLaunch('one');
+    await startGameLaunch('two');
+    expect(gameLaunchState('one').reply?.status).toBe('launched');
+
+    exit('one');
+
+    expect(gameLaunchState('one').reply).toBeNull();
+    expect(gameLaunchState('two').reply?.status).toBe('launched');
+  });
+
+  it('keeps a refusal after an exit, because it still needs the player', async () => {
+    invokeMock.mockResolvedValue(reply({ status: 'refused', pid: null } as never));
+    await startGameLaunch('one');
+
+    exit('one');
+
+    expect(gameLaunchState('one').reply?.status).toBe('refused');
   });
 });
