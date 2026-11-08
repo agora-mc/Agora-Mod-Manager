@@ -2,6 +2,7 @@
 //! (sort, move, lock), framework loader launch alternatives, and refusal of rules that could not
 //! work (MASTER_SPEC §26.3, §26.6).
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,10 +23,10 @@ use agora_core::game_registry::{
     GameRegistry, GameRegistryError, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
-    Condition, DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
-    InstallKind, LaunchAlternative, LaunchRecipe, LoadOrderDefinition, LoadOrderFormat, LootRule,
-    PackageDefinition, RelPath, RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation,
-    UserFileMapping, UserFileStrategy,
+    Condition, DeploymentStrategy, GameContext, GameDefinition, GameFuture, GameId, GamePackage,
+    GamePath, InstallId, InstallKind, LaunchAlternative, LaunchRecipe, LoadOrderDefinition,
+    LoadOrderFormat, LoadOrderRule, LoadOrderRulesReply, LootRule, PackageDefinition, RelPath,
+    RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -39,6 +40,7 @@ struct Harness {
     def: GameDefinition,
     install_dir: PathBuf,
     install: IdentifiedInstall,
+    facts: Facts,
 }
 
 impl Drop for Harness {
@@ -47,11 +49,70 @@ impl Drop for Harness {
     }
 }
 
-struct TestPackage(PackageDefinition);
+#[derive(Clone)]
+struct PluginFact {
+    masters: Vec<String>,
+    master: bool,
+    light: bool,
+}
+
+type Facts = Arc<Mutex<HashMap<String, PluginFact>>>;
+
+struct TestPackage {
+    definition: PackageDefinition,
+    facts: Facts,
+}
 
 impl GamePackage for TestPackage {
     fn definition(&self) -> &PackageDefinition {
-        &self.0
+        &self.definition
+    }
+
+    /// The test double answers the script rule hook from the plugin bytes the harness added, the
+    /// way the Creation Engine plugin's script does.
+    fn load_order_rules<'a>(
+        &'a self,
+        context: GameContext,
+        _list_id: &'a str,
+    ) -> GameFuture<'a, Option<LoadOrderRulesReply>> {
+        let facts = self.facts.clone();
+        Box::pin(async move {
+            let facts = facts.lock().unwrap();
+            let mut rules = Vec::new();
+            let mut badges = BTreeMap::new();
+            for entry in context.load_order.entries {
+                if !entry.present {
+                    continue;
+                }
+                let Some(fact) = facts.get(&entry.id.to_lowercase()) else {
+                    continue;
+                };
+                let mut marks = Vec::new();
+                if fact.master {
+                    marks.push("Master".to_string());
+                }
+                if fact.light {
+                    marks.push("Light".to_string());
+                }
+                if !marks.is_empty() {
+                    badges.insert(entry.id.clone(), marks);
+                }
+                if entry.enabled {
+                    for master in &fact.masters {
+                        rules.push(LoadOrderRule::Requires {
+                            item: entry.id.clone(),
+                            master: master.clone(),
+                            optional: false,
+                        });
+                    }
+                }
+            }
+            Ok(Some(LoadOrderRulesReply {
+                rules,
+                badges,
+                findings: Vec::new(),
+            }))
+        })
     }
 }
 
@@ -94,6 +155,8 @@ fn plugin_rule() -> LoadOrderDefinition {
             implicit_list_file: None,
             loot: None,
         },
+        intro: None,
+        item_heading: None,
     }
 }
 
@@ -216,13 +279,17 @@ impl Harness {
 
         let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+        let facts: Facts = Arc::new(Mutex::new(HashMap::new()));
         let mut builder = GameRegistry::builder();
         builder
             .add(
                 PackageSource::Compiled {
                     crate_name: "test".into(),
                 },
-                Arc::new(TestPackage(package_of(&def))),
+                Arc::new(TestPackage {
+                    definition: package_of(&def),
+                    facts: facts.clone(),
+                }),
             )
             .expect("register test package");
         let ctx = ctx.with_games(Arc::new(builder.build()));
@@ -235,6 +302,7 @@ impl Harness {
             def,
             install_dir,
             install,
+            facts,
         }
     }
 
@@ -257,6 +325,12 @@ impl Harness {
             let p = dir.path().join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, content).unwrap();
+            if let (Some(file), Some(fact)) = (
+                p.file_name().and_then(|n| n.to_str()),
+                plugin_facts(rel, content),
+            ) {
+                self.facts.lock().unwrap().insert(file.to_lowercase(), fact);
+            }
         }
         agora_core::content_store::add_folder(&self.ctx, dir.path(), Some(name))
             .unwrap()
@@ -815,7 +889,10 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
         PackageSource::Compiled {
             crate_name: "test".into(),
         },
-        Arc::new(TestPackage(package_of(def))),
+        Arc::new(TestPackage {
+            definition: package_of(def),
+            facts: Arc::new(Mutex::new(HashMap::new())),
+        }),
     )
 }
 
@@ -1030,10 +1107,46 @@ fn plugin_file(flags: u32, masters: &[&str]) -> Vec<u8> {
     out
 }
 
+/// The facts the script rule hook would read from a plugin's TES4 header, for the test double.
+fn plugin_facts(path: &str, bytes: &[u8]) -> Option<PluginFact> {
+    if bytes.len() < 24 || &bytes[..4] != b"TES4" {
+        return None;
+    }
+    let data_size = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
+    let flags = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let end = 24usize.checked_add(data_size)?;
+    if bytes.len() < end {
+        return None;
+    }
+    let mut masters = Vec::new();
+    let mut at = 24;
+    while at + 6 <= end {
+        let kind = &bytes[at..at + 4];
+        let size = u16::from_le_bytes(bytes[at + 4..at + 6].try_into().ok()?) as usize;
+        let start = at + 6;
+        if start + size > end {
+            return None;
+        }
+        if kind == b"MAST" {
+            let name = &bytes[start..start + size];
+            let name = &name[..name.iter().position(|b| *b == 0).unwrap_or(name.len())];
+            masters.push(String::from_utf8_lossy(name).into_owned());
+        }
+        at = start + size;
+    }
+    let extension = path.rsplit_once('.').map(|(_, ext)| ext.to_lowercase());
+    let extension = extension.as_deref();
+    Some(PluginFact {
+        masters,
+        master: flags & 0x1 != 0 || matches!(extension, Some("esm") | Some("esl")),
+        light: flags & 0x200 != 0 || extension == Some("esl"),
+    })
+}
+
 fn engine_definition(implicit: &[&str]) -> GameDefinition {
     let mut def = definition();
     let rule = def.load_orders.first_mut().unwrap();
-    rule.rules.kind = "creation_engine".into();
+    rule.rules.kind = "script".into();
     rule.rules.implicit = implicit.iter().map(|s| s.to_string()).collect();
     def
 }
@@ -1193,7 +1306,7 @@ fn a_plugin_the_game_always_loads_is_shown_once_and_is_not_moved() {
     let order = game_load_order::order(&h.ctx, &inst.instance_id, &h.def).unwrap();
     let names: Vec<&str> = order.entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, ["Base.esm", "Patch.esp"]);
-    assert!(order.entries[0].implicit && order.entries[0].master);
+    assert!(order.entries[0].implicit && order.entries[0].badges.iter().any(|b| b == "Master"));
     assert!(order.findings.is_empty(), "{:?}", order.findings);
 
     let report = game_load_order::sort(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
@@ -1462,9 +1575,10 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
         Finding::DuplicateListing {
             plugin: "A.esp".into(),
         },
-        Finding::UnreadableHeader {
-            plugin: "B.esp".into(),
-            reason: "bad".into(),
+        Finding::ListLevel {
+            message: "'B.esp' has a header that cannot be read: bad".into(),
+            items: vec!["B.esp".into()],
+            refuses: false,
         },
     ];
     assert_eq!(
@@ -1491,9 +1605,10 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
         problem: MasterProblem::Missing,
     }];
     assert!(refuse_load_order(missing, false).is_err());
-    let full = vec![Finding::TooManyFullPlugins {
-        active: 255,
-        limit: 254,
+    let full = vec![Finding::ListLevel {
+        message: "255 full plugins are active; the game loads at most 254".into(),
+        items: Vec::new(),
+        refuses: true,
     }];
     assert!(refuse_load_order(full, false).is_err());
 }
@@ -1502,7 +1617,7 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
 fn a_corrupted_saved_masterlist_sorts_by_masters_and_says_so() {
     let mut def = definition();
     let rule = def.load_orders.first_mut().unwrap();
-    rule.rules.kind = "creation_engine".into();
+    rule.rules.kind = "script".into();
     rule.rules.loot = Some(LootRule {
         masterlist_repo: "loot/skyrimse".into(),
         prelude_repo: None,
@@ -1585,7 +1700,7 @@ fn loot_messages_appear_on_the_first_list_read_when_a_masterlist_is_saved() {
 fn with_no_masterlist_sort_says_it_used_masters_only() {
     let mut def = definition();
     let rule = def.load_orders.first_mut().unwrap();
-    rule.rules.kind = "creation_engine".into();
+    rule.rules.kind = "script".into();
     rule.rules.loot = Some(LootRule {
         masterlist_repo: "loot/skyrimse".into(),
         prelude_repo: None,

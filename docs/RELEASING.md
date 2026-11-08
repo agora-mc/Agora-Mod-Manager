@@ -12,8 +12,9 @@ Do not treat a successful catalog release as proof that a desktop package was bu
 
 ## Official plugin releases
 
-Skyrim SE is an official plugin (`packages/official/skyrim-se/`, plugin id
-`agora.creation-engine`), not part of the app build. The `Official plugins` workflow
+Skyrim SE is two official plugins (`packages/official/creation-engine/`, plugin id
+`agora.creation-engine`, and `packages/official/skyrim-se/`, plugin id `agora.skyrim-se`), not part
+of the app build. The workflow builds each folder separately, in any order. The `Official plugins` workflow
 ([`.github/workflows/official-plugins.yml`](../.github/workflows/official-plugins.yml)) runs when
 `packages/official/**` or `registry/official-plugins/**` changes. It builds each package zip
 reproducibly, verifies that `registry/official-plugins/<plugin-id>.json` pins those exact bytes, and

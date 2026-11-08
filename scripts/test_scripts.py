@@ -2991,11 +2991,22 @@ class OfficialPluginPackageTests(unittest.TestCase):
 
     def test_the_skyrim_plugin_declares_one_game_and_game_define(self):
         manifest = bop.plugin_manifest(bop.OFFICIAL_ROOT / "skyrim-se")
-        self.assertEqual(manifest["id"], "agora.creation-engine")
+        self.assertEqual(manifest["id"], "agora.skyrim-se")
         self.assertIn("game:define", manifest["capabilities"]["required"])
+        self.assertEqual(
+            manifest["dependencies"], {"agora.creation-engine": "^0.1"}
+        )
         self.assertEqual(
             bop.game_ids(bop.OFFICIAL_ROOT / "skyrim-se", manifest), ["skyrim-se"]
         )
+
+    def test_the_creation_engine_base_has_no_game_of_its_own(self):
+        folder = bop.OFFICIAL_ROOT / "creation-engine"
+        manifest = bop.plugin_manifest(folder)
+        self.assertEqual(manifest["id"], "agora.creation-engine")
+        self.assertEqual(manifest["entrypoint"], "main.js")
+        self.assertIn("game:read", manifest["capabilities"]["required"])
+        self.assertEqual(bop.game_ids(folder, manifest), [])
 
     def test_the_zip_is_identical_across_builds_and_mtimes(self):
         first = bop.build_zip(self.folder, self.out, "0.1.0").read_bytes()
@@ -3117,7 +3128,7 @@ pub enum LoadOrderRule {
 
     def test_both_package_roots_are_checked(self):
         files = cpd.package_files()
-        self.assertEqual(len(files), 6, [str(path) for path in files])
+        self.assertEqual(len(files), 7, [str(path) for path in files])
         self.assertTrue(any("official" in path.parts for path in files))
         self.assertTrue(any("tracers" in path.parts for path in files))
 

@@ -24,18 +24,17 @@ const row = {
   present: true,
   managed: false,
   locked: false,
-  headerRead: true,
-  master: false,
-  light: false,
+  badges: ['Master'],
   masters: ['Skyrim.esm'],
-  headerError: null,
 };
 
 const view: PluginsView = {
   supported: true,
   listId: 'plugins',
   listName: 'Plugins',
-  rulesKind: 'creation_engine',
+  rulesKind: 'script',
+  intro: null,
+  itemHeading: null,
   hasLoot: true,
   rulesApply: true,
   listExists: true,

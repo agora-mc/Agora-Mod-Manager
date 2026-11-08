@@ -44,6 +44,8 @@ fn plugin_rule() -> LoadOrderDefinition {
             implicit_list_file: None,
             loot: None,
         },
+        intro: None,
+        item_heading: None,
     }
 }
 

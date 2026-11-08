@@ -142,7 +142,6 @@ A game can have any number of ordered lists, or none:
 |---|---|
 | `none` | Any order works, and the player sees no Sort button |
 | `script` | Your script returns rules, and Agora checks them and reports cycles |
-| `creation_engine` | Masters, light plugins and limits. It's the one built-in, and it's moving into a plugin |
 
 A script's rule is `before`, `requires` or `conflicts`, written as JSON from your `load_order_rules` hook:
 
@@ -153,6 +152,25 @@ A script's rule is `before`, `requires` or `conflicts`, written as JSON from you
 ```
 
 With `optional: true`, a rule applies only when both items are present, or both active for `conflicts`. Without it, a missing item is reported to the player.
+
+`load_order_rules` may also return an object, so it can add badges and list-level findings:
+
+```json
+{
+  "rules": [{ "kind": "requires", "item": "Patch.esp", "master": "Skyrim.esm" }],
+  "badges": { "Skyrim.esm": ["Master"], "Light.esl": ["Master", "Light"] },
+  "findings": [
+    { "message": "300 full plugins are active; the game loads at most 254", "refuses": true }
+  ]
+}
+```
+
+- **`badges`** are short flags shown beside an item, keyed by its name. Matching ignores case.
+- **`findings`** are problems about the list as a whole. `items` names the items it is about, and `refuses` stops a launch when true.
+
+A plain list of rules is still accepted.
+
+**`intro`** is the sentence shown above the list. **`item_heading`** is the column heading for an item's name; it defaults to `Name`.
 
 ## Tools
 
@@ -276,6 +294,14 @@ Merging works on the JSON, before the game is read, so a template can be partial
 - **`null`** removes a field.
 
 A package's `frameworks` and `tools` come along from its parents the same way. A missing parent or template, or a cycle, stops that package registering, with a warning naming the chain. Other packages carry on.
+
+### How the Creation Engine plugin is built
+
+[`packages/official/creation-engine`](../../packages/official/creation-engine) is the worked example of a parent plugin. It defines no game. Its `game_templates` entry, `creation-engine`, holds the load-order shape every Creation Engine game shares. Its `main.js` holds `creationEngineRules`, the hook that reads plugin headers and returns masters, badges and the plugin limits.
+
+[`packages/official/skyrim-se`](../../packages/official/skyrim-se) names that package in `parents` and the template in the game's `extends`. It adds only what is Skyrim's: where `Plugins.txt` lives, the implicit plugins, `Skyrim.ccc`, LOOT and the tools. Its plugin depends on `agora.creation-engine`, so turning Skyrim on turns the base on too.
+
+Each behaviour runs in the plugin that wrote it. A hook inherited from the base runs with the base plugin's entrypoint and grants; a hook the child overrides runs with the child's.
 
 ## Known gaps
 
@@ -423,8 +449,8 @@ selected runtime; `user_data` means a known user folder, resolved by Agora.
 | `header` | list of strings | optional | Lines written at the top of a `lines` file |
 | `parse` | string | required for `script` | The function that reads the file |
 | `render` | string | required for `script` | The function that writes the file |
-| `kind` | string | required | `none`, `script` or `creation_engine` |
-| `entry` | string | optional | The function that returns rules for a `script` kind |
+| `kind` | string | required | `none` or `script` |
+| `entry` | string | optional | The function that returns rules for a `script` kind; absent uses `behaviours.load_order_rules` |
 | `implicit` | list of strings | optional | Plugins the game always loads first |
 | `implicit_list_file` | path | optional | A file naming more always-loaded plugins |
 | `loot` | object | optional | LOOT masterlist sources |
@@ -432,6 +458,13 @@ selected runtime; `user_data` means a known user folder, resolved by Agora.
 | `prelude_repo` | string | optional for `loot` | The shared prelude repository, as `owner/repo` |
 | `branch` | string | required for `loot` | The masterlist branch this libloot expects |
 | `game_type` | string | required for `loot` | The game name libloot knows, such as `SkyrimSE` |
+| `intro` | string | optional | A sentence shown above the list |
+| `item_heading` | string | optional | The column heading for an item's name; default `Name` |
+| `badges` | map of string to list of strings | optional | Short flags shown beside an item, in a rules reply |
+| `findings` | list of list findings | optional | Problems about the whole list, in a rules reply |
+| `message` | string | required for a list finding | The finding in one sentence |
+| `items` | list of strings | optional for a list finding | The items it is about |
+| `refuses` | boolean | optional for a list finding | Whether a launch refuses to start |
 
 ### Script load-order rule and line
 

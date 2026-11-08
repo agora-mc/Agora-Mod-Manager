@@ -151,7 +151,7 @@ pub trait GamePackage: Send + Sync {
         &'a self,
         _context: GameContext,
         _list_id: &'a str,
-    ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
+    ) -> GameFuture<'a, Option<LoadOrderRulesReply>> {
         Box::pin(async { Ok(None) })
     }
 

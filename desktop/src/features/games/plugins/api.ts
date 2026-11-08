@@ -21,11 +21,10 @@ export interface PluginRow {
   /** Whether Agora added this line because a content layer deploys it. */
   managed: boolean;
   locked: boolean;
-  headerRead: boolean;
-  master: boolean;
-  light: boolean;
+  /** Short flags the game's rules show beside the item, such as `Master` or `Light`. */
+  badges: string[];
+  /** The items the game's rules say it needs first. */
   masters: string[];
-  headerError: string | null;
 }
 
 export interface PluginFinding {
@@ -61,11 +60,15 @@ export interface PluginsView {
   listId: string;
   /** The list's name as a person reads it. */
   listName: string;
-  /** `none`, `script` or `creation_engine`. */
+  /** `none` or `script`. */
   rulesKind: string;
+  /** This list's intro sentence, when the game declares one. */
+  intro: string | null;
+  /** The column heading for an item's name, when the game declares one. */
+  itemHeading: string | null;
   /** Whether this list declares a LOOT masterlist source. */
   hasLoot: boolean;
-  /** Whether the game's load order rules (masters, light and full limits) apply. */
+  /** Whether the game's own rules judge this list, so it can be sorted. */
   rulesApply: boolean;
   /** False until the instance has a copy of the list, which is made at deploy time. */
   listExists: boolean;
@@ -152,11 +155,8 @@ function isPluginRow(value: unknown): value is PluginRow {
     && typeof value.present === 'boolean'
     && typeof value.managed === 'boolean'
     && typeof value.locked === 'boolean'
-    && typeof value.headerRead === 'boolean'
-    && typeof value.master === 'boolean'
-    && typeof value.light === 'boolean'
-    && isStringArray(value.masters)
-    && (value.headerError === null || typeof value.headerError === 'string');
+    && isStringArray(value.badges)
+    && isStringArray(value.masters);
 }
 
 function isPluginFinding(value: unknown): value is PluginFinding {

@@ -606,6 +606,12 @@ pub struct LoadOrderDefinition {
     pub items: LoadOrderItems,
     pub format: LoadOrderFormat,
     pub rules: LoadOrderRules,
+    /// A sentence shown above the list, when the game has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intro: Option<String>,
+    /// The column heading for an item's name. Absent means `Name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_heading: Option<String>,
 }
 
 /// What a load order lists.
@@ -667,8 +673,7 @@ impl LoadOrderFormat {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoadOrderRules {
-    /// `none` (any order works), `script` or `creation_engine`. Any other value is refused at
-    /// registration.
+    /// `none` (any order works) or `script`. Any other value is refused at registration.
     pub kind: String,
     /// The plugin entrypoint a `script` rule set calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2336,6 +2341,10 @@ pub struct LoadOrderEntry {
     pub id: String,
     pub enabled: bool,
     pub locked: bool,
+    /// Whether the item's file is where the game looks for it. An entry the list names but the
+    /// folder does not have is shown, but its rules cannot read it.
+    #[serde(default)]
+    pub present: bool,
 }
 
 /// One line a `script` load order format reads or writes (MASTER_SPEC §30.12): the item's name as
@@ -2382,6 +2391,37 @@ impl LoadOrderRule {
             | Self::Conflicts { optional, .. } => *optional,
         }
     }
+}
+
+/// What a `load_order_rules` hook replies (MASTER_SPEC §30.12). A bare array of rules is still
+/// accepted, because that was the whole reply before badges and list findings existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadOrderRulesReply {
+    /// The rules the order must follow.
+    #[serde(default)]
+    pub rules: Vec<LoadOrderRule>,
+    /// Short flags shown beside an item, keyed by the item's name in the list. Case-insensitive.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub badges: BTreeMap<String, Vec<String>>,
+    /// Problems about the list as a whole. Unlike a rule finding they are not derived from an
+    /// item pair, and they may carry an action (a launch refusal) chosen by the game.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<ListFinding>,
+}
+
+/// A problem a `load_order_rules` hook reports about the list as a whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListFinding {
+    /// One sentence for a person.
+    pub message: String,
+    /// The items the finding is about. Empty when it concerns the list itself, such as a limit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+    /// Whether a launch refuses to start for this finding. The default is a warning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refuses: bool,
 }
 
 #[cfg(test)]

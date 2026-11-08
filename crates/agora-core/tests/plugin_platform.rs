@@ -156,6 +156,9 @@ fn a_rule_kind_of_anything_else_is_refused() {
                 implicit_list_file: None,
                 loot: None,
             },
+
+            intro: None,
+            item_heading: None,
         });
     assert!(matches!(
         register(package),

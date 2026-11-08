@@ -261,7 +261,8 @@ fn a_real_plugin_supplies_every_platform_hook() {
     // Script rules, format and diagnostics each answer with a marker only the script has.
     let rules = block_on(package.load_order_rules(context.clone(), "plugins"))
         .expect("rules run")
-        .expect("the script supplies rules");
+        .expect("the script supplies rules")
+        .rules;
     assert_eq!(
         rules,
         vec![LoadOrderRule::Before {

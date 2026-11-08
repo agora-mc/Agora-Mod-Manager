@@ -21,8 +21,8 @@ use agora_core::game_registry::{
 use agora_game_api::{
     DeploymentStrategy, GameContext, GameDefinition, GameError, GameFuture, GameId, GamePackage,
     GamePath, InstallId, InstallKind, LoadOrderDefinition, LoadOrderFormat, LoadOrderLine,
-    LoadOrderRule, LoadOrderRules, PackageDefinition, RelPath, RuntimeIdentity, StoreId,
-    StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
+    LoadOrderRule, LoadOrderRules, LoadOrderRulesReply, PackageDefinition, RelPath,
+    RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -51,7 +51,7 @@ impl GamePackage for TestPackage {
         &'a self,
         _context: GameContext,
         _list_id: &'a str,
-    ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
+    ) -> GameFuture<'a, Option<LoadOrderRulesReply>> {
         let hooks = self.hooks.clone();
         Box::pin(async move {
             if hooks.fail_rules {
@@ -60,7 +60,10 @@ impl GamePackage for TestPackage {
                     message: "the script rules failed on purpose".into(),
                 });
             }
-            Ok(Some(hooks.rules))
+            Ok(Some(LoadOrderRulesReply {
+                rules: hooks.rules,
+                ..Default::default()
+            }))
         })
     }
 
@@ -168,6 +171,8 @@ fn lines_rule(id: &str, file: &str) -> LoadOrderDefinition {
             implicit_list_file: None,
             loot: None,
         },
+        intro: None,
+        item_heading: None,
     }
 }
 
@@ -193,6 +198,8 @@ fn script_rule(id: &str, file: &str, kind: &str) -> LoadOrderDefinition {
             implicit_list_file: None,
             loot: None,
         },
+        intro: None,
+        item_heading: None,
     }
 }
 

@@ -1906,17 +1906,73 @@ impl PluginService {
 
     pub fn set_enabled(&self, plugin_id: &PluginId, enabled: bool) -> LauncherResult<()> {
         let conn = self.inner.conn()?;
-        if !store::set_enabled(&conn, plugin_id, enabled, &now(&self.inner.ctx))? {
-            return Err(LauncherError::Generic {
-                code: "ERR_PLUGIN_NOT_FOUND".into(),
-                message: format!("`{plugin_id}` is not installed"),
-            });
-        }
-        // Clearing the recorded failure is what makes "turn it off and on
-        // again" a real recovery rather than a no-op.
+        let records = store::list(&conn)?;
+        let name_of = |id: &PluginId| {
+            records
+                .iter()
+                .find(|record| record.id() == id)
+                .map(|record| record.manifest.name.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+
         if enabled {
-            store::set_last_error(&conn, plugin_id, None)?;
+            // Turning a plugin on brings the plugins it depends on along, because without them it
+            // cannot work. A dependency that is not installed is left to the resolver, which says
+            // why the plugin is not available.
+            let mut wanted = vec![plugin_id.clone()];
+            let mut seen: std::collections::BTreeSet<PluginId> =
+                std::iter::once(plugin_id.clone()).collect();
+            let mut index = 0;
+            while index < wanted.len() {
+                let current = wanted[index].clone();
+                index += 1;
+                let Some(record) = records.iter().find(|record| record.id() == &current) else {
+                    continue;
+                };
+                for dependency in record.manifest.dependencies.keys() {
+                    if seen.insert(dependency.clone())
+                        && records.iter().any(|record| record.id() == dependency)
+                    {
+                        wanted.push(dependency.clone());
+                    }
+                }
+            }
+            for id in &wanted {
+                let changed = store::set_enabled(&conn, id, true, &now(&self.inner.ctx))?;
+                if id == plugin_id && !changed {
+                    return Err(LauncherError::Generic {
+                        code: "ERR_PLUGIN_NOT_FOUND".into(),
+                        message: format!("`{plugin_id}` is not installed"),
+                    });
+                }
+                // Clearing the recorded failure is what makes "turn it off and on
+                // again" a real recovery rather than a no-op.
+                store::set_last_error(&conn, id, None)?;
+            }
         } else {
+            // A plugin another enabled plugin needs cannot be turned off on its own: that would
+            // leave the other one unable to run with no explanation of why.
+            if let Some(dependent) = records.iter().find(|record| {
+                record.enabled
+                    && record.id() != plugin_id
+                    && record.manifest.dependencies.contains_key(plugin_id)
+            }) {
+                return Err(LauncherError::Generic {
+                    code: "ERR_PLUGIN_NEEDED".into(),
+                    message: format!(
+                        "{} is needed by {}. Turn {} off first.",
+                        name_of(plugin_id),
+                        name_of(dependent.id()),
+                        name_of(dependent.id())
+                    ),
+                });
+            }
+            if !store::set_enabled(&conn, plugin_id, false, &now(&self.inner.ctx))? {
+                return Err(LauncherError::Generic {
+                    code: "ERR_PLUGIN_NOT_FOUND".into(),
+                    message: format!("`{plugin_id}` is not installed"),
+                });
+            }
             self.deactivate(plugin_id)?;
         }
         self.reload()

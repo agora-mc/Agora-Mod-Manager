@@ -94,17 +94,19 @@ entry whose bytes do not match its pinned size or sha256.
 
 ## Official plugin packages
 
-Skyrim SE ships as an official plugin in `packages/official/skyrim-se/`, not as a compiled package.
-The desktop and CLI register only Minecraft; Skyrim arrives from the installed plugin. To use it
-locally, install the folder as a development plugin and turn community plugins on, as described in
+Skyrim SE ships as two official plugins: the Creation Engine base in
+`packages/official/creation-engine/` and Skyrim in `packages/official/skyrim-se/`. Neither is a
+compiled package. The desktop and CLI register only Minecraft; Skyrim arrives from the installed
+plugin, which names the base as a dependency. To use them locally, install both folders as
+development plugins, base first, and turn community plugins on, as described in
 [plugins/README.md](plugins/README.md#official-plugins-in-this-repository).
 
-Build the release zip with `python scripts/build_official_plugin.py skyrim-se`. Entries are sorted,
-stored uncompressed and given a fixed timestamp and mode, so the SHA-256 is the same across builds
-and checkouts. `--verify-registry` checks that
-`registry/official-plugins/agora.creation-engine.json` pins those exact bytes;
-`--update-registry` rewrites the entry from the build. The `Official plugins` workflow attaches the
-zip to an `official-skyrim-se-v<version>` release.
+Build each release zip with `python scripts/build_official_plugin.py <folder>`, for example
+`creation-engine` or `skyrim-se`. Entries are sorted, stored uncompressed and given a fixed
+timestamp and mode, so the SHA-256 is the same across builds and checkouts. `--verify-registry`
+checks that `registry/official-plugins/<plugin id>.json` pins those exact bytes;
+`--update-registry` rewrites the entry from the build. The `Official plugins` workflow attaches each
+zip to its own `official-<folder>-v<version>` release.
 
 ## Environment boundaries
 

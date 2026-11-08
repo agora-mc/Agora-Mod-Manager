@@ -41,6 +41,13 @@ impl GamePackage for TestPackage {
     fn definition(&self) -> &PackageDefinition {
         &self.0
     }
+    fn load_order_rules<'a>(
+        &'a self,
+        _context: agora_game_api::GameContext,
+        _list_id: &'a str,
+    ) -> agora_game_api::GameFuture<'a, Option<agora_game_api::LoadOrderRulesReply>> {
+        Box::pin(async { Ok(Some(agora_game_api::LoadOrderRulesReply::default())) })
+    }
 }
 
 /// Starts a tool with its staging folder as its working folder, as the fake VFS would.
@@ -167,12 +174,15 @@ fn definition(tools: &[ToolDefinition]) -> GameDefinition {
                 header: vec![],
             },
             rules: agora_game_api::LoadOrderRules {
-                kind: "creation_engine".to_string(),
+                kind: "script".to_string(),
                 entry: None,
                 implicit: Vec::new(),
                 implicit_list_file: None,
                 loot: None,
             },
+
+            intro: None,
+            item_heading: None,
         }],
         runtime_files: Vec::new(),
         save_location: Vec::new(),

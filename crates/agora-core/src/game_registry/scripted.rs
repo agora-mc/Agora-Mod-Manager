@@ -17,12 +17,14 @@
 
 use agora_game_api::{
     Behaviours, Diagnostic, DownloadRecognition, GameContext, GameError, GameFuture, GameInstall,
-    GamePackage, LoadOrderLine, LoadOrderRule, PackageDefinition as PackageDefinitionType, RelPath,
+    GamePackage, LoadOrderLine, PackageDefinition as PackageDefinitionType, RelPath,
     RuntimeIdentity, Suggestion,
 };
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
 use agora_plugin_api::host::GameReads;
 use agora_plugin_api::manifest::PluginId;
+
+use crate::game_registry::inherit::BehaviourOwners;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -108,6 +110,7 @@ pub struct ScriptedPackage {
     definition: PackageDefinitionType,
     plugin_id: PluginId,
     behaviours: Behaviours,
+    owners: BehaviourOwners,
     runtime: BehaviourRuntime,
 }
 
@@ -115,6 +118,7 @@ impl ScriptedPackage {
     pub fn new(
         definition: PackageDefinitionType,
         plugin_id: PluginId,
+        owners: BehaviourOwners,
         runtime: BehaviourRuntime,
     ) -> Self {
         let behaviours = definition.behaviours.clone().unwrap_or_default();
@@ -122,8 +126,39 @@ impl ScriptedPackage {
             definition,
             plugin_id,
             behaviours,
+            owners,
             runtime,
         }
+    }
+
+    /// The plugin whose script runs one behaviour: the one that declared it, or this package's
+    /// own when it did not come from a parent.
+    fn owner(&self, plugin: Option<&str>) -> Result<PluginId, GameError> {
+        match plugin {
+            None => Ok(self.plugin_id.clone()),
+            Some(id) if id == self.plugin_id.as_str() => Ok(self.plugin_id.clone()),
+            Some(id) => PluginId::parse(id).map_err(|error| GameError {
+                code: "ERR_GAME_SCRIPT_OWNER".into(),
+                message: format!("the plugin that owns a script hook cannot be named: {error}"),
+            }),
+        }
+    }
+
+    fn behaviour_owner(&self, field: &str) -> Result<PluginId, GameError> {
+        self.owner(self.owners.behaviour(field))
+    }
+
+    fn script_owner(&self, game: &str, list: &str, slot: &str) -> Result<PluginId, GameError> {
+        self.owner(self.owners.script(game, list, slot))
+    }
+
+    /// The game a list id belongs to, so an inherited script slot can name its owner.
+    fn game_of_list(&self, list_id: &str) -> Option<&str> {
+        self.definition
+            .games
+            .iter()
+            .find(|game| game.load_orders.iter().any(|order| order.id == list_id))
+            .map(|game| game.id.as_str())
     }
 
     fn invoker(&self) -> Result<Arc<dyn BehaviourInvoker>, GameError> {
@@ -133,9 +168,9 @@ impl ScriptedPackage {
         })
     }
 
-    fn report(&self, message: &str) {
+    fn report(&self, plugin: &PluginId, message: &str) {
         if let Some(invoker) = self.runtime.invoker() {
-            invoker.report(&self.plugin_id, message);
+            invoker.report(plugin, message);
         }
     }
 
@@ -147,15 +182,19 @@ impl ScriptedPackage {
     /// guess.
     fn call_optional(
         &self,
+        plugin: &PluginId,
         export: &str,
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>, GameError> {
         let invoker = self.invoker()?;
-        match invoker.invoke_hook(&self.plugin_id, export, args, HOOK_TIMEOUT) {
+        match invoker.invoke_hook(plugin, export, args, HOOK_TIMEOUT) {
             Ok(value) if value.is_null() => Ok(None),
             Ok(value) => Ok(Some(value)),
             Err(error) if carries_on(&error) => {
-                self.report(&format!("`{export}` did not complete: {}", error.message));
+                self.report(
+                    plugin,
+                    &format!("`{export}` did not complete: {}", error.message),
+                );
                 Ok(None)
             }
             Err(error) => Err(GameError {
@@ -169,29 +208,33 @@ impl ScriptedPackage {
     /// error here, never `None`: collapsing it would read as a clean answer.
     fn call_required(
         &self,
+        plugin: &PluginId,
         export: &str,
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>, GameError> {
         let invoker = self.invoker()?;
-        match invoker.invoke_hook(&self.plugin_id, export, args, HOOK_TIMEOUT) {
+        match invoker.invoke_hook(plugin, export, args, HOOK_TIMEOUT) {
             Ok(value) if value.is_null() => Ok(None),
             Ok(value) => Ok(Some(value)),
             Err(error) => {
-                self.report(&format!("`{export}` did not complete: {}", error.message));
+                self.report(
+                    plugin,
+                    &format!("`{export}` did not complete: {}", error.message),
+                );
                 Err(GameError {
                     code: "ERR_GAME_HOOK_FAILED".into(),
-                    message: format!("{} `{export}` failed: {}", self.plugin_id, error.message),
+                    message: format!("{plugin} `{export}` failed: {}", error.message),
                 })
             }
         }
     }
 
-    fn warning(&self, export: &str, error: &GameError) -> Diagnostic {
+    fn warning(&self, plugin: &PluginId, export: &str, error: &GameError) -> Diagnostic {
         Diagnostic {
             code: "ERR_GAME_HOOK_FAILED".into(),
             message: format!(
-                "{} could not run its `{export}` check: {}. This check was not completed.",
-                self.plugin_id, error.message
+                "{plugin} could not run its `{export}` check: {}. This check was not completed.",
+                error.message
             ),
             severity: agora_game_api::DiagnosticSeverity::Warning,
             repairs: Vec::new(),
@@ -239,8 +282,9 @@ impl GamePackage for ScriptedPackage {
             let Some(export) = self.behaviours.detect_runtime.as_deref() else {
                 return Ok(None);
             };
+            let plugin = self.behaviour_owner("detect_runtime")?;
             let args = self.game_script_args("install", install);
-            let Some(value) = self.call_optional(export, args)? else {
+            let Some(value) = self.call_optional(&plugin, export, args)? else {
                 return Ok(None);
             };
             self.parse(export, value).map(Some)
@@ -257,12 +301,13 @@ impl GamePackage for ScriptedPackage {
             let Some(export) = self.behaviours.classify.as_deref() else {
                 return Ok(None);
             };
+            let plugin = self.behaviour_owner("classify")?;
             let args = serde_json::json!({
                 "context": context,
                 "itemName": item_name,
                 "files": files,
             });
-            let Some(value) = self.call_required(export, args)? else {
+            let Some(value) = self.call_required(&plugin, export, args)? else {
                 return Ok(None);
             };
             self.parse(export, value).map(Some)
@@ -276,17 +321,19 @@ impl GamePackage for ScriptedPackage {
         entries: &[String],
     ) -> Option<DownloadRecognition> {
         let export = self.behaviours.recognize_download.as_deref()?.to_string();
+        let plugin_id = self
+            .owner(self.owners.behaviour("recognize_download"))
+            .ok()?;
         let Some(invoker) = self.runtime.invoker() else {
             // Before the plugin service starts nothing is known about this
             // file. Reporting it as "not recognised" would be a wrong answer;
             // it is skipped and asked again on the next scan.
-            self.report(&format!(
+            self.report(&plugin_id, &format!(
                 "`{export}` could not run: the plugin runtime is not available yet; recognition                  was skipped this time"
             ));
             return None;
         };
         let args = serde_json::json!({ "fileName": file_name, "entries": entries });
-        let plugin_id = self.plugin_id.clone();
 
         // This runs on the download watcher's thread. A slow script must not
         // hold that thread, so the call is made on a helper thread and the
@@ -294,11 +341,12 @@ impl GamePackage for ScriptedPackage {
         // answered by then the answer is "not recognised this time"; the
         // script keeps running and is stopped by its own timeout.
         let report_export = export.clone();
+        let hook_plugin = plugin_id.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let spawned = std::thread::Builder::new()
             .name("agora-recognize".into())
             .spawn(move || {
-                let value = invoker.invoke_hook(&plugin_id, &export, args, RECOGNIZE_TIMEOUT);
+                let value = invoker.invoke_hook(&hook_plugin, &export, args, RECOGNIZE_TIMEOUT);
                 let _ = tx.send(value);
             });
         if spawned.is_err() {
@@ -312,21 +360,21 @@ impl GamePackage for ScriptedPackage {
                     // The trait gives no way to return an error here, so the
                     // malformed reply is reported rather than silently treated
                     // as "not this game's content".
-                    self.report(&format!(
+                    self.report(&plugin_id, &format!(
                         "`{report_export}` returned a download recognition Agora could not read: {error}"
                     ));
                     None
                 }
             },
             Ok(Err(error)) => {
-                self.report(&format!(
-                    "`{report_export}` did not complete: {}",
-                    error.message
-                ));
+                self.report(
+                    &plugin_id,
+                    &format!("`{report_export}` did not complete: {}", error.message),
+                );
                 None
             }
             Err(_) => {
-                self.report(&format!(
+                self.report(&plugin_id, &format!(
                     "`{report_export}` did not answer within {}ms; recognition was skipped this time",
                     RECOGNIZE_TIMEOUT.as_millis()
                 ));
@@ -339,24 +387,38 @@ impl GamePackage for ScriptedPackage {
         &'a self,
         context: GameContext,
         list_id: &'a str,
-    ) -> GameFuture<'a, Option<Vec<LoadOrderRule>>> {
+    ) -> GameFuture<'a, Option<agora_game_api::LoadOrderRulesReply>> {
         Box::pin(async move {
-            let export = self
+            let order = self
                 .definition
                 .games
                 .iter()
                 .flat_map(|game| game.load_orders.iter())
-                .find(|order| order.id == list_id)
-                .and_then(|order| order.rules.entry.clone())
-                .or_else(|| self.behaviours.load_order_rules.clone());
-            let Some(export) = export else {
-                return Ok(None);
+                .find(|order| order.id == list_id);
+            let (export, plugin) = match order.and_then(|order| order.rules.entry.clone()) {
+                Some(export) => {
+                    let game = self.game_of_list(list_id).unwrap_or_default();
+                    (export, self.script_owner(game, list_id, "rules")?)
+                }
+                None => match self.behaviours.load_order_rules.clone() {
+                    Some(export) => (export, self.behaviour_owner("load_order_rules")?),
+                    None => return Ok(None),
+                },
             };
             let args = serde_json::json!({ "context": context, "listId": list_id });
-            let Some(value) = self.call_required(&export, args)? else {
+            let Some(value) = self.call_required(&plugin, &export, args)? else {
                 return Ok(None);
             };
-            self.parse(&export, value).map(Some)
+            // A bare array was the whole reply before badges and findings existed.
+            let reply = if value.is_array() {
+                agora_game_api::LoadOrderRulesReply {
+                    rules: self.parse(&export, value)?,
+                    ..Default::default()
+                }
+            } else {
+                self.parse(&export, value)?
+            };
+            Ok(Some(reply))
         })
     }
 
@@ -365,14 +427,15 @@ impl GamePackage for ScriptedPackage {
             let Some(export) = self.behaviours.diagnostics.as_deref() else {
                 return Ok(Vec::new());
             };
+            let plugin = self.behaviour_owner("diagnostics")?;
             let args = self.game_script_args("context", context);
-            match self.call_required(export, args) {
+            match self.call_required(&plugin, export, args) {
                 Ok(None) => Ok(Vec::new()),
                 Ok(Some(value)) => match self.parse(export, value) {
                     Ok(diagnostics) => Ok(diagnostics),
-                    Err(error) => Ok(vec![self.warning(export, &error)]),
+                    Err(error) => Ok(vec![self.warning(&plugin, export, &error)]),
                 },
-                Err(error) => Ok(vec![self.warning(export, &error)]),
+                Err(error) => Ok(vec![self.warning(&plugin, export, &error)]),
             }
         })
     }
@@ -385,8 +448,9 @@ impl GamePackage for ScriptedPackage {
             let Some(export) = self.behaviours.prepare_launch.as_deref() else {
                 return Ok(None);
             };
+            let plugin = self.behaviour_owner("prepare_launch")?;
             let args = self.game_script_args("context", context);
-            let Some(value) = self.call_required(export, args)? else {
+            let Some(value) = self.call_required(&plugin, export, args)? else {
                 return Ok(None);
             };
             self.parse(export, value).map(Some)
@@ -400,7 +464,7 @@ impl GamePackage for ScriptedPackage {
         bytes: Vec<u8>,
     ) -> GameFuture<'a, Option<Vec<LoadOrderLine>>> {
         Box::pin(async move {
-            let Some(export) = self.script_format_export(list_id, true) else {
+            let Some((export, plugin)) = self.script_format_export(list_id, true) else {
                 return Ok(None);
             };
             let args = serde_json::json!({
@@ -408,7 +472,7 @@ impl GamePackage for ScriptedPackage {
                 "listId": list_id,
                 "bytes": bytes,
             });
-            let Some(value) = self.call_required(&export, args)? else {
+            let Some(value) = self.call_required(&plugin, &export, args)? else {
                 return Ok(None);
             };
             self.parse(&export, value).map(Some)
@@ -422,7 +486,7 @@ impl GamePackage for ScriptedPackage {
         lines: Vec<LoadOrderLine>,
     ) -> GameFuture<'a, Option<Vec<u8>>> {
         Box::pin(async move {
-            let Some(export) = self.script_format_export(list_id, false) else {
+            let Some((export, plugin)) = self.script_format_export(list_id, false) else {
                 return Ok(None);
             };
             let args = serde_json::json!({
@@ -430,7 +494,7 @@ impl GamePackage for ScriptedPackage {
                 "listId": list_id,
                 "lines": lines,
             });
-            let Some(value) = self.call_required(&export, args)? else {
+            let Some(value) = self.call_required(&plugin, &export, args)? else {
                 return Ok(None);
             };
             // A script may return text or an array of byte values.
@@ -444,9 +508,10 @@ impl GamePackage for ScriptedPackage {
 }
 
 impl ScriptedPackage {
-    /// The parse or render export a list's script format names.
-    fn script_format_export(&self, list_id: &str, parse: bool) -> Option<String> {
-        self.definition
+    /// The parse or render export a list's script format names, and its owning plugin.
+    fn script_format_export(&self, list_id: &str, parse: bool) -> Option<(String, PluginId)> {
+        let export = self
+            .definition
             .games
             .iter()
             .flat_map(|game| game.load_orders.iter())
@@ -456,7 +521,11 @@ impl ScriptedPackage {
                     Some(if parse { p.clone() } else { render.clone() })
                 }
                 agora_game_api::LoadOrderFormat::Lines { .. } => None,
-            })
+            })?;
+        let game = self.game_of_list(list_id).unwrap_or_default();
+        let slot = if parse { "parse" } else { "render" };
+        let plugin = self.script_owner(game, list_id, slot).ok()?;
+        Some((export, plugin))
     }
 }
 
@@ -480,6 +549,62 @@ pub fn needs_entrypoint(definition: &PackageDefinitionType) -> Option<&'static s
             .any(|order| order.format.is_script() || order.rules.is_script())
         {
             return Some("it names a script load order");
+        }
+    }
+    None
+}
+
+/// The first script entrypoint whose owning plugin has no entrypoint to run it. An inherited
+/// behaviour belongs to the parent plugin, so the parent's entrypoint is what matters.
+pub fn missing_entrypoint(
+    definition: &PackageDefinitionType,
+    own_plugin: &str,
+    owners: &BehaviourOwners,
+    has_entrypoint: &std::collections::BTreeMap<String, bool>,
+) -> Option<(String, &'static str)> {
+    let has = |plugin: &str| has_entrypoint.get(plugin).copied().unwrap_or(false);
+    if let Some(behaviours) = &definition.behaviours {
+        for (field, named) in [
+            ("detect_runtime", behaviours.detect_runtime.is_some()),
+            ("classify", behaviours.classify.is_some()),
+            (
+                "recognize_download",
+                behaviours.recognize_download.is_some(),
+            ),
+            ("load_order_rules", behaviours.load_order_rules.is_some()),
+            ("diagnostics", behaviours.diagnostics.is_some()),
+            ("prepare_launch", behaviours.prepare_launch.is_some()),
+        ] {
+            if named {
+                let owner = owners.behaviour(field).unwrap_or(own_plugin);
+                if !has(owner) {
+                    return Some((owner.to_string(), "it names script behaviours"));
+                }
+            }
+        }
+    }
+    for game in &definition.games {
+        for order in &game.load_orders {
+            let slots: &[&str] = match &order.format {
+                agora_game_api::LoadOrderFormat::Script { .. } => &["parse", "render"],
+                agora_game_api::LoadOrderFormat::Lines { .. } => &[],
+            };
+            for slot in slots {
+                let owner = owners
+                    .script(game.id.as_str(), &order.id, slot)
+                    .unwrap_or(own_plugin);
+                if !has(owner) {
+                    return Some((owner.to_string(), "it names a script load order format"));
+                }
+            }
+            if order.rules.entry.is_some() {
+                let owner = owners
+                    .script(game.id.as_str(), &order.id, "rules")
+                    .unwrap_or(own_plugin);
+                if !has(owner) {
+                    return Some((owner.to_string(), "it names script load order rules"));
+                }
+            }
         }
     }
     None
@@ -607,7 +732,12 @@ mod tests {
         runtime.install(invoker);
         // `definition` is our own type; construct the scripted package without
         // going through the registry helper so the test stays a unit test.
-        ScriptedPackage::new(definition, PluginId::parse("acme.test").unwrap(), runtime)
+        ScriptedPackage::new(
+            definition,
+            PluginId::parse("acme.test").unwrap(),
+            BehaviourOwners::default(),
+            runtime,
+        )
     }
 
     fn install() -> GameInstall {
@@ -730,6 +860,7 @@ mod tests {
         let package = ScriptedPackage::new(
             definition_with(serde_json::json!({ "detect_runtime": "detect" })),
             PluginId::parse("acme.test").unwrap(),
+            BehaviourOwners::default(),
             runtime.clone(),
         );
         // Before the plugin service exists the answer is unknown, not "no

@@ -363,54 +363,68 @@ impl CoreContext {
                                 }
                                 _ => None,
                             };
-                            let entrypoint = plugin_id
-                                .as_deref()
-                                .and_then(|id| has_entrypoint.get(id).copied())
-                                .unwrap_or(false);
-                            if let Some(reason) = crate::game_registry::scripted::needs_entrypoint(
+                            let names_script = crate::game_registry::scripted::needs_entrypoint(
                                 &package.definition,
-                            ) {
-                                if !entrypoint {
+                            )
+                            .is_some();
+                            if names_script {
+                                let Some(own_plugin) = plugin_id.as_deref() else {
                                     warnings.push(format!(
-                                        "{}: skipped, because {reason} but the plugin has no entrypoint to run",
+                                        "{}: skipped, because it names a script hook but has no plugin to run it",
+                                        package.label
+                                    ));
+                                    continue;
+                                };
+                                if let Some((owner, why)) =
+                                    crate::game_registry::scripted::missing_entrypoint(
+                                        &package.definition,
+                                        own_plugin,
+                                        &package.owners,
+                                        &has_entrypoint,
+                                    )
+                                {
+                                    warnings.push(format!(
+                                        "{}: skipped, because {why} but plugin {owner} has no entrypoint to run it",
                                         package.label
                                     ));
                                     continue;
                                 }
                             }
+                            // A base package with no games exists only for its children to inherit
+                            // from. It is not a game package and has nothing to register.
+                            if package.definition.games.is_empty() {
+                                continue;
+                            }
                             let source = package.source.clone();
                             let label = package.label.clone();
-                            let package: Arc<dyn agora_game_api::GamePackage> = match (
-                                &package.source,
-                                package
-                                    .definition
-                                    .behaviours
-                                    .as_ref()
-                                    .is_some_and(agora_game_api::Behaviours::names_any),
-                            ) {
-                                (
-                                    crate::game_registry::PackageSource::Plugin { plugin_id },
-                                    true,
-                                ) => match agora_plugin_api::manifest::PluginId::parse(plugin_id) {
-                                    Ok(id) => Arc::new(
-                                        crate::game_registry::scripted::ScriptedPackage::new(
-                                            package.definition,
-                                            id,
-                                            behaviour_runtime.clone(),
+                            let package: Arc<dyn agora_game_api::GamePackage> =
+                                match (&package.source, names_script) {
+                                    (
+                                        crate::game_registry::PackageSource::Plugin { plugin_id },
+                                        true,
+                                    ) => match agora_plugin_api::manifest::PluginId::parse(
+                                        plugin_id,
+                                    ) {
+                                        Ok(id) => Arc::new(
+                                            crate::game_registry::scripted::ScriptedPackage::new(
+                                                package.definition,
+                                                id,
+                                                package.owners.clone(),
+                                                behaviour_runtime.clone(),
+                                            ),
                                         ),
-                                    ),
-                                    Err(error) => {
-                                        warnings.push(format!(
-                                            "{}: skipped, because its plugin id is invalid: {}",
-                                            label, error.message
-                                        ));
-                                        continue;
-                                    }
-                                },
-                                _ => Arc::new(crate::game_registry::DeclarativePackage(
-                                    package.definition,
-                                )),
-                            };
+                                        Err(error) => {
+                                            warnings.push(format!(
+                                                "{}: skipped, because its plugin id is invalid: {}",
+                                                label, error.message
+                                            ));
+                                            continue;
+                                        }
+                                    },
+                                    _ => Arc::new(crate::game_registry::DeclarativePackage(
+                                        package.definition,
+                                    )),
+                                };
                             if let Err(err) = game_builder.add(source, package) {
                                 warnings.push(format!(
                                     "{}: rejected game package: {err}. A game or store product \

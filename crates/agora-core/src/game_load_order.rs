@@ -1,24 +1,25 @@
-//! The Creation Engine load order (MASTER_SPEC §26.6): the order the game loads an instance's
-//! plugins in, the findings the engine's rules raise against that order, and the sort, move and
-//! lock operations that change it.
+//! Load orders (MASTER_SPEC §26.6, §30.12): the order a game loads an instance's items in, the
+//! findings its rules raise against that order, and the sort, move and lock operations that
+//! change it.
 //!
 //! Core owns the ordered list, its locks and its writes ([`crate::game_plugins`]). The meaning
-//! belongs to the game: a [`LoadOrderDefinition`] with `rules.kind = "creation_engine"` turns on the
-//! master, light and limit rules here. Plugin headers come from LOOT's `esplugin` crate, read from
-//! the files the game will see: the deployment plan's source for each plugin in the plugin folder.
+//! belongs to the game: a `script` list's `load_order_rules` hook returns the rules, the badges
+//! shown beside items, and any findings about the list as a whole. Core checks the rules, reports
+//! cycles, and sorts. It knows nothing about a particular engine's file formats.
 //!
-//! The order is the rule's `implicit` plugins (and those its `implicit_list_file` names) that are
-//! present, then the instance's own list in its order. Implicit plugins are never written into
-//! the list. Locked and implicit plugins keep their positions when others are sorted or moved:
-//! free plugins trade places only among the positions that no locked or implicit plugin holds.
+//! The order is the rule's `implicit` items (and those its `implicit_list_file` names) that are
+//! present, then the instance's own list in its order. Implicit items are never written into
+//! the list. Locked and implicit items keep their positions when others are sorted or moved:
+//! free items trade places only among the positions that no locked or implicit item holds.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use agora_game_api::{
-    fold_path_case, glob_match, GameContext, GameDefinition, GamePackage, LoadOrderDefinition,
-    LoadOrderLine, LoadOrderRule,
+    fold_path_case, glob_match, GameContext, GameDefinition, GamePackage, ListFinding,
+    LoadOrderDefinition, LoadOrderLine, LoadOrderRule, LoadOrderRulesReply,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,12 +28,6 @@ use crate::game_deploy::{self, DeployMode, DeploymentPlan};
 use crate::game_plugins::{self, PluginEntry, PluginListError};
 use crate::lock_manager::LockResource;
 
-/// The `semantics` value that turns the Creation Engine rules on.
-pub const CREATION_ENGINE: &str = "creation_engine";
-/// The engine loads at most this many full (non-light) plugins, implicit ones included.
-pub const FULL_PLUGIN_LIMIT: usize = 254;
-/// The engine loads at most this many light plugins (`.esl` or the light flag).
-pub const LIGHT_PLUGIN_LIMIT: usize = 4096;
 /// What a sort says when it could not use LOOT's masterlist.
 pub const MASTERS_ONLY_MESSAGE: &str =
     "Sorted by masters only. Download LOOT's masterlist for a full sort.";
@@ -119,17 +114,12 @@ pub struct LoadOrderEntry {
     pub managed: bool,
     /// Whether the user locked this plugin's position in the order.
     pub locked: bool,
-    /// Whether the header was read. False for games without creation rules, for absent plugins,
-    /// and for headers that failed (see `header_error`).
-    pub header_read: bool,
-    /// The master flag (`.esm`, or ESM-flagged). Meaningful only when `header_read`.
-    pub master: bool,
-    /// The light flag (`.esl`, or ESL-flagged). Meaningful only when `header_read`.
-    pub light: bool,
-    /// The masters the header names, in the header's order.
+    /// Short flags the game's rules show beside the item, e.g. `Master` or `Light`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub badges: Vec<String>,
+    /// The items this one requires before it, as the game's rules name them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub masters: Vec<String>,
-    /// Why the header could not be read. Such a plugin is a finding.
-    pub header_error: Option<String>,
 }
 
 /// An instance's load order and what the game's rules say about it.
@@ -141,11 +131,15 @@ pub struct LoadOrder {
     /// The list's name as a person reads it.
     #[serde(default)]
     pub list_name: String,
-    /// The list's `rules.kind`: `none`, `script` or `creation_engine`.
+    /// The list's `rules.kind`: `none` or `script`.
     #[serde(default)]
     pub rules_kind: String,
-    /// Whether the Creation Engine rules apply to this game.
-    pub engine: bool,
+    /// A sentence shown above the list, when the game declares one.
+    #[serde(default)]
+    pub intro: Option<String>,
+    /// The column heading for an item's name, when the game declares one.
+    #[serde(default)]
+    pub item_heading: Option<String>,
     /// Whether the instance has a copy of the plugin list yet.
     pub exists: bool,
     pub entries: Vec<LoadOrderEntry>,
@@ -184,14 +178,14 @@ pub enum Finding {
     },
     /// Plugins whose masters lead back to one another. The engine cannot order them.
     MasterCycle { plugins: Vec<String> },
-    /// A plugin's header cannot be parsed, so its masters and flags are unknown.
-    UnreadableHeader { plugin: String, reason: String },
     /// The same plugin is listed more than once.
     DuplicateListing { plugin: String },
-    /// More full plugins are active than the engine loads.
-    TooManyFullPlugins { active: usize, limit: usize },
-    /// More light plugins are active than the engine loads.
-    TooManyLightPlugins { active: usize, limit: usize },
+    /// A problem the game's rules report about the list as a whole, with the items it names.
+    ListLevel {
+        message: String,
+        items: Vec<String>,
+        refuses: bool,
+    },
     /// A script rule names an item the list does not have, so the rule cannot be applied.
     MissingRuleItem {
         list: String,
@@ -229,11 +223,9 @@ impl Finding {
     pub fn refuses_launch(&self) -> bool {
         match self {
             Finding::MasterNotEarlier { problem, .. } => *problem != MasterProblem::Later,
-            Finding::MasterCycle { .. }
-            | Finding::TooManyFullPlugins { .. }
-            | Finding::TooManyLightPlugins { .. } => true,
-            Finding::UnreadableHeader { .. }
-            | Finding::DuplicateListing { .. }
+            Finding::MasterCycle { .. } => true,
+            Finding::ListLevel { refuses, .. } => *refuses,
+            Finding::DuplicateListing { .. }
             | Finding::MissingRuleItem { .. }
             | Finding::RuleConflict { .. }
             | Finding::RulesFailed { .. } => false,
@@ -260,16 +252,8 @@ impl Finding {
                 "these plugins need one another in a loop: {}",
                 plugins.join(", ")
             ),
-            Finding::UnreadableHeader { plugin, reason } => {
-                format!("'{plugin}' has a header that cannot be read: {reason}")
-            }
             Finding::DuplicateListing { plugin } => format!("'{plugin}' is listed more than once"),
-            Finding::TooManyFullPlugins { active, limit } => {
-                format!("{active} full plugins are active; the game loads at most {limit}")
-            }
-            Finding::TooManyLightPlugins { active, limit } => {
-                format!("{active} light plugins are active; the game loads at most {limit}")
-            }
+            Finding::ListLevel { message, .. } => message.clone(),
             Finding::MissingRuleItem { list, item, rule } => format!(
                 "the '{list}' load order's {rule} rule names '{item}', which the list does not have"
             ),
@@ -354,46 +338,12 @@ pub struct MoveReport {
 /// The plugin folder as the game sees it: lowercase file name to the file that holds its bytes.
 pub type Installed = BTreeMap<String, PathBuf>;
 
-/// The header facts the rules use.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginHeader {
-    pub masters: Vec<String>,
-    pub master: bool,
-    pub light: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Headers
-// ---------------------------------------------------------------------------
-
-/// Read a plugin's header with LOOT's `esplugin`, header only. Creation Engine plugins share one
-/// header layout, so the Skyrim SE format is read for all of them. Any failure is returned as
-/// text, never a panic and never an empty header.
-pub fn read_header(path: &Path) -> Result<PluginHeader, String> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut plugin = esplugin::Plugin::new(esplugin::GameId::SkyrimSE, path);
-    plugin
-        .parse_reader(file, esplugin::ParseOptions::header_only())
-        .map_err(|e| e.to_string())?;
-    let masters = plugin.masters().map_err(|e| e.to_string())?;
-    Ok(PluginHeader {
-        masters,
-        master: plugin.is_master_file(),
-        light: plugin.is_light_plugin(),
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Building the order
 // ---------------------------------------------------------------------------
 
 fn key(name: &str) -> String {
     fold_path_case(name)
-}
-
-/// Whether the game declares the Creation Engine rules.
-pub fn is_engine(rule: &LoadOrderDefinition) -> bool {
-    rule.rules.kind == CREATION_ENGINE
 }
 
 /// The list a caller means. `None` means the game's first list; naming an id the game does not
@@ -418,35 +368,39 @@ pub fn list_by_id<'a>(
     }
 }
 
-/// Whether any of the game's lists uses the Creation Engine rules, so the launch needs a Links
-/// plan to read installed plugins.
-pub fn any_engine(definition: &GameDefinition) -> bool {
-    definition.load_orders.iter().any(is_engine)
+/// Whether a list reads the game's files: a script hook, a LOOT masterlist, or a list of folders.
+fn list_needs_plan(rule: &LoadOrderDefinition) -> bool {
+    rule.rules.kind == "script" || rule.rules.loot.is_some() || rule.items.folders
 }
 
-/// Whether any list needs a deployment plan at all: rules that read the game's files, or a list
-/// of folders.
+/// Whether any list needs a deployment plan at all.
 pub fn any_needs_plan(definition: &GameDefinition) -> bool {
-    definition
-        .load_orders
-        .iter()
-        .any(|rule| is_engine(rule) || rule.rules.kind == "script" || rule.items.folders)
+    definition.load_orders.iter().any(list_needs_plan)
 }
 
 // ---------------------------------------------------------------------------
 // Script hooks
 // ---------------------------------------------------------------------------
 
-/// Drive a package hook from core's synchronous code. Called on a blocking thread under the
-/// desktop's multi-thread runtime, or on a plain thread in the CLI and tests.
+/// Drive a package hook from core's synchronous code. The hooks only wait on the plugin
+/// thread's synchronous bridge, so parking this thread is enough and no Tokio runtime is
+/// created here. That also makes the call safe from inside one (the CLI's launch path).
 fn block_on_hook<F: Future>(future: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(future),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime for a package hook")
-            .block_on(future),
+    use std::task::{Context, Poll, Wake, Waker};
+    struct ThreadWaker(std::thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::park(),
+        }
     }
 }
 
@@ -488,6 +442,7 @@ fn hook_context(
                 id: entry.name.clone(),
                 enabled: entry.active,
                 locked: entry.locked,
+                present: entry.present,
             })
             .collect(),
         rules: Vec::new(),
@@ -510,7 +465,7 @@ pub(crate) fn call_load_order_rules(
     definition: &GameDefinition,
     rule: &LoadOrderDefinition,
     entries: &[LoadOrderEntry],
-) -> Result<Vec<LoadOrderRule>, String> {
+) -> Result<LoadOrderRulesReply, String> {
     let package = package_of(ctx, definition).map_err(|error| error.to_string())?;
     let context = hook_context(ctx, instance_id, definition, rule, entries)
         .map_err(|error| error.to_string())?;
@@ -577,12 +532,12 @@ pub fn parse_implicit_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Build the effective order from the instance's list and the plugin folder the game sees.
+/// Build the effective order from the instance's list and the folder the game sees.
 ///
-/// `installed` is `None` when the game's files are not known (a game without creation rules); then
-/// every plugin is taken as present and no header is read. `implicit_names` are the names read
-/// from the rule's `implicit_list_file`. A line in the list that names an always-loaded plugin is
-/// dropped from the order: the game loads that plugin first regardless.
+/// `installed` is `None` when the game's files are not known; then every item is taken as present.
+/// `implicit_names` are the names read from the rule's `implicit_list_file`. A line in the list
+/// that names an always-loaded item is dropped from the order: the game loads that item first
+/// regardless. The game's own rules add badges and findings afterwards.
 pub fn build_order(
     rule: &LoadOrderDefinition,
     listed: &[PluginEntry],
@@ -590,7 +545,6 @@ pub fn build_order(
     implicit_names: &[String],
     exists: bool,
 ) -> LoadOrder {
-    let engine = is_engine(rule);
     let mut implicit_keys = HashSet::new();
     let mut implicit = Vec::new();
     for name in rule.rules.implicit.iter().chain(implicit_names) {
@@ -599,44 +553,23 @@ pub fn build_order(
         }
     }
 
-    let mut headers: HashMap<String, Result<PluginHeader, String>> = HashMap::new();
     let mut entries = Vec::new();
-    let mut make = |name: &str, is_implicit: bool, active: bool, managed: bool, locked: bool| {
+    let make = |name: &str, is_implicit: bool, active: bool, managed: bool, locked: bool| {
         let k = key(name);
-        let file: Option<&PathBuf> = installed.and_then(|map| map.get(&k));
-        let present = installed.is_none() || file.is_some();
+        let present = installed.is_none() || installed.is_some_and(|map| map.contains_key(&k));
         if !present && is_implicit {
             return None;
         }
-        let mut entry = LoadOrderEntry {
+        Some(LoadOrderEntry {
             name: name.to_string(),
             implicit: is_implicit,
             active: active || is_implicit,
             present,
             managed,
             locked,
-            header_read: false,
-            master: false,
-            light: false,
+            badges: Vec::new(),
             masters: Vec::new(),
-            header_error: None,
-        };
-        if let (true, Some(path)) = (engine && present, file) {
-            let read = headers
-                .entry(k)
-                .or_insert_with(|| read_header(path))
-                .clone();
-            match read {
-                Ok(header) => {
-                    entry.header_read = true;
-                    entry.master = header.master;
-                    entry.light = header.light;
-                    entry.masters = header.masters;
-                }
-                Err(reason) => entry.header_error = Some(reason),
-            }
-        }
-        Some(entry)
+        })
     };
 
     for name in &implicit {
@@ -653,12 +586,13 @@ pub fn build_order(
         }
     }
 
-    let findings = findings(&entries);
+    let findings = duplicate_findings(&entries);
     LoadOrder {
         list_id: rule.id.clone(),
         list_name: rule.name.clone(),
         rules_kind: rule.rules.kind.clone(),
-        engine,
+        intro: rule.intro.clone(),
+        item_heading: rule.item_heading.clone(),
         exists,
         entries,
         findings,
@@ -675,12 +609,7 @@ fn loads(entry: &LoadOrderEntry) -> bool {
     entry.active && entry.present
 }
 
-/// Whether the entry's masters and flags are known, so the rules apply to it.
-fn checked(entry: &LoadOrderEntry) -> bool {
-    loads(entry) && entry.header_read
-}
-
-/// Whether some loading plugin named `master` comes before position `at`.
+/// Whether some loading item named `master` comes before position `at`.
 fn master_loads_before(entries: &[LoadOrderEntry], at: usize, master: &str) -> bool {
     entries[..at]
         .iter()
@@ -721,9 +650,6 @@ fn cycle_groups(entries: &[LoadOrderEntry]) -> Vec<Vec<usize>> {
     let adjacent: Vec<Vec<usize>> = entries
         .iter()
         .map(|e| {
-            if !checked(e) {
-                return Vec::new();
-            }
             e.masters
                 .iter()
                 .filter_map(|m| by_name.get(&key(m)))
@@ -761,20 +687,9 @@ fn cycle_groups(entries: &[LoadOrderEntry]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// The findings the Creation Engine rules and the duplicate and header checks raise against a
-/// load order. Pure: it reads the entries as they are.
-pub fn findings(entries: &[LoadOrderEntry]) -> Vec<Finding> {
+/// The findings core raises without knowing the game: the same item listed more than once.
+pub fn duplicate_findings(entries: &[LoadOrderEntry]) -> Vec<Finding> {
     let mut out = Vec::new();
-
-    for e in entries {
-        if let Some(reason) = &e.header_error {
-            out.push(Finding::UnreadableHeader {
-                plugin: e.name.clone(),
-                reason: reason.clone(),
-            });
-        }
-    }
-
     let mut seen: HashMap<String, usize> = HashMap::new();
     for e in entries.iter().filter(|e| !e.implicit) {
         let count = seen.entry(key(&e.name)).or_insert(0);
@@ -785,46 +700,37 @@ pub fn findings(entries: &[LoadOrderEntry]) -> Vec<Finding> {
             });
         }
     }
+    out
+}
 
-    for (at, e) in entries.iter().enumerate() {
-        if !checked(e) {
-            continue;
-        }
-        let mut reported: HashSet<String> = HashSet::new();
-        for master in &e.masters {
-            let k = key(master);
-            if !reported.insert(k.clone()) || master_loads_before(entries, at, &k) {
-                continue;
+/// Apply a script rule reply to the entries: attach its badges and turn its list findings into
+/// core findings, then check the rules themselves.
+pub fn apply_reply(
+    entries: &mut [LoadOrderEntry],
+    reply: &LoadOrderRulesReply,
+    list: &str,
+) -> Vec<Finding> {
+    for entry in entries.iter_mut() {
+        if let Some(badges) = reply.badges.get(&entry.name) {
+            entry.badges = badges.clone();
+        } else {
+            // A script may write a badge map with any case for the item's name.
+            let wanted = key(&entry.name);
+            if let Some((_, badges)) = reply.badges.iter().find(|(name, _)| key(name) == wanted) {
+                entry.badges = badges.clone();
             }
-            out.push(Finding::MasterNotEarlier {
-                plugin: e.name.clone(),
-                master: master.clone(),
-                problem: master_problem(entries, at, &k),
-            });
         }
     }
-
-    for group in cycle_groups(entries) {
-        out.push(Finding::MasterCycle {
-            plugins: group.iter().map(|&i| entries[i].name.clone()).collect(),
-        });
-    }
-
-    let full = entries.iter().filter(|e| checked(e) && !e.light).count();
-    if full > FULL_PLUGIN_LIMIT {
-        out.push(Finding::TooManyFullPlugins {
-            active: full,
-            limit: FULL_PLUGIN_LIMIT,
-        });
-    }
-    let light = entries.iter().filter(|e| checked(e) && e.light).count();
-    if light > LIGHT_PLUGIN_LIMIT {
-        out.push(Finding::TooManyLightPlugins {
-            active: light,
-            limit: LIGHT_PLUGIN_LIMIT,
-        });
-    }
-
+    let mut out: Vec<Finding> = reply
+        .findings
+        .iter()
+        .map(|finding: &ListFinding| Finding::ListLevel {
+            message: finding.message.clone(),
+            items: finding.items.clone(),
+            refuses: finding.refuses,
+        })
+        .collect();
+    out.extend(script_findings(entries, &reply.rules, list));
     out
 }
 
@@ -847,24 +753,22 @@ fn rule_prerequisites(
     for rule in rules {
         match rule {
             LoadOrderRule::Requires { item, master, .. } => {
-                let both = known(item) && known(master);
-                if rule.optional() && !both {
+                // A missing master is reported as a missing master below, in the words players
+                // know, so only an absent *item* is a rule that cannot be applied.
+                if rule.optional() && !(known(item) && known(master)) {
                     continue;
                 }
-                for name in [item, master] {
-                    if !known(name) {
-                        findings.push(Finding::MissingRuleItem {
-                            list: list.to_string(),
-                            item: name.clone(),
-                            rule: "requires".to_string(),
-                        });
-                    }
+                if !known(item) {
+                    findings.push(Finding::MissingRuleItem {
+                        list: list.to_string(),
+                        item: item.clone(),
+                        rule: "requires".to_string(),
+                    });
+                    continue;
                 }
-                if both {
-                    let edges = prereqs.entry(key(item)).or_default();
-                    if !edges.iter().any(|edge| key(edge) == key(master)) {
-                        edges.push(master.clone());
-                    }
+                let edges = prereqs.entry(key(item)).or_default();
+                if !edges.iter().any(|edge| key(edge) == key(master)) {
+                    edges.push(master.clone());
                 }
             }
             LoadOrderRule::Before { first, second, .. } => {
@@ -951,9 +855,7 @@ pub fn script_findings(
 
     let mut scratch = entries.to_vec();
     for entry in &mut scratch {
-        let masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
-        entry.header_read = !masters.is_empty();
-        entry.masters = masters;
+        entry.masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
     }
     for group in cycle_groups(&scratch) {
         out.push(Finding::MasterCycle {
@@ -966,9 +868,17 @@ pub fn script_findings(
     out
 }
 
-/// Sort a script list by its rules, reusing the same fixed slots and cycle handling as the
-/// Creation Engine sort. The scratch entries carry the rule edges as masters; the returned entries
-/// carry none of that, so the order reads as it did.
+/// Put the rules' prerequisite edges onto the entries, so sorting can see them.
+pub fn set_prerequisites(entries: &mut [LoadOrderEntry], rules: &[LoadOrderRule], list: &str) {
+    let (prereqs, _) = rule_prerequisites(entries, rules, list);
+    for entry in entries.iter_mut() {
+        entry.masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
+    }
+}
+
+/// Sort a script list by its rules, reusing the same fixed slots and cycle handling. The scratch
+/// entries carry the rule edges as masters; the returned entries carry none of that, so the order
+/// reads as it did.
 pub fn script_sort(
     entries: &mut [LoadOrderEntry],
     rules: &[LoadOrderRule],
@@ -977,14 +887,11 @@ pub fn script_sort(
     let (prereqs, _) = rule_prerequisites(entries, rules, list);
     let mut scratch = entries.to_vec();
     for entry in &mut scratch {
-        let masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
-        entry.header_read = !masters.is_empty();
-        entry.masters = masters;
+        entry.masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
     }
     let (moves, blocked) = sort_entries(&mut scratch)?;
     for entry in &mut scratch {
         entry.masters.clear();
-        entry.header_read = false;
     }
     entries.clone_from_slice(&scratch);
     Ok((moves, blocked))
@@ -1060,7 +967,7 @@ fn first_move(
     free_slots: &[usize],
 ) -> Option<(usize, usize)> {
     for (at, dependent) in entries.iter().enumerate() {
-        if !checked(dependent) || fixed.cyclic(dependent) {
+        if fixed.cyclic(dependent) {
             continue;
         }
         let above = free_slots.iter().take_while(|&&s| s < at).count();
@@ -1128,7 +1035,7 @@ fn blocked_of(entries: &[LoadOrderEntry], fixed: &Fixed) -> Vec<Blocked> {
     let mut blocked: Vec<Blocked> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for (at, dependent) in entries.iter().enumerate() {
-        if !checked(dependent) || fixed.cyclic(dependent) {
+        if fixed.cyclic(dependent) {
             continue;
         }
         for master in &dependent.masters {
@@ -1443,7 +1350,7 @@ pub fn plan_for_order_in(
     list_id: Option<&str>,
 ) -> Result<Option<DeploymentPlan>, LoadOrderError> {
     let rule = rule_of(definition, list_id)?;
-    if !(is_engine(rule) || rule.rules.kind == "script" || rule.items.folders) {
+    if !list_needs_plan(rule) {
         return Ok(None);
     }
     game_deploy::plan(ctx, instance_id, definition, DeployMode::Links)
@@ -1471,8 +1378,7 @@ fn order_of_with_view(
 ) -> Result<LoadOrder, LoadOrderError> {
     let rule = rule_of(definition, list_id)?;
     let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
-    let needs_view = is_engine(rule) || rule.rules.kind == "script" || rule.items.folders;
-    if !needs_view {
+    if !list_needs_plan(rule) {
         return Ok(build_order(rule, &listed.entries, None, &[], listed.exists));
     }
 
@@ -1484,28 +1390,25 @@ fn order_of_with_view(
         &names,
         listed.exists,
     );
-    if is_engine(rule) {
-        if let (Some(loot), Ok(Some(cached))) = (
-            rule.rules.loot.as_ref(),
-            crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id)),
-        ) {
-            if let Ok(notes) =
-                crate::loot_masterlist::notes(&order.entries, &installed, loot, &cached)
-            {
-                order.notes = notes;
-            }
-        }
-    } else if rule.rules.kind == "script" {
+    if rule.rules.kind == "script" {
         match call_load_order_rules(ctx, instance_id, definition, rule, &order.entries) {
-            Ok(rules) => {
-                order
-                    .findings
-                    .extend(script_findings(&order.entries, &rules, &rule.id));
+            Ok(reply) => {
+                let findings = apply_reply(&mut order.entries, &reply, &rule.id);
+                order.findings.extend(findings);
             }
             Err(reason) => order.findings.push(Finding::RulesFailed {
                 list: rule.id.clone(),
                 reason,
             }),
+        }
+    }
+    if let (Some(loot), Ok(Some(cached))) = (
+        rule.rules.loot.as_ref(),
+        crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id)),
+    ) {
+        if let Ok(notes) = crate::loot_masterlist::notes(&order.entries, &installed, loot, &cached)
+        {
+            order.notes = notes;
         }
     }
     Ok(order)
@@ -1681,7 +1584,7 @@ fn sort_inner(
     if rule.rules.kind == "none" {
         return Err(LoadOrderError::NoSort(rule.id.clone()));
     }
-    if !is_engine(rule) && rule.rules.kind != "script" {
+    if rule.rules.kind != "script" {
         return Err(LoadOrderError::NoRules(definition.id.as_str().to_string()));
     }
     let _lock = ctx
@@ -1703,64 +1606,62 @@ fn sort_inner(
     )
     .entries;
 
+    // The rules are needed for the fallback sort and for the badges; the list findings are
+    // recomputed by the order read back afterwards.
+    let reply =
+        call_load_order_rules(ctx, instance_id, definition, rule, &entries).map_err(|reason| {
+            LoadOrderError::RulesScript {
+                list: rule.id.clone(),
+                reason,
+            }
+        })?;
+    set_prerequisites(&mut entries, &reply.rules, &rule.id);
+
     let mut notes = Vec::new();
     let mut mode = SortMode::Masters;
     let mut message = None;
-    let (moves, blocked) = if rule.rules.kind == "script" {
-        let rules = call_load_order_rules(ctx, instance_id, definition, rule, &entries).map_err(
-            |reason| LoadOrderError::RulesScript {
-                list: rule.id.clone(),
-                reason,
-            },
-        )?;
-        script_sort(&mut entries, &rules, &rule.id)?
-    } else {
-        let mut counted: HashMap<String, usize> = HashMap::new();
-        let mut duplicated = false;
-        for entry in entries.iter().filter(|entry| !entry.implicit) {
-            let count = counted.entry(key(&entry.name)).or_insert(0);
-            *count += 1;
-            duplicated |= *count > 1;
-        }
-        let unreadable = entries
-            .iter()
-            .any(|entry| entry.present && entry.header_error.is_some());
+    let mut counted: HashMap<String, usize> = HashMap::new();
+    let mut duplicated = false;
+    for entry in entries.iter().filter(|entry| !entry.implicit) {
+        let count = counted.entry(key(&entry.name)).or_insert(0);
+        *count += 1;
+        duplicated |= *count > 1;
+    }
 
-        match &rule.rules.loot {
-            Some(loot) if !duplicated && !unreadable => {
-                match crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id))? {
-                    Some(cached) => match crate::loot_masterlist::sort_and_notes(
-                        &entries, &installed, loot, &cached,
-                    ) {
-                        Ok(outcome) => {
-                            let moves = apply_loot_order(&mut entries, &outcome.order)?;
-                            notes = outcome.notes;
-                            let fixed = Fixed::of(&entries);
-                            let blocked = blocked_of(&entries, &fixed);
-                            mode = SortMode::Loot;
-                            (moves, blocked)
-                        }
-                        Err(LoadOrderError::Masterlist { .. }) => {
-                            message = Some(CACHED_MASTERLIST_UNREADABLE.to_string());
-                            sort_entries(&mut entries)?
-                        }
-                        Err(error) => return Err(error),
-                    },
-                    None => {
-                        message = Some(MASTERS_ONLY_MESSAGE.to_string());
+    let (moves, blocked) = match &rule.rules.loot {
+        Some(loot) if !duplicated => {
+            match crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id))? {
+                Some(cached) => match crate::loot_masterlist::sort_and_notes(
+                    &entries, &installed, loot, &cached,
+                ) {
+                    Ok(outcome) => {
+                        let moves = apply_loot_order(&mut entries, &outcome.order)?;
+                        notes = outcome.notes;
+                        let fixed = Fixed::of(&entries);
+                        let blocked = blocked_of(&entries, &fixed);
+                        mode = SortMode::Loot;
+                        (moves, blocked)
+                    }
+                    Err(LoadOrderError::Masterlist { .. }) => {
+                        message = Some(CACHED_MASTERLIST_UNREADABLE.to_string());
                         sort_entries(&mut entries)?
                     }
+                    Err(error) => return Err(error),
+                },
+                None => {
+                    message = Some(MASTERS_ONLY_MESSAGE.to_string());
+                    sort_entries(&mut entries)?
                 }
             }
-            Some(_) => {
-                message = Some(
-                    "A plugin is listed twice or its header cannot be read, so LOOT cannot sort it.                  Sorted by masters only."
-                        .to_string(),
-                );
-                sort_entries(&mut entries)?
-            }
-            None => sort_entries(&mut entries)?,
         }
+        Some(_) => {
+            message = Some(
+                "A plugin is listed twice or its header cannot be read, so LOOT cannot sort it.                  Sorted by masters only."
+                    .to_string(),
+            );
+            sort_entries(&mut entries)?
+        }
+        None => sort_entries(&mut entries)?,
     };
 
     let written = !dry_run && !moves.is_empty();
@@ -1895,18 +1796,14 @@ mod tests {
             present: true,
             managed: false,
             locked: false,
-            header_read: true,
-            master: fold_path_case(name).ends_with(".esm"),
-            light: false,
+            badges: Vec::new(),
             masters: masters.iter().map(|m| m.to_string()).collect(),
-            header_error: None,
         }
     }
 
     fn implicit(name: &str) -> LoadOrderEntry {
         LoadOrderEntry {
             implicit: true,
-            master: true,
             ..entry(name, &[])
         }
     }
@@ -1918,8 +1815,52 @@ mod tests {
         }
     }
 
+    fn requires(item: &str, master: &str) -> LoadOrderRule {
+        LoadOrderRule::Requires {
+            item: item.into(),
+            master: master.into(),
+            optional: false,
+        }
+    }
+
     fn names(entries: &[LoadOrderEntry]) -> Vec<String> {
         entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    fn plugin_line_of(name: &str, active: bool) -> PluginEntry {
+        PluginEntry {
+            name: name.to_string(),
+            active,
+            managed: false,
+            locked: false,
+        }
+    }
+
+    fn script_rule() -> LoadOrderDefinition {
+        LoadOrderDefinition {
+            id: "plugins".into(),
+            name: "Plugins".into(),
+            file: agora_game_api::RelPath::new("user/Plugins.txt").unwrap(),
+            destination: Default::default(),
+            items: agora_game_api::LoadOrderItems {
+                folder: agora_game_api::RelPath::new("Data").unwrap(),
+                patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+                folders: false,
+            },
+            format: agora_game_api::LoadOrderFormat::Lines {
+                active_prefix: "*".into(),
+                header: Vec::new(),
+            },
+            rules: agora_game_api::LoadOrderRules {
+                kind: "script".into(),
+                entry: None,
+                implicit: vec!["Skyrim.esm".into(), "Dawnguard.esm".into()],
+                implicit_list_file: Some(agora_game_api::RelPath::new("Skyrim.ccc").unwrap()),
+                loot: None,
+            },
+            intro: Some("Read this list from the top down.".into()),
+            item_heading: Some("Plugin".into()),
+        }
     }
 
     #[test]
@@ -1933,9 +1874,9 @@ mod tests {
 
     #[test]
     fn a_late_master_is_a_finding_and_names_its_problem() {
-        let late = [entry("A.esp", &["B.esm"]), entry("B.esm", &[])];
+        let late = [entry("A.esp", &[]), entry("B.esm", &[])];
         assert_eq!(
-            findings(&late),
+            script_findings(&late, &[requires("A.esp", "B.esm")], "plugins"),
             [Finding::MasterNotEarlier {
                 plugin: "A.esp".into(),
                 master: "B.esm".into(),
@@ -1948,18 +1889,18 @@ mod tests {
     fn a_missing_or_inactive_master_is_a_finding() {
         let mut inactive = entry("B.esm", &[]);
         inactive.active = false;
-        let inactive_list = [inactive, entry("A.esp", &["B.esm"])];
+        let inactive_list = [inactive, entry("A.esp", &[])];
         assert_eq!(
-            findings(&inactive_list),
+            script_findings(&inactive_list, &[requires("A.esp", "B.esm")], "plugins"),
             [Finding::MasterNotEarlier {
                 plugin: "A.esp".into(),
                 master: "B.esm".into(),
                 problem: MasterProblem::Inactive,
             }]
         );
-        let missing = [entry("A.esp", &["Gone.esm"])];
+        let missing = [entry("A.esp", &[])];
         assert_eq!(
-            findings(&missing),
+            script_findings(&missing, &[requires("A.esp", "Gone.esm")], "plugins"),
             [Finding::MasterNotEarlier {
                 plugin: "A.esp".into(),
                 master: "Gone.esm".into(),
@@ -1972,9 +1913,9 @@ mod tests {
     fn a_master_listed_but_not_installed_is_missing_not_inactive() {
         let mut absent = entry("B.esm", &[]);
         absent.present = false;
-        let list = [absent, entry("A.esp", &["B.esm"])];
+        let list = [absent, entry("A.esp", &[])];
         assert!(matches!(
-            findings(&list).as_slice(),
+            script_findings(&list, &[requires("A.esp", "B.esm")], "plugins").as_slice(),
             [Finding::MasterNotEarlier {
                 problem: MasterProblem::Missing,
                 ..
@@ -1983,15 +1924,23 @@ mod tests {
     }
 
     #[test]
-    fn an_esp_above_an_esm_with_no_dependency_is_not_a_finding() {
-        let list = [entry("A.esp", &[]), entry("B.esm", &[])];
-        assert!(findings(&list).is_empty());
+    fn a_rule_whose_item_is_absent_cannot_be_applied() {
+        let list = [entry("A.esp", &[])];
+        assert!(matches!(
+            script_findings(&list, &[requires("Gone.esp", "B.esm")], "plugins").as_slice(),
+            [Finding::MissingRuleItem { item, .. }] if item == "Gone.esp"
+        ));
     }
 
     #[test]
     fn a_master_cycle_is_reported_and_sorting_it_terminates_without_moving_it() {
         let list = [entry("A.esp", &["B.esp"]), entry("B.esp", &["A.esp"])];
-        assert!(findings(&list).contains(&Finding::MasterCycle {
+        assert!(script_findings(
+            &list,
+            &[requires("A.esp", "B.esp"), requires("B.esp", "A.esp")],
+            "plugins"
+        )
+        .contains(&Finding::MasterCycle {
             plugins: vec!["A.esp".into(), "B.esp".into()],
         }));
         let mut sorted = list.to_vec();
@@ -2004,7 +1953,7 @@ mod tests {
     fn a_plugin_listed_twice_is_a_finding_once() {
         let list = [entry("A.esp", &[]), entry("a.ESP", &[])];
         assert_eq!(
-            findings(&list),
+            duplicate_findings(&list),
             [Finding::DuplicateListing {
                 plugin: "a.ESP".into()
             }]
@@ -2013,79 +1962,33 @@ mod tests {
 
     #[test]
     fn names_compare_case_insensitively_for_masters() {
-        let list = [entry("B.ESM", &[]), entry("A.esp", &["b.esm"])];
-        assert!(findings(&list).is_empty());
+        let list = [entry("B.ESM", &[]), entry("A.esp", &[])];
+        assert!(script_findings(&list, &[requires("A.esp", "b.esm")], "plugins").is_empty());
     }
 
     #[test]
-    fn an_unreadable_header_is_a_finding_for_active_and_inactive_plugins() {
-        let mut bad = entry("Bad.esp", &[]);
-        bad.header_read = false;
-        bad.header_error = Some("truncated".into());
-        let mut inactive_bad = bad.clone();
-        inactive_bad.name = "Other.esp".into();
-        inactive_bad.active = false;
+    fn a_reply_attaches_badges_and_list_findings_with_their_refusal() {
+        let mut list = [entry("Skyrim.esm", &[]), entry("Mod.esp", &[])];
+        let reply = LoadOrderRulesReply {
+            rules: Vec::new(),
+            badges: [("skyrim.ESM".to_string(), vec!["Master".to_string()])]
+                .into_iter()
+                .collect(),
+            findings: vec![ListFinding {
+                message: "300 full plugins are active; the game loads at most 254".into(),
+                items: Vec::new(),
+                refuses: true,
+            }],
+        };
+        let findings = apply_reply(&mut list, &reply, "plugins");
+        assert_eq!(list[0].badges, ["Master"]);
+        assert!(list[1].badges.is_empty());
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].refuses_launch());
         assert_eq!(
-            findings(&[bad, inactive_bad]),
-            [
-                Finding::UnreadableHeader {
-                    plugin: "Bad.esp".into(),
-                    reason: "truncated".into()
-                },
-                Finding::UnreadableHeader {
-                    plugin: "Other.esp".into(),
-                    reason: "truncated".into()
-                },
-            ]
+            findings[0].message(),
+            "300 full plugins are active; the game loads at most 254"
         );
-    }
-
-    #[test]
-    fn full_plugins_over_254_are_a_finding_and_254_are_not() {
-        let at_limit: Vec<LoadOrderEntry> = (0..FULL_PLUGIN_LIMIT)
-            .map(|i| entry(&format!("P{i}.esp"), &[]))
-            .collect();
-        assert!(findings(&at_limit).is_empty());
-        let mut over = at_limit;
-        over.push(entry("Extra.esp", &[]));
-        assert_eq!(
-            findings(&over),
-            [Finding::TooManyFullPlugins {
-                active: 255,
-                limit: 254
-            }]
-        );
-    }
-
-    #[test]
-    fn light_plugins_are_limited_separately_from_full_ones() {
-        let mut lights: Vec<LoadOrderEntry> = (0..=LIGHT_PLUGIN_LIMIT)
-            .map(|i| {
-                let mut e = entry(&format!("L{i}.esl"), &[]);
-                e.light = true;
-                e
-            })
-            .collect();
-        assert_eq!(
-            findings(&lights),
-            [Finding::TooManyLightPlugins {
-                active: LIGHT_PLUGIN_LIMIT + 1,
-                limit: LIGHT_PLUGIN_LIMIT,
-            }]
-        );
-        lights.truncate(LIGHT_PLUGIN_LIMIT);
-        assert!(findings(&lights).is_empty());
-    }
-
-    #[test]
-    fn an_inactive_plugin_does_not_count_toward_the_limit() {
-        let mut list: Vec<LoadOrderEntry> = (0..FULL_PLUGIN_LIMIT + 5)
-            .map(|i| entry(&format!("P{i}.esp"), &[]))
-            .collect();
-        for e in list.iter_mut().take(5) {
-            e.active = false;
-        }
-        assert!(findings(&list).is_empty());
     }
 
     #[test]
@@ -2107,7 +2010,6 @@ mod tests {
         );
         assert!(blocked.is_empty());
         assert_eq!(names(&list), ["B.esm", "A.esp", "C.esp", "D.esp"]);
-        assert!(findings(&list).is_empty());
     }
 
     #[test]
@@ -2142,7 +2044,6 @@ mod tests {
         let (second, _) = sort_entries(&mut list).unwrap();
         assert!(second.is_empty());
         assert_eq!(list, once);
-        assert!(findings(&list).is_empty());
     }
 
     #[test]
@@ -2161,38 +2062,6 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_plugin_with_no_free_place_above_it_is_blocked_not_moved() {
-        // A is locked above its master B. Nothing free sits above A, so B cannot go there.
-        let mut list = vec![locked("A.esp", &["B.esm"]), entry("B.esm", &[])];
-        let (moves, blocked) = sort_entries(&mut list).unwrap();
-        assert!(moves.is_empty());
-        assert_eq!(blocked.len(), 1);
-        assert_eq!(names(&list), ["A.esp", "B.esm"]);
-    }
-
-    #[test]
-    fn a_locked_plugin_keeps_its_position_while_a_free_master_moves_above_it() {
-        // F is free, L is locked above its master M, and M is free: M takes the free place above L.
-        let mut list = vec![
-            entry("F.esp", &[]),
-            locked("L.esp", &["M.esm"]),
-            entry("M.esm", &[]),
-        ];
-        let (moves, blocked) = sort_entries(&mut list).unwrap();
-        assert_eq!(
-            moves,
-            [SortMove {
-                plugin: "M.esm".into(),
-                from: 3,
-                to: 1
-            }]
-        );
-        assert!(blocked.is_empty());
-        assert_eq!(names(&list), ["M.esm", "L.esp", "F.esp"]);
-        assert!(list[1].locked);
-    }
-
-    #[test]
     fn always_loaded_plugins_are_never_moved_and_stay_first() {
         let mut list = vec![
             implicit("Skyrim.esm"),
@@ -2202,22 +2071,6 @@ mod tests {
         let (moves, _) = sort_entries(&mut list).unwrap();
         assert!(moves.is_empty());
         assert_eq!(names(&list), ["Skyrim.esm", "A.esp", "Dawnguard.esm"]);
-    }
-
-    #[test]
-    fn a_listed_master_cannot_be_placed_above_an_always_loaded_one() {
-        // Dawnguard needs a listed plugin: the listed one cannot go above the always-loaded one.
-        let mut list = vec![implicit("Dawnguard.esm"), entry("Mod.esm", &[])];
-        list[0].masters = vec!["Mod.esm".into()];
-        let (moves, blocked) = sort_entries(&mut list).unwrap();
-        assert!(moves.is_empty());
-        assert_eq!(
-            blocked,
-            [Blocked {
-                plugin: "Dawnguard.esm".into(),
-                master: "Mod.esm".into()
-            }]
-        );
     }
 
     #[test]
@@ -2241,27 +2094,8 @@ mod tests {
         assert_eq!(names(&list), ["Skyrim.esm", "B.esp", "A.esp", "C.esp"]);
 
         let mut list = base();
-        let moved = move_entry(&mut list, "A.esp", &MoveTarget::After("C.esp".into())).unwrap();
-        assert_eq!(moved, ("A.esp".to_string(), 2, 4));
-        assert_eq!(names(&list), ["Skyrim.esm", "B.esp", "C.esp", "A.esp"]);
-
-        let mut list = base();
         move_entry(&mut list, "C.esp", &MoveTarget::Before("A.esp".into())).unwrap();
         assert_eq!(names(&list), ["Skyrim.esm", "C.esp", "A.esp", "B.esp"]);
-    }
-
-    #[test]
-    fn move_keeps_a_locked_plugin_in_its_position() {
-        let mut list = vec![
-            implicit("Skyrim.esm"),
-            entry("A.esp", &[]),
-            locked("L.esp", &[]),
-            entry("B.esp", &[]),
-        ];
-        // B goes before A: the locked plugin between them does not move.
-        move_entry(&mut list, "B.esp", &MoveTarget::Before("A.esp".into())).unwrap();
-        assert_eq!(names(&list), ["Skyrim.esm", "B.esp", "L.esp", "A.esp"]);
-        assert!(list[2].locked);
     }
 
     #[test]
@@ -2285,11 +2119,6 @@ mod tests {
         ));
         let mut list = base();
         assert!(matches!(
-            move_entry(&mut list, "A.esp", &MoveTarget::Position(9)),
-            Err(LoadOrderError::BadPosition { .. })
-        ));
-        let mut list = base();
-        assert!(matches!(
             move_entry(&mut list, "A.esp", &MoveTarget::Before("Skyrim.esm".into())),
             Err(LoadOrderError::AlwaysLoaded(_))
         ));
@@ -2298,159 +2127,14 @@ mod tests {
             move_entry(&mut list, "A.esp", &MoveTarget::After("A.esp".into())),
             Err(LoadOrderError::SelfTarget(_))
         ));
-        let mut list = base();
-        assert!(matches!(
-            move_entry(&mut list, "Nope.esp", &MoveTarget::Position(3)),
-            Err(LoadOrderError::NotListed(_))
-        ));
-        let mut list = base();
-        list[1].locked = true;
-        assert!(matches!(
-            move_entry(&mut list, "A.esp", &MoveTarget::Position(3)),
-            Err(LoadOrderError::Locked(_))
-        ));
-    }
-
-    #[test]
-    fn header_reading_fails_as_text_for_bytes_that_are_not_a_plugin() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("Empty.esp");
-        std::fs::write(&path, b"").unwrap();
-        assert!(read_header(&path).is_err());
-        let path = dir.path().join("Junk.esp");
-        std::fs::write(&path, b"this is not a plugin at all, just words").unwrap();
-        assert!(read_header(&path).is_err());
-    }
-
-    /// A Creation Engine plugin's bytes: a TES4 record with flags, an HEDR subrecord, and a MAST and
-    /// DATA pair per master. Header layout as esplugin reads it for Skyrim SE: a 24-byte record
-    /// header (type, data size, flags at offset 8, form ID, two unused words), then subrecords of a
-    /// 4-byte type, a u16 size and the data.
-    fn plugin_bytes(flags: u32, masters: &[&str]) -> Vec<u8> {
-        fn subrecord(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-            out.extend_from_slice(kind);
-            out.extend_from_slice(&u16::try_from(data.len()).unwrap().to_le_bytes());
-            out.extend_from_slice(data);
-        }
-        let mut body = Vec::new();
-        subrecord(&mut body, b"HEDR", &[0u8; 12]);
-        for master in masters {
-            let mut name = master.as_bytes().to_vec();
-            name.push(0);
-            subrecord(&mut body, b"MAST", &name);
-            subrecord(&mut body, b"DATA", &[0u8; 8]);
-        }
-        let mut out = Vec::new();
-        out.extend_from_slice(b"TES4");
-        out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(&flags.to_le_bytes());
-        out.extend_from_slice(&[0u8; 12]);
-        out.extend_from_slice(&body);
-        out
-    }
-
-    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, bytes).unwrap();
-        path
-    }
-
-    #[test]
-    fn the_header_gives_masters_and_the_master_and_light_flags() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write(
-            dir.path(),
-            "Mod.esp",
-            &plugin_bytes(0, &["Skyrim.esm", "Dawnguard.esm"]),
-        );
-        let header = read_header(&path).unwrap();
-        assert_eq!(header.masters, ["Skyrim.esm", "Dawnguard.esm"]);
-        assert!(!header.master);
-        assert!(!header.light);
-
-        let esm = write(dir.path(), "Base.esp", &plugin_bytes(0x1, &[]));
-        assert!(read_header(&esm).unwrap().master, "the master flag is read");
-
-        let flagged_light = write(dir.path(), "Flagged.esp", &plugin_bytes(0x200, &[]));
-        assert!(
-            read_header(&flagged_light).unwrap().light,
-            "the light flag is read"
-        );
-
-        let by_extension = write(dir.path(), "Light.esl", &plugin_bytes(0, &[]));
-        let header = read_header(&by_extension).unwrap();
-        assert!(header.light, "an .esl is light by its extension");
-        assert!(header.master, "an .esl is a master by its extension");
-    }
-
-    #[test]
-    fn a_truncated_header_is_an_error_not_an_empty_plugin() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut bytes = plugin_bytes(0, &["Skyrim.esm"]);
-        bytes.truncate(bytes.len() - 6);
-        let path = write(dir.path(), "Cut.esp", &bytes);
-        assert!(read_header(&path).is_err());
-        let short = write(dir.path(), "Short.esp", &plugin_bytes(0, &[])[..10]);
-        assert!(read_header(&short).is_err());
-    }
-
-    fn installed_of(files: &[(&str, PathBuf)]) -> Installed {
-        files
-            .iter()
-            .map(|(name, path)| (fold_path_case(name), path.clone()))
-            .collect()
-    }
-
-    fn plugin_line_of(name: &str, active: bool) -> PluginEntry {
-        PluginEntry {
-            name: name.to_string(),
-            active,
-            managed: false,
-            locked: false,
-        }
-    }
-
-    fn engine_rule() -> LoadOrderDefinition {
-        LoadOrderDefinition {
-            id: "plugins".into(),
-            name: "Plugins".into(),
-            file: agora_game_api::RelPath::new("user/Plugins.txt").unwrap(),
-            destination: Default::default(),
-            items: agora_game_api::LoadOrderItems {
-                folder: agora_game_api::RelPath::new("Data").unwrap(),
-                patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
-                folders: false,
-            },
-            format: agora_game_api::LoadOrderFormat::Lines {
-                active_prefix: "*".into(),
-                header: Vec::new(),
-            },
-            rules: agora_game_api::LoadOrderRules {
-                kind: CREATION_ENGINE.into(),
-                entry: None,
-                implicit: vec!["Skyrim.esm".into(), "Dawnguard.esm".into()],
-                implicit_list_file: Some(agora_game_api::RelPath::new("Skyrim.ccc").unwrap()),
-                loot: None,
-            },
-        }
     }
 
     #[test]
     fn the_order_puts_present_implicit_plugins_first_and_drops_listed_copies_of_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let skyrim = write(dir.path(), "Skyrim.esm", &plugin_bytes(0x1, &[]));
-        let cc = write(
-            dir.path(),
-            "ccbgssse037-curios.esl",
-            &plugin_bytes(0x200, &["Skyrim.esm"]),
-        );
-        let mod_esp = write(dir.path(), "Mod.esp", &plugin_bytes(0, &["Skyrim.esm"]));
-        let installed = installed_of(&[
-            ("Skyrim.esm", skyrim),
-            ("ccbgssse037-curios.esl", cc),
-            ("Mod.esp", mod_esp),
-        ]);
-        // Dawnguard is implicit but not installed; the Skyrim.ccc name for Fish is not installed.
+        let installed: Installed = ["Skyrim.esm", "ccbgssse037-curios.esl", "Mod.esp"]
+            .iter()
+            .map(|name| (fold_path_case(name), PathBuf::from(name)))
+            .collect();
         let names = vec![
             "ccBGSSSE001-Fish.esm".to_string(),
             "ccBGSSSE037-Curios.esl".to_string(),
@@ -2459,7 +2143,7 @@ mod tests {
             plugin_line_of("Skyrim.esm", true),
             plugin_line_of("Mod.esp", true),
         ];
-        let order = build_order(&engine_rule(), &listed, Some(&installed), &names, true);
+        let order = build_order(&script_rule(), &listed, Some(&installed), &names, true);
 
         let order_names: Vec<&str> = order.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
@@ -2468,47 +2152,48 @@ mod tests {
         );
         assert!(order.entries[0].implicit && order.entries[1].implicit);
         assert!(!order.entries[2].implicit);
+        assert_eq!(
+            order.intro.as_deref(),
+            Some("Read this list from the top down.")
+        );
+        assert_eq!(order.item_heading.as_deref(), Some("Plugin"));
         assert!(order.findings.is_empty(), "{:?}", order.findings);
     }
 
     #[test]
-    fn a_plugin_whose_header_is_junk_is_a_finding_that_names_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let skyrim = write(dir.path(), "Skyrim.esm", &plugin_bytes(0x1, &[]));
-        let junk = write(dir.path(), "Junk.esp", b"not a plugin");
-        let installed = installed_of(&[("Skyrim.esm", skyrim), ("Junk.esp", junk)]);
-        let listed = [plugin_line_of("Junk.esp", true)];
-        let order = build_order(&engine_rule(), &listed, Some(&installed), &[], true);
-        let junk_entry = order.entries.iter().find(|e| e.name == "Junk.esp").unwrap();
-        assert!(junk_entry.header_error.is_some());
-        assert!(matches!(
-            order.findings.as_slice(),
-            [Finding::UnreadableHeader { plugin, .. }] if plugin == "Junk.esp"
-        ));
-    }
-
-    #[test]
-    fn a_plugin_that_is_listed_but_not_installed_is_shown_missing_and_is_not_a_finding() {
-        let dir = tempfile::tempdir().unwrap();
-        let skyrim = write(dir.path(), "Skyrim.esm", &plugin_bytes(0x1, &[]));
-        let installed = installed_of(&[("Skyrim.esm", skyrim)]);
+    fn a_plugin_that_is_listed_but_not_installed_is_shown_missing() {
+        let installed: Installed = [("Skyrim.esm", PathBuf::from("Skyrim.esm"))]
+            .into_iter()
+            .map(|(name, path)| (fold_path_case(name), path))
+            .collect();
         let listed = [plugin_line_of("Gone.esp", true)];
-        let order = build_order(&engine_rule(), &listed, Some(&installed), &[], true);
+        let order = build_order(&script_rule(), &listed, Some(&installed), &[], true);
         let gone = order.entries.iter().find(|e| e.name == "Gone.esp").unwrap();
         assert!(!gone.present);
         assert!(order.findings.is_empty());
     }
 
     #[test]
-    fn a_game_without_creation_rules_reads_no_headers_and_has_no_findings() {
-        let mut rule = engine_rule();
+    fn a_game_without_rules_lists_its_items_with_no_findings() {
+        let mut rule = script_rule();
         rule.rules.kind = "none".into();
         let listed = [plugin_line_of("A.esp", true), plugin_line_of("B.esp", true)];
         let order = build_order(&rule, &listed, None, &[], true);
-        assert!(!order.engine);
-        assert!(order.entries.iter().all(|e| !e.header_read && e.present));
+        assert!(order.entries.iter().all(|e| e.present));
         assert!(order.findings.is_empty());
     }
+
+    #[test]
+    fn a_script_order_reads_the_game_files_and_a_none_order_does_not() {
+        let script = script_rule();
+        assert!(list_needs_plan(&script));
+        let mut none = script;
+        none.rules.kind = "none".into();
+        none.items.folders = false;
+        none.rules.loot = None;
+        assert!(!list_needs_plan(&none));
+    }
+
     #[test]
     fn loot_order_maps_onto_free_slots_and_leaves_fixed_ones() {
         let mut list = vec![
@@ -2518,7 +2203,6 @@ mod tests {
             entry("B.esp", &[]),
             entry("C.esp", &[]),
         ];
-        // libloot's relative order of every plugin; the fixed entries are ignored in their slots.
         let desired = vec![
             "C.esp".to_string(),
             "B.esp".to_string(),
@@ -2536,7 +2220,6 @@ mod tests {
             moves.iter().map(|m| m.plugin.as_str()).collect::<Vec<_>>(),
             ["C.esp", "A.esp"]
         );
-        // The same desired order second time moves nothing.
         assert!(apply_loot_order(&mut list, &desired).unwrap().is_empty());
     }
 

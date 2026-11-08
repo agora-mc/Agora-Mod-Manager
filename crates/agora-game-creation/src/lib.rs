@@ -6,6 +6,7 @@
 //! embedding a second copy.
 
 use agora_game_api::{GamePackage, PackageDefinition};
+use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 
 struct CreationEnginePackage(PackageDefinition);
@@ -16,17 +17,95 @@ impl GamePackage for CreationEnginePackage {
     }
 }
 
-/// The Skyrim SE package definition, read from the official plugin's package file.
+fn package_json(folder: &str) -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/official")
+        .join(folder)
+        .join("games/package.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("cannot parse {}: {error}", path.display()))
+}
+
+/// The §30.12 merge rules, enough for the two official packages: objects merge deeply, arrays of
+/// objects with an `id` merge by id, other arrays join parent first, and null removes a field.
+fn merge(parent: &Value, child: &Value) -> Value {
+    match (parent, child) {
+        (Value::Object(parent), Value::Object(child)) => {
+            let mut merged = parent.clone();
+            for (key, value) in child {
+                if value.is_null() {
+                    merged.remove(key);
+                } else {
+                    let next = match merged.get(key) {
+                        Some(existing) => merge(existing, value),
+                        None => value.clone(),
+                    };
+                    merged.insert(key.clone(), next);
+                }
+            }
+            Value::Object(merged)
+        }
+        (Value::Array(parent), Value::Array(child)) => {
+            let by_id = |items: &[Value]| {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| item.get("id").is_some_and(Value::is_string))
+            };
+            if by_id(parent) && by_id(child) {
+                let mut merged = parent.to_vec();
+                for item in child {
+                    let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                    match merged
+                        .iter()
+                        .position(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+                    {
+                        Some(position) => merged[position] = merge(&merged[position], item),
+                        None => merged.push(item.clone()),
+                    }
+                }
+                Value::Array(merged)
+            } else {
+                let mut merged = parent.clone();
+                merged.extend(child.clone());
+                Value::Array(merged)
+            }
+        }
+        (_, child) => child.clone(),
+    }
+}
+
+/// The Skyrim SE package definition, read from the official plugins. The game extends the
+/// Creation Engine template, so the base package and the template are merged in as the registry
+/// would merge them.
 pub fn game_package() -> Arc<dyn GamePackage> {
     static PACKAGE: OnceLock<Arc<dyn GamePackage>> = OnceLock::new();
     PACKAGE
         .get_or_init(|| {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../packages/official/skyrim-se/games/package.json");
-            let json_str = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-            let def: PackageDefinition = serde_json::from_str(&json_str)
-                .unwrap_or_else(|error| panic!("cannot parse {}: {error}", path.display()));
+            let base = package_json("creation-engine");
+            let skyrim = package_json("skyrim-se");
+            let mut merged = merge(&base, &skyrim);
+            let templates = merged
+                .get("game_templates")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(games) = merged.get_mut("games").and_then(Value::as_array_mut) {
+                for game in games {
+                    let Some(id) = game
+                        .get("extends")
+                        .and_then(Value::as_str)
+                        .and_then(|id| templates.get(id))
+                    else {
+                        continue;
+                    };
+                    *game = merge(id, game);
+                }
+            }
+            let def: PackageDefinition = serde_json::from_value(merged)
+                .unwrap_or_else(|error| panic!("cannot parse merged package: {error}"));
             Arc::new(CreationEnginePackage(def))
         })
         .clone()
@@ -44,7 +123,8 @@ mod tests {
         let pkg = game_package();
         let def = pkg.definition();
 
-        assert_eq!(def.id, "agora.creation-engine");
+        assert_eq!(def.id, "agora.skyrim-se");
+        assert_eq!(def.parents, vec!["creation-engine".to_string()]);
         assert_eq!(def.version.major, 0);
         assert_eq!(def.version.minor, 1);
         assert_eq!(def.version.patch, 0);

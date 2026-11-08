@@ -2066,6 +2066,7 @@ async fn async_main() {
         progress.log("warning", &warning);
         eprintln!("Warning: {warning}");
     }
+    let _script_runtime = script_runtime_if_needed(&ctx);
     cleanup_before_command(&cli.command, &ctx, &trash_adapter(), &progress, json);
     // An interrupted tool swap is put back at startup: one file existence test per game and store
     // when nothing is pending (MASTER_SPEC §26.9). A case that needs a hand is reported, not raised.
@@ -2509,6 +2510,32 @@ fn plugin_service(ctx: &agora_core::ctx::Ctx) -> PluginService {
     let host: Arc<dyn agora_plugin_api::host::ScriptHost> =
         Arc::new(agora_plugin_host::QuickJsHost::new());
     PluginService::headless(ctx.clone(), host)
+}
+
+/// Build the plugin service when a game's rules or hooks live in a plugin script. Its bridge is
+/// what lets those hooks run outside the plugin commands; without it a game check would report
+/// that the rules failed instead of reading the order.
+fn script_runtime_if_needed(ctx: &agora_core::ctx::Ctx) -> Option<PluginService> {
+    let needed = ctx.games.games().any(|game| {
+        game.load_orders
+            .iter()
+            .any(|order| order.rules.kind == "script" || order.format.is_script())
+            || ctx
+                .games
+                .package_for(&game.id)
+                .and_then(|package| package.definition().behaviours.as_ref())
+                .is_some_and(|behaviours| behaviours.names_any())
+    });
+    if !needed {
+        return None;
+    }
+    let service = plugin_service(ctx);
+    // The bridge exists as soon as the service does, but its record of what is installed comes
+    // from a reload. Without one, every activation would look like an unknown plugin.
+    if let Err(error) = service.reload() {
+        eprintln!("Warning: plugin records could not be read: {error}");
+    }
+    Some(service)
 }
 
 fn parse_plugin_id(raw: &str) -> anyhow::Result<agora_plugin_api::manifest::PluginId> {
@@ -10697,7 +10724,7 @@ fn sort_hint(
 }
 
 /// The instance's effective load order, one plugin per line: position, state, the master and
-/// light flags (`?` when the header was not read), the lock, who put the line there, and the name.
+/// the game's badges for it, the lock, who put the line there, and the name.
 fn print_load_order(instance_id: &str, order: &agora_core::game_load_order::LoadOrder) {
     if !order.exists {
         println!(
@@ -10711,8 +10738,8 @@ fn print_load_order(instance_id: &str, order: &agora_core::game_load_order::Load
         return;
     }
     println!(
-        "{:>3}  {:<8}  M L  {:<6}  {:<7}  name",
-        "#", "state", "lock", "from"
+        "{:>3}  {:<8}  {:<12}  {:<6}  {:<7}  name",
+        "#", "state", "badges", "lock", "from"
     );
     for (index, e) in order.entries.iter().enumerate() {
         let state = if e.implicit {
@@ -10722,13 +10749,10 @@ fn print_load_order(instance_id: &str, order: &agora_core::game_load_order::Load
         } else {
             "inactive"
         };
-        let (master, light) = if e.header_read {
-            (
-                if e.master { "M" } else { "-" },
-                if e.light { "L" } else { "-" },
-            )
+        let badges = if e.badges.is_empty() {
+            "-".to_string()
         } else {
-            ("?", "?")
+            e.badges.join(",")
         };
         let lock = if e.locked { "locked" } else { "" };
         let from = if e.implicit {
@@ -10738,19 +10762,12 @@ fn print_load_order(instance_id: &str, order: &agora_core::game_load_order::Load
         } else {
             "yours"
         };
-        let note = if !e.present {
-            " (missing)"
-        } else if e.header_error.is_some() {
-            " (unreadable header)"
-        } else {
-            ""
-        };
+        let note = if !e.present { " (missing)" } else { "" };
         println!(
-            "{:>3}  {:<8}  {} {}  {:<6}  {:<7}  {}{}",
+            "{:>3}  {:<8}  {:<12}  {:<6}  {:<7}  {}{}",
             index + 1,
             state,
-            master,
-            light,
+            badges,
             lock,
             from,
             e.name,

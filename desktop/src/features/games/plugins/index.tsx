@@ -180,7 +180,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
 
   const askOrPreviewSort = () => {
     if (!view) return;
-    if (view.rulesKind === 'creation_engine' && view.hasLoot && view.masterlist === null) {
+    if (view.hasLoot && view.masterlist === null) {
       setAskingForMasterlist(true);
       return;
     }
@@ -243,7 +243,6 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const showTable = view.supported && view.listExists && hasRows;
   const anyBusy = busy !== null;
   const heading = lists !== null && lists.length > 1 ? 'Load order' : (view.listName || 'Plugins');
-  const engine = view.rulesKind === 'creation_engine';
 
   return (
     <section className="space-y-4" aria-labelledby="plugins-heading" data-testid="plugins-tab">
@@ -251,9 +250,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
         <div className="max-w-2xl space-y-1">
           <h2 id="plugins-heading" className="text-lg font-semibold">{heading}</h2>
           <p className="text-sm text-muted-foreground">
-            {engine
-              ? "The game reads plugins from the top of this list down. When two plugins change the same thing, the one lower down wins. A plugin's masters must load above it."
-              : 'The game reads these from the top of this list down. When two change the same thing, the lower one wins.'}
+            {view.intro ?? 'The game reads these from the top of this list down. When two change the same thing, the lower one wins.'}
           </p>
           {view.masterlist && (
             <p className="text-xs text-muted-foreground" data-testid="plugins-masterlist">
@@ -267,13 +264,13 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
               <RefreshCw />
               Check again
             </Button>
-            {engine && view.hasLoot && (
+            {view.hasLoot && (
               <Button variant="outline" size="sm" onClick={updateMasterlistOnly} disabled={anyBusy}>
                 <Download />
                 Update masterlist
               </Button>
             )}
-            {view.rulesKind !== 'none' && (
+            {view.rulesApply && (
               <Button variant="outline" size="sm" onClick={askOrPreviewSort} disabled={anyBusy}>
                 Sort…
               </Button>
@@ -348,7 +345,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
             <thead className="bg-muted/40 text-left text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
                 <th scope="col" className="w-16 px-3 py-2">#</th>
-                <th scope="col" className="px-3 py-2">{engine ? 'Plugin' : 'Name'}</th>
+                <th scope="col" className="px-3 py-2">{view.itemHeading ?? 'Name'}</th>
                 <th scope="col" className="px-3 py-2 text-right">Change it</th>
               </tr>
             </thead>
@@ -524,14 +521,12 @@ function PluginRowView({ row, above, below, findings, disabled, onToggleActive, 
           {row.locked && <Badge variant="outline">Place locked</Badge>}
           {row.managed && <Badge variant="outline">Added by a content layer</Badge>}
           {!row.present && <Badge variant="destructive">File missing</Badge>}
-          {row.master && <Badge variant="outline">Master</Badge>}
-          {row.light && <Badge variant="outline">Light</Badge>}
+          {row.badges.map((badge) => (
+            <Badge key={badge} variant="outline">{badge}</Badge>
+          ))}
         </div>
         {row.masters.length > 0 && (
           <p className="mt-1 text-xs text-muted-foreground">Needs {row.masters.join(', ')}</p>
-        )}
-        {row.headerError && (
-          <p className="mt-1 text-xs text-destructive">Agora could not read this plugin's header: {row.headerError}</p>
         )}
         {findings.map((finding, index) => (
           <p key={index} className={finding.refusesLaunch ? 'mt-1 text-xs text-destructive' : 'mt-1 text-xs text-muted-foreground'}>

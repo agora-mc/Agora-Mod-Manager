@@ -1822,9 +1822,10 @@ mod tests {
             plugins: vec!["a.esm".into(), "b.esm".into()],
         });
         assert!(cycle.blocks);
-        let unreadable = load_order_finding(&Finding::UnreadableHeader {
-            plugin: "c.esp".into(),
-            reason: "truncated".into(),
+        let unreadable = load_order_finding(&Finding::ListLevel {
+            message: "'c.esp' has a header that cannot be read: truncated".into(),
+            items: vec!["c.esp".into()],
+            refuses: false,
         });
         assert!(
             !unreadable.blocks,

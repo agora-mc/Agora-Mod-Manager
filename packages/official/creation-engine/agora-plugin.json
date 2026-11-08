@@ -1,0 +1,20 @@
+{
+  "manifest": 1,
+  "id": "agora.creation-engine",
+  "name": "Creation Engine",
+  "version": "0.1.0",
+  "description": "Shared rules for games built on Bethesda's Creation Engine.",
+  "license": "GPL-3.0-only",
+  "apiRange": ">=0.1, <0.2",
+  "entrypoint": "main.js",
+  "capabilities": {
+    "required": ["game:define", "game:read"]
+  },
+  "contributions": {
+    "gamePackages": [
+      {
+        "path": "games/package.json"
+      }
+    ]
+  }
+}

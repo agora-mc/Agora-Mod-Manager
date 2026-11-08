@@ -3806,25 +3806,27 @@ fn games_list_shows_skyrim_only_after_the_plugin_is_installed() {
     assert!(before_text.contains("minecraft"), "{before_text}");
     assert!(!before_text.contains("skyrim-se"), "{before_text}");
 
-    // Skyrim is data only, so it loads without any plugin switch: neither the
-    // emergency stop nor a code consent can hide a game package.
-    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
-    let package = package.to_string_lossy().to_string();
-    let install = run_agora(
-        &data_dir,
-        &[
-            "plugin",
-            "install",
-            "--yes",
-            "development",
-            package.as_str(),
-        ],
-    );
-    assert!(
-        install.status.success(),
-        "installing the Skyrim plugin failed: {}",
-        String::from_utf8_lossy(&install.stderr)
-    );
+    // Skyrim inherits the Creation Engine base, which is its own official plugin. Install both,
+    // the base first, as a player's catalog install does.
+    let official = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official");
+    for package in ["creation-engine", "skyrim-se"] {
+        let package = official.join(package).to_string_lossy().to_string();
+        let install = run_agora(
+            &data_dir,
+            &[
+                "plugin",
+                "install",
+                "--yes",
+                "development",
+                package.as_str(),
+            ],
+        );
+        assert!(
+            install.status.success(),
+            "installing the Skyrim plugin failed: {}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+    }
 
     let after = run_agora(&data_dir, &["games", "list"]);
     assert!(
@@ -3835,7 +3837,7 @@ fn games_list_shows_skyrim_only_after_the_plugin_is_installed() {
     let after_text = String::from_utf8_lossy(&after.stdout);
     assert!(after_text.contains("skyrim-se"), "{after_text}");
     assert!(
-        after_text.contains("plugin: agora.creation-engine"),
+        after_text.contains("plugin: agora.skyrim-se"),
         "the list must say which source provides Skyrim: {after_text}"
     );
 }
@@ -4652,25 +4654,41 @@ fn install_skyrim_development_plugin(paths: &agora_core::app_paths::AppPaths) {
     use agora_plugin_api::capability::{Capability, CapabilitySet};
     use agora_plugin_api::manifest::PluginManifest;
 
-    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
-    let manifest: PluginManifest =
-        serde_json::from_str(&std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap())
+    let official = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official");
+    for name in ["creation-engine", "skyrim-se"] {
+        let folder = official.join(name);
+        let manifest: PluginManifest = serde_json::from_str(
+            &std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap(),
+        )
+        .unwrap();
+        let mut granted = CapabilitySet::new();
+        granted.insert(Capability::GameDefine);
+        granted.insert(Capability::GameRead);
+        let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+        store::upsert(
+            &conn,
+            &manifest,
+            &granted,
+            &PluginSource::Development {
+                path: folder.clone(),
+            },
+            &folder,
+            true,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        if manifest.entrypoint.is_some() {
+            let digest = agora_core::plugins::install::script_digest(&manifest, &folder).unwrap();
+            store::set_script_consent(
+                &conn,
+                &manifest.id,
+                true,
+                digest.as_deref(),
+                "2026-01-01T00:00:00Z",
+            )
             .unwrap();
-    let mut granted = CapabilitySet::new();
-    granted.insert(Capability::GameDefine);
-    let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
-    store::upsert(
-        &conn,
-        &manifest,
-        &granted,
-        &PluginSource::Development {
-            path: folder.clone(),
-        },
-        &folder,
-        true,
-        "2026-01-01T00:00:00Z",
-    )
-    .unwrap();
+        }
+    }
 }
 
 /// The same development install, in a data root the CLI binary will open itself.
@@ -5022,8 +5040,15 @@ fn games_instance_check_passes_a_runtime_with_its_own_frameworks() {
     // The fixture's Skyrim.esm is not a real plugin, so the load order warns that its header cannot
     // be read. That is a warning: it never fails the check.
     assert_eq!(json["status"], "warnings");
-    assert_eq!(json["load_order_findings"][0]["kind"], "unreadable_header");
-    assert_eq!(json["load_order_findings"][0]["plugin"], "Skyrim.esm");
+    assert_eq!(
+        json["load_order_findings"][0]["kind"], "list_level",
+        "{json}"
+    );
+    assert_eq!(json["load_order_findings"][0]["items"][0], "Skyrim.esm");
+    assert!(json["load_order_findings"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be read"));
 }
 
 /// Every table of the data root's `local_state.db`, as rows of text, read-only.

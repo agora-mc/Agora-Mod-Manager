@@ -113,6 +113,9 @@ fn skyrim_like() -> GameDefinition {
             implicit_list_file: None,
             loot: None,
         },
+
+        intro: None,
+        item_heading: None,
     }];
     def.tool_ids = vec![ToolId::new("nemesis").unwrap()];
     def.launch = Some(LaunchRecipe {

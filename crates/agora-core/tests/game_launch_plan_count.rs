@@ -29,6 +29,13 @@ impl GamePackage for Package {
     fn definition(&self) -> &PackageDefinition {
         &self.0
     }
+    fn load_order_rules<'a>(
+        &'a self,
+        _context: agora_game_api::GameContext,
+        _list_id: &'a str,
+    ) -> agora_game_api::GameFuture<'a, Option<agora_game_api::LoadOrderRulesReply>> {
+        Box::pin(async { Ok(Some(agora_game_api::LoadOrderRulesReply::default())) })
+    }
 }
 
 /// Says whether the virtual file system is available. A launch is only prepared, never started.
@@ -109,7 +116,7 @@ fn definition(plugin_list: u8) -> GameDefinition {
             },
             rules: agora_game_api::LoadOrderRules {
                 kind: if plugin_list == 2 {
-                    "creation_engine".to_string()
+                    "script".to_string()
                 } else {
                     "none".to_string()
                 },
@@ -118,6 +125,9 @@ fn definition(plugin_list: u8) -> GameDefinition {
                 implicit_list_file: None,
                 loot: None,
             },
+
+            intro: None,
+            item_heading: None,
         }];
         def.user_files = vec![UserFileMapping::new(
             GamePath::UserData {

@@ -1,11 +1,14 @@
 {
-  "id": "agora.creation-engine",
+  "id": "agora.skyrim-se",
   "version": "0.1.0",
   "api_range": ">=0.1, <0.2",
-  "parents": [],
+  "parents": [
+    "creation-engine"
+  ],
   "games": [
     {
       "id": "skyrim-se",
+      "extends": "creation-engine",
       "name": "The Elder Scrolls V: Skyrim Special Edition",
       "mo2_game_name": "Skyrim Special Edition",
       "stores": [
@@ -252,15 +255,6 @@
           "id": "plugins",
           "name": "Plugins",
           "file": "user/Plugins.txt",
-          "items": {
-            "folder": "Data",
-            "patterns": [
-              "*.esm",
-              "*.esl",
-              "*.esp"
-            ],
-            "folders": false
-          },
           "format": {
             "type": "lines",
             "active_prefix": "*",
@@ -270,7 +264,7 @@
             ]
           },
           "rules": {
-            "kind": "creation_engine",
+            "kind": "script",
             "implicit": [
               "Skyrim.esm",
               "Update.esm",

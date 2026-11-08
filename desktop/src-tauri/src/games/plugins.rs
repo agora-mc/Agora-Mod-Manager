@@ -82,11 +82,15 @@ pub struct PluginsView {
     pub list_id: String,
     /// The list's name as a person reads it.
     pub list_name: String,
-    /// The list's rule kind: `none`, `script` or `creation_engine`.
+    /// The list's rule kind: `none` or `script`.
     pub rules_kind: String,
+    /// This list's intro sentence, when the game declares one.
+    pub intro: Option<String>,
+    /// The column heading for an item's name, when the game declares one.
+    pub item_heading: Option<String>,
     /// Whether this list declares a LOOT masterlist source.
     pub has_loot: bool,
-    /// Whether the game's load order rules (masters, light and full limits) apply.
+    /// Whether the game's own rules judge this list, so it can be sorted.
     pub rules_apply: bool,
     /// Whether the instance has a copy of the plugin list yet. It is created at deploy time.
     pub list_exists: bool,
@@ -131,13 +135,10 @@ pub struct PluginRow {
     /// Whether Agora added this line because a content layer deploys it.
     pub managed: bool,
     pub locked: bool,
-    /// Whether the plugin's header was read. `master` and `light` mean nothing when it was not.
-    pub header_read: bool,
-    pub master: bool,
-    pub light: bool,
-    /// The masters the header names, in the header's order.
+    /// Short flags the game's rules show beside the item, such as `Master` or `Light`.
+    pub badges: Vec<String>,
+    /// The items the game's rules say it needs first.
     pub masters: Vec<String>,
-    pub header_error: Option<String>,
 }
 
 /// One problem with the load order, with the plugins it concerns so the row can show it.
@@ -158,6 +159,8 @@ impl PluginsView {
             list_id: String::new(),
             list_name: String::new(),
             rules_kind: String::new(),
+            intro: None,
+            item_heading: None,
             has_loot: false,
             rules_apply: false,
             list_exists: false,
@@ -173,8 +176,10 @@ impl PluginsView {
             list_id: order.list_id.clone(),
             list_name: order.list_name.clone(),
             rules_kind: order.rules_kind.clone(),
+            intro: order.intro.clone(),
+            item_heading: order.item_heading.clone(),
             has_loot: false,
-            rules_apply: order.engine,
+            rules_apply: order.rules_kind == "script",
             list_exists: order.exists,
             rows: order
                 .entries
@@ -202,11 +207,8 @@ fn row_view(position: usize, entry: &LoadOrderEntry) -> PluginRow {
         present: entry.present,
         managed: entry.managed,
         locked: entry.locked,
-        header_read: entry.header_read,
-        master: entry.master,
-        light: entry.light,
+        badges: entry.badges.clone(),
         masters: entry.masters.clone(),
-        header_error: entry.header_error.clone(),
     }
 }
 
@@ -220,15 +222,14 @@ fn note_view(note: &agora_core::game_load_order::PluginNote) -> PluginFinding {
 
 fn finding_view(finding: &Finding) -> PluginFinding {
     let plugins = match finding {
-        Finding::MasterNotEarlier { plugin, .. }
-        | Finding::UnreadableHeader { plugin, .. }
-        | Finding::DuplicateListing { plugin } => vec![plugin.clone()],
+        Finding::MasterNotEarlier { plugin, .. } | Finding::DuplicateListing { plugin } => {
+            vec![plugin.clone()]
+        }
         Finding::MasterCycle { plugins } => plugins.clone(),
         Finding::RuleConflict { first, second, .. } => vec![first.clone(), second.clone()],
         Finding::MissingRuleItem { item, .. } => vec![item.clone()],
-        Finding::TooManyFullPlugins { .. }
-        | Finding::TooManyLightPlugins { .. }
-        | Finding::RulesFailed { .. } => Vec::new(),
+        Finding::ListLevel { items, .. } => items.clone(),
+        Finding::RulesFailed { .. } => Vec::new(),
     };
     PluginFinding {
         message: finding.message(),
@@ -546,11 +547,8 @@ mod tests {
             present: true,
             managed: false,
             locked: false,
-            header_read: true,
-            master: false,
-            light: false,
+            badges: Vec::new(),
             masters: Vec::new(),
-            header_error: None,
         }
     }
 
@@ -558,8 +556,9 @@ mod tests {
         LoadOrder {
             list_id: "plugins".into(),
             list_name: "Plugins".into(),
-            rules_kind: "creation_engine".into(),
-            engine: true,
+            rules_kind: "script".into(),
+            intro: None,
+            item_heading: None,
             exists: true,
             entries,
             findings,
@@ -570,7 +569,7 @@ mod tests {
     #[test]
     fn rows_are_numbered_from_one_and_keep_the_order_given() {
         let mut skyrim = entry("Skyrim.esm");
-        skyrim.master = true;
+        skyrim.badges = vec!["Master".into()];
         let mut implicit = entry("Update.esm");
         implicit.implicit = true;
         let view = PluginsView::from_order(&order(
@@ -581,7 +580,7 @@ mod tests {
         assert!(view.supported && view.rules_apply && view.list_exists);
         assert_eq!(view.list_id, "plugins");
         assert_eq!(view.list_name, "Plugins");
-        assert_eq!(view.rules_kind, "creation_engine");
+        assert_eq!(view.rules_kind, "script");
         let numbered: Vec<(usize, &str)> = view
             .rows
             .iter()
@@ -592,7 +591,7 @@ mod tests {
             vec![(1, "Update.esm"), (2, "Skyrim.esm"), (3, "SkyUI.esp")]
         );
         assert!(view.rows[0].implicit);
-        assert!(view.rows[1].master);
+        assert!(view.rows[1].badges.iter().any(|b| b == "Master"));
     }
 
     #[test]
@@ -620,9 +619,10 @@ mod tests {
             master: "Skyrim.esm".to_string(),
             problem: MasterProblem::Missing,
         };
-        let limit = Finding::TooManyFullPlugins {
-            active: 300,
-            limit: 254,
+        let limit = Finding::ListLevel {
+            message: "300 full plugins are active; the game loads at most 254".into(),
+            items: Vec::new(),
+            refuses: true,
         };
         let view = PluginsView::from_order(&order(Vec::new(), vec![missing, limit]));
 
@@ -775,17 +775,15 @@ mod tests {
             view.supported, view.rules_apply, view.list_exists
         );
         println!(
-            "rows={} implicit={} active={} present={} managed={} locked={} masters={} lights={} header_read={} header_error={}",
+            "rows={} implicit={} active={} present={} managed={} locked={} masters={} badges={}",
             rows.len(),
             count(|r| r.implicit),
             count(|r| r.active),
             count(|r| r.present),
             count(|r| r.managed),
             count(|r| r.locked),
-            count(|r| r.master),
-            count(|r| r.light),
-            count(|r| r.header_read),
-            count(|r| r.header_error.is_some()),
+            count(|r| !r.masters.is_empty()),
+            count(|r| !r.badges.is_empty()),
         );
         println!(
             "plan: {:?}  order: {:?}  check: {:?}",
@@ -810,12 +808,12 @@ mod tests {
                 finding.plugins
             );
         }
-        for row in rows.iter().filter(|r| r.header_error.is_some()).take(10) {
-            println!(
-                "  header error {}: {}",
-                row.name,
-                row.header_error.as_deref().unwrap_or("")
-            );
+        for row in rows
+            .iter()
+            .filter(|r| r.badges.is_empty() && !r.masters.is_empty())
+            .take(10)
+        {
+            println!("  needs {}: {}", row.name, row.masters.join(", "));
         }
         assert!(
             view.supported && view.list_exists,

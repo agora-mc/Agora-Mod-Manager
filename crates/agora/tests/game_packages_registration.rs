@@ -78,25 +78,40 @@ fn registers_minecraft_and_skyrim_packages_together() {
 
 #[test]
 fn the_official_plugin_loads_the_same_skyrim_definition() {
+    use agora_core::game_registry::{inherit::resolve, PackageInput};
     use agora_plugin_api::manifest::PluginManifest;
 
-    let folder =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official/skyrim-se");
-    let manifest_text = std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap();
-    let manifest: PluginManifest = serde_json::from_str(&manifest_text).unwrap();
-    let contribution = manifest
-        .contributions
-        .game_packages
-        .first()
-        .expect("the plugin contributes a game package");
-    let package_text = std::fs::read_to_string(folder.join(&contribution.path)).unwrap();
-    let definition: agora_game_api::PackageDefinition =
-        serde_json::from_str(&package_text).unwrap();
-
+    let official = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official");
+    let mut inputs = Vec::new();
+    for name in ["creation-engine", "skyrim-se"] {
+        let folder = official.join(name);
+        let manifest_text = std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap();
+        let manifest: PluginManifest = serde_json::from_str(&manifest_text).unwrap();
+        let contribution = manifest
+            .contributions
+            .game_packages
+            .first()
+            .expect("the plugin contributes a game package");
+        let package_text = std::fs::read_to_string(folder.join(&contribution.path)).unwrap();
+        inputs.push(PackageInput {
+            source: PackageSource::Plugin {
+                plugin_id: manifest.id.to_string(),
+            },
+            blocked: false,
+            label: format!("Plugin {}, {}", manifest.id, contribution.path),
+            json: serde_json::from_str(&package_text).unwrap(),
+        });
+    }
+    let (resolved, warnings) = resolve(inputs);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let skyrim = resolved
+        .into_iter()
+        .find(|package| package.definition.id == "agora.skyrim-se")
+        .expect("Skyrim resolves with its parent");
     assert_eq!(
-        definition,
+        skyrim.definition,
         *agora_game_creation::game_package().definition(),
-        "the plugin package and the test helper must describe the same game"
+        "the plugin packages and the test helper must describe the same game"
     );
 }
 

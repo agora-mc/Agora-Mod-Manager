@@ -97,7 +97,11 @@ def game_ids(folder: Path, manifest: dict[str, Any]) -> list[str]:
             raise SystemExit(f"{folder}: game package {path} leaves the plugin") from error
         package = read_json(path)
         games = package.get("games")
-        if not isinstance(games, list) or not games:
+        if games is None:
+            games = []
+        if not isinstance(games, list):
+            raise SystemExit(f"{path}: games must be a list")
+        if not games and not package.get("game_templates"):
             raise SystemExit(f"{path}: the game package defines no games")
         for game in games:
             if not isinstance(game, dict) or not isinstance(game.get("id"), str):

@@ -12,7 +12,7 @@
 use crate::game_registry::PackageSource;
 use agora_game_api::PackageDefinition;
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One package read from a plugin, before inheritance is resolved.
 #[derive(Debug, Clone)]
@@ -25,6 +25,36 @@ pub struct PackageInput {
     pub json: Value,
 }
 
+/// Which plugin declared each script entrypoint, recorded while packages are merged
+/// (MASTER_SPEC §30.12). An inherited behaviour runs in the plugin that wrote it, with that
+/// plugin's grants, not in the child that inherited it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BehaviourOwners {
+    /// A `behaviours` field name (`classify`, `load_order_rules`, ...) to its plugin id.
+    pub behaviours: BTreeMap<String, String>,
+    /// A load order's script entrypoint to its plugin id. Keys are built by [`script_key`].
+    pub scripts: BTreeMap<String, String>,
+}
+
+/// The key that records one load order script slot: `parse`, `render` or `rules`.
+pub fn script_key(game: &str, list: &str, slot: &str) -> String {
+    format!("{game}/{list}/{slot}")
+}
+
+impl BehaviourOwners {
+    /// The plugin that owns a `behaviours` field, if it is not this package's own.
+    pub fn behaviour(&self, field: &str) -> Option<&str> {
+        self.behaviours.get(field).map(String::as_str)
+    }
+
+    /// The plugin that owns one load order script slot.
+    pub fn script(&self, game: &str, list: &str, slot: &str) -> Option<&str> {
+        self.scripts
+            .get(&script_key(game, list, slot))
+            .map(String::as_str)
+    }
+}
+
 /// A package after inheritance, ready for the registry.
 #[derive(Debug, Clone)]
 pub struct ResolvedPackage {
@@ -33,6 +63,7 @@ pub struct ResolvedPackage {
     /// How a warning names the package, e.g. `Plugin agora.creation-engine, games/package.json`.
     pub label: String,
     pub definition: PackageDefinition,
+    pub owners: BehaviourOwners,
 }
 
 /// Resolve every package that can be resolved. Returns the survivors and one warning per package
@@ -86,7 +117,7 @@ fn resolve_inner(
         }
         let mut visiting = Vec::new();
         let mut missing_parent = false;
-        let result: Result<PackageDefinition, String> = (|| {
+        let result: Result<(PackageDefinition, BehaviourOwners), String> = (|| {
             let (order, missing) = lineage_of(
                 i,
                 &inputs,
@@ -98,7 +129,7 @@ fn resolve_inner(
             )?;
             missing_parent = missing;
             let mut merged = Value::Object(Map::new());
-            for ancestor in order {
+            for &ancestor in &order {
                 merged = merge_json(&merged, &inputs[ancestor].json);
             }
             let mut own = input.json.clone();
@@ -112,17 +143,19 @@ fn resolve_inner(
             );
             merged = merge_json(&merged, &own);
             resolve_templates(&mut merged, &inputs[i])?;
+            let owners = owners_of(&order_with_child(&order, i), &inputs, &merged);
             let definition: PackageDefinition = serde_json::from_value::<PackageDefinition>(merged)
                 .map_err(|error| format!("package cannot be parsed: {error}"))?;
-            Ok(definition)
+            Ok((definition, owners))
         })();
 
         match result {
-            Ok(definition) => resolved.push(ResolvedPackage {
+            Ok((definition, owners)) => resolved.push(ResolvedPackage {
                 source: input.source.clone(),
                 blocked: input.blocked,
                 label: input.label.clone(),
                 definition,
+                owners,
             }),
             // A package that needs an absent parent may not even parse alone. That is not the
             // author's mistake to fix in this folder, so it is a note, not a problem.
@@ -258,6 +291,116 @@ fn resolve_templates(merged: &mut Value, input: &PackageInput) -> Result<(), Str
         *game = merge_json(template, game);
     }
     Ok(())
+}
+
+fn order_with_child(order: &[usize], child: usize) -> Vec<usize> {
+    let mut sequence = order.to_vec();
+    sequence.push(child);
+    sequence
+}
+
+fn plugin_of(input: &PackageInput) -> Option<&String> {
+    match &input.source {
+        PackageSource::Plugin { plugin_id } => Some(plugin_id),
+        PackageSource::Compiled { .. } => None,
+    }
+}
+
+/// The game object with `id` in one package's JSON, if it defines one.
+fn input_game<'a>(json: &'a Value, game_id: &str) -> Option<&'a Value> {
+    json.get("games")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|game| game.get("id").and_then(Value::as_str) == Some(game_id))
+}
+
+fn record_script_slots(
+    value: &Value,
+    game: &str,
+    plugin: &str,
+    owners: &mut BTreeMap<String, String>,
+) {
+    let Some(orders) = value.get("load_orders").and_then(Value::as_array) else {
+        return;
+    };
+    for order in orders {
+        let Some(list) = order.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let format = order.get("format");
+        for slot in ["parse", "render"] {
+            if format
+                .and_then(|format| format.get(slot))
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                owners.insert(script_key(game, list, slot), plugin.to_string());
+            }
+        }
+        if order
+            .get("rules")
+            .and_then(|rules| rules.get("entry"))
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            owners.insert(script_key(game, list, "rules"), plugin.to_string());
+        }
+    }
+}
+
+/// Record which plugin wrote each script entrypoint, in merge order (parents first, then the
+/// child). A child that overrides a behaviour owns it; an inherited one stays its parent's.
+fn owners_of(sequence: &[usize], inputs: &[PackageInput], merged: &Value) -> BehaviourOwners {
+    let mut owners = BehaviourOwners::default();
+    for &index in sequence {
+        let Some(plugin) = plugin_of(&inputs[index]) else {
+            continue;
+        };
+        if let Some(behaviours) = inputs[index]
+            .json
+            .get("behaviours")
+            .and_then(Value::as_object)
+        {
+            for (field, value) in behaviours {
+                if !value.is_null() {
+                    owners.behaviours.insert(field.clone(), plugin.clone());
+                }
+            }
+        }
+    }
+
+    let Some(games) = merged.get("games").and_then(Value::as_array) else {
+        return owners;
+    };
+    for game in games {
+        let game_id = game.get("id").and_then(Value::as_str).unwrap_or_default();
+        let extends = game.get("extends").and_then(Value::as_str);
+        // The merged game's own fields win over its template, so record them apart and let the
+        // game's owners take precedence.
+        let mut from_game = BTreeMap::new();
+        let mut from_template = BTreeMap::new();
+        for &index in sequence {
+            let Some(plugin) = plugin_of(&inputs[index]) else {
+                continue;
+            };
+            if let Some(value) = input_game(&inputs[index].json, game_id) {
+                record_script_slots(value, game_id, plugin, &mut from_game);
+            }
+            if let Some(template_id) = extends {
+                if let Some(value) = inputs[index]
+                    .json
+                    .get("game_templates")
+                    .and_then(Value::as_object)
+                    .and_then(|templates| templates.get(template_id))
+                {
+                    record_script_slots(value, game_id, plugin, &mut from_template);
+                }
+            }
+        }
+        owners.scripts.extend(from_template);
+        owners.scripts.extend(from_game);
+    }
+    owners
 }
 
 /// Merge `child` over `parent` by the §30.12 rules.

@@ -266,10 +266,18 @@ impl GameRegistryBuilder {
                         reason: format!("load order '{}' is declared twice", rule.id),
                     });
                 }
-                if !matches!(
-                    rule.rules.kind.as_str(),
-                    "none" | "script" | "creation_engine"
-                ) {
+                if rule.rules.kind == "creation_engine" {
+                    return Err(GameRegistryError::InvalidLoadOrder {
+                        game_id: game.id.clone(),
+                        reason: format!(
+                            "load order '{}' uses 'creation_engine', which moved into the \
+                             agora.creation-engine plugin; declare it as a 'script' rule set \
+                             and install that plugin",
+                            rule.id
+                        ),
+                    });
+                }
+                if !matches!(rule.rules.kind.as_str(), "none" | "script") {
                     return Err(GameRegistryError::InvalidLoadOrder {
                         game_id: game.id.clone(),
                         reason: format!(
@@ -304,23 +312,20 @@ impl GameRegistryBuilder {
                         });
                     }
                 }
-                if rule.rules.is_script()
-                    && rule
-                        .rules
-                        .entry
-                        .as_deref()
-                        .is_none_or(|entry| entry.trim().is_empty())
+                if rule
+                    .rules
+                    .entry
+                    .as_deref()
+                    .is_some_and(|entry| entry.trim().is_empty())
                 {
                     return Err(GameRegistryError::InvalidLoadOrder {
                         game_id: game.id.clone(),
-                        reason: format!(
-                            "load order '{}' has a script rule set with no entrypoint",
-                            rule.id
-                        ),
+                        reason: format!("load order '{}' has an empty rule entrypoint", rule.id),
                     });
                 }
-                // A compiled package answers script hooks in Rust, and a plugin's manifest is not
-                // visible here, so the entrypoints are checked when the script loads.
+                // A compiled package answers script hooks in Rust, and a script rule set may use
+                // the package's `behaviours.load_order_rules` instead of its own `entry`. Whether
+                // an owning plugin has an entrypoint is checked where the package is loaded.
                 for name in &rule.rules.implicit {
                     if name.trim().is_empty() || name.contains(['/', '\\']) {
                         return Err(GameRegistryError::InvalidPluginList {

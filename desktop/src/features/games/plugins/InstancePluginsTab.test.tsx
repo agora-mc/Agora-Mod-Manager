@@ -21,7 +21,9 @@ function view(overrides: Record<string, unknown> = {}) {
     supported: true,
     listId: 'plugins',
     listName: 'Plugins',
-    rulesKind: 'creation_engine',
+    rulesKind: 'script',
+    intro: 'Read the list from the top down.',
+    itemHeading: 'Plugin',
     hasLoot: true,
     rulesApply: true,
     listExists: true,
@@ -40,11 +42,8 @@ const row = {
   present: true,
   managed: true,
   locked: false,
-  headerRead: true,
-  master: false,
-  light: false,
+  badges: [],
   masters: [],
-  headerError: null,
 };
 
 function mountTab() {
@@ -68,7 +67,7 @@ describe('load order lists', () => {
   });
 
   it('keeps today’s single list, with Sort, and no tab row', async () => {
-    replies.games_plugins_lists = () => ({ lists: [{ id: 'plugins', name: 'Plugins', rulesKind: 'creation_engine' }] });
+    replies.games_plugins_lists = () => ({ lists: [{ id: 'plugins', name: 'Plugins', rulesKind: 'script' }] });
     replies.games_plugins_list = () => view({ rows: [row] });
     mountTab();
     expect(await screen.findByRole('heading', { name: 'Plugins' })).toBeInTheDocument();
@@ -82,9 +81,11 @@ describe('load order lists', () => {
       listId: 'mods',
       listName: 'Mods',
       rulesKind: 'none',
+      intro: null,
+      itemHeading: null,
       hasLoot: false,
       rulesApply: false,
-      rows: [{ ...row, name: 'my_mod', headerRead: false }],
+      rows: [{ ...row, name: 'my_mod', badges: [] }],
     });
     mountTab();
     expect(await screen.findByRole('heading', { name: 'Mods' })).toBeInTheDocument();
@@ -98,7 +99,7 @@ describe('load order lists', () => {
   it('shows a tab per list and each list keeps its own order', async () => {
     replies.games_plugins_lists = () => ({
       lists: [
-        { id: 'plugins', name: 'Plugins', rulesKind: 'creation_engine' },
+        { id: 'plugins', name: 'Plugins', rulesKind: 'script' },
         { id: 'redmods', name: 'REDmods', rulesKind: 'none' },
       ],
     });

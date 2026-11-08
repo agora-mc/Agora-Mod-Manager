@@ -17,28 +17,33 @@ Build the desktop application, open **Settings → Services → Plugins**. Choos
 ## Official plugins in this repository
 
 Some plugins are Agora's own. They live under `packages/official/<name>/`, and the signed registry
-pins them in `registry/official-plugins/<plugin-id>.json`. Skyrim Special Edition is the first:
-`packages/official/skyrim-se/` (plugin id `agora.creation-engine`, game id `skyrim-se`). The app does
-not compile Skyrim in, so `agora games list` shows it only when the plugin is installed.
+pins them in `registry/official-plugins/<plugin-id>.json`. There are two for Skyrim:
+`packages/official/creation-engine/` (plugin id `agora.creation-engine`, no game) holds the shared
+Creation Engine rules and a script, and `packages/official/skyrim-se/` (plugin id
+`agora.skyrim-se`, game id `skyrim-se`) inherits them. The app does not compile Skyrim in, so
+`agora games list` shows it only when both plugins are installed.
 
-To use it while developing, install the folder as a development plugin. It ships no code today, so
-it loads with no plugin switch and no code consent:
+To use them while developing, install both folders as development plugins, base first. The base
+ships code, so allowing it is a step of its own:
 
 ```bash
+agora --data-dir ./tmp/agora-dev plugin install --yes development packages/official/creation-engine
 agora --data-dir ./tmp/agora-dev plugin install --yes development packages/official/skyrim-se
 agora --data-dir ./tmp/agora-dev games list
 ```
 
-The CLI tests install it the same way. To build the release zip reproducibly:
+The CLI tests install them the same way. To build each release zip reproducibly:
 
 ```bash
+python scripts/build_official_plugin.py creation-engine
+python scripts/build_official_plugin.py creation-engine --verify-registry
 python scripts/build_official_plugin.py skyrim-se
 python scripts/build_official_plugin.py skyrim-se --verify-registry
 ```
 
 `--update-registry` rewrites the signed-registry entry from the built bytes; `--verify-registry`
-refuses an entry that does not pin them. The release workflow attaches the zip to the
-`official-skyrim-se-v<version>` release, which is the URL the entry names.
+refuses an entry that does not pin them. The release workflow attaches each zip to its own
+`official-<name>-v<version>` release, which is the URL the entry names.
 
 The same operations exist in the standalone CLI, which is usually faster while iterating:
 

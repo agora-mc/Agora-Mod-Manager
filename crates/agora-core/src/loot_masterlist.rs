@@ -879,8 +879,8 @@ mod tests {
                     header: vec![],
                 },
                 rules: agora_game_api::LoadOrderRules {
-                    kind: "creation_engine".into(),
-                    entry: None,
+                    kind: "script".into(),
+                    entry: Some("rules".into()),
                     implicit: vec![],
                     implicit_list_file: None,
                     loot: Some(LootRule {
@@ -890,6 +890,8 @@ mod tests {
                         game_type: "SkyrimSE".into(),
                     }),
                 },
+                intro: None,
+                item_heading: None,
             }],
             launch_alternatives: vec![],
             runtime_files: vec![],
@@ -1196,11 +1198,8 @@ mod tests {
             present: true,
             managed: false,
             locked,
-            header_read: false,
-            master: false,
-            light: false,
+            badges: Vec::new(),
             masters: Vec::new(),
-            header_error: None,
         }
     }
 
