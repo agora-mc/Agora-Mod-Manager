@@ -1585,7 +1585,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Pick the controller up',
-          body: 'Connect a controller using Bluetooth, (make sure it\'s turned on :) and use the pairing button), click into Agora with your mouse to give it focus, and press any button on the controller while Agora is open. Text and buttons get bigger, things spread out a little, and a highlight shows what is selected. These are the same pages you already know, just easier to use from the couch. There is nothing to turn on first.',
+          body: 'Connect a controller using Bluetooth, cable, or USB receiver, (make sure it\'s turned on :) and use the pairing button), click into Agora with your mouse to give it focus, and press any button on the controller while Agora is open. Text and buttons get bigger, things spread out a little, and a highlight shows what is selected. These are the same pages you already know, just easier to use from the couch. There is nothing to turn on first.',
           callout: {
             tone: 'note',
             title: 'Press a button to get started',
