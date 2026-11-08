@@ -30,6 +30,8 @@ function view(overrides: Record<string, unknown> = {}) {
     listExists: true,
     rows: [],
     findings: [],
+    notes: [],
+    notesOutOfDate: false,
     masterlist: null,
     ...overrides,
   };
@@ -96,6 +98,26 @@ describe('load order lists', () => {
     expect(screen.queryByRole('columnheader', { name: 'Plugin' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Sort…' })).toBeNull();
     expect(screen.queryByRole('button', { name: /Update masterlist/ })).toBeNull();
+  });
+
+  it('shows the list before the sorter notes arrive, then fills them in', async () => {
+    let resolveNotes!: (value: unknown) => void;
+    const notes = new Promise((resolve) => {
+      resolveNotes = resolve;
+    });
+    replies.games_plugins_lists = () => ({ lists: [{ id: 'plugins', name: 'Plugins', rulesKind: 'script' }] });
+    replies.games_plugins_list = () => view({ rows: [row], notesOutOfDate: true });
+    replies.games_plugins_sorter_notes = () => notes;
+    mountTab();
+
+    expect(await screen.findByText('SkyUI.esp')).toBeInTheDocument();
+    expect(screen.queryAllByText('A note from the sorter')).toHaveLength(0);
+
+    resolveNotes({
+      notes: [{ message: 'A note from the sorter', refusesLaunch: false, plugins: ['SkyUI.esp'] }],
+      notesOutOfDate: false,
+    });
+    expect(await screen.findAllByText('A note from the sorter')).not.toHaveLength(0);
   });
 
   it('shows a tab per list and each list keeps its own order', async () => {

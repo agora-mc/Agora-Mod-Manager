@@ -73,6 +73,15 @@ const storage = {
   set: (key, value) => call("storage.set", { key, value }),
   all: () => call("storage.all"),
   remove: (key) => call("storage.remove", { key }),
+  // Bytes live in this plugin's own blob store, as files core owns. The
+  // script names a key, never a path.
+  putBytes: (key, bytes) =>
+    call("storage.putBytes", { key, bytes: Array.from(bytes === undefined ? [] : bytes) }),
+  getBytes: (key) =>
+    call("storage.getBytes", { key }).then((reply) =>
+      reply === null || reply === undefined ? null : new Uint8Array(reply.bytes),
+    ),
+  deleteBytes: (key) => call("storage.deleteBytes", { key }),
   forInstance: (instanceId) => ({
     get: (key) => call("storage.get", { key, instanceId }),
     set: (key, value) => call("storage.set", { key, value, instanceId }),
@@ -108,6 +117,9 @@ const wasm = {
         for (const [name, value] of Object.entries(mount.files)) {
           out.files[name] = encode(value);
         }
+      }
+      if (mount.stored) {
+        out.stored = mount.stored.map(String);
       }
       return out;
     });

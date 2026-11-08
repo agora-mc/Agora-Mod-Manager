@@ -156,6 +156,77 @@ impl StageBudget {
     }
 }
 
+/// Longest a stored blob's key may be.
+pub const MAX_BLOB_KEY_LEN: usize = 128;
+
+/// Whether `key` is a plain blob name: no path, no Windows device name, and
+/// nothing that could name a stream or a folder. The same rule is used by the
+/// store's writes and by a wasm `stored` mount, so a key that cannot be saved
+/// can never be mounted either.
+pub fn validate_blob_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("a blob key cannot be empty".into());
+    }
+    if key.len() > MAX_BLOB_KEY_LEN {
+        return Err(format!(
+            "a blob key may be at most {MAX_BLOB_KEY_LEN} bytes; `{}` is {}",
+            key.chars().take(24).collect::<String>(),
+            key.len()
+        ));
+    }
+    if key == "." || key == ".." {
+        return Err(format!("`{key}` is not a blob name"));
+    }
+    if let Some(bad) = key.chars().find(|c| {
+        c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return Err(format!(
+            "a blob key cannot contain `{bad:?}`; it must be a plain name, like `notes.txt`"
+        ));
+    }
+    if key.ends_with('.') || key.ends_with(' ') {
+        return Err("a blob key cannot end with a dot or a space".into());
+    }
+    let stem = key.split('.').next().unwrap_or(key).trim_end();
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || upper
+        .strip_prefix("COM")
+        .and_then(|n| n.parse::<u8>().ok())
+        .is_some_and(|n| (1..=9).contains(&n))
+        || upper
+            .strip_prefix("LPT")
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| (1..=9).contains(&n));
+    if reserved {
+        return Err(format!("`{key}` is a reserved device name"));
+    }
+    Ok(())
+}
+
+/// The stored blobs a plugin may stage into a module's mount, when the call
+/// has one. The default refuses, so a scope without a blob store cannot be
+/// reached by accident.
+pub trait StoredBlobs: Send + Sync {
+    /// The plugin whose blobs these are, for logs.
+    fn plugin(&self) -> Option<&str> {
+        None
+    }
+
+    /// Put one stored blob at `destination` (a file path inside a mount's
+    /// staging folder), spending the run's mount allowance. A missing key is
+    /// an error naming it, never an empty file.
+    fn stage(
+        &self,
+        key: &str,
+        destination: &Path,
+        limits: &StageLimits,
+        budget: &StageBudget,
+    ) -> Result<u64, ScriptReadError>;
+}
+
 /// Read an instance's merged view by game path, and nothing else.
 ///
 /// The literals a script passes are game paths, never filesystem paths: a
@@ -329,6 +400,24 @@ pub trait ScriptHost: Send + Sync {
         timeout: Duration,
         reads: Arc<dyn GameReads>,
     ) -> PluginResult<serde_json::Value>;
+
+    /// Like [`ScriptHost::invoke`], with the call's merged view and its stored
+    /// blobs in scope when given. The default ignores the scopes, so a host
+    /// without a blob store still serves the rest of the API.
+    fn invoke_with_scopes(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        game_reads: Option<Arc<dyn GameReads>>,
+        _blobs: Option<Arc<dyn StoredBlobs>>,
+    ) -> PluginResult<serde_json::Value> {
+        match game_reads {
+            Some(reads) => self.invoke_with_game_reads(plugin_id, export, args, timeout, reads),
+            None => self.invoke(plugin_id, export, args, timeout),
+        }
+    }
 
     /// Deliver an event to a plugin's subscribers.
     ///

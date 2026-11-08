@@ -139,6 +139,21 @@ pub const METHODS: &[(&str, Option<Capability>, &str)] = &[
         "Delete one of this plugin's stored values.",
     ),
     (
+        "storage.putBytes",
+        None,
+        "Store bytes in this plugin's own blob store.",
+    ),
+    (
+        "storage.getBytes",
+        None,
+        "Read bytes from this plugin's own blob store.",
+    ),
+    (
+        "storage.deleteBytes",
+        None,
+        "Delete one of this plugin's stored blobs.",
+    ),
+    (
         "settings.all",
         None,
         "Read this plugin's declared settings.",
@@ -238,6 +253,9 @@ pub fn dispatch(
         "storage.set" => storage_set(cx, args),
         "storage.all" => storage_all(cx, args, StorageKind::Data),
         "storage.remove" => storage_remove(cx, args),
+        "storage.putBytes" => storage_put_bytes(cx, args),
+        "storage.getBytes" => storage_get_bytes(cx, args),
+        "storage.deleteBytes" => storage_delete_bytes(cx, args),
         "settings.all" => storage_all(cx, args, StorageKind::Setting),
         "events.subscribe" => events_subscribe(cx, args),
         "events.unsubscribe" => events_unsubscribe(cx, args),
@@ -673,6 +691,68 @@ fn storage_remove(
     Ok(serde_json::json!({ "removed": removed }))
 }
 
+fn storage_blob_failed(error: LauncherError) -> PluginError {
+    match &error {
+        LauncherError::Generic { code, message } if code == "ERR_PLUGIN_STORAGE_QUOTA" => {
+            PluginError::new(PluginErrorCode::ResourceExhausted, message.clone())
+        }
+        LauncherError::Generic { code, message } if code == "ERR_PLUGIN_STORAGE_KEY" => {
+            PluginError::invalid_arguments(message.clone())
+        }
+        _ => operation_failed(error),
+    }
+}
+
+fn arg_bytes(args: &serde_json::Value) -> PluginResult<Vec<u8>> {
+    args.get("bytes")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| PluginError::invalid_arguments("`bytes` must be an array of byte values"))?
+        .iter()
+        .map(|value| value.as_u64())
+        .collect::<Option<Vec<u64>>>()
+        .ok_or_else(|| PluginError::invalid_arguments("every byte must be a whole number"))?
+        .into_iter()
+        .map(|value| {
+            u8::try_from(value)
+                .map_err(|_| PluginError::invalid_arguments("every byte must be between 0 and 255"))
+        })
+        .collect()
+}
+
+fn storage_put_bytes(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    let key = arg_str(args, "key")?;
+    let bytes = arg_bytes(args)?;
+    let written = crate::plugins::blobs::put(cx.ctx, cx.plugin_id, &key, &bytes)
+        .map_err(storage_blob_failed)?;
+    Ok(serde_json::json!({ "written": written }))
+}
+
+fn storage_get_bytes(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    let key = arg_str(args, "key")?;
+    let bytes =
+        crate::plugins::blobs::get(cx.ctx, cx.plugin_id, &key).map_err(storage_blob_failed)?;
+    Ok(match bytes {
+        Some(bytes) => serde_json::json!({ "bytes": bytes }),
+        None => serde_json::Value::Null,
+    })
+}
+
+fn storage_delete_bytes(
+    cx: &DispatchContext<'_>,
+    args: &serde_json::Value,
+) -> PluginResult<serde_json::Value> {
+    let key = arg_str(args, "key")?;
+    let deleted =
+        crate::plugins::blobs::delete(cx.ctx, cx.plugin_id, &key).map_err(storage_blob_failed)?;
+    Ok(serde_json::json!({ "deleted": deleted }))
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
@@ -1067,6 +1147,9 @@ mod tests {
             "storage.set",
             "storage.all",
             "storage.remove",
+            "storage.putBytes",
+            "storage.getBytes",
+            "storage.deleteBytes",
         ] {
             assert_eq!(
                 required_capability(method),
@@ -1074,6 +1157,29 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn blob_storage_is_open_and_refuses_a_path_key() {
+        assert_eq!(
+            required_capability("storage.putBytes"),
+            MethodRequirement::Open
+        );
+        assert_eq!(
+            required_capability("storage.getBytes"),
+            MethodRequirement::Open
+        );
+        assert_eq!(
+            required_capability("storage.deleteBytes"),
+            MethodRequirement::Open
+        );
+        let error = dispatch_with(
+            CapabilitySet::new(),
+            "storage.putBytes",
+            serde_json::json!({ "key": "../escape", "bytes": [1] }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, PluginErrorCode::InvalidArguments);
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //! resolved by `GameReads` (the same merged view `game.readBytes` uses) and
 //! hardlinked into a staging folder that is deleted when the run ends.
 
-use agora_plugin_api::host::{GameReads, StageBudget, StageLimits};
+use agora_plugin_api::host::{
+    validate_blob_key, GameReads, ScriptReadError, StageBudget, StageLimits, StoredBlobs,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -116,6 +118,8 @@ struct RawMount {
     view: Option<RawView>,
     #[serde(default)]
     files: Option<BTreeMap<String, RawBytes>>,
+    #[serde(default)]
+    stored: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,12 +153,18 @@ enum Mount {
         guest: String,
         files: BTreeMap<String, Vec<u8>>,
     },
+    Stored {
+        guest: String,
+        keys: Vec<String>,
+    },
 }
 
 impl Mount {
     fn guest(&self) -> &str {
         match self {
-            Mount::View { guest, .. } | Mount::Files { guest, .. } => guest,
+            Mount::View { guest, .. }
+            | Mount::Files { guest, .. }
+            | Mount::Stored { guest, .. } => guest,
         }
     }
 }
@@ -170,6 +180,7 @@ pub fn run(
     data_root: &Path,
     options_json: &str,
     game_reads: Option<Arc<dyn GameReads>>,
+    stored_blobs: Option<Arc<dyn StoredBlobs>>,
 ) -> Result<WasmRunResult, WasmError> {
     let module = module.to_string();
     let package_root = package_root.to_path_buf();
@@ -184,6 +195,7 @@ pub fn run(
                 &data_root,
                 &options_json,
                 game_reads,
+                stored_blobs,
             )
         })
         .map_err(|e| WasmError::new("internal", format!("could not start a module runner: {e}")))?;
@@ -198,6 +210,7 @@ fn run_inner(
     data_root: &Path,
     options_json: &str,
     game_reads: Option<Arc<dyn GameReads>>,
+    stored_blobs: Option<Arc<dyn StoredBlobs>>,
 ) -> Result<WasmRunResult, WasmError> {
     // The deadline covers the whole run, not just the module's call. Work
     // before the module starts (staging, reading the file) spends it too.
@@ -211,7 +224,7 @@ fn run_inner(
         )
     })?;
     let stdin = options.stdin.map(RawBytes::into_bytes).unwrap_or_default();
-    let mounts = validate_mounts(options.mounts, game_reads.as_ref())?;
+    let mounts = validate_mounts(options.mounts, game_reads.as_ref(), stored_blobs.as_ref())?;
     let (memory_limit, timeout, stage_limits) = limits(options.limits)?;
     // One allowance for every mount in this run. Its bytes stay inside the
     // sandbox, so they are not charged to the script's `game:read` budget.
@@ -238,6 +251,20 @@ fn run_inner(
                 reads
                     .stage_view(folder, patterns, &host_dir, &stage_limits, &stage_budget)
                     .map_err(|error| mount_error(&guest, error))?;
+            }
+            Mount::Stored { keys, .. } => {
+                let blobs = stored_blobs.as_ref().ok_or_else(|| {
+                    WasmError::new(
+                        "capability_denied",
+                        "a stored mount needs a plugin blob store",
+                    )
+                })?;
+                for key in keys {
+                    let dest = host_dir.join(key);
+                    blobs
+                        .stage(key, &dest, &stage_limits, &stage_budget)
+                        .map_err(|error| mount_error(&guest, error))?;
+                }
             }
             Mount::Files { files, .. } => {
                 for (name, bytes) in files {
@@ -323,7 +350,7 @@ fn module_too_large(module: &str, bytes: u64) -> WasmError {
 }
 
 /// A staging failure as the script sees it: it names the guest mount.
-fn mount_error(guest: &str, error: agora_plugin_api::host::ScriptReadError) -> WasmError {
+fn mount_error(guest: &str, error: ScriptReadError) -> WasmError {
     WasmError::new(
         "staging_failed",
         format!("mount `{guest}`: {}", error.message),
@@ -662,10 +689,25 @@ fn limits(raw: Option<RawLimits>) -> Result<(u64, Duration, StageLimits), WasmEr
 fn validate_mounts(
     raw: Vec<RawMount>,
     game_reads: Option<&Arc<dyn GameReads>>,
+    stored_blobs: Option<&Arc<dyn StoredBlobs>>,
 ) -> Result<Vec<Mount>, WasmError> {
     let mut mounts = Vec::with_capacity(raw.len());
     for mount in raw {
         let guest = validate_guest(&mount.guest)?;
+        let kinds = [
+            mount.view.is_some(),
+            mount.files.is_some(),
+            mount.stored.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if kinds != 1 {
+            return Err(WasmError::new(
+                "invalid_arguments",
+                "a mount is a `view`, `files` or `stored`, never more than one",
+            ));
+        }
         match (mount.view, mount.files) {
             (Some(view), None) => {
                 let reads = game_reads.ok_or_else(|| {
@@ -702,10 +744,34 @@ fn validate_mounts(
                     files: staged,
                 });
             }
+            (None, None) => {
+                let keys = mount.stored.unwrap_or_default();
+                if keys.is_empty() {
+                    return Err(WasmError::new(
+                        "invalid_arguments",
+                        "a `stored` mount names at least one blob",
+                    ));
+                }
+                if stored_blobs.is_none() {
+                    return Err(WasmError::new(
+                        "capability_denied",
+                        "a stored mount needs a plugin blob store",
+                    ));
+                }
+                for key in &keys {
+                    validate_blob_key(key).map_err(|message| {
+                        WasmError::new(
+                            "invalid_arguments",
+                            format!("`{key}` is not a blob name: {message}"),
+                        )
+                    })?;
+                }
+                mounts.push(Mount::Stored { guest, keys });
+            }
             _ => {
                 return Err(WasmError::new(
                     "invalid_arguments",
-                    "a mount is either a `view` or `files`, never both",
+                    "a mount is a `view`, `files` or `stored`, never more than one",
                 ))
             }
         }
@@ -776,14 +842,16 @@ mod tests {
                 guest: "/data".into(),
                 view: None,
                 files: Some(BTreeMap::from([("a".into(), RawBytes::Text("x".into()))])),
+                stored: None,
             },
             RawMount {
                 guest: "/data/sub".into(),
                 view: None,
                 files: Some(BTreeMap::from([("b".into(), RawBytes::Text("y".into()))])),
+                stored: None,
             },
         ];
-        assert!(validate_mounts(raw, None).is_err());
+        assert!(validate_mounts(raw, None, None).is_err());
     }
 
     #[test]

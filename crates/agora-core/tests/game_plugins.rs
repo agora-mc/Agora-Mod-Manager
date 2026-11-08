@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agora_core::ctx::CoreContext;
@@ -43,6 +44,7 @@ struct Harness {
     install: IdentifiedInstall,
     facts: Facts,
     sorter: SorterReplySlot,
+    sorter_calls: Arc<AtomicUsize>,
 }
 
 impl Drop for Harness {
@@ -64,6 +66,7 @@ struct TestPackage {
     definition: PackageDefinition,
     facts: Facts,
     sorter: SorterReplySlot,
+    sorter_calls: Arc<AtomicUsize>,
 }
 
 type SorterReplySlot = Arc<Mutex<Option<SorterReply>>>;
@@ -125,6 +128,7 @@ impl GamePackage for TestPackage {
         &'a self,
         _request: SorterRequest,
     ) -> GameFuture<'a, Option<SorterReply>> {
+        self.sorter_calls.fetch_add(1, Ordering::SeqCst);
         let sorter = self.sorter.clone();
         Box::pin(async move { Ok(sorter.lock().unwrap().clone()) })
     }
@@ -304,6 +308,7 @@ impl Harness {
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let facts: Facts = Arc::new(Mutex::new(HashMap::new()));
         let sorter: SorterReplySlot = Arc::new(Mutex::new(None));
+        let sorter_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let mut builder = GameRegistry::builder();
         builder
             .add(
@@ -314,6 +319,7 @@ impl Harness {
                     definition: package_of(&def),
                     facts: facts.clone(),
                     sorter: sorter.clone(),
+                    sorter_calls: sorter_calls.clone(),
                 }),
             )
             .expect("register test package");
@@ -329,6 +335,7 @@ impl Harness {
             install,
             facts,
             sorter,
+            sorter_calls,
         }
     }
 
@@ -376,6 +383,14 @@ impl Harness {
     /// What the test double's sorter answers on the next call.
     fn answer_sorting(&self, reply: SorterReply) {
         *self.sorter.lock().unwrap() = Some(reply);
+    }
+
+    fn sorter_calls(&self) -> usize {
+        self.sorter_calls.load(Ordering::SeqCst)
+    }
+
+    fn reset_sorter_calls(&self) {
+        self.sorter_calls.store(0, Ordering::SeqCst);
     }
 
     fn copy_path(&self, inst: &GameInstanceRecord) -> PathBuf {
@@ -924,6 +939,7 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
             definition: package_of(def),
             facts: Arc::new(Mutex::new(HashMap::new())),
             sorter: Arc::new(Mutex::new(None)),
+            sorter_calls: Arc::new(AtomicUsize::new(0)),
         }),
     )
 }
@@ -1807,7 +1823,69 @@ fn a_sorter_order_is_applied_and_written() {
 }
 
 #[test]
-fn a_sorter_note_reaches_a_plain_list_read() {
+fn reading_a_list_does_not_call_the_sorter_when_notes_are_cached() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("notes-cached");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    let note = SorterNote {
+        item: "A.esp".into(),
+        level: "warn".into(),
+        text: "a saved note".into(),
+    };
+    h.answer_sorting(SorterReply {
+        order: vec!["A.esp".into()],
+        notes: vec![note.clone()],
+        general: Vec::new(),
+    });
+    game_load_order::refresh_sorter_notes(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    h.reset_sorter_calls();
+
+    let order = game_load_order::order(&h.ctx, &inst.instance_id, &h.def).unwrap();
+    assert_eq!(h.sorter_calls(), 0, "a plain read asked the sorter");
+    assert!(!order.notes_out_of_date);
+    assert_eq!(order.notes.len(), 1);
+    assert_eq!(order.notes[0].message, "a saved note");
+}
+
+#[test]
+fn changing_an_item_makes_cached_notes_stale() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("notes-stale");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_sorting(SorterReply {
+        order: vec!["A.esp".into()],
+        notes: vec![SorterNote {
+            item: "A.esp".into(),
+            level: "warn".into(),
+            text: "a saved note".into(),
+        }],
+        general: Vec::new(),
+    });
+    game_load_order::refresh_sorter_notes(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+
+    set_active(&h.ctx, &inst.instance_id, &h.def, "A.esp", false).unwrap();
+    h.reset_sorter_calls();
+    let order = game_load_order::order(&h.ctx, &inst.instance_id, &h.def).unwrap();
+    assert!(
+        order.notes_out_of_date,
+        "the changed item left the notes looking current"
+    );
+    assert!(order.notes.is_empty());
+    assert_eq!(h.sorter_calls(), 0, "a stale read ran the sorter");
+}
+
+#[test]
+fn a_plain_list_read_marks_uncached_notes_out_of_date() {
     let mut def = definition();
     def.load_orders.first_mut().unwrap().rules.kind = "script".into();
     def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
@@ -1816,7 +1894,6 @@ fn a_sorter_note_reaches_a_plain_list_read() {
     let item = h.item("mod", &[("Data/A.esp", b"a")]);
     h.add(&inst, &item);
     h.deploy(&inst);
-
     h.answer_sorting(SorterReply {
         order: vec!["A.esp".to_string()],
         notes: vec![SorterNote {
@@ -1828,11 +1905,7 @@ fn a_sorter_note_reaches_a_plain_list_read() {
     });
 
     let order = game_load_order::order(&h.ctx, &inst.instance_id, &h.def).unwrap();
-    let note = order
-        .notes
-        .iter()
-        .find(|note| note.plugin == "A.esp")
-        .expect("the sorter's note is on the first read");
-    assert_eq!(note.level, agora_core::game_load_order::NoteLevel::Error);
-    assert_eq!(note.message, "needs a patch");
+    assert!(order.notes.is_empty());
+    assert!(order.notes_out_of_date);
+    assert_eq!(h.sorter_calls(), 0, "a plain read ran the sorter");
 }

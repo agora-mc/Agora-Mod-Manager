@@ -549,6 +549,7 @@ pub fn run() {
             games::fomod::games_fomod_install,
             games::plugins::games_plugins_lists,
             games::plugins::games_plugins_list,
+            games::plugins::games_plugins_sorter_notes,
             games::plugins::games_plugins_set_active,
             games::plugins::games_plugins_set_locked,
             games::plugins::games_plugins_move,

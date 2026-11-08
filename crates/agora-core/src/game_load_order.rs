@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agora_game_api::{
     fold_path_case, glob_match, GameContext, GameDefinition, GamePackage, ListFinding,
@@ -140,6 +140,11 @@ pub struct LoadOrder {
     /// What the list's sorter says about these plugins. Empty when it has nothing to say.
     #[serde(default)]
     pub notes: Vec<PluginNote>,
+    /// True when the saved notes no longer match the list (or the sorter's data changed). The
+    /// desktop then asks for fresh notes in the background rather than running the sorter on a
+    /// plain read.
+    #[serde(default)]
+    pub notes_out_of_date: bool,
 }
 
 /// How important a sorter's message is.
@@ -309,6 +314,123 @@ pub enum SortMode {
     Sorter,
     /// Only the plugins' own masters were used.
     Masters,
+}
+
+/// The last notes a sorter gave for one list, with what they were computed from.
+#[derive(Default)]
+struct SorterNotesCache {
+    entries: Mutex<HashMap<(String, String), CachedSorterNotes>>,
+}
+
+#[derive(Clone)]
+struct CachedSorterNotes {
+    fingerprint: String,
+    data_version: String,
+    notes: Vec<PluginNote>,
+}
+
+impl SorterNotesCache {
+    fn lookup(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: &str,
+        data_version: &str,
+    ) -> Option<Vec<PluginNote>> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries
+            .get(&(game.to_string(), list.to_string()))
+            .filter(|cached| {
+                cached.fingerprint == fingerprint && cached.data_version == data_version
+            })
+            .map(|cached| cached.notes.clone())
+    }
+
+    fn store(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: String,
+        data_version: String,
+        notes: Vec<PluginNote>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries.insert(
+            (game.to_string(), list.to_string()),
+            CachedSorterNotes {
+                fingerprint,
+                data_version,
+                notes,
+            },
+        );
+    }
+}
+
+/// What a list's notes are computed from: the order, each present item's active state, and its
+/// file's size and modification time. A change to any of them makes the saved notes stale.
+fn sorter_fingerprint(entries: &[LoadOrderEntry], installed: &Installed) -> String {
+    let mut out = String::new();
+    for entry in entries.iter().filter(|entry| entry.present) {
+        out.push_str(&key(&entry.name));
+        out.push('|');
+        out.push(if entry.active { '1' } else { '0' });
+        out.push('|');
+        if let Some(path) = installed.get(&key(&entry.name)) {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                out.push_str(&metadata.len().to_string());
+                out.push(':');
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        out.push_str(&since.as_nanos().to_string());
+                    }
+                }
+            }
+        }
+        out.push(';');
+    }
+    out
+}
+
+/// The sorter's data version for a list, from its cheap status hook. An unavailable status is
+/// treated as "no version", so the notes simply read as stale rather than failing the list.
+fn sorter_data_version(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+) -> String {
+    sorter_status(ctx, instance_id, definition, Some(&rule.id))
+        .ok()
+        .flatten()
+        .map(|status| status.data_version)
+        .unwrap_or_default()
+}
+
+/// Remember notes for the list as it stands now. Sort and Update call this so the next read needs
+/// no sorter run.
+fn cache_sorter_notes(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+    installed: &Installed,
+    notes: &[PluginNote],
+) {
+    let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
+    cache.store(
+        definition.id.as_str(),
+        &rule.id,
+        sorter_fingerprint(entries, installed),
+        sorter_data_version(ctx, instance_id, definition, rule),
+        notes.to_vec(),
+    );
 }
 
 /// Where `move` puts a plugin. Positions are 1-based and count the always-loaded plugins too.
@@ -561,6 +683,43 @@ fn sorter_notes(reply: &SorterReply) -> Result<Vec<PluginNote>, LoadOrderError> 
     Ok(notes)
 }
 
+/// Ask the sorter for its notes now, cache them for the list as it stands, and return them. The
+/// desktop calls this in the background when a plain read says the notes are out of date.
+pub fn refresh_sorter_notes(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Vec<PluginNote>, LoadOrderError> {
+    let rule = rule_of(definition, list_id)?;
+    if rule.rules.sorter.is_none() {
+        return Ok(Vec::new());
+    }
+    let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let (installed, names) = installed_files(ctx, instance_id, definition, rule, links.as_ref())?;
+    let entries = build_order(
+        rule,
+        &listed.entries,
+        Some(&installed),
+        &names,
+        listed.exists,
+    )
+    .entries;
+    let reply = call_sorter(ctx, instance_id, definition, rule, &entries)?;
+    let notes = sorter_notes(&reply)?;
+    cache_sorter_notes(
+        ctx,
+        instance_id,
+        definition,
+        rule,
+        &entries,
+        &installed,
+        &notes,
+    );
+    Ok(notes)
+}
+
 /// The saved state a list's sorter reports for its status line, when it has an update hook.
 pub fn sorter_status(
     ctx: &Ctx,
@@ -598,11 +757,17 @@ fn sorter_update(
     }
     let package = package_of(ctx, definition)?;
     let request = sorter_request(ctx, instance_id, definition, rule, &[])?;
-    block_on_hook(package.update_sorter(request, update)).map_err(|error| {
+    let status = block_on_hook(package.update_sorter(request, update)).map_err(|error| {
         LoadOrderError::SorterUpdate {
             reason: error.message,
         }
-    })
+    })?;
+    // A successful update changes the sorter's data, so its saved notes are stale. Refresh them
+    // now (the user already waited for the download); a notes failure does not undo the update.
+    if update && status.is_some() {
+        let _ = refresh_sorter_notes(ctx, instance_id, definition, list_id);
+    }
+    Ok(status)
 }
 
 /// Read a script list through its package's parse hook.
@@ -723,6 +888,7 @@ pub fn build_order(
         entries,
         findings,
         notes: Vec::new(),
+        notes_out_of_date: false,
     }
 }
 
@@ -1560,14 +1726,20 @@ fn order_of_with_view(
             }),
         }
     }
-    // A sorter's notes are produced by asking it to sort. Reading a list does that too, so the
-    // notes appear before the user sorts, as they did when core ran libloot itself. A sorter that
-    // fails is not a reason to fail the read: the order itself is still Agora's.
+    // A plain read never runs the sorter. It uses the notes the last sort or update saved, and
+    // says they are out of date when the list or the sorter's data changed since.
     if read_sorter_notes && rule.rules.sorter.is_some() {
-        if let Ok(reply) = call_sorter(ctx, instance_id, definition, rule, &order.entries) {
-            if let Ok(notes) = sorter_notes(&reply) {
-                order.notes = notes;
-            }
+        let fingerprint = sorter_fingerprint(&order.entries, &installed);
+        let data_version = sorter_data_version(ctx, instance_id, definition, rule);
+        let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
+        match cache.lookup(
+            definition.id.as_str(),
+            &rule.id,
+            &fingerprint,
+            &data_version,
+        ) {
+            Some(notes) => order.notes = notes,
+            None => order.notes_out_of_date = true,
         }
     }
     Ok(order)
@@ -1805,6 +1977,17 @@ fn sort_inner(
     let written = !dry_run && !moves.is_empty();
     if written {
         write_entries(ctx, instance_id, definition, rule, &entries)?;
+    }
+    if !dry_run && mode == SortMode::Sorter {
+        cache_sorter_notes(
+            ctx,
+            instance_id,
+            definition,
+            rule,
+            &entries,
+            &installed,
+            &notes,
+        );
     }
     let order = if want_order {
         let mut order = order_of_with_view(

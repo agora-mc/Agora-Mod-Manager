@@ -41,6 +41,8 @@ const view: PluginsView = {
   listExists: true,
   rows: [row],
   findings: [],
+  notes: [],
+  notesOutOfDate: false,
   masterlist: null,
 };
 

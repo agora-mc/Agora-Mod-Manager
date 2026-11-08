@@ -189,12 +189,37 @@ export function creationEngineRules(args) {
 // saved under the plugin's own storage. A failed check keeps the old copy.
 // ---------------------------------------------------------------------------
 
-const STORE_KEY = "sorter.masterlist";
 const STATUS_KEY = "sorter.status";
-// Plugin storage allows 64 KiB per value, and the masterlist is larger than
-// that, so the saved copy is split across consecutive keys. The small meta key
-// is written last, so a failed update leaves the previous generation intact.
-const STORE_CHUNK = 24000;
+// The masterlist and prelude are blobs in the plugin's own store, named for the
+// commit they came from. The status key (small) names the current generation,
+// so writing it last makes a set of blobs switch over at once.
+function blobKey(name, generation) {
+  return name + "." + generation + ".yaml";
+}
+
+/// UTF-8 bytes for `storage.putBytes`; the module reads the files as text.
+function utf8Bytes(text) {
+  const out = [];
+  for (let index = 0; index < text.length; index += 1) {
+    let code = text.codePointAt(index);
+    if (code > 0xffff) index += 1;
+    if (code < 0x80) {
+      out.push(code);
+    } else if (code < 0x800) {
+      out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    } else if (code < 0x10000) {
+      out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    } else {
+      out.push(
+        0xf0 | (code >> 18),
+        0x80 | ((code >> 12) & 0x3f),
+        0x80 | ((code >> 6) & 0x3f),
+        0x80 | (code & 0x3f),
+      );
+    }
+  }
+  return new Uint8Array(out);
+}
 
 const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -329,47 +354,6 @@ function sha1Hex(bytes) {
     .join("");
 }
 
-async function saveBundle(bundle) {
-  const text = JSON.stringify(bundle);
-  const generation =
-    Date.now().toString(36) + Math.floor(Math.random() * 0x100000).toString(36);
-  const count = Math.max(1, Math.ceil(text.length / STORE_CHUNK));
-  const previous = await storage.get(STORE_KEY);
-  for (let index = 0; index < count; index += 1) {
-    const start = index * STORE_CHUNK;
-    await storage.set(
-      STORE_KEY + "." + generation + "." + index,
-      text.slice(start, start + STORE_CHUNK),
-    );
-  }
-  await storage.set(STORE_KEY, { generation: generation, count: count });
-  await storage.set(STATUS_KEY, {
-    fetchedAt: bundle.status.fetchedAt,
-    source: bundle.status.source || "",
-  });
-  if (previous && previous.generation && previous.generation !== generation) {
-    for (let index = 0; index < previous.count; index += 1) {
-      try {
-        await storage.remove(STORE_KEY + "." + previous.generation + "." + index);
-      } catch (error) {
-        // An old generation that cannot be removed is harmless; the new one is whole.
-      }
-    }
-  }
-}
-
-async function loadBundle() {
-  const meta = await storage.get(STORE_KEY);
-  if (!meta || !meta.generation) return null;
-  let text = "";
-  for (let index = 0; index < meta.count; index += 1) {
-    const part = await storage.get(STORE_KEY + "." + meta.generation + "." + index);
-    if (typeof part !== "string") return null;
-    text += part;
-  }
-  return JSON.parse(text);
-}
-
 async function githubJson(url) {
   const reply = await net.fetchJson(url);
   if (reply.status < 200 || reply.status >= 300) {
@@ -441,27 +425,52 @@ export async function lootUpdate(args) {
   if (options.prelude_repo) {
     prelude = await fetchPinnedFile(options.prelude_repo, branch, "prelude.yaml");
   }
+  const generation = commit.sha;
+  const masterlistKey = blobKey("masterlist", generation);
+  const preludeKey = prelude ? blobKey("prelude", generation) : null;
+  const previous = await storage.get(STATUS_KEY);
+  await storage.putBytes(masterlistKey, utf8Bytes(masterlist.text));
+  if (prelude) await storage.putBytes(preludeKey, utf8Bytes(prelude.text));
   const status = {
     fetchedAt: new Date().toISOString(),
     source:
       "https://api.github.com/repos/" + repo + "/contents/masterlist.yaml?ref=" + commit.sha,
+    dataVersion: generation,
     commitSha: commit.sha,
     blobSha: masterlist.sha,
+    masterlistKey: masterlistKey,
+    preludeKey: preludeKey,
   };
-  await saveBundle({
-    masterlist: masterlist.text,
-    prelude: prelude ? prelude.text : null,
-    status: status,
-  });
-  return { fetchedAt: status.fetchedAt, source: status.source };
+  // Naming the new generation last is the switch: a sort that reads the old
+  // status still sees the old, complete set.
+  await storage.set(STATUS_KEY, status);
+  if (previous && previous.masterlistKey && previous.masterlistKey !== masterlistKey) {
+    try {
+      await storage.deleteBytes(previous.masterlistKey);
+    } catch (error) {
+      // An old generation that cannot be removed is wasted space, not a bad sort.
+    }
+    if (previous.preludeKey && previous.preludeKey !== preludeKey) {
+      try {
+        await storage.deleteBytes(previous.preludeKey);
+      } catch (error) {
+        // Same as above.
+      }
+    }
+  }
+  return {
+    fetchedAt: status.fetchedAt,
+    source: status.source,
+    dataVersion: status.dataVersion,
+  };
 }
 
 /// Sort through the module and map libloot's answer to the sorter's reply.
 export async function lootSort(args) {
   const options = (args && args.options) || {};
   const entries = sorterEntries(args);
-  const bundle = await loadBundle();
-  if (!bundle) {
+  const status = await storage.get(STATUS_KEY);
+  if (!status || !status.masterlistKey) {
     return {
       order: entries.names,
       notes: [],
@@ -471,22 +480,23 @@ export async function lootSort(args) {
   if (!options.game_type) {
     throw new Error("the list's sorter options name no game type");
   }
+  const stored = [status.masterlistKey];
+  if (status.preludeKey) stored.push(status.preludeKey);
   const result = wasm.run("wasm/loot-sort.wasm", {
     stdin: JSON.stringify({
       game_type: options.game_type,
       data: "/data",
       load_order: entries.names,
       active: entries.active,
-      masterlist: "masterlist.yaml",
-      prelude: null,
-      masterlist_yaml: bundle.masterlist,
-      prelude_yaml: bundle.prelude ? bundle.prelude : null,
+      masterlist: "/input/" + status.masterlistKey,
+      prelude: status.preludeKey ? "/input/" + status.preludeKey : null,
     }),
     mounts: [
       {
         guest: "/data",
         view: { folder: "Data", patterns: ["*.esm", "*.esl", "*.esp"] },
       },
+      { guest: "/input", stored: stored },
     ],
     limits: { timeoutMs: 90000 },
   });

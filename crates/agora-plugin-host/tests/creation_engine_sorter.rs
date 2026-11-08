@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use agora_plugin_api::error::PluginError;
 use agora_plugin_api::host::{
-    path_matches_any, ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
+    path_matches_any, validate_blob_key, ActivationRequest, GameReads, HostBridge, ScriptHost,
+    ScriptReadError, StageBudget, StageLimits, StoredBlobs,
 };
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
@@ -24,8 +26,48 @@ const MASTERLIST: &str = "plugins:\n  - name: 'B.esp'\n    after:\n      - 'A.es
 #[derive(Clone, Default)]
 struct FakeBridge {
     storage: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     net: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     failing: Arc<Mutex<bool>>,
+}
+
+/// The plugin's blob store, as a wasm `stored` mount sees it.
+struct FakeBlobs {
+    bridge: FakeBridge,
+}
+
+impl StoredBlobs for FakeBlobs {
+    fn plugin(&self) -> Option<&str> {
+        Some(INSTANCE)
+    }
+
+    fn stage(
+        &self,
+        key: &str,
+        destination: &Path,
+        limits: &StageLimits,
+        budget: &StageBudget,
+    ) -> Result<u64, ScriptReadError> {
+        validate_blob_key(key)
+            .map_err(|message| ScriptReadError::new("invalid_arguments", message))?;
+        let bytes = self
+            .bridge
+            .blobs
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| {
+                ScriptReadError::new(
+                    "not_found",
+                    format!("there is no stored blob named `{key}`"),
+                )
+            })?;
+        budget.spend(limits, bytes.len() as u64)?;
+        std::fs::write(destination, &bytes)
+            .map_err(|error| ScriptReadError::new("staging_failed", error.to_string()))?;
+        Ok(bytes.len() as u64)
+    }
 }
 
 impl FakeBridge {
@@ -39,6 +81,10 @@ impl FakeBridge {
 
     fn storage_snapshot(&self) -> HashMap<String, serde_json::Value> {
         self.storage.lock().unwrap().clone()
+    }
+
+    fn blobs_snapshot(&self) -> HashMap<String, Vec<u8>> {
+        self.blobs.lock().unwrap().clone()
     }
 }
 
@@ -71,6 +117,40 @@ impl HostBridge for FakeBridge {
                 let key = request.args["key"].as_str().unwrap_or_default().to_string();
                 let removed = self.storage.lock().unwrap().remove(&key).is_some();
                 ok(serde_json::json!({ "removed": removed }))
+            }
+            "storage.putBytes" => {
+                let key = request.args["key"].as_str().unwrap_or_default().to_string();
+                if let Err(message) = validate_blob_key(&key) {
+                    return HostResponse::Error {
+                        request_id: id,
+                        error: PluginError::invalid_arguments(message),
+                    };
+                }
+                let Some(values) = request.args["bytes"].as_array() else {
+                    return HostResponse::Error {
+                        request_id: id,
+                        error: PluginError::invalid_arguments("`bytes` must be an array"),
+                    };
+                };
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .map(|value| value.as_u64().unwrap_or(0) as u8)
+                    .collect();
+                self.blobs.lock().unwrap().insert(key, bytes.clone());
+                ok(serde_json::json!({ "written": bytes.len() }))
+            }
+            "storage.getBytes" => {
+                let key = request.args["key"].as_str().unwrap_or_default().to_string();
+                let value = self.blobs.lock().unwrap().get(&key).cloned();
+                ok(match value {
+                    Some(bytes) => serde_json::json!({ "bytes": bytes }),
+                    None => serde_json::Value::Null,
+                })
+            }
+            "storage.deleteBytes" => {
+                let key = request.args["key"].as_str().unwrap_or_default().to_string();
+                let deleted = self.blobs.lock().unwrap().remove(&key).is_some();
+                ok(serde_json::json!({ "deleted": deleted }))
             }
             "net.fetchJson" => {
                 if *self.failing.lock().unwrap() {
@@ -125,6 +205,8 @@ impl GameReads for ViewReads {
         folder: &str,
         patterns: &[String],
         destination: &Path,
+        limits: &StageLimits,
+        budget: &StageBudget,
     ) -> Result<u64, ScriptReadError> {
         let mut base = folder
             .split('/')
@@ -160,6 +242,8 @@ impl GameReads for ViewReads {
             if !entry.path().is_file() {
                 continue;
             }
+            let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            budget.spend(limits, bytes)?;
             std::fs::copy(entry.path(), destination.join(&name))
                 .map_err(|error| ScriptReadError::new("staging_failed", error.to_string()))?;
             staged += 1;
@@ -303,15 +387,19 @@ fn invoke(
     export: &str,
     args: serde_json::Value,
     data: &Path,
+    bridge: &FakeBridge,
 ) -> serde_json::Value {
-    host.invoke_with_game_reads(
+    host.invoke_with_scopes(
         id,
         export,
         args,
         Duration::from_secs(120),
-        Arc::new(ViewReads {
+        Some(Arc::new(ViewReads {
             root: data.to_path_buf(),
-        }),
+        })),
+        Some(Arc::new(FakeBlobs {
+            bridge: bridge.clone(),
+        })),
     )
     .unwrap_or_else(|error| panic!("{export} failed: {}", error.message))
 }
@@ -322,7 +410,14 @@ fn an_update_sorts_and_maps_a_note_on_the_next_sort() {
     let data = data_folder();
     serve_masterlist(&bridge, "loot/test", "v1", "deadbeef", MASTERLIST);
 
-    let status = invoke(&host, &id, "lootUpdate", update_args(), data.path());
+    let status = invoke(
+        &host,
+        &id,
+        "lootUpdate",
+        update_args(),
+        data.path(),
+        &bridge,
+    );
     assert!(status["fetchedAt"].is_string(), "{status}");
     assert!(
         status["source"]
@@ -330,8 +425,9 @@ fn an_update_sorts_and_maps_a_note_on_the_next_sort() {
             .is_some_and(|source| source.contains("deadbeef")),
         "{status}"
     );
+    assert_eq!(status["dataVersion"], serde_json::json!("deadbeef"));
 
-    let reply = invoke(&host, &id, "lootSort", sort_args(), data.path());
+    let reply = invoke(&host, &id, "lootSort", sort_args(), data.path(), &bridge);
     assert_eq!(reply["order"], serde_json::json!(["A.esp", "B.esp"]));
     let notes = reply["notes"].as_array().expect("notes");
     assert!(
@@ -348,8 +444,16 @@ fn a_wrong_blob_hash_is_refused_and_the_saved_copy_stays() {
     let (_dir, host, id, bridge) = engine();
     let data = data_folder();
     serve_masterlist(&bridge, "loot/test", "v1", "deadbeef", MASTERLIST);
-    invoke(&host, &id, "lootUpdate", update_args(), data.path());
+    invoke(
+        &host,
+        &id,
+        "lootUpdate",
+        update_args(),
+        data.path(),
+        &bridge,
+    );
     let before = bridge.storage_snapshot();
+    let before_blobs = bridge.blobs_snapshot();
 
     bridge.serve(
         "https://api.github.com/repos/loot/test/contents/masterlist.yaml?ref=deadbeef",
@@ -380,6 +484,11 @@ fn a_wrong_blob_hash_is_refused_and_the_saved_copy_stays() {
         before,
         "the saved masterlist was left alone"
     );
+    assert_eq!(
+        bridge.blobs_snapshot(),
+        before_blobs,
+        "the saved blobs were left alone"
+    );
     host.deactivate(&id).ok();
 }
 
@@ -388,8 +497,16 @@ fn a_failed_download_keeps_the_saved_copy() {
     let (_dir, host, id, bridge) = engine();
     let data = data_folder();
     serve_masterlist(&bridge, "loot/test", "v1", "deadbeef", MASTERLIST);
-    invoke(&host, &id, "lootUpdate", update_args(), data.path());
+    invoke(
+        &host,
+        &id,
+        "lootUpdate",
+        update_args(),
+        data.path(),
+        &bridge,
+    );
     let before = bridge.storage_snapshot();
+    let before_blobs = bridge.blobs_snapshot();
 
     bridge.fail_network(true);
     let error = host
@@ -405,14 +522,15 @@ fn a_failed_download_keeps_the_saved_copy() {
         .expect_err("a failed download must be an error");
     assert!(error.message.contains("500"), "{}", error.message);
     assert_eq!(bridge.storage_snapshot(), before);
+    assert_eq!(bridge.blobs_snapshot(), before_blobs);
     host.deactivate(&id).ok();
 }
 
 #[test]
 fn no_saved_masterlist_returns_the_current_order_and_a_note() {
-    let (_dir, host, id, _bridge) = engine();
+    let (_dir, host, id, bridge) = engine();
     let data = data_folder();
-    let reply = invoke(&host, &id, "lootSort", sort_args(), data.path());
+    let reply = invoke(&host, &id, "lootSort", sort_args(), data.path(), &bridge);
     assert_eq!(reply["order"], serde_json::json!(["B.esp", "A.esp"]));
     assert_eq!(
         reply["general"],
@@ -457,16 +575,29 @@ fn the_hook_and_the_module_agree_on_real_plugins() {
         "prelude": prelude,
         "status": { "fetchedAt": "2026-11-07T00:00:00Z", "source": "fixture" },
     });
-    let text = serde_json::to_string(&bundle).unwrap();
+    let generation = "fixture";
+    let masterlist_key = format!("masterlist.{generation}.yaml");
+    let prelude_key = format!("prelude.{generation}.yaml");
     {
+        let mut blobs = bridge.blobs.lock().unwrap();
+        blobs.insert(
+            masterlist_key.clone(),
+            bundle["masterlist"].as_str().unwrap().as_bytes().to_vec(),
+        );
+        blobs.insert(
+            prelude_key.clone(),
+            bundle["prelude"].as_str().unwrap().as_bytes().to_vec(),
+        );
         let mut storage = bridge.storage.lock().unwrap();
         storage.insert(
-            "sorter.masterlist".to_string(),
-            serde_json::json!({ "generation": "fixture", "count": 1 }),
-        );
-        storage.insert(
-            "sorter.masterlist.fixture.0".to_string(),
-            serde_json::Value::String(text),
+            "sorter.status".to_string(),
+            serde_json::json!({
+                "fetchedAt": "2026-11-07T00:00:00Z",
+                "source": "fixture",
+                "dataVersion": generation,
+                "masterlistKey": masterlist_key,
+                "preludeKey": prelude_key,
+            }),
         );
     }
 
@@ -489,7 +620,7 @@ fn the_hook_and_the_module_agree_on_real_plugins() {
     });
 
     let started = std::time::Instant::now();
-    let hook = invoke(&host, &id, "lootSort", args, &fixture);
+    let hook = invoke(&host, &id, "lootSort", args, &fixture, &bridge);
     let hook_time = started.elapsed();
 
     // The same request straight to the module, with no script or storage in between.
@@ -570,12 +701,19 @@ fn status_reads_the_saved_copy_without_downloading() {
     let (_dir, host, id, bridge) = engine();
     let data = data_folder();
     serve_masterlist(&bridge, "loot/test", "v1", "deadbeef", MASTERLIST);
-    invoke(&host, &id, "lootUpdate", update_args(), data.path());
+    invoke(
+        &host,
+        &id,
+        "lootUpdate",
+        update_args(),
+        data.path(),
+        &bridge,
+    );
     bridge.fail_network(true);
 
     let mut args = update_args();
     args["update"] = serde_json::json!(false);
-    let status = invoke(&host, &id, "lootUpdate", args, data.path());
+    let status = invoke(&host, &id, "lootUpdate", args, data.path(), &bridge);
     assert!(status["fetchedAt"].is_string(), "{status}");
     host.deactivate(&id).ok();
 }

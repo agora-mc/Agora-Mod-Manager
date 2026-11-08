@@ -99,6 +99,10 @@ pub struct PluginsView {
     /// Always-loaded plugins first, then the listed ones, in the order the game reads them.
     pub rows: Vec<PluginRow>,
     pub findings: Vec<PluginFinding>,
+    /// The list's sorter's notes, shown in the same problems list.
+    pub notes: Vec<PluginFinding>,
+    /// True when the saved notes no longer match the list; the tab fetches fresh ones.
+    pub notes_out_of_date: bool,
     /// What the list's sorter last saved, when it has saved something.
     pub masterlist: Option<MasterlistView>,
 }
@@ -169,6 +173,8 @@ impl PluginsView {
             list_exists: false,
             rows: Vec::new(),
             findings: Vec::new(),
+            notes: Vec::new(),
+            notes_out_of_date: false,
             masterlist: None,
         }
     }
@@ -191,12 +197,9 @@ impl PluginsView {
                 .enumerate()
                 .map(|(index, entry)| row_view(index + 1, entry))
                 .collect(),
-            findings: order
-                .findings
-                .iter()
-                .map(finding_view)
-                .chain(order.notes.iter().map(note_view))
-                .collect(),
+            findings: order.findings.iter().map(finding_view).collect(),
+            notes: order.notes.iter().map(note_view).collect(),
+            notes_out_of_date: order.notes_out_of_date,
             masterlist: None,
         }
     }
@@ -425,6 +428,35 @@ pub async fn games_plugins_update_masterlist(
     .await
 }
 
+/// The sorter's notes for one list, fetched in the background after a read said they were stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SorterNotesView {
+    pub notes: Vec<PluginFinding>,
+    /// Always false: this reply just refreshed them.
+    pub notes_out_of_date: bool,
+}
+
+/// Ask the list's sorter for its notes now, and remember them for the next read.
+#[tauri::command]
+pub async fn games_plugins_sorter_notes(
+    app: tauri::AppHandle,
+    instance_id: String,
+    list_id: Option<String>,
+) -> Result<SorterNotesView, GamesError> {
+    run_blocking(app, "Reading the sorter's notes", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let notes =
+            load_order::refresh_sorter_notes(&ctx, &instance_id, definition, list_id.as_deref())
+                .map_err(core_failed)?;
+        Ok(SorterNotesView {
+            notes: notes.iter().map(note_view).collect(),
+            notes_out_of_date: false,
+        })
+    })
+    .await
+}
+
 /// Turn a plugin on or off in the instance's list. Refused while the game is running.
 #[tauri::command]
 pub async fn games_plugins_set_active(
@@ -623,6 +655,7 @@ mod tests {
             entries,
             findings,
             notes: Vec::new(),
+            notes_out_of_date: false,
         }
     }
 

@@ -778,6 +778,10 @@ pub struct SorterStatus {
     /// Where the copy came from, when the sorter says.
     #[serde(default)]
     pub source: String,
+    /// Changes whenever the sorter's own data changes (the update hook returns it). Notes cached
+    /// under another version are stale even when the list itself has not changed.
+    #[serde(default, rename = "dataVersion")]
+    pub data_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

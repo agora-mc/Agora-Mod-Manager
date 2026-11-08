@@ -76,8 +76,18 @@ export interface PluginsView {
   listExists: boolean;
   rows: PluginRow[];
   findings: PluginFinding[];
+  /** The list's sorter's notes, shown with the findings. */
+  notes: PluginFinding[];
+  /** True when the saved notes no longer match the list; the tab fetches fresh ones. */
+  notesOutOfDate: boolean;
   /** What the list's sorter last saved, when it has saved something. */
   masterlist: MasterlistView | null;
+}
+
+/** The sorter's notes, fetched in the background after a read said they were stale. */
+export interface SorterNotesView {
+  notes: PluginFinding[];
+  notesOutOfDate: boolean;
 }
 
 export interface PluginChange {
@@ -188,6 +198,9 @@ function isPluginsView(value: unknown): value is PluginsView {
     && value.rows.every(isPluginRow)
     && Array.isArray(value.findings)
     && value.findings.every(isPluginFinding)
+    && Array.isArray(value.notes)
+    && value.notes.every(isPluginFinding)
+    && typeof value.notesOutOfDate === 'boolean'
     && (value.masterlist === null || isMasterlistView(value.masterlist));
 }
 
@@ -278,6 +291,19 @@ export async function moveGamePlugin(instanceId: string, plugin: string, to: num
 export async function sortGamePlugins(instanceId: string, dryRun: boolean, listId?: string): Promise<SortChange> {
   const reply = await invoke<unknown>('games_plugins_sort', { instanceId, dryRun, listId: listId ?? null });
   return checkedReply('games_plugins_sort', reply, isSortChange);
+}
+
+function isSorterNotesView(value: unknown): value is SorterNotesView {
+  return isObject(value)
+    && Array.isArray(value.notes)
+    && value.notes.every(isPluginFinding)
+    && typeof value.notesOutOfDate === 'boolean';
+}
+
+/** Ask the list's sorter for its notes now, after a read said they were stale. */
+export async function refreshSorterNotes(instanceId: string, listId?: string): Promise<SorterNotesView> {
+  const reply = await invoke<unknown>('games_plugins_sorter_notes', { instanceId, listId: listId ?? null });
+  return checkedReply('games_plugins_sorter_notes', reply, isSorterNotesView);
 }
 
 /** Run the list's sorter update hook. */

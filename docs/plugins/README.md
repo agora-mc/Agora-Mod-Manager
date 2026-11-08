@@ -213,12 +213,22 @@ Mounts are read-only and staged into a temporary folder that is deleted afterwar
 
 - `{ guest: "/data", view: { folder: "Data", patterns: ["*.esp"] } }` stages matching files from the current hook's instance view. It needs `game:read` and a hook bound to an instance, exactly like `game.readBytes`.
 - `{ guest: "/input", files: { "name.yaml": "..." } }` stages bytes your script supplies.
+- `{ guest: "/input", stored: ["masterlist.yaml", "prelude.yaml"] }` stages blobs from your own `storage.putBytes` store, hardlinked or copied into the sandbox. Nothing travels through the script.
 
 Guest paths are absolute and cannot nest or repeat. `patterns` is a glob list; an empty list means every file below `folder`. A folder that exists but matches nothing is a mount with no entries; a folder that is missing or unreadable is an error naming it, and the module does not run.
 
 Staging has its own allowance, separate from the `game:read` byte budget: 4 GiB and 100,000 files per run. Staged bytes stay inside the sandbox and only the module's capped stdout and stderr come back, so hardlinking spends this allowance but not the script's read budget. Lower it with `limits: { mountBytes, mountFiles }`; you cannot raise it. A mount over the allowance is an error naming that mount. The copy fallback reads bytes but still counts against the same allowance.
 
 A module gets 1 GiB of memory and 120 seconds unless you ask for less with `limits: { memoryBytes, timeoutMs }`. Its table is capped separately. You cannot raise any limit. The engine is wasmtime, and its compile cache lives under the data root. The wall-clock deadline covers staging, compilation and the run, including time spent in a host call.
+
+### Plugin file storage
+
+`storage.putBytes(key, bytes)` stores a blob for this plugin and returns `{ written }`. `storage.getBytes(key)` returns a `Uint8Array`, or `null` when the key was never saved. `storage.deleteBytes(key)` returns `{ deleted }`.
+
+Keys are plain names: no `/`, `\`, `..`, NUL, a Windows device name such as `CON` or `LPT1`, or any other path or stream syntax. The store is per plugin, so one plugin cannot read another's blobs. A write is atomic: core writes a temp file and renames it over the old one, so a failed write leaves the old bytes. A plugin may hold 256 MiB in total; a write over that is an error, and the old bytes stay.
+
+A `stored` mount reaches the same blobs from a module without passing them through the script.
+
 
 ## Service API
 
@@ -230,7 +240,8 @@ A module gets 1 GiB of memory and 120 seconds unless you ask for less with `limi
 | `content.enable/disable/setUpdatePinned` | `content:write` | Existing content services |
 | `launch.state/history` | `launch:read` | Read launch information |
 | Launch-check contributions | `launch:prepare` | Bounded checks before normal GUI launch preflight |
-| `storage.get/set/all/remove/forInstance` | No extra capability | Namespaced plugin data |
+| `storage.get/set/all/remove/forInstance` | No extra capability | Small namespaced values |
+| `storage.putBytes/getBytes/deleteBytes` | No extra capability | This plugin's blob store: files under the plugin's own data folder, plain keys, atomic writes, 256 MiB total |
 | `settings` | No extra capability | Activation-time snapshot of declared settings; restart to refresh |
 | `ui.refresh/notify`, `log` | No extra capability | Attributed UI messages and plugin logs |
 | `on/off` | Event's read capability | Subscribe/unsubscribe to documented events |

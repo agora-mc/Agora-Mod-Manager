@@ -260,7 +260,7 @@ Every hook is called with one object, and its reply is JSON:
 - `SorterEntry` has `name`, `active`, `locked`, `implicit` and `present`.
 - `SorterReply` has `order` (every present item's name, once, case-insensitively), `notes` and `general`.
 - A `SorterNote` has `item` (empty for the whole list), `level` (`error`, `warn` or `info`) and `text`.
-- `SorterStatus` has `fetchedAt` and `source`, the status line's words.
+- `SorterStatus` has `fetchedAt`, `source` and `dataVersion`; `dataVersion` changes whenever the sorter's own data changes, and cached notes from another version are stale.
 
 **Null means "I have no opinion".** A throw is reported, never read as "nothing to say". Some hooks stop the action; a failed `diagnostics` becomes a warning finding, so the check is not shown as clean. A malformed reply counts as an error too. Hooks have time and memory limits. Names the script sees, like an item's, come from archives: treat them as untrusted.
 

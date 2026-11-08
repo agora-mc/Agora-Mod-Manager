@@ -37,6 +37,16 @@ export interface Store {
   set(key: string, value: Json): Promise<{ stored: boolean }>;
   all(): Promise<Record<string, Json>>;
   remove(key: string): Promise<{ removed: boolean }>;
+  /**
+   * Store bytes in this plugin's own blob store. Keys are plain names; a path
+   * (`/`, `\`, `..`), a Windows device name and an over-quota write are
+   * refused. The write is atomic, so a failure leaves the old bytes.
+   */
+  putBytes(key: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
+  /** Read a blob, or `null` when the key was never saved. */
+  getBytes(key: string): Promise<Uint8Array | null>;
+  /** Delete a blob. Returns whether it existed. */
+  deleteBytes(key: string): Promise<{ deleted: boolean }>;
 }
 export const instances: {
   list(): Promise<Instance[]>;
@@ -103,7 +113,14 @@ export interface WasmFilesMount {
   guest: string;
   files: Record<string, string | Uint8Array>;
 }
-export type WasmMount = WasmViewMount | WasmFilesMount;
+/** A mount of blobs from `storage.putBytes`, hardlinked into the sandbox. */
+export interface WasmStoredMount {
+  /** Absolute guest path, like `/input`. Cannot nest or repeat another mount. */
+  guest: string;
+  /** Blob keys from this plugin's own store. */
+  stored: string[];
+}
+export type WasmMount = WasmViewMount | WasmFilesMount | WasmStoredMount;
 /** Limits a script may lower, never raise. */
 export interface WasmLimits {
   /** Defaults to 1 GiB; a larger value is refused. */
