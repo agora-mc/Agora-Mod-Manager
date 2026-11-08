@@ -68,7 +68,7 @@ describe('ManualDownloadDialog', () => {
     );
     expect(screen.getByText('Main file: All in one (1.6.x)')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Open page' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Choose downloaded file…' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Choose file…' })).toBeInTheDocument();
   });
 
   it('tells the player how watching changes the offer', () => {
@@ -129,7 +129,7 @@ describe('ManualDownloadDialog', () => {
     const onInstalled = vi.fn();
     renderDialog({ onInstalled });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Choose downloaded file…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Choose file…' }));
     const notice = await screen.findByTestId('manual-no-checksum');
     expect(notice).toHaveTextContent(
       "nexusmods.com doesn't publish a checksum, so Agora couldn't check this file. Only install a file you downloaded from the page above.",
@@ -177,7 +177,7 @@ describe('ManualDownloadDialog', () => {
       });
     renderDialog();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Choose downloaded file…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Choose file…' }));
     const notice = await screen.findByTestId('manual-wrong-name');
     expect(notice).toHaveTextContent(
       "This doesn't look like Address Library for SKSE Plugins's file. Agora expected a name like *-32444-*.zip.",
@@ -193,7 +193,7 @@ describe('ManualDownloadDialog', () => {
   it('shows a cancelled picker as nothing, not an error', async () => {
     pickOpenFile.mockResolvedValue(null);
     renderDialog();
-    fireEvent.click(screen.getByRole('button', { name: 'Choose downloaded file…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Choose file…' }));
     await waitFor(() => expect(pickOpenFile).toHaveBeenCalled());
     expect(installCatalogEntry).not.toHaveBeenCalled();
     expect(screen.queryByTestId('manual-error')).not.toBeInTheDocument();

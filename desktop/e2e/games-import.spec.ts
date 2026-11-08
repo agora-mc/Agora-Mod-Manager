@@ -477,9 +477,27 @@ test.describe('Browse curated items', () => {
     await expect(dialog).toContainText('Download Address Library for SKSE Plugins yourself');
     await expect(dialog).toContainText('which Agora doesn');
     await expect(dialog).toContainText('Main file: All in one (1.6.x)');
+    const colors = await dialog.evaluate((el) => {
+      const ps = Array.from(el.querySelectorAll('p'));
+      const hint = ps.find((p) => p.textContent?.startsWith('Main file:'));
+      const body = ps.find((p) => p.textContent?.includes('which Agora doesn'));
+      return {
+        hint: hint ? getComputedStyle(hint).color : null,
+        body: body ? getComputedStyle(body).color : null,
+        dialog: getComputedStyle(el).color,
+      };
+    });
+    // The hint is the dialog's muted text, not the body text colour.
+    expect(colors.hint).toBe(colors.body);
+    expect(colors.hint).not.toBe(colors.dialog);
+    // A stable frame: the dialog and its overlay have finished their opening animation.
+    await page.addStyleTag({
+      content:
+        '*,*::before,*::after{animation-duration:0.001ms!important;transition-duration:0.001ms!important;transition-delay:0ms!important}',
+    });
     await page.screenshot({ path: '.shots/manual-download-dialog.png' });
 
-    await dialog.getByRole('button', { name: 'Choose downloaded file…' }).click();
+    await dialog.getByRole('button', { name: 'Choose file…' }).click();
     const notice = page.getByTestId('manual-no-checksum');
     await expect(notice).toContainText("doesn't publish a checksum");
     await page.screenshot({ path: '.shots/manual-no-checksum.png' });
@@ -549,7 +567,7 @@ test.describe('Browse curated items', () => {
 
     await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
     await page.getByRole('button', { name: 'Get from nexusmods.com' }).click();
-    await page.getByRole('button', { name: 'Choose downloaded file…' }).click();
+    await page.getByRole('button', { name: 'Choose file…' }).click();
 
     const notice = page.getByTestId('manual-wrong-name');
     await expect(notice).toContainText("This doesn't look like Address Library for SKSE Plugins's file.");

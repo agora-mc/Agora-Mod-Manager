@@ -212,7 +212,7 @@ export function ManualDownloadDialog({
                 disabled={busy || !pageUrl}
                 data-testid="manual-choose-file"
               >
-                {busy ? 'Checking…' : 'Choose downloaded file…'}
+                {busy ? 'Checking…' : 'Choose file…'}
               </Button>
             </div>
           )}
