@@ -59,6 +59,44 @@ agora proxy show
 agora proxy none
 ```
 
+### A game or a plugin is not working
+
+List what Agora supports and what is installed:
+
+```bash
+agora games list
+agora games discover
+agora plugin list
+agora plugin official list
+```
+
+A game other than Minecraft arrives as a plugin. Install an official one with `agora plugin official install <ID> --yes`, or a community package with `agora plugin install --yes package <FILE.zip>` (or `--yes development <FOLDER>` while you work on it). A game plugin can depend on another, shared plugin; `agora plugin list` shows the dependent plugin as needing it.
+
+A game that the store scan missed can be added:
+
+```bash
+agora games folder add <PATH>
+agora games folder list
+```
+
+`games folder add` refuses a folder that is not the install of exactly one game Agora knows, and the message says why. `games folder list` shows whether each folder is still on disk.
+
+For a game instance:
+
+```bash
+agora games instance list
+agora games instance check <INSTANCE>
+agora games instance plugins <INSTANCE>
+agora games instance plugins check <INSTANCE>
+agora games instance tools list <INSTANCE>
+```
+
+`games instance check` names a framework built for another game version, a plugin load order a launch would refuse, and stale or unknown tool output, and says which command rebuilds the tool. `games instance plugins check` prints the load-order findings. `games instance tools list` shows each tool's output state.
+
+`agora log` and `agora crash` cover Minecraft. For another game, use the game's own log or crash file and the findings from `games instance check`.
+
+`agora plugin log <ID>` reads a plugin's own log. Plugin packages are under `<root>/plugins/installed/`, their logs under `<root>/plugins/logs/`, and a plugin's saved data is in `local_state.db`; `agora paths` prints the root. A failed install leaves the previous package in place and names the reason.
+
 ### A loader requirement blocks launch
 
 ```bash

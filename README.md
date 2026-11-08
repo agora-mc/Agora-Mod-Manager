@@ -23,6 +23,7 @@ Windows is tested and signed, I don't have macOS or Linux right now so they are 
 - [Troubleshooting](https://agoramc.com/docs/desktop-troubleshooting) and [FAQ](https://agoramc.com/docs/faq) for the desktop app
 - [CLI troubleshooting](https://agoramc.com/docs/troubleshooting)
 - [CLI reference](https://agoramc.com/docs/cli)
+- [Adding a game](./docs/plugins/game-packages.md) and [community plugins](./docs/plugins/README.md) for game and plugin authors
 - [How the documentation is organized](./docs/README.md)
 
 Agora also includes a searchable **Help & Guide** tied to the current desktop interface. The website also publishes the same guides as well as other useful documentation.

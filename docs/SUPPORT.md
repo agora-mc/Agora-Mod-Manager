@@ -15,6 +15,17 @@ The output lists the root, instances, catalog database and signature, Java runti
 
 The CLI resolves the root the same way the desktop app does, so by default they share it. `AGORA_DATA_DIR` and a `portable.txt` marker beside the executable apply to both. If you used `--data-dir` or `AGORA_DATA_DIR` when the problem happened, run `agora paths` with the same override.
 
+### Other games and plugins
+
+`agora paths` prints the shared root; the rest of this section is relative to it:
+
+- A game instance is a folder under `instances/<ID>`, like a Minecraft instance, with its own `instance_manifest.json`.
+- The content store is under `content/`, with one manifest per item under `content/items/` and the file bytes under `content/objects/`.
+- Pinned bases are listed by `agora games base list`, with their state. A base record lives under `bases/manifests/`; `bases/roots.json` names base folders Agora keeps outside the data root.
+- Plugin packages are under `plugins/installed/`, and each plugin's log is `plugins/logs/<PLUGIN-ID>.log` (`agora plugin log <ID>` reads it). A plugin's saved data lives in `local_state.db`, not in its package folder.
+
+`agora games list` and `agora games discover` show which games and installs were found. `agora plugin list` shows each plugin's status, and `agora plugin official list` shows the official ones and whether an installed copy still verifies. `agora games instance check <INSTANCE>` is the cheapest summary of a game instance's framework and load-order findings.
+
 ## Identify the build
 
 ```bash
@@ -31,6 +42,9 @@ Also record which `v*` release the binary came from, or the Git commit for a sou
 | Command result | Standard output, preferably with `--output json` | The result itself. In JSON mode an error envelope goes to standard error instead |
 | Game log | The instance's `logs/latest.log` and, if present, `logs/debug.log` | Minecraft, loader, and mod startup or runtime errors |
 | Crash report | The instance's `crash-reports/`, or a JVM `hs_err_pid*.log` at the instance root | Game crashes and fatal JVM failures |
+| Plugin log | `<root>/plugins/logs/<PLUGIN-ID>.log`, or `agora plugin log <ID>` | What one plugin did, and its errors |
+
+The game-log and crash-report rows describe Minecraft. `agora log` and `agora crash` cover Minecraft instances; for another game, include the log or crash file the game itself writes, and the output of `agora games instance check <INSTANCE>`.
 
 List an instance's logs and crash reports:
 
