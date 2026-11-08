@@ -28,7 +28,7 @@ use agora_plugin_api::diagnostics::{DiagnosticReport, RepairAction, RepairPropos
 use agora_plugin_api::distribution::{Release, UpdateDocument};
 use agora_plugin_api::dto::ViewModel;
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
-use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost};
+use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptHost, StoredBlobs};
 use agora_plugin_api::manifest::{ActivationEvent, PluginId, PluginManifest};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
 use serde::{Deserialize, Serialize};
@@ -419,8 +419,9 @@ impl crate::game_registry::scripted::BehaviourInvoker for ScriptBehaviourInvoker
         args: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, PluginError> {
+        let blobs = self.service.blobs_for(plugin_id);
         self.service
-            .invoke_behaviour(plugin_id, export, args, timeout, None)
+            .invoke_behaviour(plugin_id, export, args, timeout, None, Some(blobs))
     }
 
     fn invoke_with_game_reads(
@@ -431,8 +432,9 @@ impl crate::game_registry::scripted::BehaviourInvoker for ScriptBehaviourInvoker
         timeout: Duration,
         reads: Arc<dyn GameReads>,
     ) -> Result<serde_json::Value, PluginError> {
+        let blobs = self.service.blobs_for(plugin_id);
         self.service
-            .invoke_behaviour(plugin_id, export, args, timeout, Some(reads))
+            .invoke_behaviour(plugin_id, export, args, timeout, Some(reads), Some(blobs))
     }
 
     fn invoke_hook(
@@ -474,12 +476,14 @@ impl crate::game_registry::scripted::BehaviourInvoker for ScriptBehaviourInvoker
                     instance_id,
                     session.reads.clone(),
                 ) {
+                    let blobs = self.service.blobs_for(plugin_id);
                     return self.service.invoke_behaviour(
                         plugin_id,
                         export,
                         args,
                         timeout,
                         Some(Arc::new(reads)),
+                        Some(blobs),
                     );
                 }
             }
@@ -492,18 +496,21 @@ impl crate::game_registry::scripted::BehaviourInvoker for ScriptBehaviourInvoker
                     std::path::PathBuf::from(location),
                     session.reads.clone(),
                 ) {
+                    let blobs = self.service.blobs_for(plugin_id);
                     return self.service.invoke_behaviour(
                         plugin_id,
                         export,
                         args,
                         timeout,
                         Some(Arc::new(reads)),
+                        Some(blobs),
                     );
                 }
             }
         }
+        let blobs = self.service.blobs_for(plugin_id);
         self.service
-            .invoke_behaviour(plugin_id, export, args, timeout, None)
+            .invoke_behaviour(plugin_id, export, args, timeout, None, Some(blobs))
     }
 
     fn report(&self, plugin_id: &PluginId, message: &str) {
@@ -2152,6 +2159,7 @@ impl PluginService {
         let request = ActivationRequest {
             plugin_id: plugin_id.clone(),
             package_root: record.install_dir.clone(),
+            data_root: self.inner.ctx.paths.root().to_path_buf(),
             entrypoint: record.manifest.entrypoint.clone().unwrap_or_default(),
             memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,
@@ -2296,15 +2304,20 @@ impl PluginService {
         args: serde_json::Value,
         timeout: Duration,
         reads: Option<Arc<dyn GameReads>>,
+        blobs: Option<Arc<dyn StoredBlobs>>,
     ) -> Result<serde_json::Value, PluginError> {
         self.ensure_running(plugin_id)?;
-        match reads {
-            Some(reads) => self
-                .inner
-                .host
-                .invoke_with_game_reads(plugin_id, export, args, timeout, reads),
-            None => self.inner.host.invoke(plugin_id, export, args, timeout),
-        }
+        self.inner
+            .host
+            .invoke_with_scopes(plugin_id, export, args, timeout, reads, blobs)
+    }
+
+    /// This plugin's own blob store, as a wasm `stored` mount sees it.
+    fn blobs_for(&self, plugin_id: &PluginId) -> Arc<dyn StoredBlobs> {
+        Arc::new(crate::plugins::blobs::PluginBlobs {
+            ctx: self.inner.ctx.clone(),
+            plugin_id: plugin_id.clone(),
+        })
     }
 
     /// Open a budget session for one top-level call into a plugin.
@@ -2325,10 +2338,15 @@ impl PluginService {
     ) -> Result<ViewModel, PluginError> {
         let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
-        let value = self
-            .inner
-            .host
-            .invoke(plugin_id, export, args, INVOKE_TIMEOUT)?;
+        let blobs = self.blobs_for(plugin_id);
+        let value = self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            INVOKE_TIMEOUT,
+            None,
+            Some(blobs),
+        )?;
         let model: ViewModel = serde_json::from_value(value).map_err(|e| {
             PluginError::new(
                 PluginErrorCode::ScriptError,
@@ -2348,9 +2366,15 @@ impl PluginService {
     ) -> Result<serde_json::Value, PluginError> {
         let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
-        self.inner
-            .host
-            .invoke(plugin_id, export, args, INVOKE_TIMEOUT)
+        let blobs = self.blobs_for(plugin_id);
+        self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            INVOKE_TIMEOUT,
+            None,
+            Some(blobs),
+        )
     }
 
     /// Run a diagnostic and return what it found.
@@ -2362,10 +2386,15 @@ impl PluginService {
     ) -> Result<DiagnosticReport, PluginError> {
         let _budget = self.budget_guard(plugin_id);
         self.ensure_running(plugin_id)?;
-        let value = self
-            .inner
-            .host
-            .invoke(plugin_id, export, args, DIAGNOSTIC_TIMEOUT)?;
+        let blobs = self.blobs_for(plugin_id);
+        let value = self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            DIAGNOSTIC_TIMEOUT,
+            None,
+            Some(blobs),
+        )?;
         let report: DiagnosticReport = serde_json::from_value(value).map_err(|e| {
             PluginError::new(
                 PluginErrorCode::ScriptError,
@@ -2448,9 +2477,15 @@ impl PluginService {
             ));
         }
         self.ensure_running(plugin_id)?;
-        self.inner
-            .host
-            .invoke(plugin_id, export, args, PROVIDER_TIMEOUT)
+        let blobs = self.blobs_for(plugin_id);
+        self.inner.host.invoke_with_scopes(
+            plugin_id,
+            export,
+            args,
+            PROVIDER_TIMEOUT,
+            None,
+            Some(blobs),
+        )
     }
 
     /// Run every contributed launch check for an instance.
@@ -2492,11 +2527,15 @@ impl PluginService {
                 }
                 let timeout = Duration::from_millis(check.timeout_ms.min(MAX_LAUNCH_CHECK_MS));
                 let args = serde_json::json!({ "instanceId": instance_id });
-                match self
-                    .inner
-                    .host
-                    .invoke(&plugin_id, &check.export, args, timeout)
-                {
+                let blobs = self.blobs_for(&plugin_id);
+                match self.inner.host.invoke_with_scopes(
+                    &plugin_id,
+                    &check.export,
+                    args,
+                    timeout,
+                    None,
+                    Some(blobs),
+                ) {
                     Ok(value) => match serde_json::from_value::<DiagnosticReport>(value) {
                         Ok(report) if report.validate().is_ok() => {
                             outcome.results.push(LaunchCheckResult {

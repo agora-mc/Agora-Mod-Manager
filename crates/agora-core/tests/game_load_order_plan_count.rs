@@ -106,7 +106,7 @@ fn definition() -> GameDefinition {
                 entry: None,
                 implicit: vec![],
                 implicit_list_file: None,
-                loot: None,
+                sorter: None,
             },
 
             intro: None,

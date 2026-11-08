@@ -77,7 +77,6 @@ pub mod lkg;
 pub mod loadout;
 pub mod lock_manager;
 pub mod log_sanitizer;
-pub mod loot_masterlist;
 pub mod mod_groups;
 pub mod models;
 pub mod network;

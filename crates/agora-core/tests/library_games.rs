@@ -42,7 +42,7 @@ fn plugin_rule() -> LoadOrderDefinition {
             entry: None,
             implicit: Vec::new(),
             implicit_list_file: None,
-            loot: None,
+            sorter: None,
         },
         intro: None,
         item_heading: None,

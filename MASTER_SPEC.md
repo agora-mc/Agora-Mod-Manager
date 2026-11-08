@@ -5017,7 +5017,7 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
   "file": "Plugins.txt",
   "items": { "folder": "Data", "patterns": ["*.esp"], "folders": false },
   "format": { "type": "lines", "active_prefix": "*", "header": [] },
-  "rules": { "kind": "creation_engine", "implicit": [], "implicit_list_file": null, "loot": null } }
+  "rules": { "kind": "creation_engine", "implicit": [], "implicit_list_file": null, "sorter": null } }
 ```
 
 - `format` is `lines` or `{ "type": "script", "parse": "fn", "render": "fn" }`, so an author can target a format Agora has never heard of.
@@ -5071,3 +5071,20 @@ Used by launch arguments (a string, or `{ "value": "-x", "when": {} }`), a frame
 **Proof.** The Cyberpunk tracer package must give a working modded game using only this section: REDmod placement, a before-launch `redmod deploy`, a script-parsed framework version. A test walks it through with no real game, and the author guide documents exactly the fields official plugins use, checked by script.
 
 **Known gaps.** A game whose saves are chosen by an INI setting can get per-instance saves through `save_location`; a game that keeps them in JSON or another format cannot yet. Cyberpunk 2077 is the first case: its saves live under `Saved Games` and its settings are `UserSettings.json`, so Agora lists the saves but cannot redirect them per instance.
+
+### 30.13 WebAssembly modules
+
+A plugin script can run a WebAssembly module it ships, for work too slow or too complex for a script. LOOT is the first user (§30.2).
+
+- **The shape is a WASI command.** The module reads its request from stdin and writes its answer to stdout. A script calls `agora.wasm.run(module, { stdin, mounts, limits })` and gets `{ exitCode, stdout, stderr }` back. The module is a path inside the plugin's own package, so it is hash-pinned with the rest of the plugin.
+- **Running a module needs no capability of its own.** It's pure computation in a sandbox:
+  - no network, no environment, no threads, and no writable folder;
+  - a clock and randomness;
+  - a memory cap and a time limit, with fuel or an epoch deadline, so a stuck module is stopped and reported. The wall-clock deadline covers staging, compilation and the run, including time spent inside a host call such as `poll_oneoff` or a blocked `fd_read`; the epoch stops wasm that never yields. Table elements are capped too, so a declared or grown table cannot spend host memory outside the memory cap. Module files over 64 MiB are refused.
+- **Mounts are read-only and staged.** A mount names files from the instance's merged view (a folder plus patterns), or bytes the script hands over. Agora hardlinks the view files into a fresh staging folder, falling back to copying, and preopens that folder read-only. It never preopens a real game, instance or layer folder. View mounts need `game:read` and are bound to the hook's instance, like `game.*`. A missing, unreadable or not-a-folder source is an error naming the game path and the module does not run; a folder that exists but matches nothing is an empty mount. Each chosen file is re-checked before staging and the staged entry is checked against the same-file identity taken during the walk. The staging folder is deleted afterwards.
+- **Staging has its own allowance.** Total staged bytes (default 4 GiB) and files (default 100,000) are capped per run, separately from the `game:read` byte budget: staged bytes stay inside the sandbox, and only the capped stdout and stderr come back. A script may lower the allowance, never raise it, and a mount over it is an error naming that mount. The copy fallback reads bytes but counts against the same allowance.
+- **The engine is wasmtime,** with trimmed features, plus its compile cache under the data root. The CLI release binary measured +4.5 MiB on this branch (25,131,520 bytes, against 20,434,432 at the base): wasmtime added, and the native libloot that left core removed. Interpreters were measured: wasmi took 9.4 s and Pulley 25 s on LOOT's job, against 2.4 s. Ahead-of-time compilation can't serve third-party modules.
+- **Plugins get a file store.** `agora.storage.putBytes`, `getBytes` and `deleteBytes` keep blobs as files in the plugin's own data folder, under a 256 MiB total quota. Keys are plain names, refusing paths, `..`, NUL and Windows device names. A write goes to a temp file and is renamed over the old one, so a failed write leaves the old blob. A wasm mount can name stored blobs (`{ guest, stored: [key] }`); they are hardlinked or copied from the store like view files, so large data does not travel through the script. One plugin cannot read another's blobs.
+- **A plain list read never runs the sorter.** Core caches the last notes per list, keyed by the order, the active set, each item's file size and modification time, and the sorter's `dataVersion` from its status hook. A matching read returns the cached notes; otherwise it returns none and an out-of-date flag. The desktop shows the list at once and fetches the notes in the background through a separate call; a newer read ignores a stale result. Sort and Update refresh the cache.
+- **A list can have a plugin-provided sorter.** `rules.sorter` names a hook that returns a whole order plus notes. Core checks that the order is a permutation of the list, and keeps locked and always-loaded items where they are. `rules.sorter.update` optionally names a hook behind an update button (LOOT's masterlist). With that, `rules.loot` and libloot leave core.
+- **Vendored patches** to a third-party library carry a comment saying they might be worth offering upstream, and are not offered without the owner's say.

@@ -39,6 +39,7 @@
 //!    exhausts its memory affects only itself, and the reason ends up
 //!    somewhere the user can read it.
 
+pub mod blobs;
 pub mod dispatch;
 pub mod events;
 pub mod install;

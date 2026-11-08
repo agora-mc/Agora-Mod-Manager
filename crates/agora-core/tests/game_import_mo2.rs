@@ -111,7 +111,7 @@ fn skyrim_like() -> GameDefinition {
             entry: None,
             implicit: vec!["Skyrim.esm".into(), "Update.esm".into()],
             implicit_list_file: None,
-            loot: None,
+            sorter: None,
         },
 
         intro: None,

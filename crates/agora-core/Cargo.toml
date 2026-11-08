@@ -70,12 +70,14 @@ roxmltree = "0.20"
 # LOOT's plugin header reader (GPL-3.0, the licence Agora itself uses). Header only: the
 # Creation Engine load order (MASTER_SPEC §26.6) takes masters and the master and light flags.
 
-# LOOT's load-order sort and masterlist parser (GPL-3.0-or-later; Agora is GPL-3.0-only and
-# GPL-3.0-or-later is compatible with it). Version 0.29.7 is the current Rust port.
-libloot = "0.29.7"
-
 # MicrosoftGame.config, read by Microsoft Store game discovery.
 quick-xml = "0.39"
+
+# A real file identity for staged view files: inode on Unix, volume serial and
+# file index on Windows. Already in the lock through `walkdir`, so this adds no
+# download; it lets a swap between the view walk and the hardlink be refused
+# instead of trusting timestamps and size.
+same-file = "1"
 
 # Directory junctions for shared folders on Windows. `std`'s symlink_dir needs
 # Developer Mode or elevation and, when it fails, callers silently fall back to

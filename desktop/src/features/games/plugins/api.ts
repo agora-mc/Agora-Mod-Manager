@@ -38,7 +38,7 @@ export interface PluginFinding {
 export interface MasterlistView {
   /** RFC 3339, as recorded when the copy was fetched. */
   fetchedAt: string;
-  /** The contents API URL the copy came from. */
+  /** Where the copy came from, when the sorter says. */
   source: string;
 }
 
@@ -66,16 +66,28 @@ export interface PluginsView {
   intro: string | null;
   /** The column heading for an item's name, when the game declares one. */
   itemHeading: string | null;
-  /** Whether this list declares a LOOT masterlist source. */
-  hasLoot: boolean;
+  /** Whether this list's sorter has an update hook, so the tab shows an update button. */
+  hasSorterUpdate: boolean;
+  /** The update button's label, from the list's sorter. */
+  sorterUpdateLabel: string | null;
   /** Whether the game's own rules judge this list, so it can be sorted. */
   rulesApply: boolean;
   /** False until the instance has a copy of the list, which is made at deploy time. */
   listExists: boolean;
   rows: PluginRow[];
   findings: PluginFinding[];
-  /** The LOOT masterlist cached for this game, when one has been downloaded. */
+  /** The list's sorter's notes, shown with the findings. */
+  notes: PluginFinding[];
+  /** True when the saved notes no longer match the list; the tab fetches fresh ones. */
+  notesOutOfDate: boolean;
+  /** What the list's sorter last saved, when it has saved something. */
   masterlist: MasterlistView | null;
+}
+
+/** The sorter's notes, fetched in the background after a read said they were stale. */
+export interface SorterNotesView {
+  notes: PluginFinding[];
+  notesOutOfDate: boolean;
 }
 
 export interface PluginChange {
@@ -113,7 +125,7 @@ export interface SortBlocked {
   master: string;
 }
 
-export type SortMode = 'loot' | 'masters';
+export type SortMode = 'sorter' | 'masters';
 
 export interface SortReport {
   moves: SortMove[];
@@ -121,7 +133,7 @@ export interface SortReport {
   blocked: SortBlocked[];
   /** False for a dry run, which writes nothing. */
   written: boolean;
-  /** What ordered the free plugins: LOOT's masterlist, or only their masters. */
+  /** What ordered the free plugins: the list's sorter, or only their masters. */
   mode: SortMode;
   /** A sentence for the player when the full sort could not run. */
   message: string | null;
@@ -178,13 +190,17 @@ function isPluginsView(value: unknown): value is PluginsView {
     && typeof value.listId === 'string'
     && typeof value.listName === 'string'
     && typeof value.rulesKind === 'string'
-    && typeof value.hasLoot === 'boolean'
+    && typeof value.hasSorterUpdate === 'boolean'
+    && (value.sorterUpdateLabel === null || typeof value.sorterUpdateLabel === 'string')
     && typeof value.rulesApply === 'boolean'
     && typeof value.listExists === 'boolean'
     && Array.isArray(value.rows)
     && value.rows.every(isPluginRow)
     && Array.isArray(value.findings)
     && value.findings.every(isPluginFinding)
+    && Array.isArray(value.notes)
+    && value.notes.every(isPluginFinding)
+    && typeof value.notesOutOfDate === 'boolean'
     && (value.masterlist === null || isMasterlistView(value.masterlist));
 }
 
@@ -221,7 +237,7 @@ function isSortChange(value: unknown): value is SortChange {
     && Array.isArray(value.report.moves)
     && Array.isArray(value.report.blocked)
     && typeof value.report.written === 'boolean'
-    && (value.report.mode === 'loot' || value.report.mode === 'masters')
+    && (value.report.mode === 'sorter' || value.report.mode === 'masters')
     && (value.report.message === null || typeof value.report.message === 'string')
     && isPluginsView(value.plugins);
 }
@@ -277,7 +293,20 @@ export async function sortGamePlugins(instanceId: string, dryRun: boolean, listI
   return checkedReply('games_plugins_sort', reply, isSortChange);
 }
 
-/** Download and verify LOOT's masterlist for the game. */
+function isSorterNotesView(value: unknown): value is SorterNotesView {
+  return isObject(value)
+    && Array.isArray(value.notes)
+    && value.notes.every(isPluginFinding)
+    && typeof value.notesOutOfDate === 'boolean';
+}
+
+/** Ask the list's sorter for its notes now, after a read said they were stale. */
+export async function refreshSorterNotes(instanceId: string, listId?: string): Promise<SorterNotesView> {
+  const reply = await invoke<unknown>('games_plugins_sorter_notes', { instanceId, listId: listId ?? null });
+  return checkedReply('games_plugins_sorter_notes', reply, isSorterNotesView);
+}
+
+/** Run the list's sorter update hook. */
 export async function updateGameMasterlist(instanceId: string, listId?: string): Promise<MasterlistView> {
   const reply = await invoke<unknown>('games_plugins_update_masterlist', { instanceId, listId: listId ?? null });
   return checkedReply('games_plugins_update_masterlist', reply, isMasterlistView);

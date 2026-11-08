@@ -2,6 +2,7 @@
 """Unit tests for pure functions in Agora utility scripts."""
 
 import contextlib
+import hashlib
 import http.client
 import io
 import json
@@ -19,6 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import build_loot_wasm
 import build_official_plugin as bop
 import fetch_loader_manifests
 import deploy_release_assets
@@ -3208,6 +3210,90 @@ class TestGamePackageGuideExamples(unittest.TestCase):
                         "launch example is missing "
                         f"{self.REQUIRED_LAUNCH - launch.keys()}",
                     )
+
+
+class TestBuildLootWasm(unittest.TestCase):
+    """The LOOT module build must not embed the machine it was built on."""
+
+    def test_remap_flags_cover_the_repo_registry_and_sysroot(self):
+        repo = Path("/repo")
+        cargo_home = Path("/home/user/.cargo")
+        sysroot = Path("/sysroot")
+        flags = build_loot_wasm.remap_flags(repo, cargo_home, sysroot)
+        self.assertIn(f"--remap-path-prefix={repo}=/agora", flags)
+        self.assertIn(
+            f"--remap-path-prefix={cargo_home / 'registry' / 'src'}=/cargo/registry/src",
+            flags,
+        )
+        self.assertIn(f"--remap-path-prefix={sysroot}=/rust", flags)
+
+    def test_build_environment_pins_the_target_and_removes_plain_rustflags(self):
+        sysroot = Path("/sysroot")
+        with mock.patch.dict(
+            os.environ,
+            {"CARGO_HOME": "/home/user/.cargo", "RUSTFLAGS": "-C debuginfo=0"},
+            clear=False,
+        ), mock.patch.object(build_loot_wasm, "rust_sysroot", return_value=sysroot):
+            env = build_loot_wasm.build_environment(Path("/tmp/target"))
+        self.assertEqual(env["CARGO_TARGET_DIR"], str(Path("/tmp/target")))
+        self.assertEqual(env["CARGO_INCREMENTAL"], "0")
+        self.assertNotIn("RUSTFLAGS", env)
+        flags = env["CARGO_ENCODED_RUSTFLAGS"].split(build_loot_wasm.ENCODED_SEPARATOR)
+        self.assertIn(f"--remap-path-prefix={build_loot_wasm.REPO_ROOT}=/agora", flags)
+        self.assertIn(f"--remap-path-prefix={sysroot}=/rust", flags)
+
+    def test_sha256_file_matches_hashlib(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "blob"
+            path.write_bytes(b"loot wasm")
+            self.assertEqual(
+                build_loot_wasm.sha256_file(path),
+                hashlib.sha256(b"loot wasm").hexdigest(),
+            )
+
+    def test_sources_document_lists_versions_checksums_licences_and_vendored_crates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = root / "crate"
+            crate.mkdir()
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "loot-sort"\n\n'
+                '[patch.crates-io]\nlibloot = { path = "vendor/libloot" }\n',
+                encoding="utf-8",
+            )
+            lock = root / "Cargo.lock"
+            lock.write_text(
+                'version = 4\n\n'
+                '[[package]]\nname = "loot-sort"\nversion = "0.1.0"\n\n'
+                '[[package]]\nname = "adler2"\nversion = "2.0.1"\n'
+                'checksum = "abc123"\n\n'
+                '[[package]]\nname = "libloot"\nversion = "0.29.7"\n',
+                encoding="utf-8",
+            )
+            registry = root / "registry" / "src" / "index.crates.io-test"
+            (registry / "adler2-2.0.1").mkdir(parents=True)
+            (registry / "adler2-2.0.1" / "Cargo.toml").write_text(
+                '[package]\nname = "adler2"\nversion = "2.0.1"\n'
+                'license = "0BSD OR MIT OR Apache-2.0"\n',
+                encoding="utf-8",
+            )
+            (crate / "vendor" / "libloot").mkdir(parents=True)
+            (crate / "vendor" / "libloot" / "Cargo.toml").write_text(
+                '[package]\nname = "libloot"\nversion = "0.29.7"\n'
+                'license = "GPL-3.0-or-later"\n',
+                encoding="utf-8",
+            )
+            document = build_loot_wasm.sources_document(
+                lockfile=lock,
+                manifest=crate / "Cargo.toml",
+                cargo_home=root,
+                crate_dir=crate,
+            )
+        self.assertIn("| `adler2` | 2.0.1 | `abc123` | 0BSD OR MIT OR Apache-2.0 |", document)
+        self.assertIn("https://crates.io/crates/adler2/2.0.1", document)
+        self.assertIn("| `libloot` | 0.29.7 | vendored | GPL-3.0-or-later |", document)
+        self.assertIn("patched sources in `vendor/libloot`", document)
+        self.assertNotIn("`loot-sort`", document)
 
 
 if __name__ == "__main__":

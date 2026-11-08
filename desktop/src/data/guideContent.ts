@@ -881,7 +881,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
     shortTitle: 'Other games',
     category: 'Play',
     description: 'Add support for a game like Skyrim Special Edition, make an instance, add mods, sort the load order, and know where to look when something goes wrong.',
-    keywords: ['skyrim', 'other games', 'game support', 'more games', 'base', 'load order', 'loot', 'plugins', 'fomod', 'dyndolod', 'pgpatcher', 'tools', 'mod organizer'],
+    keywords: ['skyrim', 'other games', 'game support', 'more games', 'base', 'load order', 'plugins', 'fomod', 'dyndolod', 'pgpatcher', 'tools', 'mod organizer'],
     basic: {
       summary: 'Agora can also look after mods for games other than Minecraft. Skyrim Special Edition is the first. Each game has its own instances, so one setup never disturbs another.',
       outcomes: [
@@ -942,10 +942,10 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Load order and launching',
-          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order. Sort… puts them in the order LOOT, the community\'s sorting tool, recommends.',
+          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order. Sort… puts them in the order the list\'s sorter recommends.',
           steps: [
             'Open the instance\'s Plugins tab and press Sort….',
-            'Agora asks whether to download LOOT\'s masterlist. Download and sort uses it. Sort by masters only just puts each plugin below its masters.',
+            'If the sorter has nothing saved yet, its note says to update the masterlist first; the Plugins tab has a button for it. Without it, Sort only puts each plugin below its masters.',
             'Read the preview. Nothing is written until you choose Apply, and locked or always-loaded plugins stay where they are.',
             'On Overview, read the Launch checks, then press Launch. Each finding says what is wrong, why it matters and what to do.',
           ],

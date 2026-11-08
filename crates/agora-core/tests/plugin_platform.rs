@@ -154,7 +154,7 @@ fn a_rule_kind_of_anything_else_is_refused() {
                 entry: None,
                 implicit: Vec::new(),
                 implicit_list_file: None,
-                loot: None,
+                sorter: None,
             },
 
             intro: None,

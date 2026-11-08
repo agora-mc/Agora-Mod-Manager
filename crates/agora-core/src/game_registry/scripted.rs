@@ -18,7 +18,7 @@
 use agora_game_api::{
     Behaviours, Diagnostic, DownloadRecognition, GameContext, GameError, GameFuture, GameInstall,
     GamePackage, LoadOrderLine, PackageDefinition as PackageDefinitionType, RelPath,
-    RuntimeIdentity, Suggestion,
+    RuntimeIdentity, SorterReply, SorterRequest, SorterRule, SorterStatus, Suggestion,
 };
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
 use agora_plugin_api::host::GameReads;
@@ -31,6 +31,10 @@ use std::time::Duration;
 /// How long one game hook may run. Long enough for a parser over a large
 /// folder, short enough that a stuck hook cannot hold a launch.
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
+/// A sorter runs a WebAssembly module over the whole plugin list, which takes
+/// seconds rather than milliseconds (MASTER_SPEC §30.13). The update hook also
+/// downloads a few files.
+pub const SORTER_TIMEOUT: Duration = Duration::from_secs(120);
 /// `recognize_download` runs on the download watcher's thread, so it gets a
 /// shorter budget and never waits for a script that is still running.
 pub const RECOGNIZE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -161,6 +165,19 @@ impl ScriptedPackage {
             .map(|game| game.id.as_str())
     }
 
+    /// A list's sorter and the game it belongs to, when the list declares one.
+    fn sorter_for(&self, list_id: &str) -> Option<(SorterRule, String)> {
+        for game in &self.definition.games {
+            let Some(order) = game.load_orders.iter().find(|order| order.id == list_id) else {
+                continue;
+            };
+            if let Some(sorter) = order.rules.sorter.clone() {
+                return Some((sorter, game.id.as_str().to_string()));
+            }
+        }
+        None
+    }
+
     fn invoker(&self) -> Result<Arc<dyn BehaviourInvoker>, GameError> {
         self.runtime.invoker().ok_or_else(|| GameError {
             code: "ERR_GAME_SCRIPT_HOST".into(),
@@ -212,8 +229,18 @@ impl ScriptedPackage {
         export: &str,
         args: serde_json::Value,
     ) -> Result<Option<serde_json::Value>, GameError> {
+        self.call_required_with_timeout(plugin, export, args, HOOK_TIMEOUT)
+    }
+
+    fn call_required_with_timeout(
+        &self,
+        plugin: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<Option<serde_json::Value>, GameError> {
         let invoker = self.invoker()?;
-        match invoker.invoke_hook(plugin, export, args, HOOK_TIMEOUT) {
+        match invoker.invoke_hook(plugin, export, args, timeout) {
             Ok(value) if value.is_null() => Ok(None),
             Ok(value) => Ok(Some(value)),
             Err(error) => {
@@ -419,6 +446,83 @@ impl GamePackage for ScriptedPackage {
                 self.parse(&export, value)?
             };
             Ok(Some(reply))
+        })
+    }
+
+    fn sort_load_order<'a>(
+        &'a self,
+        request: SorterRequest,
+    ) -> GameFuture<'a, Option<SorterReply>> {
+        Box::pin(async move {
+            let SorterRequest {
+                context,
+                list_id,
+                options,
+                entries,
+                active,
+                locked,
+                implicit,
+            } = request;
+            let Some((sorter, game)) = self.sorter_for(&list_id) else {
+                return Ok(None);
+            };
+            let plugin = self.script_owner(&game, &list_id, "sorter")?;
+            let args = serde_json::json!({
+                "context": context,
+                "listId": list_id,
+                "options": options,
+                "entries": entries,
+                "active": active,
+                "locked": locked,
+                "implicit": implicit,
+            });
+            let Some(value) =
+                self.call_required_with_timeout(&plugin, &sorter.hook, args, SORTER_TIMEOUT)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(self.parse(&sorter.hook, value)?))
+        })
+    }
+
+    fn update_sorter<'a>(
+        &'a self,
+        request: SorterRequest,
+        update: bool,
+    ) -> GameFuture<'a, Option<SorterStatus>> {
+        Box::pin(async move {
+            let SorterRequest {
+                context,
+                list_id,
+                options,
+                entries,
+                active,
+                locked,
+                implicit,
+            } = request;
+            let Some((sorter, game)) = self.sorter_for(&list_id) else {
+                return Ok(None);
+            };
+            let Some(export) = sorter.update.clone() else {
+                return Ok(None);
+            };
+            let plugin = self.script_owner(&game, &list_id, "sorter")?;
+            let args = serde_json::json!({
+                "context": context,
+                "listId": list_id,
+                "options": options,
+                "entries": entries,
+                "active": active,
+                "locked": locked,
+                "implicit": implicit,
+                "update": update,
+            });
+            let Some(value) =
+                self.call_required_with_timeout(&plugin, &export, args, SORTER_TIMEOUT)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(self.parse(&export, value)?))
         })
     }
 
@@ -636,6 +740,7 @@ mod tests {
         reply: Result<serde_json::Value, PluginError>,
         reports: Mutex<Vec<String>>,
         timeouts: Mutex<Vec<Duration>>,
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
     }
 
     impl FakeInvoker {
@@ -644,6 +749,7 @@ mod tests {
                 reply: Ok(value),
                 reports: Mutex::default(),
                 timeouts: Mutex::default(),
+                calls: Mutex::default(),
             })
         }
 
@@ -652,6 +758,7 @@ mod tests {
                 reply: Err(error),
                 reports: Mutex::default(),
                 timeouts: Mutex::default(),
+                calls: Mutex::default(),
             })
         }
     }
@@ -660,11 +767,12 @@ mod tests {
         fn invoke(
             &self,
             _plugin_id: &PluginId,
-            _export: &str,
-            _args: serde_json::Value,
+            export: &str,
+            args: serde_json::Value,
             timeout: Duration,
         ) -> Result<serde_json::Value, PluginError> {
             self.timeouts.lock().unwrap().push(timeout);
+            self.calls.lock().unwrap().push((export.to_string(), args));
             self.reply.clone()
         }
 
@@ -815,6 +923,129 @@ mod tests {
         block_on(package.detect_runtime(install())).unwrap();
         let timeouts = fake.timeouts.lock().unwrap();
         assert_eq!(timeouts.as_slice(), &[HOOK_TIMEOUT]);
+    }
+
+    fn sorter_definition() -> PackageDefinitionType {
+        serde_json::from_value(serde_json::json!({
+            "id": "test.pkg",
+            "version": "0.1.0",
+            "api_range": ">=0.1, <0.2",
+            "parents": [],
+            "games": [{
+                "id": "test-game",
+                "name": "Test Game",
+                "stores": [],
+                "version_sources": [],
+                "deployment": "redirect",
+                "framework_ids": [],
+                "tool_ids": [],
+                "content_rules": [],
+                "log_paths": [],
+                "crash_paths": [],
+                "user_files": [],
+                "save_paths": [],
+                "linked_archive_patterns": [],
+                "declared_writes": [],
+                "excluded_paths": [],
+                "load_orders": [{
+                    "id": "plugins",
+                    "name": "Plugins",
+                    "file": "Plugins.txt",
+                    "items": { "folder": "Data", "patterns": ["*.esp"] },
+                    "format": { "type": "lines", "active_prefix": "*" },
+                    "rules": {
+                        "kind": "script",
+                        "sorter": {
+                            "hook": "lootSort",
+                            "update": "lootUpdate",
+                            "update_label": "Update masterlist",
+                            "options": { "game_type": "SkyrimSE" }
+                        }
+                    }
+                }],
+                "runtime_files": [],
+                "save_location": [],
+                "launch_alternatives": [],
+                "copy_patterns": []
+            }],
+            "frameworks": [],
+            "tools": []
+        }))
+        .unwrap()
+    }
+
+    fn sorter_package(invoker: Arc<FakeInvoker>) -> ScriptedPackage {
+        let runtime = BehaviourRuntime::new();
+        runtime.install(invoker);
+        ScriptedPackage::new(
+            sorter_definition(),
+            PluginId::parse("acme.test").unwrap(),
+            BehaviourOwners::default(),
+            runtime,
+        )
+    }
+
+    fn sorter_request() -> SorterRequest {
+        SorterRequest {
+            context: game_context(),
+            list_id: "plugins".into(),
+            options: serde_json::json!({ "game_type": "SkyrimSE" }),
+            entries: vec![agora_game_api::SorterEntry {
+                name: "A.esp".into(),
+                active: true,
+                locked: false,
+                implicit: false,
+                present: true,
+            }],
+            active: vec!["A.esp".into()],
+            locked: Vec::new(),
+            implicit: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_scripted_package_asks_the_sorter_with_the_list_context() {
+        let invoker = FakeInvoker::answer(serde_json::json!({
+            "order": ["A.esp"],
+            "notes": [],
+            "general": []
+        }));
+        let package = sorter_package(invoker.clone());
+        let reply = block_on(package.sort_load_order(sorter_request()))
+            .unwrap()
+            .expect("the sorter answered");
+        assert_eq!(reply.order, ["A.esp"]);
+
+        let calls = invoker.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "lootSort");
+        assert_eq!(calls[0].1["listId"], "plugins");
+        assert_eq!(calls[0].1["options"]["game_type"], "SkyrimSE");
+        assert_eq!(calls[0].1["entries"][0]["name"], "A.esp");
+        assert_eq!(calls[0].1["active"], serde_json::json!(["A.esp"]));
+        let timeouts = invoker.timeouts.lock().unwrap();
+        assert_eq!(timeouts[0], SORTER_TIMEOUT);
+    }
+
+    #[test]
+    fn a_scripted_package_asks_the_update_hook_only_when_asked_to_update() {
+        let invoker = FakeInvoker::answer(serde_json::json!({
+            "fetchedAt": "2026-11-07T00:00:00Z",
+            "source": "fixture"
+        }));
+        let package = sorter_package(invoker.clone());
+
+        let status = block_on(package.update_sorter(sorter_request(), false))
+            .unwrap()
+            .expect("the status hook answered");
+        assert_eq!(status.fetched_at, "2026-11-07T00:00:00Z");
+
+        block_on(package.update_sorter(sorter_request(), true))
+            .unwrap()
+            .expect("the update hook answered");
+        let calls = invoker.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "lootUpdate");
+        assert_eq!(calls[0].1["update"], serde_json::json!(false));
+        assert_eq!(calls[1].1["update"], serde_json::json!(true));
     }
 
     fn game_context() -> GameContext {

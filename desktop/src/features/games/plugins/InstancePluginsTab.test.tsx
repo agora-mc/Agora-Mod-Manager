@@ -24,11 +24,14 @@ function view(overrides: Record<string, unknown> = {}) {
     rulesKind: 'script',
     intro: 'Read the list from the top down.',
     itemHeading: 'Plugin',
-    hasLoot: true,
+    hasSorterUpdate: true,
+    sorterUpdateLabel: 'Update masterlist',
     rulesApply: true,
     listExists: true,
     rows: [],
     findings: [],
+    notes: [],
+    notesOutOfDate: false,
     masterlist: null,
     ...overrides,
   };
@@ -83,7 +86,8 @@ describe('load order lists', () => {
       rulesKind: 'none',
       intro: null,
       itemHeading: null,
-      hasLoot: false,
+      hasSorterUpdate: false,
+      sorterUpdateLabel: null,
       rulesApply: false,
       rows: [{ ...row, name: 'my_mod', badges: [] }],
     });
@@ -96,6 +100,26 @@ describe('load order lists', () => {
     expect(screen.queryByRole('button', { name: /Update masterlist/ })).toBeNull();
   });
 
+  it('shows the list before the sorter notes arrive, then fills them in', async () => {
+    let resolveNotes!: (value: unknown) => void;
+    const notes = new Promise((resolve) => {
+      resolveNotes = resolve;
+    });
+    replies.games_plugins_lists = () => ({ lists: [{ id: 'plugins', name: 'Plugins', rulesKind: 'script' }] });
+    replies.games_plugins_list = () => view({ rows: [row], notesOutOfDate: true });
+    replies.games_plugins_sorter_notes = () => notes;
+    mountTab();
+
+    expect(await screen.findByText('SkyUI.esp')).toBeInTheDocument();
+    expect(screen.queryAllByText('A note from the sorter')).toHaveLength(0);
+
+    resolveNotes({
+      notes: [{ message: 'A note from the sorter', refusesLaunch: false, plugins: ['SkyUI.esp'] }],
+      notesOutOfDate: false,
+    });
+    expect(await screen.findAllByText('A note from the sorter')).not.toHaveLength(0);
+  });
+
   it('shows a tab per list and each list keeps its own order', async () => {
     replies.games_plugins_lists = () => ({
       lists: [
@@ -104,7 +128,7 @@ describe('load order lists', () => {
       ],
     });
     replies.games_plugins_list = (args) => args.listId === 'redmods'
-      ? view({ listId: 'redmods', listName: 'REDmods', rulesKind: 'none', hasLoot: false, rulesApply: false, rows: [{ ...row, name: 'my_mod' }] })
+      ? view({ listId: 'redmods', listName: 'REDmods', rulesKind: 'none', hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, rows: [{ ...row, name: 'my_mod' }] })
       : view({ rows: [row] });
 
     mountTab();

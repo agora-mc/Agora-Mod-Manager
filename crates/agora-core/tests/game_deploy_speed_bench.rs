@@ -286,7 +286,7 @@ fn deploy_and_launch_timings() {
                 entry: None,
                 implicit: vec![],
                 implicit_list_file: None,
-                loot: None,
+                sorter: None,
             },
 
             intro: None,
@@ -560,7 +560,7 @@ fn tools_tab_timings() {
             entry: None,
             implicit: vec![],
             implicit_list_file: None,
-            loot: None,
+            sorter: None,
         },
 
         intro: None,

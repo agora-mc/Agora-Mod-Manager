@@ -19,13 +19,14 @@
 //! is busy in a tight loop that yields to nothing.
 
 use agora_plugin_api::error::{PluginError, PluginErrorCode, PluginResult};
-use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptReads};
+use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptReads, StoredBlobs};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel, PluginEventEnvelope};
 use rquickjs::function::Async;
 use rquickjs::{
     ArrayBuffer, AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module, Object, Value,
 };
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
@@ -43,9 +44,17 @@ thread_local! {
     /// on this plugin's thread. Same isolation as `CURRENT_READS`.
     static CURRENT_GAME_READS: RefCell<Option<Arc<dyn GameReads>>> =
         const { RefCell::new(None) };
+    /// The plugin's own stored blobs, for a `stored` mount in this call.
+    static CURRENT_STORED_BLOBS: RefCell<Option<Arc<dyn StoredBlobs>>> =
+        const { RefCell::new(None) };
     /// The instance a hook is bound to, so a `game.*` call from the script
     /// cannot name a different one.
     static CURRENT_BOUND_INSTANCE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Where this plugin's own files live. A module path is resolved against
+    /// it and may never leave it.
+    static CURRENT_PACKAGE_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// Agora's data root, for the module compile cache and staging.
+    static CURRENT_DATA_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 fn current_reads() -> Option<Arc<dyn ScriptReads>> {
@@ -56,8 +65,56 @@ fn current_game_reads() -> Option<Arc<dyn GameReads>> {
     CURRENT_GAME_READS.with(|slot| slot.borrow().clone())
 }
 
+fn current_stored_blobs() -> Option<Arc<dyn StoredBlobs>> {
+    CURRENT_STORED_BLOBS.with(|slot| slot.borrow().clone())
+}
+
 fn current_bound_instance() -> Option<String> {
     CURRENT_BOUND_INSTANCE.with(|slot| slot.borrow().clone())
+}
+
+fn current_package_root() -> Option<PathBuf> {
+    CURRENT_PACKAGE_ROOT.with(|slot| slot.borrow().clone())
+}
+
+fn current_data_root() -> Option<PathBuf> {
+    CURRENT_DATA_ROOT.with(|slot| slot.borrow().clone())
+}
+
+/// The QuickJS side of `agora.wasm.run`. The run happens on its own thread,
+/// so the answer comes back as JSON; the SDK turns the byte arrays into
+/// typed views.
+fn wasm_run(module: String, options_json: String) -> rquickjs::Result<String> {
+    let (Some(package_root), Some(data_root)) = (current_package_root(), current_data_root())
+    else {
+        return Err(rquickjs::Error::new_into_js_message(
+            "agora.wasm.run",
+            "WasmRunResult",
+            "this plugin runtime has no data root, so it cannot run a module",
+        ));
+    };
+    let result = crate::wasm::run(
+        &module,
+        &package_root,
+        &data_root,
+        &options_json,
+        current_game_reads(),
+        current_stored_blobs(),
+    )
+    .map_err(|error| {
+        rquickjs::Error::new_into_js_message(
+            "agora.wasm.run",
+            "WasmRunResult",
+            format!("{}: {}", error.code, error.message),
+        )
+    })?;
+    serde_json::to_string(&result).map_err(|e| {
+        rquickjs::Error::new_into_js_message(
+            "agora.wasm.run",
+            "WasmRunResult",
+            format!("the module result could not be read: {e}"),
+        )
+    })
 }
 
 /// How many events may queue for one plugin before the oldest are dropped.
@@ -84,6 +141,7 @@ pub(crate) enum Control {
         timeout: Duration,
         reads: Option<Arc<dyn ScriptReads>>,
         game_reads: Option<Arc<dyn GameReads>>,
+        blobs: Option<Arc<dyn StoredBlobs>>,
         reply: SyncSender<PluginResult<serde_json::Value>>,
     },
     Deactivate {
@@ -237,7 +295,7 @@ async fn plugin_main(
                         let _ = reply.send(result);
                         break;
                     }
-                    Some(Control::Invoke { export, args, timeout, reads, game_reads, reply }) => {
+                    Some(Control::Invoke { export, args, timeout, reads, game_reads, blobs, reply }) => {
                         let result = invoke_export(
                             &context,
                             &deadline,
@@ -246,6 +304,7 @@ async fn plugin_main(
                             timeout,
                             reads,
                             game_reads,
+                            blobs,
                         )
                         .await;
                         if let Err(error) = &result {
@@ -369,6 +428,8 @@ async fn install_host_api(
     let api_version = request.api_version.clone();
     let settings = serde_json::to_string(&request.settings).unwrap_or_else(|_| "{}".into());
     let plugin_id_string = plugin_id.to_string();
+    CURRENT_PACKAGE_ROOT.with(|slot| *slot.borrow_mut() = Some(request.package_root.clone()));
+    CURRENT_DATA_ROOT.with(|slot| *slot.borrow_mut() = Some(request.data_root.clone()));
 
     let log_bridge = bridge.clone();
     let log_plugin = plugin_id.clone();
@@ -523,6 +584,11 @@ async fn install_host_api(
                 .set("__agora_game_list", game_list_fn)
                 .map_err(js_internal)?;
 
+            let wasm_run_fn = Function::new(ctx.clone(), wasm_run).map_err(js_internal)?;
+            globals
+                .set("__agora_wasm_run", wasm_run_fn)
+                .map_err(js_internal)?;
+
             globals
                 .set("__agora_api_version", api_version)
                 .map_err(js_internal)?;
@@ -627,13 +693,18 @@ async fn run_optional_export(
     args: serde_json::Value,
     timeout: Duration,
 ) -> PluginResult<serde_json::Value> {
-    match call_export(context, deadline, export, args, timeout, true, None, None).await {
+    match call_export(
+        context, deadline, export, args, timeout, true, None, None, None,
+    )
+    .await
+    {
         Ok(value) => Ok(value),
         Err(e) if e.code == PluginErrorCode::NotActivated => Ok(serde_json::Value::Null),
         Err(e) => Err(e),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn invoke_export(
     context: &AsyncContext,
     deadline: &Arc<AtomicU64>,
@@ -642,9 +713,10 @@ async fn invoke_export(
     timeout: Duration,
     reads: Option<Arc<dyn ScriptReads>>,
     game_reads: Option<Arc<dyn GameReads>>,
+    blobs: Option<Arc<dyn StoredBlobs>>,
 ) -> PluginResult<serde_json::Value> {
     call_export(
-        context, deadline, export, args, timeout, false, reads, game_reads,
+        context, deadline, export, args, timeout, false, reads, game_reads, blobs,
     )
     .await
 }
@@ -659,6 +731,7 @@ async fn call_export(
     optional: bool,
     reads: Option<Arc<dyn ScriptReads>>,
     game_reads: Option<Arc<dyn GameReads>>,
+    blobs: Option<Arc<dyn StoredBlobs>>,
 ) -> PluginResult<serde_json::Value> {
     let export_name = export.to_string();
     let args_json = serde_json::to_string(&args).unwrap_or_else(|_| "null".into());
@@ -670,6 +743,7 @@ async fn call_export(
         .and_then(|reads| reads.instance())
         .map(str::to_string);
     let previous_game_reads = CURRENT_GAME_READS.with(|slot| slot.replace(game_reads));
+    let previous_blobs = CURRENT_STORED_BLOBS.with(|slot| slot.replace(blobs));
     let previous_bound = CURRENT_BOUND_INSTANCE.with(|slot| slot.replace(bound_instance));
     let started = Instant::now();
 
@@ -739,6 +813,7 @@ async fn call_export(
     // Restore the previous scopes even when the call failed or timed out.
     CURRENT_READS.with(|slot| *slot.borrow_mut() = previous_reads);
     CURRENT_GAME_READS.with(|slot| *slot.borrow_mut() = previous_game_reads);
+    CURRENT_STORED_BLOBS.with(|slot| *slot.borrow_mut() = previous_blobs);
     CURRENT_BOUND_INSTANCE.with(|slot| *slot.borrow_mut() = previous_bound);
 
     match result {

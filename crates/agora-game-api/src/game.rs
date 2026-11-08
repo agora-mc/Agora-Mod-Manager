@@ -1,5 +1,6 @@
 use crate::condition::{Condition, ConditionFacts, Truth};
 use crate::id::{FrameworkId, GameId, InstallId, LayerId, RelPath, StoreId, ToolId};
+use crate::package::GameContext;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -684,9 +685,10 @@ pub struct LoadOrderRules {
     /// A file (relative to the game's root) naming more always-loaded plugins, one per line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_list_file: Option<RelPath>,
-    /// LOOT masterlist sources for this game, so sorting can use LOOT's rules.
+    /// A plugin-provided sorter that returns a whole order (MASTER_SPEC §30.13). A list without
+    /// one is sorted by its plugins' masters alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub loot: Option<LootRule>,
+    pub sorter: Option<SorterRule>,
 }
 
 impl LoadOrderRules {
@@ -695,21 +697,91 @@ impl LoadOrderRules {
     }
 }
 
-/// Where a game's LOOT masterlist comes from (MASTER_SPEC §26.6).
+/// A list's plugin-provided sorter (MASTER_SPEC §30.13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LootRule {
-    /// The masterlist repository in `owner/repo` form, e.g. `loot/skyrimse`.
-    pub masterlist_repo: String,
-    /// The shared prelude repository in `owner/repo` form, when the masterlist uses one, e.g.
-    /// `loot/prelude`.
+pub struct SorterRule {
+    /// The script function that returns a whole order plus notes. It is owned by the plugin that
+    /// declared it, like every other behaviour.
+    pub hook: String,
+    /// The script function behind the update button, when the sorter keeps something it updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prelude_repo: Option<String>,
-    /// The branch of the masterlist repository that the bundled libloot version expects,
-    /// e.g. `v0.29`. Kept as data so a different libloot only changes a game package.
-    pub branch: String,
-    /// The game name libloot knows it by (`SkyrimSE`, `Fallout4`, ...).
-    pub game_type: String,
+    pub update: Option<String>,
+    /// The update button's label, e.g. `Update masterlist`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_label: Option<String>,
+    /// Free data handed to both hooks, e.g. the sources a sorter downloads from.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub options: serde_json::Value,
+}
+
+/// One item a sorter was asked about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SorterEntry {
+    pub name: String,
+    pub active: bool,
+    pub locked: bool,
+    pub implicit: bool,
+    pub present: bool,
+}
+
+/// What core hands a sorter hook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SorterRequest {
+    /// The instance and the list as it stands before the sorter decides anything.
+    pub context: GameContext,
+    pub list_id: String,
+    /// The sorter rule's `options`, passed through unchanged.
+    pub options: serde_json::Value,
+    pub entries: Vec<SorterEntry>,
+    /// The items that are active, locked and always loaded, by name.
+    pub active: Vec<String>,
+    pub locked: Vec<String>,
+    pub implicit: Vec<String>,
+}
+
+/// One note a sorter returns about an item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SorterNote {
+    /// The item's name. Empty for a note about the list as a whole.
+    #[serde(default)]
+    pub item: String,
+    /// `error`, `warn` or `info`.
+    pub level: String,
+    pub text: String,
+}
+
+/// What a `rules.sorter.hook` answers (MASTER_SPEC §30.13).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SorterReply {
+    /// Every present item's name, in the order the list should have. Core checks it is a
+    /// permutation of the current items before applying it.
+    pub order: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<SorterNote>,
+    /// Notes about the list as a whole, with no item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub general: Vec<SorterNote>,
+}
+
+/// What a sorter's update (or status) hook answers, for the tab's status line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SorterStatus {
+    /// RFC 3339, as recorded when the copy was fetched.
+    #[serde(rename = "fetchedAt")]
+    pub fetched_at: String,
+    /// Where the copy came from, when the sorter says.
+    #[serde(default)]
+    pub source: String,
+    /// Changes whenever the sorter's own data changes (the update hook returns it). Notes cached
+    /// under another version are stale even when the list itself has not changed.
+    #[serde(default, rename = "dataVersion")]
+    pub data_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -22,6 +22,7 @@ import {
   listGamePlugins,
   listLoadOrderLists,
   moveGamePlugin,
+  refreshSorterNotes,
   setGamePluginActive,
   setGamePluginLocked,
   sortGamePlugins,
@@ -50,26 +51,47 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [sortPreview, setSortPreview] = useState<SortReport | null>(null);
-  const [askingForMasterlist, setAskingForMasterlist] = useState(false);
   const [lists, setLists] = useState<LoadOrderListRow[] | null>(null);
   const [listId, setListId] = useState<string | null>(null);
   // Counts the reads, so a reply for an instance the tab no longer shows is dropped.
   const requestId = useRef(0);
+  // Counts the background notes fetches, so a result for a view that has since changed is dropped.
+  const notesRequestId = useRef(0);
+
+  /** Fetch the sorter's notes without blocking the list; a newer read or change wins. */
+  const loadSorterNotes = useCallback((id: string | null) => {
+    const ticket = ++notesRequestId.current;
+    refreshSorterNotes(instanceId, id ?? undefined)
+      .then((result) => {
+        if (ticket !== notesRequestId.current) return;
+        setLoad((current) =>
+          current.status === 'loaded'
+            ? { status: 'loaded', view: { ...current.view, notes: result.notes, notesOutOfDate: result.notesOutOfDate } }
+            : current,
+        );
+      })
+      .catch(() => {
+        // The list is already shown; a failed notes fetch is in the plugin log.
+      });
+  }, [instanceId]);
 
   const fetchList = useCallback((id: string | null) => {
     const request = ++requestId.current;
+    notesRequestId.current++;
     setLoad({ status: 'loading' });
     setError(null);
     setNotice(null);
     setSortPreview(null);
     listGamePlugins(instanceId, id ?? undefined)
       .then((view) => {
-        if (request === requestId.current) setLoad({ status: 'loaded', view });
+        if (request !== requestId.current) return;
+        setLoad({ status: 'loaded', view });
+        if (view.notesOutOfDate) loadSorterNotes(id);
       })
       .catch((failure: unknown) => {
         if (request === requestId.current) setLoad({ status: 'failed', message: describeFailure(failure) });
       });
-  }, [instanceId]);
+  }, [instanceId, loadSorterNotes]);
 
   useEffect(() => {
     let current = true;
@@ -90,6 +112,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
     return () => {
       current = false;
       requestId.current++;
+      notesRequestId.current++;
     };
   }, [instanceId]);
 
@@ -99,6 +122,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   }, [fetchList, listId, lists]);
 
   const view = load.status === 'loaded' ? load.view : null;
+  const allFindings = view ? [...view.findings, ...view.notes] : [];
 
   /** Runs one command. Only one runs at a time; a failure is shown as the backend's own words. */
   const run = async <T,>(label: string, work: () => Promise<T>, done: (value: T) => void) => {
@@ -114,7 +138,11 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
     }
   };
 
-  const showView = (next: PluginsView) => setLoad({ status: 'loaded', view: next });
+  const showView = (next: PluginsView) => {
+    notesRequestId.current++;
+    setLoad({ status: 'loaded', view: next });
+    if (next.notesOutOfDate) loadSorterNotes(listId);
+  };
 
   /** A saved change: show the list, or say it was saved and reload it when the re-read failed. */
   const applyChange = (change: PluginChange, saved: string) => {
@@ -178,40 +206,12 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const previewSort = () =>
     run('sort-preview', () => sortGamePlugins(instanceId, true, listId ?? undefined), (change) => setSortPreview(change.report));
 
-  const askOrPreviewSort = () => {
-    if (!view) return;
-    if (view.hasLoot && view.masterlist === null) {
-      setAskingForMasterlist(true);
-      return;
-    }
-    previewSort();
-  };
-
-  const downloadMasterlistAndSort = async () => {
-    setBusy('masterlist');
-    setError(null);
-    setNotice(null);
-    try {
-      const masterlist = await updateGameMasterlist(instanceId, listId ?? undefined);
-      setLoad((current) =>
-        current.status === 'loaded' ? { status: 'loaded', view: { ...current.view, masterlist } } : current,
-      );
-      setAskingForMasterlist(false);
-      const change = await sortGamePlugins(instanceId, true, listId ?? undefined);
-      setSortPreview(change.report);
-    } catch (failure: unknown) {
-      setError(describeFailure(failure));
-    } finally {
-      setBusy(null);
-    }
-  };
-
   const updateMasterlistOnly = () =>
     run('masterlist', () => updateGameMasterlist(instanceId, listId ?? undefined), (masterlist) => {
       setLoad((current) =>
         current.status === 'loaded' ? { status: 'loaded', view: { ...current.view, masterlist } } : current,
       );
-      setNotice('Masterlist updated.');
+      setNotice('Updated.');
     });
 
   const applySort = () =>
@@ -264,15 +264,15 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
               <RefreshCw />
               Check again
             </Button>
-            {view.hasLoot && (
+            {view.hasSorterUpdate && (
               <Button variant="outline" size="sm" onClick={updateMasterlistOnly} disabled={anyBusy}>
                 <Download />
-                Update masterlist
+                {busy === 'masterlist' ? 'Updating…' : (view.sorterUpdateLabel ?? 'Update')}
               </Button>
             )}
             {view.rulesApply && (
-              <Button variant="outline" size="sm" onClick={askOrPreviewSort} disabled={anyBusy}>
-                Sort…
+              <Button variant="outline" size="sm" onClick={previewSort} disabled={anyBusy}>
+                {busy === 'sort-preview' ? 'Sorting…' : 'Sort…'}
               </Button>
             )}
           </div>
@@ -313,11 +313,11 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
         </p>
       )}
 
-      {view.findings.length > 0 && (
+      {allFindings.length > 0 && (
         <div className="space-y-2 rounded-xl border border-border bg-card p-4" data-testid="plugins-findings">
           <h3 className="text-sm font-semibold">Problems with the load order</h3>
           <ul className="space-y-2">
-            {view.findings.map((finding, index) => (
+            {allFindings.map((finding, index) => (
               <FindingItem key={index} finding={finding} />
             ))}
           </ul>
@@ -356,7 +356,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
                   row={row}
                   above={view.rows[index - 1]}
                   below={view.rows[index + 1]}
-                  findings={view.findings.filter((finding) => finding.plugins.includes(row.name))}
+                  findings={allFindings.filter((finding) => finding.plugins.includes(row.name))}
                   disabled={anyBusy}
                   onToggleActive={() => toggleActive(row)}
                   onToggleLock={() => toggleLock(row)}
@@ -368,37 +368,14 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
         </div>
       )}
 
-      <Dialog open={askingForMasterlist} onOpenChange={setAskingForMasterlist}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Download LOOT's masterlist?</DialogTitle>
-            <DialogDescription>
-              Sorting with LOOT's masterlist puts plugins in the order the LOOT community recommends. It is
-              downloaded once, when you ask, and checked against the hash GitHub reports. Without it, Agora can
-              only put each plugin below its masters.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setAskingForMasterlist(false)} disabled={anyBusy}>
-              Cancel
-            </Button>
-            <Button variant="outline" onClick={() => { setAskingForMasterlist(false); previewSort(); }} disabled={anyBusy}>
-              Sort by masters only
-            </Button>
-            <Button onClick={downloadMasterlistAndSort} disabled={anyBusy}>
-              Download and sort
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
       <Dialog open={sortPreview !== null} onOpenChange={(open) => { if (!open) setSortPreview(null); }}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Sort plugins</DialogTitle>
             <DialogDescription>
-              Free plugins are put in LOOT's order, or below their masters when no masterlist is saved. Nothing is
-              written until you apply. Locked and always-loaded plugins stay where they are.
+              Free plugins are put in the order the list's sorter recommends, or below their masters when the sorter
+              has nothing saved. Nothing is written until you apply. Locked and always-loaded plugins stay where they
+              are.
             </DialogDescription>
           </DialogHeader>
           {sortPreview?.message && (
@@ -440,7 +417,9 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
             </Button>
             {sortPreview && sortPreview.moves.length > 0 && (
               <Button onClick={applySort} disabled={anyBusy}>
-                Apply {sortPreview.moves.length} {sortPreview.moves.length === 1 ? 'move' : 'moves'}
+                {busy === 'sort-apply'
+                  ? 'Applying…'
+                  : `Apply ${sortPreview.moves.length} ${sortPreview.moves.length === 1 ? 'move' : 'moves'}`}
               </Button>
             )}
           </DialogFooter>

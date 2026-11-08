@@ -110,6 +110,7 @@ fn the_script_agrees_with_esplugin_on_every_real_plugin() {
         ActivationRequest {
             plugin_id: id.clone(),
             package_root: dir.path().to_path_buf(),
+            data_root: dir.path().to_path_buf(),
             entrypoint: "main.js".into(),
             memory_limit_bytes: ActivationRequest::DEFAULT_MEMORY_LIMIT,
             stack_limit_bytes: ActivationRequest::DEFAULT_STACK_LIMIT,

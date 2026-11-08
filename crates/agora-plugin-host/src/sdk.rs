@@ -73,6 +73,15 @@ const storage = {
   set: (key, value) => call("storage.set", { key, value }),
   all: () => call("storage.all"),
   remove: (key) => call("storage.remove", { key }),
+  // Bytes live in this plugin's own blob store, as files core owns. The
+  // script names a key, never a path.
+  putBytes: (key, bytes) =>
+    call("storage.putBytes", { key, bytes: Array.from(bytes === undefined ? [] : bytes) }),
+  getBytes: (key) =>
+    call("storage.getBytes", { key }).then((reply) =>
+      reply === null || reply === undefined ? null : new Uint8Array(reply.bytes),
+    ),
+  deleteBytes: (key) => call("storage.deleteBytes", { key }),
   forInstance: (instanceId) => ({
     get: (key) => call("storage.get", { key, instanceId }),
     set: (key, value) => call("storage.set", { key, value, instanceId }),
@@ -88,6 +97,37 @@ const net = {
 const ui = {
   refresh: (viewId) => call("ui.refresh", { viewId }),
   notify: (tone, message) => call("ui.notify", { tone, message }),
+};
+
+// A WebAssembly module the plugin ships. It is a WASI command: the request
+// goes in on stdin, the answer comes back on stdout. `stdout` and `stderr` are
+// plain byte arrays so the result survives JSON, and the `*Text` fields are the
+// same bytes decoded as UTF-8.
+const wasm = {
+  run: (module, options) => {
+    const opts = options || {};
+    const encode = (value) => (typeof value === "string" ? value : Array.from(value || []));
+    const mounts = (opts.mounts || []).map((mount) => {
+      const out = { guest: mount.guest };
+      if (mount.view) {
+        out.view = { folder: mount.view.folder, patterns: mount.view.patterns || [] };
+      }
+      if (mount.files) {
+        out.files = {};
+        for (const [name, value] of Object.entries(mount.files)) {
+          out.files[name] = encode(value);
+        }
+      }
+      if (mount.stored) {
+        out.stored = mount.stored.map(String);
+      }
+      return out;
+    });
+    const payload = { mounts };
+    if (opts.stdin !== undefined) payload.stdin = encode(opts.stdin);
+    if (opts.limits) payload.limits = opts.limits;
+    return JSON.parse(__agora_wasm_run(module, JSON.stringify(payload)));
+  },
 };
 
 // Scoped reads for crash parsers and inspectors. They reach only the artifact
@@ -183,8 +223,8 @@ const apiVersion = __agora_api_version;
 const pluginId = __agora_plugin_id;
 const settings = JSON.parse(__agora_settings);
 
-export { call, log, instances, content, launch, storage, net, ui, crash, game, on, off, apiVersion, pluginId, settings };
-export default { call, log, instances, content, launch, storage, net, ui, crash, game, on, off, apiVersion, pluginId, settings };
+export { call, log, instances, content, launch, storage, net, ui, wasm, crash, game, on, off, apiVersion, pluginId, settings };
+export default { call, log, instances, content, launch, storage, net, ui, wasm, crash, game, on, off, apiVersion, pluginId, settings };
 "#;
 
 /// Name plugins import: `import { instances } from "agora"`.

@@ -1,0 +1,169 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check formatting
+        run: |
+          cargo fmt -- --version
+          cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run clippy
+        run: |
+          cargo clippy -- --version
+          cargo clippy --workspace --all-targets -- -Dwarnings
+
+  cargo-vet:
+    runs-on: ubuntu-24.04
+
+    env:
+      CARGO_VET_REV: 28f617ea97392d527799649db588a6dbb695da8d  # 0.10.2
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: actions/cache@v5
+      id: cache-cargo-vet
+      with:
+        path: ${{ runner.tool_cache }}/cargo-vet
+        key: cargo-vet-bin-${{ env.CARGO_VET_REV }}
+
+    - name: Add the tool cache directory to the search path
+      run: echo "${{ runner.tool_cache }}/cargo-vet/bin" >> $GITHUB_PATH
+
+    - name: Ensure that the tool cache is populated with the cargo-vet binary
+      run: cargo install --root ${{ runner.tool_cache }}/cargo-vet --locked --git https://github.com/mozilla/cargo-vet --rev ${{ env.CARGO_VET_REV }} cargo-vet
+      if: steps.cache-cargo-vet.outputs.cache-hit != 'true'
+
+    - name: Invoke cargo-vet
+      run: |
+        cargo vet --version
+        cargo vet --locked
+
+  msrv:
+    strategy:
+      matrix:
+        os:
+          - windows-2025
+          - ubuntu-24.04
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      EXPECTED_MSRV: "1.82"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/cache@v5
+        id: cache-cargo
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-msrv-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Rust v${{ env.EXPECTED_MSRV }}
+        run: rustup install ${{ env.EXPECTED_MSRV }}
+
+      - name: Run cargo build using Rust v${{ env.EXPECTED_MSRV }}
+        run: cargo +${{ env.EXPECTED_MSRV }} build --workspace --all-features
+
+  build:
+    strategy:
+      matrix:
+        os:
+          - windows-2025
+          - ubuntu-24.04
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_LLVM_COV_VERSION: v0.6.19
+      TESTING_PLUGINS_VERSION: "1.6.2"
+      TESTING_PLUGINS_HASH: 01f7c8ae31e6527f0a1c1155d73653cf3af80a6af1e636ec0b33d7130e68182e
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/cache@v5
+        id: cache-cargo
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cbindgen
+        run: cargo install --locked --git https://github.com/mozilla/cbindgen --rev 58c6156b0d91e82abb03c26187b8d18fa4345ce0 cbindgen
+        if: steps.cache-cargo.outputs.cache-hit != 'true'
+
+      - name: Install cargo-llvm-cov
+        shell: bash
+        run: |
+          host=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
+          curl --proto '=https' --tlsv1.2 -fsSLO "https://github.com/taiki-e/cargo-llvm-cov/releases/download/$CARGO_LLVM_COV_VERSION/cargo-llvm-cov-$host.tar.gz"
+
+          if [[ "${{ runner.os }}" == "Windows" ]]
+          then
+            EXPECTED_HASH=dcf8e75e10b07f8348c900a600e429585cccaf4239533b7247a76c7ceaca0b3f
+          else
+            EXPECTED_HASH=aa53c5963beb832f8ea04fea8dcbcece55a99e0c31a8d1e8d514d59ed5942160
+          fi
+
+          sha256sum -c <<< "$EXPECTED_HASH cargo-llvm-cov-$host.tar.gz"
+
+          tar xzf cargo-llvm-cov-$host.tar.gz -C "$HOME/.cargo/bin"
+
+      - name: Prepare test resources
+        shell: bash
+        run: |
+          curl -sSfLO "https://github.com/Ortham/testing-plugins/archive/${{ env.TESTING_PLUGINS_VERSION }}.zip"
+          sha256sum -c <<< "${{ env.TESTING_PLUGINS_HASH }} ${{ env.TESTING_PLUGINS_VERSION }}.zip"
+          7z x "${{ env.TESTING_PLUGINS_VERSION }}.zip"
+          mv "testing-plugins-${{ env.TESTING_PLUGINS_VERSION }}" testing-plugins
+
+      - name: Build and run tests with code coverage
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+
+      - name: Upload code coverage to Coveralls
+        uses: coverallsapp/github-action@5cbfd81b66ca5d10c19b062c04de0199c215fb6e # v2.3.7
+        continue-on-error: true
+
+      # Need to rebuild the FFI wrapper so that its binary is given a filename
+      # without a hash.
+      - name: Build FFI wrapper
+        shell: bash
+        run: |
+          cargo build --manifest-path ffi/Cargo.toml
+          cbindgen --version
+          cbindgen ffi/ -o ffi/include/libloadorder.h
+
+      - name: Build and run C++ tests
+        shell: bash
+        run: |
+          cmake -B ffi/build ffi -DCMAKE_BUILD_TYPE=Debug
+          cmake --build ffi/build --config Debug
+          ctest --test-dir ffi/build --build-config Debug --output-on-failure

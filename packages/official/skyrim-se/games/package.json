@@ -273,11 +273,13 @@
               "Dragonborn.esm"
             ],
             "implicit_list_file": "Skyrim.ccc",
-            "loot": {
-              "masterlist_repo": "loot/skyrimse",
-              "prelude_repo": "loot/prelude",
-              "branch": "v0.29",
-              "game_type": "SkyrimSE"
+            "sorter": {
+              "options": {
+                "masterlist_repo": "loot/skyrimse",
+                "prelude_repo": "loot/prelude",
+                "branch": "v0.29",
+                "game_type": "SkyrimSE"
+              }
             }
           }
         }

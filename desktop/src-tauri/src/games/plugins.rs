@@ -12,7 +12,7 @@ use agora_core::game_load_order::{
     self as load_order, Finding, LoadOrder, LoadOrderEntry, MoveReport, MoveTarget, SortReport,
 };
 use agora_core::game_plugins;
-use agora_core::loot_masterlist;
+use agora_game_api::GameDefinition;
 use serde::Serialize;
 
 use super::error::{GamesError, CORE_FAILED, TASK_FAILED};
@@ -88,8 +88,10 @@ pub struct PluginsView {
     pub intro: Option<String>,
     /// The column heading for an item's name, when the game declares one.
     pub item_heading: Option<String>,
-    /// Whether this list declares a LOOT masterlist source.
-    pub has_loot: bool,
+    /// Whether this list's sorter has an update hook, so the tab shows an update button.
+    pub has_sorter_update: bool,
+    /// The update button's label, from the list's sorter.
+    pub sorter_update_label: Option<String>,
     /// Whether the game's own rules judge this list, so it can be sorted.
     pub rules_apply: bool,
     /// Whether the instance has a copy of the plugin list yet. It is created at deploy time.
@@ -97,11 +99,15 @@ pub struct PluginsView {
     /// Always-loaded plugins first, then the listed ones, in the order the game reads them.
     pub rows: Vec<PluginRow>,
     pub findings: Vec<PluginFinding>,
-    /// The LOOT masterlist cached for this game, when one has been downloaded.
+    /// The list's sorter's notes, shown in the same problems list.
+    pub notes: Vec<PluginFinding>,
+    /// True when the saved notes no longer match the list; the tab fetches fresh ones.
+    pub notes_out_of_date: bool,
+    /// What the list's sorter last saved, when it has saved something.
     pub masterlist: Option<MasterlistView>,
 }
 
-/// The cached LOOT masterlist, for the tab's "Masterlist from <date>" line.
+/// What the list's sorter last saved, for the tab's "Masterlist from <date>" line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterlistView {
@@ -112,10 +118,10 @@ pub struct MasterlistView {
 }
 
 impl MasterlistView {
-    fn from_status(status: &loot_masterlist::MasterlistStatus) -> Self {
+    fn from_status(status: &agora_game_api::SorterStatus) -> Self {
         Self {
             fetched_at: status.fetched_at.clone(),
-            source: status.source_url.clone(),
+            source: status.source.clone(),
         }
     }
 }
@@ -161,11 +167,14 @@ impl PluginsView {
             rules_kind: String::new(),
             intro: None,
             item_heading: None,
-            has_loot: false,
+            has_sorter_update: false,
+            sorter_update_label: None,
             rules_apply: false,
             list_exists: false,
             rows: Vec::new(),
             findings: Vec::new(),
+            notes: Vec::new(),
+            notes_out_of_date: false,
             masterlist: None,
         }
     }
@@ -178,7 +187,8 @@ impl PluginsView {
             rules_kind: order.rules_kind.clone(),
             intro: order.intro.clone(),
             item_heading: order.item_heading.clone(),
-            has_loot: false,
+            has_sorter_update: false,
+            sorter_update_label: None,
             rules_apply: order.rules_kind == "script",
             list_exists: order.exists,
             rows: order
@@ -187,15 +197,34 @@ impl PluginsView {
                 .enumerate()
                 .map(|(index, entry)| row_view(index + 1, entry))
                 .collect(),
-            findings: order
-                .findings
-                .iter()
-                .map(finding_view)
-                .chain(order.notes.iter().map(note_view))
-                .collect(),
+            findings: order.findings.iter().map(finding_view).collect(),
+            notes: order.notes.iter().map(note_view).collect(),
+            notes_out_of_date: order.notes_out_of_date,
             masterlist: None,
         }
     }
+}
+
+/// Fill the parts of the view that come from the list's sorter, not from the order itself. Every
+/// reply that carries a list does this, so the update button and status line survive a change.
+fn fill_sorter(
+    view: &mut PluginsView,
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<(), GamesError> {
+    let rule = load_order::list_by_id(definition, list_id).map_err(core_failed)?;
+    if let Some(sorter) = rule.rules.sorter.as_ref() {
+        view.has_sorter_update = sorter.update.is_some();
+        view.sorter_update_label = sorter.update_label.clone();
+    }
+    // The status line is informational; a sorter that cannot report it must not turn a saved
+    // change or a readable list into a failure. The hook's failure is already in the plugin log.
+    if let Ok(status) = load_order::sorter_status(ctx, instance_id, definition, Some(&rule.id)) {
+        view.masterlist = status.map(|status| MasterlistView::from_status(&status));
+    }
+    Ok(())
 }
 
 fn row_view(position: usize, entry: &LoadOrderEntry) -> PluginRow {
@@ -216,7 +245,11 @@ fn note_view(note: &agora_core::game_load_order::PluginNote) -> PluginFinding {
     PluginFinding {
         message: note.message.clone(),
         refuses_launch: false,
-        plugins: vec![note.plugin.clone()],
+        plugins: if note.plugin.is_empty() {
+            Vec::new()
+        } else {
+            vec![note.plugin.clone()]
+        },
     }
 }
 
@@ -361,30 +394,65 @@ pub async fn games_plugins_list(
         let order = load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref())
             .map_err(core_failed)?;
         let mut view = PluginsView::from_order(&order);
-        let rule = load_order::list_by_id(definition, list_id.as_deref()).map_err(core_failed)?;
-        view.has_loot = rule.rules.loot.is_some();
-        if rule.rules.loot.is_some() {
-            view.masterlist = loot_masterlist::cached_in(&ctx, definition, Some(&rule.id))
-                .map_err(core_failed)?
-                .map(|cached| MasterlistView::from_status(&cached.status));
-        }
+        fill_sorter(
+            &mut view,
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+        )?;
         Ok(view)
     })
     .await
 }
 
-/// Download and verify LOOT's masterlist for the game, replacing any cached copy.
+/// Run the list's sorter update hook, replacing whatever it keeps.
 #[tauri::command]
 pub async fn games_plugins_update_masterlist(
     app: tauri::AppHandle,
     instance_id: String,
     list_id: Option<String>,
 ) -> Result<MasterlistView, GamesError> {
-    run_blocking(app, "Updating the masterlist", move |ctx| {
+    run_blocking(app, "Updating the sorter's data", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        let status = loot_masterlist::update_in(&ctx, definition, list_id.as_deref())
-            .map_err(core_failed)?;
-        Ok(MasterlistView::from_status(&status))
+        match load_order::update_sorter(&ctx, &instance_id, definition, list_id.as_deref())
+            .map_err(core_failed)?
+        {
+            Some(status) => Ok(MasterlistView::from_status(&status)),
+            None => Err(GamesError::new(
+                "NO_SORTER_UPDATE",
+                "This list has no sorter update to run.",
+            )),
+        }
+    })
+    .await
+}
+
+/// The sorter's notes for one list, fetched in the background after a read said they were stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SorterNotesView {
+    pub notes: Vec<PluginFinding>,
+    /// Always false: this reply just refreshed them.
+    pub notes_out_of_date: bool,
+}
+
+/// Ask the list's sorter for its notes now, and remember them for the next read.
+#[tauri::command]
+pub async fn games_plugins_sorter_notes(
+    app: tauri::AppHandle,
+    instance_id: String,
+    list_id: Option<String>,
+) -> Result<SorterNotesView, GamesError> {
+    run_blocking(app, "Reading the sorter's notes", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let notes =
+            load_order::refresh_sorter_notes(&ctx, &instance_id, definition, list_id.as_deref())
+                .map_err(core_failed)?;
+        Ok(SorterNotesView {
+            notes: notes.iter().map(note_view).collect(),
+            notes_out_of_date: false,
+        })
     })
     .await
 }
@@ -410,10 +478,14 @@ pub async fn games_plugins_set_active(
         )
         .map_err(core_failed)?;
         // The change is saved: a failed re-read must not turn it into a reported failure.
-        plugin_change_after_save(
+        let mut change = plugin_change_after_save(
             changed,
             load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref()),
-        )
+        )?;
+        if let Some(view) = change.plugins.as_mut() {
+            fill_sorter(view, &ctx, &instance_id, definition, list_id.as_deref())?;
+        }
+        Ok(change)
     })
     .await
 }
@@ -439,10 +511,14 @@ pub async fn games_plugins_set_locked(
         )
         .map_err(core_failed)?;
         // The change is saved: a failed re-read must not turn it into a reported failure.
-        plugin_change_after_save(
+        let mut change = plugin_change_after_save(
             changed,
             load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref()),
-        )
+        )?;
+        if let Some(view) = change.plugins.as_mut() {
+            fill_sorter(view, &ctx, &instance_id, definition, list_id.as_deref())?;
+        }
+        Ok(change)
     })
     .await
 }
@@ -468,9 +544,17 @@ pub async fn games_plugins_move(
             &MoveTarget::Position(to),
         )
         .map_err(core_failed)?;
+        let mut view = PluginsView::from_order(&order);
+        fill_sorter(
+            &mut view,
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+        )?;
         Ok(MoveChange {
             report,
-            plugins: PluginsView::from_order(&order),
+            plugins: view,
         })
     })
     .await
@@ -496,9 +580,17 @@ pub async fn games_plugins_sort(
             dry_run,
         )
         .map_err(core_failed)?;
+        let mut view = PluginsView::from_order(&order);
+        fill_sorter(
+            &mut view,
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+        )?;
         Ok(SortChange {
             report,
-            plugins: PluginsView::from_order(&order),
+            plugins: view,
         })
     })
     .await
@@ -563,6 +655,7 @@ mod tests {
             entries,
             findings,
             notes: Vec::new(),
+            notes_out_of_date: false,
         }
     }
 

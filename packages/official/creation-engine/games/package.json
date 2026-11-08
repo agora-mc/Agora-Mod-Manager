@@ -25,7 +25,12 @@
             "active_prefix": "*"
           },
           "rules": {
-            "kind": "script"
+            "kind": "script",
+            "sorter": {
+              "hook": "lootSort",
+              "update": "lootUpdate",
+              "update_label": "Update masterlist"
+            }
           },
           "intro": "The game reads plugins from the top of this list down. When two plugins change the same thing, the one lower down wins. A plugin's masters must load above it.",
           "item_heading": "Plugin"

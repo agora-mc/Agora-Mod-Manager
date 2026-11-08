@@ -15,11 +15,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agora_game_api::{
     fold_path_case, glob_match, GameContext, GameDefinition, GamePackage, ListFinding,
-    LoadOrderDefinition, LoadOrderLine, LoadOrderRule, LoadOrderRulesReply,
+    LoadOrderDefinition, LoadOrderLine, LoadOrderRule, LoadOrderRulesReply, SorterEntry,
+    SorterReply, SorterRequest, SorterStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,12 +29,9 @@ use crate::game_deploy::{self, DeployMode, DeploymentPlan};
 use crate::game_plugins::{self, PluginEntry, PluginListError};
 use crate::lock_manager::LockResource;
 
-/// What a sort says when it could not use LOOT's masterlist.
-pub const MASTERS_ONLY_MESSAGE: &str =
-    "Sorted by masters only. Download LOOT's masterlist for a full sort.";
-/// What a sort says when the saved masterlist can no longer be read.
-pub const CACHED_MASTERLIST_UNREADABLE: &str =
-    "Sorted by masters only. The saved LOOT masterlist could not be read; update it to sort with LOOT.";
+/// What a sort says when the list has duplicates, so its sorter cannot judge it.
+pub const DUPLICATES_BY_MASTERS_ONLY: &str =
+    "Sorted by masters only. A plugin is listed twice, so the list's sorter was not asked.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadOrderError {
@@ -79,21 +77,16 @@ pub enum LoadOrderError {
     NoRoom { plugin: String, target: String },
     #[error("sort did not settle after {0} moves; nothing was written")]
     DidNotSettle(usize),
-    #[error("game '{0}' names no LOOT masterlist, so this game cannot use one")]
-    NoLootMasterlist(String),
-    #[error("cannot use the LOOT masterlist: {reason}")]
-    Masterlist { reason: String },
-    #[error("cannot download {url}: {reason}")]
-    MasterlistDownload { url: String, reason: String },
-    #[error("the {path} Git blob for {repo} is {actual}, but GitHub reported {expected}; the download was refused and the saved masterlist was left alone")]
-    MasterlistHash {
-        repo: String,
-        path: String,
-        expected: String,
-        actual: String,
-    },
-    #[error("LOOT could not sort the plugins: {reason}")]
-    Loot { reason: String },
+    #[error("the list's sorter failed: {reason}")]
+    Sorter { list: String, reason: String },
+    #[error("the list's sorter did not answer, though the list declares one")]
+    NoSorterReply(String),
+    #[error("the list's sorter returned an order that {reason}; nothing was written")]
+    SorterOrder { reason: String },
+    #[error("the list's sorter returned a note Agora cannot read: {reason}")]
+    SorterNote { reason: String },
+    #[error("the list's sorter update failed: {reason}")]
+    SorterUpdate { reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -144,12 +137,17 @@ pub struct LoadOrder {
     pub exists: bool,
     pub entries: Vec<LoadOrderEntry>,
     pub findings: Vec<Finding>,
-    /// What LOOT's masterlist says about these plugins. Empty when no masterlist is cached.
+    /// What the list's sorter says about these plugins. Empty when it has nothing to say.
     #[serde(default)]
     pub notes: Vec<PluginNote>,
+    /// True when the saved notes no longer match the list (or the sorter's data changed). The
+    /// desktop then asks for fresh notes in the background rather than running the sorter on a
+    /// plain read.
+    #[serde(default)]
+    pub notes_out_of_date: bool,
 }
 
-/// How important a LOOT masterlist message is.
+/// How important a sorter's message is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoteLevel {
@@ -158,7 +156,7 @@ pub enum NoteLevel {
     Info,
 }
 
-/// One thing LOOT's masterlist says about a plugin. Plain text, never markup.
+/// One thing a list's sorter says about a plugin. Plain text, never markup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginNote {
     pub plugin: String,
@@ -302,7 +300,7 @@ pub struct SortReport {
     pub blocked: Vec<Blocked>,
     /// Whether the moves were written to the instance's list (false for a dry run).
     pub written: bool,
-    /// What ordered the free plugins: LOOT's masterlist, or only their masters.
+    /// What ordered the free plugins: the list's sorter, or only their masters.
     pub mode: SortMode,
     /// A sentence for the user when the full sort could not run.
     pub message: Option<String>,
@@ -312,10 +310,127 @@ pub struct SortReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortMode {
-    /// LOOT's cached masterlist ordered the free plugins.
-    Loot,
+    /// The list's plugin-provided sorter ordered the free plugins.
+    Sorter,
     /// Only the plugins' own masters were used.
     Masters,
+}
+
+/// The last notes a sorter gave for one list, with what they were computed from.
+#[derive(Default)]
+struct SorterNotesCache {
+    entries: Mutex<HashMap<(String, String), CachedSorterNotes>>,
+}
+
+#[derive(Clone)]
+struct CachedSorterNotes {
+    fingerprint: String,
+    data_version: String,
+    notes: Vec<PluginNote>,
+}
+
+impl SorterNotesCache {
+    fn lookup(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: &str,
+        data_version: &str,
+    ) -> Option<Vec<PluginNote>> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries
+            .get(&(game.to_string(), list.to_string()))
+            .filter(|cached| {
+                cached.fingerprint == fingerprint && cached.data_version == data_version
+            })
+            .map(|cached| cached.notes.clone())
+    }
+
+    fn store(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: String,
+        data_version: String,
+        notes: Vec<PluginNote>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries.insert(
+            (game.to_string(), list.to_string()),
+            CachedSorterNotes {
+                fingerprint,
+                data_version,
+                notes,
+            },
+        );
+    }
+}
+
+/// What a list's notes are computed from: the order, each present item's active state, and its
+/// file's size and modification time. A change to any of them makes the saved notes stale.
+fn sorter_fingerprint(entries: &[LoadOrderEntry], installed: &Installed) -> String {
+    let mut out = String::new();
+    for entry in entries.iter().filter(|entry| entry.present) {
+        out.push_str(&key(&entry.name));
+        out.push('|');
+        out.push(if entry.active { '1' } else { '0' });
+        out.push('|');
+        if let Some(path) = installed.get(&key(&entry.name)) {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                out.push_str(&metadata.len().to_string());
+                out.push(':');
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        out.push_str(&since.as_nanos().to_string());
+                    }
+                }
+            }
+        }
+        out.push(';');
+    }
+    out
+}
+
+/// The sorter's data version for a list, from its cheap status hook. An unavailable status is
+/// treated as "no version", so the notes simply read as stale rather than failing the list.
+fn sorter_data_version(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+) -> String {
+    sorter_status(ctx, instance_id, definition, Some(&rule.id))
+        .ok()
+        .flatten()
+        .map(|status| status.data_version)
+        .unwrap_or_default()
+}
+
+/// Remember notes for the list as it stands now. Sort and Update call this so the next read needs
+/// no sorter run.
+fn cache_sorter_notes(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+    installed: &Installed,
+    notes: &[PluginNote],
+) {
+    let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
+    cache.store(
+        definition.id.as_str(),
+        &rule.id,
+        sorter_fingerprint(entries, installed),
+        sorter_data_version(ctx, instance_id, definition, rule),
+        notes.to_vec(),
+    );
 }
 
 /// Where `move` puts a plugin. Positions are 1-based and count the always-loaded plugins too.
@@ -368,9 +483,9 @@ pub fn list_by_id<'a>(
     }
 }
 
-/// Whether a list reads the game's files: a script hook, a LOOT masterlist, or a list of folders.
+/// Whether a list reads the game's files: a script hook, a sorter, or a list of folders.
 fn list_needs_plan(rule: &LoadOrderDefinition) -> bool {
-    rule.rules.kind == "script" || rule.rules.loot.is_some() || rule.items.folders
+    rule.rules.kind == "script" || rule.rules.sorter.is_some() || rule.items.folders
 }
 
 /// Whether any list needs a deployment plan at all.
@@ -477,6 +592,182 @@ pub(crate) fn call_load_order_rules(
             rule.id
         )
     })
+}
+
+/// What a package's sorter hooks receive: the list as it stands, plus the rule's free options.
+fn sorter_request(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+) -> Result<SorterRequest, LoadOrderError> {
+    let sorter = rule
+        .rules
+        .sorter
+        .as_ref()
+        .ok_or_else(|| LoadOrderError::NoSort(rule.id.clone()))?;
+    let context = hook_context(ctx, instance_id, definition, rule, entries)?;
+    Ok(SorterRequest {
+        context,
+        list_id: rule.id.clone(),
+        options: sorter.options.clone(),
+        entries: entries
+            .iter()
+            .map(|entry| SorterEntry {
+                name: entry.name.clone(),
+                active: entry.active,
+                locked: entry.locked,
+                implicit: entry.implicit,
+                present: entry.present,
+            })
+            .collect(),
+        active: entries
+            .iter()
+            .filter(|entry| entry.active)
+            .map(|entry| entry.name.clone())
+            .collect(),
+        locked: entries
+            .iter()
+            .filter(|entry| entry.locked)
+            .map(|entry| entry.name.clone())
+            .collect(),
+        implicit: entries
+            .iter()
+            .filter(|entry| entry.implicit)
+            .map(|entry| entry.name.clone())
+            .collect(),
+    })
+}
+
+/// Ask the package's sorter for a whole order. A failure is an error, never "nothing changed".
+fn call_sorter(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+) -> Result<SorterReply, LoadOrderError> {
+    let package = package_of(ctx, definition)?;
+    let request = sorter_request(ctx, instance_id, definition, rule, entries)?;
+    let result = block_on_hook(package.sort_load_order(request)).map_err(|error| {
+        LoadOrderError::Sorter {
+            list: rule.id.clone(),
+            reason: error.message,
+        }
+    })?;
+    result.ok_or_else(|| LoadOrderError::NoSorterReply(rule.id.clone()))
+}
+
+/// A sorter reply's notes as the list shows them. A level Agora does not know is refused, because
+/// guessing its severity would be inventing an answer.
+fn sorter_notes(reply: &SorterReply) -> Result<Vec<PluginNote>, LoadOrderError> {
+    let mut notes = Vec::new();
+    for note in reply.notes.iter().chain(reply.general.iter()) {
+        let level = match note.level.as_str() {
+            "error" => NoteLevel::Error,
+            "warn" => NoteLevel::Warn,
+            "info" => NoteLevel::Info,
+            other => {
+                return Err(LoadOrderError::SorterNote {
+                    reason: format!("`{other}` is not error, warn or info"),
+                })
+            }
+        };
+        notes.push(PluginNote {
+            plugin: note.item.clone(),
+            level,
+            message: note.text.clone(),
+        });
+    }
+    Ok(notes)
+}
+
+/// Ask the sorter for its notes now, cache them for the list as it stands, and return them. The
+/// desktop calls this in the background when a plain read says the notes are out of date.
+pub fn refresh_sorter_notes(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Vec<PluginNote>, LoadOrderError> {
+    let rule = rule_of(definition, list_id)?;
+    if rule.rules.sorter.is_none() {
+        return Ok(Vec::new());
+    }
+    let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let (installed, names) = installed_files(ctx, instance_id, definition, rule, links.as_ref())?;
+    let entries = build_order(
+        rule,
+        &listed.entries,
+        Some(&installed),
+        &names,
+        listed.exists,
+    )
+    .entries;
+    let reply = call_sorter(ctx, instance_id, definition, rule, &entries)?;
+    let notes = sorter_notes(&reply)?;
+    cache_sorter_notes(
+        ctx,
+        instance_id,
+        definition,
+        rule,
+        &entries,
+        &installed,
+        &notes,
+    );
+    Ok(notes)
+}
+
+/// The saved state a list's sorter reports for its status line, when it has an update hook.
+pub fn sorter_status(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Option<SorterStatus>, LoadOrderError> {
+    sorter_update(ctx, instance_id, definition, list_id, false)
+}
+
+/// Run a list's sorter update hook, which downloads and verifies whatever the sorter keeps.
+/// `None` means the list has no sorter, or its sorter declares no update.
+pub fn update_sorter(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Option<SorterStatus>, LoadOrderError> {
+    sorter_update(ctx, instance_id, definition, list_id, true)
+}
+
+fn sorter_update(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    update: bool,
+) -> Result<Option<SorterStatus>, LoadOrderError> {
+    let rule = list_by_id(definition, list_id)?;
+    let Some(sorter) = rule.rules.sorter.as_ref() else {
+        return Ok(None);
+    };
+    if sorter.update.is_none() {
+        return Ok(None);
+    }
+    let package = package_of(ctx, definition)?;
+    let request = sorter_request(ctx, instance_id, definition, rule, &[])?;
+    let status = block_on_hook(package.update_sorter(request, update)).map_err(|error| {
+        LoadOrderError::SorterUpdate {
+            reason: error.message,
+        }
+    })?;
+    // A successful update changes the sorter's data, so its saved notes are stale. Refresh them
+    // now (the user already waited for the download); a notes failure does not undo the update.
+    if update && status.is_some() {
+        let _ = refresh_sorter_notes(ctx, instance_id, definition, list_id);
+    }
+    Ok(status)
 }
 
 /// Read a script list through its package's parse hook.
@@ -597,6 +888,7 @@ pub fn build_order(
         entries,
         findings,
         notes: Vec::new(),
+        notes_out_of_date: false,
     }
 }
 
@@ -1059,13 +1351,44 @@ fn blocked_of(entries: &[LoadOrderEntry], fixed: &Fixed) -> Vec<Blocked> {
     blocked
 }
 
-/// Reorder the free entries into libloot's relative order, leaving fixed entries (always loaded,
+/// Reorder the free entries into a sorter's relative order, leaving fixed entries (always loaded,
 /// locked, or part of a master loop) exactly where they are. Every free position receives the next
-/// free plugin in libloot's order. Returns the moves that changed a plugin's position.
-fn apply_loot_order(
+/// free plugin in the sorter's order. Returns the moves that changed a plugin's position.
+///
+/// The order is checked first: it must name every present item exactly once, case-insensitively,
+/// and nothing else. A sorter that drops, adds or repeats an item is refused, so a bad reply can
+/// never silently delete a plugin from the list.
+fn apply_sorter_order(
     entries: &mut [LoadOrderEntry],
     desired: &[String],
 ) -> Result<Vec<SortMove>, LoadOrderError> {
+    let mut expected: HashMap<String, usize> = HashMap::new();
+    for entry in entries.iter().filter(|entry| entry.present) {
+        *expected.entry(key(&entry.name)).or_insert(0) += 1;
+    }
+    let mut remaining = expected.clone();
+    for name in desired {
+        let k = key(name);
+        match remaining.get_mut(&k) {
+            Some(count) if *count > 0 => *count -= 1,
+            Some(_) => {
+                return Err(LoadOrderError::SorterOrder {
+                    reason: format!("names '{name}' more often than the list has it"),
+                })
+            }
+            None => {
+                return Err(LoadOrderError::SorterOrder {
+                    reason: format!("names '{name}', which is not an item the list has"),
+                })
+            }
+        }
+    }
+    if let Some((missing, _)) = remaining.iter().find(|(_, count)| **count > 0) {
+        return Err(LoadOrderError::SorterOrder {
+            reason: format!("does not name '{missing}'"),
+        });
+    }
+
     let fixed = Fixed::of(entries);
     let free_slots = free_slots_of(entries, |e| fixed.fixed(e));
     let mut wanted: HashMap<String, usize> = HashMap::new();
@@ -1366,7 +1689,7 @@ fn order_of(
     instance_id: &str,
     definition: &GameDefinition,
 ) -> Result<LoadOrder, LoadOrderError> {
-    order_of_with_view(ctx, instance_id, definition, None, None)
+    order_of_with_view(ctx, instance_id, definition, None, None, true)
 }
 
 fn order_of_with_view(
@@ -1375,6 +1698,7 @@ fn order_of_with_view(
     definition: &GameDefinition,
     list_id: Option<&str>,
     links: Option<&DeploymentPlan>,
+    read_sorter_notes: bool,
 ) -> Result<LoadOrder, LoadOrderError> {
     let rule = rule_of(definition, list_id)?;
     let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
@@ -1402,13 +1726,20 @@ fn order_of_with_view(
             }),
         }
     }
-    if let (Some(loot), Ok(Some(cached))) = (
-        rule.rules.loot.as_ref(),
-        crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id)),
-    ) {
-        if let Ok(notes) = crate::loot_masterlist::notes(&order.entries, &installed, loot, &cached)
-        {
-            order.notes = notes;
+    // A plain read never runs the sorter. It uses the notes the last sort or update saved, and
+    // says they are out of date when the list or the sorter's data changed since.
+    if read_sorter_notes && rule.rules.sorter.is_some() {
+        let fingerprint = sorter_fingerprint(&order.entries, &installed);
+        let data_version = sorter_data_version(ctx, instance_id, definition, rule);
+        let cache = ctx.extensions.get_or_insert_with(SorterNotesCache::default);
+        match cache.lookup(
+            definition.id.as_str(),
+            &rule.id,
+            &fingerprint,
+            &data_version,
+        ) {
+            Some(notes) => order.notes = notes,
+            None => order.notes_out_of_date = true,
         }
     }
     Ok(order)
@@ -1431,7 +1762,7 @@ pub fn order_in(
     definition: &GameDefinition,
     list_id: Option<&str>,
 ) -> Result<LoadOrder, LoadOrderError> {
-    order_of_with_view(ctx, instance_id, definition, list_id, None)
+    order_of_with_view(ctx, instance_id, definition, list_id, None, true)
 }
 
 /// Every list the game keeps, in the order it declares them. A game with no lists gives an empty
@@ -1444,7 +1775,7 @@ pub fn orders(
     definition
         .load_orders
         .iter()
-        .map(|rule| order_of_with_view(ctx, instance_id, definition, Some(&rule.id), None))
+        .map(|rule| order_of_with_view(ctx, instance_id, definition, Some(&rule.id), None, true))
         .collect()
 }
 
@@ -1459,7 +1790,7 @@ pub(crate) fn orders_with_view(
     definition
         .load_orders
         .iter()
-        .map(|rule| order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links))
+        .map(|rule| order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links, true))
         .collect()
 }
 
@@ -1479,7 +1810,7 @@ pub fn check_in(
     definition: &GameDefinition,
     list_id: Option<&str>,
 ) -> Result<Vec<Finding>, LoadOrderError> {
-    Ok(order_of_with_view(ctx, instance_id, definition, list_id, None)?.findings)
+    Ok(order_of_with_view(ctx, instance_id, definition, list_id, None, true)?.findings)
 }
 
 /// The findings against every list the game keeps. A game with no lists has none.
@@ -1503,7 +1834,7 @@ pub(crate) fn check_all_with_view(
         .load_orders
         .iter()
         .map(|rule| {
-            order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links)
+            order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links, true)
                 .map(|order| order.findings)
         })
         .collect::<Result<Vec<_>, _>>()
@@ -1628,49 +1959,45 @@ fn sort_inner(
         duplicated |= *count > 1;
     }
 
-    let (moves, blocked) = match &rule.rules.loot {
-        Some(loot) if !duplicated => {
-            match crate::loot_masterlist::cached_in(ctx, definition, Some(&rule.id))? {
-                Some(cached) => match crate::loot_masterlist::sort_and_notes(
-                    &entries, &installed, loot, &cached,
-                ) {
-                    Ok(outcome) => {
-                        let moves = apply_loot_order(&mut entries, &outcome.order)?;
-                        notes = outcome.notes;
-                        let fixed = Fixed::of(&entries);
-                        let blocked = blocked_of(&entries, &fixed);
-                        mode = SortMode::Loot;
-                        (moves, blocked)
-                    }
-                    Err(LoadOrderError::Masterlist { .. }) => {
-                        message = Some(CACHED_MASTERLIST_UNREADABLE.to_string());
-                        sort_entries(&mut entries)?
-                    }
-                    Err(error) => return Err(error),
-                },
-                None => {
-                    message = Some(MASTERS_ONLY_MESSAGE.to_string());
-                    sort_entries(&mut entries)?
-                }
-            }
+    let (moves, blocked) = if rule.rules.sorter.is_some() && !duplicated {
+        let reply = call_sorter(ctx, instance_id, definition, rule, &entries)?;
+        notes = sorter_notes(&reply)?;
+        let moves = apply_sorter_order(&mut entries, &reply.order)?;
+        let fixed = Fixed::of(&entries);
+        let blocked = blocked_of(&entries, &fixed);
+        mode = SortMode::Sorter;
+        (moves, blocked)
+    } else {
+        if rule.rules.sorter.is_some() {
+            message = Some(DUPLICATES_BY_MASTERS_ONLY.to_string());
         }
-        Some(_) => {
-            message = Some(
-                "A plugin is listed twice or its header cannot be read, so LOOT cannot sort it.                  Sorted by masters only."
-                    .to_string(),
-            );
-            sort_entries(&mut entries)?
-        }
-        None => sort_entries(&mut entries)?,
+        sort_entries(&mut entries)?
     };
 
     let written = !dry_run && !moves.is_empty();
     if written {
         write_entries(ctx, instance_id, definition, rule, &entries)?;
     }
+    if !dry_run && mode == SortMode::Sorter {
+        cache_sorter_notes(
+            ctx,
+            instance_id,
+            definition,
+            rule,
+            &entries,
+            &installed,
+            &notes,
+        );
+    }
     let order = if want_order {
-        let mut order =
-            order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links.as_ref())?;
+        let mut order = order_of_with_view(
+            ctx,
+            instance_id,
+            definition,
+            Some(&rule.id),
+            links.as_ref(),
+            false,
+        )?;
         order.notes = notes;
         Some(order)
     } else {
@@ -1755,8 +2082,15 @@ fn move_inner(
         )
         .map_err(PluginListError::from)?;
     let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
-    let mut entries =
-        order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links.as_ref())?.entries;
+    let mut entries = order_of_with_view(
+        ctx,
+        instance_id,
+        definition,
+        Some(&rule.id),
+        links.as_ref(),
+        false,
+    )?
+    .entries;
     let (name, from, to) = move_entry(&mut entries, plugin, target)?;
     let written = from != to;
     if written {
@@ -1769,6 +2103,7 @@ fn move_inner(
             definition,
             Some(&rule.id),
             links.as_ref(),
+            true,
         )?)
     } else {
         None
@@ -1856,7 +2191,7 @@ mod tests {
                 entry: None,
                 implicit: vec!["Skyrim.esm".into(), "Dawnguard.esm".into()],
                 implicit_list_file: Some(agora_game_api::RelPath::new("Skyrim.ccc").unwrap()),
-                loot: None,
+                sorter: None,
             },
             intro: Some("Read this list from the top down.".into()),
             item_heading: Some("Plugin".into()),
@@ -2190,12 +2525,12 @@ mod tests {
         let mut none = script;
         none.rules.kind = "none".into();
         none.items.folders = false;
-        none.rules.loot = None;
+        none.rules.sorter = None;
         assert!(!list_needs_plan(&none));
     }
 
     #[test]
-    fn loot_order_maps_onto_free_slots_and_leaves_fixed_ones() {
+    fn a_sorter_order_maps_onto_free_slots_and_leaves_fixed_ones() {
         let mut list = vec![
             implicit("Skyrim.esm"),
             entry("A.esp", &[]),
@@ -2210,7 +2545,7 @@ mod tests {
             "L.esp".to_string(),
             "Skyrim.esm".to_string(),
         ];
-        let moves = apply_loot_order(&mut list, &desired).unwrap();
+        let moves = apply_sorter_order(&mut list, &desired).unwrap();
         assert_eq!(
             names(&list),
             ["Skyrim.esm", "C.esp", "L.esp", "B.esp", "A.esp"]
@@ -2220,7 +2555,7 @@ mod tests {
             moves.iter().map(|m| m.plugin.as_str()).collect::<Vec<_>>(),
             ["C.esp", "A.esp"]
         );
-        assert!(apply_loot_order(&mut list, &desired).unwrap().is_empty());
+        assert!(apply_sorter_order(&mut list, &desired).unwrap().is_empty());
     }
 
     #[test]
