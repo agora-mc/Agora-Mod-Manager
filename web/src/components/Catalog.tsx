@@ -94,7 +94,7 @@ export function Catalog({ items, typeLabel, typePath }: CatalogProps) {
         </h1>
         <p className="mt-1.5 text-ink-muted">
           <span className="font-semibold text-gold">{filtered.length}</span> curated{' '}
-          {typeLabel.toLowerCase()}.
+          {typeLabel.toLowerCase()} so far. Agora can connect to Modrinth and Technic to find more, but these are the ones we’ve reviewed and recommend.
         </p>
       </header>
 
