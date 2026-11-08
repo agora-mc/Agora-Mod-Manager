@@ -453,7 +453,7 @@ pub async fn launch_instance(
     }
     {
         let mut shared = state.lock().await;
-        // SOL-2 §19.3: a target must never start a launch while its canonical
+        // SOL-2 §19.3: a target must never start a launch while its
         // install transaction is applying. Delegated launches have no
         // launch_reservation, so an equivalent atomic start marker is
         // registered here and cleared when the delegated session ends.
@@ -2862,7 +2862,7 @@ pub async fn get_governance_summary(
         })?
 }
 
-/// Return the signed-in user's vote on an item's canonical GitHub issue.
+/// Return the signed-in user's vote on an item's GitHub vote issue.
 #[tauri::command]
 pub async fn get_item_vote(
     app: tauri::AppHandle,
@@ -2872,7 +2872,7 @@ pub async fn get_item_vote(
     crate::governance::get_item_vote(&app, item_id).await
 }
 
-/// Set, switch, or retract the signed-in user's canonical item vote.
+/// Set, switch, or retract the signed-in user's item vote.
 #[tauri::command]
 pub async fn set_item_vote(
     app: tauri::AppHandle,
@@ -4819,7 +4819,7 @@ pub async fn delete_mod_group(
 /// Read-modify-write the manifest under the instance lock.
 ///
 /// Grouping only ever touches `user_preferences`, but it still goes through the
-/// canonical loader and the atomic writer so it cannot race a content operation
+/// shared loader and the atomic writer so it cannot race a content operation
 /// or drop a manifest heal.
 async fn mutate_mod_groups<F>(
     app: tauri::AppHandle,
@@ -5570,7 +5570,7 @@ pub async fn browse_page(
 }
 
 // ---------------------------------------------------------------------------
-// C1-C4: canonical install pipeline facade commands
+// C1-C4: install pipeline facade commands
 // ---------------------------------------------------------------------------
 
 struct InstallProgressEmitter {
@@ -5824,7 +5824,7 @@ pub async fn detect_drift(
     Ok(serde_json::to_value(&diff).unwrap_or_default())
 }
 
-/// Compare a live instance with a canonical lockfile without changing either.
+/// Compare a live instance with a lockfile without changing either.
 #[tauri::command]
 pub async fn verify_lockfile(
     app: tauri::AppHandle,
@@ -5887,7 +5887,7 @@ pub async fn verify_lockfile(
 }
 
 /// Repair artifact drift against a validated lockfile through one recovery
-/// snapshot and one canonical transaction. Locked instances remain blocked.
+/// snapshot and one transaction. Locked instances remain blocked.
 #[tauri::command]
 pub async fn repair_lockfile(
     app: tauri::AppHandle,
@@ -6128,7 +6128,7 @@ pub async fn repair_lockfile(
     Ok(outcome)
 }
 
-/// Export a canonical, content-addressed lockfile for an instance.
+/// Export a content-addressed lockfile for an instance.
 #[tauri::command]
 pub async fn export_lockfile(
     app: tauri::AppHandle,
@@ -6343,7 +6343,7 @@ fn export_lockfile_sync(
 }
 
 /// Import a lockfile by creating a fresh instance and applying every artifact
-/// through the canonical verified transaction. Any failure removes the partial
+/// through the verified transaction. Any failure removes the partial
 /// clone and reports the exact unavailable or invalid artifact.
 #[tauri::command]
 pub async fn import_lockfile(
@@ -6893,7 +6893,7 @@ pub async fn cancel_install(app: tauri::AppHandle, plan_id: String) -> LauncherR
 }
 
 /// Re-export the core `UpdateInfo` so the IPC shape stays identical to the
-/// frontend contract at `desktop/src/lib/tauri.ts:633`. The canonical
+/// frontend contract at `desktop/src/lib/tauri.ts:633`. The shared
 /// definition lives in core (`crates/agora-core/src/update_cache.rs`) and is
 /// also the row serialized into `instance_update_cache`.
 pub use agora_core::update_cache::UpdateInfo;

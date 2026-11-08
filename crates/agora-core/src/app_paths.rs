@@ -1,4 +1,4 @@
-//! Canonical, core-owned path model for the Agora app data directory.
+//! Core-owned path model for the Agora app data directory.
 //!
 //! `AppPaths` is constructed once from a single app-data root and provides
 //! typed helpers for every subpath. No adapter (CLI, desktop, MCP) may

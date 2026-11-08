@@ -11,7 +11,7 @@
 //! - Required labels and Issue forms via read-only REST requests
 //!
 //! Diagnostics remain read-only. Item voting mutates only the authenticated
-//! user's direct reaction on a registry-mapped canonical voting issue.
+//! user's direct reaction on a registry-mapped voting issue.
 
 use crate::error::{LauncherError, LauncherResult};
 
@@ -156,7 +156,7 @@ fn resolve_vote_target(app: &AppHandle, item_id: &str) -> LauncherResult<VoteTar
         .filter(|number| *number > 0)
         .ok_or_else(|| LauncherError::Generic {
             code: "ERR_GOVERNANCE_NO_VOTE_ISSUE".to_string(),
-            message: "This item does not have a canonical voting issue.".to_string(),
+            message: "This item does not have a voting issue.".to_string(),
         })?;
 
     let config = governance.config();
@@ -339,7 +339,7 @@ async fn fetch_vote_snapshot(app: &AppHandle, target: &VoteTarget) -> LauncherRe
         .and_then(|repository| repository.issue)
         .ok_or_else(|| LauncherError::Generic {
             code: "ERR_GOVERNANCE_VOTE_ISSUE_GONE".to_string(),
-            message: "The canonical voting issue could not be found.".to_string(),
+            message: "The voting issue could not be found.".to_string(),
         })?;
 
     let mut snapshot = VoteSnapshot {
@@ -394,7 +394,7 @@ async fn apply_vote_mutation(
     Ok(())
 }
 
-/// Return the authenticated user's direct vote on an item's canonical issue.
+/// Return the authenticated user's direct vote on an item's vote issue.
 pub async fn get_item_vote(app: &AppHandle, item_id: String) -> LauncherResult<ItemVoteState> {
     let target_app = app.clone();
     let target = tokio::task::spawn_blocking(move || resolve_vote_target(&target_app, &item_id))

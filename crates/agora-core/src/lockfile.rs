@@ -1,4 +1,4 @@
-//! Canonical, privacy-preserving instance lockfiles and drift comparison.
+//! Privacy-preserving instance lockfiles and drift comparison.
 
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -185,16 +185,16 @@ impl InstanceLockfile {
         Ok(())
     }
 
-    /// Hashes a canonical representation with `contentHash` blank and the
+    /// Hashes a normalized representation with `contentHash` blank and the
     /// optional signature removed. The hash therefore never contains itself.
     pub fn recompute_content_hash(&self) -> Result<String, String> {
         let mut unsigned = self.clone();
         unsigned.content_hash.clear();
         unsigned.signature = None;
         let value = serde_json::to_value(unsigned)
-            .map_err(|error| format!("Could not canonicalize lockfile: {error}"))?;
-        let canonical = canonical_json(&value)?;
-        Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
+            .map_err(|error| format!("Could not normalize lockfile: {error}"))?;
+        let stable = stable_json(&value)?;
+        Ok(hex::encode(Sha256::digest(stable.as_bytes())))
     }
 
     pub fn to_pretty_json(&self) -> Result<String, String> {
@@ -437,7 +437,7 @@ pub fn build_from_instance(instance_dir: &std::path::Path) -> Result<InstanceLoc
     Ok(lockfile)
 }
 
-fn canonical_json(value: &serde_json::Value) -> Result<String, String> {
+fn stable_json(value: &serde_json::Value) -> Result<String, String> {
     fn sorted(value: &serde_json::Value) -> serde_json::Value {
         match value {
             serde_json::Value::Object(map) => {
@@ -457,7 +457,7 @@ fn canonical_json(value: &serde_json::Value) -> Result<String, String> {
         }
     }
     serde_json::to_string(&sorted(value))
-        .map_err(|error| format!("Could not serialize canonical JSON: {error}"))
+        .map_err(|error| format!("Could not serialize stable JSON: {error}"))
 }
 
 #[cfg(test)]
@@ -498,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_round_trip_and_self_hash_are_stable() {
+    fn stable_round_trip_and_self_hash_are_stable() {
         let original = lockfile();
         let json = original.to_pretty_json().unwrap();
         let parsed = InstanceLockfile::parse_and_validate(&json).unwrap();

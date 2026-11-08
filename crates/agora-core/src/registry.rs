@@ -648,7 +648,7 @@ pub fn check_dev_registry_env_set() -> bool {
     }
 }
 
-/// Canonical column list for `registry_items` selects that feed `row_to_item`.
+/// Shared column list for `registry_items` selects that feed `row_to_item`.
 ///
 /// Single source of truth: `browse_items` and `for_you_items` both select this
 /// exact list (with the `ri.` alias) so a schema column addition only needs
@@ -689,7 +689,7 @@ pub struct RegistryItem {
     /// Full markdown body hydrated from the upstream source. Community-authored
     /// markdown — must be rendered without `dangerouslySetInnerHTML`.
     pub body_markdown: Option<String>,
-    /// Canonical upstream page URL (e.g. https://modrinth.com/mod/<slug>).
+    /// Upstream page URL (e.g. https://modrinth.com/mod/<slug>).
     pub page_url: Option<String>,
     /// SPDX-ish license id hydrated from the upstream source.
     pub license_id: Option<String>,
@@ -1795,7 +1795,7 @@ pub struct CuratedAnnotation {
 /// Lookup is intentionally by `registry_items.id`, not `modrinth_id`, so
 /// curated entries without a Modrinth link still surface. Callers passing a
 /// Modrinth project id will get `None` even if a curated entry for that
-/// Modrinth project exists — the registry id is the canonical identity, and
+/// Modrinth project exists — the registry id is the primary identity, and
 /// Modrinth-only results must be resolved to a registry id before being
 /// treated as curated.
 pub fn get_curated_annotation(
@@ -3369,7 +3369,7 @@ mod tests {
     fn test_get_curated_annotation_ignores_modrinth_id_lookup() {
         // Contract: a Modrinth project id passed as the lookup key must NOT
         // resolve to a curated entry even when one exists for that project;
-        // the registry id is the canonical identity and Modrinth-only results
+        // the registry id is the primary identity and Modrinth-only results
         // must be resolved to a registry id before receiving curated features.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("registry.db");

@@ -65,7 +65,7 @@ pub const UPDATE_SOURCE_FILENAME: &str = "agora-plugin-update.json";
 /// Domain separator for the signed bytes.
 ///
 /// Prefixed so a signature over an update document can never be replayed as a
-/// signature over some other Agora structure that happened to canonicalise to
+/// signature over some other Agora structure that happened to normalize to
 /// the same bytes, and versioned so the envelope itself can change without
 /// ambiguity about which rule produced a given signature.
 pub const SIGNING_CONTEXT: &str = "agora-plugin-update:v1:";
@@ -389,7 +389,7 @@ impl UpdateDocument {
     /// The exact bytes a publisher signs and a client verifies.
     ///
     /// The `signatures` field is excluded — it cannot be part of what it signs
-    /// — and everything else is canonicalised so that reserialising the
+    /// — and everything else is normalized so that reserialising the
     /// document, or serving it through something that reorders keys or
     /// reindents it, does not invalidate a valid signature.
     pub fn signing_bytes(&self) -> Vec<u8> {
@@ -464,7 +464,7 @@ impl Release {
 }
 
 // ---------------------------------------------------------------------------
-// Canonicalisation
+// Normalization
 // ---------------------------------------------------------------------------
 
 /// Serialise a JSON value so the same document always produces the same bytes.
@@ -542,7 +542,7 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
     }
     // Whatever is left over must be zero padding bits. A non-zero remainder
     // means two different texts would decode to the same bytes, and a
-    // canonical form is worth more here than leniency.
+    // normalized form is worth more here than leniency.
     if accumulator & ((1 << bits) - 1) != 0 {
         return None;
     }
@@ -771,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_json_sorts_keys_at_every_depth() {
+    fn stable_json_sorts_keys_at_every_depth() {
         let value = serde_json::json!({ "b": 1, "a": { "d": 2, "c": [3, { "f": 4, "e": 5 }] } });
         assert_eq!(
             canonical_json(&value),

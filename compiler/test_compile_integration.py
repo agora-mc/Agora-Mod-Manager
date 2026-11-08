@@ -225,7 +225,7 @@ class TestRegistryItemsRequiredFields(_CompileFixtures):
 
 
 class TestPackIdentity(_CompileFixtures):
-    def test_pack_uses_canonical_registry_identity(self):
+    def test_pack_uses_registry_identity(self):
         conn = self._open_db()
         try:
             row = conn.execute(
@@ -236,7 +236,7 @@ class TestPackIdentity(_CompileFixtures):
         finally:
             conn.close()
 
-    def test_pack_mod_rows_reference_canonical_id(self):
+    def test_pack_mod_rows_reference_pack_identity(self):
         conn = self._open_db()
         try:
             count = conn.execute(
@@ -293,7 +293,7 @@ class TestFabricApiAliases(_CompileFixtures):
             self.assertIn("fabric_api", aliases)
             # The manifest has been expanded (per §19.5) to list all sub-module
             # aliases for cross-source jar-metadata matching, so there are more
-            # than just these two canonical aliases.
+            # than just these two aliases.
             self.assertGreaterEqual(len(aliases), 2,
                                     f"Expected >= 2 aliases for fabric-api, got {len(aliases)}")
         finally:

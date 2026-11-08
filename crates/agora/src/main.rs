@@ -298,7 +298,7 @@ enum Commands {
         #[command(subcommand)]
         action: LoadoutCmd,
     },
-    /// Canonical integrity lockfiles: export, verify, repair, import.
+    /// Content-addressed integrity lockfiles: export, verify, repair, import.
     Lockfile {
         #[command(subcommand)]
         action: LockfileCmd,
@@ -599,7 +599,7 @@ enum PluginCmd {
     },
     /// Sign an update document in place.
     ///
-    /// Reads the document, signs the canonical form, and writes it back with
+    /// Reads the document, signs the normalized form, and writes it back with
     /// the signature attached.
     Sign {
         /// The update document to sign.

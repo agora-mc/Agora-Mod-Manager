@@ -1,6 +1,6 @@
 //! Java runtime detection, inspection, and discovery.
 //!
-//! Provides the canonical [`JavaInstallation`] model used throughout the
+//! Provides the shared [`JavaInstallation`] model used throughout the
 //! launcher, platform-specific system-JRE discovery, managed/Mojang runtime
 //! scanning, and the combined [`detect_java_candidates`] API.
 //!
@@ -104,8 +104,8 @@ pub struct JavaInstallation {
 }
 
 impl JavaInstallation {
-    /// Canonicalise the path before comparison.
-    fn canonical_path(&self) -> PathBuf {
+    /// Resolve the path before comparison.
+    fn resolved_path(&self) -> PathBuf {
         self.path
             .canonicalize()
             .unwrap_or_else(|_| self.path.clone())
@@ -536,7 +536,7 @@ fn source_priority(src: &JavaSource) -> u8 {
 ///
 /// Candidates are returned sorted by version ascending, then by source
 /// priority (Managed > Mojang > System), then by stable path.
-/// Duplicates (same canonical path) are removed, keeping the highest-priority
+/// Duplicates (same resolved path) are removed, keeping the highest-priority
 /// source entry.
 pub fn detect_java_candidates(
     runtimes_root: Option<&Path>,
@@ -557,14 +557,14 @@ pub fn detect_java_candidates(
     // System (lowest priority)
     results.extend(detect_system_jres());
 
-    // Deduplicate by canonical path, keeping highest priority source.
-    // Sort by (version, source_priority, path) then dedup by canonical path.
+    // Deduplicate by resolved path, keeping highest priority source.
+    // Sort by (version, source_priority, path) then dedup by resolved path.
     results.sort_by_key(|inst| {
         let sp = source_priority(&inst.source);
-        let canon = inst.canonical_path();
-        (inst.version, sp, canon)
+        let resolved = inst.resolved_path();
+        (inst.version, sp, resolved)
     });
-    results.dedup_by(|a, b| a.canonical_path() == b.canonical_path());
+    results.dedup_by(|a, b| a.resolved_path() == b.resolved_path());
 
     results
 }

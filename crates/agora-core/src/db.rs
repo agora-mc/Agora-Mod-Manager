@@ -765,7 +765,7 @@ pub fn is_lockdown_enabled(conn: &Connection) -> bool {
 /// opposite security outcomes for the two uses: an unrecognised string
 /// (`"yes"`) or a failed read silently turned lockdown **off**.
 ///
-/// This parses lockdown on its own terms. Canonical booleans and the
+/// This parses lockdown on its own terms. Strict booleans and the
 /// documented legacy strings are honoured; a value that is present but not
 /// understood, or a store that cannot be read, denies rather than guessing —
 /// a kill switch that fails open is not a kill switch. A cleanly absent

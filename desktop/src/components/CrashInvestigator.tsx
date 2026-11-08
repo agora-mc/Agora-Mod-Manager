@@ -48,7 +48,7 @@ interface CrashInvestigatorProps {
   manualLogText?: string | null;
   onClose: () => void;
   /** Called to re-launch the instance after disabling a suspected mod. */
-  /** Returns true only when the canonical launch controller actually started. */
+  /** Returns true only when the launch controller actually started. */
   onLaunch: (onAwaitingHealth: () => void) => Promise<LaunchStartOutcome>;
   processState: ProcessState;
 }

@@ -650,7 +650,7 @@ impl CrashService {
     /// It does NOT mutate state (no disable, no telemetry).
     ///
     /// `explicit_files` are user-chosen absolute paths to include as
-    /// additional evidence (canonicalized and extension-validated by the
+    /// additional evidence (resolved and extension-validated by the
     /// collector).
     pub fn investigate_evidence(
         &self,

@@ -172,16 +172,16 @@ def _validate_and_extract(
             f" != {arch!r}"
         )
 
-    # Map Adoptium os name to canonical Agora platform
+    # Map Adoptium os name to the Agora platform name
     os_map = {"linux": "linux", "windows": "windows", "mac": "macos"}
-    canonical_os = os_map.get(os_name)
-    if canonical_os is None:
+    normalized_os = os_map.get(os_name)
+    if normalized_os is None:
         return f"unknown os {os_name!r}"
 
     # Map arch name
     arch_map = {"x64": "x64", "aarch64": "aarch64"}
-    canonical_arch = arch_map.get(arch)
-    if canonical_arch is None:
+    normalized_arch = arch_map.get(arch)
+    if normalized_arch is None:
         return f"unknown arch {arch!r}"
 
     # Version fields
@@ -263,8 +263,8 @@ def _validate_and_extract(
         "major": version_major,
         "full_version": full_version,
         "openjdk_version": openjdk_version,
-        "os": canonical_os,
-        "arch": canonical_arch,
+        "os": normalized_os,
+        "arch": normalized_arch,
         "image_type": image_type,
         "jvm_impl": JVM_IMPL,
         "archive_type": archive_type,

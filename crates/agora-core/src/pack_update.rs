@@ -297,7 +297,7 @@ fn verify_bytes(file: &MrpackFile, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// The Modrinth project id from a canonical CDN download URL, if any. Used as the
+/// The Modrinth project id from a standard CDN download URL, if any. Used as the
 /// stable "same mod" identity for the planner's mod-id channel without parsing
 /// the jar (which would require downloading it).
 fn project_id_from_url(raw: &str) -> Option<String> {

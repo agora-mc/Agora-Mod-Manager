@@ -319,10 +319,10 @@ def _stable_json_sha256(data: bytes, drop: set[str] | None = None) -> str:
     obj = json.loads(data.decode("utf-8"))
     if isinstance(obj, dict):
         obj = {k: v for k, v in obj.items() if k not in drop}
-    canonical = json.dumps(
+    serialized = json.dumps(
         obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
-    return _sha256_hex(canonical.encode("utf-8"))
+    return _sha256_hex(serialized.encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -1250,9 +1250,9 @@ def _sort_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
-# Canonical key order for written entries, so enriched legacy entries and
+# Fixed key order for written entries, so enriched legacy entries and
 # freshly fetched entries serialize identically.
-_CANONICAL_ENTRY_KEYS = (
+_ENTRY_KEY_ORDER = (
     "mc_version",
     "loader_version",
     "source_url",
@@ -1269,10 +1269,10 @@ _CANONICAL_ENTRY_KEYS = (
 )
 
 
-def _canonicalize_entry(loader: str, entry: dict[str, Any]) -> dict[str, Any]:
-    """Enrich a legacy entry and re-emit its keys in canonical order."""
+def _normalize_entry(loader: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Enrich a legacy entry and re-emit its keys in a fixed order."""
     entry = _enrich_entry(loader, entry)
-    return {key: entry[key] for key in _CANONICAL_ENTRY_KEYS if key in entry}
+    return {key: entry[key] for key in _ENTRY_KEY_ORDER if key in entry}
 
 
 def _write_loader_manifests(manifest: dict[str, Any]) -> None:
@@ -1280,7 +1280,7 @@ def _write_loader_manifests(manifest: dict[str, Any]) -> None:
     path = LOADER_MANIFESTS_DIR / "loader_manifests.json"
     for loader, entries in manifest["loaders"].items():
         manifest["loaders"][loader] = [
-            _canonicalize_entry(loader, entry) for entry in entries
+            _normalize_entry(loader, entry) for entry in entries
         ]
         manifest["loaders"][loader] = _sort_entries(manifest["loaders"][loader])
     manifest["domain_allowlist"] = sorted(set(manifest["domain_allowlist"]))
@@ -1350,7 +1350,7 @@ def main() -> int:
     logger.info("Per-MC version limit: %s", "unlimited" if per_mc_limit is None else per_mc_limit)
 
     manifest = _load_existing_manifest()
-    # Ensure the manifest always has the canonical domain allowlist.
+    # Ensure the manifest always has the standard domain allowlist.
     manifest["domain_allowlist"] = sorted(
         set(manifest.get("domain_allowlist", []) + DOMAIN_ALLOWLIST)
     )

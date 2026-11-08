@@ -509,7 +509,7 @@ test.describe('InstanceEditor — Reproducible tab: export', () => {
     expect(Array.isArray(parsed.artifacts)).toBe(true);
 
     // Success notice shown
-    await expect(page.getByText('Canonical lockfile exported.')).toBeVisible();
+    await expect(page.getByText('Lockfile exported.')).toBeVisible();
 
     // Verify export_lockfile was called
     const wasCalled = await page.evaluate(() => {

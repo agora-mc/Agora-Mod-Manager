@@ -127,7 +127,7 @@ fn verify_mrpack_file_hash(file: &MrpackFile, bytes: &[u8]) -> LauncherResult<()
     Ok(())
 }
 
-/// Extract a Modrinth project ID only from the canonical Modrinth CDN path.
+/// Extract a Modrinth project ID only from the standard Modrinth CDN path.
 /// Pack entries may also point at GitHub or contain no download URL, so those
 /// entries remain pack-managed without claiming a Modrinth project identity.
 fn modrinth_project_id_from_download_url(raw_url: &str) -> Option<String> {
@@ -590,7 +590,7 @@ fn relative_archive_path(raw: &str) -> PathBuf {
 /// Validate that a candidate path stays within the base directory.
 /// Rejects absolute paths, parent traversal, and existing symlink escapes.
 fn assert_safe_path(base: &Path, candidate: &Path) -> LauncherResult<()> {
-    let canonical_base = fs::canonicalize(base).map_err(|e| {
+    let resolved_base = fs::canonicalize(base).map_err(|e| {
         import_error(
             "ERR_IMPORT_PATH",
             format!("Cannot resolve import destination: {e}"),
@@ -608,13 +608,13 @@ fn assert_safe_path(base: &Path, candidate: &Path) -> LauncherResult<()> {
                 // the staging directory even when the final path does not yet
                 // exist. Check every existing ancestor, not only the leaf.
                 if probe.exists() {
-                    let canonical_probe = fs::canonicalize(&probe).map_err(|e| {
+                    let resolved_probe = fs::canonicalize(&probe).map_err(|e| {
                         import_error(
                             "ERR_IMPORT_PATH",
                             format!("Cannot resolve import path '{}': {e}", candidate.display()),
                         )
                     })?;
-                    if !canonical_probe.starts_with(&canonical_base) {
+                    if !resolved_probe.starts_with(&resolved_base) {
                         return Err(import_error(
                             "ERR_PATH_TRAVERSAL",
                             format!("Path traversal detected: {}", candidate.display()),
@@ -1825,19 +1825,19 @@ pub fn import_directory_named(
 
     // Avoid recursively copying the staging directory when a user selects the
     // Agora data folder (or the whole instances folder) as an import source.
-    let canonical_source = fs::canonicalize(source_dir).map_err(|e| {
+    let resolved_source = fs::canonicalize(source_dir).map_err(|e| {
         import_error(
             "ERR_IMPORT_PATH",
             format!("Cannot resolve source instance: {e}"),
         )
     })?;
-    let canonical_instances_root = fs::canonicalize(instances_root).map_err(|e| {
+    let resolved_instances_root = fs::canonicalize(instances_root).map_err(|e| {
         import_error(
             "ERR_IMPORT_PATH",
             format!("Cannot resolve instances folder: {e}"),
         )
     })?;
-    if canonical_instances_root.starts_with(&canonical_source) {
+    if resolved_instances_root.starts_with(&resolved_source) {
         cleanup_staging(&target);
         return Err(import_error(
             "ERR_IMPORT_RECURSIVE_SOURCE",
@@ -2887,7 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_modrinth_project_id_is_extracted_only_from_canonical_cdn_paths() {
+    fn test_modrinth_project_id_is_extracted_only_from_standard_cdn_paths() {
         assert_eq!(
             modrinth_project_id_from_download_url(
                 "https://cdn.modrinth.com/data/AANobbMI/versions/abc123/sodium.jar"

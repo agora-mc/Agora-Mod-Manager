@@ -627,7 +627,7 @@ impl InstallService {
         let dest = mods_dir.join(file_name);
         let manifest_path = self.ctx.paths.instance_manifest(instance_id)?;
 
-        let canonical = std::fs::canonicalize(source_path).map_err(|_| LauncherError::Generic {
+        let resolved = std::fs::canonicalize(source_path).map_err(|_| LauncherError::Generic {
             code: "ERR_INVALID_SOURCE".to_string(),
             message: "Source file does not exist or cannot be resolved.".to_string(),
         })?;
@@ -646,7 +646,7 @@ impl InstallService {
                 roots.push(c);
             }
         }
-        let allowed = roots.iter().any(|root| canonical.starts_with(root));
+        let allowed = roots.iter().any(|root| resolved.starts_with(root));
         if !allowed {
             return Err(LauncherError::Generic {
                 code: "ERR_SOURCE_NOT_ALLOWED".to_string(),
@@ -656,7 +656,7 @@ impl InstallService {
             });
         }
 
-        let bytes = std::fs::read(&canonical).map_err(|_| LauncherError::Generic {
+        let bytes = std::fs::read(&resolved).map_err(|_| LauncherError::Generic {
             code: "ERR_READ_FAILED".to_string(),
             message: "Failed to read the dropped file.".to_string(),
         })?;

@@ -86,7 +86,7 @@ Notes on the fields that are easy to get wrong:
 
 ### What gets signed
 
-The signature covers the document with the `signatures` field removed, canonicalised (object keys
+The signature covers the document with the `signatures` field removed, normalised (object keys
 sorted, no insignificant whitespace), prefixed with the literal context string:
 
 ```
@@ -94,7 +94,7 @@ agora-plugin-update:v1:
 ```
 
 The prefix is a domain separator, so a signature over an update document can never be replayed as a
-signature over something else. Canonicalising means reserialising or reindenting the document on
+signature over something else. Normalising means reserialising or reindenting the document on
 the way through a CDN does not break a valid signature, while changing anything a client acts on
 does.
 

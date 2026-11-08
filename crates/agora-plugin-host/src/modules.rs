@@ -3,7 +3,7 @@
 //! A plugin may `import "./util.js"` and `import "agora"`. It may not import
 //! anything else — not a path outside its package, not a URL, not a bare
 //! specifier hoping to hit something on disk. The resolver is the only place
-//! that decides, and it decides by canonicalising and comparing against the
+//! that decides, and it decides by resolving and comparing against the
 //! package root rather than by inspecting the string, so a symlink pointing
 //! out of the package is caught along with `../../`.
 
@@ -75,7 +75,7 @@ impl Resolver for PackageResolver {
                 format!("`{name}` does not exist in the plugin package"),
             ));
         };
-        // Canonicalising both sides is what makes a symlink out of the package
+        // Resolving both sides is what makes a symlink out of the package
         // fail here rather than at read time.
         let Ok(real_root) = self.root.canonicalize() else {
             return Err(Error::new_resolving_message(

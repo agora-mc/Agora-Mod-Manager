@@ -1,4 +1,4 @@
-//! Canonical install-transaction pipeline.
+//! Install-transaction pipeline.
 //!
 //! All install/update/remove entry points flow through `InstallPipeline`:
 //!
@@ -304,7 +304,7 @@ pub struct ResolvedDep {
     /// deps). Falls back to `mod_jar_id` in the UI when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Canonical upstream page URL (registry `page_url` or Modrinth project
+    /// Upstream page URL (registry `page_url` or Modrinth project
     /// URL). Absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_url: Option<String>,
@@ -889,10 +889,10 @@ pub enum ProgressPhase {
 }
 
 // ---------------------------------------------------------------------------
-// 23. CancellationToken — re-exported from canonical event_sink module
+// 23. CancellationToken — re-exported from the event_sink module
 // ---------------------------------------------------------------------------
 
-/// Re-exported from `crate::event_sink` — the canonical cancellation type.
+/// Re-exported from `crate::event_sink` — the shared cancellation type.
 pub use crate::event_sink::CancellationToken;
 
 // ---------------------------------------------------------------------------

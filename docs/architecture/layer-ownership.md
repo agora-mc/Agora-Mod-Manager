@@ -1,12 +1,12 @@
 # Layer Ownership & Dependency Boundaries
 
-> **Canonical reference for which code belongs where.** All three frontends (Tauri GUI, CLI, MCP dispatcher) call the same `agora-core` library for business logic. No frontend contains business logic that is not available to the others.
+> **Reference for which code belongs where.** All three frontends (Tauri GUI, CLI, MCP dispatcher) call the same `agora-core` library for business logic. No frontend contains business logic that is not available to the others.
 
 ---
 
 ## Architecture Overview
 
-Canonical reference for which code belongs where.
+Reference for which code belongs where.
 
 ## Ownership Rules
 
@@ -14,7 +14,7 @@ Canonical reference for which code belongs where.
 
 | Domain | Owner | Notes |
 |---|---|---|
-| AppPaths / data layout | `agora-core` | Canonical path derivation for runtimes, instances, cache, receipts |
+| AppPaths / data layout | `agora-core` | Path derivation for runtimes, instances, cache, receipts |
 | Database access (all SQLite) | `agora-core` | Both `registry.db` (the catalog) and `local_state.db`; parameterized queries only |
 | Catalogs (runtime, modrinth, etc.) | `agora-core` | Typed catalog sources; search, version resolution |
 | LaunchService (spawn + orchestrate) | `agora-core` | Includes process spawning, process identity verification, exit classification, PID tracking. The adapter provides only the raw `std::process::Command` or equivalent handle — core owns the lifecycle |

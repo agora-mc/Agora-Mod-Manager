@@ -466,13 +466,13 @@ impl RuntimeCatalog {
     ///
     /// Returns `None` if no entry matches or if the OS/arch are unrecognized.
     pub fn lookup(&self, major: u32, os: &str, arch: &str) -> Option<LookupResult> {
-        let canonical_os = normalize_os(os)?;
-        let canonical_arch = normalize_arch(arch)?;
+        let normalized_os = normalize_os(os)?;
+        let normalized_arch = normalize_arch(arch)?;
 
         self.entries
             .iter()
             .enumerate()
-            .find(|(_, e)| e.major == major && e.os == canonical_os && e.arch == canonical_arch)
+            .find(|(_, e)| e.major == major && e.os == normalized_os && e.arch == normalized_arch)
             .map(|(index, entry)| LookupResult {
                 entry: entry.clone(),
                 index,

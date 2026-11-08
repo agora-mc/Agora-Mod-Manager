@@ -1597,19 +1597,19 @@ pub fn list_managed_runtimes(runtimes_root: &Path) -> LauncherResult<Vec<Managed
 
 /// Remove a specific managed runtime by its root directory.
 ///
-/// Only deletes the **canonicalised** target directory inside the known
+/// Only deletes the **resolved** target directory inside the known
 /// managed layout (`temurin/<major>/<full_version>/<os>-<arch>/`).
 /// Rejects:
 /// - Paths outside the managed runtime root.
-/// - Symlinks / junctions where canonicalisation disagrees with the
+/// - Symlinks / junctions where path resolution disagrees with the
 ///   provided path (anti-escape guard).
-/// - Paths without a valid `receipt.json` at the canonicalised target.
+/// - Paths without a valid `receipt.json` at the resolved target.
 pub fn remove_runtime(runtimes_root: &Path, root_dir: &Path) -> LauncherResult<()> {
-    let canonical_root = runtimes_root
+    let resolved_root = runtimes_root
         .canonicalize()
         .unwrap_or_else(|_| runtimes_root.to_path_buf());
 
-    let canonical_target = root_dir
+    let resolved_target = root_dir
         .canonicalize()
         .unwrap_or_else(|_| root_dir.to_path_buf());
 
@@ -1639,7 +1639,7 @@ pub fn remove_runtime(runtimes_root: &Path, root_dir: &Path) -> LauncherResult<(
         }
     }
 
-    if !canonical_target.starts_with(&canonical_root) {
+    if !resolved_target.starts_with(&resolved_root) {
         return Err(LauncherError::Generic {
             code: "ERR_RUNTIME_REMOVE_OUTSIDE".into(),
             message: "Cannot remove: target is outside the managed runtime root.".into(),
@@ -1647,7 +1647,7 @@ pub fn remove_runtime(runtimes_root: &Path, root_dir: &Path) -> LauncherResult<(
     }
 
     // Verify it's under the known vendor + major + version + plat pattern.
-    let rel = canonical_target.strip_prefix(&canonical_root).unwrap();
+    let rel = resolved_target.strip_prefix(&resolved_root).unwrap();
     let components: Vec<_> = rel.components().collect();
     if components.len() < 4 {
         return Err(LauncherError::Generic {
@@ -1657,7 +1657,7 @@ pub fn remove_runtime(runtimes_root: &Path, root_dir: &Path) -> LauncherResult<(
     }
 
     // Require a valid runtime receipt before deletion.
-    let receipt_path = canonical_target.join("receipt.json");
+    let receipt_path = resolved_target.join("receipt.json");
     RuntimeReceipt::read_from(&receipt_path).map_err(|_| LauncherError::Generic {
         code: "ERR_RUNTIME_REMOVE_NO_RECEIPT".into(),
         message: format!(
@@ -1666,13 +1666,13 @@ pub fn remove_runtime(runtimes_root: &Path, root_dir: &Path) -> LauncherResult<(
         ),
     })?;
 
-    // Delete the canonicalised target (not the original root_dir) so that
+    // Delete the resolved target (not the original root_dir) so that
     // symlink-escape paths cannot delete unintended targets.
-    std::fs::remove_dir_all(&canonical_target).map_err(|e| LauncherError::Generic {
+    std::fs::remove_dir_all(&resolved_target).map_err(|e| LauncherError::Generic {
         code: "ERR_RUNTIME_REMOVE".into(),
         message: format!(
             "Failed to remove runtime {}: {e}",
-            canonical_target.display()
+            resolved_target.display()
         ),
     })?;
 
@@ -1749,7 +1749,7 @@ pub fn remove_unused(
 ///
 /// This is called after a game launch exits with a **success** outcome.
 /// It walks the managed runtime list, finds the runtime whose `java_path`
-/// matches (by canonical comparison), and calls `touch_successful_use` on
+/// matches (by resolved-path comparison), and calls `touch_successful_use` on
 /// its receipt.
 ///
 /// Best-effort: returns `Ok(())` even if no matching runtime is found
@@ -1757,17 +1757,17 @@ pub fn remove_unused(
 pub fn mark_successful_use(runtimes_root: &Path, java_path: &Path) -> LauncherResult<()> {
     let runtimes = list_managed_runtimes(runtimes_root)?;
 
-    let canonical_java = java_path
+    let resolved_java = java_path
         .canonicalize()
         .unwrap_or_else(|_| java_path.to_path_buf());
 
     for rt in runtimes {
-        let rt_canonical = rt
+        let rt_resolved = rt
             .java_path
             .canonicalize()
             .unwrap_or_else(|_| rt.java_path.clone());
 
-        if rt_canonical == canonical_java {
+        if rt_resolved == resolved_java {
             let receipt_path = rt.root_dir.join("receipt.json");
             let mut receipt = RuntimeReceipt::read_from(&receipt_path)?;
             receipt.touch_successful_use(&receipt_path)?;
@@ -1803,16 +1803,16 @@ pub fn validate_managed_runtime(
         return Err(runtime_corrupt("Receipt platform does not match this host"));
     }
 
-    let canonical_root = runtime
+    let resolved_root = runtime
         .root_dir
         .canonicalize()
         .map_err(|e| runtime_corrupt(&format!("Cannot resolve runtime root: {e}")))?;
-    let canonical_java = runtime
+    let resolved_java = runtime
         .java_path
         .canonicalize()
         .map_err(|e| runtime_corrupt(&format!("Cannot resolve java path: {e}")))?;
 
-    if !canonical_java.starts_with(&canonical_root) {
+    if !resolved_java.starts_with(&resolved_root) {
         return Err(runtime_corrupt("Java executable escapes runtime root"));
     }
 
@@ -1821,13 +1821,13 @@ pub fn validate_managed_runtime(
         .java_sha256
         .as_deref()
         .ok_or_else(|| runtime_corrupt("Receipt does not pin the Java executable hash"))?;
-    let actual = sha256_hex_file(&canonical_java)
+    let actual = sha256_hex_file(&resolved_java)
         .map_err(|e| runtime_corrupt(&format!("Cannot hash java binary: {e}")))?;
     if actual != expected {
         return Err(LauncherError::HashMismatch);
     }
 
-    let inspected = java::inspect_java(&canonical_java)
+    let inspected = java::inspect_java(&resolved_java)
         .ok_or_else(|| runtime_corrupt("Java inspection failed"))?;
 
     if inspected.version != required_major {
@@ -1846,7 +1846,7 @@ pub fn validate_managed_runtime(
     }
 
     Ok(JavaInstallation {
-        path: canonical_java,
+        path: resolved_java,
         version: inspected.version,
         version_string: inspected.version_string,
         source: JavaSource::Managed,
@@ -3094,7 +3094,7 @@ mod tests {
 
         // Create a symlink/junction to the entry path and try removing via it.
         // On Windows, creating a junction requires admin or developer mode.
-        // We'll just verify that the canonical check catches it by testing
+        // We'll just verify that the resolved-path check catches it by testing
         // with an unresolvable path.
         let link_path = dir.path().join("link");
         // Try to create a directory symlink using the host OS API. This may
@@ -3132,7 +3132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_runtime_uses_canonical_target() {
+    fn test_remove_runtime_uses_resolved_target() {
         let dir = tempfile::tempdir().unwrap();
         let entry_path = dir
             .path()

@@ -63,7 +63,7 @@ export interface StandardBridgeHandlers {
   openSnapshotCompare(ctx: { instanceId: string; snapshotId: string }): void;
   /** Open the standard `CrashInvestigator` (navigation only). */
   openCrashDoctor(ctx: { instanceId: string }): void;
-  /** Construct an action-bearing `InstallIntent` and open the canonical `InstallFlow`. */
+  /** Construct an action-bearing `InstallIntent` and open the `InstallFlow`. */
   openInstallFlow(ctx: InstallFlowHandlerContext): void;
 }
 

@@ -817,7 +817,7 @@ def run_governance_pipeline(
             if isinstance(affected, list):
                 excluded_rids.update(int(x) for x in affected if str(x).isdigit())
 
-        # Reuse one unresolved event per item and canonical issue so growth
+        # Reuse one unresolved event per item and vote issue so growth
         # merges into the original event instead of generating overlapping IDs.
         active_event = None
         for previous in reversed(prev_events):

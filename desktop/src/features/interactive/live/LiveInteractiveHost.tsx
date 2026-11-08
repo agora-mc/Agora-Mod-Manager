@@ -10,10 +10,10 @@
  * InstallFlow on the Standard surface).
  *
  * SOL-2 gate (batch 2 / §17.3, §17.4):
- *  - Canonical state is PROJECTED at render over the BASE (unprojected) read
+ *  - Live state is PROJECTED at render over the BASE (unprojected) read
  *    scene, so busy/lock state is reversible (active -> idle clears busy) and
- *    always reflects the LATEST canonical values (no acceptance-time stale
- *    closures; a canonical change during an unresolved read is applied when
+ *    always reflects the LATEST live values (no acceptance-time stale
+ *    closures; a live change during an unresolved read is applied when
  *    the result lands).
  *  - Refresh marks the retained scene source `refreshing` (non-executable to
  *    `routeLiveIntent`) and the accepted read installs a new revision.
@@ -154,8 +154,8 @@ export type LiveHostState =
   | { kind: 'scene'; instanceId: string; data: LiveHostData; refreshing: boolean; pending: boolean }
   | { kind: 'error'; message: string };
 
-/** Canonical app-level process state consumed by the host. */
-export interface CanonicalProcessState {
+/** Live app-level process state consumed by the host. */
+export interface LiveProcessState {
   phase: string;
   instanceId?: string | null;
 }
@@ -179,9 +179,9 @@ export interface LiveInteractiveHostProps {
   /** The active presentation — `simple` renders the same useful structure
    * without the decorative flourish. */
   presentation?: InteractionPreference;
-  /** Canonical app-level process state (useProcessController) when available. */
-  processState?: CanonicalProcessState | null;
-  /** True when a canonical install is ACTIVE (running) for this instance. */
+  /** Live app-level process state (useProcessController) when available. */
+  processState?: LiveProcessState | null;
+  /** True when an install is ACTIVE (running) for this instance. */
   installActive?: boolean;
   /** Runs the real launch (the Standard launch flow) from the Play button. */
   onLaunch?: () => Promise<void> | void;
@@ -193,7 +193,7 @@ export interface LiveInteractiveHostProps {
   onUndoTrial?: (snapshotId: string) => Promise<void>;
 }
 
-/** Map every canonical process phase conservatively onto the visual model. */
+/** Map every process phase conservatively onto the visual model. */
 function projectLaunchState(phase: string): VisualInstance['launchState'] {
   switch (phase) {
     case 'launching':
@@ -213,7 +213,7 @@ function projectLaunchState(phase: string): VisualInstance['launchState'] {
 }
 
 /**
- * Canonical phases that have RELEASED the instance.
+ * Process phases that have RELEASED the instance.
  *
  * `exited` is the phase `useProcessController` sets when the backend's
  * `game-exited` event lands, and it is exactly as terminal as `idle` and
@@ -229,28 +229,28 @@ function projectLaunchState(phase: string): VisualInstance['launchState'] {
  */
 const TERMINAL_PHASES = new Set(['idle', 'exited', 'failed']);
 
-/** Canonical inputs needed to project a scene. */
-export interface CanonicalInput {
-  processState: CanonicalProcessState | null;
+/** Inputs needed to project a scene. */
+export interface ProjectionInput {
+  processState: LiveProcessState | null;
   installActive: boolean;
   instanceId: string;
 }
 
 /**
- * Pure, REVERSIBLE canonical projection over the BASE (unprojected) read
- * scene (SOL-2 §17.3). Busy is derived ONLY from canonical state; when the
- * canonical condition clears, the base read/player lock state is restored
+ * Pure, REVERSIBLE projection over the BASE (unprojected) read
+ * scene (SOL-2 §17.3). Busy is derived ONLY from live state; when the
+ * live condition clears, the base read/player lock state is restored
  * (an idle -> launching -> idle transition never leaves the instance busy).
  */
-export function projectCanonical(scene: VisualScene, canonical: CanonicalInput): VisualScene {
+export function projectLiveState(scene: VisualScene, live: ProjectionInput): VisualScene {
   if (!scene.instance) return scene;
-  const isThisInstance = canonical.processState && canonical.processState.instanceId === canonical.instanceId;
+  const isThisInstance = live.processState && live.processState.instanceId === live.instanceId;
   const launchState = isThisInstance
-    ? projectLaunchState(canonical.processState?.phase ?? 'idle')
+    ? projectLaunchState(live.processState?.phase ?? 'idle')
     : 'idle';
   const busy =
-    (isThisInstance && !TERMINAL_PHASES.has(canonical.processState?.phase ?? 'idle'))
-    || canonical.installActive;
+    (isThisInstance && !TERMINAL_PHASES.has(live.processState?.phase ?? 'idle'))
+    || live.installActive;
   const nextInstance: VisualInstance = {
     ...scene.instance,
     launchState,
@@ -333,7 +333,7 @@ export function LiveInteractiveHost({
           setState({ kind: 'error', message: 'This instance has no readable state.' });
           return;
         }
-        // Store the BASE (unprojected) read scene. Canonical state is projected
+        // Store the BASE (unprojected) read scene. Live state is projected
         // at render with the latest values — never captured in this closure.
         const accepted = withReview(data);
         // Bind the accepted scene to the instance it was loaded for (SOL-2
@@ -363,9 +363,9 @@ export function LiveInteractiveHost({
     void loadScene(instanceId, false);
   }, [instanceId, loadScene]);
 
-  // Project the retained BASE scene with the CURRENT canonical values on every
+  // Project the retained BASE scene with the CURRENT live values on every
   // render. Reversible, latest-wins, and immune to stale acceptance closures:
-  // a canonical change while a read is unresolved is applied the moment the
+  // a live change while a read is unresolved is applied the moment the
   // accepted result lands (the projection always reads the newest props).
   const displayData = useMemo<LiveHostData | null>(() => {
     if (state.kind !== 'scene') return null;
@@ -376,7 +376,7 @@ export function LiveInteractiveHost({
     if (state.instanceId !== instanceId) return null;
     return {
       ...state.data,
-      scene: projectCanonical(state.data.scene, { processState, installActive, instanceId }),
+      scene: projectLiveState(state.data.scene, { processState, installActive, instanceId }),
     };
   }, [state, processState, installActive, instanceId]);
 
@@ -420,7 +420,7 @@ export function LiveInteractiveHost({
   }, [loadScene, instanceId]);
 
   // The base scene is read once, and a read taken while the game was running
-  // records the instance as busy. Canonical state only ever ADDS busy on top of
+  // records the instance as busy. Live state only ever ADDS busy on top of
   // it, so when the session ends the stale base would keep the "Busy" badge
   // (and the disabled controls) until the user switched views. Read the
   // instance again at the moment its session stops being active.

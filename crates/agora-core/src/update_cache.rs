@@ -21,7 +21,7 @@ use std::time::Duration;
 
 /// Information about an available update for an installed content item.
 ///
-/// The canonical definition: `desktop/src-tauri/src/commands.rs` re-exports
+/// The shared definition: `desktop/src-tauri/src/commands.rs` re-exports
 /// this type rather than declaring its own. Shape must stay identical to the
 /// TS interface at `desktop/src/lib/tauri.ts:633` — changing fields without
 /// coordinating that side breaks the IPC contract. It is also the row

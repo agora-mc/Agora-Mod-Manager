@@ -128,7 +128,7 @@ pub fn link_shared_folder(
 
     if is_link(instance_subdir) {
         return match link_target(instance_subdir) {
-            // Comparing canonically: the recorded target and the requested one
+            // Comparing resolved paths: the recorded target and the requested one
             // are often the same directory spelled differently.
             Some(existing)
                 if fs::canonicalize(&existing).ok() == fs::canonicalize(shared_target).ok() =>

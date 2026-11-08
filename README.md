@@ -113,7 +113,7 @@ See [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) for prerequisites, environmen
 - [Architecture ownership](./docs/architecture/layer-ownership.md)
 - [Agent guide](./AGENTS.md)
 
-Detailed compiler configuration, release mechanics, governance incident recovery, and agent-tool configuration live in those canonical references rather than this player-facing overview.
+Detailed compiler configuration, release mechanics, governance incident recovery, and agent-tool configuration live in those reference documents rather than this player-facing overview.
 
 ## License and community
 

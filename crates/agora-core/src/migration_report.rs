@@ -838,7 +838,7 @@ impl MigrationService {
 
     /// Generate a report for an existing instance on disk.
     ///
-    /// Reads the instance manifest via the canonical
+    /// Reads the instance manifest via the shared
     /// [`crate::helpers::read_manifest`] (which heals legacy fields), collects
     /// every content array, optionally enriches `registry_id`-only entries via
     /// `registry.db`, and classifies each entry against `target_version`.

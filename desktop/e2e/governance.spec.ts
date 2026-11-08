@@ -70,7 +70,7 @@ test('explains how to vote in the app and on GitHub', async ({ page }) => {
   await expect(page.getByText('On GitHub', { exact: true })).toBeVisible();
   await expect(page.getByText(/Open Settings → Accounts and sign in with GitHub/)).toBeVisible();
   await expect(page.getByText(/React with \+1 \(👍\) to upvote or -1 \(👎\) to downvote/)).toBeVisible();
-  await expect(page.getByText(/Only direct reactions on the canonical vote issue count/)).toBeVisible();
+  await expect(page.getByText(/Only direct reactions on the vote issue count/)).toBeVisible();
 });
 
 test('shows Agora rules of engagement', async ({ page }) => {

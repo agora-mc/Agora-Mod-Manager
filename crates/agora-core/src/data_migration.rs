@@ -94,8 +94,8 @@ impl DataMigrationService {
 
     /// Inventory a source data root without touching the destination.
     pub fn inventory(&self, source_root: &Path) -> LauncherResult<MigrationInventory> {
-        let canonical_source = Self::canonicalize_path(source_root)?;
-        Self::check_path_safety(&canonical_source)?;
+        let resolved_source = Self::resolve_path(source_root)?;
+        Self::check_path_safety(&resolved_source)?;
 
         let mut files = Vec::new();
         let mut total_size_bytes: u64 = 0;
@@ -104,8 +104,8 @@ impl DataMigrationService {
         let mut instance_ids = Vec::new();
 
         Self::walk_dir(
-            &canonical_source,
-            &canonical_source,
+            &resolved_source,
+            &resolved_source,
             &mut |rel_path, entry| {
                 let is_symlink = entry.file_type().is_ok_and(|t| t.is_symlink());
                 let metadata = entry
@@ -143,7 +143,7 @@ impl DataMigrationService {
         )?;
 
         Ok(MigrationInventory {
-            source_root: canonical_source.to_string_lossy().to_string(),
+            source_root: resolved_source.to_string_lossy().to_string(),
             files,
             total_size_bytes,
             has_local_state_db,
@@ -191,13 +191,13 @@ impl DataMigrationService {
             });
         }
 
-        let source_canonical = Self::canonicalize_path(source_root)?;
+        let resolved_source = Self::resolve_path(source_root)?;
 
         // Phase 1: Create a timestamped backup of the current destination state.
         let backup_dir = self.create_backup()?;
 
         // Phase 2: Stage copies on the same volume, then promote.
-        let result = self.stage_and_promote(&source_canonical, &plan.source_inventory);
+        let result = self.stage_and_promote(&resolved_source, &plan.source_inventory);
 
         // Phase 3: On failure, restore from backup.
         match result {
@@ -463,8 +463,8 @@ impl DataMigrationService {
     // Walking & safety
     // ------------------------------------------------------------------
 
-    /// Canonicalize a path, resolving all symlinks and verifying it exists.
-    fn canonicalize_path(path: &Path) -> LauncherResult<PathBuf> {
+    /// Resolve a path, following all symlinks and verifying it exists.
+    fn resolve_path(path: &Path) -> LauncherResult<PathBuf> {
         path.canonicalize()
             .map_err(|e| LauncherError::MigrationFailed {
                 message: format!(
@@ -474,29 +474,29 @@ impl DataMigrationService {
             })
     }
 
-    /// Verify that a canonical path is safe to walk:
+    /// Verify that a resolved path is safe to walk:
     /// - Not a symlink chain that escapes the expected root
     /// - Source root must be a directory
-    fn check_path_safety(canonical: &Path) -> LauncherResult<()> {
-        if !canonical.is_dir() {
+    fn check_path_safety(resolved: &Path) -> LauncherResult<()> {
+        if !resolved.is_dir() {
             return Err(LauncherError::MigrationFailed {
-                message: format!("Source path '{}' is not a directory", canonical.display()),
+                message: format!("Source path '{}' is not a directory", resolved.display()),
             });
         }
         // Walk the path components and ensure no component is a symlink
         // pointing outside the user's intended tree. We already resolved
-        // symlinks via canonicalize, so the path is what it is.
+        // symlinks during resolution, so the path is what it is.
         // Additional check: ensure the path doesn't contain suspicious components.
-        for component in canonical.components() {
+        for component in resolved.components() {
             match component {
                 Component::ParentDir => {
                     return Err(LauncherError::MigrationFailed {
-                        message: "Path contains '..' components even after canonicalization".into(),
+                        message: "Path contains '..' components even after path resolution".into(),
                     });
                 }
                 Component::CurDir => {
                     return Err(LauncherError::MigrationFailed {
-                        message: "Path contains '.' components even after canonicalization".into(),
+                        message: "Path contains '.' components even after path resolution".into(),
                     });
                 }
                 _ => {}
@@ -646,7 +646,7 @@ fn copy_dir_same_volume(src: &Path, dst: &Path) -> LauncherResult<()> {
 /// This is the entry point the CLI uses for dry-run previews before
 /// creating the full `DataMigrationService`.
 pub fn inventory_legacy_root(source_root: &Path) -> LauncherResult<MigrationInventory> {
-    let canonical = source_root
+    let resolved = source_root
         .canonicalize()
         .map_err(|e| LauncherError::MigrationFailed {
             message: format!(
@@ -655,11 +655,11 @@ pub fn inventory_legacy_root(source_root: &Path) -> LauncherResult<MigrationInve
             ),
         })?;
     let service = DataMigrationService::new(
-        // Dummy paths — we only need canonicalize + walk, not the dest.
+        // Dummy paths — we only need resolution + walk, not the dest.
         AppPaths::from_root(std::path::PathBuf::from("/")),
     );
     // Override self.dest by calling inventory with source.
-    service.inventory(&canonical)
+    service.inventory(&resolved)
 }
 
 #[cfg(test)]

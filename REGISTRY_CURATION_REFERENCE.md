@@ -428,7 +428,7 @@ For shaders, resource packs, datapacks, servers, and worlds: the schema is the s
 | Content type | Directory | `content_type` value | Notes |
 |---|---|---|---|
 | Mod | `registry/mods/` | `"mod"` | See §2. |
-| Pack | `registry/packs/` | `"pack"` | Uses the canonical `id` field; see §4. |
+| Pack | `registry/packs/` | `"pack"` | Uses the top-level `id` field; see §4. |
 | Shader | `registry/shaders/` | `"shader"` | The downloader writes to `<instance>/shaderpacks/`. |
 | Resource pack | `registry/resourcepacks/` | `"resourcepack"` | Writes to `<instance>/resourcepacks/`. |
 | Server | `registry/servers/` | `"server"` | Server configuration / mod set. |

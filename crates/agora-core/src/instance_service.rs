@@ -1404,7 +1404,7 @@ impl InstanceService {
         }
         drop(conn);
 
-        // Read source manifest via canonical loader — heals pack_managed and
+        // Read source manifest via the shared loader — heals pack_managed and
         // synthesizes a name-only PackOrigin for legacy instances.
         let manifest_path = self.ctx.paths.instance_manifest(&source_id)?;
         let source_manifest: InstanceManifest = if manifest_path.exists() {
@@ -2474,7 +2474,7 @@ mod tests {
     }
 
     #[test]
-    fn update_jvm_persists_canonical_gc_and_resolves_launch_profile() {
+    fn update_jvm_persists_normalized_gc_and_resolves_launch_profile() {
         let (ctx, root) = context();
         let request = CreateInstanceRequest {
             name: "GC Test".into(),

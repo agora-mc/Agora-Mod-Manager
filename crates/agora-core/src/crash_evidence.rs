@@ -305,21 +305,21 @@ impl CrashEvidenceService {
 
         // Explicit user-added files
         for ef in explicit_files {
-            let canon = match std::fs::canonicalize(ef) {
+            let resolved = match std::fs::canonicalize(ef) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if !canon.is_file() {
+            if !resolved.is_file() {
                 continue;
             }
-            if !Self::is_safe_text_path(&canon) {
+            if !Self::is_safe_text_path(&resolved) {
                 continue;
             }
-            if candidates.iter().any(|c| c.path == canon) {
+            if candidates.iter().any(|c| c.path == resolved) {
                 continue;
             }
             candidates.push(Candidate {
-                path: canon,
+                path: resolved,
                 kind: EvidenceSourceKind::UserAdded,
                 supplementary: !candidates.is_empty(),
                 modified_at: file_modified_at(ef).unwrap_or(SystemTime::UNIX_EPOCH),

@@ -45,9 +45,9 @@ const VOTE_STEPS_IN_APP = [
 ];
 
 const VOTE_STEPS_GITHUB = [
-  'Open the item’s canonical vote issue on GitHub — it carries the registry-vote label.',
+  'Open the item’s vote issue on GitHub — it carries the registry-vote label.',
   'React with +1 (👍) to upvote or -1 (👎) to downvote.',
-  'Only direct reactions on the canonical vote issue count. Reviews and comments never affect the score.',
+  'Only direct reactions on the vote issue count. Reviews and comments never affect the score.',
 ];
 
 export function Governance() {

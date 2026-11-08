@@ -173,7 +173,7 @@ pub struct ProcessIdentity {
     pub pid: u32,
     /// The process start time reported by the OS (seconds since epoch).
     pub start_time: u64,
-    /// Canonical path of the executable, when the OS provides it.
+    /// Resolved path of the executable, when the OS provides it.
     pub expected_exe: Option<String>,
 }
 

@@ -2,7 +2,7 @@
 //!
 //! `agora plugin keygen` and `agora plugin sign` are the only things that
 //! produce a signature, and `agora-core` is the only thing that checks one. If
-//! those two ever disagree about canonical form, base64, or the domain
+//! those two ever disagree about the normalized form, base64, or the domain
 //! separator, every plugin update in existence silently stops verifying — and
 //! nothing else in the test suite would notice, because each half is tested
 //! against itself.

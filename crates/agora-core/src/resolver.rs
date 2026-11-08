@@ -682,8 +682,8 @@ impl Resolver {
         let mut expanded = HashSet::new();
 
         while let Some((raw_id, requirement)) = queue.pop_front() {
-            let canonical = aliases.resolve_or_self(&raw_id);
-            let key = canonical.to_ascii_lowercase();
+            let resolved_id = aliases.resolve_or_self(&raw_id);
+            let key = resolved_id.to_ascii_lowercase();
             if let Some(existing) = resolved.get_mut(&key) {
                 if requirement == Requirement::Required {
                     existing.requirement = Requirement::Required;
@@ -699,7 +699,7 @@ impl Resolver {
                     ResolvedDep {
                         requested_by: Vec::new(),
                         pinned_version: None,
-                        mod_jar_id: canonical,
+                        mod_jar_id: resolved_id,
                         requirement,
                         source: DepSource::Manifest,
                         display_name: display_name
@@ -722,7 +722,7 @@ impl Resolver {
                     ResolvedDep {
                         requested_by: Vec::new(),
                         pinned_version: None,
-                        mod_jar_id: canonical,
+                        mod_jar_id: resolved_id,
                         requirement,
                         source: DepSource::Manifest,
                         display_name: None,
@@ -745,7 +745,7 @@ impl Resolver {
                         ResolvedDep {
                             requested_by: Vec::new(),
                             pinned_version: None,
-                            mod_jar_id: canonical,
+                            mod_jar_id: resolved_id,
                             requirement,
                             source: DepSource::Manifest,
                             display_name,
@@ -759,13 +759,13 @@ impl Resolver {
                 }
             }
 
-            let disposition = self.load_curated_dep(&canonical, manifest).await;
+            let disposition = self.load_curated_dep(&resolved_id, manifest).await;
             resolved.insert(
                 key.clone(),
                 ResolvedDep {
                     requested_by: Vec::new(),
                     pinned_version: None,
-                    mod_jar_id: canonical.clone(),
+                    mod_jar_id: resolved_id.clone(),
                     requirement,
                     source: DepSource::Manifest,
                     display_name,
@@ -774,7 +774,7 @@ impl Resolver {
                 },
             );
             if expanded.insert(key) {
-                if let Some(child) = dependency_map.get(&canonical) {
+                if let Some(child) = dependency_map.get(&resolved_id) {
                     enqueue_manifest_deps(&mut queue, child);
                 }
             }

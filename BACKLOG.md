@@ -69,7 +69,7 @@
 
 - [x] **Modrinth metadata hydration (compiler-side aggregation)** (§6.3 / §4.2)
   - **Short:** Nightly compiler bakes rich Modrinth metadata (description, full markdown body, page URL, license, updated timestamp, category fallback) into the signed `registry.db` so the client browses offline with zero Modrinth API calls.
-  - **Detail:** Generalized `_hydrate_modrinth_images()` → `_hydrate_modrinth_metadata()` in `compiler/compile.py`: same single bulk `/v2/projects?ids=[...]` request (≤100/project) now also fills `description`, `body_markdown`, `page_url` (canonical, built from slug + project_type), `license_id`, and `source_updated_at`. Precedence = manifest/curator always wins; explicit `description_override`/`body_override` keys let curators sanitize upstream text. Added 5 nullable TEXT columns to `registry_items` and bumped `SCHEMA_VERSION` 1→2 (compiler) with matched `APP_REGISTRY_SCHEMA_VERSION` 2 (desktop). Category fallback: when a manifest sets NEITHER `base_categories` NOR `community_categories`, the hydrator links the upstream Modrinth `categories` (loaders filtered out) as community/unvetted categories — trivially overridable later by adding a manual category list. Image URLs only (never binary), so the db stays compact. Desktop `ModDetail.tsx` renders the description tagline, a `View on Modrinth ↗` + license + source-updated row, and the body via `react-markdown` (escapes raw HTML by default — no `dangerouslySetInnerHTML`, satisfying AGENTS.md) with `@tailwindcss/typography` prose styling. Live counters (downloads/follows) deliberately excluded to avoid forcing nightly db churn.
+  - **Detail:** Generalized `_hydrate_modrinth_images()` → `_hydrate_modrinth_metadata()` in `compiler/compile.py`: same single bulk `/v2/projects?ids=[...]` request (≤100/project) now also fills `description`, `body_markdown`, `page_url` (built from slug + project_type), `license_id`, and `source_updated_at`. Precedence = manifest/curator always wins; explicit `description_override`/`body_override` keys let curators sanitize upstream text. Added 5 nullable TEXT columns to `registry_items` and bumped `SCHEMA_VERSION` 1→2 (compiler) with matched `APP_REGISTRY_SCHEMA_VERSION` 2 (desktop). Category fallback: when a manifest sets NEITHER `base_categories` NOR `community_categories`, the hydrator links the upstream Modrinth `categories` (loaders filtered out) as community/unvetted categories — trivially overridable later by adding a manual category list. Image URLs only (never binary), so the db stays compact. Desktop `ModDetail.tsx` renders the description tagline, a `View on Modrinth ↗` + license + source-updated row, and the body via `react-markdown` (escapes raw HTML by default — no `dangerouslySetInnerHTML`, satisfying AGENTS.md) with `@tailwindcss/typography` prose styling. Live counters (downloads/follows) deliberately excluded to avoid forcing nightly db churn.
   - **Spec:** §6.3 / §4.2 ("Hybrid Media Strategy")
   - **Acceptance:** A `modrinth_id` mod with a 5-line manifest renders a rich detail page (description + formatted markdown body + categories + icon) entirely from local `registry.db` with no network calls. Verified: `xaeros-minimap` and a synthetic no-category test both hydrate from the live Modrinth API.
 
@@ -107,7 +107,7 @@
 
 - [x] **Tauri project initialized** — React + Tailwind + Vite, 5 sidebar tabs (Home, Browse, Instances, Governance, Settings).
 - [x] **`local_state.db` schema + migrations** — `user_settings`, `user_instances`, `local_crash_telemetry`, `mcp_approval_grants`, `schema_version`.
-- [x] **Instance creation + loader injection** — Fabric/Quilt profile JSON injection with domain pinning, SHA-256 verification, stable-hash canonicalization, three-stage rollback on failure.
+- [x] **Instance creation + loader injection** — Fabric/Quilt profile JSON injection with domain pinning, SHA-256 verification, stable hashing, three-stage rollback on failure.
 - [x] **`launcher_profiles.json` atomic mutation + recovery** — `.tmp` → `rename()` with `.bak` backup; corrupt live file never poisons backup; minimal regeneration fallback.
 - [x] **Mojang launcher discovery + delegation** — OS-specific path resolution (Windows/macOS/Linux); `Command::new(launcher).arg("--profile")`.
 - [x] **JVM argument builder** — Memory + GC + custom args + AlwaysPreTouch assembly (§8.5).
@@ -338,7 +338,7 @@
 
 - [x] **Automated test suite** (§18.1)
   - **Short:** Add unit tests, integration tests, and end-to-end tests.
-  - **Detail:** Rust workspace tests, compiler tests, script tests, desktop unit tests, and a Playwright browser suite all run in CI; `docs/RELEASING.md` names the workflows that must pass. (Counts are deliberately not recorded here — they went stale the moment they were written. Run the suites for the current numbers.) The browser suite covers instance creation through canonical launch/exit, install planning/execution, batch updates, Home/Browse context, settings, LKG snapshots/restore/diff, Crash Doctor, lockfile export/verify/repair/clone, recovery states, and request-race handling. Real Minecraft process/platform smoke checks and the packaged-release smoke test remain outside deterministic CI.
+  - **Detail:** Rust workspace tests, compiler tests, script tests, desktop unit tests, and a Playwright browser suite all run in CI; `docs/RELEASING.md` names the workflows that must pass. (Counts are deliberately not recorded here — they went stale the moment they were written. Run the suites for the current numbers.) The browser suite covers instance creation through full launch/exit, install planning/execution, batch updates, Home/Browse context, settings, LKG snapshots/restore/diff, Crash Doctor, lockfile export/verify/repair/clone, recovery states, and request-race handling. Real Minecraft process/platform smoke checks and the packaged-release smoke test remain outside deterministic CI.
   - **Spec:** §18.1
   - **Acceptance:** `cargo test` and `pytest` pass; E2E test creates an instance and launches.
 
@@ -413,17 +413,17 @@ Tracking packages A1 through D5 from `Agora Desktop Upgrade.md`. Packages are co
 ### Release B — Desktop Application Infrastructure
 
 - [x] **B1** — Typed destination and history model, including recoverable invalid-entity destinations and back navigation
-- [x] **B2** — Canonical launch and process controller
+- [x] **B2** — Launch and process controller
 - [x] **B3** — Typed settings access and settings decomposition, including launcher Browse/Auto-detect/Test and persistent per-section errors
 - [x] **B4** — Accessible dialogs, notifications, and sidebar
 - [x] **B5** — Critical integration-test matrix
 
-### Release C — Canonical Safe-Install Infrastructure
+### Release C — Safe-Install Infrastructure
 
 - [x] **C0** — Install-transaction architecture ✅ (Design in MASTER_SPEC.md §23.1.3, core types implemented)
 - [x] **C1** — Read-only deterministic install-plan contract with dependencies, conflicts, choices, source normalization, and freshness fingerprints
 - [x] **C2** — Transactional install execution with verified staging, mandatory snapshot, atomic apply, health rollback, cancellation, and failure injection coverage
-- [x] **C3** — One canonical `InstallFlow` for all named desktop install entry points; CLI mod install/remove reuse the same core transaction
+- [x] **C3** — One shared `InstallFlow` for all named desktop install entry points; CLI mod install/remove reuse the same core transaction
 - [x] **C4** — Safe all-content batch updates with one plan, one snapshot, complete rollback, locked-instance enforcement, and reviewed selection UX
 
 ### Release D — Product Differentiation and UX Coherence
@@ -432,7 +432,7 @@ Tracking packages A1 through D5 from `Agora Desktop Upgrade.md`. Packages are co
 - [x] **D2** — Last-known-good recovery/reproducibility model with exact launch snapshots, serialized promotion, retention, and CLI launch classification
 - [x] **D3** — Last-known-good user flow with badges, full diff viewer, one-click restore, undo snapshot, and failure-safe recovery
 - [x] **D4** — Explainable Crash Doctor with deterministic evidence, reversible disable sets, launch-result gating, navigation safety, and optional AI fallback
-- [x] **D5** — Reproducible sharing and drift detection with canonical lockfiles, enabled-state drift, exact clone, transactional repair, and tamper/schema rejection
+- [x] **D5** — Reproducible sharing and drift detection with content-addressed lockfiles, enabled-state drift, exact clone, transactional repair, and tamper/schema rejection
 
 ---
 

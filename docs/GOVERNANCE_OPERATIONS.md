@@ -82,7 +82,7 @@ Consequences of an unlabeled vote issue:
   `governance_summary` so the misconfiguration is visible, and the compiler
   logs a warning naming the item and issue number.
 
-When creating or moving a canonical vote issue, add the `registry-vote` label
+When creating or moving a vote issue, add the `registry-vote` label
 (normalize capitalization/lowercase is fine; exact label name must match).
 Do not reuse `community-review` for vote issues — that label marks review
 issues and is ignored as a vote source.

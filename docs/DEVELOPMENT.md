@@ -88,7 +88,7 @@ Use `--skip-sign` only for local development. Production clients must not trust 
 
 ### Compiler runtime environment
 
-The Python compiler may load `.env` for local development. Copy `.env.example` to `.env` only when local compiler work needs it, and consult `.env.example` as the canonical variable list.
+The Python compiler may load `.env` for local development. Copy `.env.example` to `.env` only when local compiler work needs it, and consult `.env.example` as the authoritative variable list.
 
 Secret examples include:
 

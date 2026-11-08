@@ -1,4 +1,4 @@
-//! Canonical core-owned primitives for progress events, core events,
+//! Core-owned primitives for progress events, core events,
 //! cancellation, and event sinks.
 //!
 //! No Tauri/CLI/MCP formatting happens here. Adapters implement the sink
@@ -10,7 +10,7 @@
 //! - [`CancellationToken`] (formerly in `install_pipeline`)
 //! - [`ProgressEvent`] and [`ProgressPhase`] (merged from both `event_sink`
 //!   and `install_pipeline`)
-//! - [`ProgressSink`] (the canonical progress sink trait)
+//! - [`ProgressSink`] (the progress sink trait)
 //! - [`EventSink`] for core events
 //!
 //! `install_pipeline` now re-exports `CancellationToken` from here.
@@ -233,7 +233,7 @@ pub enum ModAction {
 // Sink traits
 // ---------------------------------------------------------------------------
 
-/// Trait for accepting progress events (canonical progress sink).
+/// Trait for accepting progress events.
 ///
 /// Implementations must be thread-safe (`Send + Sync`) since core operations
 /// may emit events from background threads.
@@ -253,7 +253,7 @@ pub trait EventSink: Send + Sync {
 /// Compatibility adapter that wraps a [`ProgressSink`] as a [`ProgressReporter`].
 ///
 /// `ProgressReporter` was the original trait in `install_pipeline`. This adapter
-/// lets existing `&dyn ProgressReporter` callers work with the canonical
+/// lets existing `&dyn ProgressReporter` callers work with the shared
 /// `ProgressSink` without changing every call site. New code should use
 /// `ProgressSink` directly.
 pub struct ProgressReporterAdapter {
@@ -268,8 +268,8 @@ impl ProgressReporterAdapter {
 
 impl crate::install_pipeline::ProgressReporter for ProgressReporterAdapter {
     fn report(&self, event: crate::install_pipeline::ProgressEvent) {
-        // Convert the install_pipeline event to the canonical event.
-        let canonical = ProgressEvent {
+        // Convert the install_pipeline event to the core progress event.
+        let event = ProgressEvent {
             operation_id: OperationId::new(""),
             phase: match event.phase {
                 crate::install_pipeline::ProgressPhase::Resolving => ProgressPhase::Resolving,
@@ -290,7 +290,7 @@ impl crate::install_pipeline::ProgressReporter for ProgressReporterAdapter {
             bytes_downloaded: Some(event.bytes_downloaded),
             bytes_total: Some(event.bytes_total),
         };
-        self.inner.report(canonical);
+        self.inner.report(event);
     }
 }
 

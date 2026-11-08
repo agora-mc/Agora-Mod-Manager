@@ -465,7 +465,7 @@ fn hash_payload(root: &Path) -> Result<Vec<InstanceImportFileRecord>, String> {
     Ok(inventory)
 }
 
-/// Build canonical `InstanceManifest` arrays for mods, resourcepacks, shaders,
+/// Build final `InstanceManifest` arrays for mods, resourcepacks, shaders,
 /// datapacks, and worlds from staged content with a given source label.
 type ManifestInventories = (
     Vec<InstalledMod>,
@@ -992,7 +992,7 @@ impl Drop for ImportJobGuard {
 }
 
 impl LauncherImportService {
-    /// Create a new service from the canonical context.
+    /// Create a new service from the core context.
     pub fn new(ctx: Ctx) -> Self {
         Self { ctx }
     }

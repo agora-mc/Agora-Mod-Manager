@@ -1287,7 +1287,7 @@ function BrowseContent({
 
 
   // ---- Render ----
-  // The bulk-install dialogs (instance picker + canonical InstallFlow) are
+  // The bulk-install dialogs (instance picker + InstallFlow) are
   // rendered by BOTH the standard page AND the Bazaar page — the Bazaar's
   // "N picked" button drives the exact same reviewed pipeline, and it must
   // open on the Bazaar rather than bouncing to the normal Browse view.
@@ -1372,7 +1372,7 @@ function BrowseContent({
         </div>
       )}
 
-      {/* Canonical install pipeline for the selected batch */}
+      {/* Install pipeline for the selected batch */}
       {installTarget && (
         <InstallFlow
           open

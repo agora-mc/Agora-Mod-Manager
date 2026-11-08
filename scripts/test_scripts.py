@@ -877,7 +877,7 @@ class TestSha256Hex(unittest.TestCase):
 class TestStableJsonSha256(unittest.TestCase):
     """Tests for fetch_loader_manifests._stable_json_sha256."""
 
-    def test_canonicalizes_key_order(self):
+    def test_sorts_key_order(self):
         """Different key orderings in JSON produce the same hash when keys are sorted."""
         obj1 = {"b": 1, "a": 2}
         obj2 = {"a": 2, "b": 1}

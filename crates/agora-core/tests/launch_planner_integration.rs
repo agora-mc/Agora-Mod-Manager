@@ -2012,7 +2012,7 @@ fn create_adoption_receipt(
     installed_profile::write_receipt_atomic(receipts_root, tuple, &receipt).unwrap();
 }
 
-/// Compute the canonical stable hash of a version JSON for the receipt.
+/// Compute the stable hash of a version JSON for the receipt.
 fn profile_stable_hash(value: &serde_json::Value) -> String {
     installed_profile::stable_profile_hash(value)
 }

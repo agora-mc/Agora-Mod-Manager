@@ -775,7 +775,7 @@ test.describe('Release C3 — Install flow entry points', () => {
     await page.getByText('test-mod-1.0.0.jar', { exact: true }).click();
     await page.getByRole('button', { name: 'Replace with test-mod-1.0.0.jar' }).click();
 
-    // The canonical review still resolves and applies the replacement.
+    // The review still resolves and applies the replacement.
     await expect.poll(() => totalInstallCalls(page)).toBeGreaterThanOrEqual(1);
     const resolveIdx = await lastInstallCall(page, 'resolve_install_plan');
     const args = await page.evaluate((idx) => (window as any).__installCalls[idx]?.args, resolveIdx);
