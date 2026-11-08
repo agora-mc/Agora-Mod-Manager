@@ -205,6 +205,22 @@ jobs:
       - name: Script unit tests
         run: python scripts/test_scripts.py -v
 
+  loot-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The committed module is byte-reproducible only with the toolchain
+          # that produced it; pin it here instead of following stable.
+          toolchain: "1.99.0"
+          targets: wasm32-wasip1
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Check the committed LOOT WebAssembly module
+        run: python scripts/build_loot_wasm.py --check
+
   frontend:
     runs-on: ubuntu-latest
     steps:
