@@ -216,9 +216,11 @@ fn fill_sorter(
         view.has_sorter_update = sorter.update.is_some();
         view.sorter_update_label = sorter.update_label.clone();
     }
-    view.masterlist = load_order::sorter_status(ctx, instance_id, definition, Some(&rule.id))
-        .map_err(core_failed)?
-        .map(|status| MasterlistView::from_status(&status));
+    // The status line is informational; a sorter that cannot report it must not turn a saved
+    // change or a readable list into a failure. The hook's failure is already in the plugin log.
+    if let Ok(status) = load_order::sorter_status(ctx, instance_id, definition, Some(&rule.id)) {
+        view.masterlist = status.map(|status| MasterlistView::from_status(&status));
+    }
     Ok(())
 }
 
