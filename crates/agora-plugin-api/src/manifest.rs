@@ -26,6 +26,10 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// Standard manifest filename inside a package or development folder.
 pub const MANIFEST_FILENAME: &str = "agora-plugin.json";
 
+/// Longest a `withoutCode` sentence may be. It is read at the install prompt
+/// and has to stay one glanceable line of plain text.
+pub const WITHOUT_CODE_MAX_LEN: usize = 240;
+
 // ---------------------------------------------------------------------------
 // Plugin identity
 // ---------------------------------------------------------------------------
@@ -235,6 +239,11 @@ pub struct PluginManifest {
     /// a purely declarative plugin such as a theme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
+    /// One plain-text sentence naming what this plugin cannot do when its code
+    /// is not allowed to run. Shown at the install prompt beside the choice to
+    /// install without running code. Only meaningful with an `entrypoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub without_code: Option<String>,
     #[serde(default)]
     pub activation: Vec<ActivationEvent>,
     #[serde(default)]
@@ -400,6 +409,30 @@ impl PluginManifest {
                     "entrypoint `{entrypoint}` must be bundled JavaScript (.js or .mjs); \
                      TypeScript is compiled at packaging time, not by the launcher"
                 )));
+            }
+        }
+        if let Some(without_code) = &self.without_code {
+            if self.entrypoint.is_none() {
+                return Err(PluginError::invalid_manifest(
+                    "`withoutCode` says what a plugin cannot do without its code, but this \
+                     plugin declares no `entrypoint` and runs none",
+                ));
+            }
+            if without_code.trim().is_empty() {
+                return Err(PluginError::invalid_manifest(
+                    "`withoutCode` must say what the plugin cannot do without its code",
+                ));
+            }
+            let length = without_code.chars().count();
+            if length > WITHOUT_CODE_MAX_LEN {
+                return Err(PluginError::invalid_manifest(format!(
+                    "`withoutCode` is {length} characters; the limit is {WITHOUT_CODE_MAX_LEN}"
+                )));
+            }
+            if without_code.chars().any(char::is_control) {
+                return Err(PluginError::invalid_manifest(
+                    "`withoutCode` must be plain text without control characters",
+                ));
             }
         }
         if let Some(source) = &self.source {
@@ -863,6 +896,58 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn a_without_code_sentence_is_optional_and_kept_verbatim() {
+        let mut json = minimal_json();
+        json["withoutCode"] = serde_json::json!("Sorting will not work.");
+        let manifest = parse(json).unwrap();
+        assert_eq!(
+            manifest.without_code.as_deref(),
+            Some("Sorting will not work.")
+        );
+    }
+
+    #[test]
+    fn rejects_a_without_code_sentence_that_is_too_long() {
+        let mut json = minimal_json();
+        json["withoutCode"] = serde_json::json!("x".repeat(WITHOUT_CODE_MAX_LEN + 1));
+        let err = parse(json).unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidManifest);
+        assert!(err.message.contains("withoutCode"), "{}", err.message);
+        assert!(err.message.contains("240"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_a_without_code_sentence_with_control_characters() {
+        for bad in ["line one\nline two", "tab\there", "nul\0here"] {
+            let mut json = minimal_json();
+            json["withoutCode"] = serde_json::json!(bad);
+            let err = parse(json).unwrap_err();
+            assert_eq!(err.code, PluginErrorCode::InvalidManifest, "{bad:?}");
+            assert!(
+                err.message.contains("withoutCode"),
+                "{bad:?}: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("control characters"),
+                "{bad:?}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_without_code_sentence_without_an_entrypoint() {
+        let mut json = minimal_json();
+        json.as_object_mut().unwrap().remove("entrypoint");
+        json["withoutCode"] = serde_json::json!("Sorting will not work.");
+        let err = parse(json).unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidManifest);
+        assert!(err.message.contains("withoutCode"), "{}", err.message);
+        assert!(err.message.contains("entrypoint"), "{}", err.message);
     }
 
     #[test]

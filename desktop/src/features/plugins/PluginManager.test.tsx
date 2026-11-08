@@ -145,7 +145,7 @@ describe('the install prompt for a plugin with code', () => {
 
   it('asks once, and installing without running code sends allowScripts = false', async () => {
     await openPrompt(true);
-    expect(await screen.findByText('Scripted runs code. Allow it?')).toBeTruthy();
+    expect(await screen.findByText('Scripted runs code')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: 'Install without running code' }));
 

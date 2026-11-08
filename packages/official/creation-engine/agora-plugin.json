@@ -7,6 +7,7 @@
   "license": "GPL-3.0-only",
   "apiRange": ">=0.1, <0.2",
   "entrypoint": "main.js",
+  "withoutCode": "Sort, masterlist updates and the plugin list's checks won't work.",
   "capabilities": {
     "required": ["game:define", "game:read", "network"]
   },

@@ -46,6 +46,47 @@ function networkHosts(preview: InstallPreview): string[] {
   return isRecord(network) ? stringArray(network.hosts) : [];
 }
 
+/** The author's sentence on what its code is for, when one is given. */
+function withoutCode(preview: InstallPreview): string | null {
+  const value = preview.manifest?.withoutCode;
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+}
+
+/**
+ * The code question for one package. One answer covers every package in the
+ * prompt, so this only explains what that package loses if the answer is no.
+ */
+function CodeQuestion({
+  preview,
+  name,
+}: {
+  preview: InstallPreview;
+  name: string;
+}) {
+  const official = preview.official === true;
+  const missing = withoutCode(preview);
+  let withoutItsCode = `Without its code, ${name} will be missing the features its code provides.`;
+  if (missing) {
+    withoutItsCode = official
+      ? `Without its code, ${name} will be missing features: ${missing}`
+      : `Without its code, ${name} will be missing features. The plugin says: “${missing}”`;
+  }
+  return (
+    <div className="mt-2" data-testid="code-question">
+      <p className="text-sm font-medium">{name} runs code</p>
+      {official ? (
+        <p className="mt-1 text-sm">
+          This is an official Agora plugin. Allowing its code is strongly recommended.
+        </p>
+      ) : null}
+      <p className="mt-1 text-sm text-muted-foreground">{withoutItsCode}</p>
+      <p className="mt-1 text-xs text-muted-foreground">
+        You can allow it later in Settings &gt; Plugins.
+      </p>
+    </div>
+  );
+}
+
 export function InstallPrompt({
   preview,
   development,
@@ -97,13 +138,16 @@ export function InstallPrompt({
   // that keeps the same code keeps the answer already given. A dependency that
   // runs code is asked about the same way.
   const targetAsksAboutCode = asksAboutCode(preview);
-  // A dependency that runs code cannot be installed without allowing it, so the
-  // "without running code" path is not offered when one needs code.
-  const dependencyNeedsCode = alsoInstalls.some(
-    (extra) => extra.runsCode === true && !extra.replacesVersion,
-  );
-  const needsCodeAnswer =
-    targetAsksAboutCode || alsoInstalls.some((extra) => asksAboutCode(extra));
+  const codeQuestions = [
+    ...(targetAsksAboutCode ? [preview] : []),
+    ...alsoInstalls.filter((extra) => asksAboutCode(extra)),
+  ];
+  const needsCodeAnswer = codeQuestions.length > 0;
+  // Every package in an official set was signed for by the catalog. One is
+  // enough to say which answer Agora recommends.
+  const officialInSet =
+    preview.official === true || alsoInstalls.some((extra) => extra.official === true);
+  const officialRunsCode = codeQuestions.some((question) => question.official === true);
 
   return (
     <div className="rounded-lg border border-border bg-muted/30 p-4">
@@ -264,9 +308,7 @@ export function InstallPrompt({
               </p>
             ) : null}
 
-            {asksAboutCode(extra) ? (
-              <p className="mt-2 text-sm font-medium">{extraName} runs code. Allow it?</p>
-            ) : null}
+            {asksAboutCode(extra) ? <CodeQuestion preview={extra} name={extraName} /> : null}
           </div>
         );
       })}
@@ -298,18 +340,20 @@ export function InstallPrompt({
         </p>
       ) : null}
 
-      {targetAsksAboutCode ? (
-        <p className="mt-3 text-sm font-medium">{manifestName} runs code. Allow it?</p>
-      ) : null}
+      {targetAsksAboutCode ? <CodeQuestion preview={preview} name={manifestName} /> : null}
 
       <div className="mt-4 flex gap-2">
         <Button size="sm" onClick={() => onConfirm(needsCodeAnswer)} disabled={busy || blocked}>
-          {busy ? busyLabel : needsCodeAnswer ? `${confirmLabel} and allow code` : confirmLabel}
+          {busy
+            ? busyLabel
+            : needsCodeAnswer
+              ? `${confirmLabel} and allow code${officialRunsCode ? ' (recommended)' : ''}`
+              : confirmLabel}
         </Button>
-        {needsCodeAnswer && !dependencyNeedsCode ? (
+        {needsCodeAnswer ? (
           <Button
             size="sm"
-            variant="secondary"
+            variant={officialInSet ? 'outline' : 'secondary'}
             onClick={() => onConfirm(false)}
             disabled={busy || blocked}
           >

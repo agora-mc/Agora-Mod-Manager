@@ -1602,7 +1602,57 @@ async fn a_failure_after_the_dependency_reports_what_was_installed() {
 }
 
 #[tokio::test]
-async fn a_dependency_that_runs_code_is_refused_without_allow_code() {
+async fn a_dependency_that_runs_code_installs_with_its_code_off_when_not_allowed() {
+    let world = World::new();
+    let base = dependency_zip(BASE, "1.0.0", &[], "", None, true);
+    let game = dependency_zip(
+        GAME_PLUGIN,
+        "1.0.0",
+        &[(BASE, ">=1.0, <2")],
+        "",
+        Some("dep-game"),
+        false,
+    );
+    world.publish(vec![
+        (
+            Release::of_plugin(GAME_PLUGIN, "1.0.0", "current", &game),
+            game,
+        ),
+        (Release::of_plugin(BASE, "1.0.0", "current", &base), base),
+    ]);
+
+    let plugin = installed(
+        world
+            .service
+            .install_official(
+                GAME_PLUGIN,
+                Consent {
+                    capabilities: true,
+                    scripts: false,
+                },
+                &world.fetcher,
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(plugin.id, GAME_PLUGIN);
+    assert_eq!(world.version_of(BASE).as_deref(), Some("1.0.0"));
+
+    let base_plugin = world
+        .service
+        .list()
+        .into_iter()
+        .find(|plugin| plugin.id == BASE)
+        .expect("the dependency is installed");
+    assert!(base_plugin.runs_code, "the dependency does have code");
+    assert!(
+        !base_plugin.scripts_allowed,
+        "the dependency's code stays off until it is allowed"
+    );
+}
+
+#[tokio::test]
+async fn a_code_dependency_still_asks_when_capabilities_are_unanswered() {
     let world = World::new();
     let base = dependency_zip(BASE, "1.0.0", &[], "", None, true);
     let game = dependency_zip(
@@ -1623,47 +1673,18 @@ async fn a_dependency_that_runs_code_is_refused_without_allow_code() {
 
     let outcome = world
         .service
-        .install_official(
-            GAME_PLUGIN,
-            Consent {
-                capabilities: true,
-                scripts: false,
-            },
-            &world.fetcher,
-        )
+        .install_official(GAME_PLUGIN, false, &world.fetcher)
         .await
         .unwrap();
     let UpdateOutcome::NeedsConsent { preview } = outcome else {
-        panic!("a code dependency needs the code answer first");
+        panic!("the capability question is still unanswered");
     };
     assert_eq!(preview.also_installs.len(), 1);
     assert!(preview.also_installs[0].runs_code);
     assert!(
         files_under(&world.packages_root()).is_empty(),
-        "nothing is installed before the code answer"
+        "nothing is installed before the capability answer"
     );
-
-    installed(
-        world
-            .service
-            .install_official(
-                GAME_PLUGIN,
-                Consent {
-                    capabilities: true,
-                    scripts: true,
-                },
-                &world.fetcher,
-            )
-            .await
-            .unwrap(),
-    );
-    let base_plugin = world
-        .service
-        .list()
-        .into_iter()
-        .find(|plugin| plugin.id == BASE)
-        .expect("the dependency is installed");
-    assert!(base_plugin.scripts_allowed);
 }
 
 // ---------------------------------------------------------------------------

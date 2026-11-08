@@ -210,6 +210,8 @@ export interface InstallPreview {
    * one consent covers them as well.
    */
   alsoInstalls?: InstallPreview[];
+  /** Served from the signed official catalog, so the prompt recommends its code. */
+  official?: boolean;
 }
 
 export type UpdateVerdict =
@@ -253,6 +255,8 @@ export interface PluginManifest {
   source?: string | null;
   apiRange: string;
   entrypoint?: string | null;
+  /** One sentence on what stops working when the plugin's code is not allowed. */
+  withoutCode?: string | null;
   network?: { hosts: string[] };
   contributions?: {
     pages?: { id: string; title: string; icon?: string | null }[];

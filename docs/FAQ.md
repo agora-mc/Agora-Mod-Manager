@@ -75,7 +75,7 @@ Minecraft is built in. Other games come as plugins, and Skyrim Special Edition i
 
 ### How do I add a game?
 
-On Home, find the **More games** card and select **Install** next to the game. If you dismissed the card, the same card is in Settings > Game support. Read what the plugin asks for, approve it, then choose **Restart now** when Agora asks. Agora looks for the game in Steam, GOG, the Epic Games Store and the Microsoft Store. If it doesn't find your copy, use **Add game folder** in Settings > Game support. A game plugin can build on another, shared plugin: Skyrim's builds on the Creation Engine base plugin, and installing Skyrim installs that base too. The install prompt lists everything it will add.
+On Home, find the **More games** card and select **Install** next to the game. If you dismissed the card, the same card is in Settings > Game support. Read what the plugin asks for, approve it, then choose **Restart now** when Agora asks. Agora looks for the game in Steam, GOG, the Epic Games Store and the Microsoft Store. If it doesn't find your copy, use **Add game folder** in Settings > Game support. A game plugin can build on another, shared plugin: Skyrim's builds on the Creation Engine base plugin, and installing Skyrim installs that base too. The install prompt lists everything it will add. You can install Skyrim without letting the Creation Engine plugin run code, but Sort, masterlist updates and the plugin list's checks won't work until you allow its code in Settings > Plugins.
 
 ### Can I bring my Mod Organizer 2 setup?
 

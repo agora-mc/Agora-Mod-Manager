@@ -88,6 +88,12 @@ have to infer any of them:
   // Bundled JavaScript only: .js or .mjs. TypeScript is compiled by you.
   "entrypoint": "main.js",
 
+  // Optional, and only with an `entrypoint`: one plain-text sentence (at most
+  // 240 characters, no control characters) saying what stops working when the
+  // user installs without letting your code run. The install prompt shows it
+  // beside that choice, so people can decide with the cost in front of them.
+  "withoutCode": "Sorting and the saved masterlist will not be used.",
+
   // When your script is loaded. Omit this and it loads at startup. Each entry
   // must name something you actually contribute, or it would never fire.
   //   onStartup | onInstanceOpened | onView:<id> | onCommand:<id> | onEvent:<name>
@@ -187,7 +193,9 @@ have to infer any of them:
 ```
 
 Everything under `contributions` is optional; a theme-only plugin needs no `entrypoint` at all.
-`examples/plugins/` has runnable versions of each of these. Where this document and
+`withoutCode` is the author's own plain-text sentence about what its code is for; it only makes
+sense with an `entrypoint`, and without one it is a validation error. `examples/plugins/` has
+runnable versions of each of these. Where this document and
 `crates/agora-plugin-api/src/manifest.rs` disagree, the code is right and this is a bug — please
 report it.
 

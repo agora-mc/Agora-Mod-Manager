@@ -210,6 +210,11 @@ pub struct InstallPreview {
     /// see everything one consent covers. Empty for a single package.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_installs: Vec<InstallPreview>,
+    /// This package comes from the signed official catalog. Set by the official
+    /// install paths so the prompt can recommend allowing its code; a community
+    /// package is never marked here.
+    #[serde(default)]
+    pub official: bool,
 }
 
 impl InstallPreview {
@@ -577,6 +582,7 @@ fn build_preview(
         uncompressed_bytes,
         manifest,
         also_installs: Vec::new(),
+        official: false,
     }
 }
 

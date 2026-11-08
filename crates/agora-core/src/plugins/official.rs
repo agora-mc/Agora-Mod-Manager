@@ -1336,7 +1336,10 @@ impl PluginService {
             }
             state.visiting.insert(id.clone());
             let bytes = self.fetch_verified_entry(entry, fetcher).await?;
-            let preview = self.preview_package_bytes(&bytes)?;
+            let mut preview = self.preview_package_bytes(&bytes)?;
+            // Every package in an official plan came from the signed catalog.
+            // The prompt uses this to recommend allowing the code.
+            preview.official = true;
             if preview.manifest.id.as_str() != entry.plugin_id
                 || preview.manifest.version.to_string() != entry.version
             {
@@ -1427,17 +1430,13 @@ impl PluginService {
         };
         let mut needs_consent = false;
         for plan in &plans {
-            // A dependency that runs code is a new answer exactly as it would be
-            // on its own: the one consent has to cover running it.
-            let dependency_code = plan.is_dependency
-                && plan.preview.replaces_version.is_none()
-                && plan.preview.runs_code
-                && !consent.scripts;
+            // A dependency that runs code installs with code off, exactly as the
+            // target does; no answer to the code question is not a reason to
+            // refuse the whole set. The capability question still is.
             if (plan.preview.requires_capability_consent() && !consent.capabilities)
                 || (plan.preview.replaces_version.is_some()
                     && plan.preview.adds_code
                     && !consent.scripts)
-                || dependency_code
             {
                 needs_consent = true;
             }
@@ -1502,7 +1501,9 @@ impl PluginService {
         consent: impl Into<Consent>,
     ) -> LauncherResult<UpdateOutcome> {
         let consent: Consent = consent.into();
-        let preview: InstallPreview = self.preview_package_bytes(bytes)?;
+        let mut preview: InstallPreview = self.preview_package_bytes(bytes)?;
+        // This path only ever installs a signed catalog entry.
+        preview.official = true;
         // The signed entry decides what these bytes are meant to be. A package
         // that says it is something else is refused even though its hash matched.
         if preview.manifest.id.as_str() != entry.plugin_id

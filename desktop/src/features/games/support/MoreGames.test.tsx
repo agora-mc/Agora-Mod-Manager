@@ -50,6 +50,7 @@ const consentPreview = {
   migratesData: false,
   fileCount: 1,
   uncompressedBytes: 1024,
+  official: true,
 };
 
 function answer(overrides: {
@@ -241,8 +242,8 @@ describe('More games card', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Install Skyrim Special Edition' }));
 
-    expect(await screen.findByText('Skyrim Special Edition runs code. Allow it?')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Install and allow code' }));
+    expect(await screen.findByText('Skyrim Special Edition runs code')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Install and allow code (recommended)' }));
 
     expect(await screen.findByText('Restart Agora to finish adding Skyrim Special Edition.')).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
@@ -267,6 +268,7 @@ describe('More games card', () => {
       ],
       runsCode: true,
       codeChanged: true,
+      official: true,
     };
     answer({
       install: (args) => {
@@ -283,11 +285,11 @@ describe('More games card', () => {
     expect(await screen.findByText('Creation Engine 1.0.0')).toBeInTheDocument();
     expect(screen.getByText('Needed by Skyrim Special Edition')).toBeInTheDocument();
     expect(screen.getByText('Read game data')).toBeInTheDocument();
-    expect(screen.getByText('Creation Engine runs code. Allow it?')).toBeInTheDocument();
-    // A dependency that runs code cannot be installed without allowing it.
-    expect(screen.queryByRole('button', { name: 'Install without running code' })).toBeNull();
+    expect(screen.getByText('Creation Engine runs code')).toBeInTheDocument();
+    // A dependency with code installs without it, so both answers are offered.
+    expect(screen.getByRole('button', { name: 'Install without running code' })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: 'Install and allow code' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Install and allow code (recommended)' }));
 
     expect(await screen.findByText('Restart Agora to finish adding Skyrim Special Edition.')).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith('install_official_plugin', {
