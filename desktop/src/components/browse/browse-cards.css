@@ -415,6 +415,18 @@
 
 .browse-card-action-row .browse-primary-action { flex: none; }
 
+/* "Get from <host>" is longer than Install, so it shares the pair's width with
+   Preview and wraps its own label instead of overflowing the card. */
+.browse-card-action-row .browse-primary-action.browse-primary-action--manual {
+  flex: 1 1 0;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+  line-height: 1.15;
+  padding-inline: 0.5rem;
+}
+
 .browse-card-action-row .browse-source-link {
   flex: 1 1 auto;
   min-width: max-content;

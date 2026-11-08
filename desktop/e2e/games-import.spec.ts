@@ -471,7 +471,7 @@ test.describe('Browse curated items', () => {
     await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
     const row = page.getByTestId('catalog-entry');
     await expect(row).toContainText('Address Library for SKSE Plugins');
-    await row.getByRole('button', { name: 'Get from www.nexusmods.com' }).click();
+    await row.getByRole('button', { name: 'Get from nexusmods.com' }).click();
 
     const dialog = page.getByTestId('manual-download-dialog');
     await expect(dialog).toContainText('Download Address Library for SKSE Plugins yourself');
@@ -486,6 +486,28 @@ test.describe('Browse curated items', () => {
 
     await dialog.getByRole('button', { name: 'Install', exact: true }).click();
     await expect(page.getByTestId('manual-installed')).toContainText('Installed Address Library for SKSE Plugins.');
+  });
+
+  test('the manual-link card fits its host at the narrowest window', async ({ page }) => {
+    await page.setViewportSize({ width: 900, height: 720 });
+    await boot(page, [], {
+      games_catalog_list: { entries: [manualEntry], instances: [{ instanceId: 'inst-1', name: 'Skyrim Main' }] },
+    });
+
+    await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
+    const row = page.getByTestId('catalog-entry');
+    const button = row.getByRole('button', { name: 'Get from nexusmods.com' });
+    await expect(button).toBeVisible();
+
+    const card = await row.boundingBox();
+    const label = await button.boundingBox();
+    expect(card).not.toBeNull();
+    expect(label).not.toBeNull();
+    // The label wraps inside the card instead of spilling past its edge.
+    expect(label!.x).toBeGreaterThanOrEqual(card!.x - 1);
+    expect(label!.x + label!.width).toBeLessThanOrEqual(card!.x + card!.width + 1);
+
+    await row.screenshot({ path: '.shots/manual-browse-card-narrow.png' });
   });
 
   test('a manually chosen file with the wrong name asks first, and installs anyway when told', async ({ page }) => {
@@ -526,7 +548,7 @@ test.describe('Browse curated items', () => {
     );
 
     await sidebarNav(page).getByRole('button', { name: 'Browse' }).click();
-    await page.getByRole('button', { name: 'Get from www.nexusmods.com' }).click();
+    await page.getByRole('button', { name: 'Get from nexusmods.com' }).click();
     await page.getByRole('button', { name: 'Choose downloaded file…' }).click();
 
     const notice = page.getByTestId('manual-wrong-name');

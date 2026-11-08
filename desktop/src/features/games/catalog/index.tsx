@@ -509,7 +509,7 @@ function CatalogCard({
                 <button
                   ref={primary}
                   type="button"
-                  className="browse-primary-action"
+                  className="browse-primary-action browse-primary-action--manual"
                   onClick={onGet}
                   disabled={!canInstall || busy || !entry.pageUrl}
                 >

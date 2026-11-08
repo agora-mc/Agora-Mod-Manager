@@ -64,7 +64,7 @@ describe('ManualDownloadDialog', () => {
     renderDialog();
     expect(screen.getByRole('dialog')).toHaveTextContent('Download Address Library for SKSE Plugins yourself');
     expect(screen.getByRole('dialog')).toHaveTextContent(
-      "Address Library for SKSE Plugins is on www.nexusmods.com, which Agora doesn't download from. Open the page, download the file, then choose it here.",
+      "Address Library for SKSE Plugins is on nexusmods.com, which Agora doesn't download from. Open the page, download the file, then choose it here.",
     );
     expect(screen.getByText('Main file: All in one (1.6.x)')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Open page' })).toBeInTheDocument();
@@ -132,7 +132,7 @@ describe('ManualDownloadDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Choose downloaded file…' }));
     const notice = await screen.findByTestId('manual-no-checksum');
     expect(notice).toHaveTextContent(
-      "www.nexusmods.com doesn't publish a checksum, so Agora couldn't check this file. Only install a file you downloaded from the page above.",
+      "nexusmods.com doesn't publish a checksum, so Agora couldn't check this file. Only install a file you downloaded from the page above.",
     );
     expect(installCatalogEntry).toHaveBeenLastCalledWith(
       expect.objectContaining({ filePath: FILE, confirmNoChecksum: false }),

@@ -49,7 +49,7 @@ describe('LibraryItemCard', () => {
     expect(chip).toHaveTextContent('Updates unknown');
     expect(chip).toHaveAttribute(
       'title',
-      "Agora can't check www.nexusmods.com for new versions. Visit the page to see if there's an update.",
+      "Agora can't check nexusmods.com for new versions. Visit the page to see if there's an update.",
     );
   });
 

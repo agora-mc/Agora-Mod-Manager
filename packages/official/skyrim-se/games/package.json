@@ -84,7 +84,8 @@
         "pgpatcher",
         "sseedit",
         "loot",
-        "synthesis"
+        "synthesis",
+        "skyrim-together"
       ],
       "launch": {
         "executable": {
@@ -655,6 +656,27 @@
       "output_patterns": [
         "Data/Synthesis.esp"
       ]
+    },
+    {
+      "id": "skyrim-together",
+      "game": "skyrim-se",
+      "name": "Skyrim Together Reborn",
+      "launch": {
+        "executable": {
+          "root": "runtime",
+          "path": "SkyrimTogether.exe"
+        },
+        "arguments": [],
+        "environment": {},
+        "working_directory": {
+          "root": "runtime",
+          "path": ""
+        }
+      },
+      "relevant_settings": [],
+      "after_tools": [],
+      "uses_install_path": false,
+      "run_only": true
     }
   ]
 }

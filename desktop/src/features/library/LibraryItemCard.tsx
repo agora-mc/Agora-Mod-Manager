@@ -65,7 +65,7 @@ const CHIP = 'inline-flex items-center gap-1 rounded-full border border-border p
 function pageHost(url: string | null): string {
   if (!url) return 'its page';
   try {
-    return new URL(url).host || 'its page';
+    return (new URL(url).host || 'its page').replace(/^www\./i, '');
   } catch {
     return 'its page';
   }

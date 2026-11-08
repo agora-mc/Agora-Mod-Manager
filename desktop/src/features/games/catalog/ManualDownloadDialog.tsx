@@ -19,12 +19,12 @@ import {
 import { formatError, openExternalUrl, pickOpenFile } from '@/lib/tauri';
 import { installCatalogEntry, type CatalogEntry, type CatalogInstallReply } from './api';
 
-/** The host a page is on, as the dialog names it. */
+/** The host a page is on, as the dialog names it. A leading `www.` is not part of the name. */
 export function pageHost(url: string): string {
   try {
-    return new URL(url).host || url;
+    return (new URL(url).host || url).replace(/^www\./i, '');
   } catch {
-    return url;
+    return url.replace(/^www\./i, '');
   }
 }
 
@@ -118,7 +118,7 @@ export function ManualDownloadDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {hint && <p className="-mt-2 text-sm text-muted-foreground">{hint}</p>}
+        {hint && <p className="text-sm text-muted-foreground">{hint}</p>}
 
         <p className="text-sm text-muted-foreground">
           {watching
@@ -160,7 +160,7 @@ export function ManualDownloadDialog({
           </p>
         )}
 
-        <DialogFooter className="gap-2 sm:justify-between">
+        <DialogFooter className="flex flex-row flex-wrap items-center justify-between gap-2 sm:justify-between">
           <Button
             type="button"
             variant="outline"
@@ -170,7 +170,7 @@ export function ManualDownloadDialog({
             Open page
           </Button>
           {step.kind === 'checksum' ? (
-            <div className="flex gap-2">
+            <div className="ml-auto flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel
               </Button>
@@ -183,7 +183,7 @@ export function ManualDownloadDialog({
               </Button>
             </div>
           ) : step.kind === 'wrong-name' ? (
-            <div className="flex gap-2">
+            <div className="ml-auto flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
                 Cancel
               </Button>
@@ -198,11 +198,11 @@ export function ManualDownloadDialog({
               </Button>
             </div>
           ) : step.kind === 'done' ? (
-            <Button type="button" onClick={() => onOpenChange(false)}>
+            <Button type="button" className="ml-auto" onClick={() => onOpenChange(false)}>
               Close
             </Button>
           ) : (
-            <div className="flex gap-2">
+            <div className="ml-auto flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
                 Cancel
               </Button>

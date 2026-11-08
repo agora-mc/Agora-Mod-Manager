@@ -3176,3 +3176,64 @@ async fn an_skse_shaped_archive_puts_the_loader_at_the_root_and_scripts_under_da
         other => panic!("the SKSE shape was not placed: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_skyrim_together_shaped_archive_puts_its_launcher_at_the_game_root() {
+    // The release archive wraps everything in `SkyrimTogetherReborn/`, with the launcher at the
+    // top of that folder (the project's MO2 guide selects it from there). Placement descends the
+    // single wrapper, so the tool's `SkyrimTogether.exe` is found at the game root.
+    let f = fixture_with_root_markers(vec!["*.exe".into(), "*.dll".into()]);
+    let instance = f.instance("together-layout");
+    let bytes = zip_bytes(&[
+        (
+            "SkyrimTogetherReborn/SkyrimTogether.exe",
+            b"launcher".as_slice(),
+        ),
+        (
+            "SkyrimTogetherReborn/Data/SkyrimTogetherReborn/resources/app.js",
+            b"ui".as_slice(),
+        ),
+    ]);
+    let dir = TempDir::new().unwrap();
+    let file = dir
+        .path()
+        .join("SkyrimTogether-1.8.4-windows-x64-sse1.6.1170.zip");
+    std::fs::write(&file, bytes).unwrap();
+
+    let report = run_file(
+        &f,
+        &manual_entry("SkyrimTogether-*.zip", vec![]),
+        &instance.instance_id,
+        &file,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.state, InstallState::Placed { .. }),
+        "{:?}",
+        report.state
+    );
+
+    let item = f.content_items().remove(0);
+    let layout = f.definition.content_layout.as_ref().unwrap();
+    match game_deploy::decide_placement(&item, layout) {
+        PlacementDecision::Place {
+            mount_path,
+            source_path,
+            reason,
+        } => {
+            assert!(
+                mount_path.is_empty(),
+                "mount_path was {mount_path}: {reason}"
+            );
+            assert_eq!(
+                source_path.to_ascii_lowercase(),
+                "skyrimtogetherreborn",
+                "{reason}"
+            );
+        }
+        other => panic!("the Skyrim Together shape was not placed: {other:?}"),
+    }
+}

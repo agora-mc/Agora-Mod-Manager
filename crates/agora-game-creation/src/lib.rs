@@ -281,9 +281,10 @@ mod tests {
                 agora_game_api::ToolId::new("sseedit").unwrap(),
                 agora_game_api::ToolId::new("loot").unwrap(),
                 agora_game_api::ToolId::new("synthesis").unwrap(),
+                agora_game_api::ToolId::new("skyrim-together").unwrap(),
             ]
         );
-        assert_eq!(def.tools.len(), 9);
+        assert_eq!(def.tools.len(), 10);
         let nemesis = &def.tools[0];
         assert!(nemesis.uses_install_path);
         let bodyslide = &def.tools[1];
@@ -517,6 +518,9 @@ mod tests {
     /// - LOOT: <https://github.com/loot/loot> (its build produces `LOOT.exe`).
     /// - Synthesis: <https://mutagen-modding.github.io/Synthesis/Installation/> (`Synthesis.exe`). It
     ///   builds a patch (`Synthesis.esp`), so it is not run-only.
+    /// - Skyrim Together: <https://wiki.tiltedphoques.com/tilted-online/guides/client-setup/using-modorganizer2-mo2/skyrim-together-reborn/making-a-custom-launch-option-in-mo2.html>
+    ///   (the archive wraps `SkyrimTogether.exe` in a `SkyrimTogetherReborn` folder, which placement
+    ///   mounts at the game root). It starts the game and builds nothing, so it is run-only.
     #[test]
     fn the_run_only_tools_are_declared_with_their_executable_names() {
         let package = game_package();
@@ -547,6 +551,12 @@ mod tests {
         let synthesis = tool("synthesis");
         assert!(!synthesis.run_only);
         assert!(exe(&synthesis).ends_with("/Synthesis.exe"));
+
+        let together = tool("skyrim-together");
+        assert!(together.run_only);
+        assert_eq!(exe(&together), "SkyrimTogether.exe");
+        assert!(!together.uses_install_path);
+        assert!(together.before_launch.is_none());
 
         // The tools that build output are not run-only.
         for id in [
