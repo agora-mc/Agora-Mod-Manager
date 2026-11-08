@@ -41,6 +41,13 @@ only for a plugin the user allowed it for (asked at install, off until then), th
   `onCommand:` is not started at launch, and one declaring `onEvent:` is started when that
   event first fires.
 - A CLI surface (`agora plugin …`) reaching the same core services as the GUI.
+
+- **Game packages.** A plugin can define games, frameworks and tools, and inherit them from
+  another package with `parents` / `extends`, which is how the official Skyrim package is built on
+  the Creation Engine base. A game can provide its own load-order sorter: the Creation Engine
+  package runs LOOT's libloot as a WebAssembly module through `agora.wasm.run`, so no LOOT code is
+  compiled into Agora or core. Exercised by `crates/agora-plugin-host/tests/creation_engine_sorter.rs`
+  and the game-package tests. Author guide: [`game-packages.md`](game-packages.md).
 - Author-hosted updates: a plugin ships an `agora-plugin-update.json` naming its update URL and
   Ed25519 keys, which are pinned when the user agrees to install and read only from the database
   afterwards. Updates come from a signed, author-hosted document; the package is authenticated by

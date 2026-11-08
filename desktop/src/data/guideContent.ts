@@ -78,7 +78,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
     description: 'Set up Agora, understand what it does, and reach your first playable instance.',
     keywords: ['onboarding', 'setup', 'registry', 'java', 'first launch'],
     basic: {
-      summary: 'Agora helps you discover, organize, and recover modded Minecraft installations. It calls each separate installation an instance and keeps risky changes contained to that instance.',
+      summary: 'Agora helps you discover, organize, and recover modded game installations. Minecraft is built in, and other games come as add-ons; the walkthrough here uses Minecraft. Agora calls each separate installation an instance and keeps risky changes contained to that instance.',
       outcomes: [
         'Complete the first-run setup without needing prior modding knowledge.',
         'Understand the difference between Agora, Minecraft, and the official launcher.',
@@ -892,7 +892,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Add a game',
-          body: 'Other games arrive as small add-ons that you install once. Your Minecraft instances are not affected.',
+          body: 'Other games arrive as small add-ons that you install once. Your Minecraft instances are not affected. The add-ons on the More games card are official, which means Agora\'s signed catalog vouches for them; a plugin you install yourself can add a game too, but it is community-made and gets no special access. Some game add-ons build on a shared one, as Skyrim\'s builds on the Creation Engine base, so both have to be installed.',
           steps: [
             'On Home, find the "More games" card and press Install next to the game. The same card is in Settings > Game support, which helps if you dismissed it on Home.',
             'If Agora shows what the add-on wants to do, read it first, and approve it only if you are happy with it.',
@@ -933,6 +933,9 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           bullets: [
             'Turn off, Turn on and Remove change one item without touching the others.',
             'When two items change the same file, the one that loads later wins. Move up and Move down change that, and each button says whether it makes the item load later or earlier.',
+            'A mod the catalog cannot download for you shows a Get from button naming its host, such as Get from nexusmods.com. It opens a dialog: choose Open page to open the mod\'s page in your browser, download the file there with the page\'s own button, then choose it with Choose file…. Agora copies it into your library and never changes the original, and that mod shows Updates unknown because Agora cannot check its page for new versions.',
+            'A mod that needs a framework such as SKSE or Address Library stops and names it. Use the Get button to open the framework\'s entry and install it first, or choose Install anyway knowing the mod probably will not work without it. The framework has to be in the instance as mod content; a copy left in the game folder is not detected.',
+            'Turn on Notice mod downloads in Settings and Agora lists a file you download in your browser under Library > New downloads, ready to add.',
           ],
           callout: {
             tone: 'note',
@@ -942,12 +945,12 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Load order and launching',
-          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order. Sort… puts them in the order the list\'s sorter recommends.',
+          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order, including the sorter\'s own notes. Sort… puts them in the order the list\'s sorter recommends. When the instance has a loader such as SKSE, Launch starts the game through it.',
           steps: [
             'Open the instance\'s Plugins tab and press Sort….',
             'If the sorter has nothing saved yet, its note says to update the masterlist first; the Plugins tab has a button for it. Without it, Sort only puts each plugin below its masters.',
             'Read the preview. Nothing is written until you choose Apply, and locked or always-loaded plugins stay where they are.',
-            'On Overview, read the Launch checks, then press Launch. Each finding says what is wrong, why it matters and what to do.',
+            'On Overview, read the Launch checks, then press Launch. Each finding says what is wrong, why it matters and what to do. While the game runs, the same button reads Stop and ends the session.',
           ],
         },
       ],
@@ -984,7 +987,8 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           body: 'Start with the page closest to the problem.',
           bullets: [
             'Overview > Launch checks says what stopped a launch, and Check again re-runs them. Launch anyway under Advanced options skips them, but the game may then crash, so we suggest it only when you know why a check is wrong.',
-            'The Plugins tab lists Problems with the load order.',
+            'The Plugins tab lists Problems with the load order, including anything the sorter\'s masterlist says.',
+            'If Agora cannot tell where an item\'s files go, a dialog names the top-level entries it found and the item is not added. Check that you downloaded the main file rather than a patch or a nested archive, then add it again.',
             'If Agora was closed while a tool ran, the Tools tab says A tool swap was interrupted and offers Put the Data folder back. Do that before you launch.',
             'Settings > (your game) > Recovery lists game files that are still swapped and offers Put the files back.',
           ],

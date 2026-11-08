@@ -172,6 +172,12 @@ A plain list of rules is still accepted.
 
 **`intro`** is the sentence shown above the list. **`item_heading`** is the column heading for an item's name; it defaults to `Name`.
 
+### Providing a sorter
+
+`rules.sorter` lets your plugin put the list in its own order instead of Agora's masters-first fallback. `hook` returns the whole order, `update` runs the tab's update button, and `options` is passed to both; `update_label` names the button. A sorter can keep its data in the plugin's own blob store and fetch it only when the player asks, so nothing is downloaded on a launch.
+
+The Creation Engine package does this for Skyrim. Its sorter hook keeps the verified LOOT masterlist in the plugin's blob store and runs libloot as a WebAssembly module, `wasm/loot-sort.wasm`, through `agora.wasm.run` ([`packages/official/creation-engine`](../../packages/official/creation-engine)). Nothing LOOT-related is compiled into Agora or into core, so a community game plugin can provide the same kind of sorter without shipping native code. [WebAssembly modules](README.md#webassembly-modules) covers the sandbox, mounts and limits.
+
 ## Tools
 
 A tool is a program that works on the instance's mods. By default whatever it writes is kept in a generated layer of its own, so the player can compare or undo it. `output` can instead be `mod`, which imports a folder the tool wrote as a content item.

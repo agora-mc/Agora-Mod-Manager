@@ -800,7 +800,9 @@ error. Minecraft cannot use `manual_link`; that strategy is planned for Minecraf
   entry needs an `asset` pattern that recognises the file the player downloads. `sha256` is
   optional. `pins` may name exact file names with their hashes. The install never downloads
   anything: it sends the player to the page, then takes a file the player chooses, copies it into
-  the content store, and never moves, changes or deletes the original. `manual_link` may be listed
+  the content store, and never moves, changes or deletes the original. Because Agora cannot check
+  the page, the library marks the item **Updates unknown**; a curator pin is still used to check
+  the file the player chose. `manual_link` may be listed
   in `download_sources` only as the last fallback, after an automatic source; a `manual_link`
   before a `github_release` or `direct_hash` is a compile error. A list with only `manual_link` is
   the normal case for an entry that has no automatic source at all.

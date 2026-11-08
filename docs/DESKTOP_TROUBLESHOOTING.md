@@ -7,8 +7,8 @@ Find what you're seeing below and try the steps in order. If you get stuck, the 
 We recommend doing these first, so you can always get back to where you started:
 
 1. Close the game.
-2. Open the instance and take a snapshot on the **Snapshots** tab.
-3. Back up any world you can't replace somewhere outside Agora.
+2. For a Minecraft instance, open the instance and take a snapshot on the **Snapshots** tab. Instances of other games don't have snapshots yet, so for those use **Clone** on the instance card first, or back up the files you are about to change yourself.
+3. Back up any world or save you can't replace somewhere outside Agora.
 4. Change one thing at a time, and launch in between. That way you know what fixed it.
 
 ## Game problems
@@ -132,6 +132,50 @@ drive it's on.
 
 Look under **Recently deleted**, below the cards on My Instances. Deleted instances stay there for 30 days, and you can restore them from there.
 
+## Other games
+
+### Agora can't find my game
+
+Open Settings > Game support. Each game says whether it was **Found on this computer**. Agora searches Steam, GOG, the Epic Games Store and the Microsoft Store by itself. If your copy is somewhere else, such as another drive or a portable install, select **Add game folder** and pick the folder the game is in. After you move or reinstall the game, open Settings > (your game) > **Installs** and select **Rescan**.
+
+### The game add-on won't install, or isn't official
+
+The **More games** card installs Agora's official plugins. Read the prompt it shows before you approve it. If the download does not match what Agora expected, nothing is installed and the card says so.
+
+A plugin you install from a file in Settings > Plugins works, but it does not get the official badge. Official means the signed catalog lists that exact version and the installed files still match.
+
+A game plugin can build on another, shared plugin. Skyrim's builds on the Creation Engine base plugin, so both need to be installed; if the game does not appear, Settings > Plugins shows the game plugin as needing the missing one.
+
+A game that is turned off in Settings > Game support is hidden from the game switcher. Its instances, bases and files are not touched.
+
+### Agora cannot tell where an item's files go
+
+Agora opens **Agora cannot tell where these files go** when the game has no rule for that archive's layout, and it lists the top-level entries it found. The item is not added, so nothing is misplaced. Check that you downloaded the mod's main file rather than a patch or an archive that only holds another archive, then add it again.
+
+### A mod needs a framework, such as SKSE or Address Library
+
+On the game's Browse, a mod that requires a framework stops before installing and names it. Use **Get (framework name)** to open the framework's own entry, install that first, then install the mod. **Install anyway** goes past the check, but the mod probably won't work until the framework is there.
+
+The framework has to be installed in the instance, as content. A copy left in the real game folder by another mod manager is not detected. Launch checks keep naming a required framework that is missing, as a warning that does not stop the launch.
+
+### Sort or Update masterlist fails
+
+**Sort…** uses LOOT's masterlist when one has been saved. If the header says there is no masterlist yet, choose **Update masterlist** first; it downloads and checks the masterlist through GitHub, and a failed check leaves the saved copy alone. It needs **Let plugins reach the network** turned on in Settings > Plugins, which is off by default, and Lockdown Mode off in Settings > Privacy. Without a masterlist, Sort still puts each plugin below its masters, but not in LOOT's order.
+
+If a plugin is locked or always loaded and cannot get below its master, the sort preview names it under **These cannot be fixed by sorting**. Unlock it and move it by hand.
+
+### A tool won't run
+
+Some tools, such as Nemesis and BodySlide, work on the real game folder, so Agora runs them on a copy of the game's **Data** folder that briefly takes its place. Agora shows the disk cost and asks first. Close Steam before agreeing, and do not start the game while the tool runs.
+
+If Agora was closed during a run, the **Tools** tab says **A tool swap was interrupted** and offers **Put the Data folder back**. Do that before launching. Settings > (your game) > **Recovery** offers **Put the files back** for per-user files that are still swapped.
+
+A tool whose card says **Out of date** should be rebuilt so the game reads output that matches your current mods.
+
+### A mod says "Updates unknown"
+
+The mod came from a page Agora does not download from, so Agora cannot check it for new versions. Visit the page yourself to see whether there is a newer file; download it and add it again to update the one in your library.
+
 ## Controllers
 
 ### My controller works in Agora but not in Minecraft
@@ -156,7 +200,7 @@ Open Settings and go to **Software Updates**, then select **Check for Updates**.
 
 If you're still stuck, other people or AI assitants can help much faster with the details in hand.
 
-1. Open Crash Doctor and select **Copy crash report**. It copies a report with your file paths and username removed. Nothing else is filtered, so give it a quick read for anything private, such as server addresses.
+1. For Minecraft, open Crash Doctor and select **Copy crash report**. It copies a report with your file paths and username removed. Nothing else is filtered, so give it a quick read for anything private, such as server addresses. For another game, include the game's own log or crash file and what the instance's **Overview > Launch checks** said.
 2. Post it on the [Agora Discord](https://discord.gg/56tpsa2sTZ), along with your Agora version, what you were doing, and what you have already tried.
 3. If you've found a bug in Agora itself that someone else could reproduce, please [open a bug report](https://github.com/agora-mc/Agora-Mod-Manager/issues/new?template=bug_report.yml).
 
