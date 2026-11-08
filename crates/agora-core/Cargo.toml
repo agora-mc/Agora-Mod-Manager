@@ -73,6 +73,12 @@ roxmltree = "0.20"
 # MicrosoftGame.config, read by Microsoft Store game discovery.
 quick-xml = "0.39"
 
+# A real file identity for staged view files: inode on Unix, volume serial and
+# file index on Windows. Already in the lock through `walkdir`, so this adds no
+# download; it lets a swap between the view walk and the hardlink be refused
+# instead of trusting timestamps and size.
+same-file = "1"
+
 # Directory junctions for shared folders on Windows. `std`'s symlink_dir needs
 # Developer Mode or elevation and, when it fails, callers silently fall back to
 # copying — which for a *shared* folder means two trees that drift apart with no

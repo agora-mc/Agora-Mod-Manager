@@ -5,6 +5,7 @@
 
 use agora_plugin_api::host::{
     path_matches_any, ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
+    StageBudget, StageLimits,
 };
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
@@ -70,6 +71,8 @@ impl GameReads for ViewReads {
         folder: &str,
         patterns: &[String],
         destination: &Path,
+        limits: &StageLimits,
+        budget: &StageBudget,
     ) -> Result<u64, ScriptReadError> {
         let base = folder
             .split('/')
@@ -82,6 +85,10 @@ impl GameReads for ViewReads {
             if !patterns.is_empty() && !path_matches_any(patterns, &relative) {
                 continue;
             }
+            let size = std::fs::metadata(&source)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            budget.spend(limits, size)?;
             let dest = relative
                 .split('/')
                 .fold(destination.to_path_buf(), |path, part| path.join(part));
@@ -408,6 +415,8 @@ fn a_script_cannot_raise_the_limits() {
     for limits in [
         serde_json::json!({ "memoryBytes": 2_u64 * 1024 * 1024 * 1024 }),
         serde_json::json!({ "timeoutMs": 999_999 }),
+        serde_json::json!({ "mountBytes": 5_u64 * 1024 * 1024 * 1024 }),
+        serde_json::json!({ "mountFiles": 100_001 }),
     ] {
         let error = invoke(
             &host,
@@ -459,4 +468,133 @@ fn a_files_mount_hands_bytes_to_the_module_read_only() {
     )
     .expect("the module runs");
     assert_eq!(value["stdoutText"], "READ:hello: world\n\nWRITE_FAILED\n");
+}
+
+#[test]
+fn a_blocking_host_call_is_stopped_by_the_time_limit() {
+    let fixture = fixture(&["sleep.wasm"]);
+    let host = activate(&fixture);
+    let started = Instant::now();
+    let outcome = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "sleep.wasm",
+            "stdin": "3000",
+            "limits": { "timeoutMs": 200 },
+        }),
+        None,
+    );
+    let elapsed = started.elapsed();
+    // `std::thread::sleep` on wasm32-wasip1 is one `poll_oneoff` clock call,
+    // which the host runs on its own thread. The epoch deadline is only checked
+    // when wasm executes again, so the module outlives its 200 ms limit by the
+    // whole sleep. A sandbox that promises a time limit must not allow this.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the time limit was missed while the module was blocked in a host call: {elapsed:?}"
+    );
+    assert!(
+        outcome.is_err(),
+        "the module should have been stopped at its deadline: {outcome:?}"
+    );
+}
+
+#[test]
+fn the_memory_cap_covers_a_module_table() {
+    let fixture = fixture(&["table_hog.wasm"]);
+    let host = activate(&fixture);
+    // table_hog declares a 4,000,000-entry funcref table (tens of megabytes of
+    // host memory) and no linear memory at all.
+    let outcome = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "table_hog.wasm",
+            "limits": { "memoryBytes": 1024 * 1024 },
+        }),
+        None,
+    );
+    if let Ok(value) = outcome {
+        panic!(
+            "a table larger than the module's memory cap was allocated and the module ran: {value}"
+        );
+    }
+}
+
+#[test]
+fn a_module_file_over_the_size_cap_is_refused() {
+    let fixture = fixture(&[]);
+    let huge = fixture.package.join("huge.wasm");
+    // A sparse file: the size is over the cap without writing 64 MiB of zeros.
+    std::fs::File::create(&huge)
+        .unwrap()
+        .set_len(64 * 1024 * 1024 + 1)
+        .unwrap();
+    let host = activate(&fixture);
+    let error = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({ "module": "huge.wasm" }),
+        None,
+    )
+    .expect_err("a module over the file size cap is refused");
+    assert!(
+        error.message.contains("at most") || error.message.to_lowercase().contains("large"),
+        "the error names the size cap: {}",
+        error.message
+    );
+}
+
+#[test]
+fn a_view_mount_over_its_cap_names_the_mount() {
+    let fixture = fixture(&["fs_probe.wasm"]);
+    // `stage` writes `a.esp` with five bytes of content.
+    let reads = stage(&fixture, "a.esp");
+    let host = activate(&fixture);
+    let error = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "fs_probe.wasm",
+            "stdin": "list /data",
+            "mounts": [{ "guest": "/data", "view": { "folder": "Data", "patterns": ["*.esp"] } }],
+            "limits": { "mountBytes": 4 },
+        }),
+        Some(reads),
+    )
+    .expect_err("a view mount over its cap is refused");
+    assert!(
+        error.message.contains("mount `/data`"),
+        "the error names the mount: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("more than"),
+        "the error says what cap was passed: {}",
+        error.message
+    );
+}
+
+#[test]
+fn a_files_mount_over_its_cap_names_the_mount() {
+    let fixture = fixture(&["fs_probe.wasm"]);
+    let host = activate(&fixture);
+    let error = invoke(
+        &host,
+        &fixture,
+        serde_json::json!({
+            "module": "fs_probe.wasm",
+            "stdin": "list /input",
+            "mounts": [{ "guest": "/input", "files": { "name.yaml": "hello" } }],
+            "limits": { "mountBytes": 4 },
+        }),
+        None,
+    )
+    .expect_err("a files mount over its cap is refused");
+    assert!(
+        error.message.contains("mount `/input`"),
+        "the error names the mount: {}",
+        error.message
+    );
 }

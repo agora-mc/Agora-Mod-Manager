@@ -9,17 +9,19 @@
 //! resolved by `GameReads` (the same merged view `game.readBytes` uses) and
 //! hardlinked into a staging folder that is deleted when the run ends.
 
-use agora_plugin_api::host::GameReads;
+use agora_plugin_api::host::{GameReads, StageBudget, StageLimits};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasmtime::{
     Cache, CacheConfig, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
     Trap,
 };
+use wasmtime_wasi::cli::StdinStream;
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
@@ -30,6 +32,17 @@ pub const DEFAULT_MEMORY_LIMIT: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Most bytes one output stream may produce before the run fails.
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Largest module file Agora will read and compile.
+pub const MAX_MODULE_BYTES: u64 = 64 * 1024 * 1024;
+/// Most entries one module's table may hold.
+///
+/// A fixed small number rather than a share of the linear-memory cap: a
+/// `funcref` entry is a pointer, so this is ~512 KiB on a 64-bit host, far
+/// above the tens of entries a Rust module uses and small enough that a module
+/// cannot turn `table.grow` or a huge declared table into host memory beyond
+/// its cap. `StoreLimitsBuilder::table_elements` is documented at
+/// <https://docs.rs/wasmtime/latest/wasmtime/struct.StoreLimitsBuilder.html#method.table_elements>.
+const MAX_TABLE_ELEMENTS: usize = 65_536;
 
 /// How often the epoch clock ticks. A module is stopped on the first tick
 /// after its deadline, so this is also the deadline's granularity.
@@ -120,6 +133,10 @@ struct RawLimits {
     memory_bytes: Option<u64>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    mount_bytes: Option<u64>,
+    #[serde(default)]
+    mount_files: Option<u64>,
 }
 
 enum Mount {
@@ -182,6 +199,9 @@ fn run_inner(
     options_json: &str,
     game_reads: Option<Arc<dyn GameReads>>,
 ) -> Result<WasmRunResult, WasmError> {
+    // The deadline covers the whole run, not just the module's call. Work
+    // before the module starts (staging, reading the file) spends it too.
+    let started = Instant::now();
     let module_path = crate::modules::resolve_package_file(package_root, module)
         .map_err(|message| WasmError::new("not_found", message))?;
     let options: RawOptions = serde_json::from_str(options_json).map_err(|e| {
@@ -192,7 +212,10 @@ fn run_inner(
     })?;
     let stdin = options.stdin.map(RawBytes::into_bytes).unwrap_or_default();
     let mounts = validate_mounts(options.mounts, game_reads.as_ref())?;
-    let (memory_limit, timeout) = limits(options.limits)?;
+    let (memory_limit, timeout, stage_limits) = limits(options.limits)?;
+    // One allowance for every mount in this run. Its bytes stay inside the
+    // sandbox, so they are not charged to the script's `game:read` budget.
+    let stage_budget = StageBudget::default();
 
     let staging = StagingDir::create(data_root)?;
     let mut preopens = Vec::new();
@@ -201,6 +224,7 @@ fn run_inner(
         std::fs::create_dir_all(&host_dir).map_err(|e| {
             WasmError::new("staging_failed", format!("could not stage a mount: {e}"))
         })?;
+        let guest = mount.guest().to_string();
         match mount {
             Mount::View {
                 folder, patterns, ..
@@ -212,11 +236,14 @@ fn run_inner(
                     )
                 })?;
                 reads
-                    .stage_view(folder, patterns, &host_dir)
-                    .map_err(|error| WasmError::new("staging_failed", error.message))?;
+                    .stage_view(folder, patterns, &host_dir, &stage_limits, &stage_budget)
+                    .map_err(|error| mount_error(&guest, error))?;
             }
             Mount::Files { files, .. } => {
                 for (name, bytes) in files {
+                    stage_budget
+                        .spend(&stage_limits, bytes.len() as u64)
+                        .map_err(|error| mount_error(&guest, error))?;
                     let dest = name
                         .split('/')
                         .fold(host_dir.clone(), |path, part| path.join(part));
@@ -224,31 +251,136 @@ fn run_inner(
                         std::fs::create_dir_all(parent).map_err(|e| {
                             WasmError::new(
                                 "staging_failed",
-                                format!("could not stage `{name}`: {e}"),
+                                format!("mount `{guest}`: could not stage `{name}`: {e}"),
                             )
                         })?;
                     }
                     std::fs::write(&dest, bytes).map_err(|e| {
-                        WasmError::new("staging_failed", format!("could not stage `{name}`: {e}"))
+                        WasmError::new(
+                            "staging_failed",
+                            format!("mount `{guest}`: could not stage `{name}`: {e}"),
+                        )
                     })?;
                 }
             }
         }
-        preopens.push((host_dir, mount.guest().to_string()));
+        preopens.push((host_dir, guest));
     }
 
-    let wasm = std::fs::read(&module_path)
-        .map_err(|e| WasmError::new("not_found", format!("could not read `{module}`: {e}")))?;
+    let wasm = read_module(&module_path, module)?;
 
-    let stdin_pipe = MemoryInputPipe::new(stdin);
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(timeout_error(timeout));
+    }
+
+    // Run on a current-thread runtime so the wall-clock deadline can drop an
+    // in-flight host call. The outer thread already isolates this from the
+    // plugin runtime, so creating a runtime here cannot nest one.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|e| {
+            WasmError::new("internal", format!("could not start a module runtime: {e}"))
+        })?;
+    runtime.block_on(execute(
+        &wasm,
+        module,
+        MemoryInputPipe::new(stdin),
+        preopens,
+        memory_limit,
+        timeout,
+        remaining,
+        data_root,
+    ))
+}
+
+/// Read a module file, refusing anything larger than [`MAX_MODULE_BYTES`].
+fn read_module(module_path: &Path, module: &str) -> Result<Vec<u8>, WasmError> {
+    let metadata = std::fs::metadata(module_path)
+        .map_err(|e| WasmError::new("not_found", format!("could not read `{module}`: {e}")))?;
+    if metadata.len() > MAX_MODULE_BYTES {
+        return Err(module_too_large(module, metadata.len()));
+    }
+    let file = std::fs::File::open(module_path)
+        .map_err(|e| WasmError::new("not_found", format!("could not read `{module}`: {e}")))?;
+    let mut wasm = Vec::with_capacity(metadata.len() as usize);
+    // Also bound the read, in case the file grows between the metadata and it.
+    file.take(MAX_MODULE_BYTES + 1)
+        .read_to_end(&mut wasm)
+        .map_err(|e| WasmError::new("not_found", format!("could not read `{module}`: {e}")))?;
+    if wasm.len() as u64 > MAX_MODULE_BYTES {
+        return Err(module_too_large(module, wasm.len() as u64));
+    }
+    Ok(wasm)
+}
+
+fn module_too_large(module: &str, bytes: u64) -> WasmError {
+    WasmError::new(
+        "module_too_large",
+        format!("`{module}` is {bytes} bytes; a module may be at most {MAX_MODULE_BYTES}"),
+    )
+}
+
+/// A staging failure as the script sees it: it names the guest mount.
+fn mount_error(guest: &str, error: agora_plugin_api::host::ScriptReadError) -> WasmError {
+    WasmError::new(
+        "staging_failed",
+        format!("mount `{guest}`: {}", error.message),
+    )
+}
+
+/// The async half of [`run_inner`].
+///
+/// Compilation and execution share one wall-clock deadline. Compilation runs
+/// on a blocking thread so the deadline can abandon it (the compile cache makes
+/// a repeat cheap), and the call itself runs under `timeout_at`, which drops
+/// the in-flight future — including a host call such as `poll_oneoff` or a
+/// blocked `fd_read` — instead of waiting for it.
+#[allow(clippy::too_many_arguments)]
+async fn execute<S: StdinStream + 'static>(
+    wasm: &[u8],
+    module_arg: &str,
+    stdin: S,
+    preopens: Vec<(PathBuf, String)>,
+    memory_limit: u64,
+    timeout: Duration,
+    remaining: Duration,
+    data_root: &Path,
+) -> Result<WasmRunResult, WasmError> {
+    let engine = engine(data_root);
+    start_ticker(&engine);
+    let deadline = tokio::time::Instant::now() + remaining;
+
+    let engine_for_compile = engine.clone();
+    let wasm_for_compile = wasm.to_vec();
+    let compiled = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || Module::new(&engine_for_compile, &wasm_for_compile)),
+    )
+    .await
+    .map_err(|_| timeout_error(timeout))?
+    .map_err(|e| {
+        WasmError::new(
+            "internal",
+            format!("the module compiler did not finish: {e}"),
+        )
+    })?;
+    let module = compiled.map_err(|e| {
+        WasmError::new(
+            "module_invalid",
+            format!("the module could not be loaded: {e}"),
+        )
+    })?;
+
     let stdout_pipe = MemoryOutputPipe::new(MAX_OUTPUT_BYTES + 1);
     let stderr_pipe = MemoryOutputPipe::new(MAX_OUTPUT_BYTES + 1);
 
     let mut builder = WasiCtxBuilder::new();
-    builder.stdin(stdin_pipe);
+    builder.stdin(stdin);
     builder.stdout(stdout_pipe.clone());
     builder.stderr(stderr_pipe.clone());
-    builder.arg(module);
+    builder.arg(module_arg);
     for (host_dir, guest) in &preopens {
         builder
             .preopened_dir(host_dir, guest, FsPerms::ReadOnly)
@@ -260,53 +392,50 @@ fn run_inner(
             })?;
     }
 
-    let engine = engine(data_root);
-    start_ticker(&engine);
-    let module = Module::new(&engine, &wasm).map_err(|e| {
-        WasmError::new(
-            "module_invalid",
-            format!("the module could not be loaded: {e}"),
-        )
-    })?;
-
     let mut linker: Linker<WasmState> = Linker::new(&engine);
-    p1::add_to_linker_sync(&mut linker, |state| &mut state.wasi).map_err(|e| {
+    p1::add_to_linker_async(&mut linker, |state| &mut state.wasi).map_err(|e| {
         WasmError::new(
             "internal",
             format!("could not wire the module's sandbox: {e}"),
         )
     })?;
 
+    // Every limit below is documented on `StoreLimitsBuilder`:
+    // - memory_size: #method.memory_size (linear-memory bytes)
+    // - memories: #method.memories (this module declares one, and
+    //   `wasm_multi_memory` is off)
+    // - tables: #method.tables (a core module may declare one)
+    // - table_elements: #method.table_elements (see `MAX_TABLE_ELEMENTS`)
+    // - instances: #method.instances (a core module cannot instantiate others)
+    // <https://docs.rs/wasmtime/latest/wasmtime/struct.StoreLimitsBuilder.html>
     let state = WasmState {
         wasi: builder.build_p1(),
         limits: StoreLimitsBuilder::new()
             .memory_size(memory_limit as usize)
             .memories(1)
+            .tables(1)
+            .table_elements(MAX_TABLE_ELEMENTS)
             .instances(1)
             .trap_on_grow_failure(true)
             .build(),
     };
     let mut store = Store::new(&engine, state);
     store.limiter(|state| &mut state.limits);
-    let ticks = timeout
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(timeout_error(timeout));
+    }
+    // The epoch covers wasm that never yields; the deadline above covers host
+    // calls. Both start from what compilation left rather than from the full
+    // timeout.
+    let ticks = remaining
         .as_millis()
         .div_ceil(EPOCH_TICK_MILLIS as u128)
         .max(1) as u64;
     store.set_epoch_deadline(ticks);
 
-    let instance = linker.instantiate(&mut store, &module).map_err(|e| {
-        WasmError::new("module_invalid", format!("the module could not start: {e}"))
-    })?;
-    let start = instance
-        .get_typed_func::<(), ()>(&mut store, "_start")
-        .map_err(|_| {
-            WasmError::new(
-                "module_invalid",
-                "the module has no `_start`; a module must be a WASI command",
-            )
-        })?;
-
-    let outcome = start.call(&mut store, ());
+    let outcome = tokio::time::timeout_at(deadline, call_start(&mut store, &linker, &module)).await;
     let stdout = stdout_pipe.contents().to_vec();
     let stderr = stderr_pipe.contents().to_vec();
     if stdout.len() > MAX_OUTPUT_BYTES || stderr.len() > MAX_OUTPUT_BYTES {
@@ -318,6 +447,11 @@ fn run_inner(
             ),
         ));
     }
+    let outcome = match outcome {
+        Err(_) => return Err(timeout_error(timeout)),
+        Ok(Err(error)) => return Err(error),
+        Ok(Ok(result)) => result,
+    };
 
     let exit_code = match outcome {
         Ok(()) => 0,
@@ -325,13 +459,7 @@ fn run_inner(
             if let Some(exit) = error.downcast_ref::<wasmtime_wasi::I32Exit>() {
                 exit.0
             } else if error.downcast_ref::<Trap>() == Some(&Trap::Interrupt) {
-                return Err(WasmError::new(
-                    "timeout",
-                    format!(
-                        "the module did not finish within {} ms and was stopped",
-                        timeout.as_millis()
-                    ),
-                ));
+                return Err(timeout_error(timeout));
             } else {
                 return Err(WasmError::new(
                     "module_trap",
@@ -348,6 +476,38 @@ fn run_inner(
         stdout,
         stderr,
     })
+}
+
+async fn call_start(
+    store: &mut Store<WasmState>,
+    linker: &Linker<WasmState>,
+    module: &Module,
+) -> Result<wasmtime::Result<()>, WasmError> {
+    let instance = linker
+        .instantiate_async(&mut *store, module)
+        .await
+        .map_err(|e| {
+            WasmError::new("module_invalid", format!("the module could not start: {e}"))
+        })?;
+    let start = instance
+        .get_typed_func::<(), ()>(&mut *store, "_start")
+        .map_err(|_| {
+            WasmError::new(
+                "module_invalid",
+                "the module has no `_start`; a module must be a WASI command",
+            )
+        })?;
+    Ok(start.call_async(&mut *store, ()).await)
+}
+
+fn timeout_error(timeout: Duration) -> WasmError {
+    WasmError::new(
+        "timeout",
+        format!(
+            "the module did not finish within {} ms and was stopped",
+            timeout.as_millis()
+        ),
+    )
 }
 
 struct WasmState {
@@ -432,10 +592,12 @@ fn start_ticker(engine: &Engine) {
     });
 }
 
-fn limits(raw: Option<RawLimits>) -> Result<(u64, Duration), WasmError> {
+fn limits(raw: Option<RawLimits>) -> Result<(u64, Duration, StageLimits), WasmError> {
     let raw = raw.unwrap_or(RawLimits {
         memory_bytes: None,
         timeout_ms: None,
+        mount_bytes: None,
+        mount_files: None,
     });
     let memory = raw.memory_bytes.unwrap_or(DEFAULT_MEMORY_LIMIT);
     if memory > DEFAULT_MEMORY_LIMIT {
@@ -466,7 +628,35 @@ fn limits(raw: Option<RawLimits>) -> Result<(u64, Duration), WasmError> {
             "a module needs a little time to run",
         ));
     }
-    Ok((memory, Duration::from_millis(timeout_ms)))
+    let defaults = StageLimits::default();
+    let mount_bytes = raw.mount_bytes.unwrap_or(defaults.max_bytes);
+    if mount_bytes > defaults.max_bytes {
+        return Err(WasmError::new(
+            "invalid_arguments",
+            format!(
+                "a script may lower the run's mount byte limit, not raise it above {} bytes",
+                defaults.max_bytes
+            ),
+        ));
+    }
+    let mount_files = raw.mount_files.unwrap_or(defaults.max_files);
+    if mount_files > defaults.max_files {
+        return Err(WasmError::new(
+            "invalid_arguments",
+            format!(
+                "a script may lower the run's mount file limit, not raise it above {}",
+                defaults.max_files
+            ),
+        ));
+    }
+    Ok((
+        memory,
+        Duration::from_millis(timeout_ms),
+        StageLimits {
+            max_bytes: mount_bytes,
+            max_files: mount_files,
+        },
+    ))
 }
 
 fn validate_mounts(
@@ -602,5 +792,62 @@ mod tests {
         assert!(!is_safe_relative("/x"));
         assert!(!is_safe_relative("a//b"));
         assert!(is_safe_relative("a/b.txt"));
+    }
+
+    /// A stdin that is open and never ready, like a pipe a writer holds.
+    struct StallingStdin;
+
+    impl wasmtime_wasi::cli::IsTerminal for StallingStdin {
+        fn is_terminal(&self) -> bool {
+            false
+        }
+    }
+
+    impl StdinStream for StallingStdin {
+        fn async_stream(&self) -> Box<dyn tokio::io::AsyncRead + Send + Sync> {
+            Box::new(StallingReader)
+        }
+    }
+
+    struct StallingReader;
+
+    impl tokio::io::AsyncRead for StallingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[test]
+    fn a_blocked_stdin_read_is_stopped_by_the_time_limit() {
+        let data = tempfile::tempdir().expect("temp data root");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime");
+        let started = std::time::Instant::now();
+        let limit = Duration::from_millis(200);
+        let result = runtime.block_on(execute(
+            include_bytes!("../tests/wasm-fixtures/wasm/fs_probe.wasm"),
+            "fs_probe.wasm",
+            StallingStdin,
+            Vec::new(),
+            64 * 1024 * 1024,
+            limit,
+            limit,
+            data.path(),
+        ));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a blocked fd_read outlived the deadline: {elapsed:?}"
+        );
+        let error = result
+            .err()
+            .unwrap_or_else(|| panic!("the blocked read was not stopped"));
+        assert_eq!(error.code, "timeout", "{}", error.message);
     }
 }

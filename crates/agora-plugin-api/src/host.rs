@@ -14,6 +14,7 @@ use crate::error::PluginResult;
 use crate::manifest::PluginId;
 use crate::protocol::{HostRequest, HostResponse, LogLevel, PluginEventEnvelope};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,6 +96,66 @@ pub trait ScriptReads: Send + Sync {
     ) -> Result<serde_json::Value, ScriptReadError>;
 }
 
+/// How much one module run's mounts may stage.
+///
+/// This is separate from the `game:read` byte budget: staged bytes stay inside
+/// the sandbox, and only the module's capped output comes back. A script may
+/// lower these, never raise them (MASTER_SPEC §30.13).
+#[derive(Debug, Clone, Copy)]
+pub struct StageLimits {
+    /// Total bytes staged across every mount in one run.
+    pub max_bytes: u64,
+    /// Total files staged across every mount in one run.
+    pub max_files: u64,
+}
+
+impl Default for StageLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 4 * 1024 * 1024 * 1024,
+            max_files: 100_000,
+        }
+    }
+}
+
+/// Bytes and files one run's mounts have staged so far.
+#[derive(Debug, Default)]
+pub struct StageBudget {
+    bytes: AtomicU64,
+    files: AtomicU64,
+}
+
+impl StageBudget {
+    /// Spend one file of `bytes`. Staging happens on one thread per run, so a
+    /// load-and-add is enough; the atomics only exist so the method can take
+    /// `&self` through the shared view trait.
+    pub fn spend(&self, limits: &StageLimits, bytes: u64) -> Result<(), ScriptReadError> {
+        let files = self.files.load(Ordering::SeqCst);
+        if files >= limits.max_files {
+            return Err(ScriptReadError::new(
+                "mount_too_large",
+                format!(
+                    "the run's mounts would stage more than {} files",
+                    limits.max_files
+                ),
+            ));
+        }
+        let total = self.bytes.load(Ordering::SeqCst);
+        if total.saturating_add(bytes) > limits.max_bytes {
+            return Err(ScriptReadError::new(
+                "mount_too_large",
+                format!(
+                    "the run's mounts would stage more than {} bytes",
+                    limits.max_bytes
+                ),
+            ));
+        }
+        self.bytes.fetch_add(bytes, Ordering::SeqCst);
+        self.files.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 /// Read an instance's merged view by game path, and nothing else.
 ///
 /// The literals a script passes are game paths, never filesystem paths: a
@@ -130,15 +191,19 @@ pub trait GameReads: Send + Sync {
     /// This exists only for the trusted WebAssembly host, which needs real
     /// bytes to preopen read-only for a module. It resolves every source with
     /// the same merged-view rules as [`GameReads::read_bytes`] and never
-    /// returns a source path to a script. The default refuses, so a scope that
-    /// has no merged view cannot stage one by accident.
+    /// returns a source path to a script. Each staged file spends `budget`
+    /// (the run's mount allowance), not the script's read budget. The default
+    /// refuses, so a scope that has no merged view cannot stage one by
+    /// accident.
     fn stage_view(
         &self,
         folder: &str,
         patterns: &[String],
         destination: &Path,
+        limits: &StageLimits,
+        budget: &StageBudget,
     ) -> Result<u64, ScriptReadError> {
-        let _ = (folder, patterns, destination);
+        let _ = (folder, patterns, destination, limits, budget);
         Err(ScriptReadError::new(
             "unsupported",
             "this read scope cannot stage files for a module",

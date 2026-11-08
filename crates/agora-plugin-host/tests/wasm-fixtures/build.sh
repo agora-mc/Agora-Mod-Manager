@@ -8,6 +8,7 @@ set -eu
 cd "$(dirname "$0")"
 CARGO_TARGET_DIR=target cargo build --release --target wasm32-wasip1
 mkdir -p wasm
-for name in echo runaway memory_hog env_probe fs_probe; do
+for name in echo runaway memory_hog env_probe fs_probe sleep; do
     cp "target/wasm32-wasip1/release/$name.wasm" "wasm/$name.wasm"
 done
+python make_table_hog.py

@@ -117,6 +117,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roxmltree",
  "rusqlite",
+ "same-file",
  "semver",
  "serde",
  "serde_json",
