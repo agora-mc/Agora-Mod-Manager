@@ -10,7 +10,7 @@ import path from 'path';
  * `internal` pages are published so cross-references never 404, but they are
  * kept out of the primary navigation.
  */
-export type DocAudience = 'user' | 'developer' | 'internal';
+export type DocAudience = 'desktop' | 'user' | 'developer' | 'internal';
 
 export interface DocPage {
   slug: string;
@@ -40,15 +40,16 @@ interface WebDocs {
 }
 
 export const AUDIENCE_LABELS: Record<DocAudience, string> = {
-  user: 'For everyone using Agora',
+  desktop: 'Desktop App Users',
+  user: 'CLI Users',
   developer: 'For contributors and maintainers',
-  internal: 'Working notes and archive',
+  internal: 'Unsorted pages',
 };
 
 const EMPTY_DOCS: WebDocs = {
   schema_version: 2,
   generated_at: '',
-  audience_order: ['user', 'developer', 'internal'],
+  audience_order: ['desktop', 'user', 'developer', 'internal'],
   group_order: [],
   docs: [],
 };

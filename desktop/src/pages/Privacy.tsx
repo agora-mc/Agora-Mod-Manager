@@ -48,7 +48,7 @@ const ENDPOINTS: Endpoint[] = [
     key: 'network_github_oauth_enabled',
     name: 'GitHub OAuth (governance)',
     hosts: 'github.com/login',
-    purpose: 'Authenticate for community governance features (triage, flagging).',
+    purpose: 'Authenticate for community governance features (voting and reviews).',
     note: 'Only active when governance features are used.',
     default: true,
     group: 'Governance',

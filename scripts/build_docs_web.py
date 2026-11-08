@@ -52,6 +52,10 @@ SKIP_PATHS = {
     Path("BACKLOG.md"),
 }
 
+# Directories under docs/ that document test fixtures for the code beside
+# them rather than Agora itself. They stay in the repository, off the website.
+SKIP_DIRS = (Path("docs/plugins/fixtures"),)
+
 H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$")
 MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)(?:\s+[\"'][^\"']*[\"'])?\)")
 SLUG_CLEAN_RE = re.compile(r"[^a-z0-9]+")
@@ -61,14 +65,19 @@ EMPHASIS_RE = re.compile(r"(\*{1,3}|_{1,3})(.+?)\1")
 # Audience/group classification for the website's grouped documentation nav.
 #
 # audience is the top-level split the site navigates by:
-#   user      - anyone running Agora, including power users driving the CLI
-#   developer - contributors, curators, maintainers, and operators
-#   internal  - working notes and archived plans; still published so no
-#               cross-reference 404s, but kept out of the main nav
+#   desktop   - people using the desktop app; shown with the hand-written
+#               "Desktop App Users" links at the top of the site's navigation
+#   user      - people driving the CLI
+#   developer - contributors, curators, plugin authors, maintainers, and
+#               operators; a collapsed section in the site's navigation
+#   internal  - the default for a page nobody has classified yet; still
+#               published so links to it work, under "Unsorted pages"
 #
 # Rules are matched longest-prefix-first against the repo-relative POSIX path,
 # so a directory prefix ("docs/architecture/") classifies everything under it.
 DOC_CATEGORIES: dict[str, tuple[str, str]] = {
+    "docs/DESKTOP_TROUBLESHOOTING.md": ("desktop", "Get help"),
+    "docs/FAQ.md": ("desktop", "Get help"),
     "docs/TROUBLESHOOTING.md": ("user", "Fix a problem"),
     "docs/SUPPORT.md": ("user", "Fix a problem"),
     "docs/CLI.md": ("user", "Power tools"),
@@ -76,36 +85,36 @@ DOC_CATEGORIES: dict[str, tuple[str, str]] = {
     "REGISTRY_CURATION_REFERENCE.md": ("developer", "Contribute and curate"),
     "docs/README.md": ("developer", "Contribute and curate"),
     "docs/DEVELOPMENT.md": ("developer", "Build Agora"),
-    "docs/desktop-native-smoke-checklist.md": ("developer", "Build Agora"),
     "docs/architecture/": ("developer", "Architecture"),
+    "docs/plugins/": ("developer", "Write plugins"),
     "docs/RELEASING.md": ("developer", "Ship and operate"),
     "docs/GOVERNANCE_OPERATIONS.md": ("developer", "Ship and operate"),
-    "docs/archive/": ("internal", "Archive"),
 }
 
 DEFAULT_CATEGORY = ("internal", "Working notes")
 
 # Display order for the website's grouped nav. Groups not listed here sort
 # last, alphabetically, so a new group is visible rather than silently hidden.
-AUDIENCE_ORDER = ["user", "developer", "internal"]
+AUDIENCE_ORDER = ["desktop", "user", "developer", "internal"]
 GROUP_ORDER = [
+    "Get help",
     "Fix a problem",
     "Power tools",
     "Contribute and curate",
     "Build Agora",
     "Architecture",
+    "Write plugins",
     "Ship and operate",
     "Working notes",
-    "Archive",
 ]
 
 
 def collect_doc_paths() -> list[Path]:
     """Return repo-relative markdown paths to publish on the website.
 
-    Includes every .md under docs/ (archives included as historical records)
-    plus the configured root-level documents, excluding internal files like
-    AGENTS.md / README.md / BACKLOG.md.
+    Includes every .md under docs/ except SKIP_DIRS, plus the configured
+    root-level documents, excluding internal files like AGENTS.md /
+    README.md / BACKLOG.md.
     """
     paths: set[Path] = set()
     if DOCS_ROOT.exists():
@@ -116,7 +125,11 @@ def collect_doc_paths() -> list[Path]:
         if candidate.exists():
             paths.add(Path(name))
     return sorted(
-        (p for p in paths if p not in SKIP_PATHS),
+        (
+            p
+            for p in paths
+            if p not in SKIP_PATHS and not any(d in p.parents for d in SKIP_DIRS)
+        ),
         key=lambda p: str(p).lower(),
     )
 

@@ -14,7 +14,7 @@
 //!    natives, assets, logging config) into the cache, verifying every hash.
 //!    For adopted profiles, artifacts are sourced from the installed `.minecraft`.
 //! 3. **Validate** – check files exist, Java meets requirements, main class set.
-//! 4. **Build command** – assemble the single canonical `PreparedCommand`.
+//! 4. **Build command** – assemble the single `PreparedCommand`.
 //! 5. **Spawn** – launch the JVM, return the child process handle.
 //! 6. **Wait & classify** – wait for exit and classify the outcome for LKG.
 //!
@@ -635,7 +635,7 @@ struct ResolvedPlanCacheEntry {
 
 /// Resolve a launch plan through a durable cache keyed by all inputs that can
 /// affect metadata resolution or Java selection. The cache is advisory: a
-/// missing, malformed, stale, or unusable entry falls back to the canonical
+/// missing, malformed, stale, or unusable entry falls back to the standard
 /// resolver and is replaced after success.
 pub async fn resolve_cached(request: ResolveRequest) -> LauncherResult<ResolvedLaunchPlan> {
     let started = std::time::Instant::now();
@@ -664,7 +664,7 @@ pub async fn resolve_cached(request: ResolveRequest) -> LauncherResult<ResolvedL
         }
     }
 
-    eprintln!("[launch-timing] resolve: durable plan cache miss, running canonical resolver");
+    eprintln!("[launch-timing] resolve: durable plan cache miss, running standard resolver");
     let plan = resolve(request.clone()).await?;
     // Resolution may populate previously missing version/profile metadata.
     // Bind the durable entry to the post-resolution state so the very next
@@ -1741,7 +1741,7 @@ async fn materialize_adopted_profile(
         }
         // This adoption path materializes content-addressed objects but does
         // not author legacy virtual/resource copies. It may consume a marker
-        // produced by the canonical materializer, but must not certify those
+        // produced by the materializer, but must not certify those
         // secondary outputs itself.
         if !index.virtual_ && !index.map_to_resources {
             write_asset_completion_marker(
@@ -1866,7 +1866,7 @@ pub fn validate(plan: &MaterializedLaunchPlan) -> LauncherResult<()> {
     Ok(())
 }
 
-/// Construct the single canonical Java command for both desktop and CLI.
+/// Construct the single Java command for both desktop and CLI.
 pub fn build_command(request: BuildCommandRequest<'_>) -> LauncherResult<PreparedCommand> {
     validate(request.plan)?;
     validate_user_jvm_args(request.user_jvm_args)?;

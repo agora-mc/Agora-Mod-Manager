@@ -52,7 +52,7 @@ pub struct DetectedLauncher {
     pub installation_key: String,
     pub kind: LauncherKind,
     pub display_name: String,
-    /// The canonical launcher data/config directory.
+    /// The resolved launcher data/config directory.
     pub config_root: PathBuf,
     /// The resolved directory containing instance subdirectories.
     pub instances_dir: PathBuf,
@@ -132,7 +132,7 @@ pub struct ImportCandidate {
     pub display_name: String,
     /// Absolute path to an icon file, if found.
     pub icon_path: Option<PathBuf>,
-    /// The canonical game-owned payload root directory.
+    /// The resolved game-owned payload root directory.
     pub payload_root: PathBuf,
     pub inventory: ContentInventory,
     /// The resolved loader tuple, if parseable.
@@ -283,7 +283,7 @@ const PRISM_IGNORED_COMPONENTS: &[&str] = &[
     "org.lwjgl3",
 ];
 
-/// Known loader UIDs and their canonical names.
+/// Known loader UIDs and their standard names.
 fn loader_for_uid(uid: &str) -> Option<(&'static str, &'static str)> {
     match uid {
         "net.fabricmc.fabric-loader" => Some(("fabric", "")),

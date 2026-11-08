@@ -347,7 +347,7 @@ async function expectReviewView(page: Page) {
 // The old standalone "Updates" panel on the Instances tab is gone: the
 // background sweep caches results and the instance editor's installed-content
 // panel owns the update actions. These tests follow that surface — check,
-// review the changelog, then the one canonical InstallFlow plan.
+// review the changelog, then the one InstallFlow plan.
 // ---------------------------------------------------------------------------
 
 /** Open the instance editor for one instance and check for updates. */
@@ -390,7 +390,7 @@ test.describe('Release C4 — updating installed content', () => {
     await expect(page.getByRole('button', { name: 'Update all 2 mods' })).toBeDisabled();
   });
 
-  test('update all reviews the changelog before opening the canonical InstallFlow', async ({ page }) => {
+  test('update all reviews the changelog before opening the InstallFlow', async ({ page }) => {
     await updatesSectionMock(page);
     await startUpdateAll(page);
 

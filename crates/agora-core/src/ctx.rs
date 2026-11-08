@@ -1,4 +1,4 @@
-//! Canonical core context — the dependency bag for every `agora-core` operation.
+//! Core context — the dependency bag for every `agora-core` operation.
 //!
 //! `Ctx` (aliased from `CoreContext`) is constructed once per host (Tauri GUI,
 //! CLI, MCP listener) and provides all shared resources: paths, HTTP clients,
@@ -65,7 +65,7 @@ impl Clock for TestClock {
 }
 
 // ---------------------------------------------------------------------------
-// CoreContext (canonical)
+// CoreContext
 // ---------------------------------------------------------------------------
 
 /// All shared resources for an Agora core session.
@@ -78,10 +78,10 @@ impl Clock for TestClock {
 /// # Type alias
 ///
 /// `pub type Ctx = CoreContext;` — prefer the shorter name when referring to
-/// the canonical context throughout the codebase.
+/// this context throughout the codebase.
 #[derive(Clone)]
 pub struct CoreContext {
-    /// Canonical path layout for this host.
+    /// Path layout for this host.
     pub paths: AppPaths,
     /// Where game packages should look for a game's own user data (an official
     /// launcher's files, a store's config) instead of the platform defaults.
@@ -112,7 +112,7 @@ pub struct CoreContext {
     pub games: Arc<crate::game_registry::GameRegistry>,
 }
 
-/// The canonical context type alias — use `Ctx` throughout the codebase.
+/// The main context type alias — use `Ctx` throughout the codebase.
 pub type Ctx = CoreContext;
 
 impl CoreContext {
@@ -708,7 +708,7 @@ impl std::fmt::Debug for CoreContext {
 }
 
 // ---------------------------------------------------------------------------
-// The canonical Ctx is CoreContext — no separate old-style Ctx remains.
+// Ctx is CoreContext — no separate old-style Ctx remains.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

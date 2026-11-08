@@ -607,24 +607,6 @@ impl RegistryService {
         get_known_conflicts(&conn)
     }
 
-    /// Check whether a registry item has status `under_review`.
-    ///
-    /// Returns `false` when the item does not exist or when the registry DB
-    /// cannot be opened (graceful degradation).
-    pub fn is_under_review(&self, item_id: &str) -> LauncherResult<bool> {
-        let conn = match self.connection() {
-            Ok(c) => c,
-            Err(_) => return Ok(false),
-        };
-        let mut stmt = match conn.prepare(
-            "SELECT 1 FROM registry_items WHERE id = ?1 AND status = 'under_review' LIMIT 1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Ok(false),
-        };
-        Ok(stmt.exists([item_id]).unwrap_or(false))
-    }
-
     // -----------------------------------------------------------------------
     // Governance schema-7 queries
     // -----------------------------------------------------------------------
@@ -932,7 +914,7 @@ fn query_game_items(
     Ok(out)
 }
 
-/// Canonical column list for `registry_items` selects that feed `row_to_item`.
+/// Shared column list for `registry_items` selects that feed `row_to_item`.
 ///
 /// Single source of truth: `browse_items` and `for_you_items` both select this
 /// exact list (with the `ri.` alias) so a schema column addition only needs
@@ -974,7 +956,7 @@ pub struct RegistryItem {
     /// Full markdown body hydrated from the upstream source. Community-authored
     /// markdown — must be rendered without `dangerouslySetInnerHTML`.
     pub body_markdown: Option<String>,
-    /// Canonical upstream page URL (e.g. https://modrinth.com/mod/<slug>).
+    /// Upstream page URL (e.g. https://modrinth.com/mod/<slug>).
     pub page_url: Option<String>,
     /// SPDX-ish license id hydrated from the upstream source.
     pub license_id: Option<String>,
@@ -1451,7 +1433,7 @@ pub fn pack_version_mods(
     rows.collect::<Result<Vec<_>, _>>().map_err(query_error)
 }
 
-/// A row from the `audit_log` transparency table (§4.6).
+/// A row from the `audit_log` table (§4.6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLogEntry {
     pub id: i64,
@@ -1530,7 +1512,7 @@ pub fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistryItem> {
     })
 }
 
-/// An under-review registry item for the Triage Center.
+/// An under-review registry item.
 #[derive(Debug, Clone, Serialize)]
 pub struct UnderReviewItem {
     pub id: String,
@@ -2082,7 +2064,7 @@ pub struct CuratedAnnotation {
 /// Lookup is intentionally by `registry_items.id`, not `modrinth_id`, so
 /// curated entries without a Modrinth link still surface. Callers passing a
 /// Modrinth project id will get `None` even if a curated entry for that
-/// Modrinth project exists — the registry id is the canonical identity, and
+/// Modrinth project exists — the registry id is the primary identity, and
 /// Modrinth-only results must be resolved to a registry id before being
 /// treated as curated.
 pub fn get_curated_annotation(
@@ -3659,7 +3641,7 @@ mod tests {
     fn test_get_curated_annotation_ignores_modrinth_id_lookup() {
         // Contract: a Modrinth project id passed as the lookup key must NOT
         // resolve to a curated entry even when one exists for that project;
-        // the registry id is the canonical identity and Modrinth-only results
+        // the registry id is the primary identity and Modrinth-only results
         // must be resolved to a registry id before receiving curated features.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("registry.db");
@@ -4287,7 +4269,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // RegistryService::known_conflicts / is_under_review tests
+    // RegistryService::known_conflicts / list_under_review_items tests
     // -------------------------------------------------------------------
 
     #[test]
@@ -4314,7 +4296,7 @@ mod tests {
     }
 
     #[test]
-    fn service_is_under_review_when_present() {
+    fn service_lists_under_review_items() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("registry.db");
         let conn = Connection::open(&db_path).unwrap();
@@ -4343,18 +4325,9 @@ mod tests {
         let ctx = Ctx::for_testing(dir.path().to_owned());
         let svc = RegistryService::new(ctx);
 
-        assert!(svc.is_under_review("review-mod").unwrap());
-        assert!(!svc.is_under_review("unknown-mod").unwrap());
-    }
-
-    #[test]
-    fn service_is_under_review_missing_registry_returns_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = Ctx::for_testing(dir.path().to_owned());
-        let svc = RegistryService::new(ctx);
-        // Graceful degradation: missing registry → false
-        let result = svc.is_under_review("anything").unwrap();
-        assert!(!result);
+        let items = svc.list_under_review_items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "review-mod");
     }
 }
 

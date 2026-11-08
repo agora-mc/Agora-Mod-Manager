@@ -45,9 +45,9 @@ const VOTE_STEPS_IN_APP = [
 ];
 
 const VOTE_STEPS_GITHUB = [
-  'Open the item’s canonical vote issue on GitHub — it carries the registry-vote label.',
+  'Open the item’s vote issue on GitHub — it carries the registry-vote label.',
   'React with +1 (👍) to upvote or -1 (👎) to downvote.',
-  'Only direct reactions on the canonical vote issue count. Reviews and comments never affect the score.',
+  'Only direct reactions on the vote issue count. Reviews and comments never affect the score.',
 ];
 
 export function Governance() {
@@ -61,8 +61,9 @@ export function Governance() {
         panel={
           <div className="max-w-3xl rounded-xl border border-white/15 bg-black/15 p-4 text-sm leading-6 text-white/80 backdrop-blur-xs sm:text-base">
             Agora is a <strong className="text-white">community-curated</strong> platform. Every
-            entry in the catalog is reviewed and voted on by people like you, and the community’s
-            scores decide what stays, what is promoted, and what is removed. Voting is how we keep
+            entry in the catalog is open to votes and reviews from people like you. Votes set each
+            entry’s score, which helps people find the best of the catalog, and curators make the
+            final call on what stays listed. Voting is how we keep
             the catalog a boutique selection of genuinely good content instead of a warehouse of
             whatever happens to be popular.
           </div>
@@ -142,7 +143,7 @@ export function Governance() {
             Every entry in the catalog is a flat, public manifest in the Agora repository. A
             nightly compiler turns those manifests into a signed catalog that your launcher
             downloads and verifies. The same pipeline reads the community’s votes, scores every
-            item, and publishes a transparent record of what changed and why.
+            item, and keeps a public record of any suspicious voting.
           </p>
           <p>
             <strong className="text-foreground">Reviews</strong> are structured, technical
@@ -154,8 +155,8 @@ export function Governance() {
           <p>
             Agora also watches for coordinated vote manipulation. Sudden, artificial bursts of
             votes are detected, quarantined, and reviewed by curators before they can distort the
-            list. Curators make the final call, and everything is logged publicly — there is no
-            hidden moderation.
+            list. Curators make the final call, and those decisions are recorded in the public repository —
+            there is no hidden moderation.
           </p>
         </div>
       </section>

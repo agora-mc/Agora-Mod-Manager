@@ -1252,25 +1252,6 @@ export const getRegistryItem = (itemId: string) =>
   invoke<RegistryItem | null>('get_registry_item', { itemId });
 export const listCategories = () => invoke<CategoryInfo[]>('list_categories');
 
-// --- Governance / Transparency Log ---
-
-/**
- * AuditLogEntry — mirrors the Rust `AuditLogEntry` struct in
- * desktop/src-tauri/src/registry.rs. Keep these two definitions in sync:
- * adding/removing/renaming a field on the Rust struct requires the same change
- * here, or the value will be silently dropped at the IPC boundary.
- * TODO: replace this hand-mirror with generated types (e.g. ts-rs) once a
- * codegen step is wired into the build.
- */
-export interface AuditLogEntry {
-  id: number;
-  timestamp: string;
-  action: string;
-  details: string | null;
-}
-
-export const listAuditLog = (limit?: number) =>
-  invoke<AuditLogEntry[]>('list_audit_log', { limit });
 export const checkRegistryUpdate = (force?: boolean) =>
   invoke<RegistryStatus>('check_registry_update', { force });
 export const getRegistryStatus = () => invoke<RegistryStatus>('get_registry_status');
@@ -2137,14 +2118,6 @@ export interface DiagnosticCheck {
   message: string;
 }
 
-export interface UnderReviewItem {
-  id: string;
-  name: string;
-  content_type: string;
-  icon_url: string | null;
-  net_score: number;
-}
-
 export interface ModReview {
   author: string | null;
   text: string;
@@ -2158,12 +2131,6 @@ export interface ModReview {
   evidence?: string | null;
   limitations?: string | null;
   issue_url?: string | null;
-}
-
-export interface TriagePoll {
-  discussion_url: string | null;
-  keep_votes: number;
-  remove_votes: number;
 }
 
 export const getGovernanceConfig = () =>
@@ -2186,17 +2153,8 @@ export const listGovernanceEvents = (itemId: string | null) =>
 export const runGovernanceDiagnostics = () =>
   invoke<DiagnosticCheck[]>('run_governance_diagnostics');
 
-export const listUnderReviewItems = () =>
-  invoke<UnderReviewItem[]>('list_under_review_items');
-
-export const listRecentResolutions = (limit?: number) =>
-  invoke<AuditLogEntry[]>('list_recent_resolutions', { limit });
-
 export const listModReviews = (itemId: string) =>
   invoke<ModReview[]>('list_mod_reviews', { itemId });
-
-export const fetchTriagePoll = (modId: string) =>
-  invoke<TriagePoll>('fetch_triage_poll', { modId });
 
 // --- Crash Investigation (guided isolation) ---
 
@@ -2211,12 +2169,13 @@ export interface SuspectScore {
   total_score: number;
   breakdown: Record<string, unknown>;
   is_dependent_of: string | null;
+  /** Curators are reviewing this catalog entry. Context only, not evidence of a cause. */
+  under_review: boolean;
 }
 
 export type SuggestedAction =
   | { kind: 'GuidedDisable'; next_suspect: SuspectScore }
   | { kind: 'ConfidenceAutoDisable'; mod_id: string; filename: string }
-  | { kind: 'ShowTriageBanner'; mod_id: string }
   | { kind: 'NoSuspects' };
 
 export interface InvestigationResult {

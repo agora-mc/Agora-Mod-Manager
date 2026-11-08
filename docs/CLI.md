@@ -1,5 +1,7 @@
 # Agora CLI reference
 
+### The Agora CLI is an advanced tool for AI agents and commandline familiar users. We do not recommend it for most users.
+
 The `agora` binary exposes the same core instance, catalog, health, launch, snapshot, runtime, install, and community-plugin services used by the desktop application. It is intended for advanced users, support diagnostics, scripting, and AI assistant apps.
 
 The CLI can modify the same data used by the desktop application. Read the safety section before experimenting.
@@ -815,10 +817,10 @@ The CLI MCP transport uses standard input/output. It is different from the deskt
 
 When an external client launches this command:
 
-- reserve standard input and output for JSON-RPC;
-- do not wrap it in a shell that injects banners;
-- keep the process local;
-- use Agora's approval and instance-locking controls for modifying tools.
+- Reserve standard input and output for JSON-RPC.
+- Do not wrap it in a shell that injects banners.
+- Keep the process local.
+- Use Agora's approval and instance-locking controls for modifying tools.
 
 The stdio transport reads one JSON-RPC request per line and writes one response per line. Notifications do not receive a response. Diagnostics remain on standard error so standard output stays protocol-only.
 
@@ -834,11 +836,11 @@ agora --output json registry status
 
 Do not parse human tables. For automation:
 
-1. select JSON explicitly;
-2. check the process exit code;
-3. capture standard error separately;
-4. tolerate additive JSON fields;
-5. never treat a printed success message as sufficient when the exit code is nonzero.
+1. Select JSON explicitly.
+2. Check the process exit code.
+3. Capture standard error separately.
+4. Tolerate additive JSON fields.
+5. Never treat a printed success message as sufficient when the exit code is nonzero.
 
 On a command failure in JSON mode, standard error contains an envelope shaped like:
 

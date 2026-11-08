@@ -368,7 +368,7 @@ test.describe('ModDetail Governance summary fields', () => {
 
 });
 
-test.describe('ModDetail canonical voting controls', () => {
+test.describe('ModDetail voting controls', () => {
   // These tests are about the vote itself; the first-vote explainer has its own describe.
   test.beforeEach(async ({ page }) => {
     await page.addInitScript(() => localStorage.setItem('agora-vote-explainer-acknowledged', '1'));

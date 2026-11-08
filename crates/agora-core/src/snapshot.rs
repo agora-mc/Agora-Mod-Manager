@@ -548,7 +548,7 @@ pub(crate) fn pre_restore_dir(instance_dir: &Path) -> PathBuf {
 /// their recorded hashes without rereading every object blob; restore still
 /// verifies object bytes before mutation. Legacy entries with no recorded hash
 /// are hashed from their archive bytes. This is also the
-/// canonical input for LKG/drift comparisons, ensuring both sides use the same
+/// shared input for LKG/drift comparisons, ensuring both sides use the same
 /// `mods/foo.jar` path format and the same tracked-entry set.
 pub fn snapshot_file_index(
     instance_dir: &Path,

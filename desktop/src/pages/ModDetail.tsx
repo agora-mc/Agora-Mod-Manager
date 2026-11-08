@@ -277,7 +277,7 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
   const [selectedModrinthCandidate, setSelectedModrinthCandidate] = useState<RawModrinthVersionCandidate | null>(null);
   const [phase, setPhase] = useState<'idle' | 'loadingVersions' | 'pickingVersion' | 'installing' | 'done' | 'error'>('idle');
   const [installMsg, setInstallMsg] = useState<string | null>(null);
-  const [canonicalInstall, setCanonicalInstall] = useState<{
+  const [pendingInstall, setPendingInstall] = useState<{
     intent: InstallIntent;
     instanceName: string;
   } | null>(null);
@@ -1116,7 +1116,7 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
     }
   };
 
-  const openCanonicalInstall = (
+  const openPendingInstall = (
     instanceId: string,
     sourceType: SourceType,
     sourceItemId: string,
@@ -1125,7 +1125,7 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
   ) => {
     const instance = instances.find((candidate) => candidate.instance_id === instanceId)
       ?? versionsTabInstances.find((candidate) => candidate.instance_id === instanceId);
-    setCanonicalInstall({
+    setPendingInstall({
       instanceName: instance?.name ?? instanceId,
       intent: {
         action: {
@@ -1151,7 +1151,7 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
   const handleConfirmInstall = () => {
     if (!selectedInstanceId) return;
     if (isModrinthInstall && selectedModrinthCandidate && item.modrinth_id) {
-      openCanonicalInstall(
+      openPendingInstall(
         selectedInstanceId,
         'modrinth',
         item.modrinth_id,
@@ -1161,7 +1161,7 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
       return;
     }
     if (selectedCandidate) {
-      openCanonicalInstall(selectedInstanceId, 'curated', itemId, selectedCandidate.version);
+      openPendingInstall(selectedInstanceId, 'curated', itemId, selectedCandidate.version);
     }
   };
 
@@ -1215,11 +1215,11 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
     }
   };
 
-  // Versions tab uses the same canonical plan and executor as the primary action.
+  // Versions tab uses the same plan and executor as the primary action.
   const handleInstallVersionFromTab = () => {
     if (!versionsTabInstanceId) return;
     if (selectedCuratedTabVersion) {
-      openCanonicalInstall(
+      openPendingInstall(
         versionsTabInstanceId,
         'curated',
         itemId,
@@ -1235,10 +1235,10 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
       // catalog resolver matches on it, and it is what Modrinth published the
       // row under.
       if (isRegistryBacked) {
-        openCanonicalInstall(versionsTabInstanceId, 'curated', itemId, selectedVersion.version);
+        openPendingInstall(versionsTabInstanceId, 'curated', itemId, selectedVersion.version);
         return;
       }
-      openCanonicalInstall(
+      openPendingInstall(
         versionsTabInstanceId,
         'modrinth',
         item.modrinth_id,
@@ -2053,16 +2053,16 @@ export function ModDetail({ itemId, initialInstanceId, requestedContentType, onB
         )}
 
 
-        {canonicalInstall && (
+        {pendingInstall && (
           <InstallFlow
             open
-            intent={canonicalInstall.intent}
-            instanceName={canonicalInstall.instanceName}
+            intent={pendingInstall.intent}
+            instanceName={pendingInstall.instanceName}
             onOpenInstance={onOpenInstanceEditor}
             onClose={() => {
-              setLastInstallTarget(canonicalInstall.intent.targetInstance);
+              setLastInstallTarget(pendingInstall.intent.targetInstance);
               setInstallRefresh((value) => value + 1);
-              setCanonicalInstall(null);
+              setPendingInstall(null);
             }}
           />
         )}
@@ -2986,7 +2986,7 @@ function PackCreateDialog({
   const [error, setError] = useState<string | null>(null);
   const [installPhase, setInstallPhase] = useState<'form' | 'installing'>('form');
   const [createdInstanceId, setCreatedInstanceId] = useState<string | null>(null);
-  const [canonicalInstall, setCanonicalInstall] = useState<InstallIntent | null>(null);
+  const [pendingInstall, setPendingInstall] = useState<InstallIntent | null>(null);
 
   // Curated packs come in two shapes: a locked release (exact target, pinned
   // mods — the build the curator tested) and the flexible recipe, aimed at any
@@ -3171,7 +3171,7 @@ function PackCreateDialog({
         const result = await createInstance(request);
         const createdId = result.instance_id;
         setCreatedInstanceId(createdId);
-        setCanonicalInstall({
+        setPendingInstall({
           action: {
             type: 'batch-install',
             items: packPlan.mods.map((mod) => ({
@@ -3441,16 +3441,16 @@ function PackCreateDialog({
         )}
 
       </div>
-      {canonicalInstall && createdInstanceId && (
+      {pendingInstall && createdInstanceId && (
         <InstallFlow
           open
-          intent={canonicalInstall}
+          intent={pendingInstall}
           instanceName={name || createdInstanceId}
           background
           onBackgroundStart={(plan) => startPlan(plan, `Installing ${packName}`, name || createdInstanceId)}
           onOpenInstance={onCreated}
           onClose={() => {
-            setCanonicalInstall(null);
+            setPendingInstall(null);
             onCancel();
           }}
         />

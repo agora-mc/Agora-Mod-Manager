@@ -7,7 +7,7 @@ import { Callout } from '@/components/GuideBody';
 export const metadata = {
   title: 'Documentation - Agora',
   description:
-    'Find the right Agora documentation: install and first run, task guides, troubleshooting, CLI reference, and contributor references.',
+    'Find the right Agora documentation: install and first run, Help & guide, troubleshooting, CLI reference, and contributor references.',
 };
 
 const ROUTES = [
@@ -21,13 +21,19 @@ const ROUTES = [
     href: '/docs/guides',
     heading: 'I want step-by-step guides for everything',
     body: 'Step-by-step guides for common tasks, from installing mods to sharing instances.',
-    cta: 'Task guides',
+    cta: 'Help & guide',
   },
   {
-    href: '/docs/troubleshooting',
+    href: '/docs/desktop-troubleshooting',
     heading: 'Something is not working',
-    body: 'Start from the symptom: launch blocked, loader mismatch, missing Java, crash after launch, offline failures.',
+    body: 'Start from what you are seeing: a crash, a blocked launch, the wrong Java, or an empty Browse page.',
     cta: 'Troubleshooting',
+  },
+  {
+    href: '/docs/faq',
+    heading: 'I have a quick question',
+    body: 'Short answers about accounts, mods, your data, and what Agora can do.',
+    cta: 'FAQ',
   },
   {
     href: '/docs/cli',
@@ -51,7 +57,7 @@ const WAYS_TO_READ = [
   },
   {
     href: '/docs/guides',
-    title: 'Walk me through it (task guides)',
+    title: 'Walk me through it (Help & guide)',
     body: 'Numbered steps for a specific task, assuming no prior modding knowledge. Every guide has this version.',
   },
   // {
@@ -79,24 +85,13 @@ const COMMON_QUESTIONS = [
   { href: '/docs/guides/controller-handheld', label: 'Can I use Agora with a controller?' },
 ];
 
-// Troubleshooting is already a primary route card on this page, so it is
-// skipped in the advanced and developer listing below to avoid duplication.
-const SLUGS_HIDDEN_FROM_LIBRARY = new Set(['troubleshooting']);
-
 export default async function DocsPage() {
   const sections = await getDocNav();
-  const library = sections
-    .filter((section) => section.audience !== 'internal')
-    .map((section) => ({
-      ...section,
-      groups: section.groups
-        .map((group) => ({
-          ...group,
-          docs: group.docs.filter((doc) => !SLUGS_HIDDEN_FROM_LIBRARY.has(doc.slug)),
-        }))
-        .filter((group) => group.docs.length > 0),
-    }))
-    .filter((section) => section.groups.length > 0);
+  // Desktop pages are already primary route cards above, so this listing only
+  // covers the advanced and developer docs.
+  const library = sections.filter(
+    (section) => section.audience !== 'internal' && section.audience !== 'desktop'
+  );
   const guideCount = getGuideTopics().length;
 
   return (
@@ -174,7 +169,7 @@ export default async function DocsPage() {
       <section>
         <h2 className="text-2xl font-bold">Common Questions</h2>
         <p className="mt-2 text-gray-600 dark:text-gray-300">
-          Links to the Task Guide section that answers it.
+          Links to the Help &amp; guide topic that answers it.
         </p>
         <ul className="mt-4 grid gap-2 sm:grid-cols-2">
           {COMMON_QUESTIONS.map((question) => (
@@ -192,7 +187,7 @@ export default async function DocsPage() {
           href="/docs/guides"
           className="mt-4 inline-flex font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
         >
-          All {guideCount} task guides
+          All {guideCount} guides
         </Link>
       </section>
 

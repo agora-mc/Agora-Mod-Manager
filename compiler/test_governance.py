@@ -606,7 +606,7 @@ class TestPipelineMocked(unittest.TestCase):
         state = json.loads(self.gs.read_text(encoding="utf-8"))
         self.assertEqual(len(state.get("events", [])), 0)
 
-    def test_canonical_pack_id_participates_in_governance(self):
+    def test_pack_id_participates_in_governance(self):
         self.vi.write_text(json.dumps({
             "schema_version": 1,
             "items": {"optimized-survival": {"issue_number": 6}},

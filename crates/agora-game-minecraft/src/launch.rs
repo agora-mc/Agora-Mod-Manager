@@ -10,7 +10,7 @@
 //!
 //! # Removed (managed installer path)
 //! `InstallProfile`, `Processor`, `ProcessorData`, `parse_pinned_installer`,
-//! `read_bounded_zip_entry`, `canonical_version_json`, `ResolvedInstallerPlan`,
+//! `read_bounded_zip_entry`, `stable_version_json`, `ResolvedInstallerPlan`,
 //! The previous managed-installer orchestration and its staging types have
 //! been removed; the official pinned installer is the sole install authority.
 //! Forge/NeoForge launch uses the installed-profile adoption path only.

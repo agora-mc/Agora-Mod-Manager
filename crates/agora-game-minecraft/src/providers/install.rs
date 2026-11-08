@@ -425,7 +425,7 @@ impl CuratedProviderPack {
     }
 }
 
-/// SHA-256 over a plan's canonical JSON.
+/// SHA-256 over a plan's stable JSON.
 ///
 /// This is what a curator pins for a `provider_pack` entry. It covers every
 /// file's path, URL and published digest, so it changes if the provider ever

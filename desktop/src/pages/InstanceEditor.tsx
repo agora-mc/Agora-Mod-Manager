@@ -588,7 +588,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
   // A Minecraft version migration is being applied (reported by the migrate tab,
   // which can be left while it runs).
   const [migrationBusy, setMigrationBusy] = useState(false);
-  const [canonicalOperation, setCanonicalOperation] = useState<{
+  const [installOperation, setInstallOperation] = useState<{
     intent: InstallIntent;
     instanceName: string;
   } | null>(null);
@@ -1081,8 +1081,8 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     }
   };
 
-  const beginCanonicalOperation = (action: InstallIntent['action']) => {
-    setCanonicalOperation({
+  const beginInstallOperation = (action: InstallIntent['action']) => {
+    setInstallOperation({
       instanceName: detail?.row.name ?? instanceId,
       intent: {
         action,
@@ -1098,9 +1098,9 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     });
   };
 
-  /** Canonical operation targeting an EXPLICIT instance (SOL-2 §19.4). */
-  const beginCanonicalOperationFor = (targetId: string, targetName: string, action: InstallIntent['action']) => {
-    setCanonicalOperation({
+  /** Install operation targeting an EXPLICIT instance (SOL-2 §19.4). */
+  const beginInstallOperationFor = (targetId: string, targetName: string, action: InstallIntent['action']) => {
+    setInstallOperation({
       instanceName: targetName,
       intent: {
         action,
@@ -1121,7 +1121,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       title: `Review a safe removal plan for "${filename}"?`,
     })) return;
     setError(null);
-    beginCanonicalOperation({ type: 'remove', filename });
+    beginInstallOperation({ type: 'remove', filename });
   };
 
   const handleBulkRemove = async (rows: InstalledContentRow[]): Promise<boolean> => {
@@ -1134,7 +1134,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       title: `Review one safe removal plan for ${filenames.length} selected item${filenames.length === 1 ? '' : 's'} (${preview})?`,
     })) return false;
     setError(null);
-    beginCanonicalOperation({ type: 'batch-remove', filenames });
+    beginInstallOperation({ type: 'batch-remove', filenames });
     return true;
   };
 
@@ -1239,7 +1239,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
 
   /** Apply a reviewed set of updates as one transaction. */
   const applyUpdates = (updates: UpdateInfo[]) => {
-    beginCanonicalOperation({
+    beginInstallOperation({
       type: 'batch-update',
       items: updates.map((update) => ({ itemId: update.mod_jar_id, targetVersion: update.target_version })),
     });
@@ -1351,7 +1351,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
 
     setPackProgress(null);
     setPackInstallOpen(false);
-    beginCanonicalOperation({ type: 'batch-install', items });
+    beginInstallOperation({ type: 'batch-install', items });
   };
 
   const handleDismissPackProgress = () => {
@@ -1528,7 +1528,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
     setStatus(null);
     const path = await pickOpenFile('Import Mod', ['jar']);
     if (path === null) return;
-    beginCanonicalOperation({
+    beginInstallOperation({
       type: 'install',
       sourceType: 'manual',
       itemId: path.split(/[\\/]/).pop() ?? 'manual-mod',
@@ -1553,7 +1553,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       const ext = file.name.toLowerCase();
       // .jar → manual mod install
       if (ext.endsWith('.jar')) {
-        beginCanonicalOperation({
+        beginInstallOperation({
           type: 'install',
           sourceType: 'manual',
           itemId: file.name,
@@ -1629,7 +1629,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
       }).length;
       setLockfileNotice(
         unresolved === 0
-          ? 'Canonical lockfile exported. It contains hashes and settings, never private config contents.'
+          ? 'Lockfile exported. It contains hashes and settings, never private config contents.'
           : `Lockfile exported with ${unresolved} unreproducible artifact${unresolved === 1 ? '' : 's'} clearly marked. Verification still works, but clone and repair will refuse substitution.`,
       );
     } catch (cause) {
@@ -2033,13 +2033,13 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                         return;
                       }
                       leaveInteractiveForBridge();
-                      beginCanonicalOperationFor(id, fresh?.row.name ?? id, { type: 'remove', filename });
+                      beginInstallOperationFor(id, fresh?.row.name ?? id, { type: 'remove', filename });
                       return;
                     }
                     if ((action === 'install' || action === 'update') && installed?.registry_id) {
                       leaveInteractiveForBridge();
                       if (action === 'install') {
-                        beginCanonicalOperationFor(id, fresh?.row.name ?? id, {
+                        beginInstallOperationFor(id, fresh?.row.name ?? id, {
                           type: 'install',
                           sourceType: 'curated',
                           itemId: installed.registry_id,
@@ -3877,7 +3877,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
           onClose={() => setOrphans([])}
           onConfirm={(filenames) => {
             setOrphans([]);
-            beginCanonicalOperation({ type: 'batch-remove', filenames });
+            beginInstallOperation({ type: 'batch-remove', filenames });
           }}
         />
       )}
@@ -3910,13 +3910,13 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
         />
       )}
 
-      {canonicalOperation && (
+      {installOperation && (
         <InstallFlow
           open
-          intent={canonicalOperation.intent}
-          instanceName={canonicalOperation.instanceName}
+          intent={installOperation.intent}
+          instanceName={installOperation.instanceName}
           background
-          onBackgroundStart={(plan) => startPlan(plan, `${describePlanAction(plan).verb} in ${canonicalOperation.instanceName}`, canonicalOperation.instanceName)}
+          onBackgroundStart={(plan) => startPlan(plan, `${describePlanAction(plan).verb} in ${installOperation.instanceName}`, installOperation.instanceName)}
           onOpenInstance={onOpenInstanceEditor}
           onSuccess={(targetId) => {
             // Invalidate the view: the cache lists updates that were just
@@ -3932,7 +3932,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
             // Only a removal can strand a dependency, and the answer is read
             // from the manifest as it now stands rather than modelled from the
             // plan — so this is a plain question, asked once, after the fact.
-            const action = canonicalOperation?.intent.action.type;
+            const action = installOperation?.intent.action.type;
             if (action === 'remove' || action === 'batch-remove') {
               void getOrphanedDependencies(targetId)
                 .then(setOrphans)
@@ -3940,7 +3940,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
             }
           }}
            onClose={() => {
-              setCanonicalOperation(null);
+              setInstallOperation(null);
               void reloadInstance().catch((cause) => setError(formatError(cause)));
             }}
         />

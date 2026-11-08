@@ -78,7 +78,7 @@ fn content_subdir(content_type: &str) -> &str {
     }
 }
 
-/// Read through the canonical loader so a profile application heals and
+/// Read through the shared loader so a profile application heals and
 /// re-stamps the manifest exactly like every other write path. A local reader
 /// here used to skip both, which meant toggling a loadout could quietly undo a
 /// manifest heal.

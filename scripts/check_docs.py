@@ -31,7 +31,7 @@ Checks:
   blob-main       stale `blob/main` GitHub links (default branch is master)
   launch-mode     claims that Agora always delegates / never launches
                   directly, or that direct launch is the global default
-  spelling        canonical product spelling: Modrinth, NeoForge,
+  spelling        official product spelling: Modrinth, NeoForge,
                   Last Known Good, Crash Doctor
   installer-size  fixed installer-size claims ("~10-15 MB" style)
   workflow-refs   references to .github/workflows files that do not exist
@@ -115,7 +115,7 @@ LAUNCH_MODE_PATTERNS = [
     r"always\s+launch\w*\s+directly",
 ]
 
-CANONICAL_SPELLING = [
+APPROVED_SPELLING = [
     ("Modrinth", [r"\bmodrinth\b"]),
     ("NeoForge", [r"\bneoforge\b"]),
     ("Last Known Good", [r"\blast-known-good\b", r"\blast known good\b"]),
@@ -459,7 +459,7 @@ def check_spelling() -> list[Finding]:
     findings = []
     for path in PROSE_MARKDOWN + PROSE_TSX + [GUIDE_CONTENT]:
         for i, line in iter_prose_lines(path):
-            for name, patterns in CANONICAL_SPELLING:
+            for name, patterns in APPROVED_SPELLING:
                 for pat_src in patterns:
                     for m in re.finditer(pat_src, line, re.IGNORECASE):
                         if re.match(r"\.(?:png|jpe?g|webp|svg)\b", line[m.end() :], re.IGNORECASE):
@@ -470,8 +470,8 @@ def check_spelling() -> list[Finding]:
                                     "spelling",
                                     path,
                                     i,
-                                    f'non-canonical spelling "{m.group(0)}" '
-                                    f"(canonical: {name})",
+                                    f'non-standard spelling "{m.group(0)}" '
+                                    f"(preferred: {name})",
                                 )
                             )
     return findings

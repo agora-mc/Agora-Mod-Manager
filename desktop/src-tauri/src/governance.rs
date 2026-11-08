@@ -11,16 +11,16 @@
 //! - Required labels and Issue forms via read-only REST requests
 //!
 //! Diagnostics remain read-only. Item voting mutates only the authenticated
-//! user's direct reaction on a registry-mapped canonical voting issue.
+//! user's direct reaction on a registry-mapped voting issue.
 
 use crate::error::{LauncherError, LauncherResult};
 
-use agora_core::governance::{checked_github_graphql, github_headers, GovernanceService};
+use agora_core::governance::{github_headers, GovernanceService};
 pub use agora_core::governance::{
     resolve_github_app_slug, resolve_governance_config as core_resolve_config,
     resolve_governance_environment, resolve_governance_repo,
     run_governance_diagnostics as core_sync_checks, DiagnosticCheck, DiagnosticStatus,
-    GovernanceConfig, GovernanceEnvironment, GovernanceEvent, GovernanceSummary, TriagePoll,
+    GovernanceConfig, GovernanceEnvironment, GovernanceEvent, GovernanceSummary,
 };
 use agora_core::registry::RegistryService;
 use tauri::AppHandle;
@@ -156,7 +156,7 @@ fn resolve_vote_target(app: &AppHandle, item_id: &str) -> LauncherResult<VoteTar
         .filter(|number| *number > 0)
         .ok_or_else(|| LauncherError::Generic {
             code: "ERR_GOVERNANCE_NO_VOTE_ISSUE".to_string(),
-            message: "This item does not have a canonical voting issue.".to_string(),
+            message: "This item does not have a voting issue.".to_string(),
         })?;
 
     let config = governance.config();
@@ -339,7 +339,7 @@ async fn fetch_vote_snapshot(app: &AppHandle, target: &VoteTarget) -> LauncherRe
         .and_then(|repository| repository.issue)
         .ok_or_else(|| LauncherError::Generic {
             code: "ERR_GOVERNANCE_VOTE_ISSUE_GONE".to_string(),
-            message: "The canonical voting issue could not be found.".to_string(),
+            message: "The voting issue could not be found.".to_string(),
         })?;
 
     let mut snapshot = VoteSnapshot {
@@ -394,7 +394,7 @@ async fn apply_vote_mutation(
     Ok(())
 }
 
-/// Return the authenticated user's direct vote on an item's canonical issue.
+/// Return the authenticated user's direct vote on an item's vote issue.
 pub async fn get_item_vote(app: &AppHandle, item_id: String) -> LauncherResult<ItemVoteState> {
     let target_app = app.clone();
     let target = tokio::task::spawn_blocking(move || resolve_vote_target(&target_app, &item_id))
@@ -482,258 +482,6 @@ pub async fn run_network_diagnostics(app: &AppHandle) -> Vec<DiagnosticCheck> {
         }
     };
     agora_core::governance::run_network_diagnostics(&ctx).await
-}
-
-// --- Triage poll (read-only GraphQL) ---
-
-pub async fn fetch_triage_poll(app: &AppHandle, mod_id: String) -> LauncherResult<TriagePoll> {
-    let mut token = crate::auth::get_valid_access_token(app)
-        .await
-        .ok_or(LauncherError::AuthRequired)?;
-
-    let _permit = agora_core::github_ratelimit::acquire_github_permit().await;
-    let ctx = crate::core_context(app)?;
-
-    let governance_repo_str = resolve_governance_repo();
-    let search_query = format!(
-        "repo:{owner}/{repo} [Community Triage] {mod_id}",
-        owner = governance_repo_str.split('/').next().unwrap_or(""),
-        repo = governance_repo_str.split('/').nth(1).unwrap_or(""),
-        mod_id = mod_id,
-    );
-
-    let search_body = serde_json::json!({
-        "query": r#"
-            query ($q: String!) {
-              search(query: $q, type: DISCUSSION, first: 5) {
-                nodes {
-                  ... on Discussion {
-                    id
-                    url
-                    title
-                  }
-                }
-              }
-            }
-        "#,
-        "variables": { "q": search_query },
-    });
-
-    let mut resp = checked_github_graphql(&ctx.http_clients, &token, &search_body)
-        .await
-        .map_err(|_| LauncherError::NetworkOffline)?;
-
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        crate::auth::log_line("GitHub token expired during triage poll search; attempting refresh");
-        if agora_core::auth::try_refresh_after_401_with_token(&token)
-            .await
-            .is_ok()
-        {
-            if let Some(new_token) = crate::auth::get_valid_access_token(app).await {
-                token = new_token;
-                let retry_resp = checked_github_graphql(&ctx.http_clients, &token, &search_body)
-                    .await
-                    .map_err(|_| LauncherError::NetworkOffline)?;
-                if retry_resp.status() != reqwest::StatusCode::UNAUTHORIZED {
-                    resp = retry_resp;
-                } else {
-                    let _ = crate::auth::clear_token(app);
-                    return Err(LauncherError::AuthExpired);
-                }
-            }
-        } else {
-            let _ = crate::auth::clear_token(app);
-            return Err(LauncherError::AuthExpired);
-        }
-    }
-    if agora_core::github_ratelimit::is_rate_limit_response(&resp) {
-        let retry = agora_core::github_ratelimit::parse_retry_after(&resp);
-        agora_core::github_ratelimit::report_rate_limit(retry).await;
-        return Err(LauncherError::Generic {
-            code: "ERR_RATE_LIMITED".to_string(),
-            message: format!("GitHub rate limited triage poll for {mod_id}."),
-        });
-    }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = agora_core::http_client::checked_response_text(
-            resp,
-            agora_core::http_client::ClientCategory::GitHub,
-        )
-        .await
-        .unwrap_or_default();
-        return Err(LauncherError::Generic {
-            code: "ERR_TRIAGE_POLL".to_string(),
-            message: format!("Triage poll search failed (status {status}): {body}"),
-        });
-    }
-
-    // (remaining fetch_triage_poll is unchanged; see previous impl)
-    // Deserialize search results
-    #[derive(Debug, serde::Deserialize)]
-    struct SearchResponse {
-        search: Option<SearchPayload>,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    struct SearchPayload {
-        nodes: Option<Vec<DiscussionNode>>,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    struct DiscussionNode {
-        id: String,
-        url: String,
-        title: String,
-    }
-
-    let search_text = agora_core::http_client::checked_response_text(
-        resp,
-        agora_core::http_client::ClientCategory::GitHub,
-    )
-    .await
-    .map_err(|_| LauncherError::Generic {
-        code: "ERR_TRIAGE_POLL".to_string(),
-        message: "Failed to parse triage poll search response.".to_string(),
-    })?;
-    let search_resp: SearchResponse =
-        serde_json::from_str(&search_text).map_err(|_| LauncherError::Generic {
-            code: "ERR_TRIAGE_POLL".to_string(),
-            message: "Failed to parse triage poll search response.".to_string(),
-        })?;
-
-    let nodes = search_resp.search.and_then(|s| s.nodes).unwrap_or_default();
-    let discussion = nodes
-        .into_iter()
-        .find(|d| d.title.contains(&mod_id))
-        .ok_or_else(|| LauncherError::Generic {
-            code: "ERR_TRIAGE_POLL".to_string(),
-            message: format!("No triage discussion found for mod '{mod_id}'."),
-        })?;
-
-    let reactions_body = serde_json::json!({
-        "query": r#"
-            query ($id: ID!) {
-              node(id: $id) {
-                ... on Discussion {
-                  url
-                  reactions(first: 100) {
-                    nodes {
-                      user { login }
-                      content
-                    }
-                  }
-                }
-              }
-            }
-        "#,
-        "variables": { "id": discussion.id },
-    });
-
-    let mut resp2 = checked_github_graphql(&ctx.http_clients, &token, &reactions_body)
-        .await
-        .map_err(|_| LauncherError::NetworkOffline)?;
-
-    if resp2.status() == reqwest::StatusCode::UNAUTHORIZED {
-        crate::auth::log_line(
-            "GitHub token expired during triage poll reactions; attempting refresh",
-        );
-        if agora_core::auth::try_refresh_after_401_with_token(&token)
-            .await
-            .is_ok()
-        {
-            if let Some(new_token) = crate::auth::get_valid_access_token(app).await {
-                token = new_token;
-                let retry_resp = checked_github_graphql(&ctx.http_clients, &token, &reactions_body)
-                    .await
-                    .map_err(|_| LauncherError::NetworkOffline)?;
-                if retry_resp.status() != reqwest::StatusCode::UNAUTHORIZED {
-                    resp2 = retry_resp;
-                } else {
-                    let _ = crate::auth::clear_token(app);
-                    return Err(LauncherError::AuthExpired);
-                }
-            }
-        } else {
-            let _ = crate::auth::clear_token(app);
-            return Err(LauncherError::AuthExpired);
-        }
-    }
-    if agora_core::github_ratelimit::is_rate_limit_response(&resp2) {
-        let retry = agora_core::github_ratelimit::parse_retry_after(&resp2);
-        agora_core::github_ratelimit::report_rate_limit(retry).await;
-        return Err(LauncherError::Generic {
-            code: "ERR_RATE_LIMITED".to_string(),
-            message: format!("GitHub rate limited triage poll reactions for {mod_id}."),
-        });
-    }
-    if !resp2.status().is_success() {
-        let status = resp2.status();
-        let body = agora_core::http_client::checked_response_text(
-            resp2,
-            agora_core::http_client::ClientCategory::GitHub,
-        )
-        .await
-        .unwrap_or_default();
-        return Err(LauncherError::Generic {
-            code: "ERR_TRIAGE_POLL".to_string(),
-            message: format!("Triage poll reactions failed (status {status}): {body}"),
-        });
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct ReactionsResponse {
-        node: Option<ReactionsPayload>,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    struct ReactionsPayload {
-        reactions: Option<ReactionsPayloadInner>,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    struct ReactionsPayloadInner {
-        nodes: Option<Vec<ReactionNode>>,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    struct ReactionNode {
-        content: String,
-    }
-
-    let reactions_text = agora_core::http_client::checked_response_text(
-        resp2,
-        agora_core::http_client::ClientCategory::GitHub,
-    )
-    .await
-    .map_err(|_| LauncherError::Generic {
-        code: "ERR_TRIAGE_POLL".to_string(),
-        message: "Failed to parse triage poll reactions response.".to_string(),
-    })?;
-    let reactions_resp: ReactionsResponse =
-        serde_json::from_str(&reactions_text).map_err(|_| LauncherError::Generic {
-            code: "ERR_TRIAGE_POLL".to_string(),
-            message: "Failed to parse triage poll reactions response.".to_string(),
-        })?;
-
-    let (keep_votes, remove_votes) = reactions_resp
-        .node
-        .and_then(|n| n.reactions)
-        .and_then(|r| r.nodes)
-        .map(|nodes| {
-            let mut keep = 0i64;
-            let mut remove = 0i64;
-            for rxn in nodes {
-                match rxn.content.as_str() {
-                    "THUMBS_UP" | "+1" | "HOORAY" => keep += 1,
-                    "THUMBS_DOWN" | "-1" => remove += 1,
-                    _ => {}
-                }
-            }
-            (keep, remove)
-        })
-        .unwrap_or((0, 0));
-
-    Ok(TriagePoll {
-        discussion_url: Some(discussion.url),
-        keep_votes,
-        remove_votes,
-    })
 }
 
 #[cfg(test)]

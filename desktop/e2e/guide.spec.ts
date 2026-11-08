@@ -86,7 +86,7 @@ test('switches experience levels and searches all guide content', async ({ page 
   await expect(page.getByText(/Connection details for setting up an app by hand/)).toBeVisible();
 
   await page.getByRole('button', { name: /^Basic guide Clear/ }).click();
-  await expect(page.getByText(/MCP is an advanced optional bridge/)).toBeVisible();
+  await expect(page.getByText(/MCP is an advanced and optional bridge/)).toBeVisible();
 });
 
 test('tracks completed pages and restores the selected guide page', async ({ page }) => {

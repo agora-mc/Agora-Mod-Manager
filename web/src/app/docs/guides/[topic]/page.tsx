@@ -17,7 +17,7 @@ export async function generateMetadata({
   const topic = getGuideTopic(id);
   if (!topic) return { title: 'Guide not found — Agora' };
   return {
-    title: `${topic.title} — Agora Guides`,
+    title: `${topic.title} — Agora Help & guide`,
     description: topic.description,
   };
 }
@@ -41,7 +41,7 @@ export default async function GuideTopicPage({
         </Link>
         <span aria-hidden="true"> / </span>
         <Link href="/docs/guides" className="hover:text-indigo-600 dark:hover:text-indigo-400">
-          Task guides
+          Help &amp; guide
         </Link>
         <span aria-hidden="true"> / </span>
         <span className="text-gray-700 dark:text-gray-300">{topic.shortTitle}</span>

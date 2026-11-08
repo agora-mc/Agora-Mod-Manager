@@ -127,7 +127,7 @@ describe('live intent controller (SOL-2 BLOCKER 2)', () => {
     if (result.status === 'blocked') expect(result.gate).toBe('missing-source');
   });
 
-  it('blocks a review while a canonical operation is busy (availability gate)', () => {
+  it('blocks a review while an install operation is busy (availability gate)', () => {
     const result = routeLiveIntent(
       freshScene(),
       { kind: 'review-health' },

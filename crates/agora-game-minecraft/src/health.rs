@@ -626,18 +626,18 @@ struct CapabilityProvider {
 /// physical file at most once per resolved ID.
 ///
 /// The same JAR can expose several raw IDs that a curated alias map collapses
-/// to one canonical ID. That is one installed file, not a duplicate.
+/// to one resolved ID. That is one installed file, not a duplicate.
 fn resolve_id_file_index(
     raw_index: HashMap<String, Vec<String>>,
     aliases: &AliasMap,
 ) -> HashMap<String, Vec<String>> {
     let mut resolved = HashMap::new();
     for (id, files) in raw_index {
-        let canonical = aliases.resolve_or_self(&id).to_lowercase();
-        let canonical_files = resolved.entry(canonical).or_insert_with(Vec::new);
+        let resolved_id = aliases.resolve_or_self(&id).to_lowercase();
+        let resolved_files = resolved.entry(resolved_id).or_insert_with(Vec::new);
         for file in files {
-            if !canonical_files.contains(&file) {
-                canonical_files.push(file);
+            if !resolved_files.contains(&file) {
+                resolved_files.push(file);
             }
         }
     }
@@ -691,12 +691,12 @@ fn resolve_capability_providers(
             // ships them, but a Sodium/Mod Menu that merely bundles
             // `fabric-api-base` must not stand in for a missing `fabric-api`:
             // the loader asks for the umbrella id and fails.
-            let canonical = if is_nested {
+            let resolved_id = if is_nested {
                 id.to_lowercase()
             } else {
                 aliases.resolve_or_self(id).to_lowercase()
             };
-            let entries = providers.entry(canonical).or_insert_with(Vec::new);
+            let entries = providers.entry(resolved_id).or_insert_with(Vec::new);
             if !entries
                 .iter()
                 .any(|provider: &CapabilityProvider| provider.owner_filename == installed.filename)
@@ -1387,7 +1387,7 @@ fn health_from_inventory(
     for ij in &jars {
         let source = &ij.filename;
         let source_mod_id = ij.metadata.mod_jar_id.as_deref();
-        // Canonicalize the SOURCE id through aliases BEFORE lookup so curated
+        // Resolve the SOURCE id through aliases BEFORE lookup so curated
         // overrides keyed by the registry id still match a raw jar id.
         let source_resolved = source_mod_id.map(|id| aliases.resolve_or_self(id).to_lowercase());
 

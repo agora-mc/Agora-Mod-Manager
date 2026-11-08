@@ -25,7 +25,7 @@ pub enum GcProfile {
     Manual,
 }
 
-/// Canonical persisted JVM garbage-collector selection.
+/// Persisted JVM garbage-collector selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GcSelection {
@@ -40,7 +40,7 @@ pub enum GcSelection {
 }
 
 impl GcSelection {
-    /// Parse new caller input strictly, accepting only canonical values and
+    /// Parse new caller input strictly, accepting only normalized values and
     /// the aliases that have historically been sent by callers.
     pub fn from_input(value: &str) -> Option<Self> {
         let normalized = value.trim().to_ascii_lowercase();
@@ -62,7 +62,7 @@ impl GcSelection {
         }
     }
 
-    /// Return the canonical value used for new persistence writes.
+    /// Return the normalized value used for new persistence writes.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_selection_input_is_strict_and_canonical() {
+    fn gc_selection_input_is_strict_and_normalized() {
         let accepted = [
             ("auto", GcSelection::Auto, "auto"),
             ("manual", GcSelection::Manual, "manual"),

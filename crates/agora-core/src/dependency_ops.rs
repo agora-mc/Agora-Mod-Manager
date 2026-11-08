@@ -312,12 +312,12 @@ impl JarDeps {
 // 2. Alias normalization
 // ---------------------------------------------------------------------------
 
-/// In-memory alias map: lowercase alias → canonical registry_id.
+/// In-memory alias map: lowercase alias → resolved registry_id.
 ///
 /// Built from `(registry_id, alias)` tuples returned by
 /// `registry::get_all_mod_aliases()`. Each alias is lowercased and mapped
-/// to its canonical registry_id. The canonical id itself (lowercased) is
-/// also inserted so the canonical id is always resolvable.
+/// to its resolved registry_id. The resolved id itself (lowercased) is
+/// also inserted so the resolved id is always resolvable.
 pub struct AliasMap {
     map: std::collections::HashMap<String, String>,
 }
@@ -327,21 +327,21 @@ impl AliasMap {
     pub fn from_pairs(pairs: &[(String, String)]) -> Self {
         let mut map = std::collections::HashMap::new();
         for (registry_id, alias) in pairs {
-            let canonical = registry_id.to_lowercase();
-            map.insert(alias.to_lowercase(), canonical.clone());
-            // Also map the canonical id itself so it is always resolvable.
-            map.insert(canonical.clone(), canonical);
+            let resolved = registry_id.to_lowercase();
+            map.insert(alias.to_lowercase(), resolved.clone());
+            // Also map the resolved id itself so it is always resolvable.
+            map.insert(resolved.clone(), resolved);
         }
         Self { map }
     }
 
-    /// Look up `id` in the alias map. Returns the canonical registry_id
+    /// Look up `id` in the alias map. Returns the resolved registry_id
     /// if found, `None` otherwise.
     pub fn resolve(&self, id: &str) -> Option<String> {
         self.map.get(&id.to_lowercase()).cloned()
     }
 
-    /// Resolve `id` to its canonical form, or return the raw id unchanged
+    /// Resolve `id` to its resolved form, or return the raw id unchanged
     /// if no alias mapping exists.
     pub fn resolve_or_self(&self, id: &str) -> String {
         self.resolve(id).unwrap_or_else(|| id.to_string())

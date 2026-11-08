@@ -16,7 +16,8 @@ the source of truth.
 Open an issue with the matching template under
 [`.github/ISSUE_TEMPLATE/`](./.github/ISSUE_TEMPLATE/): bug reports, mod submissions,
 and review forms each have one. For troubleshooting a build you are running, start
-with [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) and
+with [docs/DESKTOP_TROUBLESHOOTING.md](./docs/DESKTOP_TROUBLESHOOTING.md) or
+[docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) (CLI), and
 [docs/SUPPORT.md](./docs/SUPPORT.md).
 
 ## Changing code

@@ -1,6 +1,6 @@
 # Community plugins: experimental author guide
 
-The plugin host uses API **0.1.1** (0.1.1 added content providers; every 0.1.0 plugin still loads). It adds behavior to the existing Minecraft launcher without rebuilding Agora. This is a development feature; the public release acceptance gates are recorded in `implementation-status.md`.
+The plugin host uses API **0.1.1** (0.1.1 added content providers; every 0.1.0 plugin still loads). It adds behavior to Agora, and support for whole games, without rebuilding Agora. This is a development feature; the public release acceptance gates are recorded in `implementation-status.md`.
 
 Adding a game? See [Adding a game to Agora](game-packages.md). The other plugin docs are [content providers](providers.md), [publishing](publishing.md) and [implementation status](implementation-status.md).
 

@@ -17,7 +17,7 @@
 //!   the current profile hash + curated installer SHA.
 
 use crate::launch::{merge_forge_version, parse_maven_descriptor, VersionInfo};
-use agora_core::download::{canonical_version_json, sha256_hex};
+use agora_core::download::{sha256_hex, stable_version_json};
 use agora_core::network;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -197,7 +197,7 @@ pub struct InstalledProfileReceipt {
     pub profile_id: String,
     /// Must equal `"versions/<profile_id>/<profile_id>.json"`.
     pub profile_relative_path: String,
-    /// Canonical stable hash of the profile JSON (time/releaseTime dropped,
+    /// Stable hash of the profile JSON (time/releaseTime dropped,
     /// keys sorted).
     pub profile_stable_hash: String,
     /// Base Minecraft version ID (e.g. "1.21").
@@ -236,7 +236,7 @@ pub struct AdoptedProfile {
     pub profile_id: String,
     /// Absolute path to the profile JSON on disk.
     pub profile_path: PathBuf,
-    /// Canonical stable hash of the profile JSON.
+    /// Stable hash of the profile JSON.
     pub profile_stable_hash: String,
     /// Parsed loader version metadata.
     pub loader_version: VersionInfo,
@@ -748,12 +748,12 @@ fn collect_unhashed_library_paths(libraries: &[crate::launch::Library]) -> Vec<S
 // Stable profile hash
 // ---------------------------------------------------------------------------
 
-/// Compute the canonical stable hash of a profile JSON value.
+/// Compute the stable hash of a profile JSON value.
 ///
-/// Uses the same algorithm as `canonical_version_json`: recursively sorts keys
+/// Uses the same algorithm as `stable_version_json`: recursively sorts keys
 /// and drops `time` / `releaseTime` fields.
 pub fn stable_profile_hash(value: &serde_json::Value) -> String {
-    sha256_hex(canonical_version_json(value).as_bytes())
+    sha256_hex(stable_version_json(value).as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -2479,11 +2479,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Canonical hash order / time parity
+    // Stable hash order / time parity
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_canonical_hash_order_and_time_parity() {
+    fn test_stable_hash_order_and_time_parity() {
         // Profile with time/releaseTime fields in reverse alphabetical order.
         let with_time = json!({
             "releaseTime": "2026-01-01T00:00:00Z",

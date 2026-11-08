@@ -59,7 +59,7 @@ impl ModCache {
             cached_at: chrono::Utc::now().to_rfc3339(),
         };
         // Metadata belongs to the content-addressed hash directory, alongside
-        // `file.jar`. `list_cached` reads this canonical filename; the old
+        // `file.jar`. `list_cached` reads this fixed filename; the old
         // `file.json` location made newly cached jars invisible to cache
         // management and size accounting.
         let meta_path = cache_path

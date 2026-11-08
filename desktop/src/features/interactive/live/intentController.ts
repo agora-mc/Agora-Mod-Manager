@@ -89,7 +89,7 @@ export function operationSeamFor(bridge: ApprovedBridge): string {
     case 'crash-doctor':
       return 'CrashInvestigator (recovery-first experiment flow)';
     case 'install-flow':
-      return 'InstallIntent -> InstallFlow -> canonical install pipeline';
+      return 'InstallIntent -> InstallFlow -> install pipeline';
   }
 }
 
@@ -124,7 +124,7 @@ export function contextForBridge(
 
 /**
  * Typed instance readiness/lock inputs for the availability gate (SOL-2 §18.3).
- * These are derived from the projected live scene + canonical app state and
+ * These are derived from the projected live scene + app state and
  * are NOT collapsed into a single boolean so each condition can be explained.
  */
 export interface AvailabilityInput {
@@ -134,7 +134,7 @@ export interface AvailabilityInput {
   recoveryBusy: boolean;
   /** A process/launch is active for the instance (running/starting/stopping/delegated or process-unknown). */
   processBusy: boolean;
-  /** A canonical install transaction is active for the instance. */
+  /** An install transaction is active for the instance. */
   installBusy: boolean;
 }
 

@@ -186,7 +186,7 @@ Correlate test launches by `session_id` and wait for `game-exited` or delegated 
 | Different fresh crash | Restore and show that the failure changed; do not confirm or rule out automatically. |
 | Clean/stable success | Ask the user to confirm the fix before recording attribution and keeping the chosen disable set. |
 | Short abandoned/cancelled/launch error | Restore and mark the test inconclusive. |
-| Health or MSA decision interrupts start | Keep the experiment pending and resume only after the canonical launch controller reports a session start. |
+| Health or MSA decision interrupts start | Keep the experiment pending and resume only after the launch controller reports a session start. |
 
 Remove the Instances-page effect that can auto-open a modal for only one “last” instance. Instead, surface a post-crash alert/toast tied to the `game-exited` instance with an Investigate action. Manual Troubleshoot remains available at all times.
 
@@ -207,7 +207,7 @@ Primary files:
 
 Change `agora crash investigate <instance>` to use the unified evidence collector and full investigation result, not only `suggest_mod_incompatibility` on the newest crash report.
 
-Support repeatable `--file <path>` arguments for explicitly selected CLI evidence. CLI paths are explicit user inputs, canonicalized and bounded by the same text/size policy. Add `--paste` only if stdin is a TTY-safe explicit mode; never block implicitly waiting for input.
+Support repeatable `--file <path>` arguments for explicitly selected CLI evidence. CLI paths are explicit user inputs, resolved and bounded by the same text/size policy. Add `--paste` only if stdin is a TTY-safe explicit mode; never block implicitly waiting for input.
 
 Human output shows source selection, signature/summary, confidence-ranked suspects, evidence excerpts, and next safe actions. JSON output exposes the stable typed result and keeps diagnostics/progress off stdout.
 
@@ -430,4 +430,4 @@ Run desktop npm commands from `desktop/`. Run registry compilation/database veri
 - Automatic modification of Manual memory settings.
 - Unattended destructive Crash Doctor actions from CLI or MCP.
 - Removing saves from recovery snapshots.
-- Replacing Tauri, SQLite, the component library, or the canonical launch controller.
+- Replacing Tauri, SQLite, the component library, or the launch controller.

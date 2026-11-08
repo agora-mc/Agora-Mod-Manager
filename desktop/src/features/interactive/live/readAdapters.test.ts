@@ -123,7 +123,7 @@ const investigation: CrashInvestigation = {
   fingerprint: { exception_class: 'java.lang.OutOfMemoryError', top_frames: ['a.b.C'] },
   triage: { matched: true, signature_name: 'oom', solution_markdown: null, action_button_json: null },
   suspects: [
-    { mod_id: 'sodium', filename: 'sodium.jar', total_score: 5, breakdown: { secret: 'internal' }, is_dependent_of: null },
+    { mod_id: 'sodium', filename: 'sodium.jar', total_score: 5, breakdown: { secret: 'internal' }, is_dependent_of: null, under_review: false },
   ],
   failure_category: 'CrashReport',
 };

@@ -1,89 +1,79 @@
 # How Agora's documentation is organized
 
-Agora's documentation is organized by audience and by depth. The goal is to help a player complete a task quickly without forcing maintainers, CLI users, and governance operators through the same page. This file describes the system; it is not itself a starting point for readers.
+This page is for anyone writing or maintaining Agora's documentation. It explains where each kind of page lives, how the website is built from the repository, and what to update when Agora changes. If you're looking for help using Agora, start at the [documentation home](https://agoramc.com/docs) instead.
 
-## Choose the right guide
+## Where each page belongs
 
-| Audience | Start here | What belongs there |
+Every page is written for one audience. The website's sidebar is built around these audiences.
+
+| Audience | Pages | Covers |
 | --- | --- | --- |
-| Players using the desktop app | **Help & Guide** inside Agora | Task-based guidance tied to the current UI |
-| Players before installation or sharing a link | [Website documentation](https://agoramc.com/docs) | Audience router, install and first run, visual tour, and the published task guides |
-| CLI users and automation authors | [CLI reference](./CLI.md) | Commands, flags, output formats, safety, examples, and exit codes |
-| Contributors | [Development guide](./DEVELOPMENT.md) | Local builds, tests, environment boundaries, and repository layout |
-| Release maintainers | [Release guide](./RELEASING.md) | Catalog and desktop release checklists |
-| Governance operators | [Governance operations](./GOVERNANCE_OPERATIONS.md) | Read-only diagnostics, monitor state, decisions, and incident recovery |
-| Catalog curators | [Catalog curation reference](../REGISTRY_CURATION_REFERENCE.md) | Manifest authoring and review rules |
-| Review participants | [Code of Engagement](../CODE_OF_ENGAGEMENT.md) | Conduct and review boundaries |
-| Troubleshooting and support | [Troubleshooting](./TROUBLESHOOTING.md) | Safe diagnosis and evidence collection |
-| Support evidence and local data | [Support reference](./SUPPORT.md) | Data roots, logs, versions, minimal support bundles, redaction, and reset boundaries |
+| Desktop app users | [Help & guide](https://agoramc.com/docs/guides), [Troubleshooting Agora](./DESKTOP_TROUBLESHOOTING.md), [FAQ](./FAQ.md), and the website's install and tour pages | Doing things in the app, fixing problems, and quick answers, using the labels on screen |
+| CLI users | [CLI reference](./CLI.md), [CLI troubleshooting](./TROUBLESHOOTING.md), [Data, logs, and support evidence](./SUPPORT.md) | Commands, flags, output, exit codes, diagnosis, and support evidence |
+| Contributors | [Developing Agora](./DEVELOPMENT.md), [Layer ownership](./architecture/layer-ownership.md) | Local builds, tests, validation gates, and which layer owns what |
+| Catalog curators and reviewers | [Catalog curation reference](../REGISTRY_CURATION_REFERENCE.md), [Code of Engagement](../CODE_OF_ENGAGEMENT.md) | Writing catalog entries and the rules for reviews |
+| Plugin authors | [Community plugins](./plugins/README.md), [Content providers](./plugins/providers.md), [Publishing](./plugins/publishing.md), [Implementation status](./plugins/implementation-status.md) | Writing, publishing, and updating plugins, and what the plugin host supports today |
+| Maintainers and operators | [Releasing Agora](./RELEASING.md), [Governance operations](./GOVERNANCE_OPERATIONS.md) | Releases, signing, the governance pipeline, and incident recovery |
 
-## Three tiers of detail
+Desktop pages explain what a player sees and does. They don't describe how Agora works behind the scenes, and they don't ask players to use a terminal. CLI pages can assume a reader who is comfortable with a shell, logs, and Minecraft modding. Contributor pages can assume knowledge of the codebase.
 
-### 1. Task guidance
+Superseded plans and finished review logs are not kept as pages. Git history keeps them, and `git log --diff-filter=D` finds a deleted file by path. A page that no longer matches the product is worse than no page, so update or delete it rather than archiving it.
 
-The in-app guide and website answer questions such as:
+## How the website is built
 
-- How do I create or import an instance?
-- Why is launch blocked?
-- How do I switch to a compatible loader?
-- What does a snapshot protect?
-- How do I prepare an instance for offline play?
+The website keeps no copy of its own. Two sources feed it:
 
-Task guidance should use the same labels the current interface uses.
+- **Help & guide** comes from `desktop/src/data/guideContent.ts`, the same file the app's built-in guide uses, published at `/docs/guides/`. The app and the website can't describe the product differently.
+- **Every other page** comes from markdown. `scripts/build_docs_web.py` reads every file under `docs/` plus the root-level `CODE_OF_ENGAGEMENT.md` and `REGISTRY_CURATION_REFERENCE.md`, and writes `docs-web.json`, which the site loads. Each file becomes `/docs/<slug>`, its first heading becomes the page title, and relative links to other docs are rewritten to their website addresses.
 
-### 2. Reference documentation
+Files under `docs/plugins/fixtures/` describe test fixtures, so they stay in the repository and are not published.
 
-Reference pages describe stable interfaces that are awkward to teach inside the application:
+The install, tour, and documentation home pages are hand-written in `web/src/app/docs/`.
 
-- CLI syntax and exit codes
-- data and log discovery
-- reproducible support commands
-- file-format boundaries
-- troubleshooting evidence
-- development prerequisites
+### Placing a page in the navigation
 
-Reference documentation should be searchable and linkable.
+`DOC_CATEGORIES` in `scripts/build_docs_web.py` gives each file an audience and a group:
 
-Superseded implementation plans and completed review logs are not kept as files. They live in Git history, where `git log --diff-filter=D` finds them by path. Current behavior comes from the built product, CLI help, tests, and the references above — a checked-in plan that no longer matches the product is worse than no plan at all.
+| Audience | Sidebar section |
+| --- | --- |
+| `desktop` | **Desktop App Users**, below the hand-written install, tour, and Help & guide links |
+| `user` | **CLI Users** |
+| `developer` | **For contributors and maintainers**, collapsed until opened or until you're on one of its pages |
+| `internal` | **Unsorted pages**, collapsed, and shown only when such a page exists |
 
-### 3. Maintainer and operator documentation
+A new file with no rule lands in `internal`. It's still published so links to it work, but it carries a banner saying it may be out of date. Add a rule for every new page, so that nothing is left in that section.
 
-Release, signing, compiler, governance-monitor, and incident-recovery procedures belong in narrowly scoped maintainer documents. They should not dominate the project landing page or the player-facing website.
+After changing a page or a rule, run `python scripts/build_docs_web.py` to rebuild `docs-web.json`. A running development server caches the file, so restart it to see the change.
 
-## How the website is assembled
+### Links
 
-The website does not keep its own copy of any documentation. Two build steps feed it:
+- Between markdown pages, use relative links such as `./CLI.md`. They work on GitHub and are rewritten for the website.
+- From a markdown page to a Help & guide topic or a hand-written page, use the full address, for example `https://agoramc.com/docs/guides/launching`. `scripts/check_docs.py` rejects site-relative links like `/docs/guides/launching` in markdown, because they would be broken on GitHub.
 
-- `scripts/build_docs_web.py` reads every markdown file under `docs/` plus the configured root documents, and writes `docs-web.json`. For each page it derives the slug, title, description, and an **audience** (`user`, `developer`, `internal`) and **group** used to build the site's grouped navigation. It also emits a `body` with the leading H1 removed, because the website renders the title in its own page header.
-- The website imports `desktop/src/data/guideContent.ts` directly and publishes those topics at `/docs/guides/`. There is no second copy of the guide text, so the app and the website cannot describe the product differently.
-
-New markdown is published automatically, but it defaults to the `internal` audience — visible only under the collapsed "Working notes and archive" section. Add a rule to `DOC_CATEGORIES` in `scripts/build_docs_web.py` to place a page in front of players or contributors.
-
-Pages classified `internal` are still published so cross-references never break, and they render with a banner marking them as non-authoritative working notes. No document currently carries that classification, so the section does not appear in the navigation; the bucket exists to catch new files that nobody has classified yet.
-
-## Source-of-truth rules
+## Sources of truth
 
 - The current interface is the source of truth for button names and navigation.
-- `crates/agora/src/main.rs` is the source of truth for CLI syntax. `docs/CLI.md` explains how to use that interface.
-- `desktop/src/data/guideContent.ts` is the source of truth for in-app guide copy **and** for the website's published task guides.
+- `crates/agora/src/main.rs` is the source of truth for CLI syntax. `docs/CLI.md` explains how to use it.
+- `desktop/src/data/guideContent.ts` is the source of truth for the in-app guide and the website's Help & guide.
 - `REGISTRY_CURATION_REFERENCE.md` is the source of truth for catalog manifests.
 - `CODE_OF_ENGAGEMENT.md` is the source of truth for review conduct.
 - Workflow files are the source of truth for automated release triggers.
 - Secret values never belong in documentation, examples, screenshots, or support bundles.
 
-## Documentation update checklist
+## When something changes
 
-A feature change is not complete until its documentation impact is reviewed.
+A feature change isn't finished until its documentation has been checked.
 
-1. Update the in-app guide when a user-visible workflow, label, warning, or recovery action changes. This updates the website's task guides at the same time.
-2. Update `docs/CLI.md` and CLI help when a command, flag, output shape, or exit code changes.
-3. Update the website's hand-written pages (`web/src/app/docs/`) when pre-install requirements, first-run behavior, or the screenshot tour changes.
-4. Classify any new markdown document in `DOC_CATEGORIES` so it does not land in the internal bucket by default.
-5. Update operator documents when workflows, variables, signing, or governance state changes.
-6. Test commands against a temporary data directory.
-7. Check internal and website links.
-8. Avoid copying the same detailed procedure into multiple files. Link to the canonical page instead.
+1. Update the in-app guide when a user-visible workflow, label, warning, or recovery action changes. This updates the website's Help & guide too.
+2. Update the desktop troubleshooting page and FAQ when a fix, label, or answer they mention changes.
+3. Update `docs/CLI.md` and the CLI help when a command, flag, output shape, or exit code changes.
+4. Update the hand-written pages in `web/src/app/docs/` when installation, first run, or the screenshot tour changes.
+5. Give any new markdown page a rule in `DOC_CATEGORIES`.
+6. Update operator documents when workflows, variables, signing, or governance state change.
+7. Test any documented command against a temporary data directory.
+8. Run `python scripts/check_docs.py` to check links and known wording problems.
+9. Link to the page that already explains a procedure instead of copying it.
 
-## README contract
+## The root README
 
-Keep the root README scannable and in this order: product purpose; download and documentation links; first-run player path; key capabilities; safety and recovery boundaries; project principles; compact contributor quick start; canonical maintainer references; license and community links. Operator incident procedures and full environment tables do not belong there.
+Keep the root `README.md` short and in this order: what Agora is, download and documentation links, the first-run path, key capabilities, safety and recovery limits, project principles, a short contributor quick start, maintainer references, and license and community links. Incident procedures and full environment tables don't belong there.

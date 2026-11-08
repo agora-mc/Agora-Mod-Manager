@@ -31,7 +31,7 @@
 //!   second step to make it sync-friendly (and would race with a sync that
 //!   sees a half-written tree).
 //! * **Zip Slip is already mitigated.** `snapshot.rs:1626` and `import.rs:392`
-//!   both canonicalise archive paths and reject `..`, absolute paths and `\`.
+//!   both normalize archive paths and reject `..`, absolute paths and `\`.
 //!   Reusing zip lets us reuse the same `validate_relative_path` guard
 //!   (`snapshot.rs:1626`) verbatim.
 //!
@@ -460,7 +460,7 @@ pub fn export_snapshot(
         .cloned()
         .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
 
-    // `snapshot_file_index` is the canonical, scope-agnostic reader that
+    // `snapshot_file_index` is the shared, scope-agnostic reader that
     // handles both modern manifests and legacy zips, validates paths, dupes,
     // and hash formats, and returns a sorted index.
     let file_index = crate::snapshot::snapshot_file_index(instance_dir, snapshot_id)?;

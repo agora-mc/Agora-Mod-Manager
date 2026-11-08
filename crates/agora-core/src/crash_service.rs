@@ -356,6 +356,10 @@ pub struct SuspectScore {
     pub breakdown: serde_json::Value,
     #[serde(default)]
     pub is_dependent_of: Option<String>,
+    /// Curators are reviewing this catalog entry. Shown as context only: it
+    /// says nothing about whether the mod caused the crash.
+    #[serde(default)]
+    pub under_review: bool,
 }
 
 // -----------------------------------------------------------------------
@@ -598,7 +602,6 @@ impl CrashService {
 pub enum SuggestedAction {
     GuidedDisable { next_suspect: SuspectScore },
     ConfidenceAutoDisable { mod_id: String, filename: String },
-    ShowTriageBanner { mod_id: String },
     NoSuspects,
 }
 
@@ -639,7 +642,7 @@ impl CrashService {
     /// It does NOT mutate state (no disable, no telemetry).
     ///
     /// `explicit_files` are user-chosen absolute paths to include as
-    /// additional evidence (canonicalized and extension-validated by the
+    /// additional evidence (resolved and extension-validated by the
     /// collector).
     pub fn investigate_evidence(
         &self,
@@ -746,9 +749,6 @@ impl CrashService {
 
 /// Run the full investigation pipeline: score suspects, fetch ruled-out mods,
 /// filter them out, pick the top remaining, and build an `InvestigationResult`.
-///
-/// If the top suspect's registry_id is `under_review` in the registry, the
-/// suggested action is `ShowTriageBanner`.
 pub fn continue_investigation(
     ctx: &Ctx,
     fingerprint: &CrashFingerprint,
@@ -756,7 +756,6 @@ pub fn continue_investigation(
     crash_text: &str,
 ) -> LauncherResult<InvestigationResult> {
     let crash_svc = CrashService::new(ctx.clone());
-    let registry_svc = crate::registry::RegistryService::new(ctx.clone());
 
     // Score suspects.
     let mut suspects = score_suspects(ctx, crash_text, installed)?;
@@ -780,17 +779,8 @@ pub fn continue_investigation(
     let suggested_action = if suspects.is_empty() {
         SuggestedAction::NoSuspects
     } else {
-        let top = &suspects[0];
-        let is_under_review = registry_svc.is_under_review(&top.mod_id).unwrap_or(false);
-
-        if is_under_review {
-            SuggestedAction::ShowTriageBanner {
-                mod_id: top.mod_id.clone(),
-            }
-        } else {
-            SuggestedAction::GuidedDisable {
-                next_suspect: top.clone(),
-            }
+        SuggestedAction::GuidedDisable {
+            next_suspect: suspects[0].clone(),
         }
     };
 
@@ -978,6 +968,7 @@ pub fn compute_mod_score(
         total_score,
         breakdown,
         is_dependent_of: None,
+        under_review: false,
     }
 }
 
@@ -1021,6 +1012,29 @@ pub fn score_suspects(
     crash_text: &str,
     installed: &[crate::models::InstalledMod],
 ) -> LauncherResult<Vec<SuspectScore>> {
+    let mut suspects = rank_suspects(ctx, crash_text, installed)?;
+    // A catalog we cannot read must not get in the way of crash help.
+    let under_review: HashSet<String> = crate::registry::RegistryService::new(ctx.clone())
+        .list_under_review_items()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    mark_under_review(&mut suspects, &under_review);
+    Ok(suspects)
+}
+
+fn mark_under_review(suspects: &mut [SuspectScore], under_review: &HashSet<String>) {
+    for suspect in suspects {
+        suspect.under_review = under_review.contains(&suspect.mod_id);
+    }
+}
+
+fn rank_suspects(
+    ctx: &Ctx,
+    crash_text: &str,
+    installed: &[crate::models::InstalledMod],
+) -> LauncherResult<Vec<SuspectScore>> {
     let crash_svc = CrashService::new(ctx.clone());
     let registry_svc = crate::registry::RegistryService::new(ctx.clone());
 
@@ -1039,6 +1053,7 @@ pub fn score_suspects(
                     total_score: 0.0,
                     breakdown: serde_json::json!({}),
                     is_dependent_of: None,
+                    under_review: false,
                 })
                 .collect());
         }
@@ -1222,6 +1237,7 @@ pub fn score_suspects(
                     "parent_score": s.total_score,
                 }),
                 is_dependent_of: Some(s.mod_id.clone()),
+                under_review: false,
             });
         }
     }
@@ -2949,11 +2965,32 @@ Caused by: java.lang.NullPointerException
                 total_score: 0.5,
                 breakdown: serde_json::json!({}),
                 is_dependent_of: None,
+                under_review: false,
             },
         };
         let json2 = serde_json::to_string(&sa2).unwrap();
         assert!(json2.contains("GuidedDisable"));
         assert!(json2.contains("test-mod"));
+    }
+
+    #[test]
+    fn suspects_under_review_are_marked_without_changing_their_order() {
+        let suspect = |mod_id: &str, total_score: f64| SuspectScore {
+            mod_id: mod_id.into(),
+            filename: format!("{mod_id}.jar"),
+            total_score,
+            breakdown: serde_json::json!({}),
+            is_dependent_of: None,
+            under_review: false,
+        };
+        let mut suspects = vec![suspect("reviewed", 0.9), suspect("other", 0.4)];
+        let under_review: HashSet<String> = ["reviewed".to_string()].into_iter().collect();
+
+        mark_under_review(&mut suspects, &under_review);
+
+        assert_eq!(suspects[0].mod_id, "reviewed");
+        assert!(suspects[0].under_review);
+        assert!(!suspects[1].under_review);
     }
 
     #[test]
@@ -3008,6 +3045,7 @@ java.lang.NullPointerException: Cannot invoke "java.util.List.forEach(java.util.
             total_score,
             breakdown: serde_json::json!({}),
             is_dependent_of: None,
+            under_review: false,
         }
     }
 

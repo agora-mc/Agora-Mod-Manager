@@ -23,7 +23,7 @@ use std::str::FromStr;
 /// call*. A manifest for a schema we do not know is rejected without guessing.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// Canonical manifest filename inside a package or development folder.
+/// Standard manifest filename inside a package or development folder.
 pub const MANIFEST_FILENAME: &str = "agora-plugin.json";
 
 // ---------------------------------------------------------------------------

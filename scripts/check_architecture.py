@@ -396,7 +396,7 @@ def check_single_update_check() -> None:
 # startup mass-rewrite. See helpers.rs: read_manifest.
 INSTANCE_MANIFEST_OWNER = "helpers.rs"
 ALLOW_RAW_MANIFEST_FILES = {
-    # helpers.rs itself is the canonical loader
+    # helpers.rs itself is the shared loader
     CORE_SRC / "helpers.rs",
     # models.rs contains the struct definition and tests that deserialize
     # legacy JSON fixtures (e.g., legacy_manifest_json) — not instance files

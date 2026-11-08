@@ -2,7 +2,7 @@ import Link from 'next/link';
 import { getGuideCategories, getGuideTopics } from '@/lib/guide';
 
 export const metadata = {
-  title: 'Task guides — Agora Docs',
+  title: 'Help & guide — Agora Docs',
   description:
     'Step-by-step and in-depth guides for every part of Agora, mirrored from the app’s built-in Help & Guide.',
 };
@@ -19,9 +19,9 @@ export default function GuidesIndexPage() {
             Docs
           </Link>
           <span aria-hidden="true"> / </span>
-          <span className="text-gray-700 dark:text-gray-300">Task guides</span>
+          <span className="text-gray-700 dark:text-gray-300">Help &amp; guide</span>
         </nav>
-        <h1 className="text-3xl font-bold tracking-tight">Task guides</h1>
+        <h1 className="text-3xl font-bold tracking-tight">Help &amp; guide</h1>
         <p className="mt-3 max-w-3xl text-sm text-gray-500 dark:text-gray-400">
           These are the same guides built into the desktop app under{' '}
           <strong>Help &amp; Guide</strong>, published here so you can read them
@@ -73,7 +73,7 @@ export default function GuidesIndexPage() {
             href="/docs/troubleshooting"
             className="text-indigo-600 hover:underline dark:text-indigo-400"
           >
-            Troubleshooting
+            CLI troubleshooting
           </Link>
           <Link href="/docs/support" className="text-indigo-600 hover:underline dark:text-indigo-400">
             Data, logs, and support evidence

@@ -11,7 +11,7 @@ export { GUIDE_OVERVIEW } from '@guide/guideContent';
 export type { GuideCallout, GuideLevel, GuidePage, GuideSection, GuideTopic };
 
 /**
- * The website's task guides are the desktop app's Help & Guide, rendered for
+ * The website's Help & guide page is the desktop app's Help & Guide, rendered for
  * the web. `desktop/src/data/guideContent.ts` is the single source of truth for
  * this copy (see docs/README.md), so the two surfaces cannot contradict each
  * other: the site has no second copy to fall out of date.

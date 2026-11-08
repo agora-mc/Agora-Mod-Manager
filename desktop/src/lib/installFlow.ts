@@ -188,7 +188,7 @@ export interface ResolvedDep {
   disposition: DepDisposition;
   /** Human-readable project name when known; falls back to modJarId. */
   displayName?: string | null;
-  /** Canonical upstream page URL when known. */
+  /** Upstream page URL when known. */
   pageUrl?: string | null;
   /** Selected batch items that pulled this dependency in. */
   requestedBy?: string[];

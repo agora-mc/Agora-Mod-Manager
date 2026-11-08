@@ -63,7 +63,7 @@ _CLI_REGISTRY_ROOT: str | None = None
 
 
 def normalize_pack_identity(item: dict[str, Any]) -> dict[str, Any]:
-    """Normalize the deprecated top-level pack_id alias to canonical id."""
+    """Normalize the deprecated top-level pack_id alias to the top-level id."""
     if "pack_id" not in item:
         return item
 
@@ -3555,7 +3555,7 @@ _CHANGELOG_MAX_VERSIONS_PER_ITEM = 30
 # a second network round-trip per project.
 _MODRINTH_VERSION_CACHE: dict[str, list[dict[str, Any]]] = {}
 
-# Modrinth `project_type` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ canonical site URL path segment.
+# Modrinth `project_type` ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ standard site URL path segment.
 _PROJECT_TYPE_URL_PATH = {
     "mod": "mod",
     "modpack": "modpack",
@@ -3585,7 +3585,7 @@ _MODRINTH_LOADER_CATEGORY_NAMES = frozenset(
 
 
 def _build_modrinth_page_url(proj: dict[str, Any]) -> str | None:
-    """Construct the canonical Modrinth page URL from a bulk project payload."""
+    """Construct the Modrinth page URL from a bulk project payload."""
     slug = proj.get("slug")
     if not slug:
         return None
@@ -3596,7 +3596,7 @@ def _build_modrinth_page_url(proj: dict[str, Any]) -> str | None:
 def _hydrate_modrinth_metadata(items: list[dict[str, Any]]) -> None:
     """Batch-query the Modrinth API to hydrate rich metadata for items with a Modrinth ID.
 
-    Pulls the short description, full markdown body, canonical page URL,
+    Pulls the short description, full markdown body, page URL,
     license id, and last-updated timestamp from the bulk ``/v2/projects``
     endpoint (up to 100 projects per request), in addition to the icon and
     gallery URLs. This bakes rich, instant-on metadata into the signed
@@ -3724,7 +3724,7 @@ def _hydrate_modrinth_metadata(items: list[dict[str, Any]]) -> None:
             if body:
                 item["body_markdown"] = body
 
-        # Canonical page URL: manifest > constructed-from-slug.
+        # Page URL: manifest > constructed-from-slug.
         if not item.get("page_url"):
             page_url = _build_modrinth_page_url(proj)
             if page_url:
@@ -4729,7 +4729,7 @@ def compile_registry(
     # entry stops the compile before any slow work, and written to their own table.
     official_plugins = load_official_plugins(official_fetcher)
 
-    # Identity must be canonical before hydration and governance. Keep the
+    # Identity must be normalized before hydration and governance. Keep the
     # legacy alias readable for existing registries, but never let downstream
     # passes grow content-type-specific identity lookups.
     for path, item in all_items:
@@ -4745,7 +4745,7 @@ def compile_registry(
             )
 
     # Which game each entry is for, and the fields that game allows. Runs
-    # before download sources are canonicalized so every error names its file.
+    # before download sources are normalized so every error names its file.
     for path, item in all_items:
         check_game_scope(path, item, game_declarations)
     for path, item in game_items:
@@ -4766,7 +4766,7 @@ def compile_registry(
             logger.error("Invalid download sources in %s", path)
             raise
 
-    # Download sources must be canonical before hydration: the hydrators pick
+    # Download sources must be normalized before hydration: the hydrators pick
     # a Modrinth project id off download_strategy/modrinth_id, and both of
     # those may be stated only inside an item's download_sources list.
     for path, item in all_items:

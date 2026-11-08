@@ -1,7 +1,7 @@
 /**
  * MUSIC_TRACKS - public-domain music for the Agora ambience layer.
  *
- * This is the canonical, hand-maintained source. It was originally generated
+ * This is the hand-maintained source. It was originally generated
  * from a verified MusicXML conversion pipeline; that pipeline's inputs are no
  * longer in the repository, so this file is the source of truth going
  * forward. Edits must preserve the voice-sum invariant checked by

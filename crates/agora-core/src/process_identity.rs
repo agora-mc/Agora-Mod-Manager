@@ -218,7 +218,7 @@ pub struct ProcessIdentity {
     pub pid: u32,
     /// The process start time reported by the OS (seconds since epoch).
     pub start_time: u64,
-    /// Canonical path of the executable, when the OS provides it.
+    /// Resolved path of the executable, when the OS provides it.
     pub expected_exe: Option<String>,
     /// The name of the job object the launch put this process in (Windows), when it made one.
     /// Everything the process starts belongs to the same job, so a later Stop can end the whole

@@ -36,13 +36,13 @@ pub fn md5_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Produce a canonical serialization of a JSON value for stable hashing.
+/// Produce a stable serialization of a JSON value for hashing.
 ///
 /// Sorts object keys recursively, drops `time` and `releaseTime` fields (which
 /// Mojang changes when re-releasing the same version), and uses a deterministic
 /// serializer with no extra whitespace. This is the same algorithm the compiler
 /// generator uses when computing `version_json_sha256`.
-pub fn canonical_version_json(value: &serde_json::Value) -> String {
+pub fn stable_version_json(value: &serde_json::Value) -> String {
     fn strip_and_sort(val: &serde_json::Value) -> serde_json::Value {
         match val {
             serde_json::Value::Object(map) => {
@@ -61,7 +61,7 @@ pub fn canonical_version_json(value: &serde_json::Value) -> String {
         }
     }
     let cleaned = strip_and_sort(value);
-    serde_json::to_string(&cleaned).expect("canonical_version_json serialization must not fail")
+    serde_json::to_string(&cleaned).expect("stable_version_json serialization must not fail")
 }
 
 /// Download a mod artifact using the dedicated GitHub/Modrinth allowlist.
@@ -240,9 +240,9 @@ pub fn stable_json_sha256(data: &[u8]) -> Option<String> {
         map.remove("time");
         map.remove("releaseTime");
     }
-    let canonical = serde_json::to_string(&obj).ok()?;
+    let serialized = serde_json::to_string(&obj).ok()?;
     let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
+    hasher.update(serialized.as_bytes());
     Some(hex::encode(hasher.finalize()))
 }
 
@@ -262,37 +262,37 @@ mod tests {
     }
 
     #[test]
-    fn stable_json_sha256_matches_python_canonicalization() {
+    fn stable_json_sha256_matches_python_normalization() {
         // This test vector must correspond to what the Python script
         // (`scripts/fetch_loader_manifests.py`, `_stable_json_sha256`)
         // computes for the same input.
         let input = br#"{"id":"1.21","mainClass":"net.minecraft.client.main.Main","time":"2024-06-13T15:00:00+00:00","releaseTime":"2024-06-13T15:00:00+00:00","type":"release"}"#;
         // Python sorts keys with `sort_keys=True` after dropping time/releaseTime.
-        // The expected canonical is: {"id":"1.21","mainClass":"net.minecraft.client.main.Main","type":"release"}
+        // The expected output is: {"id":"1.21","mainClass":"net.minecraft.client.main.Main","type":"release"}
         let hash = stable_json_sha256(input).unwrap();
         // Compute expected: SHA-256 of '{"id":"1.21","mainClass":"net.minecraft.client.main.Main","type":"release"}'
-        let canonical =
+        let expected_bytes =
             br#"{"id":"1.21","mainClass":"net.minecraft.client.main.Main","type":"release"}"#;
         let mut hasher = Sha256::new();
-        hasher.update(canonical);
+        hasher.update(expected_bytes);
         let expected = hex::encode(hasher.finalize());
         assert_eq!(
             hash, expected,
-            "stable_json_sha256 must match Python-style canonicalization"
+            "stable_json_sha256 must match Python-style normalization"
         );
     }
 
     #[test]
-    fn canonical_version_json_rust_python_parity() {
+    fn stable_version_json_rust_python_parity() {
         // This hardcoded test vector ensures Rust and Python produce the
-        // same canonical JSON hash for a realistic version.json.
+        // same stable JSON hash for a realistic version.json.
         // Python (scripts/fetch_loader_manifests.py _stable_json_sha256):
         //   1. Parse JSON
         //   2. Drop "time" and "releaseTime" keys
         //   3. Serialize with sort_keys=True, separators=(',', ':'), ensure_ascii=True
         //   4. SHA-256 of UTF-8 bytes
         //
-        // Rust (crate::download::canonical_version_json):
+        // Rust (crate::download::stable_version_json):
         //   1. Parse JSON
         //   2. Recursively strip "time" and "releaseTime"
         //   3. Sort object keys recursively
@@ -307,34 +307,31 @@ mod tests {
             "libraries": [{"name": "net.minecraftforge:forge:47.1.0"}],
             "type": "release"
         });
-        let canonical = super::canonical_version_json(&version_json);
-        let hash = super::sha256_hex(canonical.as_bytes());
+        let stable = super::stable_version_json(&version_json);
+        let hash = super::sha256_hex(stable.as_bytes());
 
         // Verify structure: no time/releaseTime, keys sorted
-        assert!(!canonical.contains("\"time\""), "must drop time");
-        assert!(
-            !canonical.contains("\"releaseTime\""),
-            "must drop releaseTime"
-        );
+        assert!(!stable.contains("\"time\""), "must drop time");
+        assert!(!stable.contains("\"releaseTime\""), "must drop releaseTime");
         // id should appear before inheritsFrom (sorted)
         assert!(
-            canonical.find("\"id\"").unwrap() < canonical.find("\"inheritsFrom\"").unwrap(),
+            stable.find("\"id\"").unwrap() < stable.find("\"inheritsFrom\"").unwrap(),
             "id must sort before inheritsFrom"
         );
 
         // Verify this is deterministic
-        let canonical2 = super::canonical_version_json(&version_json);
-        let hash2 = super::sha256_hex(canonical2.as_bytes());
-        assert_eq!(hash, hash2, "canonical JSON hash must be deterministic");
+        let stable2 = super::stable_version_json(&version_json);
+        let hash2 = super::sha256_hex(stable2.as_bytes());
+        assert_eq!(hash, hash2, "stable JSON hash must be deterministic");
 
         // Cross-language parity: the Python script with the same input
         // should produce the same hash. This is the expected value from
         // running: _stable_json_sha256(json.dumps({"id":"forge-...","inheritsFrom":"1.21","mainClass":"net.minecraftforge.Main","libraries":[{"name":"net.minecraftforge:forge:47.1.0"}],"type":"release"}))
         // with time/releaseTime removed and sort_keys=True.
-        let expected_python_canonical = r#"{"id":"forge-1.21-47.1.0","inheritsFrom":"1.21","libraries":[{"name":"net.minecraftforge:forge:47.1.0"}],"mainClass":"net.minecraftforge.Main","type":"release"}"#;
+        let expected_python_stable = r#"{"id":"forge-1.21-47.1.0","inheritsFrom":"1.21","libraries":[{"name":"net.minecraftforge:forge:47.1.0"}],"mainClass":"net.minecraftforge.Main","type":"release"}"#;
         assert_eq!(
-            canonical, expected_python_canonical,
-            "Rust canonical JSON must match Python"
+            stable, expected_python_stable,
+            "Rust stable JSON must match Python"
         );
     }
 }

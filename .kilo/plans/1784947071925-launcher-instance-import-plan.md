@@ -44,19 +44,19 @@ All adapters must accept a manually selected launcher root, validate it by forma
 Add UI-agnostic core models for:
 
 - `LauncherKind`: `Prism`, `CurseForge`, `Modrinth`.
-- `DetectedLauncher`: stable installation key, kind, display name, canonical launcher/config root, discovered instance count, and detection warnings.
-- `ImportCandidate`: stable source instance key, display metadata, canonical payload root, Minecraft/loader tuple, content counts, byte estimate, last-played time, icon preview, imported/update state, launch strategy, sanitized launch-settings preview, warnings, and `Ready`/`NeedsReview`/`Unsupported` status.
+- `DetectedLauncher`: stable installation key, kind, display name, resolved launcher/config root, discovered instance count, and detection warnings.
+- `ImportCandidate`: stable source instance key, display metadata, resolved payload root, Minecraft/loader tuple, content counts, byte estimate, last-played time, icon preview, imported/update state, launch strategy, sanitized launch-settings preview, warnings, and `Ready`/`NeedsReview`/`Unsupported` status.
 - `ImportBatchPlan`: fingerprinted selected candidates, destination IDs/names, new-vs-update action, file/byte/disk plan, launch preparation, settings decisions, conflicts, and blockers.
 - `ImportBatchResult`: per-instance `Imported`, `Updated`, `Skipped`, `Failed`, or `Cancelled` outcomes plus instance ID, warnings, health result, and suggested action.
 
-Expose one canonical path through `ImportService`:
+Route every import through one `ImportService` path:
 
 1. `discover_launcher_instances(custom_root)` returns launchers and candidates.
 2. `plan_launcher_import(selections)` re-reads source metadata, resolves collisions/provenance/update eligibility, computes disk needs, and returns an immutable fingerprinted review plan.
 3. `execute_launcher_import(plan, sink, cancel)` validates the plan/source again and executes independent per-instance jobs.
 4. `check_launcher_import_updates(instance_ids)` reports source missing/unchanged/updated/target modified states without mutating.
 
-Tauri and CLI remain thin adapters. Never put Tauri types in `agora-core`. Frontend commands select candidates by backend-issued source keys; execution must canonicalize and validate every source again rather than trusting a raw frontend path.
+Tauri and CLI remain thin adapters. Never put Tauri types in `agora-core`. Frontend commands select candidates by backend-issued source keys; execution must resolve and validate every source again rather than trusting a raw frontend path.
 
 ## Implementation Phases
 
@@ -64,18 +64,18 @@ Tauri and CLI remain thin adapters. Never put Tauri types in `agora-core`. Front
 
 1. Raise the local-state schema version and add nullable/default-safe columns to `user_instances`: `icon_path` and `launch_mode_override` (`auto`, `direct`, `delegated`; existing rows default to `auto`).
 2. Make launch resolution honor `launch_mode_override` in both frontend routing and backend commands. A forced-delegated instance must reject direct-launch bypass and explain why; normal instances continue to follow the global setting.
-3. Add `instance_imports` keyed by Agora instance ID with launcher kind, stable source instance key, canonical local source locator, source metadata JSON, imported settings baseline, source fingerprint, timestamps, and last result.
+3. Add `instance_imports` keyed by Agora instance ID with launcher kind, stable source instance key, resolved local source locator, source metadata JSON, imported settings baseline, source fingerprint, timestamps, and last result.
 4. Add `instance_import_files` keyed by Agora instance ID + normalized relative path with SHA-256, size, and source metadata needed for unchanged/update checks.
 5. Add a small persistent `instance_import_jobs` journal with job ID, instance/source key, staging/final paths, state, plan fingerprint, and timestamps so startup can finish or roll back a crash interrupted between rename and DB commit.
 6. Cascade import rows/baselines on delete; retain them across display-name rename; do not copy provenance when cloning; never include source paths/provenance in exports, lockfiles, MCP responses, telemetry, or `instance_manifest.json`.
 7. Add a validated local-icon loader (bounded PNG/JPEG/WebP size and MIME, returned as an escaped data URL or other narrowly scoped backend response) instead of broadening Tauri filesystem capabilities.
 8. Generalize snapshot creation to accept an explicit normalized file set. Import updates must snapshot every changed/deleted imported payload file, not only the current fixed `TRACKED_ENTRIES`; exclude `.agora*`, staging, snapshots, and provenance internals.
 
-### 2. Refactor The Canonical Import Pipeline
+### 2. Refactor The Import Pipeline
 
 1. Split source parsing/copy policy from orchestration while retaining `import.rs`/`import_service.rs` as the public core boundary. Reuse one target allocator, path validator, content inventory builder, settings sanitizer, and promotion mechanism for `.mrpack`, Prism ZIP, generic directory, and launcher migrations.
 2. Change low-level importers to prepare a staging result rather than rename into `instances/` themselves.
-3. Run source validation, full metadata parsing, destination locking, copy/download, hash verification, canonical manifest construction, Minecraft metadata preparation, loader preparation, and health validation before promotion.
+3. Run source validation, full metadata parsing, destination locking, copy/download, hash verification, final manifest construction, Minecraft metadata preparation, loader preparation, and health validation before promotion.
 4. Register a persistent job before staging. At promotion, use a local-state transaction plus same-volume directory rename and job-state transitions. Startup recovery must handle every boundary: staging only, final directory with uncommitted instance row, committed row with missing final directory, and completed stale journal.
 5. Roll back staging, DB rows, and any just-created official-launcher profile on required failure. Keep valid shared Agora runtime artifacts. Never delete or edit source files.
 6. Stream large files with bounded buffers while calculating SHA-256 and emitting byte/file progress. Check cancellation between chunks/files; atomic rename/DB commit sections are non-interruptible.
@@ -94,8 +94,8 @@ Tauri and CLI remain thin adapters. Never put Tauri types in `agora-core`. Front
 ### 4. Build Fidelity, Readiness, And Safety Planning
 
 1. Copy every regular game-owned file below the adapter's payload root, including mods, disabled mods, configs, KubeJS/CraftTweaker scripts, options, servers, resource/shader packs, screenshots, saves/worlds, datapacks, maps, and unknown pack-specific data.
-2. Never traverse symlinks, junctions, reparse points, devices, or paths outside the canonical payload root. Exclude source control files such as Prism outer metadata, CurseForge `.curseclient`/`minecraftinstance.json`, Modrinth `profile.json`, launcher credentials, and any source `instance_manifest.json`/`.agora*` data. Shared launcher runtime/cache trees outside the adapter's payload root are never copied; do not drop an in-root file merely because a generic folder name resembles a cache.
-3. Build all canonical `InstanceManifest` arrays from staged content. Hash every artifact; parse JAR IDs, versions, dependencies, aliases, and enabled state with `jar_metadata`; inventory zipped and directory resource packs/shaders/datapacks/worlds; retain unknown files on disk even when they are not managed artifacts.
+2. Never traverse symlinks, junctions, reparse points, devices, or paths outside the resolved payload root. Exclude source control files such as Prism outer metadata, CurseForge `.curseclient`/`minecraftinstance.json`, Modrinth `profile.json`, launcher credentials, and any source `instance_manifest.json`/`.agora*` data. Shared launcher runtime/cache trees outside the adapter's payload root are never copied; do not drop an in-root file merely because a generic folder name resembles a cache.
+3. Build all final `InstanceManifest` arrays from staged content. Hash every artifact; parse JAR IDs, versions, dependencies, aliases, and enabled state with `jar_metadata`; inventory zipped and directory resource packs/shaders/datapacks/worlds; retain unknown files on disk even when they are not managed artifacts.
 4. Resolve identities in this order: trusted source metadata, exact local registry SHA-256 match, optional consented Modrinth hash lookup, then stable manual/imported identity. Preserve Modrinth IDs from local Modrinth metadata without requiring live API access. Never add CurseForge egress.
 5. Normalize source launch settings into Agora fields. Extract RAM and known GC flags, remove duplicate `-Xms/-Xmx`, reject classpath/jar/agent/native-path/credential-bearing arguments, list every omitted argument in review, and never carry shell hooks, wrappers, or environment commands.
 6. For cataloged loader tuples, use `LoaderService` and allow normal direct/delegated behavior.
@@ -129,7 +129,7 @@ Tauri and CLI remain thin adapters. Never put Tauri types in `agora-core`. Front
 
 1. Add structured errors and suggested actions for source busy/changed, unknown source schema, unsupported loader/components, destination changed, disk full, unsafe path, transaction recovery, and delegated profile conflict.
 2. Keep local Modrinth import separate from `modrinth_enabled` consent and `network_modrinth_enabled` egress permission. Only optional online enrichment requires both and no lockdown.
-3. Keep the existing file/URL import commands working while routing them through the corrected canonical staging/promotion pipeline. Existing instances imported before provenance exists remain ordinary instances and are not guessed/relinked automatically.
+3. Keep the existing file/URL import commands working while routing them through the corrected staging/promotion pipeline. Existing instances imported before provenance exists remain ordinary instances and are not guessed/relinked automatically.
 4. Add thin CLI commands for detection, plan JSON, execution, and update check, or at minimum expose equivalent core APIs and preserve current `agora import <path>` behavior. CLI and desktop must not implement separate parsing/copy logic.
 5. Update the in-app Guide and BACKLOG acceptance records only after the implementation and tests land. Document exclusions and the delegated-only unusual-loader fallback clearly.
 6. Do not add broad Tauri filesystem, shell, SQL execute, or network permissions. Backend commands perform scoped reads/copies; local icons use the validated loader; no new external domains are required.

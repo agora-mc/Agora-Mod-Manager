@@ -219,7 +219,7 @@ test('High Interaction renders a real instance and approved health review opens 
   await expect(page.getByText('Example warning').first()).toBeVisible();
 });
 
-test('approved remove through InstallFlow: Stage remove re-resolves and opens the canonical InstallFlow', async ({ page }) => {
+test('approved remove through InstallFlow: Stage remove re-resolves and opens the InstallFlow', async ({ page }) => {
   await installHighInteractionMock(page);
   await openHighInteraction(page);
 
@@ -229,7 +229,7 @@ test('approved remove through InstallFlow: Stage remove re-resolves and opens th
   await expect(page.getByRole('button', { name: 'Remove from this instance' })).toBeVisible();
   await page.getByRole('button', { name: 'Remove from this instance' }).click();
 
-  // The bridge re-resolves per route and opens the canonical InstallFlow,
+  // The bridge re-resolves per route and opens the InstallFlow,
   // which resolves a remove plan.
   const resolveIdx = await lastInstallCall(page, 'resolve_install_plan');
   await resolveInstall(page, resolveIdx, makeRemovePlan());

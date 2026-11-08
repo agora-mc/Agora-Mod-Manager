@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-// Re-export canonical types from core.
+// Re-export shared types from core.
 pub use agora_core::models::{InstalledMod, InstanceManifest};
 
 /// A row in `local_state.db`'s `user_instances` table.

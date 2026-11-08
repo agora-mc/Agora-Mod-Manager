@@ -601,7 +601,7 @@ If the launcher cannot reach GitHub Releases to fetch or update `registry.db`, i
    - Users can install mods manually, one at a time, bypassing the central registry entirely.
 6. **Manual Download Mode:** A "Drag .jar Here" panel is always available. Users can install manually downloaded mod files directly into instances.
 7. Users can still create **Custom Instances** from scratch and install modloaders, because `loader_manifests.json` is cached locally.
-8. Governance features (Triage Center, voting, reviews) are disabled because they require GitHub API access.
+8. Governance features (voting, reviews) are disabled because they require GitHub API access.
 
 **Exit Condition:** Degraded Mode exits automatically when the launcher successfully completes a registry update check against GitHub.
 
@@ -768,7 +768,7 @@ The compiler generates an append-only **`/governance/audit_log.json`** file in t
 - `REACTION_SCRUBBED` — Malicious reaction deleted by compiler
 - `SIGNATURE_REJECTED` — Registry signature failed verification (logged by client, submitted via telemetry)
 
-**Retention:** The audit log is appended to nightly. When it exceeds 10,000 entries, the oldest 2,000 entries are moved to `/governance/audit_log_archive.{YYYYMMDD}.json`. The current log and the last 3 archived logs are included in `registry.db` as `audit_log_json` for in-app display in the Triage Center "Transparency Log" panel.
+**Retention:** The audit log is appended to nightly. When it exceeds 10,000 entries, the oldest 2,000 entries are moved to `/governance/audit_log_archive.{YYYYMMDD}.json`. The current log is copied into the `audit_log` table in `registry.db`, which `agora registry audit-log` reads.
 
 ---
 
@@ -781,7 +781,7 @@ The following text appears verbatim in three places:
 2. The GitHub Issue Form header (`review-form.yml`)
 3. The Tauri "Write a Review" modal — the user must check a consent box before the Submit button becomes active
 
-The canonical text lives in `CODE_OF_ENGAGEMENT.md` at the repository root. A CI workflow copies this file into the three required locations during the nightly build. This ensures a single source of truth.
+The source text lives in `CODE_OF_ENGAGEMENT.md` at the repository root. A CI workflow copies this file into the three required locations during the nightly build. This ensures a single source of truth.
 
 ---
 
@@ -892,6 +892,8 @@ When `immune = true`:
 
 ### 5.5 In-App Comment Reporting
 
+**Status: removed.** The launcher no longer has a flag button; concerns reach curators through the community channels. The original design is kept below for reference.
+
 The launcher's UI includes a "🚩 Flag Review" button on every comment. This must be rate-limited to prevent abuse.
 
 **Rate Limiting:** Each user is limited to **5 flag submissions per hour** and **20 per day**. If the limit is exceeded, the flag button is greyed out with a tooltip showing when the limit resets. This prevents a single user from generating thousands of admin tickets.
@@ -919,13 +921,15 @@ The launcher's UI includes a "🚩 Flag Review" button on every comment. This mu
 
 **Note:** The private admin repo must be created during project initialization. The Tauri app pre-configures its `owner/repo` path.
 
-### 5.6 Triage Center UI (In-App Tab)
+### 5.6 Community Governance UI (In-App Tab)
 
-A dedicated sidebar tab labeled **"Community Governance"** or **"Triage Center"** shows:
+The **Community Governance** sidebar tab is a static page: it makes no network calls. It explains why votes matter, how to vote, how moderation works and the rules of engagement, and links to the community. Participation happens on each curated item's detail page:
 
-- **Active Triage Polls:** Live cards for every mod currently under review. Each card shows the mod name, reason for triage, live Keep/Remove percentage bars (fetched from GitHub Discussions API on page load), and a **"Cast Your Vote"** button that deep-links directly to the GitHub Discussion.
-- **Recent Resolutions:** A historical feed showing recently resolved votes (kept or removed), with the final percentages displayed. Maintains absolute platform transparency.
-- **Crash-to-Poll Connection:** If a user experiences a crash, and the crash log's `package_signatures` cross-reference reveals the crashing mod is currently under community review, the crash popup will dynamically say: *"This mod is currently being voted on by the community due to similar issues. Click here to read the report and view the active poll."*
+- **Voting:** Up and down arrows in the Community section add or remove the signed-in user's public GitHub reaction on the item's vote issue. The first vote asks the user to confirm it will be public. Published scores change after the next catalog build. Immune items, and items with no vote issue, show no arrows.
+- **Agora tab:** The Governance Summary shows counted, raw and quarantined votes and conflicted voters, with links to vote on GitHub and to write a technical review. Community reviews are listed below it for signed-in users.
+- **Crash connection:** Crash Doctor marks any suspect that is `under_review` with a note that curators are reviewing it and that this may not be related to the crash. The normal guided test is still offered.
+
+The in-app triage poll and resolution feeds were removed. Production runs the governance pipeline described in §24, which quarantines suspicious votes for curator review; §3.1 steps 5 and 8 and §5.3 now apply only when the compiler runs without an explicit governance mode.
 
 ---
 
@@ -938,7 +942,7 @@ Sidebar Tabs:
   ├── 🏠 Home (Featured & Trending)
   ├── 🔍 Browse (Curated Mod/Pack/Shader/etc. discovery)
   ├── 📦 My Instances
-  ├── 🗳️ Community Governance (Triage Center)
+  ├── 🗳️ Community Governance
   └── ⚙️ Settings
 
 Main Content Area: Dynamic based on sidebar selection
@@ -1033,9 +1037,8 @@ After onboarding, users can revisit and modify their integration preferences at 
 | Use MCP AI tools (if AI ON) | ✅ | ❌ |
 | Vote on mods | ✅ | ❌ |
 | Submit reviews | ✅ | ❌ |
-| Access Triage Center | ✅ | ❌ |
+| Read community reviews | ✅ | ❌ |
 | Report crashes to GitHub | ✅ | ❌ |
-| Flag comments | ✅ | ❌ |
 
 All features work offline once `registry.db` is cached, except those requiring live API calls. Integration toggles are independent of OAuth state — a user can have Modrinth ON and AI OFF, or vice versa, in Browse-Only Mode.
 ```
@@ -1361,7 +1364,7 @@ If any file with a banned extension is found inside the zip — even within a wh
 
 Before writing any extracted file to disk:
 - Strip all absolute path prefixes and `../` parent directory operators from the file's stored path.
-- Verify that the resolved canonical path is inside the designated instance directory sandbox.
+- Verify that the resolved path is inside the designated instance directory sandbox.
 - If any path escapes the sandbox: abort the entire installation.
 
 #### 7.2.4 The "Manifest Only" Guarantee
@@ -2070,7 +2073,6 @@ This section gives a concrete build order so a coding agent (or human developer)
 3. "Recent Resolutions" history feed.
 4. Curator Shield banner for immune items.
 5. Flag review system (GitHub issue direct creation).
-6. In-app Transparency Log display from `audit_log.json`.
 
 **Acceptance test:** An item marked under_review appears in the Triage Center with live poll data.
 
@@ -2200,7 +2202,7 @@ This section is an honest disclosure of what the spec does not yet cover, what a
 
 5. **The `loader_manifests.json` maintenance burden.** Every new modloader version requires a curator PR to add the hash. If the curator team is small, this becomes a bottleneck.
 
-6. **The audit log grows unboundedly.** Even with rotation, this is a 10,000-entry file. Performance is fine for `append` operations but reading the whole file for the Triage Center Transparency Log could be slow.
+6. **The audit log grows unboundedly.** Even with rotation, this is a 10,000-entry file. Performance is fine for `append` operations.
 
 7. **Race conditions in the readers-writer lock on `registry.db`.** A simple lock works but has edge cases. Consider using a SQLite-native approach or a proper RWLock with timeout.
 
@@ -2291,10 +2293,10 @@ D:/Agora/
 +-- scripts/                   # verify_db.py, deploy_release_assets.py, refresh_loader_manifests.py
 +-- .github/                   # workflows (compile, release-desktop, web-build, e2e), ISSUE_TEMPLATE
 +-- .kilo/                     # Kilo agent config, commands, agent profiles, skills, MASTER_SPEC.md
-+-- AGENTS.md                  # Canonical agent guide
++-- AGENTS.md                  # Agent guide
 +-- README.md                  # Project overview + setup + release cutting
 +-- BACKLOG.md                 # Phase-by-phase task tracker
-+-- CODE_OF_ENGAGEMENT.md      # Canonical review-conduct rules
++-- CODE_OF_ENGAGEMENT.md      # Review-conduct rules
 +-- REGISTRY_CURATION_REFERENCE.md   # Self-contained manifest-authoring guide
 +-- Cargo.toml                 # Workspace root (members: crates/agora-core, desktop/src-tauri, crates/agora)
 +-- .env.example               # Compiler env vars (GITHUB_TOKEN, ED25519_PRIVATE_KEY, DISCORD_WEBHOOK_URL)
@@ -2327,7 +2329,7 @@ ecord_crash_event (now wired into investigate_crash per A5 of the 2026-07-05 aud
 
 ### 19.5 Dependency-Aware Mod Operations
 
-From the deleted dependency-aware-mod-ops-plan.md: manifests may declare mod_dependencies: {required: [...], optional: [...], incompatible: [...]} and mod_jar_aliases: [...] to let the install/dependency system match across sources (curated registry ID, Modrinth project ID, jar-declared ID). crates/agora-core/src/dependency_ops.rs and desktop/src-tauri/src/dependency_ops.rs implement a unified dependency graph; crates/agora-core/src/jar_metadata.rs parses fabric.mod.json / mods.toml from jars at install time. fabric-api.json is the canonical example of a manifest with mod_dependencies.
+From the deleted dependency-aware-mod-ops-plan.md: manifests may declare mod_dependencies: {required: [...], optional: [...], incompatible: [...]} and mod_jar_aliases: [...] to let the install/dependency system match across sources (curated registry ID, Modrinth project ID, jar-declared ID). crates/agora-core/src/dependency_ops.rs and desktop/src-tauri/src/dependency_ops.rs implement a unified dependency graph; crates/agora-core/src/jar_metadata.rs parses fabric.mod.json / mods.toml from jars at install time. fabric-api.json is the standard example of a manifest with mod_dependencies.
 
 ### 19.6 MCP Server -- Implemented Tool Set & Roadmap
 
@@ -2372,7 +2374,7 @@ Cross-referenced against section 17 phase definitions:
 | 2 (Tauri skeleton + instance engine) | Done (with v1 crate migration in progress) | agora-core holds most logic; desktop still has thick mod_install/instances/crash_investigator/mcp modules pending migration. |
 | 3 (Browse, discovery, search) | Done | Browse + Modrinth federated into single page; For-You algorithm; debounce + removed per-item log spam during 2026-07-05 audit. |
 | 4 (Crash diagnostics) | Done | Pre-launch interceptor, regex triage, GitHub issue search, preview-before-submit, manual log viewer, section 19.4 dynamic investigator wired (A5). |
-| 5 (Governance & Triage) | Done | Triage Center tab, Curator Shield, Flag Review, Transparency Log. |
+| 5 (Governance & Triage) | Done | Curator Shield and in-app voting. The Triage Center tab and Flag Review were built, then removed (§5.5, §5.6). |
 | 6 (MCP Server) | Done | All 6 currently-implemented tools functional; per-session auth deferred (B2 approval pending user re-decision). |
 | 7 (Dev Mode sandboxed builds) | Not started | Spec section 11. |
 | 8 (Web directory) | Done | Static Next.js, registry.db fetched at CI build via scripts/fetch_registry_db.py (since deleted; the web build compiles the catalog itself), react-markdown with tightened sanitize schema, CSP header in 
@@ -2476,9 +2478,9 @@ from the first. The migration folds the intent forward before dropping the key:
 a stored `true` forces `modrinth_enabled` and `technic_enabled` off, so removing
 the switch never silently re-enables a source the user had opted out of.
 
-### 20.3 Canonical Registry Identity for Packs (formerly §19.17)
+### 20.3 Registry Identity for Packs (formerly §19.17)
 
-Every registry manifest uses `id` as its canonical top-level identity and declares its kind through `content_type`. Pack manifests therefore use `id` plus `content_type: "pack"`; the older top-level `pack_id` field is a deprecated compiler input alias. The compiler normalizes that alias before metadata hydration or governance, rejects mismatched `id` and `pack_id` values, and keeps relational names such as `pack_mods.pack_id` unchanged because those identify the owning pack in a relationship rather than defining a separate identity system.
+Every registry manifest uses `id` as its top-level identity and declares its kind through `content_type`. Pack manifests therefore use `id` plus `content_type: "pack"`; the older top-level `pack_id` field is a deprecated compiler input alias. The compiler normalizes that alias before metadata hydration or governance, rejects mismatched `id` and `pack_id` values, and keeps relational names such as `pack_mods.pack_id` unchanged because those identify the owning pack in a relationship rather than defining a separate identity system.
 
 ---
 
@@ -3028,15 +3030,15 @@ Keeping instances safe to change: safe operations, Last Known Good, content-addr
 
 **Architecture principles:**
 
-1. **One canonical launch orchestration path.** There is exactly one route through health preflight, user decision, launch mode selection, process spawn, PID tracking, and exit handling. Dialogs return decisions; they do not launch.
-2. **One canonical install transaction path.** Every mod/update/removal entry point resolves an `InstallIntent` → `ResolvedInstallPlan` → verified staging → atomic application → health scan → result. No page bypasses the plan.
+1. **One launch orchestration path.** There is exactly one route through health preflight, user decision, launch mode selection, process spawn, PID tracking, and exit handling. Dialogs return decisions; they do not launch.
+2. **One install transaction path.** Every mod/update/removal entry point resolves an `InstallIntent` → `ResolvedInstallPlan` → verified staging → atomic application → health scan → result. No page bypasses the plan.
 3. **React dialogs return user decisions and do not execute business operations.** A dialog's only side effect is calling `onConfirm()` or `onCancel()`. The parent component dispatches backend commands.
 4. **Process state survives navigation.** Running-instance identity, PID, console subscription, and exit status live in a controller that outlives page components. React may query backend state after remount.
 5. **User-changing operations are previewable and reversible.** Every manifest mutation produces a plan that shows what changes before execution. Snapshots enable rollback.
 6. **Existing snapshots become the basis of last-known-good recovery.** A successful launch establishes LKG state. Changes since LKG are visible. One-click restore returns to LKG.
 7. **Desktop UX work must include meaningful integration tests.** Mocked UI tests, Rust integration tests, and native smoke checks are separate layers. A test that only asserts the page rendered is not sufficient.
 
-#### 19.13.3 Release C canonical install-transaction architecture
+#### 19.13.3 Release C install-transaction architecture
 
 > Approved design from C0 Sol architect call. Implementation packages C1-C4.
 
@@ -3050,7 +3052,7 @@ Keeping instances safe to change: safe operations, Last Known Good, content-addr
 
 **Key invariants:**
 - InstallIntent -> ResolvedInstallPlan: plan makes zero instance changes. Deterministic for unchanged input (intent + instance state + registry revision).
-- Plan fingerprint = SHA-256(canonical_json(intent) || canonical_json(resolved_candidates) || instance_state_hash || registry_revision). Stale plans are rejected at apply time.
+- Plan fingerprint = SHA-256(stable JSON(intent) || stable JSON(resolved_candidates) || instance_state_hash || registry_revision). Stale plans are rejected at apply time.
 - Required dependencies: fail closed. Missing -> blocking error, plan cannot proceed.
 - Optional dependencies: governed by OptionalDepsPolicy (Include/ExcludeAll/Prompt). Prompt returns choices to frontend; user picks, intent re-submitted.
 - Conflicts: structured DepConflict with resolution_options (Replace/Skip/DisableExisting/Abort) and blocking flag.
@@ -3091,7 +3093,7 @@ Keeping instances safe to change: safe operations, Last Known Good, content-addr
 
 ### 23.2 Last-Known-Good and Reproducibility Architecture (formerly §19.14)
 
-> Approved design from D2 architect call. LKG is an additive marker on the existing zip-snapshot system, driven by a pure `LaunchOutcome` classifier in `agora-core`. Lockfiles are a separate canonical, content-addressed, hash-authoritative export format that excludes config contents for privacy.
+> Approved design from D2 architect call. LKG is an additive marker on the existing zip-snapshot system, driven by a pure `LaunchOutcome` classifier in `agora-core`. Lockfiles are a separate content-addressed, hash-authoritative export format that excludes config contents for privacy.
 
 **Data model.** LKG is a label on a snapshot, not separate storage. Three artifacts per instance: snapshot index (inside snapshot zip with `isLkg`, `promotedAt`, `launchSessionId`), `lkg.json` (convenience pointer), and `launches.jsonl` (append-only audit trail). Current LKG = snapshot with highest `promotedAt`.
 
@@ -3105,7 +3107,7 @@ Keeping instances safe to change: safe operations, Last Known Good, content-addr
 
 **Restore semantics.** Transactional with pre-restore snapshot: block active game, snapshot current, verify staged files, atomic swap, rollback on failure. Pre-restore snapshot enables undo.
 
-**Lockfile schema.** Portable canonical instance definition. Contains mods (id, filename, SHA-256, source URL, hashes), loader manifest hash, manifest hash, content hash. Optional Ed25519 signature for authorship attribution. Config excluded for privacy (`configPolicy.included: false`). Import verification: parse → check schema version → recompute contentHash → verify signature → verify each artifact hash → reject with precise error on any failure.
+**Lockfile schema.** Portable instance definition. Contains mods (id, filename, SHA-256, source URL, hashes), loader manifest hash, manifest hash, content hash. Optional Ed25519 signature for authorship attribution. Config excluded for privacy (`configPolicy.included: false`). Import verification: parse → check schema version → recompute contentHash → verify signature → verify each artifact hash → reject with precise error on any failure.
 
 **Config policy.** Tracked in snapshots (mods/ + manifest + small config files). **Excluded** from lockfile entirely (privacy: no server IPs, world data). Optional `configHash` for drift detection without content exposure.
 
@@ -3115,7 +3117,7 @@ Keeping instances safe to change: safe operations, Last Known Good, content-addr
 
 **Migration sequence.** Phase 1: core types + pure logic + unit tests. Phase 2: pre-change snapshots. Phase 3: launch classification + promotion. Phase 4: diff viewer. Phase 5: LKG restore. Phase 6: lockfile export/import. Phase 7: drift detection. Phase 8: retention automation. Phase 9: backfill existing instances.
 
-**Required tests.** Pure unit: classify_launch outcomes, promote_to_lkg failure rejection, compute_diff symmetry, lockfile canonicalization round-trip, detect_drift, retention_plan boundary. Integration: pre-change snapshot on install, lkg.json written on success, crash does not overwrite, restore transactionality. E2E: snapshot → launch → promote → diff → restore → content hash match; export lockfile → import → verify → reject tampered lockfile.
+**Required tests.** Pure unit: classify_launch outcomes, promote_to_lkg failure rejection, compute_diff symmetry, lockfile normalization round-trip, detect_drift, retention_plan boundary. Integration: pre-change snapshot on install, lkg.json written on success, crash does not overwrite, restore transactionality. E2E: snapshot → launch → promote → diff → restore → content hash match; export lockfile → import → verify → reject tampered lockfile.
 
 ### 23.3 Content-Addressed Recovery Snapshots (formerly §19.15)
 
@@ -3187,7 +3189,7 @@ egistry_items row. (Previously the column was always NULL.)
 
 Production registry and governance data remain in the main Agora repository by default. The compiler may explicitly target a separate governance repository and registry fixture root for sandbox testing; compiler code remains exclusively in the main repository. Governance repository resolution is `--governance-repo`, `AGORA_GOVERNANCE_REPO`, `AGORA_REGISTRY_REPO`, then `GITHUB_REPOSITORY`.
 
-Compiler governance modes are `off`, `read-only`, and `monitor`. All modes are non-mutating with respect to GitHub. `monitor` may write persistent local governance state and send deduplicated Discord alerts for new, expanded, or resolved quarantine events. Review Issues are identified only by the `community-review` label. Votes are read only from direct `+1` and `-1` reactions on canonical Issues mapped in `registry/governance/vote_issues.json`; review and comment reactions never count.
+Compiler governance modes are `off`, `read-only`, and `monitor`. All modes are non-mutating with respect to GitHub. `monitor` may write persistent local governance state and send deduplicated Discord alerts for new, expanded, or resolved quarantine events. Review Issues are identified only by the `community-review` label. Votes are read only from direct `+1` and `-1` reactions on the Issues mapped in `registry/governance/vote_issues.json`; review and comment reactions never count.
 
 Schema 7 adds per-item `governance_summary` and persistent `governance_events` tables while retaining final counted values and compatibility fields on `registry_items`. Pending and rejected reaction IDs remain excluded across compiles; an accepted curator decision restores them. The desktop supports schema 6 fallback, compile-time production/sandbox governance configuration, read-only diagnostics, and a debug-only validated `AGORA_DEV_REGISTRY_DB` override. The v1 review-report/admin-alert path is removed.
 

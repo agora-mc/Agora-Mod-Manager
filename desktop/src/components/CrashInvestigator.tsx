@@ -48,7 +48,7 @@ interface CrashInvestigatorProps {
   manualLogText?: string | null;
   onClose: () => void;
   /** Called to re-launch the instance after disabling a suspected mod. */
-  /** Returns true only when the canonical launch controller actually started. */
+  /** Returns true only when the launch controller actually started. */
   onLaunch: (onAwaitingHealth: () => void) => Promise<LaunchStartOutcome>;
   processState: ProcessState;
 }
@@ -124,6 +124,11 @@ function SuspectCard({
             {isTop && (
               <p className="mt-1 text-xs text-muted-foreground">
                 Looks like the most likely cause — try the test below.
+              </p>
+            )}
+            {suspect.under_review && (
+              <p className="mt-1 text-xs text-amber-800 dark:text-amber-300">
+                Agora’s curators are reviewing this project right now. This may not be related to your crash.
               </p>
             )}
           </div>
@@ -210,23 +215,6 @@ function FixConfirmation({
           No, still crashing
         </button>
       </div>
-    </div>
-  );
-}
-
-/** Triage banner for mods under community review. */
-function TriageBanner({ modId, onViewTriage }: { modId: string; onViewTriage: () => void }) {
-  return (
-    <div className="rounded-xl border border-yellow-300 dark:border-yellow-700 bg-yellow-50 dark:bg-yellow-900/20 p-4">
-      <p className="text-sm text-yellow-800 dark:text-yellow-200 mb-3">
-        Other players have reported problems with “{modId}” — our moderators are looking into it.
-      </p>
-      <button
-        onClick={onViewTriage}
-        className="rounded-lg px-3 py-2 text-sm font-medium transition-colors bg-yellow-600 text-white hover:bg-yellow-700"
-      >
-        View in Triage Center
-      </button>
     </div>
   );
 }
@@ -838,10 +826,6 @@ export function CrashInvestigator({
     return () => { cancelled = true; };
   }, [instanceId, pendingTest, processState.error, processState.healthReport, processState.instanceId, processState.outcome, processState.phase, restoreInvestigationSnapshot, result]);
 
-  const handleViewTriage = useCallback(() => {
-    onClose();
-  }, [onClose]);
-
   // Build a redacted report and put it on the clipboard. Everything happens
   // locally; Agora never sends the report anywhere.
   const handleExportReport = useCallback(async () => {
@@ -1228,14 +1212,6 @@ export function CrashInvestigator({
                   onFix={handleFixConfirmed}
                   onStillCrashing={handleStillCrashing}
                   loading={loading}
-                />
-              )}
-
-              {/* Triage banner */}
-              {suggested_action.kind === 'ShowTriageBanner' && (
-                <TriageBanner
-                  modId={suggested_action.mod_id}
-                  onViewTriage={handleViewTriage}
                 />
               )}
 

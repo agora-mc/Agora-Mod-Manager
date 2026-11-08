@@ -225,7 +225,7 @@ describe('LiveInteractiveHost (High Interaction live surface)', () => {
     await waitFor(() => expect(onOpenStandardOperation).toHaveBeenCalledTimes(0));
   });
 
-  it('projects canonical phases: launching, running, stopping, delegated, failed', async () => {
+  it('projects live phases: launching, running, stopping, delegated, failed', async () => {
     const cases: Array<{ phase: string; launch: string; busy: boolean }> = [
       { phase: 'launching', launch: 'starting', busy: true },
       { phase: 'running', launch: 'running', busy: true },
@@ -257,7 +257,7 @@ describe('LiveInteractiveHost (High Interaction live surface)', () => {
     }
   });
 
-  it('ignores canonical process state for a different instance', async () => {
+  it('ignores live process state for a different instance', async () => {
     const load = vi.fn(async (): Promise<LiveHostData> => makeData());
     render(
       <LiveInteractiveHost
@@ -272,7 +272,7 @@ describe('LiveInteractiveHost (High Interaction live surface)', () => {
     expect(bench).toHaveAttribute('data-launch-state', 'idle');
   });
 
-  it('blocks a review while an install is active (canonical availability)', async () => {
+  it('blocks a review while an install is active (live availability)', async () => {
     const scene = baseScene();
     scene.findings = [
       {
@@ -388,7 +388,7 @@ describe('LiveInteractiveHost (High Interaction live surface)', () => {
     expect(screen.getByRole('button', { name: 'Play this instance' })).toBeEnabled();
   });
 
-  it('canonical busy is reversible: idle -> launching -> idle clears busy (never sticky)', async () => {
+  it('live busy is reversible: idle -> launching -> idle clears busy (never sticky)', async () => {
     const load = vi.fn(async (): Promise<LiveHostData> => makeData());
     const { rerender } = render(
       <LiveInteractiveHost
@@ -608,7 +608,7 @@ describe('LiveInteractiveHost (High Interaction live surface)', () => {
     expect(bench).toHaveAttribute('data-lock-state', 'editable');
   });
 
-  it('applies the LATEST canonical state when a read lands after a canonical change', async () => {
+  it('applies the LATEST live state when a read lands after a live change', async () => {
     let resolveLoad: (d: LiveHostData) => void = () => undefined;
     const load = vi.fn((): Promise<LiveHostData> => new Promise((resolve) => { resolveLoad = resolve; }));
     const { rerender } = render(
@@ -620,7 +620,7 @@ describe('LiveInteractiveHost (High Interaction live surface)', () => {
       />,
     );
     await waitFor(() => expect(load).toHaveBeenCalledTimes(1));
-    // Canonical state changes while the initial read is unresolved.
+    // Live state changes while the initial read is unresolved.
     rerender(
       <LiveInteractiveHost
         instanceId="inst-1"
@@ -631,7 +631,7 @@ describe('LiveInteractiveHost (High Interaction live surface)', () => {
     );
     resolveLoad(makeData());
     await waitFor(() => expect(screen.getAllByText('My World').length).toBeGreaterThanOrEqual(1));
-    // The accepted read is projected with the LATEST canonical state, not the
+    // The accepted read is projected with the LATEST live state, not the
     // stale idle captured when the read started.
     const bench = screen.getByTestId('live-instance-editor');
     expect(bench).toHaveAttribute('data-launch-state', 'running');

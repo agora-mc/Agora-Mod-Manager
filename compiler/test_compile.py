@@ -37,7 +37,7 @@ import compile as _compile  # noqa: E402
 # ---------------------------------------------------------------------------
 
 class TestNormalizePackIdentity(unittest.TestCase):
-    def test_legacy_pack_id_becomes_canonical_id(self):
+    def test_legacy_pack_id_becomes_top_level_id(self):
         item = {"pack_id": "my-pack", "name": "My Pack"}
 
         result = _compile.normalize_pack_identity(item)
@@ -45,7 +45,7 @@ class TestNormalizePackIdentity(unittest.TestCase):
         self.assertEqual(result["id"], "my-pack")
         self.assertEqual(result["content_type"], "pack")
 
-    def test_canonical_pack_is_unchanged(self):
+    def test_pack_identity_is_unchanged(self):
         item = {"id": "my-pack", "content_type": "pack"}
 
         self.assertEqual(_compile.normalize_pack_identity(item), item)

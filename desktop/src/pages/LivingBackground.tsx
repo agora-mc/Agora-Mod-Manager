@@ -10,7 +10,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { Mountain, Music, Volume2, CloudRain, CloudSnow, Sun, ZoomIn, ZoomOut, Sparkles, Rainbow, ChevronDown, ChevronRight, Lock, LockOpen, RotateCcw } from 'lucide-react';
+import { Mountain, Music, Volume2, CloudRain, CloudSnow, Sun, ZoomIn, ZoomOut, Sparkles, Rainbow, Maximize2, ChevronRight, Lock, LockOpen, RotateCcw } from 'lucide-react';
 import { MUSIC_TRACK_CHOICES, INSTRUMENT_CHOICES } from '../features/ambience/engine/audio/trackChoices';
 import { useAmbience } from '../features/ambience/AmbienceProvider';
 import { Switch } from '../components/ui/switch';
@@ -242,17 +242,22 @@ export function LivingBackground() {
           aria-label="Living background controls"
           data-testid="living-bg-controls"
         >
-          <button
-            type="button"
-            onClick={() => setPanelOpen((v) => !v)}
-            aria-expanded={panelOpen}
-            aria-controls="living-bg-panel-body"
-            className="mb-3 flex w-full items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-muted-foreground hover:text-foreground"
-          >
-            <ChevronDown className="h-4 w-4" aria-hidden="true" />
-            Control panel
-            <span className="ml-auto font-normal normal-case tracking-normal text-muted-foreground">Hide</span>
-          </button>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <span className="text-xs font-bold uppercase tracking-[0.2em] text-muted-foreground">
+              Control panel
+            </span>
+            <button
+              type="button"
+              onClick={() => setPanelOpen(false)}
+              aria-expanded={panelOpen}
+              aria-controls="living-bg-panel-body"
+              className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow-md transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              data-testid="living-bg-hide"
+            >
+              <Maximize2 className="h-4 w-4" aria-hidden="true" />
+              Open Full Living Background
+            </button>
+          </div>
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
               Locks stop the world changing the time of day or the weather on its own; unlocked, both keep cycling.
