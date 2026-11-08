@@ -747,13 +747,21 @@ impl GameReads for GameViewReads {
             } else {
                 format!("{folded_folder}/")
             };
+            let mut exists = false;
             for (folded, entry) in entries {
+                if folded == &folded_folder {
+                    return Err(refusal(
+                        "not_a_folder",
+                        format!("`{folder}` is not a folder in this instance's view"),
+                    ));
+                }
                 let Some(rest) = folded.strip_prefix(&prefix) else {
                     continue;
                 };
                 if rest.is_empty() {
                     continue;
                 }
+                exists = true;
                 let Some(relative) = relative_below(&entry.game_path, folder) else {
                     continue;
                 };
@@ -769,14 +777,58 @@ impl GameReads for GameViewReads {
                 )?;
                 candidates.push((relative, entry.source.clone()));
             }
+            if !exists {
+                return Err(refusal(
+                    "not_found",
+                    format!("`{folder}` does not exist in this instance's view"),
+                ));
+            }
         } else {
+            let mut exists = false;
             for root in &self.roots {
                 reject_reparse_chain(root, folder)?;
                 let base = folder
                     .split('/')
                     .filter(|part| !part.is_empty())
                     .fold(root.clone(), |path, part| path.join(part));
-                walk_view(&base, "", 0, &mut candidates)?;
+                match std::fs::symlink_metadata(&base) {
+                    Ok(meta) if is_reparse_point(&meta) => {
+                        return Err(refusal(
+                            "reparse_point",
+                            format!("`{folder}` passes through a link, which is not followed"),
+                        ));
+                    }
+                    Ok(meta) if meta.is_dir() => {
+                        exists = true;
+                        walk_view(&base, folder, "", 0, &mut candidates)?;
+                    }
+                    Ok(_) => {
+                        // A file in a higher layer shadows a folder below it;
+                        // only the highest layer that has the name decides.
+                        if !exists {
+                            return Err(refusal(
+                                "not_a_folder",
+                                format!("`{folder}` is not a folder in this instance's view"),
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        return Err(refusal(
+                            "unreadable",
+                            format!(
+                                "{} could not be read in this instance's view",
+                                view_subject(folder)
+                            ),
+                        ));
+                    }
+                }
+            }
+            if !exists {
+                return Err(refusal(
+                    "not_found",
+                    format!("`{folder}` does not exist in this instance's view"),
+                ));
             }
         }
 
@@ -793,25 +845,161 @@ impl GameReads for GameViewReads {
             {
                 continue;
             }
+            let game_path = view_path(folder, &relative);
+            // Check the chosen file again immediately before staging: the walk
+            // and the staging pass are separate, and a link can appear between
+            // them. The identity is checked again after the hardlink, so a
+            // swap inside that window is caught too.
+            let meta = std::fs::symlink_metadata(&source)
+                .map_err(|_| refusal("unreadable", format!("`{game_path}` could not be read")))?;
+            if is_reparse_point(&meta) || !meta.is_file() {
+                return Err(refusal(
+                    "reparse_point",
+                    format!("`{game_path}` is not a regular file, so it is not staged"),
+                ));
+            }
+            let expected = file_identity(&meta);
+            // Staging hands the module the same bytes a read would return, so
+            // it spends the same byte budget.
+            self.budget.spend(&self.limits, meta.len())?;
             let dest = relative
                 .split('/')
                 .fold(destination.to_path_buf(), |path, part| path.join(part));
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|_| {
-                    refusal("staging_failed", "could not create a folder for the module")
+                    refusal(
+                        "staging_failed",
+                        format!("could not create a folder for `{game_path}`"),
+                    )
                 })?;
             }
-            match std::fs::hard_link(&source, &dest) {
-                Ok(()) => {}
-                Err(_) => {
-                    std::fs::copy(&source, &dest).map_err(|_| {
-                        refusal("staging_failed", "could not stage a file for the module")
-                    })?;
-                }
-            }
+            stage_file(&source, &dest, expected, &game_path)?;
             staged += 1;
         }
         Ok(staged)
+    }
+}
+
+/// A game path made from a folder and a path relative to it.
+fn view_path(folder: &str, relative: &str) -> String {
+    if folder.is_empty() {
+        relative.to_string()
+    } else {
+        format!("{folder}/{relative}")
+    }
+}
+
+/// What a script sees for a path, never a host path.
+fn view_subject(path: &str) -> String {
+    if path.is_empty() {
+        "the instance view".to_string()
+    } else {
+        format!("`{path}`")
+    }
+}
+
+/// The identity of a file, used to catch a swap between the walk and staging.
+///
+/// On Unix an inode number and its device; on Windows the creation and write
+/// times plus the size, because the stable `MetadataExt` surface does not
+/// expose a file index.
+#[cfg(unix)]
+type FileIdentity = (u64, u64, u64);
+#[cfg(windows)]
+type FileIdentity = (u64, u64, u64);
+#[cfg(not(any(unix, windows)))]
+type FileIdentity = ();
+
+fn file_identity(meta: &std::fs::Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino(), meta.len())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        (
+            meta.creation_time(),
+            meta.last_write_time(),
+            meta.file_size(),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+    }
+}
+
+/// Link or copy one file into the staging folder, refusing a swapped source.
+///
+/// A hardlink shares the real file's data, so after linking the staged entry
+/// must be the same ordinary file the walk saw. The copy fallback opens the
+/// source and checks the opened handle's identity before copying, because a
+/// copy follows a link.
+fn stage_file(
+    source: &Path,
+    dest: &Path,
+    expected: FileIdentity,
+    game_path: &str,
+) -> Result<(), ScriptReadError> {
+    match std::fs::hard_link(source, dest) {
+        Ok(()) => {
+            let meta = std::fs::symlink_metadata(dest).map_err(|_| {
+                refusal(
+                    "staging_failed",
+                    format!("`{game_path}` could not be checked after staging"),
+                )
+            })?;
+            if is_reparse_point(&meta) || !meta.is_file() || file_identity(&meta) != expected {
+                let _ = std::fs::remove_file(dest);
+                return Err(refusal(
+                    "staging_failed",
+                    format!("`{game_path}` changed while it was staged"),
+                ));
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let mut from = std::fs::File::open(source)
+                .map_err(|_| refusal("unreadable", format!("`{game_path}` could not be read")))?;
+            let opened = from
+                .metadata()
+                .map_err(|_| refusal("unreadable", format!("`{game_path}` could not be read")))?;
+            if is_reparse_point(&opened) || !opened.is_file() || file_identity(&opened) != expected
+            {
+                return Err(refusal(
+                    "staging_failed",
+                    format!("`{game_path}` changed while it was staged"),
+                ));
+            }
+            let mut to = std::fs::File::create(dest).map_err(|_| {
+                refusal(
+                    "staging_failed",
+                    format!("`{game_path}` could not be staged"),
+                )
+            })?;
+            std::io::copy(&mut from, &mut to).map_err(|_| {
+                refusal(
+                    "staging_failed",
+                    format!("`{game_path}` could not be staged"),
+                )
+            })?;
+            let meta = std::fs::symlink_metadata(dest).map_err(|_| {
+                refusal(
+                    "staging_failed",
+                    format!("`{game_path}` could not be checked after staging"),
+                )
+            })?;
+            if is_reparse_point(&meta) || !meta.is_file() {
+                let _ = std::fs::remove_file(dest);
+                return Err(refusal(
+                    "staging_failed",
+                    format!("`{game_path}` changed while it was staged"),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -828,8 +1016,13 @@ fn relative_below(full: &str, folder: &str) -> Option<String> {
 
 /// Collect the ordinary files below `dir`, skipping reparse points, with paths
 /// relative to the staged folder.
+///
+/// `game_dir` is the path the script used for `dir`, so an error can name what
+/// the script asked for without revealing a host path. Every `read_dir` and
+/// metadata failure is an error rather than a silently smaller mount.
 fn walk_view(
     dir: &Path,
+    game_dir: &str,
     prefix: &str,
     depth: usize,
     out: &mut Vec<(String, PathBuf)>,
@@ -837,24 +1030,43 @@ fn walk_view(
     if depth > 64 {
         return Ok(());
     }
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for entry in read_dir.flatten() {
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        if is_reparse_point(&meta) {
-            continue;
-        }
+    let read_dir = std::fs::read_dir(dir).map_err(|_| {
+        refusal(
+            "unreadable",
+            format!(
+                "{} could not be read in this instance's view",
+                view_subject(game_dir)
+            ),
+        )
+    })?;
+    for entry in read_dir {
+        let entry = entry.map_err(|_| {
+            refusal(
+                "unreadable",
+                format!(
+                    "{} could not be read in this instance's view",
+                    view_subject(game_dir)
+                ),
+            )
+        })?;
         let name = entry.file_name().to_string_lossy().to_string();
         let relative = if prefix.is_empty() {
-            name
+            name.clone()
         } else {
             format!("{prefix}/{name}")
         };
+        let game_path = view_path(game_dir, &name);
+        let meta = std::fs::symlink_metadata(entry.path()).map_err(|_| {
+            refusal(
+                "unreadable",
+                format!("`{game_path}` could not be read in this instance's view"),
+            )
+        })?;
+        if is_reparse_point(&meta) {
+            continue;
+        }
         if meta.is_dir() {
-            walk_view(&entry.path(), &relative, depth + 1, out)?;
+            walk_view(&entry.path(), &game_path, &relative, depth + 1, out)?;
         } else if meta.is_file() {
             out.push((relative, entry.path()));
         }
@@ -2113,7 +2325,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "review: a missing mount source stages an empty folder instead of failing, so the module runs"]
     fn a_missing_view_folder_is_not_an_empty_mount() {
         let root = unique_root("stage-missing");
         let reads = reader(&root);
@@ -2139,5 +2350,64 @@ mod tests {
             not_a_folder.is_err(),
             "a file named as a view folder staged an empty mount: {not_a_folder:?}"
         );
+    }
+
+    #[test]
+    fn a_view_folder_that_matches_nothing_is_still_a_mount() {
+        let root = unique_root("stage-no-match");
+        write(&root.join("Data/a.esp"), b"a");
+        let reads = reader(&root);
+        let destination = unique_root("stage-no-match-dest");
+
+        let staged = reads
+            .stage_view("Data", &["*.esm".to_string()], &destination)
+            .expect("an existing folder is a mount even when no file matches");
+
+        assert_eq!(staged, 0);
+        // How the module tells: the guest mount exists and lists as empty, so
+        // "nothing matched" is a mount with no entries, not a failed run.
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&destination).ok();
+    }
+
+    #[test]
+    fn staging_spends_the_read_budget() {
+        let root = unique_root("stage-budget");
+        write(&root.join("Data/big.esp"), &[0u8; 100]);
+        let reads = reader(&root);
+        let destination = unique_root("stage-budget-dest");
+
+        let error = reads
+            .stage_view("Data", &[], &destination)
+            .expect_err("staging past the read budget is refused");
+
+        assert_eq!(error.code, "budget_spent", "{}", error.message);
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&destination).ok();
+    }
+
+    #[test]
+    fn a_file_swapped_after_the_walk_is_not_staged() {
+        let root = unique_root("stage-swap");
+        let original = root.join("original.esp");
+        let swapped = root.join("swapped.esp");
+        write(&original, b"a");
+        write(&swapped, b"bbbb");
+        let destination = unique_root("stage-swap-dest").join("staged.esp");
+        let expected = file_identity(&std::fs::symlink_metadata(&original).unwrap());
+
+        // The walk saw `original`, but staging is handed `swapped`: the
+        // identity no longer matches, so nothing is left in the staging folder.
+        let error = stage_file(&swapped, &destination, expected, "Data/original.esp")
+            .expect_err("a swapped file is not staged");
+
+        assert_eq!(error.code, "staging_failed", "{}", error.message);
+        assert!(!destination.exists(), "the swapped file was removed");
+        std::fs::remove_dir_all(&root).ok();
+        if let Some(parent) = destination.parent() {
+            std::fs::remove_dir_all(parent).ok();
+        }
     }
 }
