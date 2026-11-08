@@ -90,7 +90,7 @@ Agora needs the internet to download its catalog the first time. Connect, then c
 
 If you are online and it still fails, check that **Lockdown Mode** is off under Settings > Privacy. Privacy is only visible with Advanced mode turned on in Settings.
 
-If Agora says it can't verify the catalog, please don't try to get around it. Ask on Discord instead, because the check is there to confirm the catalog really came from Agora.
+If Agora says it can't verify the catalog, please don't try to get around it. Ask on the [Agora Discord](https://discord.gg/56tpsa2sTZ) instead, because the check is there to confirm the catalog really came from Agora.
 
 ### Modrinth mods aren't showing up
 
@@ -140,7 +140,7 @@ This is expected, because Minecraft has no built-in controller support. Agora of
 
 ### Agora doesn't respond to my controller
 
-Press a button on the controller while the Agora window is focused. Agora only notices a controller once you use it. There is no setting to turn on, so if nothing happens at all, check that the controller works in another app. See [Playing with a controller](https://agoramc.com/docs/guides/controller-handheld).
+Press a button on the controller while the Agora window is focused (make sure to click into the app and that the controller is conencted via bluetooth, cable, or USB receiver). Agora only notices a controller once you use it. There is no setting to turn on, so if nothing happens at all, check that the controller works in another app. See [Playing with a controller](https://agoramc.com/docs/guides/controller-handheld).
 
 ## Agora itself
 
@@ -154,7 +154,7 @@ Open Settings and go to **Software Updates**, then select **Check for Updates**.
 
 ## Getting help
 
-If you're still stuck, other people can help much faster with the details in hand.
+If you're still stuck, other people or AI assitants can help much faster with the details in hand.
 
 1. Open Crash Doctor and select **Copy crash report**. It copies a report with your file paths and username removed. Nothing else is filtered, so give it a quick read for anything private, such as server addresses.
 2. Post it on the [Agora Discord](https://discord.gg/56tpsa2sTZ), along with your Agora version, what you were doing, and what you have already tried.

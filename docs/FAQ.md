@@ -16,6 +16,10 @@ Yes. Agora is free, has no ads, and is open source. It's funded by donations.
 
 Windows is tested and signed. macOS and Linux builds are available, but they aren't officially tested yet and may not work properly.
 
+### I play Minecraft on my console/phone/through the Microsoft store, how do I get Agora to work with it?
+
+Agora is designed for Minecraft Java Edition, which is available on PC only. The console, phone, and Microsoft Store versions of Minecraft are frequently known as Minecraft Bedrock and do not support the same mods as Java Edition, hence why Agora only supports Java Edition.
+
 ### Do I still need to own the game?
 
 Yes. Agora starts the game, but it doesn't give you a copy of it.
