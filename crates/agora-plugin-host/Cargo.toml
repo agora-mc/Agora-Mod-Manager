@@ -20,3 +20,4 @@ base64 = { workspace = true }
 esplugin = "6.1"
 sha1 = { workspace = true }
 tempfile = { workspace = true }
+wasm-encoder = "0.261"

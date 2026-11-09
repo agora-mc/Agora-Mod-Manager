@@ -264,6 +264,7 @@ dependencies = [
  "sha1 0.10.6",
  "tempfile",
  "tokio",
+ "wasm-encoder",
  "wasmtime",
  "wasmtime-wasi",
 ]

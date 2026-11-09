@@ -169,11 +169,13 @@ impl Mount {
     }
 }
 
-/// Run one module in its own thread and wait for it.
+/// Run one module in its own thread and wait for it, never past its deadline.
 ///
 /// The thread is deliberate: `wasmtime-wasi`'s synchronous preview 1 adapter
 /// needs a Tokio runtime, and the plugin thread is already inside one. A fresh
 /// thread also keeps a module panic from taking down the plugin's runtime.
+/// A compile the deadline abandons keeps running in the background; see
+/// [`run_inner`].
 pub fn run(
     module: &str,
     package_root: &Path,
@@ -310,7 +312,7 @@ fn run_inner(
         .map_err(|e| {
             WasmError::new("internal", format!("could not start a module runtime: {e}"))
         })?;
-    runtime.block_on(execute(
+    let outcome = runtime.block_on(execute(
         &wasm,
         module,
         MemoryInputPipe::new(stdin),
@@ -319,7 +321,13 @@ fn run_inner(
         timeout,
         remaining,
         data_root,
-    ))
+    ));
+    // Dropping a runtime waits for its `spawn_blocking` tasks. A compile the
+    // deadline abandoned must not hold the call open, so shut the runtime down
+    // in the background: the compile keeps running on its blocking thread until
+    // it finishes, but the caller gets its timeout at the deadline.
+    runtime.shutdown_background();
+    outcome
 }
 
 /// Read a module file, refusing anything larger than [`MAX_MODULE_BYTES`].
@@ -364,6 +372,10 @@ fn mount_error(guest: &str, error: ScriptReadError) -> WasmError {
 /// a repeat cheap), and the call itself runs under `timeout_at`, which drops
 /// the in-flight future — including a host call such as `poll_oneoff` or a
 /// blocked `fd_read` — instead of waiting for it.
+///
+/// An abandoned compile cannot be cancelled; it runs to completion on its
+/// blocking thread. [`run_inner`] shuts the runtime down in the background so
+/// that work never delays the caller past the deadline.
 #[allow(clippy::too_many_arguments)]
 async fn execute<S: StdinStream + 'static>(
     wasm: &[u8],
@@ -917,5 +929,97 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("the blocked read was not stopped"));
         assert_eq!(error.code, "timeout", "{}", error.message);
+    }
+
+    /// A valid WASI command module with `functions` small functions, large
+    /// enough that a cold compile is much slower than a short deadline.
+    /// `nonce` makes the bytes unique so the wasmtime compile cache cannot
+    /// hide the compile time.
+    fn large_module(nonce: u64, functions: u32) -> Vec<u8> {
+        use wasm_encoder::{
+            CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
+            Instruction, Module as EncodedModule, TypeSection,
+        };
+        let mut module = EncodedModule::new();
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        module.section(&types);
+        let mut funcs = FunctionSection::new();
+        for _ in 0..functions {
+            funcs.function(0);
+        }
+        module.section(&funcs);
+        let mut exports = ExportSection::new();
+        exports.export("_start", ExportKind::Func, 0);
+        module.section(&exports);
+        let mut code = CodeSection::new();
+        for _ in 0..functions {
+            let mut body = Function::new([]);
+            for _ in 0..8 {
+                body.instruction(&Instruction::I32Const(1));
+                body.instruction(&Instruction::I32Const(2));
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::Drop);
+            }
+            body.instruction(&Instruction::End);
+            code.function(&body);
+        }
+        module.section(&code);
+        module.section(&CustomSection {
+            name: "nonce".into(),
+            data: nonce.to_le_bytes().to_vec().into(),
+        });
+        module.finish()
+    }
+
+    /// The deadline covers compilation. When a compile outlasts it, the call
+    /// must return at the deadline, not once the abandoned compile finishes.
+    ///
+    /// The module is deliberately large enough that a cold compile is far
+    /// slower than the limit, and the probe uses different bytes so the
+    /// wasmtime compile cache cannot hide that. This does not depend on the
+    /// machine being slow: the probe measures how long a cold compile takes,
+    /// and the assertion is relative to that measurement.
+    #[test]
+    fn a_compile_that_outlasts_the_deadline_does_not_hold_the_call() {
+        const FUNCTIONS: u32 = 12_000;
+        let limit = Duration::from_millis(20);
+
+        let data = tempfile::tempdir().expect("temp data root");
+        let package = data.path().join("package");
+        std::fs::create_dir_all(&package).unwrap();
+
+        // How long a cold compile of this size takes. A different nonce for
+        // the module below keeps this from warming the cache for it.
+        let probe = large_module(1, FUNCTIONS);
+        let started = std::time::Instant::now();
+        Module::new(&engine(data.path()), &probe).expect("the probe module compiles");
+        let compile_time = started.elapsed();
+
+        let wasm = large_module(2, FUNCTIONS);
+        std::fs::write(package.join("big.wasm"), &wasm).unwrap();
+        let started = std::time::Instant::now();
+        let outcome = run(
+            "big.wasm",
+            &package,
+            data.path(),
+            r#"{"module":"big.wasm","limits":{"timeoutMs":20}}"#,
+            None,
+            None,
+        );
+        let elapsed = started.elapsed();
+
+        let error = outcome.expect_err("the module should hit its deadline");
+        assert_eq!(error.code, "timeout", "{}", error.message);
+        // If a cold compile is not clearly slower than the limit, the test
+        // cannot tell an abandoned compile from a fast one.
+        assert!(
+            compile_time > limit * 10,
+            "the probe module compiled in {compile_time:?}, too fast to test the deadline"
+        );
+        assert!(
+            elapsed < compile_time / 2,
+            "the call waited {elapsed:?} for a compile that takes {compile_time:?}"
+        );
     }
 }
