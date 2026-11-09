@@ -1110,7 +1110,7 @@ mod tests {
         const FUNCTIONS: u32 = 12_000;
         // The engine's first compile pays Cranelift and cache startup, which
         // would make the probe look far slower than the compile it measures.
-        Module::new(&engine(data), &large_module(variant + 2, 1))
+        Module::new(&engine(data), large_module(variant + 2, 1))
             .expect("the warm-up module compiles");
         let probe = large_module(variant, FUNCTIONS);
         let started = Instant::now();
