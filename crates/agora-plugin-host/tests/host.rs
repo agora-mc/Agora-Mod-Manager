@@ -493,7 +493,13 @@ fn a_plugin_exceeding_its_memory_ceiling_fails_without_taking_the_process() {
             Duration::from_secs(10),
         )
         .unwrap_err();
-    assert_eq!(err.code, PluginErrorCode::ResourceExhausted);
+    assert_eq!(
+        err.code,
+        PluginErrorCode::ResourceExhausted,
+        "code={:?} message={}",
+        err.code,
+        err.message
+    );
 }
 
 #[test]

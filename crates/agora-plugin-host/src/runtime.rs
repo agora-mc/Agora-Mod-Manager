@@ -23,7 +23,8 @@ use agora_plugin_api::host::{ActivationRequest, GameReads, HostBridge, ScriptRea
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel, PluginEventEnvelope};
 use rquickjs::function::Async;
 use rquickjs::{
-    ArrayBuffer, AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module, Object, Value,
+    ArrayBuffer, AsyncContext, AsyncRuntime, CatchResultExt, CaughtError, Ctx, Function, Module,
+    Object, Value,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -626,16 +627,16 @@ async fn load_and_activate(
         .async_with(async move |ctx: Ctx<'_>| -> PluginResult<()> {
             let (module, promise) = Module::declare(ctx.clone(), entrypoint.as_str(), source)
                 .catch(&ctx)
-                .map_err(|e| script_error(&e.to_string()))?
+                .map_err(|e| script_error(&e))?
                 .eval()
                 .catch(&ctx)
-                .map_err(|e| script_error(&e.to_string()))?;
+                .map_err(|e| script_error(&e))?;
             // Top-level await and any import side effects settle here.
             promise
                 .into_future::<()>()
                 .await
                 .catch(&ctx)
-                .map_err(|e| script_error(&e.to_string()))?;
+                .map_err(|e| script_error(&e))?;
             let namespace: Object = module.namespace().map_err(js_internal)?;
             ctx.globals()
                 .set("__agora_exports", namespace)
@@ -669,20 +670,31 @@ fn js_internal(e: rquickjs::Error) -> PluginError {
     PluginError::internal(e.to_string())
 }
 
-fn script_error(message: &str) -> PluginError {
+fn script_error(error: &CaughtError<'_>) -> PluginError {
+    let message = error.to_string();
     if message.contains("interrupted") {
         PluginError::new(
             PluginErrorCode::Timeout,
             "the plugin was interrupted after exceeding its time limit",
         )
-    } else if message.contains("out of memory") {
+    } else if message.contains("out of memory") || is_bare_null(error) {
+        // QuickJS normally throws an InternalError saying "out of memory".
+        // When even that Error object cannot be allocated, it throws the bare
+        // value `null` instead (quickjs.c: "out of memory: throw JS_NULL to
+        // avoid recursing"). Which of the two happens depends on the host's
+        // allocator, so both mean the ceiling was hit.
         PluginError::new(
             PluginErrorCode::ResourceExhausted,
             "the plugin exceeded its memory limit",
         )
     } else {
-        PluginError::new(PluginErrorCode::ScriptError, message.to_string())
+        PluginError::new(PluginErrorCode::ScriptError, message)
     }
+}
+
+/// QuickJS's sentinel for running out of memory while throwing an error.
+fn is_bare_null(error: &CaughtError<'_>) -> bool {
+    matches!(error, CaughtError::Value(value) if value.is_null())
 }
 
 /// Call an export that may or may not exist. A missing export is `Ok(Null)`.
@@ -770,7 +782,7 @@ async fn call_export(
             let returned: Value = function
                 .call((parsed,))
                 .catch(&ctx)
-                .map_err(|e| script_error(&e.to_string()))?;
+                .map_err(|e| script_error(&e))?;
 
             let resolved: Value = if let Some(promise) = returned.as_promise() {
                 promise
@@ -778,7 +790,7 @@ async fn call_export(
                     .into_future::<Value>()
                     .await
                     .catch(&ctx)
-                    .map_err(|e| script_error(&e.to_string()))?
+                    .map_err(|e| script_error(&e))?
             } else {
                 returned
             };
@@ -792,7 +804,7 @@ async fn call_export(
             let text: Option<String> = stringify
                 .call((resolved,))
                 .catch(&ctx)
-                .map_err(|e| script_error(&e.to_string()))?;
+                .map_err(|e| script_error(&e))?;
             let Some(text) = text else {
                 return Ok(serde_json::Value::Null);
             };
@@ -856,7 +868,7 @@ async fn dispatch_event(
         dispatch
             .call::<_, ()>((json,))
             .catch(&ctx)
-            .map_err(|e| script_error(&e.to_string()))
+            .map_err(|e| script_error(&e))
     });
     let result = tokio::time::timeout(EVENT_DISPATCH_TIMEOUT + Duration::from_millis(250), work)
         .await
@@ -868,4 +880,28 @@ async fn dispatch_event(
         });
     clear_deadline(deadline);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rquickjs::{Context, Runtime};
+
+    /// QuickJS throws the bare value `null` when it cannot allocate the
+    /// "out of memory" Error object, which is what happens on hosts where the
+    /// error object no longer fits under the plugin's ceiling. That sentinel
+    /// must map to the same code as an ordinary "out of memory" throw.
+    #[test]
+    fn a_bare_null_exception_is_the_memory_ceiling() {
+        let runtime = Runtime::new().expect("runtime");
+        let context = Context::full(&runtime).expect("context");
+        context.with(|ctx| {
+            let error = ctx
+                .eval::<(), _>("throw null")
+                .expect_err("throwing null is an error");
+            let caught = CaughtError::from_error(&ctx, error);
+            let plugin_error = script_error(&caught);
+            assert_eq!(plugin_error.code, PluginErrorCode::ResourceExhausted);
+        });
+    }
 }

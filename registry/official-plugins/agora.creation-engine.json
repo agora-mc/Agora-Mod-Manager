@@ -7,8 +7,8 @@
   "current": {
     "version": "0.1.0",
     "package_url": "https://github.com/agora-mc/Agora-Mod-Manager/releases/download/official-creation-engine-v0.1.0/creation-engine-0.1.0.zip",
-    "sha256": "0fd5dc020a37dd6a246f8ed10c07191cf107e1dd01190cfda36e07fbb5231e04",
-    "tree_sha256": "0b3a12aa8ca759dbcae73ac16172e88efcd3fda563077df89cd993aa4c8f8a95",
-    "size": 4901539
+    "sha256": "6c0d790bb8cb2dcd0d041d069c15de01878447ea08135a8066495fd785ba671e",
+    "tree_sha256": "e87912aebef2dd8c7d1a4f6cd492dfbe4621611383840a9d8b4329683d1dbb26",
+    "size": 4901198
   }
 }
