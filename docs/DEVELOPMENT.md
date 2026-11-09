@@ -269,6 +269,32 @@ npm run tauri:dev
 
 Close Agora before removing that temporary directory. Microsoft credentials use the operating-system credential store and are not isolated by `AGORA_DATA_DIR`; do not sign in or sign out with a personal account during disposable-profile tests.
 
+## Crash benchmark
+
+`scripts/crash_benchmark.py` scores Crash Doctor answers against a frozen answer key. It is
+game-agnostic: it never parses a crash log, only compares predicted culprit names with the key.
+
+The corpus and its answer key stay outside the repository. Test only with synthetic rows in a
+temporary folder, and keep `test-key.jsonl` away from anyone still writing rules: `score --detail`
+refuses that file unless `--i-am-done-writing-rules` is given.
+
+```bash
+python scripts/crash_benchmark.py freeze --labels labels.jsonl --manifest manifest.jsonl --out ../crash-key --salt "$SALT"
+python scripts/crash_benchmark.py score --key ../crash-key/dev-key.jsonl --predictions predictions.jsonl --tool crash-doctor
+python scripts/crash_benchmark.py compare --key ../crash-key/dev-key.jsonl tool-a=a.jsonl tool-b=b.jsonl
+```
+
+`freeze` keeps gold rows with a culprit and no template risk, splits them into `dev-key.jsonl`
+and `test-key.jsonl` by manifest hash (so a log posted twice stays on one side), and writes
+`freeze.json` with the counts and the test key's SHA-256. `score` reports top-1, top-3, abstained,
+wrong and missing rows overall and by game, log type, difficulty and whether the culprit is in the
+log. `compare` adds an `abstain-always` baseline so a tool that answers badly can rank below
+silence. Pass `--expect-sha256` to refuse a changed key, `--json` for machine output, or `--detail`
+for per-row results.
+
+The Phostwood and engine adapters that produce prediction files come later; for now tools emit the
+JSONL format themselves.
+
 ## Pull-request evidence
 
 Include the smallest relevant evidence:

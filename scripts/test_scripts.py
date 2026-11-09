@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import build_loot_wasm
 import build_official_plugin as bop
+import crash_benchmark as cb
 import fetch_loader_manifests
 import deploy_release_assets
 import finalize_release_assets as fra
@@ -3293,6 +3294,293 @@ class TestBuildLootWasm(unittest.TestCase):
         self.assertIn("| `libloot` | 0.29.7 | vendored | GPL-3.0-or-later |", document)
         self.assertIn("patched sources in `vendor/libloot`", document)
         self.assertNotIn("`loot-sort`", document)
+
+
+class TestCrashBenchmark(unittest.TestCase):
+    """Tests for the game-agnostic crash benchmark skeleton."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_jsonl(self, name: str, rows: list[dict[str, Any]]) -> Path:
+        path = self.tmp / name
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        return path
+
+    def _gold(self, row_id: str, culprit: str = "Mod.jar", **extra: Any) -> dict[str, Any]:
+        row = {
+            "id": row_id,
+            "label": "gold",
+            "poster_confirmed": True,
+            "culprit": culprit,
+            "culprit_kind": "mod",
+            "culprit_in_log": True,
+            "fix": None,
+            "quote": "quote",
+            "difficulty": "easy",
+            "template_risk": False,
+        }
+        row.update(extra)
+        return row
+
+    def _manifest_row(
+        self,
+        row_id: str,
+        sha: str | None = None,
+        game: str = "minecraft",
+        log_type: str = "crash",
+    ) -> dict[str, Any]:
+        return {
+            "id": row_id,
+            "game": game,
+            "log_type": log_type,
+            "file": f"{row_id}.log",
+            "sha256": sha or f"sha-{row_id}",
+        }
+
+    def _key_row(self, row_id: str, culprit: str = "Mod.jar") -> dict[str, Any]:
+        return {
+            "id": row_id,
+            "game": "minecraft",
+            "log_type": "crash",
+            "difficulty": "easy",
+            "culprit_kind": "mod",
+            "culprit_in_log": True,
+            "culprit": culprit,
+        }
+
+    def _freeze(
+        self,
+        labels: list[dict[str, Any]],
+        manifest: list[dict[str, Any]],
+        out_name: str = "out",
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], Path]:
+        out = self.tmp / out_name
+        summary = cb.freeze(
+            self._write_jsonl("labels.jsonl", labels),
+            self._write_jsonl("manifest.jsonl", manifest),
+            out,
+            **kwargs,
+        )
+        return summary, out
+
+    def _key_ids(self, out: Path) -> set[str]:
+        ids: set[str] = set()
+        for name in ("dev-key.jsonl", "test-key.jsonl"):
+            for line in (out / name).read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    ids.add(json.loads(line)["id"])
+        return ids
+
+    def _prediction(self, row_id: str, *suspects: str, abstained: bool = False) -> dict[str, Any]:
+        return {
+            "id": row_id,
+            "suspects": [
+                {"name": suspect, "confidence": None} for suspect in suspects
+            ],
+            "abstained": abstained,
+        }
+
+    def test_empty_predictions_are_an_error_not_a_perfect_score(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        empty = self.tmp / "predictions.jsonl"
+        empty.write_text("", encoding="utf-8")
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, empty)
+
+    def test_empty_key_is_an_error(self):
+        key = self.tmp / "key.jsonl"
+        key.write_text("", encoding="utf-8")
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod", abstained=False)]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_a_missing_prediction_counts_as_abstained_not_as_skipped(self):
+        key = self._write_jsonl(
+            "key.jsonl", [self._key_row("a"), self._key_row("b")]
+        )
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod")]
+        )
+
+        result = cb.score(key, predictions)
+
+        overall = result["overall"]
+        self.assertEqual(overall["rows"], 2)
+        self.assertEqual(overall["top1_hits"], 1)
+        self.assertEqual(overall["abstained"], 1)
+        self.assertEqual(overall["missing"], 1)
+        self.assertEqual(overall["wrong"], 0)
+
+    def test_unknown_prediction_id_is_an_error(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("ghost", "Mod")]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_duplicate_id_is_an_error(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [self._prediction("a", "Mod"), self._prediction("a", "Mod")],
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_the_split_is_deterministic_and_duplicates_of_one_log_stay_together(self):
+        labels = [
+            self._gold("a"),
+            self._gold("b"),
+            self._gold("c"),
+            self._gold("d"),
+        ]
+        manifest = [
+            self._manifest_row("a", sha="same-log"),
+            self._manifest_row("b", sha="same-log"),
+            self._manifest_row("c", sha="log-c"),
+            self._manifest_row("d", sha="log-d"),
+        ]
+
+        _, first = self._freeze(labels, manifest, out_name="first", salt="pepper")
+        _, second = self._freeze(labels, manifest, out_name="second", salt="pepper")
+
+        for name in ("dev-key.jsonl", "test-key.jsonl"):
+            self.assertEqual(
+                (first / name).read_bytes(), (second / name).read_bytes()
+            )
+
+        placed = {
+            row_id: name
+            for name in ("dev-key.jsonl", "test-key.jsonl")
+            for row_id in (
+                json.loads(line)["id"]
+                for line in (first / name).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        }
+        self.assertEqual(placed["a"], placed["b"])
+
+    def test_template_risk_rows_never_enter_the_key(self):
+        summary, out = self._freeze(
+            [self._gold("a"), self._gold("b", template_risk=True)],
+            [self._manifest_row("a"), self._manifest_row("b")],
+        )
+
+        self.assertEqual(self._key_ids(out), {"a"})
+        self.assertEqual(summary["dropped"]["template_risk"], 1)
+
+    def test_silver_rows_never_enter_the_key(self):
+        silver = {
+            "id": "b",
+            "label": "silver",
+            "culprit": "Other.jar",
+            "template_risk": False,
+        }
+        summary, out = self._freeze(
+            [self._gold("a"), silver],
+            [self._manifest_row("a"), self._manifest_row("b")],
+        )
+
+        self.assertEqual(self._key_ids(out), {"a"})
+        self.assertEqual(summary["dropped"]["label_silver"], 1)
+
+    def test_out_inside_a_git_tree_is_refused(self):
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        out = repo / "key"
+
+        with self.assertRaises(cb.BenchmarkError) as raised:
+            cb.freeze(
+                self._write_jsonl("labels.jsonl", [self._gold("a")]),
+                self._write_jsonl("manifest.jsonl", [self._manifest_row("a")]),
+                out,
+            )
+
+        self.assertIn("git", str(raised.exception).lower())
+        self.assertFalse(out.exists())
+
+    def test_detail_on_the_test_key_is_refused(self):
+        key = self._write_jsonl("test-key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod")]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions, detail=True)
+
+        result = cb.score(
+            key, predictions, detail=True, i_am_done_writing_rules=True
+        )
+        self.assertEqual(len(result["rows"]), 1)
+
+    def test_a_changed_key_fails_expect_sha256(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod")]
+        )
+        actual = hashlib.sha256(key.read_bytes()).hexdigest()
+
+        self.assertEqual(
+            cb.score(key, predictions, expect_sha256=actual)["overall"]["rows"], 1
+        )
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions, expect_sha256="0" * 64)
+
+    def test_name_matching_ignores_extension_and_punctuation_but_is_not_fuzzy(self):
+        self.assertEqual(
+            cb.normalize_name("Cool Mod.DLL"), cb.normalize_name("cool-mod")
+        )
+        self.assertEqual(cb.normalize_name("Plugin.esp"), "plugin")
+        self.assertNotEqual(cb.normalize_name("Foo"), cb.normalize_name("FooBar"))
+
+        key = self._write_jsonl(
+            "key.jsonl", [self._key_row("a", culprit="Cool Mod.dll")]
+        )
+        exact = self._write_jsonl(
+            "exact.jsonl", [self._prediction("a", "cool-mod")]
+        )
+        fuzzy = self._write_jsonl(
+            "fuzzy.jsonl", [self._prediction("a", "coolmod-extra")]
+        )
+
+        self.assertEqual(cb.score(key, exact)["overall"]["top1_hits"], 1)
+        self.assertEqual(cb.score(key, fuzzy)["overall"]["top1_hits"], 0)
+
+    def test_abstain_always_scores_zero_hits(self):
+        key = self._write_jsonl(
+            "key.jsonl", [self._key_row("a"), self._key_row("b")]
+        )
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [self._prediction("a", "Wrong"), self._prediction("b", "Wrong")],
+        )
+
+        results = cb.compare(key, [("bad-tool", predictions)])
+
+        self.assertEqual(results[0]["tool"], "abstain-always")
+        baseline = results[0]["overall"]
+        self.assertEqual(baseline["rows"], 2)
+        self.assertEqual(baseline["top1_hits"], 0)
+        self.assertEqual(baseline["top3_hits"], 0)
+        self.assertEqual(baseline["abstained"], 2)
+        self.assertEqual(baseline["wrong"], 0)
+        self.assertEqual(results[1]["tool"], "bad-tool")
+        self.assertEqual(results[1]["overall"]["top1_hits"], 0)
 
 
 if __name__ == "__main__":
