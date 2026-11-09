@@ -3242,6 +3242,37 @@ class TestBuildLootWasm(unittest.TestCase):
         self.assertIn(f"--remap-path-prefix={build_loot_wasm.REPO_ROOT}=/agora", flags)
         self.assertIn(f"--remap-path-prefix={sysroot}=/rust", flags)
 
+    def test_reference_platform_is_linux_only(self):
+        with mock.patch.object(build_loot_wasm.sys, "platform", "linux"):
+            self.assertTrue(build_loot_wasm.is_reference_platform())
+        for other in ("win32", "darwin"):
+            with mock.patch.object(build_loot_wasm.sys, "platform", other):
+                self.assertFalse(build_loot_wasm.is_reference_platform())
+
+    def test_non_linux_check_says_it_cannot_compare(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            build_loot_wasm, "is_reference_platform", return_value=False
+        ), mock.patch.object(build_loot_wasm, "build") as build, contextlib.redirect_stderr(
+            stderr
+        ):
+            code = build_loot_wasm.main(["--check"])
+        self.assertEqual(code, 0)
+        build.assert_not_called()
+        self.assertIn("cannot compare", stderr.getvalue())
+
+    def test_non_linux_build_refuses_to_overwrite_the_reference(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            build_loot_wasm, "is_reference_platform", return_value=False
+        ), mock.patch.object(build_loot_wasm, "build") as build, contextlib.redirect_stderr(
+            stderr
+        ):
+            code = build_loot_wasm.main([])
+        self.assertEqual(code, 1)
+        build.assert_not_called()
+        self.assertIn("refusing to overwrite", stderr.getvalue())
+
     def test_sha256_file_matches_hashlib(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "blob"
