@@ -985,9 +985,9 @@ mod tests {
 
     /// A valid WASI command module with `functions` small functions, large
     /// enough that a cold compile is much slower than a short deadline.
-    /// `nonce` makes the bytes unique so the wasmtime compile cache cannot
+    /// `variant` makes the bytes unique so the wasmtime compile cache cannot
     /// hide the compile time.
-    fn large_module(nonce: u64, functions: u32) -> Vec<u8> {
+    fn large_module(variant: u64, functions: u32) -> Vec<u8> {
         use wasm_encoder::{
             CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
             Instruction, Module as EncodedModule, TypeSection,
@@ -1018,8 +1018,8 @@ mod tests {
         }
         module.section(&code);
         module.section(&CustomSection {
-            name: "nonce".into(),
-            data: nonce.to_le_bytes().to_vec().into(),
+            name: "variant".into(),
+            data: variant.to_le_bytes().to_vec().into(),
         });
         module.finish()
     }
@@ -1041,7 +1041,7 @@ mod tests {
         let package = data.path().join("package");
         std::fs::create_dir_all(&package).unwrap();
 
-        // How long a cold compile of this size takes. A different nonce for
+        // How long a cold compile of this size takes. A different variant for
         // the module below keeps this from warming the cache for it.
         let probe = large_module(1, FUNCTIONS);
         let started = std::time::Instant::now();
@@ -1105,19 +1105,19 @@ mod tests {
         data: &Path,
         package: &Path,
         slots: Arc<Semaphore>,
-        nonce: u64,
+        variant: u64,
     ) -> (Result<WasmRunResult, WasmError>, Duration, Duration) {
         const FUNCTIONS: u32 = 12_000;
         // The engine's first compile pays Cranelift and cache startup, which
         // would make the probe look far slower than the compile it measures.
-        Module::new(&engine(data), &large_module(nonce + 2, 1))
+        Module::new(&engine(data), &large_module(variant + 2, 1))
             .expect("the warm-up module compiles");
-        let probe = large_module(nonce, FUNCTIONS);
+        let probe = large_module(variant, FUNCTIONS);
         let started = Instant::now();
         Module::new(&engine(data), &probe).expect("the probe module compiles");
         let compile_time = started.elapsed();
 
-        let wasm = large_module(nonce + 1, FUNCTIONS);
+        let wasm = large_module(variant + 1, FUNCTIONS);
         std::fs::write(package.join("big.wasm"), &wasm).unwrap();
         let started = Instant::now();
         let outcome = run_inner(
