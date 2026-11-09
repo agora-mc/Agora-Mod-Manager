@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use wasmtime::{
     Cache, CacheConfig, Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
     Trap,
@@ -51,9 +52,26 @@ const MAX_TABLE_ELEMENTS: usize = 65_536;
 const EPOCH_TICK: Duration = Duration::from_millis(20);
 const EPOCH_TICK_MILLIS: u64 = 20;
 
+/// How many module compiles may run at once across the whole process.
+///
+/// A compile the deadline abandons keeps running on its blocking thread, so
+/// without a cap a plugin could call a large module repeatedly with tiny
+/// limits and pile up background compiles. Two at a time leaves a normal LOOT
+/// run room to compile its module while still bounding that pile.
+const MAX_CONCURRENT_COMPILES: usize = 2;
+
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 static TICKER: OnceLock<()> = OnceLock::new();
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+static COMPILE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// The process-wide compile limit, shared by every plugin and every per-call
+/// runtime.
+fn compile_slots() -> Arc<Semaphore> {
+    COMPILE_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_COMPILES)))
+        .clone()
+}
 
 /// Why a module run failed. `code` is a stable token; `message` is for a
 /// plugin author and the plugin log.
@@ -198,6 +216,7 @@ pub fn run(
                 &options_json,
                 game_reads,
                 stored_blobs,
+                compile_slots(),
             )
         })
         .map_err(|e| WasmError::new("internal", format!("could not start a module runner: {e}")))?;
@@ -213,6 +232,7 @@ fn run_inner(
     options_json: &str,
     game_reads: Option<Arc<dyn GameReads>>,
     stored_blobs: Option<Arc<dyn StoredBlobs>>,
+    slots: Arc<Semaphore>,
 ) -> Result<WasmRunResult, WasmError> {
     // The deadline covers the whole run, not just the module's call. Work
     // before the module starts (staging, reading the file) spends it too.
@@ -321,6 +341,7 @@ fn run_inner(
         timeout,
         remaining,
         data_root,
+        slots,
     ));
     // Dropping a runtime waits for its `spawn_blocking` tasks. A compile the
     // deadline abandoned must not hold the call open, so shut the runtime down
@@ -386,16 +407,34 @@ async fn execute<S: StdinStream + 'static>(
     timeout: Duration,
     remaining: Duration,
     data_root: &Path,
+    slots: Arc<Semaphore>,
 ) -> Result<WasmRunResult, WasmError> {
     let engine = engine(data_root);
     start_ticker(&engine);
     let deadline = tokio::time::Instant::now() + remaining;
 
+    // Wait for a compile slot inside the same deadline as the run. A call that
+    // cannot get one is told why rather than being mistaken for a slow module.
+    let permit = tokio::time::timeout_at(deadline, slots.acquire_owned())
+        .await
+        .map_err(|_| busy_compile_error(timeout))?
+        .map_err(|e| {
+            WasmError::new(
+                "internal",
+                format!("the module compiler slot was closed: {e}"),
+            )
+        })?;
+
     let engine_for_compile = engine.clone();
     let wasm_for_compile = wasm.to_vec();
     let compiled = tokio::time::timeout_at(
         deadline,
-        tokio::task::spawn_blocking(move || Module::new(&engine_for_compile, &wasm_for_compile)),
+        tokio::task::spawn_blocking(move || {
+            // Held by the compile itself, so an abandoned compile keeps its
+            // slot until it really finishes, even after its runtime is gone.
+            let _permit = permit;
+            Module::new(&engine_for_compile, &wasm_for_compile)
+        }),
     )
     .await
     .map_err(|_| timeout_error(timeout))?
@@ -544,6 +583,18 @@ fn timeout_error(timeout: Duration) -> WasmError {
         "timeout",
         format!(
             "the module did not finish within {} ms and was stopped",
+            timeout.as_millis()
+        ),
+    )
+}
+
+/// The deadline passed while the call was waiting for a compile slot. This is
+/// a timeout, but saying it was a slow module would be wrong.
+fn busy_compile_error(timeout: Duration) -> WasmError {
+    WasmError::new(
+        "timeout",
+        format!(
+            "the module could not start within {} ms because too many other modules were already compiling",
             timeout.as_millis()
         ),
     )
@@ -919,6 +970,7 @@ mod tests {
             limit,
             limit,
             data.path(),
+            Arc::new(Semaphore::new(1)),
         ));
         let elapsed = started.elapsed();
         assert!(
@@ -999,13 +1051,14 @@ mod tests {
         let wasm = large_module(2, FUNCTIONS);
         std::fs::write(package.join("big.wasm"), &wasm).unwrap();
         let started = std::time::Instant::now();
-        let outcome = run(
+        let outcome = run_inner(
             "big.wasm",
             &package,
             data.path(),
             r#"{"module":"big.wasm","limits":{"timeoutMs":20}}"#,
             None,
             None,
+            Arc::new(Semaphore::new(1)),
         );
         let elapsed = started.elapsed();
 
@@ -1021,5 +1074,204 @@ mod tests {
             elapsed < compile_time / 2,
             "the call waited {elapsed:?} for a compile that takes {compile_time:?}"
         );
+    }
+
+    fn echo_package(data: &Path) -> PathBuf {
+        let package = data.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("echo.wasm"),
+            include_bytes!("../tests/wasm-fixtures/wasm/echo.wasm"),
+        )
+        .unwrap();
+        package
+    }
+
+    fn wait_for_a_free_slot(slots: &Arc<Semaphore>, within: Duration) {
+        let deadline = Instant::now() + within;
+        while slots.available_permits() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the compile slot never came back"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Start a run whose cold compile is far slower than its 20 ms deadline.
+    /// Returns the outcome, how long the call took, and how long a cold compile
+    /// of that module takes on this machine.
+    fn abandoned_compile(
+        data: &Path,
+        package: &Path,
+        slots: Arc<Semaphore>,
+        nonce: u64,
+    ) -> (Result<WasmRunResult, WasmError>, Duration, Duration) {
+        const FUNCTIONS: u32 = 12_000;
+        // The engine's first compile pays Cranelift and cache startup, which
+        // would make the probe look far slower than the compile it measures.
+        Module::new(&engine(data), &large_module(nonce + 2, 1))
+            .expect("the warm-up module compiles");
+        let probe = large_module(nonce, FUNCTIONS);
+        let started = Instant::now();
+        Module::new(&engine(data), &probe).expect("the probe module compiles");
+        let compile_time = started.elapsed();
+
+        let wasm = large_module(nonce + 1, FUNCTIONS);
+        std::fs::write(package.join("big.wasm"), &wasm).unwrap();
+        let started = Instant::now();
+        let outcome = run_inner(
+            "big.wasm",
+            package,
+            data,
+            r#"{"module":"big.wasm","limits":{"timeoutMs":20}}"#,
+            None,
+            None,
+            slots,
+        );
+        (outcome, started.elapsed(), compile_time)
+    }
+
+    /// A call that cannot get a compile slot waits only until its own deadline,
+    /// then says why it never started.
+    #[test]
+    fn a_call_with_no_free_compile_slot_times_out_at_its_deadline_and_says_why() {
+        let data = tempfile::tempdir().expect("temp data root");
+        let package = echo_package(data.path());
+        let slots = Arc::new(Semaphore::new(1));
+        let _held = slots.clone().try_acquire_owned().expect("the slot is held");
+        let limit = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let outcome = run_inner(
+            "echo.wasm",
+            &package,
+            data.path(),
+            r#"{"module":"echo.wasm","limits":{"timeoutMs":200}}"#,
+            None,
+            None,
+            slots,
+        );
+        let elapsed = started.elapsed();
+
+        let error = outcome.expect_err("a call with no free slot should time out");
+        assert_eq!(error.code, "timeout", "{}", error.message);
+        assert!(
+            error.message.to_lowercase().contains("compiling"),
+            "the error says why it did not start: {}",
+            error.message
+        );
+        assert_ne!(
+            error.message,
+            timeout_error(limit).message,
+            "the slot wait is not the ordinary timeout message"
+        );
+        assert!(
+            elapsed >= limit * 4 / 5,
+            "the call gave up before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the call waited past its deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_waits_for_a_slot_and_runs_when_one_frees_inside_its_deadline() {
+        let data = tempfile::tempdir().expect("temp data root");
+        let package = echo_package(data.path());
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots.clone().try_acquire_owned().expect("the slot is held");
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(held);
+        });
+
+        let started = Instant::now();
+        let outcome = run_inner(
+            "echo.wasm",
+            &package,
+            data.path(),
+            r#"{"module":"echo.wasm","limits":{"timeoutMs":5000}}"#,
+            None,
+            None,
+            slots,
+        );
+        let elapsed = started.elapsed();
+
+        let value = outcome.expect("the call runs once a slot frees");
+        assert_eq!(value.exit_code, 0);
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "the call did not wait for the held slot: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_compile_keeps_its_slot_until_it_finishes() {
+        let data = tempfile::tempdir().expect("temp data root");
+        let package = data.path().join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+
+        let (outcome, elapsed, compile_time) =
+            abandoned_compile(data.path(), &package, slots.clone(), 21);
+        assert!(
+            compile_time > Duration::from_millis(200),
+            "the probe module compiled in {compile_time:?}, too fast to test the slot"
+        );
+        assert_eq!(
+            outcome.expect_err("the run should hit its deadline").code,
+            "timeout"
+        );
+        assert!(
+            elapsed < compile_time / 2,
+            "the call waited {elapsed:?} for a compile that takes {compile_time:?}"
+        );
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the abandoned compile gave up its slot before it finished"
+        );
+
+        wait_for_a_free_slot(&slots, compile_time * 3 + Duration::from_secs(5));
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "the slot did not come back when the compile finished"
+        );
+    }
+
+    #[test]
+    fn a_slot_is_released_when_the_compile_finishes_even_after_the_call_gave_up() {
+        let data = tempfile::tempdir().expect("temp data root");
+        let package = data.path().join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+
+        let (outcome, _, compile_time) =
+            abandoned_compile(data.path(), &package, slots.clone(), 31);
+        assert_eq!(
+            outcome.expect_err("the run should hit its deadline").code,
+            "timeout"
+        );
+        wait_for_a_free_slot(&slots, compile_time * 3 + Duration::from_secs(5));
+
+        std::fs::write(
+            package.join("echo.wasm"),
+            include_bytes!("../tests/wasm-fixtures/wasm/echo.wasm"),
+        )
+        .unwrap();
+        let later = run_inner(
+            "echo.wasm",
+            &package,
+            data.path(),
+            r#"{"module":"echo.wasm","limits":{"timeoutMs":5000}}"#,
+            None,
+            None,
+            slots,
+        );
+        let value = later.expect("a later call gets the released slot");
+        assert_eq!(value.exit_code, 0);
     }
 }

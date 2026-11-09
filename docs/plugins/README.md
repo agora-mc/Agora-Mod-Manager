@@ -227,7 +227,7 @@ Guest paths are absolute and cannot nest or repeat. `patterns` is a glob list; a
 
 Staging has its own allowance, separate from the `game:read` byte budget: 4 GiB and 100,000 files per run. Staged bytes stay inside the sandbox and only the module's capped stdout and stderr come back, so hardlinking spends this allowance but not the script's read budget. Lower it with `limits: { mountBytes, mountFiles }`; you cannot raise it. A mount over the allowance is an error naming that mount. The copy fallback reads bytes but still counts against the same allowance.
 
-A module gets 1 GiB of memory and 120 seconds unless you ask for less with `limits: { memoryBytes, timeoutMs }`. Its table is capped separately. You cannot raise any limit. The engine is wasmtime, and its compile cache lives under the data root. The wall-clock deadline covers staging, compilation and the run, including time spent in a host call.
+A module gets 1 GiB of memory and 120 seconds unless you ask for less with `limits: { memoryBytes, timeoutMs }`. Its table is capped separately. You cannot raise any limit. The engine is wasmtime, and its compile cache lives under the data root. The wall-clock deadline covers staging, compilation and the run, including time spent in a host call. At most two modules compile at once across the whole process; a call that finds no free slot waits within its deadline and then fails as a timeout.
 
 ### Plugin file storage
 
