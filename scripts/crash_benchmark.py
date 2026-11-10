@@ -11,6 +11,13 @@ Subcommands:
     freeze   build dev-key.jsonl / test-key.jsonl from labels + manifest
     score    score one predictions file against a key
     compare  score several tools (plus an abstain-always baseline) in one table
+    predict  turn a tool's output into a predictions file (a benchmark adapter)
+
+Every hit rate is reported twice: **strict**, where a predicted name must
+normalise to the key's culprit or one of its `accept` entries, and **loose**,
+which splits those answers into words and accepts a prediction that contains a
+word. Loose matching is a measuring aid, not a verdict: a short answer inside a
+longer unrelated name can still be over-credited.
 """
 
 from __future__ import annotations
@@ -18,12 +25,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
+import shlex
+import subprocess
 import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
 EXTENSIONS = (".dll", ".esp", ".esm", ".esl", ".jar", ".pex")
 GROUP_DIMENSIONS = ("game", "log_type", "difficulty", "culprit_in_log")
+SEGMENT_SPLIT = re.compile(r" and | with |[&,()/;]")
 
 
 class BenchmarkError(Exception):
@@ -38,6 +52,52 @@ def normalize_name(name: str) -> str:
             text = text[: -len(extension)]
             break
     return "".join(character for character in text if character.isalnum())
+
+
+def _validate_accept(value: Any, where: str) -> list[str] | None:
+    """Return a label row's optional `accept` list, or raise naming the row."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or any(
+        not isinstance(entry, str) or not entry for entry in value
+    ):
+        raise BenchmarkError(
+            f"{where}: 'accept' must be a list of non-empty strings"
+        )
+    return list(value)
+
+
+def _strict_names(row: dict[str, Any]) -> list[str]:
+    """The culprit and every accepted spelling, normalised for exact comparison."""
+    names = [normalize_name(row["culprit"])]
+    for entry in row.get("accept") or []:
+        names.append(normalize_name(entry))
+    return names
+
+
+def _loose_segments(row: dict[str, Any]) -> list[str]:
+    """Words from the culprit and its `accept` entries, for loose matching.
+
+    Answers are people's words ("SMIM (Static Mesh Improvement Mod)") while a
+    tool predicts file names, so both sides are normalised and the answer is
+    split at ` and `, ` with `, `&`, `,`, `/`, `(`, `)`, and `;`. Segments under
+    four characters are dropped because they would match almost anything.
+
+    Loose matching still over-credits: a short answer word that appears inside
+    a longer, unrelated prediction counts. It is a measuring aid, not a verdict.
+    """
+    segments: set[str] = set()
+    for text in (row["culprit"], *(row.get("accept") or [])):
+        for piece in SEGMENT_SPLIT.split(str(text)):
+            segment = normalize_name(piece)
+            if len(segment) >= 4:
+                segments.add(segment)
+    return sorted(segments)
+
+
+def _loose_hit(name: str, segments: Iterable[str]) -> bool:
+    """A prediction hits when it is, or contains, an answer segment."""
+    return any(segment in name for segment in segments)
 
 
 def _read_jsonl(path: Path, what: str) -> list[dict[str, Any]]:
@@ -234,6 +294,9 @@ def freeze(
         if row.get("template_risk") is True:
             dropped["template_risk"] += 1
             continue
+        accept = _validate_accept(
+            row.get("accept"), f"labels {labels_path}: row {row_id!r}"
+        )
 
         manifest_row = by_id.get(row_id)
         if manifest_row is None:
@@ -246,18 +309,19 @@ def freeze(
         if row_id in seen:
             raise BenchmarkError(f"duplicate key id {row_id!r}")
         seen.add(row_id)
-        key.append(
-            {
-                "id": row_id,
-                "game": game,
-                "log_type": log_type,
-                "difficulty": row.get("difficulty"),
-                "culprit_kind": row.get("culprit_kind"),
-                "culprit_in_log": row.get("culprit_in_log"),
-                "culprit": culprit,
-                "sha256": sha256,
-            }
-        )
+        key_row: dict[str, Any] = {
+            "id": row_id,
+            "game": game,
+            "log_type": log_type,
+            "difficulty": row.get("difficulty"),
+            "culprit_kind": row.get("culprit_kind"),
+            "culprit_in_log": row.get("culprit_in_log"),
+            "culprit": culprit,
+            "sha256": sha256,
+        }
+        if accept is not None:
+            key_row["accept"] = accept
+        key.append(key_row)
 
     if not key:
         raise BenchmarkError(
@@ -282,10 +346,13 @@ def freeze(
     forced_dev = sum(1 for row in dev_rows if row["id"] in dev_ids)
 
     def public(row: dict[str, Any]) -> dict[str, Any]:
-        return {field: row[field] for field in (
+        fields = {field: row[field] for field in (
             "id", "game", "log_type", "difficulty", "culprit_kind",
             "culprit_in_log", "culprit",
         )}
+        if "accept" in row:
+            fields["accept"] = row["accept"]
+        return fields
 
     dev_rows.sort(key=lambda item: (item["game"], item["id"]))
     test_rows.sort(key=lambda item: (item["game"], item["id"]))
@@ -343,9 +410,12 @@ def _empty_metrics() -> dict[str, int]:
         "rows": 0,
         "top1_hits": 0,
         "top3_hits": 0,
+        "loose_top1_hits": 0,
+        "loose_top3_hits": 0,
         "abstained": 0,
         "wrong": 0,
         "missing": 0,
+        "errors": 0,
     }
 
 
@@ -380,6 +450,11 @@ def _load_key(key_path: Path) -> list[dict[str, Any]]:
         seen.add(row_id)
         if row.get("culprit") is None:
             raise BenchmarkError(f"key row {row_id!r} has a null culprit")
+        accept = _validate_accept(
+            row.get("accept"), f"key {key_path}: row {row_id!r}"
+        )
+        if accept is not None:
+            row["accept"] = accept
     return key
 
 
@@ -389,6 +464,14 @@ def _validate_predictions(rows: Iterable[dict[str, Any]], where: str) -> dict[st
         row_id = _string_field(row, "id", where)
         if row_id in predictions:
             raise BenchmarkError(f"duplicate prediction id {row_id!r}")
+        error = row.get("error")
+        if error is not None:
+            if not isinstance(error, str) or not error:
+                raise BenchmarkError(
+                    f"prediction {row_id!r}: 'error' must be a non-empty string"
+                )
+            predictions[row_id] = row
+            continue
         abstained = row.get("abstained")
         if not isinstance(abstained, bool):
             raise BenchmarkError(
@@ -460,34 +543,52 @@ def _score(
 
     for row in sorted(key, key=lambda item: item["id"]):
         row_id = row["id"]
-        culprit = normalize_name(row["culprit"])
+        strict_names = _strict_names(row)
+        segments = _loose_segments(row)
         prediction = predictions.get(row_id)
         metrics = _empty_metrics()
         metrics["rows"] = 1
+
+        top1_hit = False
+        top3_hit = False
+        top1_loose = False
+        top3_loose = False
+        matched_by: str | None = None
 
         if prediction is None:
             metrics["abstained"] = 1
             metrics["missing"] = 1
             outcome = "missing"
             top1_name = None
-            top3_hit = False
+        elif "error" in prediction:
+            metrics["errors"] = 1
+            outcome = "error"
+            top1_name = None
         elif prediction["abstained"]:
             metrics["abstained"] = 1
             outcome = "abstained"
             top1_name = None
-            top3_hit = False
         else:
             suspects = prediction["suspects"]
             names = [normalize_name(suspect["name"]) for suspect in suspects]
             top1_name = suspects[0]["name"]
-            top1_hit = names[0] == culprit
-            top3_hit = culprit in names[:3]
+            top1_hit = names[0] in strict_names
+            top3_hit = any(name in strict_names for name in names[:3])
+            top1_loose = _loose_hit(names[0], segments)
+            top3_loose = any(_loose_hit(name, segments) for name in names[:3])
             if top1_hit:
                 metrics["top1_hits"] = 1
+                matched_by = "strict"
             else:
                 metrics["wrong"] = 1
+                if top1_loose:
+                    matched_by = "loose"
             if top3_hit:
                 metrics["top3_hits"] = 1
+            if top1_loose:
+                metrics["loose_top1_hits"] = 1
+            if top3_loose:
+                metrics["loose_top3_hits"] = 1
             outcome = "hit" if top1_hit else "wrong"
 
         _add(overall, metrics)
@@ -504,6 +605,10 @@ def _score(
                     "outcome": outcome,
                     "top1": top1_name,
                     "top3_hit": top3_hit,
+                    "strict_top1_hit": top1_hit,
+                    "loose_top1_hit": top1_loose,
+                    "loose_top3_hit": top3_loose,
+                    "matched_by": matched_by,
                     "groups": {
                         dimension: _group_value(row, dimension)
                         for dimension in GROUP_DIMENSIONS
@@ -580,13 +685,26 @@ def _metrics_cells(metrics: dict[str, int]) -> list[Any]:
         metrics["rows"],
         metrics["top1_hits"],
         metrics["top3_hits"],
+        metrics["loose_top1_hits"],
+        metrics["loose_top3_hits"],
         metrics["abstained"],
         metrics["wrong"],
         metrics["missing"],
+        metrics["errors"],
     ]
 
 
-METRIC_HEADERS = ["rows", "top-1", "top-3", "abstained", "wrong", "missing"]
+METRIC_HEADERS = [
+    "rows",
+    "top-1",
+    "top-3",
+    "loose top-1",
+    "loose top-3",
+    "abstained",
+    "wrong",
+    "missing",
+    "errors",
+]
 
 
 def format_score(result: dict[str, Any], detail: bool) -> str:
@@ -599,12 +717,31 @@ def format_score(result: dict[str, Any], detail: bool) -> str:
     lines = [f"Tool: {result['tool']}", _table(["group", *METRIC_HEADERS], rows)]
     if detail:
         detail_rows = [
-            [row["id"], row["outcome"], row["top1"] or "-", row["top3_hit"]]
+            [
+                row["id"],
+                row["outcome"],
+                row["top1"] or "-",
+                row["top3_hit"],
+                row["loose_top1_hit"],
+                row["loose_top3_hit"],
+                row["matched_by"] or "-",
+            ]
             for row in result["rows"]
         ]
         lines.append("")
         lines.append(
-            _table(["id", "outcome", "top-1 suspect", "top-3 hit"], detail_rows)
+            _table(
+                [
+                    "id",
+                    "outcome",
+                    "top-1 suspect",
+                    "top-3 hit",
+                    "loose top-1",
+                    "loose top-3",
+                    "matched by",
+                ],
+                detail_rows,
+            )
         )
     return "\n".join(lines)
 
@@ -641,6 +778,262 @@ def format_compare(results: list[dict[str, Any]]) -> str:
         [result["tool"], *_metrics_cells(result["overall"])] for result in results
     ]
     return _table(["tool", *METRIC_HEADERS], rows)
+
+
+# ---------------------------------------------------------------------------
+# predict: run a tool and turn its answer into predictions
+# ---------------------------------------------------------------------------
+
+
+def _split_command(command: str) -> list[str]:
+    """Split `--agora` into argv without ever handing a shell a string."""
+    if not isinstance(command, str) or not command.strip():
+        raise BenchmarkError("--agora needs a command to run")
+    parts = shlex.split(command, posix=os.name != "nt")
+    if os.name == "nt":
+        # posix=False keeps the quotes around a path with spaces; drop them.
+        parts = [
+            part[1:-1]
+            if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'"
+            else part
+            for part in parts
+        ]
+    if not parts:
+        raise BenchmarkError("--agora needs a command to run")
+    return parts
+
+
+def _read_ids(path: str | Path, what: str) -> list[str]:
+    """Ids from a key file's JSON rows, or one per line in a plain list."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as error:
+        raise BenchmarkError(f"cannot read {what} file {path}: {error}") from error
+    ids: list[str] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                value = json.loads(stripped).get("id")
+            except (json.JSONDecodeError, AttributeError) as error:
+                raise BenchmarkError(
+                    f"{what} {path}:{line_number}: invalid JSON: {error}"
+                ) from error
+            if not isinstance(value, str) or not value:
+                raise BenchmarkError(f"{what} {path}:{line_number}: no `id`")
+        else:
+            value = stripped
+        if value in seen:
+            raise BenchmarkError(
+                f"{what} {path}:{line_number}: duplicate id {value!r}"
+            )
+        seen.add(value)
+        ids.append(value)
+    if not ids:
+        raise BenchmarkError(f"{what} file {path} names no ids")
+    return ids
+
+
+def _short_message(text: str, limit: int = 300) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit] + "..."
+
+
+def _prediction_from_run(
+    row_id: str, completed: subprocess.CompletedProcess[str]
+) -> dict[str, Any]:
+    """Turn one analyzer run into a row. A failed run is an error, never silence."""
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    payload: Any = None
+    if stdout.strip():
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = None
+    if payload is None:
+        reason = f"the analyzer exited {completed.returncode} without parsable JSON"
+        if stderr.strip():
+            reason += f": {_short_message(stderr)}"
+        return {"id": row_id, "error": reason}
+    if not isinstance(payload, dict) or not isinstance(payload.get("answer"), dict):
+        return {"id": row_id, "error": "the analyzer's JSON has no answer object"}
+    answer = payload["answer"]
+    candidates = answer.get("candidates")
+    if not isinstance(candidates, list):
+        return {
+            "id": row_id,
+            "error": "the analyzer's answer has no candidates list",
+        }
+
+    files = payload.get("files")
+    read_by: Any = None
+    file_reason: Any = None
+    if isinstance(files, list) and files and isinstance(files[0], dict):
+        read_by = files[0].get("read_by")
+        file_reason = files[0].get("reason")
+
+    suspects: list[dict[str, Any]] = []
+    skipped_unnamed = 0
+    for candidate in candidates:
+        owner = candidate.get("owner") if isinstance(candidate, dict) else None
+        name = owner.get("name") if isinstance(owner, dict) else None
+        if isinstance(name, str) and name.strip():
+            suspects.append({"name": name, "confidence": None})
+        else:
+            skipped_unnamed += 1
+
+    row: dict[str, Any] = {
+        "id": row_id,
+        "suspects": suspects,
+        "abstained": not suspects,
+        "read_by": read_by,
+    }
+    if skipped_unnamed:
+        row["skipped_unnamed"] = skipped_unnamed
+    if file_reason and not suspects:
+        row["reason"] = file_reason
+    return row
+
+
+def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write the whole file beside its target, then swap it in."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            for row in rows:
+                stream.write(_json_line(row))
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def predict(
+    manifest_path: str | Path,
+    corpus_root: str | Path,
+    ids_path: str | Path,
+    out_path: str | Path,
+    agora: str,
+    plugin_dirs: Iterable[str | Path] = (),
+    allow_code: bool = False,
+    jobs: int = 1,
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    """Run `agora crash analyze` for each id and write a predictions file.
+
+    Arguments are passed as a list, never through a shell, so a path with
+    spaces or quotes is safe. The analyzer exits non-zero when it read no file
+    but still prints JSON; that is an abstention and the file report's reason
+    is kept. A run that times out, exits non-zero with no JSON, or prints JSON
+    that does not parse becomes an `error` row, never an abstention.
+    """
+    if not isinstance(jobs, int) or jobs < 1:
+        raise BenchmarkError("--jobs must be at least 1")
+    if timeout is None or timeout <= 0:
+        raise BenchmarkError("--timeout must be greater than 0")
+
+    manifest_path = Path(manifest_path)
+    corpus_root = Path(corpus_root)
+    out = Path(out_path)
+    if _inside_git_work_tree(out):
+        raise BenchmarkError(
+            f"refusing --out {out}: it is inside a git work tree, and benchmark "
+            "predictions must never enter a repository"
+        )
+
+    manifest = {}
+    for row in _read_jsonl(manifest_path, "manifest"):
+        manifest_id = _string_field(row, "id", f"manifest {manifest_path}")
+        file_field = _string_field(row, "file", f"manifest id {manifest_id!r}")
+        manifest[manifest_id] = file_field
+    if not manifest:
+        raise BenchmarkError(f"manifest file {manifest_path} has no rows")
+
+    ids = _read_ids(ids_path, "ids")
+    command = _split_command(agora)
+    plugin_options: list[str] = []
+    for folder in plugin_dirs:
+        plugin_options.extend(["--plugin-dir", str(folder)])
+    if allow_code:
+        plugin_options.append("--allow-code")
+
+    jobs_by_id: list[tuple[str, Path]] = []
+    for row_id in ids:
+        if row_id not in manifest:
+            raise BenchmarkError(f"ids file row {row_id!r} is not in the manifest")
+        jobs_by_id.append((row_id, corpus_root / manifest[row_id]))
+
+    def run_one(row_id: str, log_path: Path) -> dict[str, Any]:
+        if not log_path.is_file():
+            return {"id": row_id, "error": f"log file not found: {log_path}"}
+        argv = [
+            *command,
+            "crash",
+            "analyze",
+            str(log_path),
+            "--json",
+            *plugin_options,
+        ]
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return {"id": row_id, "error": f"timed out after {timeout:g} s"}
+        except OSError as error:
+            return {"id": row_id, "error": f"could not run the analyzer: {error}"}
+        return _prediction_from_run(row_id, completed)
+
+    if jobs == 1:
+        rows = [run_one(row_id, log_path) for row_id, log_path in jobs_by_id]
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [
+                pool.submit(run_one, row_id, log_path)
+                for row_id, log_path in jobs_by_id
+            ]
+            rows = [future.result() for future in futures]
+
+    _write_jsonl_atomic(out, rows)
+
+    summary = {
+        "rows": len(rows),
+        "answered": sum(1 for row in rows if "error" not in row and not row["abstained"]),
+        "abstained": sum(1 for row in rows if "error" not in row and row["abstained"]),
+        "errors": sum(1 for row in rows if "error" in row),
+        "no_parser": sum(
+            1 for row in rows if "error" not in row and row.get("read_by") is None
+        ),
+        "skipped_unnamed": sum(row.get("skipped_unnamed", 0) for row in rows),
+        "out": str(out),
+    }
+    return summary
+
+
+def format_predict(summary: dict[str, Any]) -> str:
+    lines = [
+        f"Predicted {summary['rows']} rows: "
+        f"answered {summary['answered']}, abstained {summary['abstained']}, "
+        f"errors {summary['errors']}",
+        f"No parser recognised {summary['no_parser']} log(s)",
+        f"Skipped {summary['skipped_unnamed']} candidate(s) with no owner name",
+        f"Wrote {summary['out']}",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +1097,25 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--key", required=True)
     compare_parser.add_argument("tools", nargs="+", metavar="TOOL=PREDICTIONS")
 
+    predict_parser = subparsers.add_parser(
+        "predict", help="run a tool over a corpus and write a predictions file"
+    )
+    predict_parser.add_argument("--manifest", required=True)
+    predict_parser.add_argument("--corpus-root", required=True)
+    predict_parser.add_argument(
+        "--ids", required=True, help="a key file's rows or a plain list of ids"
+    )
+    predict_parser.add_argument("--out", required=True)
+    predict_parser.add_argument(
+        "--agora", required=True, help='the analyzer command, for example "agora.exe"'
+    )
+    predict_parser.add_argument(
+        "--plugin-dir", action="append", default=[], dest="plugin_dirs"
+    )
+    predict_parser.add_argument("--allow-code", action="store_true")
+    predict_parser.add_argument("--jobs", type=int, default=1)
+    predict_parser.add_argument("--timeout", type=float, default=120.0)
+
     return parser
 
 
@@ -740,6 +1152,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "compare":
             results = compare(args.key, _parse_tool_specs(args.tools))
             print(format_compare(results))
+            return 0
+        if args.command == "predict":
+            summary = predict(
+                args.manifest,
+                args.corpus_root,
+                args.ids,
+                args.out,
+                args.agora,
+                plugin_dirs=args.plugin_dirs,
+                allow_code=args.allow_code,
+                jobs=args.jobs,
+                timeout=args.timeout,
+            )
+            print(format_predict(summary))
             return 0
     except BenchmarkError as error:
         print(f"error: {error}", file=sys.stderr)

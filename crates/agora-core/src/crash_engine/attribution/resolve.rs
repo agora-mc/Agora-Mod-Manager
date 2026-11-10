@@ -221,7 +221,7 @@ impl Resolver {
             if let Some(reason) = could_not_rule_out {
                 return unknown(reason);
             }
-            return self.not_in_instance(role);
+            return self.not_in_instance(role, value);
         }
 
         let candidates: Vec<Candidate> = matches
@@ -235,7 +235,7 @@ impl Resolver {
                 })
             })
             .collect();
-        self.choose(candidates, role)
+        self.choose(candidates, role, value)
     }
 
     fn resolve_index(
@@ -253,12 +253,12 @@ impl Resolver {
                     .unwrap_or("the instance listing is unavailable"),
             );
         }
-        let Some(value) = normalize_index_value(value) else {
+        let Some(normalized) = normalize_index_value(value) else {
             return unknown("the ref has an empty value");
         };
-        let positions = self.view.index().items(index, &value, matching);
+        let positions = self.view.index().items(index, &normalized, matching);
         if positions.is_empty() {
-            return self.not_in_instance(role);
+            return self.not_in_instance(role, value);
         }
         let candidates: Vec<Candidate> = positions
             .into_iter()
@@ -269,14 +269,19 @@ impl Resolver {
                 via: index.to_string(),
             })
             .collect();
-        self.choose(candidates, role)
+        self.choose(candidates, role, value)
     }
 
     /// Later position wins; a turned-off layer provides nothing. If every provider is turned off,
     /// name the latest one and say why instead of claiming the file is not in the instance.
-    fn choose(&self, mut candidates: Vec<Candidate>, role: Option<&RoleRule>) -> Attribution {
+    fn choose(
+        &self,
+        mut candidates: Vec<Candidate>,
+        role: Option<&RoleRule>,
+        value: &str,
+    ) -> Attribution {
         if candidates.is_empty() {
-            return self.not_in_instance(role);
+            return self.not_in_instance(role, value);
         }
         let any_enabled = candidates
             .iter()
@@ -317,8 +322,10 @@ impl Resolver {
     }
 
     /// A listing that is complete and has no provider. A role can still tell us this is the system,
-    /// the game itself or a framework; otherwise it is genuinely not in the instance.
-    fn not_in_instance(&self, role: Option<&RoleRule>) -> Attribution {
+    /// the game itself or a framework; otherwise it is genuinely not in the instance. A framework
+    /// is named after the ref itself, not the role's matching pattern: a prefix or wildcard rule
+    /// would otherwise show its pattern to the user.
+    fn not_in_instance(&self, role: Option<&RoleRule>, value: &str) -> Attribution {
         if let Some(rule) = role {
             match rule.role {
                 Role::System => {
@@ -342,7 +349,7 @@ impl Resolver {
                 Role::Framework | Role::HookFramework => {
                     return Attribution {
                         owner: Owner::Framework {
-                            name: rule.value.clone(),
+                            name: value.to_string(),
                         },
                         role: None,
                         also_provided_by: Vec::new(),
@@ -377,7 +384,9 @@ impl RefResolver for Resolver {
 /// There is nothing in an instance to blame, so a ref names itself: `ExampleMod.dll` resolves to
 /// an owner whose display name is that value. A pack's `roles` still win, and apply exactly as they
 /// do for an installed instance, because a system module or a framework is one wherever it is seen.
-/// Inspectors have no file to open here; that is the caller's business, not the resolver's.
+/// A framework is named after the ref itself, not the role's matching pattern, so a prefix or
+/// wildcard rule does not show its pattern to the user. Inspectors have no file to open here; that
+/// is the caller's business, not the resolver's.
 pub struct LooseResolver {
     roles: Vec<RoleRule>,
 }
@@ -421,7 +430,7 @@ impl RefResolver for LooseResolver {
             Role::System => Owner::System,
             Role::Platform => Owner::Base,
             Role::Framework | Role::HookFramework => Owner::Framework {
-                name: rule.value.clone(),
+                name: value.to_string(),
             },
         };
         Resolved {
