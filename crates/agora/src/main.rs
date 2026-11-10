@@ -1806,6 +1806,9 @@ enum CrashCmd {
         /// Run a script parser from a --plugin-dir folder. Without it, such a folder is refused.
         #[arg(long = "allow-code")]
         allow_code: bool,
+        /// With --json, also print what each parser found. For writing and checking rules.
+        #[arg(long, requires = "json")]
+        facts: bool,
     },
 }
 
@@ -4742,6 +4745,7 @@ async fn run_crash_command(
             plugin_dirs,
             game_version,
             allow_code,
+            facts,
         } => {
             cli_crash::run(
                 ctx,
@@ -4750,6 +4754,7 @@ async fn run_crash_command(
                     plugin_dirs,
                     game_version,
                     allow_code,
+                    facts,
                     json,
                 },
             )

@@ -20,6 +20,8 @@ pub struct AnalyzeArgs {
     pub plugin_dirs: Vec<PathBuf>,
     pub game_version: Option<String>,
     pub allow_code: bool,
+    /// Add what each parser found to the JSON output.
+    pub facts: bool,
     pub json: bool,
 }
 
@@ -80,10 +82,25 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
     })?;
 
     if args.json {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "answer": output.answer,
             "files": output.files,
         });
+        if args.facts {
+            let parsed: Vec<serde_json::Value> = output
+                .parsed
+                .iter()
+                .map(|parsed| {
+                    serde_json::json!({
+                        "file": parsed.artifact,
+                        "plugin_id": parsed.plugin.id,
+                        "parser_id": parsed.parser_id,
+                        "output": parsed.output,
+                    })
+                })
+                .collect();
+            value["parsed"] = serde_json::Value::Array(parsed);
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         print_text(&output);

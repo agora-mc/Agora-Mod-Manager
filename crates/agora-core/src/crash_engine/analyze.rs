@@ -89,6 +89,8 @@ pub struct AnalyzedFile {
 pub struct AnalyzeOutput {
     pub answer: CrashAnswer,
     pub files: Vec<AnalyzedFile>,
+    /// What each parser found, for someone writing or checking rules. The answer never needs it.
+    pub parsed: Vec<ParsedArtifact>,
 }
 
 impl AnalyzeOutput {
@@ -305,6 +307,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
     Ok(AnalyzeOutput {
         answer: crash_answer,
         files: reports,
+        parsed,
     })
 }
 
