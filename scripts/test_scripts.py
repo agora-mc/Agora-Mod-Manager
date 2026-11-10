@@ -3402,6 +3402,35 @@ class TestCrashBenchmark(unittest.TestCase):
         )
         return summary, out
 
+    def test_freeze_puts_already_studied_ids_in_dev(self):
+        ids = [f"row-{n}" for n in range(12)]
+        labels = [self._gold(i) for i in ids]
+        manifest = [self._manifest_row(i) for i in ids]
+        # row-0 shares its log with dup, so both must follow it to dev.
+        labels.append(self._gold("dup"))
+        manifest.append(self._manifest_row("dup", sha="sha-row-0"))
+        studied = self.tmp / "studied.txt"
+
+        def test_ids(out: Path) -> set[str]:
+            text = (out / "test-key.jsonl").read_text(encoding="utf-8")
+            return {json.loads(line)["id"] for line in text.splitlines() if line.strip()}
+
+        # Everything is test without the list, so the list is what moves them.
+        _, plain = self._freeze(labels, manifest, "plain", test_fraction=1.0)
+        self.assertEqual(test_ids(plain), set(ids) | {"dup"})
+
+        studied.write_text('row-0\n{"id": "row-5"}\nnot-in-the-key\n', encoding="utf-8")
+        summary, out = self._freeze(
+            labels, manifest, "forced", test_fraction=1.0, dev_ids_path=studied
+        )
+        self.assertEqual(test_ids(out), set(ids) - {"row-0", "row-5", "dup"})
+        self.assertEqual(summary["forced_dev"], 2)
+        self.assertEqual(self._key_ids(out), set(ids) | {"dup"})
+
+        studied.write_text("\n", encoding="utf-8")
+        with self.assertRaises(cb.BenchmarkError):
+            self._freeze(labels, manifest, "empty", dev_ids_path=studied)
+
     def _key_ids(self, out: Path) -> set[str]:
         ids: set[str] = set()
         for name in ("dev-key.jsonl", "test-key.jsonl"):

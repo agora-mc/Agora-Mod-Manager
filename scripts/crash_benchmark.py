@@ -102,7 +102,10 @@ def _string_field(row: dict[str, Any], field: str, where: str) -> str:
 
 
 def _split_key(
-    key: list[dict[str, Any]], salt: str, test_fraction: float
+    key: list[dict[str, Any]],
+    salt: str,
+    test_fraction: float,
+    dev_ids: frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Split by manifest sha256, stratified per game, deterministically.
 
@@ -110,6 +113,9 @@ def _split_key(
     twice always lands on the same side. Within a game, groups are ordered by
     sha256(salt + the group's lexicographically smallest id); the first
     round(n * test_fraction) go to test.
+
+    A group holding any id in `dev_ids` goes to dev and is left out of that
+    count: a case somebody has already studied cannot be held out.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in key:
@@ -117,6 +123,8 @@ def _split_key(
 
     per_game: dict[str, list[tuple[int, str]]] = {}
     for sha, rows in groups.items():
+        if any(row["id"] in dev_ids for row in rows):
+            continue
         canonical = min(rows, key=lambda item: item["id"])
         digest = hashlib.sha256((salt + canonical["id"]).encode("utf-8")).hexdigest()
         per_game.setdefault(canonical["game"], []).append((int(digest, 16), sha))
@@ -136,6 +144,36 @@ def _split_key(
     return dev, test
 
 
+def _read_dev_ids(path: str | Path | None) -> frozenset[str]:
+    """Ids that must land in dev: one per line, or JSON lines with an `id`."""
+    if path is None:
+        return frozenset()
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as error:
+        raise BenchmarkError(f"cannot read dev ids file {path}: {error}") from error
+    ids: set[str] = set()
+    for line_number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                value = json.loads(stripped).get("id")
+            except (json.JSONDecodeError, AttributeError) as error:
+                raise BenchmarkError(
+                    f"dev ids {path}:{line_number}: invalid JSON: {error}"
+                ) from error
+            if not isinstance(value, str) or not value:
+                raise BenchmarkError(f"dev ids {path}:{line_number}: no `id`")
+            ids.add(value)
+        else:
+            ids.add(stripped)
+    if not ids:
+        raise BenchmarkError(f"dev ids file {path} names no ids")
+    return frozenset(ids)
+
+
 def freeze(
     labels_path: str | Path,
     manifest_path: str | Path,
@@ -143,6 +181,7 @@ def freeze(
     salt: str = "",
     test_fraction: float = 0.5,
     force: bool = False,
+    dev_ids_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build dev-key.jsonl and test-key.jsonl, returning the freeze summary."""
     if not 0.0 <= test_fraction <= 1.0:
@@ -238,7 +277,9 @@ def freeze(
             f"refusing to overwrite an existing key in {out}; use --force to replace it"
         )
 
-    dev_rows, test_rows = _split_key(key, salt, test_fraction)
+    dev_ids = _read_dev_ids(dev_ids_path)
+    dev_rows, test_rows = _split_key(key, salt, test_fraction, dev_ids)
+    forced_dev = sum(1 for row in dev_rows if row["id"] in dev_ids)
 
     def public(row: dict[str, Any]) -> dict[str, Any]:
         return {field: row[field] for field in (
@@ -265,6 +306,7 @@ def freeze(
         "test_sha256": test_sha256,
         "salt": salt,
         "test_fraction": test_fraction,
+        "forced_dev": forced_dev,
         "dropped": dropped,
         "dropped_total": sum(dropped.values()),
     }
@@ -281,6 +323,7 @@ def format_freeze(summary: dict[str, Any], out_dir: str | Path) -> str:
         f"Key: {summary['key_rows']} rows "
         f"(dev {summary['dev_rows']}, test {summary['test_rows']})",
         f"Dropped: {summary['dropped_total']} ({reasons})",
+        f"Forced into dev: {summary.get('forced_dev', 0)}",
         f"test-key.jsonl sha256: {summary['test_sha256']}",
         f"Wrote {Path(out_dir) / 'dev-key.jsonl'}, "
         f"{Path(out_dir) / 'test-key.jsonl'} and {Path(out_dir) / 'freeze.json'}",
@@ -636,6 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
     freeze_parser.add_argument("--salt", default="")
     freeze_parser.add_argument("--test-fraction", type=float, default=0.5)
     freeze_parser.add_argument("--force", action="store_true")
+    freeze_parser.add_argument(
+        "--dev-ids",
+        help="file of ids (one per line, or JSON lines with `id`) that must go "
+        "to dev because they were already studied",
+    )
 
     score_parser = subparsers.add_parser(
         "score", help="score one predictions file against a key"
@@ -671,6 +719,7 @@ def main(argv: list[str] | None = None) -> int:
                 salt=args.salt,
                 test_fraction=args.test_fraction,
                 force=args.force,
+                dev_ids_path=args.dev_ids,
             )
             print(format_freeze(summary, args.out))
             return 0
