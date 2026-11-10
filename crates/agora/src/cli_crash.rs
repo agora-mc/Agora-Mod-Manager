@@ -218,6 +218,12 @@ impl agora_plugin_api::host::HostBridge for NoopBridge {
 }
 
 fn print_text(output: &AnalyzeOutput) {
+    if !output.read_any() {
+        // Nothing was read, so there is no diagnosis to state: say what happened to each file.
+        println!("Agora could not read these files, so it has nothing to diagnose.");
+        print_files(output);
+        return;
+    }
     let answer = &output.answer;
     println!("{}", english(&answer.headline));
     println!("How sure: {}", answer.level.label());
@@ -246,6 +252,8 @@ fn print_text(output: &AnalyzeOutput) {
 
     if !answer.could_not_check.is_empty() {
         println!("Could not check:");
+        // Several rules often miss the same thing; say it once, with how many.
+        let mut lines: Vec<(String, usize)> = Vec::new();
         for check in &answer.could_not_check {
             let plugin = check
                 .source
@@ -257,24 +265,41 @@ fn print_text(output: &AnalyzeOutput) {
                 .as_ref()
                 .map(|detail| format!(": {detail}"))
                 .unwrap_or_default();
-            println!(
-                "  - {}: {}{detail} (from {plugin})",
+            let line = format!(
+                "{}: {}{detail} (from {plugin})",
                 check.subject,
                 reason_words(check.reason)
             );
+            match lines.iter_mut().find(|(seen, _)| *seen == line) {
+                Some((_, count)) => *count += 1,
+                None => lines.push((line, 1)),
+            }
+        }
+        for (line, count) in lines {
+            if count > 1 {
+                println!("  - {line} ({count} rules)");
+            } else {
+                println!("  - {line}");
+            }
         }
     }
 
-    if !output.files.is_empty() {
-        println!("Files:");
-        for file in &output.files {
-            match &file.read_by {
-                Some(reader) => println!("  {}: read by {}", file.name, reader.plugin_name),
-                None => println!(
-                    "  {}: not recognised by any installed crash pack",
-                    file.name
-                ),
-            }
+    print_files(output);
+}
+
+fn print_files(output: &AnalyzeOutput) {
+    if output.files.is_empty() {
+        return;
+    }
+    println!("Files:");
+    for file in &output.files {
+        match (&file.read_by, &file.reason) {
+            (Some(reader), _) => println!("  {}: read by {}", file.name, reader.plugin_name),
+            (None, Some(reason)) => println!("  {}: {reason}", file.name),
+            (None, None) => println!(
+                "  {}: not recognised by any installed crash pack",
+                file.name
+            ),
         }
     }
 }

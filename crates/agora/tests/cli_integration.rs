@@ -1547,6 +1547,24 @@ fn crash_analyze_names_a_file_it_cannot_open() {
 }
 
 #[test]
+fn crash_analyze_of_a_file_nobody_reads_states_no_diagnosis() {
+    let (tmp, data_dir) = temp_data_dir();
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "a shopping list, not a crash log\n").unwrap();
+    let output = run_agora(&data_dir, &["crash", "analyze", file.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("could not read these files"), "{stdout}");
+    assert!(
+        stdout.contains("notes.txt: no installed crash pack recognised this file"),
+        "{stdout}"
+    );
+    // No diagnosis and no list of checks for a file that was never read.
+    assert!(!stdout.contains("The game crashed"), "{stdout}");
+    assert!(!stdout.contains("Could not check"), "{stdout}");
+}
+
+#[test]
 fn instance_memory_recommendation_is_read_only_and_explained() {
     let (_tmp, data_dir) = temp_data_dir();
     run_agora(&data_dir, &["paths"]);
