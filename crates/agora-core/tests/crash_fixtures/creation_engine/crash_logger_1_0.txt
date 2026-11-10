@@ -1,0 +1,46 @@
+Skyrim SSE v1.6.353
+CrashLoggerSSE v1.0.0
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF600001000 ExampleGame.dll+001000
+
+SYSTEM SPECS:
+	OS: Microsoft Windows 10 Home v10.0.19041
+	CPU: InventedVendor Invented CPU 9000
+	GPU #1: Invented Graphics 9000
+	GPU #2: Microsoft Basic Render Driver
+	PHYSICAL MEMORY: 6.00 GB/16.00 GB
+
+PROBABLE CALL STACK:
+	[ 0] 0x7FF600001000                   ExampleGame.dll+001000 -> 11111+0x10
+	[ 1] 0x7FF600002000                   ExampleGame.dll+002000 -> 11112+0x20
+	[ 2] 0x7FF600003000                   ExampleLogger.dll+003000
+
+REGISTERS:
+	RAX 0x0                (size_t)
+	RDX 0x1F000000000      (ExampleForm*)
+		File: "ExampleBase.esm"
+		Modified by: ExamplePatch.esp -> ExampleBase.esm
+		Flags: 0x00000009 kInitialized
+		FormID: 0x00012345
+		FormType: FormList (91)
+		EditorID: "ExampleEditorId"
+
+STACK:
+	[RSP+0   ] 0x0                (size_t)
+	[RSP+8   ] 0x1F000000100      (ExampleTriShape*)
+		Name: "meshes\example\invented.nif"
+		RTTIName: "ExampleTriShape"
+
+MODULES:
+	ExampleGame.dll                    0x7FF600000000
+	ExampleLogger.dll                  0x7FF600004000
+
+SKSE PLUGINS:
+	ExampleLogger.dll v1.0
+	ExamplePlugin.dll
+
+PLUGINS:
+	Light: 2	Regular: 3	Total: 5
+	[00]     ExampleBase.esm
+	[01]     ExamplePatch.esp
+	[FE:000] ExampleLight.esl

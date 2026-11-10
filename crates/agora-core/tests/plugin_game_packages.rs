@@ -504,3 +504,64 @@ fn a_package_naming_a_behaviour_with_no_entrypoint_does_not_register() {
         "the warning says why: {warnings:?}"
     );
 }
+
+#[test]
+fn a_template_only_base_package_validates_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("games")).unwrap();
+    std::fs::write(
+        tmp.path().join("games/package.json"),
+        r#"{
+            "id": "acme.base",
+            "version": "0.1.0",
+            "api_range": ">=0.1, <0.2",
+            "parents": [],
+            "games": [],
+            "game_templates": { "base": { "deployment": "virtual_file_system" } }
+        }"#,
+    )
+    .unwrap();
+
+    let report = agora_core::game_registry::validate::validate_plugin(
+        "acme.base",
+        tmp.path(),
+        &["games/package.json".to_string()],
+        None,
+    );
+    assert!(report.is_clean(), "{:#?}", report.problems);
+    assert_eq!(report.packages.len(), 1);
+    assert_eq!(report.packages[0].id, "acme.base");
+}
+
+#[test]
+fn a_package_with_neither_games_nor_templates_is_still_a_problem() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("games")).unwrap();
+    std::fs::write(
+        tmp.path().join("games/package.json"),
+        r#"{
+            "id": "acme.empty",
+            "version": "0.1.0",
+            "api_range": ">=0.1, <0.2",
+            "parents": [],
+            "games": []
+        }"#,
+    )
+    .unwrap();
+
+    let report = agora_core::game_registry::validate::validate_plugin(
+        "acme.empty",
+        tmp.path(),
+        &["games/package.json".to_string()],
+        None,
+    );
+    assert!(!report.is_clean());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|problem| { problem.message.contains("defines no games") }),
+        "{:#?}",
+        report.problems
+    );
+}

@@ -1,0 +1,43 @@
+SkyrimVR v1.4.15
+trainwreck v1.4.0
+
+Unhandled exception "C06D007E" at 0x7FF900001000 ExampleBridge.dll+001000 RaiseExample
+
+SYSTEM SPECS:
+    OS: Windows 10 Pro 23H2 22631.4460
+    CPU: InventedVendor Invented VR CPU
+    GPU #1: Invented Graphics VR
+    GPU #2: Microsoft Basic Render Driver
+    RAM: 10.00 GiB/32.00 GiB
+    PAGE FILE: 20.00 GiB/48.00 GiB
+
+PROBABLE CALL STACK:
+    [0 ] 0x7FF900001000 ExampleBridge.dll+001000 RaiseExample
+        mov rax,[rbp-18h]
+        [D:\build\example\bridge.cpp:301]
+    [1 ] 0x7FF900002000 ExampleGame.exe+002000 ExampleRun
+        ret
+
+REGISTERS:
+    RAX 0x0                (size_t)
+    RCX 0x1B500000000      (ExampleScroll*)
+    R12 0x7FF900002000     (void* -> ExampleGame.exe+002000)
+        ret
+
+STACK:
+    [RSP+0   ] 0x0                (size_t)
+    [RSP+8   ] 0x1B500000100      (ExampleObject*)
+
+MODULES:
+    ExampleBridge.dll
+        Address: 0x7FF900000000
+        SHA: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        Version: v1.0.0
+    ExampleGame.exe
+        Address: 0x7FF900002000
+        SHA: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+        Version: v1.4.15
+
+SCRIPT EXTENDER PLUGINS:
+    ExampleBridge.dll v1.0.0
+    ExampleVR.dll
