@@ -292,6 +292,14 @@ fn engine() -> (tempfile::TempDir, QuickJsHost, PluginId, Arc<FakeBridge>) {
     std::fs::create_dir_all(dir.path().join("wasm")).unwrap();
     std::fs::copy(module, dir.path().join("wasm/loot-sort.wasm"))
         .expect("the module is in the repository");
+    // `main.js` imports its generated function-name table.
+    std::fs::create_dir_all(dir.path().join("crash")).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/official/creation-engine/crash/addrlib-names.js"),
+        dir.path().join("crash/addrlib-names.js"),
+    )
+    .expect("the name table is in the repository");
 
     let id = PluginId::parse("agora.creation-engine").unwrap();
     let host = QuickJsHost::new();
