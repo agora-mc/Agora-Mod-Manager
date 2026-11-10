@@ -407,6 +407,38 @@ impl Bound {
     }
 }
 
+/// Everything wrong with what an inspector returned. An inspector may emit the same facts a parser
+/// may, so the fact rules are exactly a parser's; `detail` is length-bounded too. Empty means valid.
+pub fn validate_inspector_output(
+    output: &InspectorOutput,
+    limits: &ParserLimits,
+) -> Vec<LintProblem> {
+    // An inspector has no producer, bucket, coverage or notes, so a parser shell carries its facts
+    // and contract through the same checks.
+    let shell = ParserOutput {
+        contract: output.contract,
+        producer: Producer {
+            format: "inspector".to_string(),
+            version: None,
+        },
+        facts: output.facts.clone(),
+        bucket: Vec::new(),
+        coverage: Vec::new(),
+        notes: Vec::new(),
+    };
+    let mut out = validate_parser_output(&shell, limits);
+    if let Some(detail) = &output.detail {
+        if detail.len() > limits.max_attr_len as usize {
+            out.push(problem(
+                LintCode::BadOutput,
+                "",
+                format!("`detail` is longer than {} bytes", limits.max_attr_len),
+            ));
+        }
+    }
+    out
+}
+
 struct RuleLint {
     at: String,
     out: Vec<LintProblem>,

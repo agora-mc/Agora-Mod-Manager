@@ -12,7 +12,8 @@
 use super::attribution::LooseResolver;
 use super::{
     answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusProfile, EvaluateInput,
-    Inspection, InspectionRequest, Inspector, ParsedArtifact, PluginIdentity,
+    Inspection, InspectionOutcome, InspectionRequest, Inspector, ParsedArtifact, PluginIdentity,
+    RefResolver,
 };
 use crate::crash_packs::{
     artifact_handle, parse_artifact_with_builtin, parser_request, LoadedCrashPack, MemoryArtifact,
@@ -20,8 +21,9 @@ use crate::crash_packs::{
 };
 use crate::error::{LauncherError, LauncherResult};
 use agora_game_api::crash::{
-    Artifact, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, GameHandle, MatchedBy,
-    ParserLimits, Privacy, Retained, SessionVerdict, DETECT_HEAD_BYTES,
+    Artifact, AttrValue, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, Fact,
+    GameHandle, MatchedBy, ParserLimits, Privacy, Retained, Scalar, SessionVerdict,
+    DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use serde::{Deserialize, Serialize};
@@ -41,7 +43,17 @@ pub struct CrashFile {
     pub bytes: Vec<u8>,
 }
 
-/// Everything one loose-file analysis needs.
+/// What an analysis did not have to build for itself: the instance behind the crash.
+pub struct InstanceAnalysis<'a> {
+    /// The game the instance runs. Only this game's packs, and those for every game, take part.
+    pub game_id: &'a str,
+    /// Who owns each ref in this instance's deployed view.
+    pub resolver: &'a dyn RefResolver,
+    /// The deeper checks this instance's packs can make.
+    pub inspector: &'a dyn Inspector,
+}
+
+/// Everything one crash analysis needs.
 pub struct AnalyzeInput<'a> {
     /// The crash packs that loaded and linted clean.
     pub packs: &'a [LoadedCrashPack],
@@ -53,6 +65,9 @@ pub struct AnalyzeInput<'a> {
     /// The packs compiled into Agora, for the parsers their JSON names. Each must also be in
     /// `packs`, loaded by `load_built_in_packs`.
     pub built_in: &'a [BuiltInPack],
+    /// The instance the crash came from, when the caller knows it. `None` is a loose file: names
+    /// stand for themselves and nothing can be inspected.
+    pub instance: Option<InstanceAnalysis<'a>>,
 }
 
 /// The pack and parser that read one file.
@@ -107,8 +122,8 @@ impl AnalyzeOutput {
 struct NoInspector;
 
 impl Inspector for NoInspector {
-    fn inspect(&self, _request: &InspectionRequest<'_>) -> Inspection {
-        Inspection::Missing
+    fn inspect(&self, _request: &InspectionRequest<'_>) -> InspectionOutcome {
+        Inspection::Missing.into()
     }
 }
 
@@ -129,6 +144,11 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
     });
 
     let limits = ParserLimits::DEFAULT;
+    let game_id = input
+        .instance
+        .as_ref()
+        .map(|instance| instance.game_id)
+        .unwrap_or(UNKNOWN_GAME);
     let mut parsed: Vec<ParsedArtifact> = Vec::new();
     let mut reports: Vec<AnalyzedFile> = Vec::with_capacity(input.files.len());
     let mut failures: Vec<(String, FileParserFailure)> = Vec::new();
@@ -165,7 +185,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             "",
             handle,
             GameHandle {
-                id: UNKNOWN_GAME.to_string(),
+                id: game_id.to_string(),
                 runtime_version: input.runtime_version.map(str::to_string),
             },
             limits,
@@ -237,30 +257,42 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         reports.push(report);
     }
 
+    // With an instance, the game is known and only its packs, plus those for every game, take part.
     // A loose file names no game, so it stands for the games of the packs that read it: another
     // game's rules must not accuse a module in this one. Packs for every game always take part.
-    let read_games: std::collections::BTreeSet<&str> = reports
-        .iter()
-        .filter_map(|report| report.read_by.as_ref())
-        .flat_map(|reader| {
-            packs
+    let packs: Vec<&LoadedCrashPack> = match &input.instance {
+        Some(instance) => packs
+            .into_iter()
+            .filter(|pack| {
+                pack.pack.games.is_empty()
+                    || pack.pack.games.iter().any(|game| game == instance.game_id)
+            })
+            .collect(),
+        None => {
+            let read_games: std::collections::BTreeSet<&str> = reports
                 .iter()
-                .filter(move |pack| pack.plugin_id == reader.plugin_id)
-                .flat_map(|pack| pack.pack.games.iter().map(String::as_str))
-        })
-        .collect();
-    let packs: Vec<&LoadedCrashPack> = packs
-        .into_iter()
-        .filter(|pack| {
-            read_games.is_empty()
-                || pack.pack.games.is_empty()
-                || pack
-                    .pack
-                    .games
-                    .iter()
-                    .any(|game| read_games.contains(game.as_str()))
-        })
-        .collect();
+                .filter_map(|report| report.read_by.as_ref())
+                .flat_map(|reader| {
+                    packs
+                        .iter()
+                        .filter(move |pack| pack.plugin_id == reader.plugin_id)
+                        .flat_map(|pack| pack.pack.games.iter().map(String::as_str))
+                })
+                .collect();
+            packs
+                .into_iter()
+                .filter(|pack| {
+                    read_games.is_empty()
+                        || pack.pack.games.is_empty()
+                        || pack
+                            .pack
+                            .games
+                            .iter()
+                            .any(|game| read_games.contains(game.as_str()))
+                })
+                .collect()
+        }
+    };
 
     let pack_inputs: Vec<super::PackInput> = packs
         .iter()
@@ -269,16 +301,41 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             pack: pack.pack.clone(),
         })
         .collect();
-    let engine_facts = Vec::new();
-    let resolver = LooseResolver::from_packs(packs.iter().map(|pack| &pack.pack), &parsed);
-    let inspector = NoInspector;
+    // Only an instance has files for an inspector to open. The fact is always present, with `game`
+    // only when there is one, so a rule can require `game` and stay quiet for a loose file without
+    // becoming unanchored.
+    let instance_attrs = match &input.instance {
+        Some(instance) => [(
+            "game".to_string(),
+            AttrValue::Scalar(Scalar::Text(instance.game_id.to_string())),
+        )]
+        .into_iter()
+        .collect(),
+        None => Default::default(),
+    };
+    let engine_facts: Vec<Fact> = vec![Fact {
+        kind: "core.instance".to_string(),
+        attrs: instance_attrs,
+        refs: Vec::new(),
+        span: None,
+    }];
+    let loose_resolver = LooseResolver::from_packs(packs.iter().map(|pack| &pack.pack), &parsed);
+    let resolver: &dyn RefResolver = match &input.instance {
+        Some(instance) => instance.resolver,
+        None => &loose_resolver,
+    };
+    let no_inspector = NoInspector;
+    let inspector: &dyn Inspector = match &input.instance {
+        Some(instance) => instance.inspector,
+        None => &no_inspector,
+    };
     let evaluated = evaluate(&EvaluateInput {
         packs: &pack_inputs,
         parsed: &parsed,
         engine_facts: &engine_facts,
         runtime_version: input.runtime_version,
-        resolver: &resolver,
-        inspector: &inspector,
+        resolver,
+        inspector,
     });
     let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
     let scored = consensus(

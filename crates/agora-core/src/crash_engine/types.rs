@@ -55,9 +55,11 @@ pub trait RefResolver {
     fn resolve(&self, reference: &Ref) -> Resolved;
 }
 
-/// One inspector call.
+/// One inspector call. `plugin_id` is the plugin whose rule asked: inspector ids are local to a
+/// plugin, so an inspector is found in that plugin's pack and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectionRequest<'a> {
+    pub plugin_id: &'a str,
     pub inspector: &'a str,
     pub target: &'a Ref,
 }
@@ -73,9 +75,34 @@ pub enum Inspection {
     Failed(String),
 }
 
+/// An inspection's result with what it wants the answer to show: its own detail, and any facts it
+/// found (such as the versions a file declares).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InspectionOutcome {
+    pub result: Inspection,
+    pub detail: Option<String>,
+    pub facts: Vec<Fact>,
+}
+
+impl InspectionOutcome {
+    pub fn new(result: Inspection) -> Self {
+        Self {
+            result,
+            detail: None,
+            facts: Vec::new(),
+        }
+    }
+}
+
+impl From<Inspection> for InspectionOutcome {
+    fn from(result: Inspection) -> Self {
+        Self::new(result)
+    }
+}
+
 /// The deeper check a rule can ask for.
 pub trait Inspector {
-    fn inspect(&self, request: &InspectionRequest<'_>) -> Inspection;
+    fn inspect(&self, request: &InspectionRequest<'_>) -> InspectionOutcome;
 }
 
 /// Facts only the engine knows, such as the session verdict. They are always covered when present.

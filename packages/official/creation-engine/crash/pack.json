@@ -85,6 +85,19 @@
       }
     }
   ],
+  "inspectors": [
+    {
+      "id": "skse_plugin_declaration",
+      "accepts": [
+        "*.dll"
+      ],
+      "entry": {
+        "script": {
+          "export": "inspectSksePluginDeclaration"
+        }
+      }
+    }
+  ],
   "ref_maps": [
     {
       "kind": "module",
@@ -1086,6 +1099,137 @@
         }
       },
       "reference": "Phostwood dllCompatibleSkyrimVersionsMap.js entry SkyClimb.dll (GPL-3)"
+    },
+    {
+      "id": "skse_plugin_built_for_another_game_version",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.script_extender_plugin",
+              "ref": {
+                "kind": "module",
+                "bind": "d"
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.instance",
+              "where": {
+                "game": {
+                  "present": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "verify": {
+        "inspector": "skse_plugin_declaration",
+        "target": "d",
+        "on_fail": [
+          {
+            "finding": {
+              "scope": "root_cause",
+              "level": "likely",
+              "candidate": {
+                "owner_of": "d"
+              },
+              "family": "verified_asset",
+              "weight": 16
+            }
+          },
+          {
+            "signal": {
+              "family": "known_signature",
+              "candidate": {
+                "owner_of": "d"
+              },
+              "weight": 8
+            }
+          }
+        ]
+      },
+      "text": {
+        "headline": {
+          "en": "{owner:d} is listed as a script-extender plugin, and its file declares it was built for a game version other than the one that crashed. Updating it, or using the build made for this game version, is the first thing to try."
+        },
+        "why_not_sure": {
+          "en": "A DLL built for another game version is a known cause of crashes, but the log cannot show that this DLL was the one that failed."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "CommonLibSSE-NG include/SKSE/Interfaces.h lines 536-622 (struct and flags), include/REL/Version.h lines 94-107 (packing)"
+    },
+    {
+      "id": "stack_module_built_for_another_game_version",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "core.frame",
+              "where": {
+                "actionable_index": {
+                  "lte": 16
+                }
+              },
+              "ref": {
+                "kind": "module",
+                "bind": "d"
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.instance",
+              "where": {
+                "game": {
+                  "present": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "verify": {
+        "inspector": "skse_plugin_declaration",
+        "target": "d",
+        "on_fail": [
+          {
+            "finding": {
+              "scope": "root_cause",
+              "level": "likely",
+              "candidate": {
+                "owner_of": "d"
+              },
+              "family": "verified_asset",
+              "weight": 16
+            }
+          },
+          {
+            "signal": {
+              "family": "execution",
+              "candidate": {
+                "owner_of": "d"
+              },
+              "weight": 8
+            }
+          }
+        ]
+      },
+      "text": {
+        "headline": {
+          "en": "{owner:d} was on the crash stack, and its file declares it was built for a game version other than the one that crashed. Updating it, or using the build made for this game version, is the first thing to try."
+        },
+        "why_not_sure": {
+          "en": "A DLL built for another game version is a known cause of crashes, but being on the stack does not prove it was the one that failed."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "CommonLibSSE-NG include/SKSE/Interfaces.h lines 536-622 (struct and flags), include/REL/Version.h lines 94-107 (packing)"
     }
   ]
 }

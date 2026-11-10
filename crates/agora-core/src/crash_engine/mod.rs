@@ -12,6 +12,7 @@ mod answer;
 pub mod attribution;
 mod consensus;
 mod evaluate;
+mod inspector;
 pub mod parsers;
 mod profile;
 mod types;
@@ -22,6 +23,7 @@ pub use analyze::*;
 pub use answer::*;
 pub use consensus::*;
 pub use evaluate::*;
+pub use inspector::*;
 pub use profile::*;
 pub use types::*;
 

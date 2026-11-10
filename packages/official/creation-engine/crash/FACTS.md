@@ -411,6 +411,85 @@ the best clue to what the failing thread was loading.
   "refs": [{ "kind": "file", "value": "meshes\\example\\invented.nif", "strength": "object" }] }
 ```
 
+## Inspectors
+
+An inspector opens one file a rule points at. `skse_plugin_declaration` accepts
+`*.dll` and reads only the PE headers, the export table, and the
+`SKSEPlugin_Version` data. It is `inspectSksePluginDeclaration` in `main.js`.
+It sees the file by id through `crash.readBytes`; the rule's ref is resolved to
+the deployed file before the script runs, and the script never sees a path.
+
+### `creation.skse_plugin_declaration`
+
+| Attribute | Meaning |
+|---|---|
+| `data_version` | The struct's first field. This reader knows `1`. |
+| `plugin_version` | The plugin's own version, decoded to `1.2.3` or `1.2.3.4`. |
+| `name` | The name the plugin declares, when it is non-empty. |
+| `address_independent` | `versionIndependence` bit `0x1`: uses the post-AE address library. |
+| `signature_scanning` | `versionIndependence` bit `0x2`: finds addresses by signature. |
+| `structs_post_629` | `versionIndependence` bit `0x4`: built for the structs that changed in 1.6.629. |
+| `uses_no_structs` | `versionIndependenceEx` bit `0x1`: uses none of the structs that changed. |
+| `compatible_runtimes` | Each non-zero packed runtime version, decoded to `1.5.97` style. |
+| `minimum_xse_version` | The declared minimum SKSE version, decoded the same way. |
+
+The fact also has a `module` ref naming the DLL (a mention).
+
+### PE and struct offsets
+
+Source: `.spike/CommonLibSSE-NG/include/SKSE/Interfaces.h` (commit
+`f49373ed`, GPL-3 with modding exceptions) and
+`.spike/CommonLibSSE-NG/include/REL/Version.h`.
+
+| Field | Offset | Source |
+|---|---|---|
+| DOS header magic / `e_lfanew` | `0x00` / `0x3C` | standard PE layout |
+| PE signature | `e_lfanew` | standard PE layout |
+| number of sections | COFF + `0x06` | standard PE layout |
+| size of optional header | COFF + `0x14` | standard PE layout |
+| export directory RVA/size | optional header data directory 0 (`0x70` PE32+, `0x60` PE32) | standard PE layout |
+| section table | `e_lfanew + 24 + SizeOfOptionalHeader` | standard PE layout |
+| export directory fields | `NameCount` at `0x18`, `AddressOfFunctions` at `0x1C`, `AddressOfNames` at `0x20`, `AddressOfNameOrdinals` at `0x24` | standard PE layout |
+| `dataVersion` | `0x000` | Interfaces.h:613 |
+| `pluginVersion` | `0x004` | Interfaces.h:614 |
+| `pluginName[256]` | `0x008` | Interfaces.h:615 |
+| `author[256]` | `0x108` | Interfaces.h:616 |
+| `supportEmail[252]` | `0x208` | Interfaces.h:617 |
+| `versionIndependenceEx` | `0x304` | Interfaces.h:618 |
+| `versionIndependence` | `0x308` | Interfaces.h:619 |
+| `compatibleVersions[16]` | `0x30C` | Interfaces.h:620 |
+| `xseMinimum` | `0x34C` | Interfaces.h:621 |
+| struct size | `0x350` | Interfaces.h:622 |
+
+Flag values: `AddressLibraryPostAE = 1 << 0`, `Signatures = 1 << 1`,
+`StructsPost629 = 1 << 2` (Interfaces.h:546-548); `NoStructUse = 1 << 0`,
+`AddressLibraryV5 = 1 << 1` (Interfaces.h:553-554). Version packing is
+`major << 24 | minor << 16 | patch << 4 | build` (Version.h:94-107), so `1.6.1170`
+is `[1, 6, 1170, 0]`.
+
+### What "supported" means
+
+The header says the struct layouts changed in **1.6.629**, not 1.6.1130:
+"In AE 1.6.629, however, the layout of some structs changed. If this is flagged
+as independent, then SKSE will let your plugin work with runtimes before and
+after this change" (Interfaces.h:786-796). The matching bit is
+`kVersionIndependent_StructsPost629` (1.6.629); `kVersionIndependentEx_NoStructUse`
+is the other way a plugin says it avoids the changed structs (Interfaces.h:553).
+
+The inspector applies that reading:
+
+- **Version-independent** (`address_independent` or `signature_scanning`): any
+  runtime is accepted, except a struct mismatch. On or after 1.6.629 it needs
+  `uses_no_structs` or `structs_post_629`; before 1.6.629 it must not set
+  `structs_post_629`.
+- **Not version-independent**: the running version must appear in
+  `compatible_runtimes`. If that list is empty, the answer is `unknown`, not
+  `fail`, because the file does not declare enough to judge.
+
+That is derived from the header's documented meaning, not from SKSE's own
+loader source (not in this checkout). The `pass`/`fail` split only uses what the
+DLL declares; a `fail` still never says "certainly".
+
 ## Coverage keys
 
 `coverage` says what each parser looked for. A rule about a kind with no fact
@@ -500,6 +579,8 @@ cause); the test set is never read. One family alone tops out at `possible`
 | `win24h2_upscaler_fault` | finding, environment | `possible` | `KERNELBASE.dll` fault with the Skyrim Upscaler on the stack. From Phostwood. |
 | `dragons_eye_minimap_fault` | known signature | 6 | The minimap loaded with camera or image-space objects live. From Phostwood. |
 | `skyclimb_outdated` | known signature | 6 | SkyClimb older than 1.1.2 on game 1.6.1130 or later (8 right, 2 wrong on dev; both wrong rows did have an old SkyClimb). From Phostwood's version table. |
+| `skse_plugin_built_for_another_game_version` | verified asset + known signature | 16 + 8 | The inspector opened a listed plugin's DLL and its declared versions exclude the running game. Only an instance has the file, so the rule requires `core.instance.game`. |
+| `stack_module_built_for_another_game_version` | verified asset + execution | 16 + 8 | The same check for a DLL on the crash stack (actionable frames 0-16). The inspector reads the DLL's own declaration; the rule says only that it does not support this game. |
 
 What the dev set taught, kept here so nobody re-learns it:
 

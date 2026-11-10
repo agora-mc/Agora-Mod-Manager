@@ -118,6 +118,7 @@ fn run(running: &Running, text: &str) -> AnalyzeOutput {
         runtime_version: None,
         host: &running.host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
     assert!(output.read_any(), "{:#?}", output.files);

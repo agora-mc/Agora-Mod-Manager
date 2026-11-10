@@ -557,6 +557,14 @@ impl GameReads for GameViewReads {
         self.instance.as_deref()
     }
 
+    fn size(&self, path: &str) -> Option<u64> {
+        let rel = parse_game_path(path).ok()?;
+        let physical = self.physical(rel.as_str()).ok()??;
+        std::fs::metadata(physical)
+            .ok()
+            .map(|metadata| metadata.len())
+    }
+
     fn read_bytes(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ScriptReadError> {
         if len > self.limits.max_read_bytes {
             return Err(refusal(

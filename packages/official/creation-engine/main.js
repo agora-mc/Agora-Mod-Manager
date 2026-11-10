@@ -1636,6 +1636,350 @@ export async function parseTrainwreck(request) {
 }
 
 // ---------------------------------------------------------------------------
+// SKSE plugin declarations (MASTER_SPEC §30.11)
+//
+// An SKSE plugin DLL exports `SKSEPlugin_Version`, a pointer to an
+// `SKSE::PluginVersionData`. The layout and flags are CommonLibSSE-NG
+// include/SKSE/Interfaces.h lines 536-622; a version's packed form is
+// include/REL/Version.h lines 94-107. The old `PluginVersionData` and the newer
+// `PluginDeclaration` deliberately share this layout, so both read the same.
+//
+// `versionIndependence` bits: 0x1 address library (post-AE), 0x2 signature
+// scanning, 0x4 post-1.6.629 structs. `versionIndependenceEx` bit 0x1 means the
+// plugin uses none of the structs that changed in 1.6.629. The header says the
+// struct change is at 1.6.629 and that "independent" means SKSE lets a plugin
+// work before and after it (Interfaces.h lines 786-807).
+//
+// Every read is a small, explicit window and every value is bounds-checked, so
+// a hostile or truncated file can only come out `unknown`.
+// ---------------------------------------------------------------------------
+
+const SKSE_VERSION_DATA_SIZE = 0x350;
+const SKSE_STRUCT_CHANGE = [1, 6, 629, 0];
+const SKSE_EXPORT_NAME = "SKSEPlugin_Version";
+
+function skseU16(bytes, at) {
+  return bytes[at] | (bytes[at + 1] << 8);
+}
+
+function skseU32(bytes, at) {
+  return (
+    (bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) | (bytes[at + 3] << 24)) >>> 0
+  );
+}
+
+function skseCString(bytes, at, max) {
+  let out = "";
+  for (let index = at; index < at + max && index < bytes.length; index += 1) {
+    if (bytes[index] === 0) break;
+    out += String.fromCharCode(bytes[index]);
+  }
+  return out;
+}
+
+function skseVersionParts(packed) {
+  return [(packed >>> 24) & 0xff, (packed >>> 16) & 0xff, (packed >>> 4) & 0xfff, packed & 0xf];
+}
+
+function skseVersionText(parts) {
+  const base = parts.slice(0, 3).join(".");
+  return parts[3] ? base + "." + parts[3] : base;
+}
+
+function skseSameVersion(left, right) {
+  for (let index = 0; index < 4; index += 1) {
+    if ((left[index] || 0) !== (right[index] || 0)) return false;
+  }
+  return true;
+}
+
+function skseAtLeast(parts, floor) {
+  for (let index = 0; index < 4; index += 1) {
+    if ((parts[index] || 0) > floor[index]) return true;
+    if ((parts[index] || 0) < floor[index]) return false;
+  }
+  return true;
+}
+
+function skseParseRunning(value) {
+  const text = String(value === undefined || value === null ? "" : value).trim();
+  if (!/^[0-9]+(\.[0-9]+){1,3}$/.test(text)) return null;
+  const parts = text.split(".").map((part) => Number(part));
+  while (parts.length < 4) parts.push(0);
+  return parts.slice(0, 4);
+}
+
+function skseRvaToOffset(table, count, rva) {
+  for (let index = 0; index < count; index += 1) {
+    const at = index * 40;
+    if (at + 40 > table.length) return null;
+    const virtualSize = skseU32(table, at + 8);
+    const virtualAddress = skseU32(table, at + 12);
+    const rawSize = skseU32(table, at + 16);
+    const rawPointer = skseU32(table, at + 20);
+    const span = Math.max(virtualSize, rawSize);
+    if (rva >= virtualAddress && rva < virtualAddress + span) {
+      return rawPointer + (rva - virtualAddress);
+    }
+  }
+  return null;
+}
+
+function skseResult(result, detail, facts) {
+  const answer = { contract: CRASH_CONTRACT, result, detail };
+  if (facts) answer.facts = facts;
+  return answer;
+}
+
+/// What an SKSE plugin DLL declares, and whether the running game version fits it.
+export async function inspectSksePluginDeclaration(request) {
+  const artifact = request.artifact.id;
+  const running = skseParseRunning(request.game && request.game.runtime_version);
+
+  const dos = new Uint8Array(crash.readBytes(artifact, 0, 64));
+  if (dos.length < 64 || dos[0] !== 0x4d || dos[1] !== 0x5a) {
+    return skseResult("unknown", "the file does not start with a DOS header");
+  }
+  const peOffset = skseU32(dos, 0x3c);
+  if (peOffset < 0x40 || peOffset > 0x10000000) {
+    return skseResult("unknown", "the DOS header points outside the file");
+  }
+
+  const coff = new Uint8Array(crash.readBytes(artifact, peOffset, 24));
+  if (coff.length < 24) {
+    return skseResult("unknown", "the file ends before its PE header");
+  }
+  if (coff[0] !== 0x50 || coff[1] !== 0x45 || coff[2] !== 0x00 || coff[3] !== 0x00) {
+    return skseResult("unknown", "the file has no PE signature");
+  }
+  const sectionCount = skseU16(coff, 6);
+  const optionalSize = skseU16(coff, 20);
+  if (sectionCount === 0 || sectionCount > 96) {
+    return skseResult("unknown", "the PE header has an impossible section count");
+  }
+  if (optionalSize < 96) {
+    return skseResult("unknown", "the PE optional header is too short");
+  }
+
+  const optional = new Uint8Array(crash.readBytes(artifact, peOffset + 24, optionalSize));
+  if (optional.length < optionalSize) {
+    return skseResult("unknown", "the file ends before its optional header");
+  }
+  const magic = skseU16(optional, 0);
+  let dataDirectory;
+  if (magic === 0x20b) dataDirectory = 112;
+  else if (magic === 0x10b) dataDirectory = 96;
+  else return skseResult("unknown", "the PE optional header has an unknown format");
+  if (optionalSize < dataDirectory + 8) {
+    return skseResult("unknown", "the PE optional header has no export directory");
+  }
+  const exportRva = skseU32(optional, dataDirectory);
+  const exportSize = skseU32(optional, dataDirectory + 4);
+  if (exportRva === 0 || exportSize === 0) {
+    return skseResult("unknown", "the DLL exports nothing, so it has no SKSEPlugin_Version");
+  }
+
+  const tableOffset = peOffset + 24 + optionalSize;
+  const table = new Uint8Array(crash.readBytes(artifact, tableOffset, sectionCount * 40));
+  if (table.length < sectionCount * 40) {
+    return skseResult("unknown", "the file ends before its section table");
+  }
+  const mapRva = (rva) => skseRvaToOffset(table, sectionCount, rva);
+
+  const exportOffset = mapRva(exportRva);
+  if (exportOffset === null) {
+    return skseResult("unknown", "the export directory is not inside a section");
+  }
+  const directory = new Uint8Array(crash.readBytes(artifact, exportOffset, 40));
+  if (directory.length < 40) {
+    return skseResult("unknown", "the export directory is truncated");
+  }
+  const functionCount = skseU32(directory, 20);
+  const nameCount = skseU32(directory, 24);
+  const functionsRva = skseU32(directory, 28);
+  const namesRva = skseU32(directory, 32);
+  const ordinalsRva = skseU32(directory, 36);
+  if (nameCount === 0 || nameCount > 16384) {
+    return skseResult("unknown", "the DLL's export name count is unusable");
+  }
+  const namesOffset = mapRva(namesRva);
+  const ordinalsOffset = mapRva(ordinalsRva);
+  if (namesOffset === null || ordinalsOffset === null) {
+    return skseResult("unknown", "the export name table is not inside a section");
+  }
+  const names = new Uint8Array(crash.readBytes(artifact, namesOffset, nameCount * 4));
+  const ordinals = new Uint8Array(crash.readBytes(artifact, ordinalsOffset, nameCount * 2));
+  if (names.length < nameCount * 4 || ordinals.length < nameCount * 2) {
+    return skseResult("unknown", "the export name table is truncated");
+  }
+
+  let exportIndex = -1;
+  for (let index = 0; index < nameCount; index += 1) {
+    const nameOffset = mapRva(skseU32(names, index * 4));
+    if (nameOffset === null) continue;
+    const raw = new Uint8Array(crash.readBytes(artifact, nameOffset, 32));
+    if (skseCString(raw, 0, raw.length) === SKSE_EXPORT_NAME) {
+      exportIndex = index;
+      break;
+    }
+  }
+  if (exportIndex < 0) {
+    return skseResult(
+      "unknown",
+      "the DLL does not export SKSEPlugin_Version, so it declares no version data",
+    );
+  }
+
+  const ordinal = skseU16(ordinals, exportIndex * 2);
+  if (ordinal >= functionCount) {
+    return skseResult("unknown", "the export ordinal points past the function table");
+  }
+  const functionsOffset = mapRva(functionsRva);
+  if (functionsOffset === null) {
+    return skseResult("unknown", "the export function table is not inside a section");
+  }
+  const functionEntry = new Uint8Array(
+    crash.readBytes(artifact, functionsOffset + ordinal * 4, 4),
+  );
+  if (functionEntry.length < 4) {
+    return skseResult("unknown", "the export function table is truncated");
+  }
+  const dataRva = skseU32(functionEntry, 0);
+  if (dataRva >= exportRva && dataRva < exportRva + exportSize) {
+    return skseResult("unknown", "SKSEPlugin_Version is a forwarder, not version data");
+  }
+  const dataOffset = mapRva(dataRva);
+  if (dataOffset === null) {
+    return skseResult("unknown", "the version data is not inside a section");
+  }
+
+  const data = new Uint8Array(crash.readBytes(artifact, dataOffset, SKSE_VERSION_DATA_SIZE));
+  if (data.length < SKSE_VERSION_DATA_SIZE) {
+    return skseResult("unknown", "the version data is truncated");
+  }
+  const dataVersion = skseU32(data, 0x000);
+  if (dataVersion !== 1) {
+    return skseResult("unknown", "the version data has a format this inspector does not know");
+  }
+  const name = skseCString(data, 0x008, 256);
+  const versionIndependenceEx = skseU32(data, 0x304);
+  const versionIndependence = skseU32(data, 0x308);
+  const compatible = [];
+  for (let index = 0; index < 16; index += 1) {
+    const packed = skseU32(data, 0x30c + index * 4);
+    if (packed === 0) break;
+    compatible.push(packed);
+  }
+  const addressIndependent = (versionIndependence & 0x1) !== 0;
+  const signatureScanning = (versionIndependence & 0x2) !== 0;
+  const structsPost629 = (versionIndependence & 0x4) !== 0;
+  const noStructUse = (versionIndependenceEx & 0x1) !== 0;
+  const versionIndependent = addressIndependent || signatureScanning;
+
+  const attrs = {
+    data_version: dataVersion,
+    plugin_version: skseVersionText(skseVersionParts(skseU32(data, 0x004))),
+    address_independent: addressIndependent,
+    signature_scanning: signatureScanning,
+    structs_post_629: structsPost629,
+    uses_no_structs: noStructUse,
+    compatible_runtimes: compatible.map((packed) => skseVersionText(skseVersionParts(packed))),
+    minimum_xse_version: skseVersionText(skseVersionParts(skseU32(data, 0x34c))),
+  };
+  if (name) attrs.name = name;
+  const fact = {
+    kind: "creation.skse_plugin_declaration",
+    attrs,
+    refs: [{ kind: "module", value: request.artifact.name, strength: "mention" }],
+  };
+  const label = name || request.artifact.name;
+
+  if (!running) {
+    return skseResult(
+      "unknown",
+      "the request does not say which game version is running, so the declaration cannot be judged",
+      [fact],
+    );
+  }
+
+  if (versionIndependent) {
+    if (skseAtLeast(running, SKSE_STRUCT_CHANGE)) {
+      const safe = noStructUse || structsPost629;
+      const why = safe
+        ? noStructUse
+          ? "it declares that it uses none of the structs that changed in 1.6.629"
+          : "it declares that it uses the post-1.6.629 structs"
+        : "it is version-independent but does not declare that it avoids the structs that changed in 1.6.629";
+      if (safe) {
+        return skseResult(
+          "pass",
+          label + " supports game version " + skseVersionText(running) + ": " + why + ".",
+          [fact],
+        );
+      }
+      return skseResult(
+        "fail",
+        label +
+          " was built for another game version; " +
+          skseVersionText(running) +
+          " is not supported because " +
+          why +
+          ".",
+        [fact],
+      );
+    }
+    if (structsPost629) {
+      return skseResult(
+        "fail",
+        label +
+          " was built for another game version; it uses the post-1.6.629 structs, which " +
+          skseVersionText(running) +
+          " does not have.",
+        [fact],
+      );
+    }
+    return skseResult(
+      "pass",
+      label +
+        " supports game version " +
+        skseVersionText(running) +
+        ": it is version-independent and does not require the post-1.6.629 structs.",
+      [fact],
+    );
+  }
+
+  if (compatible.length === 0) {
+    return skseResult(
+      "unknown",
+      label +
+        " declares no compatible runtime versions and no version independence, so its game support cannot be read",
+      [fact],
+    );
+  }
+
+  const supported = compatible.some((packed) =>
+    skseSameVersion(skseVersionParts(packed), running),
+  );
+  if (supported) {
+    return skseResult(
+      "pass",
+      label + " supports game version " + skseVersionText(running) + ": it lists it as compatible.",
+      [fact],
+    );
+  }
+  return skseResult(
+    "fail",
+    label +
+      " was built for another game version; it lists only " +
+      compatible.map((packed) => skseVersionText(skseVersionParts(packed))).join(", ") +
+      " as compatible, and the running game is " +
+      skseVersionText(running) +
+      ".",
+    [fact],
+  );
+}
+
+// ---------------------------------------------------------------------------
 // LOOT's sorter (MASTER_SPEC §30.13)
 //
 // The order, the notes and the masterlist parser are libloot's, compiled into

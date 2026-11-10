@@ -177,7 +177,11 @@ pub const CORE_FACT_KINDS: &[(&str, &[&str])] = &[
 /// - `core.change`: one per content item changed since the last good launch. `change` is `added`,
 ///   `removed` or `updated`; the item is in `refs` under kind `content`.
 /// - `core.attribution`: one per ref, with the content key that owns it.
+/// - `core.instance`: the analysis has a game behind it. `game` is its game id, and is absent when
+///   the file is loose. It is always present, so a rule can require `game` and stay quiet without an
+///   instance without making the rule unanchored.
 pub const ENGINE_FACT_KINDS: &[(&str, &[&str])] = &[
+    ("core.instance", &["game"]),
     ("core.session", &["verdict", "exit_code", "runtime_ms"]),
     (
         "core.history",
