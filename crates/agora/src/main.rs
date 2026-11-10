@@ -13198,12 +13198,14 @@ mod tests {
                         plugin_dirs,
                         game_version,
                         allow_code,
+                        facts,
                     },
             } => {
                 assert_eq!(files.len(), 2);
                 assert_eq!(plugin_dirs.len(), 1);
                 assert_eq!(game_version.as_deref(), Some("1.2.3"));
                 assert!(allow_code);
+                assert!(!facts);
             }
             _ => panic!("expected crash analyze"),
         }

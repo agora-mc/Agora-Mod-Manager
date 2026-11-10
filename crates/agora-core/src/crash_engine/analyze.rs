@@ -20,8 +20,8 @@ use crate::crash_packs::{
 };
 use crate::error::{LauncherError, LauncherResult};
 use agora_game_api::crash::{
-    Artifact, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, GameHandle, MatchedBy, ParserLimits,
-    Privacy, Retained, SessionVerdict, DETECT_HEAD_BYTES,
+    Artifact, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, GameHandle, MatchedBy,
+    ParserLimits, Privacy, Retained, SessionVerdict, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use serde::{Deserialize, Serialize};

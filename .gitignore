@@ -7,6 +7,8 @@ dist
 registry.db
 registry.db.sig
 *.log
+# Test fixtures are often logs; keep them tracked.
+!crates/*/tests/**/*.log
 .DS_Store
 __pycache__
 .idea
