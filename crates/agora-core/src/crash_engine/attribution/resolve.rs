@@ -372,6 +372,65 @@ impl RefResolver for Resolver {
     }
 }
 
+/// The resolver for a crash file the user handed Agora with no instance behind it.
+///
+/// There is nothing in an instance to blame, so a ref names itself: `ExampleMod.dll` resolves to
+/// an owner whose display name is that value. A pack's `roles` still win, and apply exactly as they
+/// do for an installed instance, because a system module or a framework is one wherever it is seen.
+/// Inspectors have no file to open here; that is the caller's business, not the resolver's.
+pub struct LooseResolver {
+    roles: Vec<RoleRule>,
+}
+
+impl LooseResolver {
+    pub fn new(roles: Vec<RoleRule>) -> Self {
+        Self { roles }
+    }
+
+    /// Every role rule the given packs declare, in pack order.
+    pub fn from_packs<'a>(packs: impl IntoIterator<Item = &'a CrashPack>) -> Self {
+        let mut roles = Vec::new();
+        for pack in packs {
+            roles.extend(pack.roles.iter().cloned());
+        }
+        Self::new(roles)
+    }
+}
+
+impl RefResolver for LooseResolver {
+    fn resolve(&self, reference: &Ref) -> Resolved {
+        let value = reference.value.trim();
+        if value.is_empty() {
+            return Resolved {
+                owner: Owner::Unknown,
+                role: None,
+            };
+        }
+        let Some(rule) = self.roles.iter().find(|rule| {
+            rule.kind == reference.kind && matches_value(rule.matching, value, &rule.value)
+        }) else {
+            return Resolved {
+                owner: Owner::Item {
+                    key: value.to_string(),
+                    name: value.to_string(),
+                },
+                role: None,
+            };
+        };
+        let owner = match rule.role {
+            Role::System => Owner::System,
+            Role::Platform => Owner::Base,
+            Role::Framework | Role::HookFramework => Owner::Framework {
+                name: rule.value.clone(),
+            },
+        };
+        Resolved {
+            owner,
+            role: Some(rule.role),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PathMatch {
     pattern_index: usize,

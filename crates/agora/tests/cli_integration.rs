@@ -291,6 +291,7 @@ const NESTED_COMMANDS: &[&[&str]] = &[
     &["crash", "list"],
     &["crash", "inspect"],
     &["crash", "investigate"],
+    &["crash", "analyze"],
     &["pack", "install"],
     &["pack", "export"],
     &["pack", "review"],
@@ -1448,6 +1449,102 @@ fn crash_investigate_accepts_explicit_text_evidence() {
         "selected-forge-crash.txt"
     );
     assert!(parsed["evidence"]["sources"][0].get("path").is_none());
+}
+
+fn write_crash_analyze_fixtures(root: &Path) -> (PathBuf, PathBuf) {
+    let plugin = root.join("analyze-plugin");
+    std::fs::create_dir_all(plugin.join("crash")).unwrap();
+    std::fs::write(
+        plugin.join("agora-plugin.json"),
+        r#"{
+  "manifest": 1,
+  "id": "acme.harbor",
+  "name": "Acme Harbor crash rules",
+  "version": "1.0.0",
+  "license": "MIT",
+  "apiRange": ">=0.1, <0.2",
+  "capabilities": { "required": ["crash:contribute"] },
+  "contributions": { "crashPacks": [{ "path": "crash/pack.json" }] }
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("crash/pack.json"),
+        r#"{
+  "contract": 1,
+  "parsers": [{
+    "id": "loose_log",
+    "entry": { "generic": { "name": "text_sections", "config": {
+      "sections": [{
+        "id": "faults",
+        "header": "^== FAULTS ==$",
+        "lines": [{
+          "pattern": "^module (?P<module>[A-Za-z0-9_.-]+) failed$",
+          "kind": "acme.fault",
+          "refs": [{ "kind": "module", "value": "module" }]
+        }]
+      }]
+    } } },
+    "detect": { "all": ["(?m)^== FAULTS ==$"] }
+  }],
+  "rules": [{
+    "id": "module_faulted",
+    "version": 1,
+    "when": { "fact": { "kind": "acme.fault", "ref": { "kind": "module", "bind": "m" } } },
+    "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 16 } }],
+    "text": { "headline": { "en": "{owner:m} failed while the game was running." } }
+  }]
+}"#,
+    )
+    .unwrap();
+    let crash = root.join("friend-crash.txt");
+    std::fs::write(&crash, "== FAULTS ==\nmodule ExampleMod.dll failed\n").unwrap();
+    (plugin, crash)
+}
+
+#[test]
+fn crash_analyze_names_the_module_a_loose_file_names_itself() {
+    let (tmp, data_dir) = temp_data_dir();
+    let (plugin, crash) = write_crash_analyze_fixtures(tmp.path());
+    let output = run_agora_json(
+        &data_dir,
+        &[
+            "crash",
+            "analyze",
+            crash.to_str().unwrap(),
+            "--plugin-dir",
+            plugin.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed = assert_json_stdout(&output);
+    assert_eq!(parsed["answer"]["verdict"]["kind"], "crashed");
+    assert_eq!(parsed["answer"]["verdict"]["how"], "supplied");
+    assert_eq!(
+        parsed["answer"]["candidates"][0]["owner"]["name"],
+        "ExampleMod.dll"
+    );
+    assert_eq!(parsed["files"][0]["read_by"]["plugin_id"], "acme.harbor");
+    assert_eq!(
+        parsed["files"][0]["read_by"]["plugin_name"],
+        "Acme Harbor crash rules"
+    );
+}
+
+#[test]
+fn crash_analyze_says_when_no_plugin_can_read_crash_files() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let output = run_agora(&data_dir, &["crash", "analyze", "not-a-file.txt"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No installed plugin can read crash files yet."),
+        "{stderr}"
+    );
 }
 
 #[test]

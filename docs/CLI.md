@@ -793,9 +793,14 @@ agora crash list <INSTANCE>
 agora crash inspect <INSTANCE> <FILE>
 agora crash investigate <INSTANCE>
 agora crash investigate <INSTANCE> --file extra-log.txt
+agora crash analyze <FILE>... [--plugin-dir <FOLDER>]... [--game-version <V>] [--allow-code] [--json]
 ```
 
 `--file` may be repeated. Review logs for local paths, usernames, server addresses, tokens, or private chat before sharing output.
+
+`crash analyze` reads crash files that came from somewhere else, such as a friend's log or one attached to a forum post. It needs no instance and no launch record. The files are matched to parsers by their content using the crash packs of installed, enabled plugins; `--plugin-dir` adds a development folder, read the way `plugin validate` reads one. A script parser in a development folder runs code, so it is refused unless `--allow-code` is given; a script parser in an installed plugin runs only if the user already allowed that plugin's code. With no instance, a name in the log is reported as itself (`ExampleMod.dll`) unless a pack's `roles` mark it as the system, the game, or a framework. A parser that fails is shown under `Could not check` and names its plugin; it is never reported as "nothing found".
+
+The text output is the headline, `How sure:`, then `Suspects:`, `Findings:`, `Could not check:` and `Files:` (each file is `read by <plugin>` or `not recognised by any installed crash pack`). Empty sections are omitted. `--json` prints exactly `{ "answer": <CrashAnswer>, "files": [<per-file report>] }`. The command exits 0 when at least one file was read, and non-zero otherwise; when no installed plugin contributes a crash pack it says so and exits non-zero.
 
 ### Guide for AI agents
 

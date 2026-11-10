@@ -85,6 +85,12 @@ impl std::fmt::Display for PackProblem {
 #[serde(rename_all = "camelCase")]
 pub struct LoadedCrashPack {
     pub plugin_id: String,
+    /// The plugin's display name, so an answer can name it to a person. Defaults to the id for a
+    /// report written before this field existed.
+    #[serde(default)]
+    pub plugin_name: String,
+    #[serde(default)]
+    pub plugin_version: String,
     pub file: String,
     pub pack: CrashPack,
 }
@@ -261,6 +267,8 @@ pub fn load_plugin_packs(
                 if config_problems.is_empty() {
                     report.packs.push(LoadedCrashPack {
                         plugin_id: plugin_id.to_string(),
+                        plugin_name: manifest.name.clone(),
+                        plugin_version: manifest.version.to_string(),
                         file: relative,
                         pack,
                     });

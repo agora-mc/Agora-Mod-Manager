@@ -15,6 +15,8 @@ pub enum MatchedBy {
     WorkingDir,
     /// The log's time falls inside the session. Likely, not certain.
     Time,
+    /// The user handed Agora the file itself, with no instance or launch record to tie it to.
+    Supplied,
 }
 
 /// What Agora saw of the game's end.

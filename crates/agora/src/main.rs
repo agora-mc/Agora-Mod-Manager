@@ -1,5 +1,6 @@
 #![warn(clippy::large_futures)]
 mod cli_bisect;
+mod cli_crash;
 mod cli_packs;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -1790,6 +1791,21 @@ enum CrashCmd {
         /// Add an explicit diagnostic text file. May be repeated.
         #[arg(long = "file")]
         files: Vec<PathBuf>,
+    },
+    /// Diagnose crash files that came from somewhere else: no instance, no launch record.
+    Analyze {
+        /// The crash file to read. May be repeated.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// A plugin development folder to read crash packs from. May be repeated.
+        #[arg(long = "plugin-dir")]
+        plugin_dirs: Vec<PathBuf>,
+        /// The game version the crash came from, when you know it.
+        #[arg(long = "game-version")]
+        game_version: Option<String>,
+        /// Run a script parser from a --plugin-dir folder. Without it, such a folder is refused.
+        #[arg(long = "allow-code")]
+        allow_code: bool,
     },
 }
 
@@ -4720,6 +4736,24 @@ async fn run_crash_command(
             } else {
                 println!("{}", content);
             }
+        }
+        CrashCmd::Analyze {
+            files,
+            plugin_dirs,
+            game_version,
+            allow_code,
+        } => {
+            cli_crash::run(
+                ctx,
+                cli_crash::AnalyzeArgs {
+                    files,
+                    plugin_dirs,
+                    game_version,
+                    allow_code,
+                    json,
+                },
+            )
+            .await?;
         }
         CrashCmd::Investigate { instance, files } => {
             let investigation =
@@ -13134,6 +13168,40 @@ mod tests {
                 action: super::CrashCmd::Investigate { .. }
             }
         ));
+    }
+
+    #[test]
+    fn crash_analyze_parses_files_and_flags() {
+        let cli = Cli::try_parse_from([
+            "agora",
+            "crash",
+            "analyze",
+            "friend-crash.txt",
+            "forum-log.txt",
+            "--plugin-dir",
+            "./crash-rules",
+            "--game-version",
+            "1.2.3",
+            "--allow-code",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Commands::Crash {
+                action:
+                    super::CrashCmd::Analyze {
+                        files,
+                        plugin_dirs,
+                        game_version,
+                        allow_code,
+                    },
+            } => {
+                assert_eq!(files.len(), 2);
+                assert_eq!(plugin_dirs.len(), 1);
+                assert_eq!(game_version.as_deref(), Some("1.2.3"));
+                assert!(allow_code);
+            }
+            _ => panic!("expected crash analyze"),
+        }
     }
 
     #[test]

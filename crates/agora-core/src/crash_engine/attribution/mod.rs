@@ -15,5 +15,5 @@ mod tests;
 
 pub use index::ArchiveIndex;
 pub use instance::{from_instance, InstanceViewError};
-pub use resolve::{Attribution, Resolver};
+pub use resolve::{Attribution, LooseResolver, Resolver};
 pub use view::{InstanceView, LayerOwner, LayerView, Listing};

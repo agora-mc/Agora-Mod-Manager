@@ -7,6 +7,7 @@
 //! [`evidence`] is the file-facing stage beside it: it collects what a session wrote, copies it
 //! into Agora's store, sweeps for changes and applies retention.
 
+mod analyze;
 mod answer;
 pub mod attribution;
 mod consensus;
@@ -17,6 +18,7 @@ mod types;
 
 pub mod evidence;
 
+pub use analyze::*;
 pub use answer::*;
 pub use consensus::*;
 pub use evaluate::*;
@@ -57,7 +59,7 @@ pub(crate) fn source_key(source: &SourceAttribution) -> String {
 }
 
 /// The words for an owner in a sentence. Never a certainty claim.
-pub(crate) fn owner_name(owner: &Owner) -> String {
+pub fn owner_name(owner: &Owner) -> String {
     match owner {
         Owner::Item { name, .. } => name.clone(),
         Owner::Base => "the game".to_string(),
