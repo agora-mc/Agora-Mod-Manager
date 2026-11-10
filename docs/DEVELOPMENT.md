@@ -282,18 +282,42 @@ refuses that file unless `--i-am-done-writing-rules` is given.
 python scripts/crash_benchmark.py freeze --labels labels.jsonl --manifest manifest.jsonl --out ../crash-key --salt "$SALT"
 python scripts/crash_benchmark.py score --key ../crash-key/dev-key.jsonl --predictions predictions.jsonl --tool crash-doctor
 python scripts/crash_benchmark.py compare --key ../crash-key/dev-key.jsonl tool-a=a.jsonl tool-b=b.jsonl
+python scripts/crash_benchmark.py predict --manifest manifest.jsonl --corpus-root ../crash-logs --ids ../crash-key/dev-key.jsonl --out predictions.jsonl --agora "target/debug/agora.exe"
 ```
 
 `freeze` keeps gold rows with a culprit and no template risk, splits them into `dev-key.jsonl`
 and `test-key.jsonl` by manifest hash (so a log posted twice stays on one side), and writes
-`freeze.json` with the counts and the test key's SHA-256. `score` reports top-1, top-3, abstained,
-wrong and missing rows overall and by game, log type, difficulty and whether the culprit is in the
-log. `compare` adds an `abstain-always` baseline so a tool that answers badly can rank below
-silence. Pass `--expect-sha256` to refuse a changed key, `--json` for machine output, or `--detail`
-for per-row results.
+`freeze.json` with the counts and the test key's SHA-256. A label row may carry `accept`, a list
+of other spellings of the same culprit; `freeze` copies it into the key, and an `accept` that is
+not a list of non-empty strings is an error naming the row.
 
-The Phostwood and engine adapters that produce prediction files come later; for now tools emit the
-JSONL format themselves.
+Every hit rate is shown twice. **Strict** is an exact normalised match against the culprit or one
+of its `accept` entries, and keeps the original field names (`top1_hits`, `top3_hits`). **Loose**
+splits the culprit and each accepted spelling at ` and `, ` with `, `&`, `,`, `/`, `(`, `)` and
+`;`, normalises each word, drops words under four characters, and counts a prediction that equals
+or contains a word (`loose_top1_hits`, `loose_top3_hits`). Because answers are people's words while
+tools predict file names, loose is usually the fairer reading, but it can over-credit: a short
+answer word inside a longer unrelated name still counts. Treat it as a measuring aid, not a
+verdict; strict stays the rule for a claim. `score` reports top-1, top-3, both matching modes,
+abstained, wrong, missing and error rows overall and by game, log type, difficulty and whether the
+culprit is in the log. An error row is a tool that failed, not one that abstained. `compare` adds
+an `abstain-always` baseline so a tool that answers badly can rank below silence. Pass
+`--expect-sha256` to refuse a changed key, `--json` for machine output, or `--detail` for per-row
+results including which rule matched.
+
+`predict` runs a tool over the corpus and writes the predictions file. It finds each id's `file`
+in the manifest under `--corpus-root` and runs `<agora> crash analyze <file> --json` with any
+`--plugin-dir` and `--allow-code` options. Arguments are passed as a list, never through a shell,
+so a path with spaces or quotes is safe. The first named owner of each candidate becomes a suspect
+in order; candidates whose owner has no name (the system, an unknown) are skipped and counted. Per
+row it also records `files[0].read_by`, so a summary can say how many logs no parser recognised.
+A non-zero exit with parsable JSON is an abstention, keeping the file report's reason; a timeout, a
+non-zero exit with no JSON, or unparsable JSON is an `error` row, never an abstention. `--jobs`
+runs several analyses at once and rows stay in id order; `--timeout` caps each log (120 s by
+default). `--out` inside a git work tree is refused, and the file is written atomically.
+
+The Phostwood adapter that produces prediction files comes later; for now tools emit the JSONL
+format themselves or go through `predict`.
 
 ## Pull-request evidence
 

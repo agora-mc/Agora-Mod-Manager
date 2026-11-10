@@ -452,7 +452,7 @@ fn a_pack_role_still_applies_without_an_instance() {
     assert_eq!(
         resolved.owner,
         Owner::Framework {
-            name: "acmeengine.dll".into()
+            name: "AcmeEngine.dll".into()
         }
     );
     assert_eq!(resolved.role, Some(agora_game_api::crash::Role::Framework));

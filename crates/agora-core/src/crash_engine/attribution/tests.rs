@@ -8,6 +8,7 @@ use agora_game_api::crash::{
 
 use super::index::ArchiveIndex;
 use super::*;
+use crate::crash_engine::types::RefResolver;
 
 fn owner(key: &str) -> Owner {
     Owner::Item {
@@ -558,6 +559,43 @@ fn the_worked_skyrim_example_resolves_as_expected() {
     assert_eq!(mesh.owner, owner("example-hair"));
     assert_eq!(mesh.role, None);
     assert_eq!(mesh.via.as_deref(), Some("Data/meshes/example/hair.nif"));
+}
+
+#[test]
+fn a_framework_owner_is_named_by_the_ref_not_the_role_pattern() {
+    // A prefix role is the closest a role rule gets to a wildcard: `com.example`
+    // stands for everything beneath it, so showing the pattern would hide which
+    // class actually matched.
+    let rule = role_rule(
+        "class",
+        "com.example",
+        NameMatch::PrefixDot,
+        Role::Framework,
+    );
+    let reference = reference("class", "com.example.widgets.Widget");
+
+    let instance = resolver(
+        InstanceView::new(Vec::new()),
+        vec![path_map("class", &["{value}"], NameMatch::Exact, false)],
+        vec![rule.clone()],
+    )
+    .attribute(&reference);
+    assert_eq!(
+        instance.owner,
+        Owner::Framework {
+            name: "com.example.widgets.Widget".to_string()
+        }
+    );
+    assert_eq!(instance.role, Some(Role::Framework));
+
+    let loose = LooseResolver::new(vec![rule]).resolve(&reference);
+    assert_eq!(
+        loose.owner,
+        Owner::Framework {
+            name: "com.example.widgets.Widget".to_string()
+        }
+    );
+    assert_eq!(loose.role, Some(Role::Framework));
 }
 
 #[test]

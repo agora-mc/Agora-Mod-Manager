@@ -3642,6 +3642,377 @@ class TestCrashBenchmark(unittest.TestCase):
         self.assertEqual(results[1]["tool"], "bad-tool")
         self.assertEqual(results[1]["overall"]["top1_hits"], 0)
 
+    def test_person_words_hit_loosely_and_miss_strictly(self):
+        cases = [
+            ("SMIM (Static Mesh Improvement Mod)", "SMIM-SE-Merged-All.esp"),
+            ("SkyClimb and po3_PapyrusExtender", "SkyClimb.dll"),
+            ("QuickLootRE", "QuickLootRE SE.esp"),
+        ]
+        for index, (culprit, prediction) in enumerate(cases):
+            key = self._write_jsonl(
+                f"loose-key-{index}.jsonl",
+                [self._key_row("a", culprit=culprit)],
+            )
+            predictions = self._write_jsonl(
+                f"loose-pred-{index}.jsonl", [self._prediction("a", prediction)]
+            )
+            overall = cb.score(key, predictions)["overall"]
+            self.assertEqual(overall["top1_hits"], 0, culprit)
+            self.assertEqual(overall["loose_top1_hits"], 1, culprit)
+            self.assertEqual(overall["loose_top3_hits"], 1, culprit)
+
+    def test_a_short_answer_inside_a_longer_unrelated_name_misses_both_ways(self):
+        key = self._write_jsonl(
+            "skyrim-key.jsonl",
+            [self._key_row("a", culprit="Skyrim Immersive Creatures")],
+        )
+        predictions = self._write_jsonl(
+            "skyrim-pred.jsonl", [self._prediction("a", "Skyrim.esm")]
+        )
+
+        overall = cb.score(key, predictions)["overall"]
+
+        self.assertEqual(overall["top1_hits"], 0)
+        self.assertEqual(overall["loose_top1_hits"], 0)
+        self.assertEqual(overall["loose_top3_hits"], 0)
+
+    def test_a_segment_under_four_characters_never_matches(self):
+        key = self._write_jsonl(
+            "short-key.jsonl", [self._key_row("a", culprit="Foo & Bar")]
+        )
+        predictions = self._write_jsonl(
+            "short-pred.jsonl", [self._prediction("a", "Foo.dll")]
+        )
+
+        overall = cb.score(key, predictions)["overall"]
+
+        self.assertEqual(overall["loose_top1_hits"], 0)
+
+    def test_an_accept_entry_makes_a_strict_hit_and_freeze_copies_it(self):
+        labels = [
+            self._gold(
+                "a", culprit="Cool Mod (the loud one)", accept=["coolmod"]
+            )
+        ]
+        _, out = self._freeze(
+            labels,
+            [self._manifest_row("a")],
+            out_name="accept",
+            test_fraction=1.0,
+        )
+        key_path = out / "test-key.jsonl"
+        key_row = json.loads(
+            key_path.read_text(encoding="utf-8").splitlines()[0]
+        )
+        self.assertEqual(key_row["accept"], ["coolmod"])
+
+        predictions = self._write_jsonl(
+            "accept-pred.jsonl", [self._prediction("a", "cool-mod")]
+        )
+        overall = cb.score(key_path, predictions)["overall"]
+        self.assertEqual(overall["top1_hits"], 1)
+
+    def test_an_invalid_accept_is_an_error_at_freeze_naming_the_row(self):
+        for bad in ("coolmod", [""], ["ok", 3], [None], []):
+            with self.subTest(accept=bad):
+                labels = [self._gold("bad-row", accept=bad)]
+                if bad == []:
+                    _, out = self._freeze(
+                        labels,
+                        [self._manifest_row("bad-row")],
+                        out_name="empty-accept",
+                        test_fraction=1.0,
+                    )
+                    row = json.loads(
+                        (out / "test-key.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()[0]
+                    )
+                    self.assertEqual(row["accept"], [])
+                    continue
+                with self.assertRaises(cb.BenchmarkError) as raised:
+                    self._freeze(labels, [self._manifest_row("bad-row")])
+                self.assertIn("bad-row", str(raised.exception))
+
+    def test_error_predictions_are_counted_separately(self):
+        key = self._write_jsonl(
+            "error-key.jsonl", [self._key_row("a"), self._key_row("b")]
+        )
+        predictions = self._write_jsonl(
+            "error-pred.jsonl",
+            [
+                self._prediction("a", "Wrong"),
+                {"id": "b", "error": "timed out after 1 s"},
+            ],
+        )
+
+        result = cb.score(key, predictions)
+        overall = result["overall"]
+        self.assertEqual(overall["rows"], 2)
+        self.assertEqual(overall["errors"], 1)
+        self.assertEqual(overall["abstained"], 0)
+        self.assertEqual(overall["missing"], 0)
+
+        compared = cb.compare(key, [("tool", predictions)])
+        self.assertEqual(compared[1]["overall"]["errors"], 1)
+
+    def test_detail_shows_whether_strict_or_loose_matched(self):
+        key = self._write_jsonl(
+            "detail-key.jsonl",
+            [self._key_row("a", culprit="SMIM (Static Mesh Improvement Mod)")],
+        )
+        predictions = self._write_jsonl(
+            "detail-pred.jsonl", [self._prediction("a", "SMIM-SE-Merged-All.esp")]
+        )
+
+        result = cb.score(key, predictions, detail=True)
+        row = result["rows"][0]
+
+        self.assertEqual(row["outcome"], "wrong")
+        self.assertEqual(row["matched_by"], "loose")
+        self.assertFalse(row["strict_top1_hit"])
+        self.assertTrue(row["loose_top1_hit"])
+        self.assertTrue(row["loose_top3_hit"])
+
+    def _analyzer(self, body: str) -> Path:
+        script = self.tmp / "fake_analyzer.py"
+        script.write_text(body, encoding="utf-8")
+        return script
+
+    def _predict(
+        self,
+        ids: list[str],
+        script: Path,
+        *,
+        corpus_name: str,
+        manifest_rows: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], Path]:
+        corpus = self.tmp / f"corpus-{corpus_name}"
+        corpus.mkdir(parents=True)
+        rows = manifest_rows or [
+            self._manifest_row(row_id) for row_id in ids
+        ]
+        for row in rows:
+            target = corpus / row["file"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("synthetic log\n", encoding="utf-8")
+        manifest = self._write_jsonl(
+            f"manifest-{corpus_name}.jsonl", rows
+        )
+        ids_path = self._write_jsonl(
+            f"ids-{corpus_name}.jsonl", [{"id": row_id} for row_id in ids]
+        )
+        out = self.tmp / f"predictions-{corpus_name}.jsonl"
+        summary = cb.predict(
+            manifest,
+            corpus,
+            ids_path,
+            out,
+            f'"{sys.executable}" "{script}"',
+            **kwargs,
+        )
+        return summary, out
+
+    @staticmethod
+    def _rows(path: Path) -> list[dict[str, Any]]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def test_predict_reads_candidates_and_skips_unnamed_owners(self):
+        script = self._analyzer(
+            "import json\n"
+            "print(json.dumps({'answer': {'candidates': ["
+            "{'owner': {'kind': 'item', 'key': 'a', 'name': 'SkyClimb.dll'}}, "
+            "{'owner': {'kind': 'system'}}, "
+            "{'owner': {'kind': 'framework', 'name': 'FancyHooks'}}]}, "
+            "'files': [{'name': 'a.log', 'read_by': "
+            "{'plugin_id': 'p', 'plugin_name': 'P', 'parser_id': 'r'}}]}))\n"
+        )
+
+        summary, out = self._predict(["a"], script, corpus_name="read")
+        row = self._rows(out)[0]
+
+        self.assertEqual(
+            [suspect["name"] for suspect in row["suspects"]],
+            ["SkyClimb.dll", "FancyHooks"],
+        )
+        self.assertFalse(row["abstained"])
+        self.assertEqual(row["read_by"]["parser_id"], "r")
+        self.assertEqual(row["skipped_unnamed"], 1)
+        self.assertEqual(summary["skipped_unnamed"], 1)
+        self.assertEqual(summary["no_parser"], 0)
+
+    def test_predict_keeps_id_order_whatever_the_job_count(self):
+        script = self._analyzer(
+            "import json, os, sys\n"
+            "print(json.dumps({'answer': {'candidates': [{'owner': "
+            "{'kind': 'item', 'key': 'k', "
+            "'name': os.path.basename(sys.argv[3])}}]}, 'files': []}))\n"
+        )
+
+        summary, out = self._predict(
+            ["c", "a", "b"], script, corpus_name="order", jobs=3
+        )
+        rows = self._rows(out)
+
+        self.assertEqual([row["id"] for row in rows], ["c", "a", "b"])
+        self.assertEqual(
+            [row["suspects"][0]["name"] for row in rows],
+            ["c.log", "a.log", "b.log"],
+        )
+        self.assertEqual(summary["errors"], 0)
+
+    def test_predict_passes_a_path_with_spaces_as_one_argument(self):
+        script = self._analyzer(
+            "import json, os, sys\n"
+            "path = sys.argv[3]\n"
+            "if not os.path.isfile(path):\n"
+            "    sys.exit(9)\n"
+            "print(json.dumps({'answer': {'candidates': [{'owner': "
+            "{'kind': 'item', 'key': 'k', 'name': os.path.basename(path)}}]}, "
+            "'files': []}))\n"
+        )
+        manifest_rows = [
+            {
+                "id": "spaced",
+                "game": "minecraft",
+                "log_type": "crash",
+                "file": "logs/a log with spaces.log",
+                "sha256": "sha-spaced",
+            }
+        ]
+
+        summary, out = self._predict(
+            ["spaced"],
+            script,
+            corpus_name="spaces",
+            manifest_rows=manifest_rows,
+        )
+        row = self._rows(out)[0]
+
+        self.assertNotIn("error", row)
+        self.assertEqual(row["suspects"][0]["name"], "a log with spaces.log")
+        self.assertEqual(summary["errors"], 0)
+
+    def test_predict_passes_plugin_options(self):
+        script = self._analyzer(
+            "import json, sys\n"
+            "if '--allow-code' not in sys.argv or '--plugin-dir' not in sys.argv:\n"
+            "    sys.exit(7)\n"
+            "print(json.dumps({'answer': {'candidates': []}, 'files': []}))\n"
+        )
+
+        summary, out = self._predict(
+            ["a"],
+            script,
+            corpus_name="plugins",
+            plugin_dirs=[self.tmp / "plugins"],
+            allow_code=True,
+        )
+
+        self.assertTrue(self._rows(out)[0]["abstained"])
+        self.assertEqual(summary["errors"], 0)
+
+    def test_predict_keeps_a_nonzero_run_with_json_as_an_abstention(self):
+        script = self._analyzer(
+            "import json, sys\n"
+            "print(json.dumps({'answer': {'candidates': []}, 'files': ["
+            "{'name': 'a.log', 'reason': "
+            "'the file is empty; there is nothing to read'}]}))\n"
+            "sys.exit(1)\n"
+        )
+
+        summary, out = self._predict(["a"], script, corpus_name="nonzero-json")
+        row = self._rows(out)[0]
+
+        self.assertTrue(row["abstained"])
+        self.assertNotIn("error", row)
+        self.assertIn("nothing to read", row["reason"])
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(summary["abstained"], 1)
+
+    def test_predict_makes_a_nonzero_run_without_json_an_error(self):
+        script = self._analyzer(
+            "import sys\nprint('the analyzer fell over', file=sys.stderr)\nsys.exit(2)\n"
+        )
+
+        summary, out = self._predict(["a"], script, corpus_name="nonzero")
+        row = self._rows(out)[0]
+
+        self.assertIn("exit", row["error"])
+        self.assertIn("fell over", row["error"])
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["abstained"], 0)
+
+    def test_predict_makes_garbage_output_an_error(self):
+        script = self._analyzer("print('not json')\n")
+
+        summary, out = self._predict(["a"], script, corpus_name="garbage")
+        row = self._rows(out)[0]
+
+        self.assertIn("JSON", row["error"])
+        self.assertEqual(summary["errors"], 1)
+
+    def test_predict_makes_a_timeout_an_error_not_an_abstention(self):
+        script = self._analyzer("import time\ntime.sleep(10)\n")
+
+        summary, out = self._predict(
+            ["a"], script, corpus_name="timeout", timeout=0.2
+        )
+        row = self._rows(out)[0]
+
+        self.assertIn("timed out", row["error"])
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["abstained"], 0)
+
+    def test_predict_refuses_an_out_inside_a_git_tree(self):
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        corpus = self.tmp / "corpus-git"
+        corpus.mkdir()
+        (corpus / "a.log").write_text("synthetic log\n", encoding="utf-8")
+        manifest = self._write_jsonl(
+            "manifest-git.jsonl", [self._manifest_row("a")]
+        )
+        ids = self._write_jsonl("ids-git.jsonl", [{"id": "a"}])
+        script = self._analyzer("print('{}')\n")
+
+        with self.assertRaises(cb.BenchmarkError) as raised:
+            cb.predict(
+                manifest,
+                corpus,
+                ids,
+                repo / "predictions.jsonl",
+                f'"{sys.executable}" "{script}"',
+            )
+
+        self.assertIn("git", str(raised.exception).lower())
+        self.assertFalse((repo / "predictions.jsonl").exists())
+
+    def test_predict_refuses_an_id_that_is_not_in_the_manifest(self):
+        corpus = self.tmp / "corpus-missing"
+        corpus.mkdir()
+        manifest = self._write_jsonl(
+            "manifest-missing.jsonl", [self._manifest_row("a")]
+        )
+        ids = self._write_jsonl("ids-missing.jsonl", [{"id": "ghost"}])
+        script = self._analyzer("print('{}')\n")
+
+        with self.assertRaises(cb.BenchmarkError) as raised:
+            cb.predict(
+                manifest,
+                corpus,
+                ids,
+                self.tmp / "missing-predictions.jsonl",
+                f'"{sys.executable}" "{script}"',
+            )
+
+        self.assertIn("ghost", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
