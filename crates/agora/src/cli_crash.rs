@@ -35,6 +35,13 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         eprintln!("Warning: {problem}");
     }
     let mut packs: Vec<LoadedCrashPack> = installed.packs;
+    // The packs compiled into Agora load through the same linter as a plugin's.
+    let built_in = agora_game_minecraft::crash::built_in_packs();
+    let built_in_report = agora_core::crash_packs::load_built_in_packs(&built_in);
+    for problem in &built_in_report.problems {
+        eprintln!("Warning: {problem}");
+    }
+    packs.extend(built_in_report.packs);
     let installed_script = installed_script_plugins(&packs);
     for id in installed_script {
         if let Ok(plugin_id) = PluginId::parse(&id) {
@@ -79,6 +86,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         files: &crash_files,
         runtime_version: args.game_version.as_deref(),
         host: host.as_ref(),
+        built_in: &built_in,
     })?;
 
     if args.json {

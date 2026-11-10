@@ -15,12 +15,12 @@ use super::{
     Inspection, InspectionRequest, Inspector, ParsedArtifact, PluginIdentity,
 };
 use crate::crash_packs::{
-    artifact_handle, parse_artifact, parser_request, LoadedCrashPack, MemoryArtifact,
-    ParserFailureKind,
+    artifact_handle, parse_artifact_with_builtin, parser_request, LoadedCrashPack, MemoryArtifact,
+    ParserFailureKind, BUILT_IN_PLUGIN_ID,
 };
 use crate::error::{LauncherError, LauncherResult};
 use agora_game_api::crash::{
-    Artifact, CouldNotCheck, CouldNotCheckReason, CrashAnswer, GameHandle, MatchedBy, ParserLimits,
+    Artifact, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, GameHandle, MatchedBy, ParserLimits,
     Privacy, Retained, SessionVerdict, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
@@ -50,6 +50,9 @@ pub struct AnalyzeInput<'a> {
     pub runtime_version: Option<&'a str>,
     /// The script host a script parser runs in. Generic parsers never use it.
     pub host: &'a dyn ScriptHost,
+    /// The packs compiled into Agora, for the parsers their JSON names. Each must also be in
+    /// `packs`, loaded by `load_built_in_packs`.
+    pub built_in: &'a [BuiltInPack],
 }
 
 /// The pack and parser that read one file.
@@ -169,7 +172,15 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         );
 
         for pack in &packs {
-            let outcome = parse_artifact(
+            let built_in = if pack.plugin_id == BUILT_IN_PLUGIN_ID {
+                input
+                    .built_in
+                    .iter()
+                    .find(|built_in| built_in.file == pack.file)
+            } else {
+                None
+            };
+            let outcome = parse_artifact_with_builtin(
                 input.host,
                 &pack.plugin_id,
                 &pack.pack,
@@ -177,6 +188,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
                 reads.clone(),
                 None,
                 head,
+                built_in,
             );
             for attempt in &outcome.attempts {
                 match &attempt.outcome {

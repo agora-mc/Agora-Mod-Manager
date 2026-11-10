@@ -318,8 +318,11 @@ pub fn load_built_in_packs(packs: &[BuiltInPack]) -> CrashPackReport {
                     }
                 }
                 if problems.is_empty() {
+                    let identity = built_in_identity();
                     report.packs.push(LoadedCrashPack {
-                        plugin_id: BUILT_IN_PLUGIN_ID.to_string(),
+                        plugin_id: identity.id,
+                        plugin_name: identity.name,
+                        plugin_version: identity.version,
                         file: built_in.file.clone(),
                         pack,
                     });
