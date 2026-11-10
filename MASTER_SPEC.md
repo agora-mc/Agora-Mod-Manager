@@ -4972,7 +4972,11 @@ The importer reads a copy of Vortex's state (opening the original changes it). A
 
 *(Built: slice 1.1. Types, linter and worked examples only; no evaluator, sweep, host or UI yet. Lives in `agora_game_api::crash`, version `CRASH_CONTRACT_VERSION`, not frozen until the Creation Engine parsers exist.)*
 
-A plugin contributes **crash packs**: JSON files listed under `contributions.crashPacks`, needing the `crash:contribute` capability. Official and community packs are the same thing. A compiled game package has no separate path; its pack ships in a plugin. A game's normal exit codes stay in `session.normal_exit_codes`.
+A plugin contributes **crash packs**: JSON files listed under `contributions.crashPacks`, needing the `crash:contribute` capability. Official and community packs are the same thing. A game's normal exit codes stay in `session.normal_exit_codes`.
+
+**Built-in packs** *(built)*. A game compiled into Agora may hand over packs itself (`agora_game_api::crash::BuiltInPack`: the pack JSON plus the Rust parsers it names), so its crash analysis works with nothing installed. Minecraft's lives in `agora-game-minecraft` (owner's decision: Minecraft crash support stays inside Agora, not in a plugin). A built-in pack is the same format, goes through the same linter (`load_built_in_packs`), and its parsers sit behind the same contract as a script's, so a plugin could do the same job. Its findings name their source as Agora (`BUILT_IN_PLUGIN_ID`). A plugin's pack can write rules over a built-in parser's facts with no change to Agora. Core holds no game words for this.
+
+**Loose files** *(built)*. `agora crash analyze <file>...` runs the same pipeline over files with no instance: names in the log stand for themselves (`LooseResolver`), and anything that needs the instance comes out "could not check". `--json --facts` also prints what each parser found.
 
 | Slot | Says | What it is |
 |---|---|---|

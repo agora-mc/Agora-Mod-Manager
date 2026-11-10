@@ -1536,15 +1536,14 @@ fn crash_analyze_names_the_module_a_loose_file_names_itself() {
 }
 
 #[test]
-fn crash_analyze_says_when_no_plugin_can_read_crash_files() {
+fn crash_analyze_names_a_file_it_cannot_open() {
+    // Agora's own packs always load, so with no plugin installed the run reaches the files.
     let (_tmp, data_dir) = temp_data_dir();
     let output = run_agora(&data_dir, &["crash", "analyze", "not-a-file.txt"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("No installed plugin can read crash files yet."),
-        "{stderr}"
-    );
+    assert!(stderr.contains("Could not read not-a-file.txt"), "{stderr}");
+    assert!(!stderr.contains("No crash pack loaded"), "{stderr}");
 }
 
 #[test]

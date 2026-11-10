@@ -66,7 +66,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
     }
 
     if packs.is_empty() {
-        anyhow::bail!("No installed plugin can read crash files yet.");
+        anyhow::bail!("No crash pack loaded, so Agora cannot read crash files.");
     }
 
     let mut crash_files = Vec::with_capacity(args.files.len());
