@@ -1,14 +1,16 @@
 //! Hostile tests for attribution. Each is named for the failure it catches.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use agora_game_api::crash::{
-    CrashPack, NameMatch, Owner, Ref, RefLookup, RefMap, Role, RoleRule, Strength,
+    AttrValue, CrashPack, Fact, NameMatch, Owner, ParserOutput, Producer, Ref, RefLookup, RefMap,
+    Role, RoleRule, Scalar, Strength, CRASH_CONTRACT_VERSION,
 };
 
 use super::index::ArchiveIndex;
 use super::*;
-use crate::crash_engine::types::RefResolver;
+use crate::crash_engine::types::{ParsedArtifact, PluginIdentity, RefResolver};
 
 fn owner(key: &str) -> Owner {
     Owner::Item {
@@ -41,6 +43,7 @@ fn path_map(kind: &str, patterns: &[&str], matching: NameMatch, archives: bool) 
             archives,
         },
         matching,
+        ignore: Vec::new(),
     }
 }
 
@@ -49,7 +52,67 @@ fn index_map(kind: &str, index: &str, matching: NameMatch) -> RefMap {
         kind: kind.to_string(),
         lookup: RefLookup::Index(index.to_string()),
         matching,
+        ignore: Vec::new(),
     }
+}
+
+fn facts_map(kind: &str, fact_kind: &str, key: &str, name: &str, ignore: &[&str]) -> RefMap {
+    RefMap {
+        kind: kind.to_string(),
+        lookup: RefLookup::Facts {
+            kind: fact_kind.to_string(),
+            key: key.to_string(),
+            name: name.to_string(),
+        },
+        matching: NameMatch::Segment,
+        ignore: ignore.iter().map(|word| word.to_string()).collect(),
+    }
+}
+
+fn mod_fact(id: &str, name: &str) -> Fact {
+    let mut attrs = BTreeMap::new();
+    attrs.insert(
+        "id".to_string(),
+        AttrValue::Scalar(Scalar::Text(id.to_string())),
+    );
+    attrs.insert(
+        "name".to_string(),
+        AttrValue::Scalar(Scalar::Text(name.to_string())),
+    );
+    Fact {
+        kind: "test.mod".to_string(),
+        attrs,
+        refs: Vec::new(),
+        span: None,
+    }
+}
+
+fn parsed(facts: Vec<Fact>) -> Vec<ParsedArtifact> {
+    vec![ParsedArtifact {
+        plugin: PluginIdentity {
+            id: "test.plugin".to_string(),
+            name: "Test plugin".to_string(),
+            version: "1.0.0".to_string(),
+        },
+        parser_id: "test".to_string(),
+        artifact: "fixture.log".to_string(),
+        source: None,
+        output: ParserOutput {
+            contract: CRASH_CONTRACT_VERSION,
+            producer: Producer {
+                format: "test".to_string(),
+                version: None,
+            },
+            facts,
+            bucket: Vec::new(),
+            coverage: Vec::new(),
+            notes: Vec::new(),
+        },
+    }]
+}
+
+fn loose(maps: Vec<RefMap>, facts: &[Fact]) -> LooseResolver {
+    LooseResolver::new(Vec::new(), maps, &parsed(facts.to_vec()))
 }
 
 fn role_rule(kind: &str, value: &str, matching: NameMatch, role: Role) -> RoleRule {
@@ -588,7 +651,7 @@ fn a_framework_owner_is_named_by_the_ref_not_the_role_pattern() {
     );
     assert_eq!(instance.role, Some(Role::Framework));
 
-    let loose = LooseResolver::new(vec![rule]).resolve(&reference);
+    let loose = LooseResolver::new(vec![rule], Vec::new(), &[]).resolve(&reference);
     assert_eq!(
         loose.owner,
         Owner::Framework {
@@ -872,4 +935,188 @@ fn the_index_scales_to_a_large_instance() {
         resolving.as_secs() < 30,
         "resolving {REFS} refs took {resolving:?}"
     );
+}
+
+#[test]
+fn a_class_is_named_by_the_mod_list_in_the_same_file() {
+    let resolver = loose(
+        vec![facts_map("class", "test.mod", "id", "name", &[])],
+        &[mod_fact("shinyshaders", "Shiny Shaders")],
+    );
+    let answer = resolver.attribute(&reference(
+        "class",
+        "net.example.shinyshaders.pipeline.ShadowThing",
+    ));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "shinyshaders".into(),
+            name: "Shiny Shaders".into(),
+        }
+    );
+}
+
+#[test]
+fn the_classs_own_name_is_never_the_key() {
+    let resolver = loose(
+        vec![facts_map("class", "test.mod", "id", "name", &[])],
+        &[mod_fact("iris", "Iris")],
+    );
+    let answer = resolver.attribute(&reference("class", "a.b.Iris"));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "a.b.Iris".into(),
+            name: "a.b.Iris".into(),
+        }
+    );
+}
+
+#[test]
+fn a_key_under_three_characters_never_matches() {
+    let resolver = loose(
+        vec![facts_map("class", "test.mod", "id", "name", &[])],
+        &[mod_fact("ab", "Short Name")],
+    );
+    let answer = resolver.attribute(&reference("class", "ab.example.Thing"));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "ab.example.Thing".into(),
+            name: "ab.example.Thing".into(),
+        }
+    );
+}
+
+#[test]
+fn an_ignored_segment_never_matches() {
+    let resolver = loose(
+        vec![facts_map(
+            "class",
+            "test.mod",
+            "id",
+            "name",
+            &["client", "core"],
+        )],
+        &[mod_fact("client", "Client"), mod_fact("core", "Core")],
+    );
+    let answer = resolver.attribute(&reference("class", "net.client.core.pipeline.Thing"));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "net.client.core.pipeline.Thing".into(),
+            name: "net.client.core.pipeline.Thing".into(),
+        }
+    );
+}
+
+#[test]
+fn the_longest_matching_key_wins() {
+    let resolver = loose(
+        vec![facts_map("class", "test.mod", "id", "name", &[])],
+        &[
+            mod_fact("shiny", "Shiny"),
+            mod_fact("shinyshaders", "Shiny Shaders"),
+        ],
+    );
+    let answer = resolver.attribute(&reference("class", "net.shiny.shinyshaders.pipeline.Thing"));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "shinyshaders".into(),
+            name: "Shiny Shaders".into(),
+        }
+    );
+}
+
+#[test]
+fn a_tie_between_different_keys_is_ambiguous_and_no_match() {
+    let resolver = loose(
+        vec![facts_map("class", "test.mod", "id", "name", &[])],
+        &[mod_fact("alpha", "Alpha"), mod_fact("bravo", "Bravo")],
+    );
+    let answer = resolver.attribute(&reference("class", "alpha.bravo.pipeline.Thing"));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "alpha.bravo.pipeline.Thing".into(),
+            name: "alpha.bravo.pipeline.Thing".into(),
+        }
+    );
+    let reason = answer.reason.expect("ambiguity is reported");
+    assert!(reason.contains("ambiguous"), "{reason}");
+}
+
+#[test]
+fn dots_dollars_and_slashes_all_split_a_ref_value() {
+    let resolver = loose(
+        vec![facts_map("class", "test.mod", "id", "name", &[])],
+        &[mod_fact("shinyshaders", "Shiny Shaders")],
+    );
+    for value in [
+        "net.example.shinyshaders.pipeline.Thing",
+        "knot/net.example.shinyshaders$Thing.run",
+    ] {
+        let answer = resolver.attribute(&reference("class", value));
+        assert_eq!(
+            answer.owner,
+            Owner::Item {
+                key: "shinyshaders".into(),
+                name: "Shiny Shaders".into(),
+            },
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn a_facts_lookup_with_no_facts_of_that_kind_resolves_nothing() {
+    let resolver = loose(vec![facts_map("class", "test.mod", "id", "name", &[])], &[]);
+    let answer = resolver.attribute(&reference("class", "net.example.shinyshaders.Thing"));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "net.example.shinyshaders.Thing".into(),
+            name: "net.example.shinyshaders.Thing".into(),
+        }
+    );
+}
+
+#[test]
+fn ref_maps_for_one_kind_are_tried_in_order() {
+    let resolver = loose(
+        vec![
+            path_map("class", &["Data/{value}"], NameMatch::PrefixDot, false),
+            facts_map("class", "other.kind", "id", "name", &[]),
+            facts_map("class", "test.mod", "id", "name", &[]),
+        ],
+        &[mod_fact("shinyshaders", "Shiny Shaders")],
+    );
+    let answer = resolver.attribute(&reference(
+        "class",
+        "net.example.shinyshaders.pipeline.ShadowThing",
+    ));
+    assert_eq!(
+        answer.owner,
+        Owner::Item {
+            key: "shinyshaders".into(),
+            name: "Shiny Shaders".into(),
+        }
+    );
+}
+
+#[test]
+fn an_instance_resolver_tries_a_later_map_when_an_earlier_one_finds_nothing() {
+    let view = InstanceView::new(vec![layer("mod-a", true, item("mod-a"), &["mods/a.jar"])
+        .with_index("java_package", vec!["com.example".to_string()])]);
+    let resolver = resolver(
+        view,
+        vec![
+            path_map("class", &["Data/{value}"], NameMatch::PrefixDot, false),
+            index_map("class", "java_package", NameMatch::PrefixDot),
+        ],
+        Vec::new(),
+    );
+    let answer = resolver.attribute(&reference("class", "com.example.Widget"));
+    assert_eq!(answer.owner, owner("mod-a"));
 }

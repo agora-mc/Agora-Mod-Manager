@@ -270,7 +270,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         })
         .collect();
     let engine_facts = Vec::new();
-    let resolver = LooseResolver::from_packs(packs.iter().map(|pack| &pack.pack));
+    let resolver = LooseResolver::from_packs(packs.iter().map(|pack| &pack.pack), &parsed);
     let inspector = NoInspector;
     let evaluated = evaluate(&EvaluateInput {
         packs: &pack_inputs,

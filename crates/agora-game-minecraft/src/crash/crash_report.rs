@@ -1,7 +1,7 @@
 //! The `---- Minecraft Crash Report ----` file, whichever loader wrote it.
 
 use super::shared::{
-    absent, checked, class_from_frame, collect_lines, fact, jar_from_frame,
+    absent, checked, collect_lines, fact, frame_symbol_and_class, jar_from_frame,
     java_exception_category, looked_for, not_applicable, notes_for, number, reference,
     source_location, text,
 };
@@ -482,14 +482,13 @@ fn parse_frame(line: &str, index: u32, line_no: usize) -> Option<Fact> {
     let rest = line.trim_start().strip_prefix("at ")?;
     let invocation = rest.split_whitespace().next()?;
     let before_paren = invocation.split('(').next().unwrap_or(invocation);
-    let class = class_from_frame(before_paren)?;
-    let symbol = before_paren.rsplit('/').next().unwrap_or(before_paren);
+    let (symbol, class) = frame_symbol_and_class(before_paren);
     let (source_file, source_line) = source_location(invocation);
     let mut attrs = vec![
         ("index", number(index as f64)),
         ("kind", text("managed")),
         ("symbol_scheme", text("jvm")),
-        ("symbol", text(symbol.to_string())),
+        ("symbol", text(symbol)),
     ];
     if let Some(file) = &source_file {
         attrs.push(("source_file", text(file.clone())));
@@ -497,7 +496,10 @@ fn parse_frame(line: &str, index: u32, line_no: usize) -> Option<Fact> {
     if let Some(line) = source_line {
         attrs.push(("line", number(line)));
     }
-    let mut refs = vec![reference("class", class, Strength::Exec)];
+    let mut refs = Vec::new();
+    if let Some(class) = class {
+        refs.push(reference("class", class, Strength::Exec));
+    }
     if let Some(jar) = jar_from_frame(line) {
         refs.push(reference("file", jar, Strength::Mention));
     }

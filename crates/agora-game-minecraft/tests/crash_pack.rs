@@ -258,6 +258,93 @@ mod crash {
     }
 
     #[test]
+    fn a_frame_strips_module_loader_and_lambda_decoration() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+java.lang.IllegalStateException: decorated frames\n\
+\tat java.base/java.lang.Thread.run(Thread.java:1)\n\
+\tat app//net.example.Loader.bar(Loader.java:2)\n\
+\tat knot//net.example.Knot.qux(Knot.java:3)\n\
+\tat a.b.C$$Lambda$12/0x000001a2b3c4.run(Unknown Source)\n\
+\tat a.b.C$$Lambda$12/991528828.apply(Unknown Source)\n\
+\tat a.b.C$$Lambda/0x0000aaaa.run(Unknown Source)\n\
+\tat a.b.C$Inner.run(Inner.java:4)\n\
+\tat 991528828.apply(Unknown Source)\n\
+";
+        let output = run_ok("crash_report", report.as_bytes());
+        let classes: Vec<String> = output
+            .facts
+            .iter()
+            .filter(|fact| fact.kind == "core.frame")
+            .flat_map(|fact| fact.refs.iter())
+            .filter(|reference| reference.kind == "class")
+            .map(|reference| reference.value.clone())
+            .collect();
+        for expected in [
+            "java.lang.Thread",
+            "net.example.Loader",
+            "net.example.Knot",
+            "a.b.C",
+            "a.b.C$Inner",
+        ] {
+            assert!(classes.iter().any(|class| class == expected), "{expected}");
+        }
+        assert!(
+            classes
+                .iter()
+                .all(|class| !class.chars().all(char::is_numeric)),
+            "{classes:?}"
+        );
+        let numeric = output
+            .facts
+            .iter()
+            .find(|fact| {
+                fact.kind == "core.frame"
+                    && fact.attrs.get("symbol").and_then(|value| match value {
+                        AttrValue::Scalar(Scalar::Text(symbol)) => {
+                            Some(symbol == "991528828.apply")
+                        }
+                        _ => None,
+                    }) == Some(true)
+            })
+            .expect("the frame with no sensible class");
+        assert!(
+            numeric
+                .refs
+                .iter()
+                .all(|reference| reference.kind != "class"),
+            "{:?}",
+            numeric.refs
+        );
+    }
+
+    #[test]
+    fn a_latest_log_lambda_frame_has_no_numeric_class() {
+        let log = "[01:02:03] [main/INFO]: Loading Minecraft 1.20.1 with Fabric Loader 0.16.0\n\
+[01:02:04] [main/ERROR]: java.lang.IllegalStateException: decorated frames\n\
+\tat java.base/java.lang.Thread.run(Thread.java:1)\n\
+\tat a.b.C$$Lambda$12/991528828.apply(Unknown Source)\n";
+        let output = run_ok("latest_log", log.as_bytes());
+        let classes: Vec<&str> = output
+            .facts
+            .iter()
+            .filter(|fact| fact.kind == "core.frame")
+            .flat_map(|fact| fact.refs.iter())
+            .filter(|reference| reference.kind == "class")
+            .map(|reference| reference.value.as_str())
+            .collect();
+        assert!(classes.contains(&"java.lang.Thread"), "{classes:?}");
+        assert!(classes.contains(&"a.b.C"), "{classes:?}");
+        assert!(
+            classes
+                .iter()
+                .all(|class| !class.chars().all(char::is_numeric)),
+            "{classes:?}"
+        );
+    }
+
+    #[test]
     fn windows_and_unix_line_endings_parse_the_same() {
         let lf = fixture("crash_fabric.txt");
         let crlf = String::from_utf8(lf.clone())

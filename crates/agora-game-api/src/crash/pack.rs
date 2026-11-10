@@ -219,6 +219,10 @@ pub struct RefMap {
     pub lookup: RefLookup,
     #[serde(rename = "match")]
     pub matching: NameMatch,
+    /// Segments that never name the thing being looked up. Only `segment` matching reads it; a
+    /// list here keeps a class named `net.*` or `*.client.*` from matching a mod id by accident.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +238,15 @@ pub enum RefLookup {
     },
     /// A name the instance view has indexed for its items, such as declared mod ids.
     Index(String),
+    /// A name from a fact of the same analysis, such as the mod list in the crash report that is
+    /// being read. `kind` is the fact kind, `key` the attribute that is matched against the ref,
+    /// and `name` the attribute shown to the user (falling back to the key). This needs no
+    /// instance, so a loose file can name the mod its own report lists.
+    Facts {
+        kind: String,
+        key: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +256,10 @@ pub enum NameMatch {
     Casefold,
     /// `a.b.c` matches an entry `a.b` at a dot boundary: class names and packages.
     PrefixDot,
+    /// The ref value is split at `.`, `$` and `/`; the last part (the class's own name) is dropped
+    /// and the rest are compared with the index keys, all normalised to lower-case ASCII letters
+    /// and digits. A key under three characters never matches. A `facts` lookup uses this.
+    Segment,
 }
 
 /// Whether a path pattern uses `*` only as a whole folder segment, and never as the file name.

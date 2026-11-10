@@ -63,6 +63,15 @@
     { "kind": "mod_id", "lookup": { "index": "mod_id" }, "match": "exact" },
     { "kind": "class", "lookup": { "index": "java_package" }, "match": "prefix_dot" },
     {
+      "kind": "class",
+      "lookup": { "facts": { "kind": "minecraft.mod", "key": "id", "name": "name" } },
+      "match": "segment",
+      "ignore": [
+        "client", "server", "common", "api", "core", "mixin", "util", "lib", "impl",
+        "mod", "mods", "net", "com", "org", "io", "me", "dev"
+      ]
+    },
+    {
       "kind": "file",
       "lookup": { "path": { "patterns": ["mods/{value}", "mods/*/{value}"], "archives": true } },
       "match": "casefold"
@@ -78,7 +87,18 @@
     { "kind": "class", "value": "net.minecraftforge", "match": "prefix_dot", "role": "platform" },
     { "kind": "class", "value": "net.neoforged", "match": "prefix_dot", "role": "platform" },
     { "kind": "class", "value": "cpw.mods", "match": "prefix_dot", "role": "platform" },
-    { "kind": "class", "value": "org.spongepowered", "match": "prefix_dot", "role": "framework" }
+    { "kind": "class", "value": "com.mojang", "match": "prefix_dot", "role": "platform" },
+    { "kind": "class", "value": "org.lwjgl", "match": "prefix_dot", "role": "platform" },
+    { "kind": "class", "value": "org.spongepowered", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "com.google", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "org.apache", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "io.netty", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "it.unimi", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "org.slf4j", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "org.objectweb.asm", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "com.llamalad7", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "kotlin", "match": "prefix_dot", "role": "framework" },
+    { "kind": "class", "value": "scala", "match": "prefix_dot", "role": "framework" }
   ],
   "rules": [
     {

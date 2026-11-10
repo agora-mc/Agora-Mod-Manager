@@ -452,7 +452,8 @@ fn a_pack_role_still_applies_without_an_instance() {
         &generic_pack(roles, &fault_rule("module_faulted")),
         None,
     );
-    let resolver = agora_core::crash_engine::attribution::LooseResolver::from_packs([&pack.pack]);
+    let resolver =
+        agora_core::crash_engine::attribution::LooseResolver::from_packs([&pack.pack], &[]);
     let resolved = resolver.resolve(&agora_game_api::crash::Ref {
         kind: "module".into(),
         value: "AcmeEngine.dll".into(),

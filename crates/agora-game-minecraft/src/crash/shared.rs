@@ -212,19 +212,56 @@ pub(crate) fn source_location(invocation: &str) -> (Option<String>, Option<f64>)
     }
 }
 
-/// Strip the loader's decoration from a frame's class token. Fabric writes `knot//a.b.C`, Forge
-/// writes `TRANSFORMER/name@version/a.b.C`, and a JDK frame writes `java.base/jdk.internal...`.
-pub(crate) fn class_from_frame(qualified: &str) -> Option<String> {
-    let class_path = qualified.rsplit('/').next().unwrap_or(qualified);
-    let class = match class_path.rsplit_once('.') {
-        Some((class, _method)) => class,
-        None => return None,
-    };
-    if class.is_empty() || class == "-" {
-        None
-    } else {
-        Some(class.to_string())
+/// What a stack frame's `class.method` token names: the text to show as its symbol, and the class
+/// that owns it when one survives the decoration around it.
+///
+/// Fabric writes `knot//a.b.C.m` and a class loader writes `app//a.b.C.m`; Forge writes
+/// `TRANSFORMER/name@version/a.b.C.m`; the JDK writes `java.base/java.lang.Thread.run`. A lambda is
+/// `a.b.C$$Lambda$12/0x...run` or `a.b.C$$Lambda$12/991528828.apply`, where the part before the
+/// `$$Lambda` marker is the class that wrote it. A plain inner class stays `a.b.C$Inner`.
+pub(crate) fn frame_symbol_and_class(qualified: &str) -> (String, Option<String>) {
+    let qualified = qualified.trim();
+    if qualified.is_empty() {
+        return (String::new(), None);
     }
+    // A class loader is written with a doubled slash; anything before the last one is its prefix.
+    let base = qualified
+        .rsplit_once("//")
+        .map(|(_, rest)| rest)
+        .unwrap_or(qualified);
+    let lambda = base.find("$$Lambda");
+    let symbol = match lambda {
+        // The lambda suffix is not a module prefix, so keep the whole token for evidence.
+        Some(_) => base.to_string(),
+        // A module prefix (`java.base/...`) puts the frame after the last single slash.
+        None => base.rsplit('/').next().unwrap_or(base).to_string(),
+    };
+    let class_part = match lambda {
+        Some(at) => &base[..at],
+        None => base,
+    };
+    // A module prefix can sit before a lambda's class too.
+    let class_part = class_part.rsplit('/').next().unwrap_or(class_part);
+    let class = if lambda.is_some() {
+        (!class_part.is_empty() && class_part != "-").then(|| class_part.to_string())
+    } else {
+        match class_part.rsplit_once('.') {
+            Some((class, _method)) if !class.is_empty() && class != "-" => Some(class.to_string()),
+            _ => None,
+        }
+    };
+    // A class is never only digits or a bare hex address: those are lambda numbers and addresses,
+    // and the frame keeps its symbol without a class ref instead.
+    let class = class.filter(|class| !is_numeric_or_hex(class));
+    (symbol, class)
+}
+
+fn is_numeric_or_hex(text: &str) -> bool {
+    let hex = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    !hex.is_empty() && hex.chars().all(|character| character.is_ascii_hexdigit())
 }
 
 /// The jar or module a Forge/NeoForge frame annotation names: `~[some.jar%123!/:?]`.

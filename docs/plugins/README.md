@@ -201,6 +201,28 @@ report it.
 
 A plugin installed or enabled while Agora runs takes effect on the next start.
 
+### Crash packs
+
+A crash pack is JSON with `sources`, `parsers`, `inspectors`, `ref_maps`, `roles` and `rules`. A
+`ref_map` says how a ref kind traces to the content that provides it:
+
+| `lookup` | What it reads |
+|---|---|
+| `path` | Files in the instance view, matched by `patterns`; `archives` also searches inside listed archives |
+| `index` | A name the instance view indexed for its items, such as a declared mod id |
+| `facts` | A fact of the same analysis, such as the mod list in the crash report being read. It needs `kind`, `key` (the attribute matched against the ref) and `name` (the attribute shown, falling back to `key`) |
+
+`match` is `exact`, `casefold`, `prefix_dot` or `segment`. `segment` is valid only with a `facts`
+lookup: it splits the ref value at `.`, `$` and `/`, drops the last part (the class's own name),
+and compares the rest with the fact key after lower-casing and keeping only ASCII letters and
+digits. Keys under three characters never match. `ignore` lists segments that never match, so a
+class in a `net.example.client` package does not name a mod just because one of those words is its
+id. If two different keys match, the longer wins; two of the same length are ambiguous and resolve
+to nothing.
+
+A kind may have more than one ref map. They are tried in order, and a later one is used when an
+earlier one finds nothing. Every finding still names the plugin that made it.
+
 ### The runtime
 
 Scripts run in QuickJS through `rquickjs 0.13`, with separate bounded runtimes on host-owned worker threads. This is **not an OS process sandbox**. QuickJS supports ES modules, promises, and async functions; the host adds the `agora` module. It does not add `require`, `process`, filesystem access, DOM APIs, native modules, or global `fetch`. Bundle third-party JavaScript and mark `agora` external. Use the standalone declarations in `sdk/` for TypeScript.

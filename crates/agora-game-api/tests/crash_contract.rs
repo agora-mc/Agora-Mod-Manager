@@ -681,6 +681,34 @@ fn a_ref_map_or_role_cannot_match_everything() {
 }
 
 #[test]
+fn a_facts_lookup_and_segment_match_are_valid_only_together() {
+    let map = |lookup: &str, matching: &str| {
+        format!(
+            r#"{{ "contract": 1, "ref_maps": [{{ "kind": "class", "lookup": {lookup}, "match": "{matching}" }}] }}"#
+        )
+    };
+    let facts = r#"{ "facts": { "kind": "test.mod", "key": "id", "name": "name" } }"#;
+
+    assert!(lint_pack_json(&map(facts, "segment")).is_ok());
+    for pack in [
+        map(facts, "exact"),
+        map(r#"{ "index": "java_package" }"#, "segment"),
+        map(r#"{ "path": { "patterns": ["Data/{value}"] } }"#, "segment"),
+        map(
+            r#"{ "facts": { "kind": "", "key": "id", "name": "name" } }"#,
+            "segment",
+        ),
+        map(
+            r#"{ "facts": { "kind": "test.mod", "key": "", "name": "name" } }"#,
+            "segment",
+        ),
+    ] {
+        let problems = lint_pack_json(&pack).expect_err(&pack);
+        assert_eq!(problems[0].code, LintCode::BadRefMap, "{pack}");
+    }
+}
+
+#[test]
 fn a_path_pattern_wildcard_is_one_whole_segment() {
     let map = |pattern: &str| {
         format!(
