@@ -9,6 +9,7 @@ pub mod clone;
 mod content_bridge;
 pub mod context;
 pub mod controller_service;
+pub mod crash;
 pub mod curated_pack;
 pub mod datapack_sync;
 pub mod dependency_service;
