@@ -15,9 +15,10 @@
 
 use crate::error::LauncherResult;
 use agora_game_api::crash::{
-    lint_pack_json, validate_parser_output, ArtifactHandle, CodeEntry, CoverageState, CrashPack,
-    Detect, GameHandle, LinesReply, ParseNoteKind, ParserDecl, ParserLimits, ParserOutput,
-    ParserRequest, ReadRefusal, ReadRefused, CRASH_CONTRACT_VERSION, DETECT_HEAD_BYTES,
+    lint_pack_json, validate_parser_output, ArtifactHandle, BuiltInPack, CodeEntry, CoverageState,
+    CrashPack, Detect, GameHandle, LinesReply, ParseNoteKind, ParserDecl, ParserLimits,
+    ParserOutput, ParserReadError, ParserReads, ParserRequest, ReadRefusal, ReadRefused,
+    CRASH_CONTRACT_VERSION, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReadError, ScriptReads};
 use agora_plugin_api::manifest::{validate_package_path, PluginManifest};
@@ -77,6 +78,18 @@ impl std::fmt::Display for PackProblem {
             write!(f, " ({})", self.at)?;
         }
         write!(f, ": {} [{}]", self.message, self.code)
+    }
+}
+
+/// The source a built-in pack's findings name: Agora itself, not a plugin.
+pub const BUILT_IN_PLUGIN_ID: &str = "agora";
+
+/// Who findings from a built-in pack name, with this Agora build's version.
+pub fn built_in_identity() -> crate::crash_engine::PluginIdentity {
+    crate::crash_engine::PluginIdentity {
+        id: BUILT_IN_PLUGIN_ID.to_string(),
+        name: "Agora".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 
@@ -242,22 +255,7 @@ pub fn load_plugin_packs(
 
         match lint_pack_json(&text) {
             Ok(pack) => {
-                let mut config_problems = Vec::new();
-                for parser in &pack.parsers {
-                    if let CodeEntry::Generic { name, config } = &parser.entry {
-                        if let Err(message) =
-                            crate::crash_engine::parsers::validate_config(name, config)
-                        {
-                            config_problems.push(PackProblem::new(
-                                plugin_id,
-                                relative.clone(),
-                                format!("parser `{}`", parser.id),
-                                "parser_config",
-                                message,
-                            ));
-                        }
-                    }
-                }
+                let config_problems = parser_config_problems(plugin_id, &relative, &pack, false);
                 if config_problems.is_empty() {
                     report.packs.push(LoadedCrashPack {
                         plugin_id: plugin_id.to_string(),
@@ -283,6 +281,95 @@ pub fn load_plugin_packs(
     }
 
     report
+}
+
+/// Load the packs a compiled game package supplies. The JSON is linted by the same linter a
+/// plugin's pack goes through, and each `built_in` parser must have its code supplied beside it.
+pub fn load_built_in_packs(packs: &[BuiltInPack]) -> CrashPackReport {
+    let mut report = CrashPackReport::default();
+    for built_in in packs {
+        match lint_pack_json(&built_in.json) {
+            Ok(pack) => {
+                let mut problems =
+                    parser_config_problems(BUILT_IN_PLUGIN_ID, &built_in.file, &pack, true);
+                for parser in &pack.parsers {
+                    if let CodeEntry::BuiltIn { name } = &parser.entry {
+                        if !built_in
+                            .parsers
+                            .iter()
+                            .any(|(supplied, _)| supplied == name)
+                        {
+                            problems.push(PackProblem::new(
+                                BUILT_IN_PLUGIN_ID,
+                                built_in.file.clone(),
+                                format!("parser `{}`", parser.id),
+                                "missing_parser",
+                                format!("no built-in parser named `{name}` was supplied"),
+                            ));
+                        }
+                    }
+                }
+                if problems.is_empty() {
+                    report.packs.push(LoadedCrashPack {
+                        plugin_id: BUILT_IN_PLUGIN_ID.to_string(),
+                        file: built_in.file.clone(),
+                        pack,
+                    });
+                } else {
+                    report.problems.extend(problems);
+                }
+            }
+            Err(problems) => {
+                for problem in problems {
+                    report.problems.push(PackProblem::new(
+                        BUILT_IN_PLUGIN_ID,
+                        built_in.file.clone(),
+                        problem.at,
+                        format!("{:?}", problem.code).to_lowercase(),
+                        problem.message,
+                    ));
+                }
+            }
+        }
+    }
+    report
+}
+
+/// Check every parser entry that needs code on this side. A plugin may not name a parser compiled
+/// into Agora; only a built-in pack may, and then its code must come with it.
+fn parser_config_problems(
+    plugin_id: &str,
+    file: &str,
+    pack: &CrashPack,
+    allow_built_in: bool,
+) -> Vec<PackProblem> {
+    let mut problems = Vec::new();
+    for parser in &pack.parsers {
+        match &parser.entry {
+            CodeEntry::Generic { name, config } => {
+                if let Err(message) = crate::crash_engine::parsers::validate_config(name, config) {
+                    problems.push(PackProblem::new(
+                        plugin_id,
+                        file,
+                        format!("parser `{}`", parser.id),
+                        "parser_config",
+                        message,
+                    ));
+                }
+            }
+            CodeEntry::BuiltIn { .. } if !allow_built_in => {
+                problems.push(PackProblem::new(
+                    plugin_id,
+                    file,
+                    format!("parser `{}`", parser.id),
+                    "built_in",
+                    "a plugin's pack cannot name a parser compiled into Agora; ship a script or a generic parser",
+                ));
+            }
+            _ => {}
+        }
+    }
+    problems
 }
 
 /// Validate a development folder's packs. Used by `agora plugin validate`.
@@ -546,6 +633,42 @@ impl ScriptReads for LimitedReads {
     }
 }
 
+/// The same scoped reads a script sees, handed to a parser compiled into the binary.
+struct ReadsForBuiltIn<'a> {
+    inner: &'a dyn ScriptReads,
+}
+
+impl ParserReads for ReadsForBuiltIn<'_> {
+    fn read_bytes(
+        &self,
+        artifact: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, ParserReadError> {
+        self.inner
+            .read_bytes(artifact, offset, len)
+            .map_err(|error| ParserReadError::new(error.code, error.message))
+    }
+
+    fn read_lines(
+        &self,
+        artifact: &str,
+        from_line: u64,
+        max_lines: u32,
+    ) -> Result<LinesReply, ParserReadError> {
+        let value = self
+            .inner
+            .read_lines(artifact, from_line, max_lines)
+            .map_err(|error| ParserReadError::new(error.code, error.message))?;
+        serde_json::from_value(value).map_err(|error| {
+            ParserReadError::new(
+                "unreadable",
+                format!("the lines reply was malformed: {error}"),
+            )
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Detection
 // ---------------------------------------------------------------------------
@@ -776,6 +899,22 @@ pub fn parse_artifact(
     format: Option<&str>,
     head: &[u8],
 ) -> ArtifactParse {
+    parse_artifact_with_builtin(host, plugin_id, pack, request, reads, format, head, None)
+}
+
+/// Like [`parse_artifact`], for a pack whose parsers are compiled into the binary. `built_in` is
+/// the pack that supplied `pack`'s JSON; a plugin's pack passes `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_artifact_with_builtin(
+    host: &dyn ScriptHost,
+    plugin_id: &str,
+    pack: &CrashPack,
+    request: &ParserRequest,
+    reads: Arc<dyn ScriptReads>,
+    format: Option<&str>,
+    head: &[u8],
+    built_in: Option<&BuiltInPack>,
+) -> ArtifactParse {
     let selected: Vec<&ParserDecl> = match format {
         Some(id) => match pack.parsers.iter().find(|parser| parser.id == id) {
             Some(parser) => vec![parser],
@@ -823,7 +962,7 @@ pub fn parse_artifact(
 
     let mut attempts = Vec::new();
     for parser in selected {
-        let outcome = run_one(host, plugin_id, parser, request, reads.clone());
+        let outcome = run_one(host, plugin_id, parser, request, reads.clone(), built_in);
         attempts.push(ParserAttempt {
             parser_id: parser.id.clone(),
             outcome,
@@ -841,6 +980,7 @@ fn run_one(
     parser: &ParserDecl,
     request: &ParserRequest,
     reads: Arc<dyn ScriptReads>,
+    built_in: Option<&BuiltInPack>,
 ) -> ParserDispatch {
     // A pack may ask for less than the engine allows, never more.
     let limits = parser
@@ -946,6 +1086,47 @@ fn run_one(
                         &parser.id,
                         kind,
                         format!("generic parser `{name}`: {}", error.message),
+                    ));
+                }
+            }
+        }
+        CodeEntry::BuiltIn { name } => {
+            let found = built_in.and_then(|supplied| {
+                supplied
+                    .parsers
+                    .iter()
+                    .find(|(supplied_name, _)| supplied_name == name)
+                    .map(|(_, parser)| parser.as_ref())
+            });
+            let Some(found) = found else {
+                return ParserDispatch::Failed(ParserFailure::new(
+                    plugin_id,
+                    &parser.id,
+                    ParserFailureKind::UnsupportedEntry,
+                    format!("no built-in parser named `{name}` was supplied for this pack"),
+                ));
+            };
+            let adapter = ReadsForBuiltIn {
+                inner: reads.as_ref(),
+            };
+            match found.parse(request, &adapter) {
+                Ok(output) => match serde_json::to_value(&output) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return ParserDispatch::Failed(ParserFailure::new(
+                            plugin_id,
+                            &parser.id,
+                            ParserFailureKind::Internal,
+                            format!("could not encode the built-in parser output: {error}"),
+                        ))
+                    }
+                },
+                Err(error) => {
+                    return ParserDispatch::Failed(ParserFailure::new(
+                        plugin_id,
+                        &parser.id,
+                        ParserFailureKind::Internal,
+                        format!("built-in parser `{name}`: {}", error.message),
                     ));
                 }
             }

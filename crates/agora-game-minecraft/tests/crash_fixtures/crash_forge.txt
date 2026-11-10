@@ -1,0 +1,28 @@
+---- Minecraft Crash Report ----
+// A test crash, invented for these fixtures.
+
+Time: 2026-03-04 05:06:07
+Description: Initializing game
+
+java.lang.RuntimeException: examplemod registry failure
+	at com.example.mod.ExampleRegistry.setup(ExampleRegistry.java:17) ~[examplemod-1.2.3.jar%231!/:?] {}
+	at net.minecraftforge.registries.GameData.postRegisterEvents(GameData.java:315) ~[forge-1.20.1-47.3.0-universal.jar%23285!/:?] {}
+	at net.minecraftforge.fml.ModLoader.gatherAndInitializeMods(ModLoader.java:183) ~[fmlcore-1.20.1-47.3.0.jar%23281!/:?] {}
+
+A detailed walkthrough of the error, its code path and all known details is as follows:
+---------------------------------------------------------------------------------------
+-- System Details --
+Details:
+	Minecraft Version: 1.20.1
+	Minecraft Version ID: 1.20.1
+	Operating System: Windows 10 (amd64) version 10.0
+	Java Version: 17.0.8, Example JDK Vendor
+	Java VM Version: OpenJDK 64-Bit Server VM (mixed mode), Example JDK Vendor
+	Memory: 700000000 bytes (667 MiB) / 1300000000 bytes (1239 MiB) up to 4000000000 bytes (3814 MiB)
+	JVM Flags: 2 total; -Xss1M -Xmx3814m
+	Launched Version: forge-47.3.0
+	FML: 47.3
+	Forge: net.minecraftforge:47.3.0
+	Mod List: 
+		examplemod-1.2.3.jar                              |Example Mod                   |examplemod                    |1.2.3               |COMMON_SET|Manifest: example
+		examplelib-4.5.6.jar                              |Example Library               |examplelib                    |4.5.6               |COMMON_SET|Manifest: example

@@ -18,6 +18,7 @@
 //! with a message.
 
 mod answer;
+mod builtin;
 mod facts;
 mod lint;
 mod pack;
@@ -26,6 +27,7 @@ mod rule;
 mod session;
 
 pub use answer::*;
+pub use builtin::*;
 pub use facts::*;
 pub use lint::*;
 pub use pack::*;

@@ -165,6 +165,10 @@ pub enum CodeEntry {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         config: serde_json::Value,
     },
+    /// A parser compiled into the binary, supplied with a built-in pack. Only a game package's
+    /// built-in pack may name one; a plugin's pack is refused, because it would run code that is
+    /// not in the plugin.
+    BuiltIn { name: String },
 }
 
 /// Recognising a format from its name and first bytes. Every field given must fit.
