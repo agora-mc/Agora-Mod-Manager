@@ -499,7 +499,9 @@ function crashExceptionCategory(code) {
   if (name.includes("STACK_OVERFLOW")) return "unknown";
   if (name.includes("BREAKPOINT")) return "assert";
   if (name.includes("ASSERT")) return "assert";
-  if (name.includes("OUT_OF_MEMORY") || name.includes("MEMORY")) return "oom";
+  if (name.includes("OUT_OF_MEMORY") || name.includes("MEMORY") || name.includes("BAD_ALLOC")) {
+    return "oom";
+  }
   if (name.includes("FAST_FAIL")) return "fast_fail";
   return "unknown";
 }

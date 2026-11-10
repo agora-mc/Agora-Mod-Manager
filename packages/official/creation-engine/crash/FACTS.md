@@ -1,8 +1,8 @@
 # Creation Engine crash facts
 
-This pack turns the two Creation Engine crash logs into facts. It holds no
-rules: rule writers work from this file and the fact vocabulary in
-`crates/agora-game-api/src/crash/facts.rs`.
+This pack turns the two Creation Engine crash logs into facts, and holds the
+first rules over them (see "Rules" at the end). Rule writers work from this
+file and the fact vocabulary in `crates/agora-game-api/src/crash/facts.rs`.
 
 The parsers are `parseCrashLogger` and `parseTrainwreck` in `main.js`. They use
 only the `crash.readLines` call the contract allows, so they never see a path.
@@ -448,9 +448,13 @@ The pack marks as `system` the Windows modules and graphics drivers that must
 not be accused (`ntdll`, `KERNEL32`, `KERNELBASE`, `user32`, `win32u`, `gdi32`,
 `gdi32full`, `ucrtbase`, `msvcrt`, `advapi32`, `sechost`, `rpcrt4`, `combase`,
 `ole32`, `dxgi`, `d3d11`, `nvldumdx`, `atiumd64`, `atidxx64`, `amdxx64`,
-`amdxc64`). `SkyrimSE.exe` and `SkyrimVR.exe` are `platform`. The SKSE loader
-and the known SKSE DLL names are `framework`. `CrashLogger.dll` and
-`trainwreck.dll` are `hook_framework`.
+`amdxc64`, `nvwgf2umx`, and the C++ runtime `vcruntime140`, `vcruntime140_1`,
+`msvcp140`). `SkyrimSE.exe` and `SkyrimVR.exe` are `platform`, and so are the
+base game's plugins (`Skyrim.esm`, `Update.esm`, the three DLC masters,
+`_ResourcePack.esl`). The SKSE loader, the known SKSE DLL names and the
+Unofficial Skyrim Special Edition Patch are `framework`. `CrashLogger.dll`,
+`trainwreck.dll`, `hdtSMP64.dll`, `EngineFixes.dll` and `tbbmalloc.dll` are
+`hook_framework`: they sit on stacks they did not cause.
 
 Left out on purpose: every other module. A short, sure list is better than a
 long guess. The pack does not name versioned SKSE DLLs generically (the role
@@ -473,3 +477,31 @@ module on the stack, so it has no role.
   names the image and version. The pid is simply absent.
 - **A line longer than the 8 KiB read limit is cut.** The parser keeps what it
   read, emits `truncated`, and never throws the log away.
+
+## Rules
+
+Measured on the benchmark's dev set only (129 Skyrim logs with a confirmed
+cause); the test set is never read. One family alone tops out at `possible`
+(weight 7 or less); two independent families agreeing can reach higher.
+
+| Rule | Family | Weight | Why this weight |
+|---|---|---|---|
+| `module_near_top_of_stack` | execution | 7 | A non-system DLL in the first three probable frames was the cause about 40% of the time before the hook-framework roles, more after. |
+| `module_lower_on_stack` | execution | 3 | Below the floor on its own; only adds to other evidence. |
+| `plugin_object_in_register` | object reference | 6 | The plugin of a record in a register was the cause 48% of the time. |
+| `plugin_object_on_stack` | object reference | 3 | Stack slots hold old data; never names anyone alone. |
+| `file_in_register` | object reference | 5 | A file path in a register names a broken mesh or texture in a few cases. |
+| `out_of_memory` | finding, environment | `likely` | Only an out-of-memory exception (including `std::bad_alloc`); caps any mod at `possible`. |
+| `dll_dependency_failed_to_load` | finding, environment | `possible` | `C06D007E`: a DLL could not load a library it needs. |
+
+What the dev set taught, kept here so nobody re-learns it:
+
+- **Memory nearly full is not evidence.** The 14 dev logs with the most RAM in
+  use (92-98%) all had a mod as the confirmed cause, so there is no rule on it.
+- **The last plugin in a `Modified by` chain is weak** (right 14% of the time as
+  a top pick), so there is no rule on it yet, despite the common advice.
+- **No save signature is visible**: save-caused crashes die in the game's own
+  code, named only by Address Library ids. A save rule needs the ids of the
+  save-loading functions, not guesses.
+- About a third of version-mismatch causes appear only in the SKSE plugin list.
+  They need the DLL's own declared game versions (an inspector), not a log rule.

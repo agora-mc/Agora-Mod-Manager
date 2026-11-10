@@ -344,6 +344,345 @@
       "value": "trainwreck.dll",
       "match": "casefold",
       "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "vcruntime140.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "vcruntime140_1.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "msvcp140.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "nvwgf2umx.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "hdtSMP64.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "EngineFixes.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "tbbmalloc.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "plugin",
+      "value": "Skyrim.esm",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "plugin",
+      "value": "Update.esm",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "plugin",
+      "value": "Dawnguard.esm",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "plugin",
+      "value": "HearthFires.esm",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "plugin",
+      "value": "Dragonborn.esm",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "plugin",
+      "value": "_ResourcePack.esl",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "plugin",
+      "value": "Unofficial Skyrim Special Edition Patch.esp",
+      "match": "casefold",
+      "role": "framework"
+    }
+  ],
+  "rules": [
+    {
+      "id": "module_near_top_of_stack",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.frame",
+          "where": {
+            "kind": "probable",
+            "index": {
+              "lte": 2
+            }
+          },
+          "ref": {
+            "kind": "module",
+            "strength": "exec",
+            "bind": "m"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "execution",
+            "candidate": {
+              "owner_of": "m"
+            },
+            "weight": 7
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash happened in code from {owner:m}, near the top of the call stack."
+        },
+        "why_not_sure": {
+          "en": "Code near the top of the stack is often where a crash shows, not where it started."
+        }
+      }
+    },
+    {
+      "id": "module_lower_on_stack",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.frame",
+          "where": {
+            "kind": "probable",
+            "index": {
+              "gte": 3,
+              "lte": 9
+            }
+          },
+          "ref": {
+            "kind": "module",
+            "strength": "exec",
+            "bind": "m"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "execution",
+            "candidate": {
+              "owner_of": "m"
+            },
+            "weight": 3
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "Code from {owner:m} was on the call stack when the game crashed."
+        }
+      }
+    },
+    {
+      "id": "plugin_object_in_register",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": {
+              "regex": "^R[A-Z0-9]{1,2}$"
+            }
+          },
+          "ref": {
+            "kind": "plugin",
+            "strength": "object",
+            "bind": "p"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "object_reference",
+            "candidate": {
+              "owner_of": "p"
+            },
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game was handling a record from {owner:p} when it crashed."
+        },
+        "why_not_sure": {
+          "en": "A record in use when the game crashed may be a victim rather than the cause."
+        }
+      }
+    },
+    {
+      "id": "plugin_object_on_stack",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": {
+              "regex": "^RSP"
+            }
+          },
+          "ref": {
+            "kind": "plugin",
+            "strength": "object",
+            "bind": "p"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "object_reference",
+            "candidate": {
+              "owner_of": "p"
+            },
+            "weight": 3
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A record from {owner:p} was nearby in memory when the game crashed."
+        }
+      }
+    },
+    {
+      "id": "file_in_register",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": {
+              "regex": "^R[A-Z0-9]{1,2}$"
+            }
+          },
+          "ref": {
+            "kind": "file",
+            "strength": "object",
+            "bind": "f"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "object_reference",
+            "candidate": {
+              "owner_of": "f"
+            },
+            "weight": 5
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game was handling the file {owner:f} when it crashed."
+        },
+        "why_not_sure": {
+          "en": "A damaged file is a common cause, but this one may only have been in use."
+        }
+      }
+    },
+    {
+      "id": "out_of_memory",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "category": "oom"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "likely"
+          }
+        },
+        {
+          "trust": {
+            "cap": "possible",
+            "text": {
+              "en": "The game ran out of memory, which can make any code crash, so a mod named here may only be where it ran out."
+            }
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game ran out of memory. A larger Windows page file, or fewer high-resolution textures, often helps."
+        },
+        "why_not_sure": {
+          "en": "A mod can cause the memory use, but the log does not say which."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "dll_dependency_failed_to_load",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "class": "C06D007E"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A DLL could not load another library it needs. A missing requirement, or a mod built for a different game version, is a common reason."
+        },
+        "why_not_sure": {
+          "en": "The log does not say which library was missing."
+        }
+      },
+      "next_step": "confirm_experiment"
     }
   ]
 }
