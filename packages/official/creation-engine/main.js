@@ -11,6 +11,7 @@
 // Source for the flags and extensions: https://github.com/Ortham/esplugin (GameId handling).
 
 import { crash, game, net, storage, wasm } from "agora";
+import { SE_NAMES as ADDRLIB_SE_NAMES, AE_NAMES as ADDRLIB_AE_NAMES } from "./crash/addrlib-names.js";
 
 const MASTER_FLAG = 0x1;
 const LIGHT_FLAG = 0x200;
@@ -1167,6 +1168,17 @@ function crashSymbolScheme(game) {
   return crashGameVersionAtLeast(game.version, 1, 6, 0) ? "addrlib-ae" : "addrlib-se";
 }
 
+/// The CommonLibSSE-NG function name for an Address Library id, when the
+/// table has one. `crash/addrlib-names.js` is generated from that source by
+/// `scripts/gen_addrlib_names.py`; a missing id is left unnamed.
+function crashAddrlibName(scheme, symbol) {
+  const key = crashText(symbol);
+  if (!key) return undefined;
+  if (scheme === "addrlib-ae") return ADDRLIB_AE_NAMES[key];
+  if (scheme === "addrlib-se") return ADDRLIB_SE_NAMES[key];
+  return undefined;
+}
+
 function crashCallStackSection(sections) {
   for (const name of [
     "PROBABLE CALL STACK",
@@ -1263,15 +1275,58 @@ function crashParseCallStack(state, limits, sections, lines, game, logType) {
       refs: crashRefList(refs, limits, state),
       span: crashSpan("PROBABLE CALL STACK", index, index),
     });
-    if (functionName) {
+    let frameName = functionName;
+    let nameSource = functionName ? "log" : undefined;
+    if (!frameName) {
+      const named = crashAddrlibName(attrs.symbol_scheme, attrs.symbol);
+      if (named) {
+        frameName = named;
+        nameSource = "address_library_names";
+      }
+    }
+    if (frameName) {
       crashPushFact(state, limits, {
         kind: "creation.frame_name",
-        attrs: { index: frameIndex, name: functionName },
+        attrs: { index: frameIndex, name: frameName, source: nameSource },
         span: crashSpan("PROBABLE CALL STACK", index, index),
       });
     }
   }
   return true;
+}
+
+/// Give an exception site the name of the call frame it points at. The site
+/// and the top frame report the same module offset, so the frame's name (from
+/// the log or the Address Library table) is the site's name too. A site with
+/// no matching frame stays as it was.
+function crashNameExceptionSites(state) {
+  const namesByIndex = new Map();
+  for (const fact of state.facts) {
+    if (fact.kind === "creation.frame_name") {
+      namesByIndex.set(fact.attrs.index, fact.attrs.name);
+    }
+  }
+  if (namesByIndex.size === 0) return;
+  const frames = state.facts.filter((fact) => fact.kind === "core.frame");
+  for (const site of state.facts) {
+    if (site.kind !== "creation.exception_site" || site.attrs.name) continue;
+    const module = crashText(site.attrs.module).toLowerCase();
+    const offset = crashText(site.attrs.offset).toLowerCase();
+    const address = crashText(site.attrs.address).toLowerCase();
+    for (const frame of frames) {
+      const frameModule = crashText(
+        (frame.refs.find((ref) => ref.kind === "module") || {}).value,
+      ).toLowerCase();
+      const sameModule = module && frameModule && module === frameModule;
+      const sameOffset = offset && offset === crashText(frame.attrs.rva).toLowerCase();
+      const sameAddress = address && address === crashText(frame.attrs.address).toLowerCase();
+      if ((sameModule && (sameOffset || sameAddress)) || (!module && sameAddress)) {
+        const name = namesByIndex.get(frame.attrs.index);
+        if (name) site.attrs.name = name;
+        break;
+      }
+    }
+  }
 }
 
 function crashParseModules(state, limits, sections, lines, logType) {
@@ -1557,6 +1612,7 @@ function crashParseCreationEngine(request, logType) {
   const systemSection = crashParseSystem(state, limits, sections, lines);
   const exceptionFlags = crashParseException(state, limits, sections, lines, header.game, logType);
   const callStack = crashParseCallStack(state, limits, sections, lines, header.game, logType);
+  crashNameExceptionSites(state);
   const modules = crashParseModules(state, limits, sections, lines, logType);
   const scriptExtender = crashParseScriptExtender(state, limits, sections, lines, logType);
   const loadOrder = crashParseLoadOrder(state, limits, sections, lines, logType);

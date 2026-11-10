@@ -32,6 +32,25 @@ on the name.
 Both sources have no `format`, so the content decides which parser runs. A file
 that is not one of these logs is never claimed.
 
+## Function names
+
+Crash Logger usually prints only an Address Library id (`-> 19142+0x10`), while
+other analyzers match crashes by function name. `crash/addrlib-names.json` and
+`crash/addrlib-names.js` are generated from
+[CommonLibSSE-NG](https://github.com/alandtse/CommonLibSSE-NG) at commit
+`f49373ed922fde1dfbff0208f63a49bf8846c109` (GPL-3.0 with modding exceptions; see
+its `COPYING.txt` and `EXCEPTIONS.md`). `scripts/gen_addrlib_names.py` reads the
+`RELOCATION_ID(se, ae)`, `REL::RelocationID(se, ae)`, `REL::VariantID(se, ae, vr)`
+and `REL::ID(id)` uses inside CommonLib functions and writes the two tables:
+1432 SE ids and 1290 AE ids, with 42 ids named differently by more than one
+definition (the first sorted path wins). It does not read the vtable/RTTI offset
+tables, which name data rather than functions, and it cannot resolve ids passed
+through a macro.
+
+The table is a label, not evidence: a named frame says which function the game
+was in, never which mod is at fault. An id the table does not name stays
+unnamed, and `addrlib-vr` and `addrlib-unknown` frames are never named.
+
 ## Format bands
 
 The parsers feature-detect every section; the bands are where the observed
@@ -100,6 +119,7 @@ frame so a log with no call stack still carries the site.
 | `module` | The module named after the address. |
 | `offset` | The offset inside that module. |
 | `symbol` | A Trainwreck function name after the offset. |
+| `name` | The frame's function name, when the call stack names the same module offset (the log's own name, else the Address Library table). |
 | `source_file`, `line` | A `file.cpp:NNN` the line gives. |
 | `instruction` | The disassembled instruction, when present. |
 
@@ -137,12 +157,14 @@ later probable frames, `mention` for scanned frames).
 
 ### `creation.frame_name`
 
-The function name when the log prints one beside the frame (a Crash Logger
-arrow tail or a Trainwreck symbol).
+The function name for a frame, and where it came from. The log's own name (a
+Crash Logger arrow tail or a Trainwreck symbol) is kept with `source: "log"`;
+an Address Library id the generated table names gets
+`source: "address_library_names"`. An id the table does not name emits no fact.
 
 ```json
 { "kind": "creation.frame_name",
-  "attrs": { "index": 0, "name": "ExampleNamespace::ExampleUpdate" } }
+  "attrs": { "index": 0, "name": "ExampleNamespace::ExampleUpdate", "source": "log" } }
 ```
 
 ### `core.module`

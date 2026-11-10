@@ -458,6 +458,102 @@ fn crash_logger_1_17_reads_compact_objects_and_frame_names() {
         .filter_map(|fact| text_attr(fact, "name"))
         .collect();
     assert!(names.contains(&"ExampleNamespace::ExampleUpdate".to_string()));
+    let logged = facts(output, "creation.frame_name")
+        .into_iter()
+        .find(|fact| text_attr(fact, "name").as_deref() == Some("ExampleNamespace::ExampleUpdate"))
+        .expect("the log's own name must be kept");
+    assert_eq!(text_attr(logged, "source").as_deref(), Some("log"));
+}
+
+fn named_frames(output: &ParserOutput) -> Vec<(f64, String, String)> {
+    facts(output, "creation.frame_name")
+        .into_iter()
+        .map(|fact| {
+            (
+                number_attr(fact, "index").unwrap_or(-1.0),
+                text_attr(fact, "name").unwrap_or_default(),
+                text_attr(fact, "source").unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_se_log_uses_the_se_address_library_names() {
+    let running = start();
+    let output = parse_with_format(
+        &running,
+        "crash-se.log",
+        &fixture("addrlib_se.txt"),
+        "crash_logger",
+    );
+    let output = parsed(&output);
+
+    let frames = facts(output, "core.frame");
+    assert_eq!(
+        text_attr(frames[0], "symbol_scheme").as_deref(),
+        Some("addrlib-se")
+    );
+    assert_eq!(text_attr(frames[0], "symbol").as_deref(), Some("19142"));
+
+    let names = named_frames(output);
+    assert_eq!(
+        names,
+        vec![
+            (
+                0.0,
+                "TESObjectREFR::CreateReference".to_string(),
+                "address_library_names".to_string()
+            ),
+            (
+                2.0,
+                "ExampleHelper::InventedHook".to_string(),
+                "log".to_string()
+            ),
+        ],
+        "the unnamed id must stay unnamed and the log's own name must be kept"
+    );
+
+    let site = &facts(output, "creation.exception_site")[0];
+    assert_eq!(
+        text_attr(site, "name").as_deref(),
+        Some("TESObjectREFR::CreateReference"),
+        "the exception site points at the named top frame"
+    );
+}
+
+#[test]
+fn an_ae_log_uses_the_ae_address_library_names() {
+    let running = start();
+    let output = parse_with_format(
+        &running,
+        "crash-ae.log",
+        &fixture("addrlib_ae.txt"),
+        "crash_logger",
+    );
+    let output = parsed(&output);
+
+    let frames = facts(output, "core.frame");
+    assert_eq!(
+        text_attr(frames[0], "symbol_scheme").as_deref(),
+        Some("addrlib-ae")
+    );
+    assert_eq!(text_attr(frames[0], "symbol").as_deref(), Some("19544"));
+
+    let names = named_frames(output);
+    assert_eq!(
+        names,
+        vec![(
+            0.0,
+            "TESObjectREFR::CreateReference".to_string(),
+            "address_library_names".to_string()
+        )],
+        "an SE id on an AE log must not borrow the SE name"
+    );
+    assert_eq!(
+        text_attr(facts(output, "creation.exception_site")[0], "name").as_deref(),
+        Some("TESObjectREFR::CreateReference")
+    );
 }
 
 #[test]
