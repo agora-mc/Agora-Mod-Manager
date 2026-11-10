@@ -983,6 +983,21 @@ mod tests {
         assert_eq!(error.code, "timeout", "{}", error.message);
     }
 
+    /// These tests measure time while compiling very large modules. Run side
+    /// by side on a small machine they starve each other and miss deadlines
+    /// that have nothing to do with what they check, so they take turns.
+    /// A deadline a cold compile cannot meet, but long enough for the work
+    /// before the compile (staging, reading the file) on a busy machine. A run
+    /// that times out before it starts compiling never takes a slot at all.
+    fn deadline_inside_a_compile(compile_time: Duration) -> Duration {
+        (compile_time / 8).max(Duration::from_millis(20))
+    }
+
+    fn one_timing_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A valid WASI command module with `functions` small functions, large
     /// enough that a cold compile is much slower than a short deadline.
     /// `variant` makes the bytes unique so the wasmtime compile cache cannot
@@ -1034,8 +1049,8 @@ mod tests {
     /// and the assertion is relative to that measurement.
     #[test]
     fn a_compile_that_outlasts_the_deadline_does_not_hold_the_call() {
+        let _turn = one_timing_test_at_a_time();
         const FUNCTIONS: u32 = 12_000;
-        let limit = Duration::from_millis(20);
 
         let data = tempfile::tempdir().expect("temp data root");
         let package = data.path().join("package");
@@ -1047,18 +1062,23 @@ mod tests {
         let started = std::time::Instant::now();
         Module::new(&engine(data.path()), &probe).expect("the probe module compiles");
         let compile_time = started.elapsed();
+        let limit = deadline_inside_a_compile(compile_time);
 
         let wasm = large_module(2, FUNCTIONS);
         std::fs::write(package.join("big.wasm"), &wasm).unwrap();
+        let slots = Arc::new(Semaphore::new(1));
         let started = std::time::Instant::now();
         let outcome = run_inner(
             "big.wasm",
             &package,
             data.path(),
-            r#"{"module":"big.wasm","limits":{"timeoutMs":20}}"#,
+            &format!(
+                r#"{{"module":"big.wasm","limits":{{"timeoutMs":{}}}}}"#,
+                limit.as_millis()
+            ),
             None,
             None,
-            Arc::new(Semaphore::new(1)),
+            slots.clone(),
         );
         let elapsed = started.elapsed();
 
@@ -1067,13 +1087,15 @@ mod tests {
         // If a cold compile is not clearly slower than the limit, the test
         // cannot tell an abandoned compile from a fast one.
         assert!(
-            compile_time > limit * 10,
+            compile_time > Duration::from_millis(200),
             "the probe module compiled in {compile_time:?}, too fast to test the deadline"
         );
         assert!(
             elapsed < compile_time / 2,
             "the call waited {elapsed:?} for a compile that takes {compile_time:?}"
         );
+        // Let the abandoned compile finish before the next test takes its turn.
+        wait_for_a_free_slot(&slots, compile_time * 3 + Duration::from_secs(5));
     }
 
     fn echo_package(data: &Path) -> PathBuf {
@@ -1098,7 +1120,7 @@ mod tests {
         }
     }
 
-    /// Start a run whose cold compile is far slower than its 20 ms deadline.
+    /// Start a run whose cold compile is far slower than its deadline.
     /// Returns the outcome, how long the call took, and how long a cold compile
     /// of that module takes on this machine.
     fn abandoned_compile(
@@ -1116,6 +1138,7 @@ mod tests {
         let started = Instant::now();
         Module::new(&engine(data), &probe).expect("the probe module compiles");
         let compile_time = started.elapsed();
+        let limit = deadline_inside_a_compile(compile_time);
 
         let wasm = large_module(variant + 1, FUNCTIONS);
         std::fs::write(package.join("big.wasm"), &wasm).unwrap();
@@ -1124,7 +1147,10 @@ mod tests {
             "big.wasm",
             package,
             data,
-            r#"{"module":"big.wasm","limits":{"timeoutMs":20}}"#,
+            &format!(
+                r#"{{"module":"big.wasm","limits":{{"timeoutMs":{}}}}}"#,
+                limit.as_millis()
+            ),
             None,
             None,
             slots,
@@ -1136,6 +1162,7 @@ mod tests {
     /// then says why it never started.
     #[test]
     fn a_call_with_no_free_compile_slot_times_out_at_its_deadline_and_says_why() {
+        let _turn = one_timing_test_at_a_time();
         let data = tempfile::tempdir().expect("temp data root");
         let package = echo_package(data.path());
         let slots = Arc::new(Semaphore::new(1));
@@ -1178,6 +1205,7 @@ mod tests {
 
     #[test]
     fn a_call_waits_for_a_slot_and_runs_when_one_frees_inside_its_deadline() {
+        let _turn = one_timing_test_at_a_time();
         let data = tempfile::tempdir().expect("temp data root");
         let package = echo_package(data.path());
         let slots = Arc::new(Semaphore::new(1));
@@ -1192,7 +1220,7 @@ mod tests {
             "echo.wasm",
             &package,
             data.path(),
-            r#"{"module":"echo.wasm","limits":{"timeoutMs":5000}}"#,
+            r#"{"module":"echo.wasm"}"#,
             None,
             None,
             slots,
@@ -1209,6 +1237,7 @@ mod tests {
 
     #[test]
     fn an_abandoned_compile_keeps_its_slot_until_it_finishes() {
+        let _turn = one_timing_test_at_a_time();
         let data = tempfile::tempdir().expect("temp data root");
         let package = data.path().join("package");
         std::fs::create_dir_all(&package).unwrap();
@@ -1244,6 +1273,7 @@ mod tests {
 
     #[test]
     fn a_slot_is_released_when_the_compile_finishes_even_after_the_call_gave_up() {
+        let _turn = one_timing_test_at_a_time();
         let data = tempfile::tempdir().expect("temp data root");
         let package = data.path().join("package");
         std::fs::create_dir_all(&package).unwrap();
@@ -1266,7 +1296,7 @@ mod tests {
             "echo.wasm",
             &package,
             data.path(),
-            r#"{"module":"echo.wasm","limits":{"timeoutMs":5000}}"#,
+            r#"{"module":"echo.wasm"}"#,
             None,
             None,
             slots,

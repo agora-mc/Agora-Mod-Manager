@@ -1,0 +1,10 @@
+# cargo-nextest runs every test in its own process, side by side.
+#
+# A few plugin-host tests compile very large WebAssembly modules to check what
+# a call does when a compile outlasts its deadline. Each compile uses every
+# core, so beside other tests they make unrelated time limits miss. They get
+# the whole machine while they run. (Under plain `cargo test` the same tests
+# take turns inside their own binary; see `one_timing_test_at_a_time`.)
+[[profile.default.overrides]]
+filter = 'package(agora-plugin-host) & test(/compile|slot/)'
+threads-required = "num-test-threads"
