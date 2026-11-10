@@ -186,11 +186,29 @@ pub fn lint_pack(pack: &CrashPack) -> Vec<LintProblem> {
                         out.push(problem(LintCode::BadRefMap, &at, message));
                     }
                 }
+                refuse_segment(&mut out, &at, map.matching);
             }
-            RefLookup::Index(index) if index.is_empty() => {
-                out.push(problem(LintCode::BadRefMap, &at, "`index` is empty"));
+            RefLookup::Index(index) => {
+                if index.is_empty() {
+                    out.push(problem(LintCode::BadRefMap, &at, "`index` is empty"));
+                }
+                refuse_segment(&mut out, &at, map.matching);
             }
-            RefLookup::Index(_) => {}
+            RefLookup::Facts { kind, key, .. } => {
+                if kind.is_empty() {
+                    out.push(problem(LintCode::BadRefMap, &at, "`facts.kind` is empty"));
+                }
+                if key.is_empty() {
+                    out.push(problem(LintCode::BadRefMap, &at, "`facts.key` is empty"));
+                }
+                if map.matching != NameMatch::Segment {
+                    out.push(problem(
+                        LintCode::BadRefMap,
+                        &at,
+                        "a `facts` lookup is only valid with `match: \"segment\"`",
+                    ));
+                }
+            }
         }
         if map.kind.is_empty() {
             out.push(problem(LintCode::BadRefMap, &at, "`kind` is empty"));
@@ -218,6 +236,17 @@ pub fn lint_pack(pack: &CrashPack) -> Vec<LintProblem> {
         }
     }
     out
+}
+
+/// `segment` is a `facts` match and compares against an analysis rather than an instance index.
+fn refuse_segment(out: &mut Vec<LintProblem>, at: &str, matching: NameMatch) {
+    if matching == NameMatch::Segment {
+        out.push(problem(
+            LintCode::BadRefMap,
+            at,
+            "`segment` matching is only valid with a `facts` lookup",
+        ));
+    }
 }
 
 fn is_valid_id(id: &str) -> bool {

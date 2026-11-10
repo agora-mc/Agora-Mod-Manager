@@ -1,13 +1,15 @@
 //! Answers "who owns this ref, and what role has it" from an instance snapshot and a crash pack.
 
-use agora_game_api::crash::{CrashPack, NameMatch, Owner, Ref, RefLookup, RefMap, Role, RoleRule};
+use agora_game_api::crash::{
+    AttrValue, CrashPack, Fact, NameMatch, Owner, Ref, RefLookup, RefMap, Role, RoleRule, Scalar,
+};
 
 use super::index::{
-    expand_pattern, matches_segments, matches_value, normalize_index_value, normalize_path,
-    ArchiveIndex, PatternError,
+    class_segments, expand_pattern, matches_segments, matches_value, normalize_index_value,
+    normalize_path, normalize_segment, ArchiveIndex, PatternError,
 };
 use super::view::InstanceView;
-use crate::crash_engine::types::{RefResolver, Resolved};
+use crate::crash_engine::types::{ParsedArtifact, RefResolver, Resolved};
 
 /// What attribution found out about one ref. [`Resolver::resolve`] drops the detail the evaluator's
 /// trait does not carry; the rest is kept for the engine facts and for showing `also_provided_by`.
@@ -64,7 +66,12 @@ impl Resolver {
         let matched_role = self.matching_role(reference);
         let role = matched_role.map(|rule| rule.role);
 
-        let Some(map) = self.ref_maps.iter().find(|map| map.kind == reference.kind) else {
+        let maps: Vec<&RefMap> = self
+            .ref_maps
+            .iter()
+            .filter(|map| map.kind == reference.kind)
+            .collect();
+        if maps.is_empty() {
             return Attribution {
                 owner: Owner::Unknown,
                 role,
@@ -72,7 +79,7 @@ impl Resolver {
                 via: None,
                 reason: Some(format!("no ref map for kind '{}'", reference.kind)),
             };
-        };
+        }
 
         if value.is_empty() {
             return Attribution {
@@ -84,12 +91,28 @@ impl Resolver {
             };
         }
 
-        let mut answer = match &map.lookup {
-            RefLookup::Path { patterns, archives } => {
-                self.resolve_path(map.matching, patterns, *archives, value, matched_role)
+        // A pack may list more than one map for a kind: an earlier one that finds nothing lets
+        // the next try, and the last miss is the answer when none finds anything.
+        let mut fallback = None;
+        for map in maps {
+            let mut answer = match &map.lookup {
+                RefLookup::Path { patterns, archives } => {
+                    self.resolve_path(map.matching, patterns, *archives, value, matched_role)
+                }
+                RefLookup::Index(index) => {
+                    self.resolve_index(index, map.matching, value, matched_role)
+                }
+                RefLookup::Facts { .. } => unknown(
+                    "this resolver has no parsed facts for a `facts` ref map; only a loose file has",
+                ),
+            };
+            answer.role = role;
+            if !matches!(answer.owner, Owner::Unknown | Owner::NotInInstance) {
+                return answer;
             }
-            RefLookup::Index(index) => self.resolve_index(index, map.matching, value, matched_role),
-        };
+            fallback = Some(answer);
+        }
+        let mut answer = fallback.expect("there was at least one ref map");
         answer.role = role;
         answer
     }
@@ -384,59 +407,226 @@ impl RefResolver for Resolver {
 /// There is nothing in an instance to blame, so a ref names itself: `ExampleMod.dll` resolves to
 /// an owner whose display name is that value. A pack's `roles` still win, and apply exactly as they
 /// do for an installed instance, because a system module or a framework is one wherever it is seen.
-/// A framework is named after the ref itself, not the role's matching pattern, so a prefix or
-/// wildcard rule does not show its pattern to the user. Inspectors have no file to open here; that
-/// is the caller's business, not the resolver's.
+/// A `facts` ref map may still name the owner from another fact in the same file: a crash report's
+/// own mod list turns a Java class into the mod that shipped it. A framework is named after the ref
+/// itself, not the role's matching pattern, so a prefix or wildcard rule does not show its pattern
+/// to the user. Inspectors have no file to open here; that is the caller's business, not the
+/// resolver's.
 pub struct LooseResolver {
     roles: Vec<RoleRule>,
+    maps: Vec<LooseMap>,
+}
+
+struct LooseMap {
+    map: RefMap,
+    facts: Option<FactsIndex>,
 }
 
 impl LooseResolver {
-    pub fn new(roles: Vec<RoleRule>) -> Self {
-        Self { roles }
+    pub fn new(roles: Vec<RoleRule>, ref_maps: Vec<RefMap>, parsed: &[ParsedArtifact]) -> Self {
+        let maps = ref_maps
+            .into_iter()
+            .map(|map| {
+                let facts = matches!(&map.lookup, RefLookup::Facts { .. })
+                    .then(|| FactsIndex::build(&map.lookup, parsed));
+                LooseMap { map, facts }
+            })
+            .collect();
+        Self { roles, maps }
     }
 
-    /// Every role rule the given packs declare, in pack order.
-    pub fn from_packs<'a>(packs: impl IntoIterator<Item = &'a CrashPack>) -> Self {
-        let mut roles = Vec::new();
-        for pack in packs {
-            roles.extend(pack.roles.iter().cloned());
+    /// Every role rule and ref map the given packs declare, in pack order.
+    pub fn from_packs<'a>(
+        packs: impl IntoIterator<Item = &'a CrashPack>,
+        parsed: &[ParsedArtifact],
+    ) -> Self {
+        let packs: Vec<&CrashPack> = packs.into_iter().collect();
+        let roles = packs
+            .iter()
+            .flat_map(|pack| pack.roles.iter().cloned())
+            .collect();
+        let maps = packs
+            .iter()
+            .flat_map(|pack| pack.ref_maps.iter().cloned())
+            .collect();
+        Self::new(roles, maps, parsed)
+    }
+
+    /// Everything this resolver knows about a ref, including why it settled on the name it did.
+    pub fn attribute(&self, reference: &Ref) -> Attribution {
+        let value = reference.value.trim();
+        if value.is_empty() {
+            return unknown("the ref has an empty value");
         }
-        Self::new(roles)
+
+        if let Some(rule) = self.roles.iter().find(|rule| {
+            rule.kind == reference.kind && matches_value(rule.matching, value, &rule.value)
+        }) {
+            let owner = match rule.role {
+                Role::System => Owner::System,
+                Role::Platform => Owner::Base,
+                Role::Framework | Role::HookFramework => Owner::Framework {
+                    name: value.to_string(),
+                },
+            };
+            return Attribution {
+                owner,
+                role: Some(rule.role),
+                also_provided_by: Vec::new(),
+                via: None,
+                reason: None,
+            };
+        }
+
+        let mut ambiguous = None;
+        for entry in &self.maps {
+            if entry.map.kind != reference.kind {
+                continue;
+            }
+            let Some(index) = &entry.facts else {
+                continue;
+            };
+            match index.find(value, &entry.map.ignore) {
+                FactMatch::Found(found) => {
+                    return Attribution {
+                        owner: Owner::Item {
+                            key: found.key.clone(),
+                            name: found.name.clone(),
+                        },
+                        role: None,
+                        also_provided_by: Vec::new(),
+                        via: None,
+                        reason: None,
+                    }
+                }
+                FactMatch::Ambiguous => {
+                    ambiguous = Some(format!(
+                        "ambiguous: the ref names more than one key in the pack's `{}` facts",
+                        entry.map.kind
+                    ));
+                }
+                FactMatch::Missing => {}
+            }
+        }
+        Attribution {
+            owner: Owner::Item {
+                key: value.to_string(),
+                name: value.to_string(),
+            },
+            role: None,
+            also_provided_by: Vec::new(),
+            via: None,
+            reason: ambiguous,
+        }
     }
 }
 
 impl RefResolver for LooseResolver {
     fn resolve(&self, reference: &Ref) -> Resolved {
-        let value = reference.value.trim();
-        if value.is_empty() {
-            return Resolved {
-                owner: Owner::Unknown,
-                role: None,
-            };
-        }
-        let Some(rule) = self.roles.iter().find(|rule| {
-            rule.kind == reference.kind && matches_value(rule.matching, value, &rule.value)
-        }) else {
-            return Resolved {
-                owner: Owner::Item {
-                    key: value.to_string(),
-                    name: value.to_string(),
-                },
-                role: None,
-            };
-        };
-        let owner = match rule.role {
-            Role::System => Owner::System,
-            Role::Platform => Owner::Base,
-            Role::Framework | Role::HookFramework => Owner::Framework {
-                name: value.to_string(),
-            },
-        };
+        let attribution = self.attribute(reference);
         Resolved {
-            owner,
-            role: Some(rule.role),
+            owner: attribution.owner,
+            role: attribution.role,
         }
+    }
+}
+
+/// One displayable key a `facts` ref map found, prepared for `segment` matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FactValue {
+    key: String,
+    normalized: String,
+    name: String,
+}
+
+/// The attribute values a pack's `facts` lookup indexes, built once from one analysis.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FactsIndex {
+    values: Vec<FactValue>,
+}
+
+impl FactsIndex {
+    fn build(lookup: &RefLookup, parsed: &[ParsedArtifact]) -> Self {
+        let RefLookup::Facts { kind, key, name } = lookup else {
+            return Self::default();
+        };
+        let mut values = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for artifact in parsed {
+            for fact in &artifact.output.facts {
+                if &fact.kind != kind {
+                    continue;
+                }
+                let Some(key_value) = fact_text(fact, key) else {
+                    continue;
+                };
+                let key_value = key_value.trim();
+                if key_value.is_empty() {
+                    continue;
+                }
+                let name_value = fact_text(fact, name)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(key_value)
+                    .to_string();
+                if seen.insert((key_value.to_string(), name_value.clone())) {
+                    values.push(FactValue {
+                        key: key_value.to_string(),
+                        normalized: normalize_segment(key_value),
+                        name: name_value,
+                    });
+                }
+            }
+        }
+        Self { values }
+    }
+
+    fn find(&self, value: &str, ignore: &[String]) -> FactMatch<'_> {
+        let ignored: Vec<String> = ignore.iter().map(|word| normalize_segment(word)).collect();
+        let segments = class_segments(value);
+        let matches: Vec<&FactValue> = self
+            .values
+            .iter()
+            .filter(|entry| {
+                entry.normalized.len() >= 3
+                    && !ignored.iter().any(|word| word == &entry.normalized)
+                    && segments.contains(&entry.normalized)
+            })
+            .collect();
+        if matches.is_empty() {
+            return FactMatch::Missing;
+        }
+        // The longest key wins. Two different keys of the same length are ambiguous, and an
+        // ambiguous answer is no answer rather than a guess.
+        let longest_len = matches
+            .iter()
+            .map(|entry| entry.normalized.len())
+            .max()
+            .unwrap_or(0);
+        let longest: Vec<&FactValue> = matches
+            .into_iter()
+            .filter(|entry| entry.normalized.len() == longest_len)
+            .collect();
+        if longest
+            .iter()
+            .any(|entry| entry.normalized != longest[0].normalized)
+        {
+            return FactMatch::Ambiguous;
+        }
+        FactMatch::Found(longest[0])
+    }
+}
+
+enum FactMatch<'a> {
+    Found(&'a FactValue),
+    Ambiguous,
+    Missing,
+}
+
+fn fact_text<'a>(fact: &'a Fact, attr: &str) -> Option<&'a str> {
+    match fact.attrs.get(attr) {
+        Some(AttrValue::Scalar(Scalar::Text(text))) => Some(text),
+        _ => None,
     }
 }
 

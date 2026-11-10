@@ -179,6 +179,20 @@ Refs: `mod_id`. Provided by `crash_report`, in the Fabric, Quilt, Forge and NeoF
   "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "mention" }] }
 ```
 
+### Naming a mod from the report's own mod list
+
+A class frame names a Java class, not a mod. The pack's second `class` ref map reads the
+`minecraft.mod` facts in the same report: it keys each fact by its `id` and shows its `name`.
+Matching is `segment`: the ref value is split at `.`, `$` and `/`, the last part (the class's own
+name) is dropped, and every other part is normalised to lower-case ASCII letters and digits. A mod
+id matches when it equals one of those parts. Ids under three characters never match, and the map's
+`ignore` list rules out words too common to identify a mod (`client`, `server`, `common`, `api`,
+`core`, `mixin`, `util`, `lib`, `impl`, `mod`, `mods`, and the package roots `net`, `com`, `org`,
+`io`, `me`, `dev`). If two different keys match, the longer wins; two different keys of the same
+length are ambiguous and resolve to nothing. The first `class` map is still the instance's
+`java_package` index, so an installed jar index wins when there is one; the facts map is tried when
+that map misses. A report with no mod list, or an empty one, leaves the class naming itself.
+
 ### `minecraft.crash`
 
 | Attribute | Meaning |
@@ -305,5 +319,6 @@ The pack maps `mod_id` through an index named `mod_id` (exact) and `class` throu
 - the jar file names under `mods/` (the `file` ref map, with `archives`), so a Forge/NeoForge
   frame annotation can trace to its mod.
 
-Until that index exists, frames resolve to "something Agora could not identify" and the engine
-does not accuse them. The pack does not build the index.
+Until that index exists, a loose crash report still names a mod when its own mod list has the id
+(above), and otherwise a frame resolves to "something Agora could not identify" and the engine does
+not accuse it. The pack does not build the index.

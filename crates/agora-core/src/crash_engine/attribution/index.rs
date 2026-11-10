@@ -111,6 +111,7 @@ impl FileIndex {
                 .cloned()
                 .unwrap_or_default(),
             NameMatch::PrefixDot => dot_prefix_matches(&self.exact, key),
+            NameMatch::Segment => Vec::new(),
         }
     }
 
@@ -125,6 +126,7 @@ impl FileIndex {
                 .cloned()
                 .unwrap_or_default(),
             NameMatch::PrefixDot => dot_prefix_matches(&self.by_name_exact, name),
+            NameMatch::Segment => Vec::new(),
         }
     }
 
@@ -152,6 +154,7 @@ impl FileIndex {
                 }
                 positions
             }
+            NameMatch::Segment => Vec::new(),
         }
     }
 }
@@ -330,7 +333,46 @@ pub(crate) fn matches_value(matching: NameMatch, value: &str, rule: &str) -> boo
                     .strip_prefix(rule)
                     .is_some_and(|rest| rest.starts_with('.'))
         }
+        NameMatch::Segment => segment_key_matches(value, rule, &[]),
     }
+}
+
+/// A key in the form `segment` matching compares: lower-case ASCII letters and digits only.
+pub(crate) fn normalize_segment(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+/// The parts of a ref value that may name its owner, with the class's own name dropped. A Java
+/// class is written with dots, inner classes with `$`, and a loader or module prefix with `/`.
+pub(crate) fn class_segments(value: &str) -> Vec<String> {
+    let mut parts: Vec<&str> = value.split(['.', '$', '/']).collect();
+    parts.pop();
+    parts
+        .into_iter()
+        .filter_map(|part| {
+            let normalized = normalize_segment(part);
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect()
+}
+
+/// Whether `key` names one of the segments before the class's own name. Keys under three
+/// characters never match, and an ignored segment never does.
+pub(crate) fn segment_key_matches(value: &str, key: &str, ignore: &[String]) -> bool {
+    let key = normalize_segment(key);
+    if key.len() < 3 {
+        return false;
+    }
+    if ignore
+        .iter()
+        .any(|ignored| normalize_segment(ignored) == key)
+    {
+        return false;
+    }
+    class_segments(value).contains(&key)
 }
 
 /// A path as the index stores it: `/` separators, no `..`, no absolute path, and Windows' dropped
