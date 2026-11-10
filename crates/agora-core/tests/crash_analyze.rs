@@ -466,3 +466,111 @@ fn a_pack_role_still_applies_without_an_instance() {
     );
     assert_eq!(resolved.role, Some(agora_game_api::crash::Role::Framework));
 }
+
+fn for_games(pack: String, games: &str) -> String {
+    pack.replacen(
+        r#""contract": 1,"#,
+        &format!(r#""contract": 1, "games": [{games}],"#),
+        1,
+    )
+}
+
+#[test]
+fn another_games_rules_stay_out_of_a_loose_file_read_for_one_game() {
+    let (_a, harbor) = plugin_folder(
+        "acme.harbor",
+        "Acme Harbor crash rules",
+        &for_games(generic_pack("", &fault_rule("harbor_rule")), r#""harbor""#),
+        None,
+    );
+    let (_b, other) = plugin_folder(
+        "acme.other",
+        "Acme Other crash rules",
+        &for_games(
+            generic_pack("", &fault_rule("other_game_rule")),
+            r#""other""#,
+        ),
+        None,
+    );
+    let (_c, every) = plugin_folder(
+        "acme.every",
+        "Acme rules for every game",
+        &generic_pack("", &fault_rule("every_game_rule")),
+        None,
+    );
+    let host = idle_host();
+    let output = analyze(&AnalyzeInput {
+        packs: &[other, every, harbor],
+        files: &[file(
+            "pasted.txt",
+            "== FAULTS ==\nmodule ExampleMod.dll failed\n",
+        )],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+    })
+    .unwrap();
+
+    let rules: Vec<&str> = output
+        .answer
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.sources.iter())
+        .filter_map(|source| source.rule_id.as_deref())
+        .collect();
+    // `acme.every` sorts first, so it is the one that read the file; it serves every game, so the
+    // file names no game and every pack takes part.
+    assert_eq!(
+        output.files[0].read_by.as_ref().unwrap().plugin_id,
+        "acme.every"
+    );
+    assert!(rules.contains(&"other_game_rule"), "{rules:?}");
+
+    // Read by the harbor pack alone, the other game's rule must not speak.
+    let (_a2, harbor) = plugin_folder(
+        "acme.harbor",
+        "Acme Harbor crash rules",
+        &for_games(generic_pack("", &fault_rule("harbor_rule")), r#""harbor""#),
+        None,
+    );
+    let (_b2, other) = plugin_folder(
+        "acme.other",
+        "Acme Other crash rules",
+        &for_games(
+            generic_pack("", &fault_rule("other_game_rule")),
+            r#""other""#,
+        ),
+        None,
+    );
+    let (_c2, universal) = plugin_folder(
+        "acme.universal",
+        "Acme rules for every game",
+        &generic_pack("", &fault_rule("every_game_rule")),
+        None,
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: &[universal, other, harbor],
+        files: &[file(
+            "pasted.txt",
+            "== FAULTS ==\nmodule ExampleMod.dll failed\n",
+        )],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+    })
+    .unwrap();
+    assert_eq!(
+        output.files[0].read_by.as_ref().unwrap().plugin_id,
+        "acme.harbor"
+    );
+    let rules: Vec<&str> = output
+        .answer
+        .candidates
+        .iter()
+        .flat_map(|candidate| candidate.sources.iter())
+        .filter_map(|source| source.rule_id.as_deref())
+        .collect();
+    assert!(rules.contains(&"harbor_rule"), "{rules:?}");
+    assert!(rules.contains(&"every_game_rule"), "{rules:?}");
+    assert!(!rules.contains(&"other_game_rule"), "{rules:?}");
+}

@@ -237,6 +237,31 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         reports.push(report);
     }
 
+    // A loose file names no game, so it stands for the games of the packs that read it: another
+    // game's rules must not accuse a module in this one. Packs for every game always take part.
+    let read_games: std::collections::BTreeSet<&str> = reports
+        .iter()
+        .filter_map(|report| report.read_by.as_ref())
+        .flat_map(|reader| {
+            packs
+                .iter()
+                .filter(move |pack| pack.plugin_id == reader.plugin_id)
+                .flat_map(|pack| pack.pack.games.iter().map(String::as_str))
+        })
+        .collect();
+    let packs: Vec<&LoadedCrashPack> = packs
+        .into_iter()
+        .filter(|pack| {
+            read_games.is_empty()
+                || pack.pack.games.is_empty()
+                || pack
+                    .pack
+                    .games
+                    .iter()
+                    .any(|game| read_games.contains(game.as_str()))
+        })
+        .collect();
+
     let pack_inputs: Vec<super::PackInput> = packs
         .iter()
         .map(|pack| super::PackInput {
