@@ -180,7 +180,8 @@ pub struct Detect {
     /// The artifact's first bytes, in hex, for a binary format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub magic_hex: Option<String>,
-    /// Regexes over the first [`DETECT_HEAD_BYTES`] of text. All must match.
+    /// Regexes over the first [`DETECT_HEAD_BYTES`] of text, with `\r\n` already turned into
+    /// `\n`. All must match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub all: Vec<String>,
     /// At least one must match.

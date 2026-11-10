@@ -507,3 +507,59 @@ mod crash {
         ));
     }
 }
+
+/// A loose file keeps no original name (a forum paste, a renamed copy) and often has Windows line
+/// ends; detection must still pick the right parser from the content alone.
+mod detection {
+    use agora_core::crash_packs::detect_parsers;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agora-game-minecraft/tests/crash_fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+    }
+
+    fn crlf(bytes: &[u8]) -> Vec<u8> {
+        String::from_utf8_lossy(bytes)
+            .replace('\n', "\r\n")
+            .into_bytes()
+    }
+
+    fn detected(bytes: &[u8]) -> Vec<String> {
+        let built_in = agora_game_minecraft::crash::built_in_packs();
+        let report = agora_core::crash_packs::load_built_in_packs(&built_in);
+        let pack = &report.packs[0].pack;
+        detect_parsers(pack, "pasted-3f9a.log", bytes)
+            .unwrap()
+            .into_iter()
+            .map(|parser| parser.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn each_minecraft_file_is_recognised_under_any_name_and_either_line_end() {
+        for (file, parser) in [
+            ("crash_fabric.txt", "crash_report"),
+            ("crash_forge.txt", "crash_report"),
+            ("latest_mixin.log", "latest_log"),
+            ("latest_fabric_missing.log", "latest_log"),
+            ("hs_err_sample.log", "hs_err"),
+        ] {
+            let lf = fixture(file);
+            assert_eq!(detected(&lf), vec![parser], "{file} with LF");
+            assert_eq!(detected(&crlf(&lf)), vec![parser], "{file} with CRLF");
+        }
+    }
+
+    #[test]
+    fn other_logs_are_not_claimed() {
+        let skyrim = b"Skyrim SSE v1.6.1170\r\nCrashLoggerSSE v1-15-0-0 Nov  1 2024\r\n\r\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF6C1A2B3C4 SkyrimSE.exe+0123456\r\n";
+        let plain_timestamps = b"[12:00:01] [info] service started\n[12:00:02] [warn] retrying\n";
+        assert!(detected(skyrim).is_empty());
+        assert!(detected(plain_timestamps).is_empty());
+        assert!(detected(&fixture("lookalike.txt")).is_empty());
+        assert!(detected(b"").is_empty());
+    }
+}

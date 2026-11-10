@@ -695,7 +695,9 @@ pub fn detect_parsers<'a>(
     head: &[u8],
 ) -> Result<Vec<&'a ParserDecl>, ParserFailure> {
     let head = &head[..head.len().min(DETECT_HEAD_BYTES)];
-    let text = String::from_utf8_lossy(head);
+    // Patterns see `\n` line ends whatever the file used: in this regex dialect `$` never matches
+    // before `\r`, so `(?m)^banner$` would silently miss every Windows log.
+    let text = String::from_utf8_lossy(head).replace("\r\n", "\n");
     let mut matched = Vec::new();
     for parser in &pack.parsers {
         if parser.detect.is_empty() {
@@ -1295,6 +1297,25 @@ mod tests {
         )
         .unwrap();
         assert!(detect_parsers(&pack, "x.log", b"anything")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_line_anchored_pattern_matches_windows_line_endings() {
+        let pack: CrashPack = serde_json::from_str(
+            r#"{"contract":1,"parsers":[{"id":"banner","entry":{"script":{"export":"parse"}},
+                "detect":{"all":["(?m)^---- Banner ----$"]}}]}"#,
+        )
+        .unwrap();
+        for head in [
+            &b"intro\n---- Banner ----\nbody\n"[..],
+            &b"intro\r\n---- Banner ----\r\nbody\r\n"[..],
+        ] {
+            assert_eq!(detect_parsers(&pack, "x.txt", head).unwrap().len(), 1);
+        }
+        // A lone `\r` is not a line end, so it still blocks `$`.
+        assert!(detect_parsers(&pack, "x.txt", b"---- Banner ----\rmore\n")
             .unwrap()
             .is_empty());
     }

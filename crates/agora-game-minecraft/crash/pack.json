@@ -38,17 +38,15 @@
       "id": "crash_report",
       "entry": { "built_in": { "name": "crash_report" } },
       "detect": {
-        "name_glob": "crash-*.txt",
-        "all": ["(?m)^---- Minecraft Crash Report ----$"]
+        "all": ["---- Minecraft Crash Report ----"]
       }
     },
     {
       "id": "latest_log",
       "entry": { "built_in": { "name": "latest_log" } },
       "detect": {
-        "name_glob": "latest.log",
         "any": [
-          "(?m)^\\[\\d\\d:\\d\\d:\\d\\d(:\\d\\d\\.\\d\\d\\d)?\\] \\[",
+          "(?m)^\\[[^\\]\\n]*\\d\\d:\\d\\d:\\d\\d[^\\]\\n]*\\] \\[[^\\]\\n/]+/(INFO|WARN|ERROR|DEBUG|FATAL)\\]",
           "(?m)^Loading Minecraft "
         ]
       }
@@ -57,7 +55,6 @@
       "id": "hs_err",
       "entry": { "built_in": { "name": "hs_err" } },
       "detect": {
-        "name_glob": "hs_err_pid*.log",
         "all": ["(?m)^# A fatal error has been detected by the Java Runtime Environment:$"]
       }
     }
