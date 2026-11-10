@@ -47634,6 +47634,23 @@
         "release_channel": "stable"
       },
       {
+        "mc_version": "1.20.1",
+        "loader_version": "47.4.29",
+        "source_url": "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.4.29/forge-1.20.1-47.4.29-installer.jar",
+        "sha256": "a60f4e219abc6ae5ab5c9c0458741fbb8aba15deaf444810ff61bf3e94e907f4",
+        "file_name": "forge-1.20.1-47.4.29-installer.jar",
+        "file_type": "installer_jar",
+        "version_json_sha256": "41a003232e62ca1324a4c354340452b00daca5aa9a874a000dfc426ddab734ce",
+        "content_sha256": "b81be56fe8795a60734e909421aecdec946943d1d2b208f9f22d0223875aaf03",
+        "installer_spec": 1,
+        "provided_versions": {
+          "forge": "47.4.29",
+          "javafml": "47",
+          "lowcodefml": "47"
+        },
+        "release_channel": "stable"
+      },
+      {
         "mc_version": "1.20.2",
         "loader_version": "48.0.40",
         "source_url": "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.2-48.0.40/forge-1.20.2-48.0.40-installer.jar",
