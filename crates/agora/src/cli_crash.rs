@@ -1,14 +1,23 @@
-//! `agora crash analyze`: diagnose crash files handed to Agora, with no instance behind them.
+//! `agora crash analyze`: diagnose crash files, with an instance behind them or on their own.
 //!
 //! A thin adapter over [`agora_core::crash_engine::analyze`]. It reads the files, loads the crash
 //! packs of installed plugins plus any `--plugin-dir` development folder, starts the script host a
-//! script parser needs, and prints the answer. It opens no instance and changes nothing.
+//! script parser or inspector needs, and prints the answer. With `--instance` it also reads that
+//! instance's deployed view so refs attribute to mods and an inspector can open one file; it
+//! changes nothing.
 
-use agora_core::crash_engine::{analyze, owner_name, AnalyzeInput, AnalyzeOutput, CrashFile};
+use agora_core::crash_engine::attribution::{from_instance, Resolver};
+use agora_core::crash_engine::{
+    analyze, owner_name, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
+    InstanceInspector,
+};
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
+use agora_core::game_script::instance_reads;
 use agora_core::plugins::PluginService;
-use agora_game_api::crash::{CodeEntry, CouldNotCheckReason, LocalText};
-use agora_plugin_api::host::{ActivationRequest, ScriptHost};
+use agora_game_api::crash::{
+    CodeEntry, CouldNotCheckReason, GameHandle, LocalText, RefMap, RoleRule,
+};
+use agora_plugin_api::host::{ActivationRequest, GameReads, ScriptHost};
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_host::QuickJsHost;
 use std::collections::BTreeSet;
@@ -17,6 +26,7 @@ use std::sync::Arc;
 
 pub struct AnalyzeArgs {
     pub files: Vec<PathBuf>,
+    pub instance: Option<String>,
     pub plugin_dirs: Vec<PathBuf>,
     pub game_version: Option<String>,
     pub allow_code: bool,
@@ -55,7 +65,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         let (folder_packs, script_ids) = load_development_folder(folder)?;
         if !script_ids.is_empty() && !args.allow_code {
             anyhow::bail!(
-                "{} has a crash parser written in a script, which runs code. Pass --allow-code to run it.",
+                "{} has a crash parser or inspector written in a script, which runs code. Pass --allow-code to run it.",
                 folder.display()
             );
         }
@@ -81,12 +91,79 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         crash_files.push(CrashFile { name, bytes });
     }
 
+    // With an instance the game is known, so only its packs take part, refs resolve to the mods
+    // that provide them, and an inspector may open one file in the deployed view. Without one the
+    // loose-file path is unchanged: names stand for themselves and nothing is inspected.
+    let mut instance_game_id: Option<String> = None;
+    let mut instance_resolver: Option<Resolver> = None;
+    let mut instance_scope: Option<Arc<dyn GameReads>> = None;
+    let mut effective_version = args.game_version.clone();
+    if let Some(instance_id) = args.instance.as_deref() {
+        let manifest = agora_core::game_instance::get_manifest(ctx, instance_id)
+            .map_err(|error| anyhow::anyhow!("Unknown instance '{instance_id}': {error}"))?;
+        let game_id = manifest.game.as_str().to_string();
+        let view = from_instance(ctx, instance_id)
+            .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
+        // Only the instance's game and the packs for every game may say how a ref is attributed.
+        let game_packs: Vec<&LoadedCrashPack> = packs
+            .iter()
+            .filter(|pack| {
+                pack.pack.games.is_empty() || pack.pack.games.iter().any(|game| game == &game_id)
+            })
+            .collect();
+        let ref_maps: Vec<RefMap> = game_packs
+            .iter()
+            .flat_map(|pack| pack.pack.ref_maps.iter().cloned())
+            .collect();
+        let roles: Vec<RoleRule> = game_packs
+            .iter()
+            .flat_map(|pack| pack.pack.roles.iter().cloned())
+            .collect();
+        instance_resolver = Some(Resolver::new(view, ref_maps, roles));
+        instance_scope = Some(Arc::new(instance_reads(ctx, instance_id).map_err(
+            |error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"),
+        )?));
+        if effective_version.is_none() {
+            effective_version = manifest
+                .runtime_identity
+                .as_ref()
+                .map(|runtime| runtime.version.clone());
+        }
+        instance_game_id = Some(game_id);
+    }
+    let instance_inspector = match (&instance_resolver, &instance_scope) {
+        (Some(resolver), Some(scope)) => Some(InstanceInspector::new(
+            host.as_ref(),
+            &packs,
+            resolver,
+            scope.clone(),
+            GameHandle {
+                id: instance_game_id.clone().unwrap_or_default(),
+                runtime_version: effective_version.clone(),
+            },
+        )),
+        _ => None,
+    };
+    let instance = match (
+        instance_game_id.as_deref(),
+        instance_resolver.as_ref(),
+        instance_inspector.as_ref(),
+    ) {
+        (Some(game_id), Some(resolver), Some(inspector)) => Some(InstanceAnalysis {
+            game_id,
+            resolver,
+            inspector,
+        }),
+        _ => None,
+    };
+
     let output = analyze(&AnalyzeInput {
         packs: &packs,
         files: &crash_files,
-        runtime_version: args.game_version.as_deref(),
+        runtime_version: effective_version.as_deref(),
         host: host.as_ref(),
         built_in: &built_in,
+        instance,
     })?;
 
     if args.json {
@@ -121,7 +198,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
 }
 
 /// Read one development folder the way `agora plugin validate` does, and name the plugin ids that
-/// contribute a script parser so the caller can decide about running code.
+/// contribute script code so the caller can decide about running it.
 fn load_development_folder(folder: &Path) -> anyhow::Result<(Vec<LoadedCrashPack>, Vec<String>)> {
     let manifest = agora_core::plugins::install::read_folder_manifest(folder)?;
     let report = load_plugin_packs(manifest.id.as_str(), folder, &manifest);
@@ -131,7 +208,7 @@ fn load_development_folder(folder: &Path) -> anyhow::Result<(Vec<LoadedCrashPack
     let script_ids = report
         .packs
         .iter()
-        .filter(|pack| has_script_parser(pack))
+        .filter(|pack| has_script_code(pack))
         .map(|pack| pack.plugin_id.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -139,22 +216,27 @@ fn load_development_folder(folder: &Path) -> anyhow::Result<(Vec<LoadedCrashPack
     Ok((report.packs, script_ids))
 }
 
-/// Plugin ids whose packs contain a script parser, deduplicated in a stable order.
+/// Plugin ids whose packs contain script code, deduplicated in a stable order.
 fn installed_script_plugins(packs: &[LoadedCrashPack]) -> Vec<String> {
     packs
         .iter()
-        .filter(|pack| has_script_parser(pack))
+        .filter(|pack| has_script_code(pack))
         .map(|pack| pack.plugin_id.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
 }
 
-fn has_script_parser(pack: &LoadedCrashPack) -> bool {
+fn has_script_code(pack: &LoadedCrashPack) -> bool {
     pack.pack
         .parsers
         .iter()
         .any(|parser| matches!(parser.entry, CodeEntry::Script { .. }))
+        || pack
+            .pack
+            .inspectors
+            .iter()
+            .any(|inspector| matches!(inspector.entry, CodeEntry::Script { .. }))
 }
 
 /// Start a development folder's script so its parser exports exist. `--allow-code` was checked by
@@ -168,7 +250,7 @@ fn activate_folder_parser(
     let manifest = agora_core::plugins::install::read_folder_manifest(folder)?;
     let Some(entrypoint) = manifest.entrypoint.clone() else {
         anyhow::bail!(
-            "{} contributes a script parser but its manifest names no entrypoint",
+            "{} contributes script crash code but its manifest names no entrypoint",
             folder.display()
         );
     };
@@ -250,6 +332,23 @@ fn print_text(output: &AnalyzeOutput) {
         }
     }
 
+    if !answer.inspections.is_empty() {
+        println!("Inspections:");
+        for inspection in &answer.inspections {
+            let detail = inspection
+                .detail
+                .as_ref()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default();
+            println!(
+                "  - {} [{}]{detail} (from {})",
+                inspection.target,
+                inspect_words(inspection.result),
+                inspection.source.plugin_name
+            );
+        }
+    }
+
     if !answer.could_not_check.is_empty() {
         println!("Could not check:");
         // Several rules often miss the same thing; say it once, with how many.
@@ -306,6 +405,15 @@ fn print_files(output: &AnalyzeOutput) {
 
 fn english(text: &LocalText) -> &str {
     text.get("en").map(String::as_str).unwrap_or("")
+}
+
+fn inspect_words(result: agora_game_api::crash::InspectResult) -> &'static str {
+    use agora_game_api::crash::InspectResult;
+    match result {
+        InspectResult::Pass => "pass",
+        InspectResult::Fail => "fail",
+        InspectResult::Unknown => "unknown",
+    }
 }
 
 fn reason_words(reason: CouldNotCheckReason) -> &'static str {

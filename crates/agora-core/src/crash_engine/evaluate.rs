@@ -4,10 +4,10 @@
 use super::*;
 use agora_game_api::crash::{
     AttrMatch, AttrValue, Condition, CouldNotCheck, CouldNotCheckReason, CountQuery, Coverage,
-    CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding, Level, LocalText,
-    MatchOps, NextStepKind, ParseNoteKind, Ref, RepairOffer, RepairRequest, ResolvedRepair, Role,
-    Rule, RuleText, Scalar, Scope, Signal, SourceAttribution, Strength, TextMatch, TrustNote,
-    Truth, MAX_RULE_BRANCHES,
+    CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding, InspectResult,
+    InspectionRecord, Level, LocalText, MatchOps, NextStepKind, ParseNoteKind, Ref, RepairOffer,
+    RepairRequest, ResolvedRepair, Role, Rule, RuleText, Scalar, Scope, Signal, SourceAttribution,
+    Strength, TextMatch, TrustNote, Truth, MAX_RULE_BRANCHES,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,6 +26,8 @@ pub struct EvaluateInput<'a> {
 pub struct EvaluateOutput {
     pub signals: Vec<Signal>,
     pub findings: Vec<Finding>,
+    /// What each deeper check decided, with its detail and facts, for the answer to show.
+    pub inspections: Vec<InspectionRecord>,
     pub could_not_check: Vec<CouldNotCheck>,
     pub trust_notes: Vec<TrustNote>,
     /// The weakest cap a `trust` effect gave, if any.
@@ -1291,6 +1293,7 @@ struct RuleProducts {
     fired: bool,
     signals: Vec<Signal>,
     findings: Vec<Finding>,
+    inspections: Vec<InspectionRecord>,
     could_not_check: Vec<CouldNotCheck>,
     trust_notes: Vec<TrustNote>,
     level_caps: Vec<Level>,
@@ -1343,6 +1346,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
 
     let mut signals = Vec::new();
     let mut findings = Vec::new();
+    let mut inspections = Vec::new();
     let mut could_not_check = Vec::new();
     let mut trust_notes = Vec::new();
     let mut repairs = Vec::new();
@@ -1355,6 +1359,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         }
         signals.extend(product.signals);
         findings.extend(product.findings);
+        inspections.extend(product.inspections);
         could_not_check.extend(product.could_not_check);
         trust_notes.extend(product.trust_notes);
         repairs.extend(product.repairs);
@@ -1423,12 +1428,29 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         )
     });
     repairs.dedup_by(|a, b| a.request == b.request && a.source == b.source);
+    // Two rules may inspect the same file; show one row, not one per rule.
+    inspections.sort_by_key(|inspection| {
+        format!(
+            "{}\0{}\0{:?}\0{}",
+            inspection.inspector,
+            inspection.target,
+            inspection.result,
+            inspection.detail.as_deref().unwrap_or("")
+        )
+    });
+    inspections.dedup_by(|a, b| {
+        a.inspector == b.inspector
+            && a.target == b.target
+            && a.result == b.result
+            && a.detail == b.detail
+    });
     next_steps.sort_by_key(|kind| next_step_rank(*kind));
     next_steps.dedup();
 
     EvaluateOutput {
         signals,
         findings: clean_findings(findings),
+        inspections,
         could_not_check,
         trust_notes,
         level_cap: cap,
@@ -1592,11 +1614,12 @@ fn evaluate_rule(
         if let Some(verify) = &rule.verify {
             match branch.bindings.refs.get(&verify.target) {
                 Some(target) => {
-                    let inspection = input.inspector.inspect(&InspectionRequest {
+                    let outcome = input.inspector.inspect(&InspectionRequest {
+                        plugin_id: &plugin.id,
                         inspector: &verify.inspector,
                         target: &target.reference,
                     });
-                    match inspection {
+                    match &outcome.result {
                         Inspection::Pass => apply_effects(
                             input,
                             plugin,
@@ -1633,6 +1656,10 @@ fn evaluate_rule(
                             });
                         }
                         Inspection::Missing => {
+                            // An inspector that does not apply (a system module, a file another
+                            // inspector owns, a loose file with no instance) found nothing to say.
+                            // The rule's `on_unknown` decides whether that is worth a note; a
+                            // per-target "no inspector is installed" line would only be noise.
                             apply_effects(
                                 input,
                                 plugin,
@@ -1641,12 +1668,6 @@ fn evaluate_rule(
                                 branch,
                                 &mut product,
                             );
-                            product.could_not_check.push(CouldNotCheck {
-                                reason: CouldNotCheckReason::InspectorMissing,
-                                subject: verify.inspector.clone(),
-                                detail: None,
-                                source: Some(rule_source(plugin, rule, None)),
-                            });
                         }
                         Inspection::Failed(detail) => {
                             apply_effects(
@@ -1660,10 +1681,26 @@ fn evaluate_rule(
                             product.could_not_check.push(CouldNotCheck {
                                 reason: CouldNotCheckReason::CodeFailed,
                                 subject: verify.inspector.clone(),
-                                detail: Some(detail),
+                                detail: Some(detail.clone()),
                                 source: Some(rule_source(plugin, rule, None)),
                             });
                         }
+                    }
+                    let result = match &outcome.result {
+                        Inspection::Pass => Some(InspectResult::Pass),
+                        Inspection::Fail => Some(InspectResult::Fail),
+                        Inspection::Unknown => Some(InspectResult::Unknown),
+                        Inspection::Missing | Inspection::Failed(_) => None,
+                    };
+                    if let Some(result) = result {
+                        product.inspections.push(InspectionRecord {
+                            inspector: verify.inspector.clone(),
+                            target: target.reference.value.clone(),
+                            result,
+                            detail: outcome.detail,
+                            facts: outcome.facts,
+                            source: rule_source(plugin, rule, None),
+                        });
                     }
                 }
                 None => {

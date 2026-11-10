@@ -3,8 +3,8 @@
 
 use agora_core::crash_engine::{
     answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusOutput, ConsensusProfile,
-    EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionRequest, Inspector,
-    PackInput, ParsedArtifact, PluginIdentity,
+    EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionOutcome, InspectionRequest,
+    Inspector, PackInput, ParsedArtifact, PluginIdentity,
 };
 use agora_game_api::crash::{
     certainty_claim, AttrValue, Coverage, CoverageState, CrashPack, Fact, Level, MatchedBy,
@@ -66,8 +66,8 @@ impl agora_core::crash_engine::RefResolver for FakeResolver {
 struct FixedInspector(Inspection);
 
 impl Inspector for FixedInspector {
-    fn inspect(&self, _request: &InspectionRequest<'_>) -> Inspection {
-        self.0.clone()
+    fn inspect(&self, _request: &InspectionRequest<'_>) -> InspectionOutcome {
+        self.0.clone().into()
     }
 }
 

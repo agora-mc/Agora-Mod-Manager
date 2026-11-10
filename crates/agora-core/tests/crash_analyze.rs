@@ -182,6 +182,7 @@ fn a_supplied_file_names_the_module_it_names_itself_and_says_the_user_supplied_i
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -219,6 +220,7 @@ fn no_files_at_all_is_an_error() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap_err();
     assert_eq!(error.code(), "ERR_CRASH_ANALYZE_NO_FILES");
@@ -245,6 +247,7 @@ fn an_empty_file_and_an_unrecognised_file_name_nobody_and_say_so() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -287,6 +290,7 @@ fn a_parser_that_throws_is_could_not_check_naming_the_plugin_and_the_report_says
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -332,6 +336,7 @@ fn two_files_where_one_parses_use_it_and_still_list_the_other() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -362,6 +367,7 @@ fn a_system_role_never_outranks_the_module_that_was_also_named() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -398,6 +404,7 @@ fn the_same_input_in_a_different_file_order_gives_the_same_answer() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
     let backward = analyze(&AnalyzeInput {
@@ -406,6 +413,7 @@ fn the_same_input_in_a_different_file_order_gives_the_same_answer() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -434,6 +442,7 @@ fn a_file_over_the_read_limits_is_refused_and_said() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -509,6 +518,7 @@ fn another_games_rules_stay_out_of_a_loose_file_read_for_one_game() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
 
@@ -558,6 +568,7 @@ fn another_games_rules_stay_out_of_a_loose_file_read_for_one_game() {
         runtime_version: None,
         host: &host,
         built_in: &[],
+        instance: None,
     })
     .unwrap();
     assert_eq!(

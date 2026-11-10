@@ -223,6 +223,15 @@ to nothing.
 A kind may have more than one ref map. They are tried in order, and a later one is used when an
 earlier one finds nothing. Every finding still names the plugin that made it.
 
+An `inspector` opens one file a rule's `verify` points at and reports `pass`, `fail` or `unknown`.
+It gets the same request and read scope as a parser, with the target file as its artifact, so it
+still never sees a path. `accepts` lists the file names it will open (case-insensitive `*` and
+`?`). A rule's `verify.target` names a ref-bound variable; the engine resolves that ref through the
+same ref maps as attribution before the inspector runs, and only an instance has a file to open. A
+missing target, a file the inspector does not accept, or a file outside the instance view is
+`missing`, which takes the rule's `on_unknown` effects. A script error, timeout or invalid output is
+"could not check" and names the plugin, never a pass.
+
 ### The runtime
 
 Scripts run in QuickJS through `rquickjs 0.13`, with separate bounded runtimes on host-owned worker threads. This is **not an OS process sandbox**. QuickJS supports ES modules, promises, and async functions; the host adds the `agora` module. It does not add `require`, `process`, filesystem access, DOM APIs, native modules, or global `fetch`. Bundle third-party JavaScript and mark `agora` external. Use the standalone declarations in `sdk/` for TypeScript.

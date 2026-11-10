@@ -99,6 +99,7 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         level,
         candidates,
         findings,
+        inspections: input.evaluated.inspections.clone(),
         could_not_check: input.evaluated.could_not_check.clone(),
         trust_notes: input.evaluated.trust_notes.clone(),
         next,

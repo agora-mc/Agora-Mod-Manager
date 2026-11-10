@@ -1792,11 +1792,14 @@ enum CrashCmd {
         #[arg(long = "file")]
         files: Vec<PathBuf>,
     },
-    /// Diagnose crash files that came from somewhere else: no instance, no launch record.
+    /// Diagnose crash files against an instance, or on their own when none is named.
     Analyze {
         /// The crash file to read. May be repeated.
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// The instance the crash came from. Lets an inspector open a file in its deployed view.
+        #[arg(long = "instance")]
+        instance: Option<String>,
         /// A plugin development folder to read crash packs from. May be repeated.
         #[arg(long = "plugin-dir")]
         plugin_dirs: Vec<PathBuf>,
@@ -4742,6 +4745,7 @@ async fn run_crash_command(
         }
         CrashCmd::Analyze {
             files,
+            instance,
             plugin_dirs,
             game_version,
             allow_code,
@@ -4751,6 +4755,7 @@ async fn run_crash_command(
                 ctx,
                 cli_crash::AnalyzeArgs {
                     files,
+                    instance,
                     plugin_dirs,
                     game_version,
                     allow_code,
@@ -13195,6 +13200,7 @@ mod tests {
                 action:
                     super::CrashCmd::Analyze {
                         files,
+                        instance,
                         plugin_dirs,
                         game_version,
                         allow_code,
@@ -13202,11 +13208,31 @@ mod tests {
                     },
             } => {
                 assert_eq!(files.len(), 2);
+                assert_eq!(instance, None);
                 assert_eq!(plugin_dirs.len(), 1);
                 assert_eq!(game_version.as_deref(), Some("1.2.3"));
                 assert!(allow_code);
                 assert!(!facts);
             }
+            _ => panic!("expected crash analyze"),
+        }
+    }
+
+    #[test]
+    fn crash_analyze_takes_an_instance_for_inspection() {
+        let cli = Cli::try_parse_from([
+            "agora",
+            "crash",
+            "analyze",
+            "friend-crash.txt",
+            "--instance",
+            "my-instance",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Commands::Crash {
+                action: super::CrashCmd::Analyze { instance, .. },
+            } => assert_eq!(instance.as_deref(), Some("my-instance")),
             _ => panic!("expected crash analyze"),
         }
     }

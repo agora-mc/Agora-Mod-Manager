@@ -3,8 +3,8 @@
 
 use agora_core::crash_engine::{
     answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusProfile, EngineFacts,
-    EvaluateInput, Inspection, InspectionRequest, Inspector, ParsedArtifact, PluginIdentity,
-    RefResolver, Resolved,
+    EvaluateInput, Inspection, InspectionOutcome, InspectionRequest, Inspector, ParsedArtifact,
+    PluginIdentity, RefResolver, Resolved,
 };
 use agora_core::crash_packs::{
     artifact_handle, built_in_identity, load_built_in_packs, load_plugin_packs,
@@ -64,8 +64,8 @@ impl RefResolver for NoResolver {
 struct NoInspector;
 
 impl Inspector for NoInspector {
-    fn inspect(&self, _request: &InspectionRequest<'_>) -> Inspection {
-        Inspection::Missing
+    fn inspect(&self, _request: &InspectionRequest<'_>) -> InspectionOutcome {
+        Inspection::Missing.into()
     }
 }
 

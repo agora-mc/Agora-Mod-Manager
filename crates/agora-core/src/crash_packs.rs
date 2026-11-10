@@ -15,10 +15,11 @@
 
 use crate::error::LauncherResult;
 use agora_game_api::crash::{
-    lint_pack_json, validate_parser_output, ArtifactHandle, BuiltInPack, CodeEntry, CoverageState,
-    CrashPack, Detect, GameHandle, LinesReply, ParseNoteKind, ParserDecl, ParserLimits,
-    ParserOutput, ParserReadError, ParserReads, ParserRequest, ReadRefusal, ReadRefused,
-    CRASH_CONTRACT_VERSION, DETECT_HEAD_BYTES,
+    lint_pack_json, validate_inspector_output, validate_parser_output, ArtifactHandle, BuiltInPack,
+    CodeEntry, CoverageState, CrashPack, Detect, GameHandle, InspectorDecl, InspectorOutput,
+    LinesReply, ParseNoteKind, ParserDecl, ParserLimits, ParserOutput, ParserReadError,
+    ParserReads, ParserRequest, ReadRefusal, ReadRefused, CRASH_CONTRACT_VERSION,
+    DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReadError, ScriptReads};
 use agora_plugin_api::manifest::{validate_package_path, PluginManifest};
@@ -752,7 +753,7 @@ fn detect_matches(detect: &Detect, name: &str, head: &[u8], text: &str) -> Resul
 }
 
 /// Case-insensitive `*` and `?`, over the name only.
-fn glob_matches(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob_matches(pattern: &str, name: &str) -> bool {
     let pattern = pattern.to_lowercase();
     let name = name.to_lowercase();
     let pattern: Vec<char> = pattern.chars().collect();
@@ -1214,6 +1215,164 @@ fn run_one(
     } else {
         ParserDispatch::Parsed(output)
     }
+}
+
+/// What one inspector said.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InspectorDispatch {
+    /// The output is valid and says what the inspector found.
+    Inspected(InspectorOutput),
+    /// It could not check the file. Never a pass.
+    Failed(ParserFailure),
+}
+
+/// Run one inspector export through the same host and read scope a parser uses.
+///
+/// The request's artifact is the one file the rule pointed at, and `reads` reaches only it. A
+/// script error, timeout, invalid output or wrong contract becomes [`InspectorDispatch::Failed`],
+/// so the caller reports "could not check", naming the plugin.
+pub fn run_inspector(
+    host: &dyn ScriptHost,
+    plugin_id: &str,
+    inspector: &InspectorDecl,
+    request: &ParserRequest,
+    reads: Arc<dyn ScriptReads>,
+) -> InspectorDispatch {
+    let limits = request.limits;
+    let effective = ParserRequest {
+        parser: inspector.id.clone(),
+        limits,
+        ..request.clone()
+    };
+    let request = &effective;
+    let reads: Arc<dyn ScriptReads> = Arc::new(LimitedReads::new(reads, limits));
+
+    let value: serde_json::Value = match &inspector.entry {
+        CodeEntry::Script { export } => {
+            let Ok(id) = agora_plugin_api::manifest::PluginId::parse(plugin_id) else {
+                return InspectorDispatch::Failed(ParserFailure::new(
+                    plugin_id,
+                    &inspector.id,
+                    ParserFailureKind::Internal,
+                    "the plugin id is not a valid id",
+                ));
+            };
+            let args = match serde_json::to_value(request) {
+                Ok(args) => args,
+                Err(error) => {
+                    return InspectorDispatch::Failed(ParserFailure::new(
+                        plugin_id,
+                        &inspector.id,
+                        ParserFailureKind::Internal,
+                        format!("could not encode the inspector request: {error}"),
+                    ))
+                }
+            };
+            let timeout = Duration::from_millis(request.limits.max_ms);
+            match host.invoke_with_reads(&id, export, args, timeout, reads) {
+                Ok(value) => value,
+                Err(error) => {
+                    let kind = match error.code {
+                        agora_plugin_api::PluginErrorCode::Timeout => ParserFailureKind::TimedOut,
+                        agora_plugin_api::PluginErrorCode::ResourceExhausted => {
+                            ParserFailureKind::OutOfMemory
+                        }
+                        agora_plugin_api::PluginErrorCode::Cancelled => {
+                            ParserFailureKind::Cancelled
+                        }
+                        agora_plugin_api::PluginErrorCode::NotActivated => {
+                            ParserFailureKind::NotRunning
+                        }
+                        agora_plugin_api::PluginErrorCode::ScriptError
+                            if error.message.contains("exports no function named") =>
+                        {
+                            ParserFailureKind::MissingExport
+                        }
+                        agora_plugin_api::PluginErrorCode::ScriptError => {
+                            if error.message.contains("interrupted") {
+                                ParserFailureKind::TimedOut
+                            } else {
+                                ParserFailureKind::ScriptThrew
+                            }
+                        }
+                        _ => ParserFailureKind::Internal,
+                    };
+                    return InspectorDispatch::Failed(ParserFailure::new(
+                        plugin_id,
+                        &inspector.id,
+                        kind,
+                        error.message,
+                    ));
+                }
+            }
+        }
+        _ => {
+            return InspectorDispatch::Failed(ParserFailure::new(
+                plugin_id,
+                &inspector.id,
+                ParserFailureKind::UnsupportedEntry,
+                "this build runs script inspectors only",
+            ))
+        }
+    };
+
+    let size = match serde_json::to_vec(&value) {
+        Ok(encoded) => encoded.len(),
+        Err(error) => {
+            return InspectorDispatch::Failed(ParserFailure::new(
+                plugin_id,
+                &inspector.id,
+                ParserFailureKind::InvalidOutput,
+                format!("the output was not JSON: {error}"),
+            ))
+        }
+    };
+    if size > MAX_PARSER_OUTPUT_BYTES {
+        return InspectorDispatch::Failed(ParserFailure::new(
+            plugin_id,
+            &inspector.id,
+            ParserFailureKind::OutputTooLarge,
+            format!("the output is {size} bytes; the limit is {MAX_PARSER_OUTPUT_BYTES}"),
+        ));
+    }
+
+    let output: InspectorOutput = match serde_json::from_value(value) {
+        Ok(output) => output,
+        Err(error) => {
+            return InspectorDispatch::Failed(ParserFailure::new(
+                plugin_id,
+                &inspector.id,
+                ParserFailureKind::InvalidOutput,
+                format!("the output is not the crash contract's inspector shape: {error}"),
+            ))
+        }
+    };
+    if output.contract != CRASH_CONTRACT_VERSION {
+        return InspectorDispatch::Failed(ParserFailure::new(
+            plugin_id,
+            &inspector.id,
+            ParserFailureKind::WrongContract,
+            format!(
+                "output says contract {}, and this Agora reads {CRASH_CONTRACT_VERSION}",
+                output.contract
+            ),
+        ));
+    }
+    let problems = validate_inspector_output(&output, &request.limits);
+    if !problems.is_empty() {
+        let message = problems
+            .iter()
+            .map(|problem| problem.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return InspectorDispatch::Failed(ParserFailure::new(
+            plugin_id,
+            &inspector.id,
+            ParserFailureKind::InvalidOutput,
+            message,
+        ));
+    }
+    InspectorDispatch::Inspected(output)
 }
 
 /// Build the handle a parser request carries for one artifact.

@@ -59,6 +59,7 @@ fn analyze_text(text: &str) -> AnalyzeOutput {
         runtime_version: None,
         host: &host,
         built_in: &built_in,
+        instance: None,
     })
     .expect("the crash report is read")
 }

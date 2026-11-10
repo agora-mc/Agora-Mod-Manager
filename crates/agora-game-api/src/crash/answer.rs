@@ -1,6 +1,8 @@
 //! What the engine produces. A plugin's rules feed it; the UI shows it.
 
-use super::{LocalText, MatchedBy, NextStepKind, Privacy, SessionVerdict, SourceSpan};
+use super::{
+    Fact, InspectResult, LocalText, MatchedBy, NextStepKind, Privacy, SessionVerdict, SourceSpan,
+};
 use serde::{Deserialize, Serialize};
 
 /// How sure Agora is. **There is no "certain" here, on purpose** (MASTER_SPEC §30.5): false
@@ -284,6 +286,21 @@ pub enum Retained {
     NotRetained { why: String },
 }
 
+/// A deeper check an inspector made. It is shown so that the inspector's own detail and facts reach
+/// the user even when the rule builds no finding from them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InspectionRecord {
+    pub inspector: String,
+    /// The ref's value, as the rule named it.
+    pub target: String,
+    pub result: InspectResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<Fact>,
+    pub source: SourceAttribution,
+}
+
 /// A warning about all the evidence, with who raised it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustNote {
@@ -293,7 +310,7 @@ pub struct TrustNote {
 
 /// The answer to "why did my game crash?". Abstaining is an answer: `level` `not_sure`, no
 /// candidates, and a next step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CrashAnswer {
     pub contract: u32,
     pub verdict: SessionVerdict,
@@ -302,6 +319,9 @@ pub struct CrashAnswer {
     /// Ranked, strongest first. Empty when Agora isn't naming anyone.
     pub candidates: Vec<Candidate>,
     pub findings: Vec<Finding>,
+    /// What each deeper check found, so its detail and facts are not lost.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inspections: Vec<InspectionRecord>,
     pub could_not_check: Vec<CouldNotCheck>,
     pub trust_notes: Vec<TrustNote>,
     pub next: NextStep,

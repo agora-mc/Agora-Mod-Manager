@@ -243,6 +243,12 @@ pub trait GameReads: Send + Sync {
     /// At most `len` bytes from `offset`, or an error that says why.
     fn read_bytes(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ScriptReadError>;
 
+    /// The file's size in bytes, when the scope can tell without reading it. A scope that cannot
+    /// says `None`, and a caller must not treat that as an empty file.
+    fn size(&self, _path: &str) -> Option<u64> {
+        None
+    }
+
     /// Lines as text, shaped like the crash contract's `LinesReply`.
     fn read_lines(
         &self,

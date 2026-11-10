@@ -2,8 +2,8 @@
 //! quiet on a case close to it. The parsers' own outputs are tested in the game package.
 
 use agora_core::crash_engine::{
-    evaluate, EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionRequest, Inspector,
-    PackInput, ParsedArtifact, RefResolver, Resolved,
+    evaluate, EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionOutcome,
+    InspectionRequest, Inspector, PackInput, ParsedArtifact, RefResolver, Resolved,
 };
 use agora_core::crash_packs::{built_in_identity, load_built_in_packs, BUILT_IN_PLUGIN_ID};
 use agora_game_api::crash::{
@@ -53,8 +53,8 @@ impl RefResolver for MapResolver {
 struct NoInspector;
 
 impl Inspector for NoInspector {
-    fn inspect(&self, _request: &InspectionRequest<'_>) -> Inspection {
-        Inspection::Missing
+    fn inspect(&self, _request: &InspectionRequest<'_>) -> InspectionOutcome {
+        Inspection::Missing.into()
     }
 }
 
