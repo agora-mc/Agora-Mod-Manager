@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import build_loot_wasm
 import build_official_plugin as bop
+import gen_addrlib_names as gan
 import crash_benchmark as cb
 import fetch_loader_manifests
 import deploy_release_assets
@@ -4012,6 +4013,140 @@ class TestCrashBenchmark(unittest.TestCase):
             )
 
         self.assertIn("ghost", str(raised.exception))
+
+
+class TestGenAddrlibNames(unittest.TestCase):
+    """The Address Library name generator, on a tiny invented checkout."""
+
+    CPS = "void Thing::Go()\n{\n\tusing func_t = decltype(&Thing::Go);\n\tstatic REL::Relocation<func_t> func{ RELOCATION_ID(100, 200) };\n}\n"
+
+    def _checkout(self, root: Path) -> Path:
+        (root / "src" / "A").mkdir(parents=True)
+        (root / "src" / "Z").mkdir(parents=True)
+        (root / "include" / "E").mkdir(parents=True)
+        (root / "src" / "A" / "Example.cpp").write_text(
+            "namespace Example {\n"
+            "void Thing::Go()\n{\n"
+            "\tusing func_t = decltype(&Thing::Go);\n"
+            "\tstatic REL::Relocation<func_t> func{ RELOCATION_ID(100, 200) };\n"
+            "}\n"
+            "void First::One()\n{\n"
+            "\tstatic REL::Relocation<func_t> func{ REL::RelocationID(108, 208) };\n"
+            "}\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "Z" / "Conflict.cpp").write_text(
+            "namespace Example {\n"
+            "void Second::Two()\n{\n"
+            "\tstatic REL::Relocation<func_t> func{ RELOCATION_ID(108, 208) };\n"
+            "}\n"
+            "}\n"
+            "// RELOCATION_ID(999, 999) in a comment is not a source shape\n",
+            encoding="utf-8",
+        )
+        (root / "include" / "E" / "Example.h").write_text(
+            "namespace Example {\n"
+            "class ExampleThing {\n"
+            "public:\n"
+            "\tint GetValue()\n"
+            "\t{\n"
+            "\t\tusing func_t = decltype(&ExampleThing::GetValue);\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::RelocationID(101, 201) };\n"
+            "\t\treturn func(this);\n"
+            "\t}\n"
+            "\tvoid MakeVariant()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::VariantID(102, 202, 0x999) };\n"
+            "\t}\n"
+            "\tstruct Holder {\n"
+            "\t\tinline static REL::Relocation<int*> value{ RELOCATION_ID(109, 209) };\n"
+            "\t};\n"
+            "#ifdef ENABLE_SKYRIM_AE\n"
+            "\tvoid AeOnly()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::ID(103) };\n"
+            "\t}\n"
+            "#endif\n"
+            "#ifdef ENABLE_SKYRIM_VR\n"
+            "\tvoid VrOnly()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::ID(110) };\n"
+            "\t}\n"
+            "#endif\n"
+            "\tvoid Ambiguous()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::ID(104) };\n"
+            "\t}\n"
+            "};\n"
+            "constexpr std::array<REL::VariantID, 1> VTABLE_Ignored{ REL::VariantID(105, 205, 0x8) };\n"
+            "constexpr REL::VariantID NiRTTI_Ignored(106, 206, 0x9);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        root.with_name(root.name + ".commit").write_text(
+            "https://example.test/invented deadbeef\nMIT\n", encoding="utf-8"
+        )
+        return root
+
+    def test_names_are_split_by_runtime_and_first_path_wins(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "checkout"
+            self._checkout(root)
+            out = Path(temporary) / "names.json"
+            result = gan.generate(root, out, out.with_suffix(".js"))
+
+            table = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(table["source"]["repo"], "https://example.test/invented")
+            self.assertEqual(table["source"]["commit"], "deadbeef")
+            self.assertEqual(table["source"]["licence"], "MIT")
+            self.assertEqual(table["se"]["100"], "Thing::Go")
+            self.assertEqual(table["ae"]["200"], "Thing::Go")
+            self.assertEqual(table["se"]["101"], "ExampleThing::GetValue")
+            self.assertEqual(table["se"]["102"], "ExampleThing::MakeVariant")
+            self.assertEqual(table["se"]["109"], "ExampleThing::Holder::value")
+            self.assertEqual(table["se"]["108"], "First::One")
+            self.assertEqual(table["ae"]["208"], "First::One")
+            self.assertEqual(table["ae"]["103"], "ExampleThing::AeOnly")
+            self.assertNotIn("103", table["se"])
+            self.assertNotIn("104", table["se"])
+            self.assertNotIn("104", table["ae"])
+            self.assertNotIn("105", table["se"])
+            self.assertNotIn("106", table["ae"])
+            self.assertNotIn("999", table["se"])
+            self.assertNotIn("999", table["ae"])
+            self.assertEqual(result["conflicts"], 2)
+            self.assertTrue(any("offset table" in shape for shape in result["unparsed"]))
+            self.assertTrue(
+                any("namespace-scope id constant" in shape for shape in result["unparsed"])
+            )
+            self.assertTrue(
+                any("REL::ID with no single runtime" in shape for shape in result["unparsed"])
+            )
+            js = out.with_suffix(".js").read_text(encoding="utf-8")
+            self.assertIn("export const SE_NAMES", js)
+            self.assertIn('"100": "Thing::Go"', js)
+
+    def test_a_rerun_on_the_same_checkout_is_byte_identical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "checkout"
+            self._checkout(root)
+            first = Path(temporary) / "one.json"
+            second = Path(temporary) / "two.json"
+            gan.generate(root, first, first.with_suffix(".js"))
+            gan.generate(root, second, second.with_suffix(".js"))
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(
+                first.with_suffix(".js").read_bytes(),
+                second.with_suffix(".js").read_bytes(),
+            )
+
+    def test_missing_source_metadata_is_an_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "checkout"
+            root.mkdir()
+            with self.assertRaises(gan.GenerationError):
+                gan.generate(root, Path(temporary) / "names.json")
 
 
 if __name__ == "__main__":
