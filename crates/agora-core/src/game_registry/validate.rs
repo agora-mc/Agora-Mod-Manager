@@ -156,6 +156,17 @@ pub fn validate_plugin(
             }
         }
         let definition = package.definition.clone();
+        // A base package may contribute only templates; the official-plugin build
+        // accepts that too. The registry itself registers games, so there is nothing
+        // to add here, but the package is otherwise valid and its exports are checked.
+        if definition.games.is_empty() && !definition.game_templates.is_empty() {
+            report.packages.push(CheckedGamePackage {
+                file: file.clone(),
+                id: definition.id.clone(),
+            });
+            checked.push((file, definition));
+            continue;
+        }
         let package_for_registry = Arc::new(DeclarativePackage(definition.clone()))
             as Arc<dyn agora_game_api::GamePackage>;
         match builder.add(package.source.clone(), package_for_registry) {

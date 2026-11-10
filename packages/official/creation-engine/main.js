@@ -10,7 +10,7 @@
 // the master flag, and `.esl` implies light.
 // Source for the flags and extensions: https://github.com/Ortham/esplugin (GameId handling).
 
-import { game, net, storage, wasm } from "agora";
+import { crash, game, net, storage, wasm } from "agora";
 
 const MASTER_FLAG = 0x1;
 const LIGHT_FLAG = 0x200;
@@ -177,6 +177,1460 @@ export function creationEngineRules(args) {
   }
 
   return { rules: rules, badges: badges, findings: findings };
+}
+
+// ---------------------------------------------------------------------------
+// Crash log parsers (MASTER_SPEC §30.11)
+//
+// Two tools write Creation Engine crash logs: Crash Logger (CrashLoggerSSE) and
+// Trainwreck. Both are plain text with the same broad sections, but the exact
+// line shapes changed across versions. These parsers feature-detect: they keep
+// whatever section of the version they are given, and their coverage says what
+// they looked for so an absent section is "could not check", not "not there".
+//
+// Crash Logger's format and its default output folder, `Documents/My Games/
+// <game>/SKSE/crash-<timestamp>.log`, come from its own source:
+// https://github.com/alandtse/CrashLoggerSSE (MIT). Trainwreck has no source
+// here, so its format was learned from the logs themselves; its folder and
+// filename pattern are marked unverified in crash/FACTS.md.
+//
+// A parser sees no paths. It reads only the artifact id it was given.
+
+const CRASH_CONTRACT = 1;
+
+const CRASH_SECTIONS = new Set([
+  "SYSTEM SPECS:",
+  "VR SPECS:",
+  "PROCESS INFO:",
+  "PROBABLE CALL STACK:",
+  "CALL STACK ([P]robable / [S]tack scan):",
+  "CALL STACK (HYBRID):",
+  "RAW CALL STACK:",
+  "REGISTERS:",
+  "STACK:",
+  "MODULES:",
+  "SKSE PLUGINS:",
+  "SCRIPT EXTENDER PLUGINS:",
+  "PLUGINS:",
+  "POSSIBLE RELEVANT OBJECTS:",
+  "ACCESS VIOLATION ANALYSIS:",
+  "THREAD CONTEXT (HEURISTIC):",
+  "GAME STATE:",
+  "C++ EXCEPTION:",
+  "CRASH LOG REPORT:",
+  "CRASHED WHILE LOADING A MODEL (this thread, newest first):",
+  "MODEL PATHS FOR RESOURCE IDS ON THIS THREAD'S STACK (innermost first):",
+]);
+
+const SCALAR_TYPE = /^(?:void|char|bool|float|double|long|short|int|unsigned(?:\s+\w+)?|signed(?:\s+\w+)?|size_t|ssize_t|intptr_t|uintptr_t|std::size_t|std::ssize_t|std::intptr_t|std::uintptr_t|u?int(?:8|16|32|64)_t|DWORD|QWORD|WORD|BYTE|HANDLE|HMODULE|LPVOID|PVOID)$/;
+
+const ASSET_EXTENSION = /\.(?:nif|dds|hkx|pex|psc|tri|kf|kfm|egm|egt|lip|wav|xwm|fuz|swf|gfx|ini|json|txt|bsa|ba2)$/i;
+const PLUGIN_EXTENSION = /\.(?:esp|esm|esl)$/i;
+const SOURCE_PATTERN = /(?:^|[\s\[])((?:[A-Za-z]:[\\/])?[^\[\]\s|]+?\.(?:cpp|c|cc|cxx|h|hpp|hxx)):(\d+)/;
+const STRENGTH_ORDER = { mention: 0, object: 1, exec: 2, exec_top: 3 };
+
+function crashText(value) {
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function crashTrim(value) {
+  return crashText(value).trim();
+}
+
+function crashUnquote(value) {
+  const text = crashTrim(value);
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
+    return text.slice(1, -1);
+  }
+  return text;
+}
+
+function crashClean(value, maxAttr) {
+  const text = crashText(value);
+  return text.length > maxAttr ? text.slice(0, maxAttr) : text;
+}
+
+function crashNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+/// Prefix uppercase, as the logs print addresses. Addresses and form ids travel
+/// as text because a script number holds only 53 bits.
+function crashHex(text) {
+  return "0x" + crashTrim(text).replace(/^0x/i, "").toUpperCase();
+}
+
+function crashIndent(line) {
+  let width = 0;
+  for (const character of line) {
+    if (character === "\t") width += 4;
+    else if (character === " ") width += 1;
+    else break;
+  }
+  return width;
+}
+
+function crashIsSectionHeader(line) {
+  const text = line.trim();
+  if (CRASH_SECTIONS.has(text)) return true;
+  if (text.length < 4 || text.length > 120 || !text.endsWith(":")) return false;
+  if (!/^[A-Z]/.test(text)) return false;
+  return /^[A-Z][A-Z0-9 ()'\/\[\]\-\.\+]+:$/.test(text);
+}
+
+function crashSections(lines) {
+  const headers = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (crashIsSectionHeader(lines[index])) {
+      headers.push({
+        name: lines[index].trim().replace(/:$/, ""),
+        start: index,
+        end: lines.length,
+      });
+    }
+  }
+  for (let index = 0; index + 1 < headers.length; index += 1) {
+    headers[index].end = headers[index + 1].start;
+  }
+  const map = {};
+  for (const header of headers) {
+    if (!(header.name in map)) map[header.name] = header;
+  }
+  return { headers, map };
+}
+
+function crashReadAllLines(request) {
+  const artifact = request.artifact.id;
+  const maxLines = crashNumber(request.limits.max_lines) || 100000;
+  const chunk = Math.max(1, Math.min(maxLines, 20000));
+  const lines = [];
+  let from = 0;
+  let cut = false;
+  let gap = false;
+  let budget = false;
+
+  for (let guard = 0; guard < 64; guard += 1) {
+    let reply;
+    try {
+      reply = crash.readLines(artifact, from, chunk);
+    } catch (error) {
+      return {
+        lines,
+        cut,
+        gap,
+        budget,
+        error: String(error && error.message ? error.message : error),
+      };
+    }
+    if (!reply || !Array.isArray(reply.lines)) {
+      return { lines, cut, gap, budget, error: "the host returned no lines" };
+    }
+    for (const line of reply.lines) lines.push(line);
+    if (reply.cut) cut = true;
+    if (reply.gap) gap = true;
+    if (reply.next_line === undefined || reply.next_line === null) break;
+    if (reply.next_line <= from) break;
+    from = reply.next_line;
+    if (lines.length >= maxLines * 2) {
+      budget = true;
+      break;
+    }
+  }
+  return { lines, cut, gap, budget, error: null };
+}
+
+function crashVersion(text) {
+  const value = crashTrim(text).replace(/^v/i, "").replace(/-/g, ".");
+  return value || undefined;
+}
+
+function crashGameVersionAtLeast(version, major, minor, patch) {
+  const parts = crashText(version)
+    .split(".")
+    .map((part) => Number(part));
+  const got = [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+  const wanted = [major || 0, minor || 0, patch || 0];
+  for (let index = 0; index < 3; index += 1) {
+    if (got[index] > wanted[index]) return true;
+    if (got[index] < wanted[index]) return false;
+  }
+  return true;
+}
+
+function crashProducerHeader(lines, format) {
+  let producer;
+  let gameLine;
+  for (const line of lines.slice(0, 40)) {
+    if (!producer) {
+      if (format === "crash_logger") {
+        const match = line.match(/CrashLoggerSSE\s+v([0-9][0-9A-Za-z.\-]*)/);
+        if (match) producer = crashVersion(match[1]);
+      } else if (format === "trainwreck") {
+        const match = line.match(/^trainwreck\s+v([0-9][0-9A-Za-z.\-]*)/);
+        if (match) producer = crashVersion(match[1]);
+      }
+    }
+    if (!gameLine) {
+      // Some uploaded logs lost the first character of "Skyrim"; the rest of
+      // the line still has everything that matters.
+      const match = line.match(/^\s*S?kyrim\s*(SSE|SE|VR)\s+v([0-9][0-9A-Za-z.\-]*)/);
+      if (match) gameLine = { edition: match[1], version: match[2] };
+    }
+  }
+  if (!producer) return null;
+  let edition = gameLine ? gameLine.edition : undefined;
+  if (!edition) {
+    const exception = lines.find((line) => /^\s*Unhandled exception\b/.test(line));
+    if (exception && /SkyrimVR\.exe/i.test(exception)) edition = "VR";
+    else if (exception && /SkyrimSE\.exe/i.test(exception)) edition = "SSE";
+  }
+  const vr = edition === "VR";
+  return {
+    format,
+    version: producer,
+    game: {
+      name: "Skyrim",
+      edition: edition === "VR" ? "VR" : edition === "SE" || edition === "SSE" ? "SSE" : undefined,
+      version: gameLine ? gameLine.version : undefined,
+      vr: edition ? vr : undefined,
+      executable: edition ? (vr ? "SkyrimVR.exe" : "SkyrimSE.exe") : undefined,
+    },
+  };
+}
+
+function crashFindLine(lines, pattern) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(pattern);
+    if (match) return { match, index, line: lines[index] };
+  }
+  return null;
+}
+
+function crashFindSection(sections, name) {
+  if (sections.map[name]) return sections.map[name];
+  for (const header of sections.headers) {
+    if (header.name.startsWith(name)) return header;
+  }
+  return undefined;
+}
+
+function crashScalar(value) {
+  return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+}
+
+function crashAddAttr(attrs, name, value, limits) {
+  if (value === undefined || value === null) return;
+  if (!crashScalar(value)) return;
+  if (typeof value === "string") {
+    if (value.length === 0) return;
+    attrs[name] = crashClean(value, limits.max_attr_len);
+  } else {
+    attrs[name] = value;
+  }
+}
+
+function crashAddRef(refs, kind, value, strength, limits) {
+  const text = crashClean(crashUnquote(value), limits.max_attr_len);
+  if (!text) return;
+  const key = kind + "\u0000" + text;
+  const previous = refs.get(key);
+  if (previous) {
+    if ((STRENGTH_ORDER[strength] || 0) > (STRENGTH_ORDER[previous.strength] || 0)) {
+      previous.strength = strength;
+    }
+    return;
+  }
+  refs.set(key, { kind, value: text, strength: strength || "mention" });
+}
+
+function crashRefList(refs, limits, state) {
+  const all = Array.from(refs.values());
+  const max = crashNumber(limits.max_refs_per_fact) || 16;
+  if (all.length > max) {
+    state.refsTruncated = true;
+    return all.slice(0, max);
+  }
+  return all;
+}
+
+function crashPushFact(state, limits, fact) {
+  if (state.facts.length >= (crashNumber(limits.max_facts) || 20000)) {
+    state.budgetSpent = true;
+    return false;
+  }
+  state.facts.push(fact);
+  state.kinds[fact.kind] = (state.kinds[fact.kind] || 0) + 1;
+  return true;
+}
+
+function crashSpan(section, start, end) {
+  const span = { section };
+  if (start !== undefined) span.line_start = start + 1;
+  if (end !== undefined) span.line_end = end + 1;
+  return span;
+}
+
+function crashLooksLikePath(value) {
+  const text = crashUnquote(value);
+  return (text.includes("\\") || text.includes("/")) && ASSET_EXTENSION.test(text);
+}
+
+function crashPointerClass(address) {
+  if (!address) return undefined;
+  let value;
+  try {
+    value = BigInt(address);
+  } catch (error) {
+    return undefined;
+  }
+  if (value === 0n) return "null";
+  if (value < 0x10000n) return "near_null";
+  if (value >= 0xfffffffffffffff0n) return "non_canonical";
+  if (value >= 0xffff800000000000n) return "kernel";
+  if (value > 0x00007fffffffffffn) return "non_canonical";
+  return "user";
+}
+
+function crashExceptionCategory(code) {
+  const name = crashText(code).toUpperCase();
+  if (name.includes("ACCESS_VIOLATION")) return "access_violation";
+  if (name.includes("IN_PAGE_ERROR")) return "access_violation";
+  if (name.includes("STACK_OVERFLOW")) return "unknown";
+  if (name.includes("BREAKPOINT")) return "assert";
+  if (name.includes("ASSERT")) return "assert";
+  if (name.includes("OUT_OF_MEMORY") || name.includes("MEMORY")) return "oom";
+  if (name.includes("FAST_FAIL")) return "fast_fail";
+  return "unknown";
+}
+
+function crashIsObjectType(type) {
+  const text = crashTrim(type)
+    .replace(/^(?:const|struct|class)\s+/, "")
+    .replace(/\s*\*+$/, "")
+    .trim();
+  return text.length > 0 && !SCALAR_TYPE.test(text);
+}
+
+function crashSplitType(type) {
+  const text = crashText(type);
+  const arrow = text.indexOf(" -> ");
+  const base = (arrow >= 0 ? text.slice(0, arrow) : text).trim();
+  let module;
+  let offset;
+  if (arrow >= 0) {
+    const target = text.slice(arrow + 4);
+    const match = target.match(/^(\S+?)\+([0-9A-Fa-f]+)/);
+    if (match) {
+      module = match[1];
+      offset = crashHex(match[2]);
+    }
+  }
+  return { type: base, module, offset };
+}
+
+function crashObjectHeader(line, logType) {
+  const compact = line.match(/^[\t ]+([A-Z][A-Z0-9+]*):\s*\((.*?)\)(.*)$/);
+  if (compact) {
+    return {
+      compact: true,
+      place: compact[1],
+      value: "",
+      type: compact[2],
+      rest: compact[3],
+    };
+  }
+  const stack = line.match(/^[\t ]+\[RSP\+([0-9A-Fa-f]+)\s*\]\s+0x([0-9A-Fa-f]+)\s+\((.*)\)\s*(?:\[[^\]]*\])?\s*$/);
+  if (stack) {
+    const split = crashSplitType(stack[3]);
+    return {
+      compact: false,
+      place: "RSP+" + stack[1].toUpperCase(),
+      value: crashHex(stack[2]),
+      type: split.type,
+      module: split.module,
+      moduleOffset: split.offset,
+    };
+  }
+  const register = line.match(/^[\t ]+([A-Z][A-Z0-9]*)\s+0x([0-9A-Fa-f]+)\s+\((.*)\)\s*(?:\[[^\]]*\])?\s*$/);
+  if (register) {
+    const split = crashSplitType(register[3]);
+    return {
+      compact: false,
+      place: register[1],
+      value: crashHex(register[2]),
+      type: split.type,
+      module: split.module,
+      moduleOffset: split.offset,
+    };
+  }
+  return null;
+}
+
+function crashField(line) {
+  const match = line.match(/^[\t ]*([A-Za-z][A-Za-z0-9 _\/\-\.]*):\s*(.*)$/);
+  if (!match) return null;
+  return { label: match[1].trim(), value: match[2].trim() };
+}
+
+function crashAddField(object, label, value) {
+  if (!(label in object.fields)) object.fields[label] = [];
+  object.fields[label].push(value);
+}
+
+// Iterative on purpose: real logs nest decoded objects deeply enough that a
+// recursive walk overflows the script stack.
+function crashParseBlock(lines, root, baseIndent) {
+  const stack = [{ indent: baseIndent, object: root }];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.trim() === "") {
+      index += 1;
+      continue;
+    }
+    const indent = crashIndent(line);
+    const field = crashField(line);
+    if (!field) {
+      index += 1;
+      continue;
+    }
+    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) {
+      stack.pop();
+    }
+    const object = stack[stack.length - 1].object;
+    let peek = index + 1;
+    while (peek < lines.length && lines[peek].trim() === "") peek += 1;
+    const hasChildren = peek < lines.length && crashIndent(lines[peek]) > indent;
+    if (hasChildren) {
+      const child = {
+        place: object.place,
+        value: "",
+        type: field.label,
+        field: field.label,
+        name: field.value,
+        depth: object.depth + 1,
+        fields: {},
+        children: [],
+        line: object.line,
+        endLine: object.endLine,
+      };
+      object.children.push(child);
+      stack.push({ indent, object: child });
+    } else {
+      crashAddField(object, field.label, field.value);
+    }
+    index += 1;
+  }
+}
+
+function crashFieldList(object, names) {
+  for (const name of names) {
+    const values = object.fields[name];
+    if (values && values.length > 0) return values;
+  }
+  return [];
+}
+
+function crashObjectAttrs(object, limits) {
+  const attrs = {};
+  crashAddAttr(attrs, "type", object.type, limits);
+  crashAddAttr(attrs, "place", object.place, limits);
+  crashAddAttr(attrs, "value", object.value, limits);
+  if (object.field) crashAddAttr(attrs, "field", object.field, limits);
+  if (object.depth) crashAddAttr(attrs, "depth", object.depth, limits);
+  if (object.name) crashAddAttr(attrs, "name", crashUnquote(object.name), limits);
+  if (!object.name) {
+    for (const name of crashFieldList(object, ["Name", "Full Name", "Object Reference", "GetFullName"])) {
+      const value = crashUnquote(name);
+      if (value && value !== "None" && value !== "---") {
+        crashAddAttr(attrs, "name", value, limits);
+        break;
+      }
+    }
+  }
+  for (const form of crashFieldList(object, ["FormID", "Form ID"])) {
+    crashAddAttr(attrs, "form_id", crashUnquote(form), limits);
+    break;
+  }
+  for (const editor of crashFieldList(object, ["EditorID", "Editor ID"])) {
+    crashAddAttr(attrs, "editor_id", crashUnquote(editor), limits);
+    break;
+  }
+  for (const type of crashFieldList(object, ["FormType", "Form Type"])) {
+    crashAddAttr(attrs, "form_type", crashTrim(type), limits);
+    break;
+  }
+  for (const flags of crashFieldList(object, ["Flags"])) {
+    crashAddAttr(attrs, "flags", crashTrim(flags), limits);
+    break;
+  }
+  for (const rtti of crashFieldList(object, ["RTTIName"])) {
+    crashAddAttr(attrs, "rtti", crashUnquote(rtti), limits);
+    break;
+  }
+  return attrs;
+}
+
+function crashObjectRefs(object, limits, state) {
+  const refs = new Map();
+  for (const file of crashFieldList(object, ["File"])) {
+    const value = crashUnquote(file);
+    if (!value) continue;
+    if (PLUGIN_EXTENSION.test(value) && !value.includes("\\") && !value.includes("/")) {
+      crashAddRef(refs, "plugin", value, "object", limits);
+    } else if (crashLooksLikePath(value)) {
+      crashAddRef(refs, "file", value, "object", limits);
+    }
+  }
+  for (const form of crashFieldList(object, ["FormID", "Form ID"])) {
+    crashAddRef(refs, "form", crashUnquote(form), "object", limits);
+  }
+  for (const script of crashFieldList(object, ["Script", "Script Name"])) {
+    crashAddRef(refs, "script", crashUnquote(script), "object", limits);
+  }
+  for (const name of [
+    "Name",
+    "Full Name",
+    "Object Reference",
+    "GetFullName",
+  ]) {
+    for (const value of crashFieldList(object, [name])) {
+      if (crashLooksLikePath(value)) crashAddRef(refs, "file", value, "object", limits);
+    }
+  }
+  for (const name of [
+    "Animation Name",
+    "Skeleton Name",
+    "fxpFilename",
+    "inputFilePath",
+    "filePath",
+    "streamName",
+    "Path",
+    "Model",
+  ]) {
+    for (const value of crashFieldList(object, [name])) {
+      if (crashLooksLikePath(value)) crashAddRef(refs, "file", value, "object", limits);
+    }
+  }
+  // Any other field that plainly names an asset is still a file ref.
+  for (const values of Object.values(object.fields)) {
+    for (const value of values) {
+      if (crashLooksLikePath(value)) crashAddRef(refs, "file", value, "object", limits);
+    }
+  }
+  return crashRefList(refs, limits, state);
+}
+
+function crashEmitChain(state, limits, object, section) {
+  const chains = crashFieldList(object, ["Modified by"]);
+  for (const chain of chains) {
+    const parts = crashText(chain)
+      .split("->")
+      .map((part) => crashUnquote(part))
+      .filter((part) => part.length > 0);
+    if (parts.length === 0) continue;
+    const max = crashNumber(limits.max_refs_per_fact) || 16;
+    for (let start = 0; start < parts.length; start += max) {
+      const refs = new Map();
+      for (const part of parts.slice(start, start + max)) {
+        crashAddRef(refs, "plugin", part, "object", limits);
+      }
+      const attrs = {
+        place: object.place,
+        depth: object.depth,
+        field: "modified_by",
+        start,
+      };
+      crashAddAttr(attrs, "form_id", object.fields["FormID"] ? crashUnquote(object.fields["FormID"][0]) : undefined, limits);
+      crashPushFact(state, limits, {
+        kind: "creation.plugin_chain",
+        attrs,
+        refs: crashRefList(refs, limits, state),
+        span: crashSpan(section, object.line, object.endLine),
+      });
+    }
+  }
+}
+
+function crashEmitObject(state, limits, root, section, isRoot) {
+  const stack = [{ object: root, isRoot }];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const object = current.object;
+    if (current.isRoot && !crashIsObjectType(object.type) && object.children.length === 0) {
+      const interesting = [
+        "File",
+        "FormID",
+        "Form ID",
+        "EditorID",
+        "Editor ID",
+        "Modified by",
+        "RTTIName",
+      ].some((name) => (object.fields[name] || []).length > 0);
+      if (!interesting) continue;
+    }
+    const attrs = crashObjectAttrs(object, limits);
+    const refs = crashObjectRefs(object, limits, state);
+    if (crashPushFact(state, limits, {
+      kind: "creation.object",
+      attrs,
+      refs,
+      span: crashSpan(section, object.line, object.endLine),
+    })) {
+      crashEmitChain(state, limits, object, section);
+    }
+    for (let index = object.children.length - 1; index >= 0; index -= 1) {
+      stack.push({ object: object.children[index], isRoot: false });
+    }
+  }
+}
+
+function crashParseObjects(state, limits, lines, section, logType) {
+  const start = section.start + 1;
+  let index = start;
+  while (index < section.end) {
+    const line = lines[index];
+    const header = crashObjectHeader(line, logType);
+    if (!header) {
+      index += 1;
+      continue;
+    }
+    if (header.compact) {
+      const attrs = { place: header.place };
+      crashAddAttr(attrs, "type", header.type, limits);
+      const refs = new Map();
+      const name = header.rest.match(/"([^"]*)"/);
+      if (name) crashAddAttr(attrs, "name", name[1], limits);
+      const plugin = header.rest.match(/\("([^"]*)"\)/) || header.rest.match(/"([^"]*\.(?:esp|esm|esl))"/i);
+      if (plugin) crashAddRef(refs, "plugin", plugin[1], "object", limits);
+      const forms = Array.from(header.rest.matchAll(/\[(0x[0-9A-Fa-f]+)\]/g));
+      if (forms.length > 0) {
+        crashAddAttr(attrs, "form_id", forms[0][1], limits);
+        for (const form of forms) crashAddRef(refs, "form", form[1], "object", limits);
+      }
+      crashPushFact(state, limits, {
+        kind: "creation.object",
+        attrs,
+        refs: crashRefList(refs, limits, state),
+        span: crashSpan(section.name, index, index),
+      });
+      index += 1;
+      continue;
+    }
+    const headerIndent = crashIndent(line);
+    let end = index + 1;
+    while (end < section.end) {
+      if (lines[end].trim() === "") break;
+      const indent = crashIndent(lines[end]);
+      if (indent <= headerIndent) break;
+      end += 1;
+    }
+    const object = {
+      place: header.place,
+      value: header.value,
+      type: header.type,
+      depth: 0,
+      fields: {},
+      children: [],
+      line: index,
+      endLine: end - 1,
+    };
+    crashParseBlock(lines.slice(index + 1, end), object, headerIndent);
+    crashEmitObject(state, limits, object, section.name, true);
+    if (header.module) {
+      // A scalar pointer into a module is a code address, not an object.
+      const refs = new Map();
+      crashAddRef(refs, "module", header.module, "mention", limits);
+      const attrs = { place: header.place, value: header.value, module_offset: header.moduleOffset };
+      crashPushFact(state, limits, {
+        kind: "creation.code_pointer",
+        attrs,
+        refs: crashRefList(refs, limits, state),
+        span: crashSpan(section.name, index, index),
+      });
+    }
+    index = end;
+  }
+}
+
+function crashParseSystem(state, limits, sections, lines) {
+  const section = crashFindSection(sections, "SYSTEM SPECS");
+  if (!section) return false;
+  const attrs = {};
+  const gpus = [];
+  const memory = {};
+  const processor = {};
+  for (let index = section.start + 1; index < section.end; index += 1) {
+    const line = lines[index];
+    const text = line.trim();
+    let match = text.match(/^OS:\s*(.*)$/);
+    if (match) crashAddAttr(attrs, "os", match[1], limits);
+    match = text.match(/^CPU:\s*(.*)$/);
+    if (match) {
+      const cpu = match[1].trim();
+      const space = cpu.indexOf(" ");
+      crashAddAttr(processor, "vendor", space >= 0 ? cpu.slice(0, space) : cpu, limits);
+      crashAddAttr(processor, "name", space >= 0 ? cpu.slice(space + 1).trim() : cpu, limits);
+    }
+    match = text.match(/^CPU Cores:\s*(\d+)\s+logical,\s*(\d+)\s+physical,\s*(\d+)\s+packages/);
+    if (match) {
+      processor.logical = Number(match[1]);
+      processor.physical = Number(match[2]);
+      processor.packages = Number(match[3]);
+    }
+    match = text.match(/^GPU #\d+:\s*(.*)$/);
+    if (match) gpus.push(match[1].trim());
+    match = text.match(/^PHYSICAL MEMORY:\s*([\d.]+)\s*(?:GB|GiB)\s*\/\s*([\d.]+)\s*(?:GB|GiB)/);
+    if (!match) match = text.match(/^RAM:\s*([\d.]+)\s*(?:GB|GiB)\s*\/\s*([\d.]+)\s*(?:GB|GiB)/);
+    if (match) {
+      const used = Number(match[1]);
+      const total = Number(match[2]);
+      if (Number.isFinite(used) && Number.isFinite(total) && total > 0) {
+        memory.physical_used_mb = Math.round(used * 1024);
+        memory.physical_total_mb = Math.round(total * 1024);
+        attrs.ram_free_mb = Math.round((total - used) * 1024);
+      }
+    }
+    match = text.match(/^VIRTUAL MEMORY:\s*([\d.]+)\s*(?:GB|GiB)\s*\/\s*([\d.]+)\s*(?:GB|GiB)/);
+    if (match) {
+      const used = Number(match[1]);
+      const total = Number(match[2]);
+      if (Number.isFinite(used) && Number.isFinite(total) && total > 0) {
+        memory.virtual_used_mb = Math.round(used * 1024);
+        memory.virtual_total_mb = Math.round(total * 1024);
+        attrs.commit_pct = Math.round((used / total) * 1000) / 10;
+      }
+    }
+    match = text.match(/^PAGE FILE:\s*([\d.]+)\s*(?:GB|GiB)\s*\/\s*([\d.]+)\s*(?:GB|GiB)/);
+    if (match) {
+      const used = Number(match[1]);
+      const total = Number(match[2]);
+      if (Number.isFinite(used) && Number.isFinite(total) && total > 0) {
+        memory.pagefile_used_mb = Math.round(used * 1024);
+        memory.pagefile_total_mb = Math.round(total * 1024);
+        attrs.commit_pct = Math.round((used / total) * 1000) / 10;
+      }
+    }
+    match = text.match(/^GPU MEMORY:\s*([\d.]+)\s*\/\s*([\d.]+)\s*(?:GB|GiB)/);
+    if (match) {
+      const used = Number(match[1]);
+      const total = Number(match[2]);
+      if (Number.isFinite(used) && Number.isFinite(total) && total > 0) {
+        memory.gpu_used_mb = Math.round(used * 1024);
+        memory.gpu_total_mb = Math.round(total * 1024);
+        attrs.vram_pct = Math.round((used / total) * 1000) / 10;
+      }
+    }
+  }
+  if (gpus.length > 0) {
+    const max = crashNumber(limits.max_list_len) || 64;
+    attrs.gpu = gpus.slice(0, max);
+  }
+  crashPushFact(state, limits, {
+    kind: "core.system",
+    attrs,
+    span: crashSpan("SYSTEM SPECS", section.start, section.end - 1),
+  });
+  if (Object.keys(memory).length > 0) {
+    crashPushFact(state, limits, {
+      kind: "creation.system_memory",
+      attrs: memory,
+      span: crashSpan("SYSTEM SPECS", section.start, section.end - 1),
+    });
+  }
+  if (Object.keys(processor).length > 0) {
+    crashPushFact(state, limits, {
+      kind: "creation.processor",
+      attrs: processor,
+      span: crashSpan("SYSTEM SPECS", section.start, section.end - 1),
+    });
+  }
+  return true;
+}
+
+function crashParseProcess(state, limits, sections, lines, game) {
+  const attrs = {};
+  crashAddAttr(attrs, "image", game.executable, limits);
+  crashAddAttr(attrs, "image_version", game.version, limits);
+  const section = crashFindSection(sections, "PROCESS INFO");
+  if (section) {
+    for (let index = section.start + 1; index < section.end; index += 1) {
+      const text = lines[index].trim();
+      let match = text.match(/^Process ID:\s*(\d+)/);
+      if (match) attrs.pid = Number(match[1]);
+      match = text.match(/^Working Directory:\s*(.*)$/);
+      if (match) crashAddAttr(attrs, "cwd", match[1], limits);
+      match = text.match(/^Command Line:\s*(.*)$/);
+      if (match) crashAddAttr(attrs, "command_line", match[1], limits);
+      match = text.match(/^Process Uptime:\s*[\d:.]+(?:ms)?\s*\((\d+)\s*ms\)/);
+      if (match) attrs.uptime_s = Number(match[1]) / 1000;
+      match = text.match(/^Executable MD5:\s*(\S+)/);
+      if (match) crashAddAttr(attrs, "image_hash", match[1], limits);
+    }
+  }
+  crashPushFact(state, limits, {
+    kind: "core.process",
+    attrs,
+    span: section ? crashSpan("PROCESS INFO", section.start, section.end - 1) : undefined,
+  });
+  return section !== undefined;
+}
+
+function crashParseGame(state, limits, game) {
+  const attrs = {};
+  crashAddAttr(attrs, "game", game.name, limits);
+  crashAddAttr(attrs, "edition", game.edition, limits);
+  crashAddAttr(attrs, "version", game.version, limits);
+  if (game.vr !== undefined) attrs.vr = game.vr;
+  crashAddAttr(attrs, "executable", game.executable, limits);
+  crashPushFact(state, limits, { kind: "creation.game", attrs });
+}
+
+function crashParseException(state, limits, sections, lines, game, logType) {
+  const exception = crashFindLine(lines, /^\s*Unhandled exception\b/);
+  let mainCode;
+  let mainType;
+  let access;
+  let faultAddress;
+  let site = {};
+  let exceptionLine;
+
+  if (exception) {
+    exceptionLine = exception.line;
+    const match = exception.line
+      .trim()
+      .match(/^Unhandled exception(?:\s+"([^"]*)")?\s+at\s+0x([0-9A-Fa-f]+)(?:\s+(\S+?)\+([0-9A-Fa-f]+))?(.*)$/);
+    if (match) {
+      mainCode = match[1] || undefined;
+      site.address = crashHex(match[2]);
+      if (match[3]) {
+        site.module = match[3];
+        site.offset = crashHex(match[4]);
+      }
+      let rest = match[5] || "";
+      const source = rest.match(SOURCE_PATTERN);
+      if (source) {
+        site.source_file = source[1];
+        site.line = Number(source[2]);
+        rest = rest.replace(source[0], " ");
+      }
+      if (logType === "trainwreck") {
+        const symbol = rest.trim().split(/\s+/)[0];
+        if (symbol && !symbol.startsWith("0x") && !/^[a-z]{2,}\s/.test(rest.trim())) {
+          site.symbol = symbol;
+        }
+      } else {
+        const tab = rest.indexOf("\t");
+        if (tab >= 0) {
+          const instruction = rest.slice(tab + 1).trim();
+          if (instruction) site.instruction = instruction;
+        }
+        const pipe = rest.indexOf("|");
+        if (pipe >= 0) {
+          const tail = rest.slice(pipe + 1).trim();
+          const source2 = tail.match(SOURCE_PATTERN);
+          if (source2) {
+            site.source_file = source2[1];
+            site.line = Number(source2[2]);
+          }
+        }
+      }
+    }
+  }
+
+  const accessLine = crashFindLine(lines, /^\s*(?:Access Violation|In-Page Error):\s*Tried to\s+(read|write|execute)\s+memory at\s+0x([0-9A-Fa-f]+)/);
+  if (accessLine) {
+    access = accessLine.match[1];
+    faultAddress = crashHex(accessLine.match[2]);
+  }
+
+  if (mainCode !== undefined || site.address !== undefined || access !== undefined) {
+    const attrs = {};
+    const exceptionClass = mainCode !== undefined ? mainCode : access !== undefined ? "EXCEPTION_ACCESS_VIOLATION" : undefined;
+    crashAddAttr(attrs, "class", exceptionClass, limits);
+    crashAddAttr(attrs, "category", crashExceptionCategory(exceptionClass), limits);
+    crashAddAttr(attrs, "access", access, limits);
+    crashAddAttr(attrs, "fault_address", faultAddress, limits);
+    if (mainType) crashAddAttr(attrs, "message", mainType, limits);
+    const pointerClass = crashPointerClass(faultAddress);
+    crashAddAttr(attrs, "pointer_class", pointerClass, limits);
+    if (faultAddress) {
+      let nearNull = false;
+      try {
+        nearNull = BigInt(faultAddress) < 0x10000n;
+      } catch (error) {
+        nearNull = false;
+      }
+      attrs.near_null = nearNull;
+    }
+    attrs.depth = 0;
+    const refs = new Map();
+    if (site.module) crashAddRef(refs, "module", site.module, "exec_top", limits);
+    crashPushFact(state, limits, {
+      kind: "core.exception",
+      attrs,
+      refs: crashRefList(refs, limits, state),
+      span: exceptionLine !== undefined ? crashSpan("exception", exception.index, exception.index) : undefined,
+    });
+  }
+
+  if (site.instruction) site.instruction = crashClean(site.instruction, limits.max_attr_len);
+  if (site.source_file) site.source_file = crashClean(site.source_file, limits.max_attr_len);
+  if (Object.keys(site).length > 0) {
+    crashPushFact(state, limits, {
+      kind: "creation.exception_site",
+      attrs: site,
+      span: exceptionLine !== undefined ? crashSpan("exception", exception.index, exception.index) : undefined,
+    });
+  }
+
+  // Crash Logger 1.20+ writes a compact access-violation analysis.
+  const analysis = crashFindSection(sections, "ACCESS VIOLATION ANALYSIS");
+  if (analysis) {
+    const attrs = {};
+    for (let index = analysis.start + 1; index < analysis.end; index += 1) {
+      const text = lines[index].trim();
+      let match = text.match(/^Instruction:\s*(.*)$/);
+      if (match) crashAddAttr(attrs, "instruction", match[1], limits);
+      match = text.match(/^Memory Operand:\s*\[base=([^,\]]+),\s*index=([^,\]]+),\s*scale=([^,\]]+),\s*disp=([^\]]+)\]/);
+      if (match) {
+        crashAddAttr(attrs, "base", match[1].trim(), limits);
+        crashAddAttr(attrs, "index", match[2].trim(), limits);
+        crashAddAttr(attrs, "scale", match[3].trim(), limits);
+        crashAddAttr(attrs, "disp", match[4].trim(), limits);
+      }
+      match = text.match(/^Base Register:\s*(\S+)\s*=\s*(0x[0-9A-Fa-f]+)/);
+      if (match) crashAddAttr(attrs, "base_value", match[2], limits);
+      match = text.match(/^Computed Address:\s*(0x[0-9A-Fa-f]+)/);
+      if (match) crashAddAttr(attrs, "computed_address", match[1], limits);
+      match = text.match(/^Fault Address:\s*(0x[0-9A-Fa-f]+)(.*)$/);
+      if (match) {
+        crashAddAttr(attrs, "fault_address", match[1], limits);
+        if (match[2].includes("mismatch")) attrs.mismatch = true;
+      }
+    }
+    crashPushFact(state, limits, {
+      kind: "creation.access_violation",
+      attrs,
+      span: crashSpan("ACCESS VIOLATION ANALYSIS", analysis.start, analysis.end - 1),
+    });
+  }
+
+  // A C++ exception block is its own exception, one level in when a main
+  // exception already exists.
+  const cpp = crashFindSection(sections, "C++ EXCEPTION");
+  if (cpp) {
+    const attrs = { depth: exception || mainCode !== undefined ? 1 : 0 };
+    const refs = new Map();
+    const site2 = {};
+    for (let index = cpp.start + 1; index < cpp.end; index += 1) {
+      const text = lines[index].trim();
+      let match = text.match(/^Type:\s*\((.*?)\)\s*$/);
+      if (match) {
+        const type = crashTrim(match[1]).replace(/\*+$/, "");
+        crashAddAttr(attrs, "class", type, limits);
+        crashAddAttr(attrs, "category", "unknown", limits);
+      }
+      match = text.match(/^Info:\s*(.*)$/);
+      if (match) crashAddAttr(attrs, "message", match[1], limits);
+      match = text.match(/^Throw Location:\s*(\S+?)\+([0-9A-Fa-f]+)/);
+      if (match) {
+        site2.module = match[1];
+        site2.offset = crashHex(match[2]);
+        crashAddRef(refs, "module", match[1], "exec_top", limits);
+      }
+    }
+    crashPushFact(state, limits, {
+      kind: "core.exception",
+      attrs,
+      refs: crashRefList(refs, limits, state),
+      span: crashSpan("C++ EXCEPTION", cpp.start, cpp.end - 1),
+    });
+    if (Object.keys(site2).length > 0) {
+      crashPushFact(state, limits, {
+        kind: "creation.exception_site",
+        attrs: site2,
+        span: crashSpan("C++ EXCEPTION", cpp.start, cpp.end - 1),
+      });
+    }
+  }
+
+  return { exception: Boolean(exception || cpp || access !== undefined), accessViolation: analysis !== undefined };
+}
+
+function crashSymbolScheme(game) {
+  if (game.vr) return "addrlib-vr";
+  if (!game.version) return "addrlib-unknown";
+  return crashGameVersionAtLeast(game.version, 1, 6, 0) ? "addrlib-ae" : "addrlib-se";
+}
+
+function crashCallStackSection(sections) {
+  for (const name of [
+    "PROBABLE CALL STACK",
+    "CALL STACK ([P]robable / [S]tack scan)",
+    "CALL STACK (HYBRID)",
+    "CALL STACK",
+  ]) {
+    const section = crashFindSection(sections, name);
+    if (section) return section;
+  }
+  return undefined;
+}
+
+function crashParseCallStack(state, limits, sections, lines, game, logType) {
+  const section = crashCallStackSection(sections);
+  if (!section) return false;
+  const scheme = crashSymbolScheme(game);
+  for (let index = section.start + 1; index < section.end; index += 1) {
+    const line = lines[index];
+    const match = line.match(/^\s*\[\s*(\d+)\s*\]\s*(?:\[([PS])\])?\s*0x([0-9A-Fa-f]+)\s+(\S+?)\+([0-9A-Fa-f]+)\s*(.*)$/);
+    if (!match) continue;
+    const frameIndex = Number(match[1]);
+    const kind = match[2] === "S" ? "scan" : "probable";
+    const attrs = {
+      index: frameIndex,
+      kind,
+      address: crashHex(match[3]),
+      rva: crashHex(match[5]),
+    };
+    const refs = new Map();
+    const strength = kind === "scan" ? "mention" : frameIndex === 0 ? "exec_top" : "exec";
+    crashAddRef(refs, "module", match[4], strength, limits);
+    let rest = match[6] || "";
+    let functionName;
+    if (logType === "crash_logger") {
+      const arrow = rest.match(/->\s*([^\s+]+)\+0x([0-9A-Fa-f]+)\s*(.*)$/);
+      if (arrow) {
+        const symbol = arrow[1];
+        attrs.symbol_offset = Number.parseInt(arrow[2], 16);
+        if (/^[0-9A-Fa-f]+$/.test(symbol) && /[A-Fa-f]/.test(symbol)) {
+          attrs.symbol_scheme = scheme;
+          attrs.symbol = symbol;
+        } else if (/^\d+$/.test(symbol)) {
+          attrs.symbol_scheme = scheme;
+          attrs.symbol = symbol;
+        } else {
+          attrs.symbol_scheme = "pdb";
+          attrs.symbol = symbol;
+        }
+        const tail = crashTrim(arrow[3]);
+        if (tail && !/^(?:mov|call|jmp|test|cmp|add|sub|lea|push|pop|ret|nop|xor|and|or|inc|dec|int3|lock|rep|movs|movss|cmp|jz|jnz|je|jne|jb|ja|jbe|jae|jl|jg|jle|jge|jmp|ud2|v?mov|v?add|v?sub|v?mul|v?div|v?xor|v?and|v?or|v?cmp|v?test|v?ucomis|v?comis|pxor|pand|por|xmm)/i.test(tail)) {
+          functionName = tail.split(/\s+/)[0];
+        }
+      } else {
+        const tab = rest.indexOf("\t");
+        if (tab >= 0) {
+          const instruction = rest.slice(tab + 1).trim();
+          if (instruction) {
+            const source = rest.match(SOURCE_PATTERN);
+            if (source) {
+              attrs.source_file = source[1];
+              attrs.line = Number(source[2]);
+            }
+          }
+        }
+      }
+    } else {
+      const symbol = rest.trim().split(/\s+/)[0];
+      if (symbol && !/^(?:mov|call|jmp|test|cmp|add|sub|lea|push|pop|ret|nop|xor|and|or|inc|dec|int3|lock|rep|movs|movss|ud2)/i.test(symbol)) {
+        attrs.symbol_scheme = "pdb";
+        attrs.symbol = symbol;
+        functionName = symbol;
+      }
+      // Source and instruction lines follow the frame, indented.
+      for (let next = index + 1; next < section.end; next += 1) {
+        const text = lines[next];
+        if (/^\s*\[\s*\d+\s*\]\s+0x[0-9A-Fa-f]+/.test(text)) break;
+        if (text.trim() === "") break;
+        const source = text.match(SOURCE_PATTERN);
+        if (source) {
+          attrs.source_file = source[1];
+          attrs.line = Number(source[2]);
+        }
+      }
+    }
+    const source = rest.match(SOURCE_PATTERN);
+    if (source && attrs.source_file === undefined) {
+      attrs.source_file = source[1];
+      attrs.line = Number(source[2]);
+    }
+    crashPushFact(state, limits, {
+      kind: "core.frame",
+      attrs,
+      refs: crashRefList(refs, limits, state),
+      span: crashSpan("PROBABLE CALL STACK", index, index),
+    });
+    if (functionName) {
+      crashPushFact(state, limits, {
+        kind: "creation.frame_name",
+        attrs: { index: frameIndex, name: functionName },
+        span: crashSpan("PROBABLE CALL STACK", index, index),
+      });
+    }
+  }
+  return true;
+}
+
+function crashParseModules(state, limits, sections, lines, logType) {
+  const section = crashFindSection(sections, "MODULES");
+  if (!section) return false;
+  if (logType === "crash_logger") {
+    for (let index = section.start + 1; index < section.end; index += 1) {
+      const match = lines[index].trim().match(/^(\S+)\s+0x([0-9A-Fa-f]+)\s*$/);
+      if (!match) continue;
+      const refs = new Map();
+      crashAddRef(refs, "module", match[1], "mention", limits);
+      crashPushFact(state, limits, {
+        kind: "core.module",
+        attrs: { base_address: crashHex(match[2]) },
+        refs: crashRefList(refs, limits, state),
+        span: crashSpan("MODULES", index, index),
+      });
+    }
+    return true;
+  }
+  let current;
+  let index = section.start + 1;
+  while (index < section.end) {
+    const text = lines[index];
+    if (text.trim() === "") {
+      index += 1;
+      continue;
+    }
+    const indent = crashIndent(text);
+    if (indent === 4 && !text.trim().endsWith(":") && !text.trim().includes(" ")) {
+      if (current) crashEmitModule(state, limits, current);
+      current = { name: text.trim(), attrs: {}, line: index };
+      index += 1;
+      continue;
+    }
+    if (current) {
+      const match = text.trim().match(/^Address:\s*(0x[0-9A-Fa-f]+)/);
+      if (match) current.attrs.base_address = match[1];
+      const hash = text.trim().match(/^SHA:\s*([0-9A-Fa-f]+)/);
+      if (hash) {
+        current.hash = hash[1];
+      }
+      const version = text.trim().match(/^Version:\s*v?(.+)$/);
+      if (version) current.attrs.version = crashTrim(version[1]);
+    }
+    index += 1;
+  }
+  if (current) crashEmitModule(state, limits, current);
+  return true;
+}
+
+function crashEmitModule(state, limits, module) {
+  const refs = new Map();
+  crashAddRef(refs, "module", module.name, "mention", limits);
+  crashPushFact(state, limits, {
+    kind: "core.module",
+    attrs: module.attrs,
+    refs: crashRefList(refs, limits, state),
+    span: crashSpan("MODULES", module.line, module.line),
+  });
+  if (module.hash) {
+    crashPushFact(state, limits, {
+      kind: "creation.module_hash",
+      attrs: { hash: module.hash, algorithm: module.hash.length === 128 ? "sha512" : "unknown" },
+      refs: crashRefList(new Map([["m", { kind: "module", value: module.name, strength: "mention" }]]), limits, state),
+      span: crashSpan("MODULES", module.line, module.line),
+    });
+  }
+}
+
+function crashParseScriptExtender(state, limits, sections, lines, logType) {
+  const name = logType === "crash_logger" ? "SKSE PLUGINS" : "SCRIPT EXTENDER PLUGINS";
+  const section = crashFindSection(sections, name);
+  if (!section) return false;
+  for (let index = section.start + 1; index < section.end; index += 1) {
+    const text = lines[index].trim();
+    if (!text) continue;
+    const match = text.match(/^(\S+?)(?:\s+(v?[0-9][0-9A-Za-z.\-]*))?\s*$/);
+    if (!match) continue;
+    const attrs = {};
+    if (match[2]) attrs.version = crashVersion(match[2]);
+    const refs = new Map();
+    crashAddRef(refs, "module", match[1], "mention", limits);
+    crashPushFact(state, limits, {
+      kind: "creation.script_extender_plugin",
+      attrs,
+      refs: crashRefList(refs, limits, state),
+      span: crashSpan(name, index, index),
+    });
+  }
+  return true;
+}
+
+function crashParseLoadOrder(state, limits, sections, lines, logType) {
+  if (logType === "trainwreck") return { present: false, entries: 0, unreadable: false };
+  const section = crashFindSection(sections, "PLUGINS");
+  if (!section) return { present: false, entries: 0, unreadable: false };
+  let entries = 0;
+  let unreadable = false;
+  for (let index = section.start + 1; index < section.end; index += 1) {
+    const text = lines[index].trim();
+    if (!text) continue;
+    const summary = text.match(/^Light:\s*(\d+)\s+Regular:\s*(\d+)\s+Total:\s*(\d+)/);
+    if (summary) {
+      crashPushFact(state, limits, {
+        kind: "creation.load_order_summary",
+        attrs: {
+          light: Number(summary[1]),
+          regular: Number(summary[2]),
+          total: Number(summary[3]),
+        },
+        span: crashSpan("PLUGINS", index, index),
+      });
+      continue;
+    }
+    let match = text.match(/^\[FE:\s*([0-9A-Fa-f]+)\]\s*(.+?)\s*$/);
+    let light = true;
+    if (!match) {
+      match = text.match(/^\[([0-9A-Fa-f ]+)\]\s*(.+?)\s*$/);
+      light = false;
+    }
+    if (!match) {
+      unreadable = true;
+      crashPushFact(state, limits, {
+        kind: "creation.load_order_error",
+        attrs: { message: text },
+        span: crashSpan("PLUGINS", index, index),
+      });
+      continue;
+    }
+    entries += 1;
+    const indexText = light ? "FE:" + match[1].trim().toUpperCase() : match[1].trim().toUpperCase();
+    const refs = new Map();
+    crashAddRef(refs, "plugin", match[2], "object", limits);
+    crashPushFact(state, limits, {
+      kind: "creation.plugin",
+      attrs: { index: indexText, light },
+      refs: crashRefList(refs, limits, state),
+      span: crashSpan("PLUGINS", index, index),
+    });
+  }
+  return { present: true, entries, unreadable };
+}
+
+function crashParseModels(state, limits, sections, lines) {
+  let found = false;
+  for (const header of sections.headers) {
+    if (!header.name.startsWith("CRASHED WHILE LOADING A MODEL") && !header.name.startsWith("MODEL PATHS FOR RESOURCE IDS")) {
+      continue;
+    }
+    found = true;
+    for (let index = header.start + 1; index < header.end; index += 1) {
+      const text = lines[index];
+      if (!text || !text.trim()) continue;
+      const attrs = {};
+      const place = text.match(/\[(RSP\+[0-9A-Fa-f]+)\]/);
+      if (place) attrs.place = place[1].toUpperCase();
+      const path = text.trim();
+      if (crashLooksLikePath(path)) {
+        attrs.path = crashUnquote(path);
+        const refs = new Map();
+        crashAddRef(refs, "file", path, "object", limits);
+        crashPushFact(state, limits, {
+          kind: "creation.model_request",
+          attrs,
+          refs: crashRefList(refs, limits, state),
+          span: crashSpan(header.name, index, index),
+        });
+      } else {
+        attrs.text = crashTrim(path);
+        crashPushFact(state, limits, {
+          kind: "creation.model_request",
+          attrs,
+          span: crashSpan(header.name, index, index),
+        });
+      }
+    }
+  }
+  return found;
+}
+
+
+function crashCoverage(state, limits, sections, flags) {
+  const coverage = [];
+  const add = (kind, has, why) => {
+    if (has) {
+      coverage.push({ kind, state: "checked" });
+    } else {
+      coverage.push({ kind, state: "absent", why });
+    }
+  };
+  add("core.exception", flags.exception, "The log has no unhandled-exception line.");
+  add("core.frame", flags.callStack, "The log has no call-stack section.");
+  add("core.module", flags.modules, "The log has no MODULES section.");
+  add("creation.module_hash", flags.modules, "The log has no MODULES section.");
+  add("core.process", true, "The game executable and its version are in the header.");
+  add("core.system", flags.system, "The log has no SYSTEM SPECS section.");
+  add("creation.game", true, "The log header names the game and version.");
+  add("creation.processor", flags.system, "The log has no SYSTEM SPECS section.");
+  add("creation.system_memory", flags.system, "The log has no SYSTEM SPECS section.");
+  add("creation.exception_site", flags.exception, "The log has no unhandled-exception line.");
+  add("creation.access_violation", flags.accessAnalysis, "The log has no ACCESS VIOLATION ANALYSIS section.");
+  add("creation.object", flags.objects, "The log has no registers, stack or relevant-object section.");
+  add("creation.plugin_chain", flags.objects, "The log has no registers, stack or relevant-object section.");
+  add("creation.code_pointer", flags.objects, "The log has no registers, stack or relevant-object section.");
+  add("creation.frame_name", flags.callStack, "The log has no call stack.");
+  add("creation.script_extender_plugin", flags.scriptExtender, "The log has no script-extender plugin section.");
+  if (flags.loadOrderApplicable) {
+    if (!flags.loadOrder) {
+      coverage.push({ kind: "creation.plugin", state: "absent", why: "The log has no PLUGINS section, so its load order was not recorded." });
+      coverage.push({ kind: "creation.load_order_summary", state: "absent", why: "The log has no PLUGINS section, so its load order was not recorded." });
+      coverage.push({ kind: "creation.load_order_error", state: "absent", why: "The log has no PLUGINS section." });
+    } else {
+      coverage.push({ kind: "creation.load_order_summary", state: "checked" });
+      coverage.push({ kind: "creation.load_order_error", state: "checked" });
+      if (flags.loadOrderEntries > 0 || !flags.loadOrderUnreadable) {
+        coverage.push({ kind: "creation.plugin", state: "checked" });
+      } else {
+        coverage.push({ kind: "creation.plugin", state: "absent", why: "The logger wrote an error instead of the plugin list." });
+      }
+    }
+  } else {
+    coverage.push({ kind: "creation.plugin", state: "not_applicable", why: "Trainwreck writes no plugin list." });
+    coverage.push({ kind: "creation.load_order_summary", state: "not_applicable", why: "Trainwreck writes no plugin list." });
+    coverage.push({ kind: "creation.load_order_error", state: "not_applicable", why: "Trainwreck writes no plugin list." });
+  }
+  add("creation.model_request", flags.models, "The log has no model-loading section.");
+  coverage.push({ kind: "core.log_line", state: "not_applicable" });
+  coverage.push({ kind: "core.load_verdict", state: "not_applicable" });
+  coverage.push({ kind: "core.dependency_problem", state: "not_applicable" });
+  return coverage;
+}
+
+function crashBuildBucket(exception, frames, game, logType) {
+  const bucket = [];
+  if (exception && exception.class) {
+    bucket.push({ scheme: "exception", value: exception.class });
+  }
+  for (const frame of frames) {
+    if (bucket.length >= 8) break;
+    if (!frame.symbol) continue;
+    const scheme = frame.symbol_scheme || (logType === "trainwreck" ? "pdb" : crashSymbolScheme(game));
+    let value;
+    if (scheme.startsWith("addrlib")) {
+      value = frame.symbol + "+0x" + Number(frame.symbol_offset || 0).toString(16);
+    } else {
+      value = frame.symbol;
+    }
+    bucket.push({ scheme, value });
+  }
+  return bucket;
+}
+
+function crashParseCreationEngine(request, logType) {
+  const read = crashReadAllLines(request);
+  if (read.error) throw new Error(read.error);
+  const lines = read.lines;
+  if (lines.length === 0) {
+    return {
+      contract: CRASH_CONTRACT,
+      producer: { format: logType },
+      facts: [],
+      notes: [{ kind: "wrong_format", message: "the file is empty" }],
+    };
+  }
+  const header = crashProducerHeader(lines, logType);
+  if (!header) {
+    return {
+      contract: CRASH_CONTRACT,
+      producer: { format: logType },
+      facts: [],
+      notes: [{ kind: "wrong_format", message: "the header is not this logger's" }],
+    };
+  }
+
+  const sections = crashSections(lines);
+  const limits = request.limits;
+  const state = { facts: [], kinds: {}, budgetSpent: false, refsTruncated: false };
+  const notes = [];
+
+  crashParseGame(state, limits, header.game);
+  const processSection = crashParseProcess(state, limits, sections, lines, header.game);
+  const systemSection = crashParseSystem(state, limits, sections, lines);
+  const exceptionFlags = crashParseException(state, limits, sections, lines, header.game, logType);
+  const callStack = crashParseCallStack(state, limits, sections, lines, header.game, logType);
+  const modules = crashParseModules(state, limits, sections, lines, logType);
+  const scriptExtender = crashParseScriptExtender(state, limits, sections, lines, logType);
+  const loadOrder = crashParseLoadOrder(state, limits, sections, lines, logType);
+
+  let objects = false;
+  for (const name of ["REGISTERS", "STACK", "POSSIBLE RELEVANT OBJECTS", "THREAD CONTEXT (HEURISTIC)"]) {
+    const section = crashFindSection(sections, name);
+    if (!section) continue;
+    objects = true;
+    crashParseObjects(state, limits, lines, section, logType);
+  }
+  const models = crashParseModels(state, limits, sections, lines);
+
+  const flags = {
+    exception: exceptionFlags.exception,
+    accessAnalysis: exceptionFlags.accessViolation,
+    callStack,
+    modules,
+    system: systemSection,
+    objects,
+    scriptExtender,
+    loadOrder: loadOrder.present,
+    loadOrderEntries: loadOrder.entries,
+    loadOrderUnreadable: loadOrder.unreadable,
+    loadOrderApplicable: logType === "crash_logger",
+    models,
+  };
+  const coverage = crashCoverage(state, limits, sections, flags);
+
+  // A header with neither an exception nor a call stack is a log that stopped
+  // early; say so rather than letting the missing sections look like absence.
+  if (!exceptionFlags.exception && !callStack) {
+    notes.push({ kind: "truncated", message: "the log stops before its exception or call stack" });
+  }
+  if (read.cut) notes.push({ kind: "truncated", message: "a line was longer than the read limit and was cut" });
+  if (read.gap) notes.push({ kind: "truncated", message: "the kept head and tail are not adjacent" });
+  if (read.budget || state.budgetSpent) notes.push({ kind: "budget_spent", message: "the parser reached its fact or line budget" });
+  if (state.refsTruncated) notes.push({ kind: "other", message: "some references were dropped to stay inside the per-fact limit" });
+  if (!processSection && logType === "crash_logger") {
+    notes.push({ kind: "other", message: "this logger version has no process id, so the session is tied by time" });
+  }
+  if (!header.game.version || !header.game.edition) {
+    notes.push({ kind: "truncated", message: "the header line naming the game is incomplete" });
+  }
+
+  const exceptionFacts = state.facts.filter((fact) => fact.kind === "core.exception" && Number(fact.attrs.depth || 0) === 0);
+  const exception = exceptionFacts.length > 0 ? {
+    class: exceptionFacts[0].attrs.class,
+  } : undefined;
+  const frames = state.facts
+    .filter((fact) => fact.kind === "core.frame")
+    .map((fact) => ({
+      symbol: fact.attrs.symbol,
+      symbol_scheme: fact.attrs.symbol_scheme,
+      symbol_offset: fact.attrs.symbol_offset,
+    }));
+  const bucket = crashBuildBucket(exception, frames, header.game, logType);
+
+  return {
+    contract: CRASH_CONTRACT,
+    producer: { format: header.format, version: header.version },
+    facts: state.facts,
+    bucket,
+    coverage,
+    notes,
+  };
+}
+
+/// Crash Logger (CrashLoggerSSE) crash logs, versions 1.0 through 1.25.
+export async function parseCrashLogger(request) {
+  return crashParseCreationEngine(request, "crash_logger");
+}
+
+/// Trainwreck crash logs, versions 1.2 through 1.4.
+export async function parseTrainwreck(request) {
+  return crashParseCreationEngine(request, "trainwreck");
 }
 
 // ---------------------------------------------------------------------------

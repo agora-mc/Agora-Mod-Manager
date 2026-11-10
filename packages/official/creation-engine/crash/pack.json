@@ -1,0 +1,349 @@
+{
+  "contract": 1,
+  "games": [
+    "skyrim-se"
+  ],
+  "sources": [
+    {
+      "id": "crash_logger",
+      "where": {
+        "root": "user_data",
+        "location": "documents",
+        "path": "My Games/Skyrim Special Edition/SKSE"
+      },
+      "match": {
+        "glob": "crash-*.log"
+      },
+      "bind": [
+        "pid_in_facts",
+        {
+          "time": {
+            "before_s": 2,
+            "after_s": 10
+          }
+        }
+      ],
+      "role": "primary",
+      "privacy": "personal"
+    },
+    {
+      "id": "trainwreck",
+      "where": {
+        "root": "user_data",
+        "location": "documents",
+        "path": "My Games/Skyrim Special Edition/SKSE"
+      },
+      "match": {
+        "glob": "crash_*.log"
+      },
+      "bind": [
+        {
+          "time": {
+            "before_s": 2,
+            "after_s": 10
+          }
+        }
+      ],
+      "role": "primary",
+      "privacy": "personal"
+    }
+  ],
+  "parsers": [
+    {
+      "id": "crash_logger",
+      "entry": {
+        "script": {
+          "export": "parseCrashLogger"
+        }
+      },
+      "detect": {
+        "all": [
+          "(?m)^CrashLoggerSSE v"
+        ],
+        "any": [
+          "(?m)^Unhandled exception ",
+          "(?m)^SYSTEM SPECS:",
+          "(?m)^ACCESS VIOLATION ANALYSIS:"
+        ]
+      }
+    },
+    {
+      "id": "trainwreck",
+      "entry": {
+        "script": {
+          "export": "parseTrainwreck"
+        }
+      },
+      "detect": {
+        "all": [
+          "(?m)^trainwreck v"
+        ],
+        "any": [
+          "(?m)^Unhandled exception ",
+          "(?m)^SYSTEM SPECS:"
+        ]
+      }
+    }
+  ],
+  "ref_maps": [
+    {
+      "kind": "module",
+      "lookup": {
+        "path": {
+          "patterns": [
+            "Data/SKSE/Plugins/{value}",
+            "{value}"
+          ]
+        }
+      },
+      "match": "casefold"
+    },
+    {
+      "kind": "plugin",
+      "lookup": {
+        "path": {
+          "patterns": [
+            "Data/{value}"
+          ]
+        }
+      },
+      "match": "casefold"
+    },
+    {
+      "kind": "file",
+      "lookup": {
+        "path": {
+          "patterns": [
+            "Data/{value}"
+          ],
+          "archives": true
+        }
+      },
+      "match": "casefold"
+    }
+  ],
+  "roles": [
+    {
+      "kind": "module",
+      "value": "SkyrimSE.exe",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "module",
+      "value": "SkyrimVR.exe",
+      "match": "casefold",
+      "role": "platform"
+    },
+    {
+      "kind": "module",
+      "value": "ntdll.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "KERNEL32.DLL",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "KERNELBASE.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "user32.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "win32u.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "gdi32.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "gdi32full.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "ucrtbase.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "msvcrt.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "advapi32.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "sechost.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "rpcrt4.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "combase.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "ole32.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "dxgi.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "d3d11.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "nvldumdx.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "atiumd64.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "atidxx64.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "amdxx64.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "amdxc64.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_loader.exe",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_5_97.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_318.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_323.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_342.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_353.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_640.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_659.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_1130.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_1170.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_1_6_1179.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "sksevr_1_4_15.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "CrashLogger.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "trainwreck.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    }
+  ]
+}

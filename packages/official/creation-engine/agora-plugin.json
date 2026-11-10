@@ -10,7 +10,7 @@
   "entrypoint": "main.js",
   "withoutCode": "Sort, masterlist updates and the plugin list's checks won't work.",
   "capabilities": {
-    "required": ["game:define", "game:read", "network"]
+    "required": ["game:define", "game:read", "network", "crash:contribute"]
   },
   "network": {
     "hosts": ["api.github.com"]
@@ -19,6 +19,11 @@
     "gamePackages": [
       {
         "path": "games/package.json"
+      }
+    ],
+    "crashPacks": [
+      {
+        "path": "crash/pack.json"
       }
     ]
   }
