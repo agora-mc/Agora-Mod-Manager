@@ -39296,6 +39296,23 @@
           "lowcodefml": "12.0.12"
         },
         "release_channel": "stable"
+      },
+      {
+        "mc_version": "26.3",
+        "loader_version": "26.3.0.102",
+        "source_url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.3.0.102/neoforge-26.3.0.102-installer.jar",
+        "sha256": "e26e42b0414da4f68840835b4d637928b971a01852b32b6424747290f84e9f1c",
+        "file_name": "neoforge-26.3.0.102-installer.jar",
+        "file_type": "installer_jar",
+        "version_json_sha256": "11b9182178251dde2cdaeb188e00687ce41b0d477c63c038871a39d5d74287a7",
+        "content_sha256": "ff4d2b9ba4ef3b7a67a703dc3178640cc6f1a533ba54f00a0c50a02841b9488e",
+        "installer_spec": 1,
+        "provided_versions": {
+          "neoforge": "26.3.0.102",
+          "javafml": "12.0.12",
+          "lowcodefml": "12.0.12"
+        },
+        "release_channel": "stable"
       }
     ],
     "forge": [
