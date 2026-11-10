@@ -493,6 +493,13 @@ cause); the test set is never read. One family alone tops out at `possible`
 | `file_in_register` | object reference | 5 | A file path in a register names a broken mesh or texture in a few cases. |
 | `out_of_memory` | finding, environment | `likely` | Only an out-of-memory exception (including `std::bad_alloc`); caps any mod at `possible`. |
 | `dll_dependency_failed_to_load` | finding, environment | `possible` | `C06D007E`: a DLL could not load a library it needs. |
+| `content_catalog_format_mismatch` | finding, environment | `likely` | `std::invalid_argument` "stoull" while an `InstalledContent` object is live: `ContentCatalog.txt` written by another game build (3 of 3 dev rows). From Tullius's signatures. |
+| `missing_masters_known_site` | finding, environment | `likely` | The `0198090` / `5E1F22` crash site, gated to the exact builds it belongs to (8 of 9 dev rows were missing masters or ESL support). From Phostwood. |
+| `cot_divide_by_zero` | known signature | 7 | Integer divide-by-zero with Climates of Tamriel loaded (2 of 2). From Phostwood. |
+| `d3d11_graphics_injector_fault` | finding, environment | `possible` | The fault is in `d3d11.dll`, where ENB or ReShade hook in. From Phostwood and Tullius. |
+| `win24h2_upscaler_fault` | finding, environment | `possible` | `KERNELBASE.dll` fault with the Skyrim Upscaler on the stack. From Phostwood. |
+| `dragons_eye_minimap_fault` | known signature | 6 | The minimap loaded with camera or image-space objects live. From Phostwood. |
+| `skyclimb_outdated` | known signature | 6 | SkyClimb older than 1.1.2 on game 1.6.1130 or later (8 right, 2 wrong on dev; both wrong rows did have an old SkyClimb). From Phostwood's version table. |
 
 What the dev set taught, kept here so nobody re-learns it:
 
@@ -505,3 +512,14 @@ What the dev set taught, kept here so nobody re-learns it:
   save-loading functions, not guesses.
 - About a third of version-mismatch causes appear only in the SKSE plugin list.
   They need the DLL's own declared game versions (an inspector), not a log rule.
+- **Phostwood's DLL version table is not adopted as a whole.** It is a 9-entry
+  snapshot ending at game 1.6.1129. As suspects it gave 14 right and 17 wrong on
+  dev; as a note it touched 6 unrelated logs. Only SkyClimb, its most common
+  entry, is a rule. The real answer is the DLL inspector, which reads each
+  plugin's own declared versions and cannot go stale.
+- Also measured and dropped: Engine Fixes being absent (0 of 12), a plugin count
+  near 254 (0 of 3), a near-null access violation (fires on every kind of
+  cause), the save/load manager on the stack (4 of 6 were mods).
+- Rule conditions: `any` stops at its first true branch, so one rule over a list
+  names only the first match. Write one rule per suspect when each should be
+  named.

@@ -683,6 +683,409 @@
         }
       },
       "next_step": "confirm_experiment"
+    },
+    {
+      "id": "content_catalog_format_mismatch",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "core.exception",
+              "where": {
+                "class": "std::invalid_argument",
+                "message": {
+                  "glob": "*invalid stoull argument*"
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.object",
+              "where": {
+                "type": {
+                  "glob": "InstalledContent*"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "likely"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game stopped while reading its installed-content catalog, on a value it expected to be a number. Another game build on this PC can rewrite ContentCatalog.txt in a format this build cannot read; moving that file aside lets the game rebuild it."
+        },
+        "why_not_sure": {
+          "en": "This names the file the game was reading, not the mod or tool that changed it."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius crash_signatures.json CONTENT_CATALOG_FORMAT_MISMATCH (GPL-3, idea)"
+    },
+    {
+      "id": "missing_masters_known_site",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.game",
+              "where": {
+                "version": {
+                  "version": {
+                    "exact": [
+                      "1.5.97",
+                      "1.6.640"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "any": [
+              {
+                "fact": {
+                  "kind": "creation.exception_site",
+                  "where": {
+                    "module": {
+                      "glob": "SkyrimSE.exe"
+                    },
+                    "offset": {
+                      "glob": "*5E1F22"
+                    }
+                  }
+                }
+              },
+              {
+                "fact": {
+                  "kind": "creation.exception_site",
+                  "where": {
+                    "module": {
+                      "glob": "SkyrimSE.exe"
+                    },
+                    "offset": {
+                      "glob": "*0198090"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "likely"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "This crash sits at an engine location that load orders with missing masters or unsupported ESL-format plugins reach. Check the missing-master list, and whether backported ESL support is needed for this game build."
+        },
+        "why_not_sure": {
+          "en": "The location says the load order was incomplete; it does not name which plugin was missing."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood diagnoses.js:580 checkForMissingMasters (GPL-3)"
+    },
+    {
+      "id": "cot_divide_by_zero",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "core.exception",
+              "where": {
+                "class": "EXCEPTION_INT_DIVIDE_BY_ZERO"
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.plugin",
+              "ref": {
+                "kind": "plugin",
+                "value": {
+                  "glob": "ClimatesOfTamriel.esm"
+                },
+                "bind": "p"
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "p"
+            },
+            "family": "known_signature",
+            "weight": 7
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash was a divide-by-zero, and Climates of Tamriel is loaded. This mod is known to reach that failure through one of its records; replacing it or clearing the affected record from the save is the usual next step."
+        },
+        "why_not_sure": {
+          "en": "A loaded mod that has had this failure reported is a lead, not a proof."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood diagnoses.js:3371 analyzeCoTDivideByZeroCrash (GPL-3)"
+    },
+    {
+      "id": "d3d11_graphics_injector_fault",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.exception_site",
+          "where": {
+            "module": {
+              "glob": "d3d11.dll"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The fault is inside d3d11.dll, where a graphics injector such as ENB or ReShade puts its code. An injector binary built for a different game build is one common reason."
+        },
+        "why_not_sure": {
+          "en": "The log does not say which injector, if any, is installed."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood diagnoses.js:5035 checkENBIssue (GPL-3); Tullius graphics_injection_rules.json (GPL-3)"
+    },
+    {
+      "id": "win24h2_upscaler_fault",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.exception_site",
+              "where": {
+                "module": {
+                  "glob": "KERNELBASE.dll"
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.frame",
+              "ref": {
+                "kind": "module",
+                "value": {
+                  "glob": "SkyrimUpscaler.dll"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash reached KERNELBASE.dll with the Skyrim Upscaler on the stack. This pairing has been reported on Windows 11 24H2 with DLAA; disabling the upscaler is a small test."
+        },
+        "why_not_sure": {
+          "en": "The log does not state the Windows build, so the 24H2 link is a report, not a check."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood diagnoses.js:1809 analyzeWin24H2UpscalerCrash (GPL-3)"
+    },
+    {
+      "id": "dragons_eye_minimap_fault",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.script_extender_plugin",
+              "ref": {
+                "kind": "module",
+                "value": {
+                  "glob": "DragonsEyeMinimap.dll"
+                },
+                "bind": "d"
+              }
+            }
+          },
+          {
+            "any": [
+              {
+                "fact": {
+                  "kind": "creation.object",
+                  "where": {
+                    "rtti": {
+                      "glob": "NiCamera"
+                    }
+                  }
+                }
+              },
+              {
+                "fact": {
+                  "kind": "creation.object",
+                  "where": {
+                    "type": {
+                      "glob": "BSImagespace*"
+                    }
+                  }
+                }
+              },
+              {
+                "fact": {
+                  "kind": "core.frame",
+                  "ref": {
+                    "kind": "module",
+                    "value": {
+                      "glob": "DragonsEyeMinimap.dll"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "known_signature",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The Dragon's Eye Minimap plugin is loaded and camera or image-space objects are on the stack. Toggling the minimap off is a quick test before a longer investigation."
+        },
+        "why_not_sure": {
+          "en": "The plugin is one of several things that can produce this stack shape."
+        }
+      },
+      "reference": "Phostwood diagnoses.js:951 analyzeDragonsEyeMinimapIssue (GPL-3)"
+    },
+    {
+      "id": "skyclimb_outdated",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.game",
+              "where": {
+                "version": {
+                  "version": {
+                    "min": "1.6.1130"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "any": [
+              {
+                "fact": {
+                  "kind": "creation.script_extender_plugin",
+                  "where": {
+                    "version": {
+                      "version": {
+                        "below": "1.1.2"
+                      }
+                    }
+                  },
+                  "ref": {
+                    "kind": "module",
+                    "value": {
+                      "glob": "SkyClimb.dll"
+                    },
+                    "bind": "d"
+                  }
+                }
+              },
+              {
+                "fact": {
+                  "kind": "creation.script_extender_plugin",
+                  "where": {
+                    "version": {
+                      "present": false
+                    }
+                  },
+                  "ref": {
+                    "kind": "module",
+                    "value": {
+                      "glob": "SkyClimb.dll"
+                    },
+                    "bind": "d"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "known_signature",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SkyClimb is older than the release its author lists as compatible with this game build. Updating it, or using the build for this game version, is a small first step."
+        },
+        "why_not_sure": {
+          "en": "An old SkyClimb on a newer game is a known cause of crashes, but this log does not show that it was the one that crashed."
+        }
+      },
+      "reference": "Phostwood dllCompatibleSkyrimVersionsMap.js entry SkyClimb.dll (GPL-3)"
     }
   ]
 }

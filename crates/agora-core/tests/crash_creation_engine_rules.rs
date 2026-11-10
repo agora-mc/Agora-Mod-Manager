@@ -303,3 +303,62 @@ fn a_failed_delay_load_is_a_finding_that_names_nobody() {
     assert!(rule_fired(&output, "dll_dependency_failed_to_load"));
     assert!(output.answer.candidates.is_empty());
 }
+
+/// The template on another game build, with one more SKSE plugin listed.
+fn on_build(text: &str, build: &str, extra_skse: Option<&str>) -> String {
+    let mut text = text.replace("Skyrim SSE v1.6.1170", &format!("Skyrim SSE v{build}"));
+    if let Some(line) = extra_skse {
+        text = text.replace("SKSE PLUGINS:\n", &format!("SKSE PLUGINS:\n\t{line}\n"));
+    }
+    text
+}
+
+fn signalled(output: &AnalyzeOutput, rule: &str) -> bool {
+    output.answer.candidates.iter().any(|candidate| {
+        candidate
+            .sources
+            .iter()
+            .any(|source| source.rule_id.as_deref() == Some(rule))
+    })
+}
+
+#[test]
+fn an_old_skyclimb_on_a_new_game_build_is_named_and_a_current_one_is_not() {
+    let running = start();
+    let base = log("EXCEPTION_ACCESS_VIOLATION", &["SkyrimSE.exe"], &[], &[]);
+    let old = run(
+        &running,
+        &on_build(&base, "1.6.1170", Some("SkyClimb.dll v1.1.0")),
+    );
+    assert!(signalled(&old, "skyclimb_outdated"), "{:?}", names(&old));
+    assert_eq!(
+        names(&old).first().map(String::as_str),
+        Some("SkyClimb.dll")
+    );
+
+    let current = run(
+        &running,
+        &on_build(&base, "1.6.1170", Some("SkyClimb.dll v1.2.0.1")),
+    );
+    assert!(!signalled(&current, "skyclimb_outdated"));
+
+    // Before 1.6.1130 the old build was the right one.
+    let older_game = run(
+        &running,
+        &on_build(&base, "1.6.640", Some("SkyClimb.dll v1.1.0")),
+    );
+    assert!(!signalled(&older_game, "skyclimb_outdated"));
+}
+
+#[test]
+fn the_missing_master_site_is_recognised_only_on_its_own_game_build() {
+    let running = start();
+    let at_site = log("EXCEPTION_ACCESS_VIOLATION", &["SkyrimSE.exe"], &[], &[])
+        .replace("SkyrimSE.exe+001000", "SkyrimSE.exe+0198090");
+    let on_640 = run(&running, &on_build(&at_site, "1.6.640", None));
+    assert!(rule_fired(&on_640, "missing_masters_known_site"));
+    assert!(on_640.answer.candidates.is_empty(), "it accuses nobody");
+    // The same raw offset on another build is a different place in the code.
+    let on_1170 = run(&running, &on_build(&at_site, "1.6.1170", None));
+    assert!(!rule_fired(&on_1170, "missing_masters_known_site"));
+}
