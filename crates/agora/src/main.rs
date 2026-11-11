@@ -8465,7 +8465,7 @@ async fn run_command(
                         load_order,
                         outputs: generated,
                         requirements,
-                        diagnostics: _,
+                        diagnostics,
                         passed: _,
                     } = match agora_core::game_instance::launch_checks(ctx, &record, game_def) {
                         Ok(checks) => checks,
@@ -8488,6 +8488,7 @@ async fn run_command(
                         && load_order.is_empty()
                         && generated.is_empty()
                         && requirements.is_empty()
+                        && diagnostics.is_empty()
                     {
                         "ok"
                     } else {
@@ -8502,6 +8503,7 @@ async fn run_command(
                             "load_order_findings": load_order,
                             "generated_findings": generated,
                             "requirement_findings": requirements,
+                            "diagnostics": diagnostics,
                             "exitCode": if refuses { 1 } else { 0 },
                         });
                         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -8544,6 +8546,16 @@ async fn run_command(
                         }
                         for finding in &generated {
                             println!("- {}", finding.message);
+                        }
+                    }
+                    if !json {
+                        for diagnostic in &diagnostics {
+                            let label = match diagnostic.severity {
+                                agora_game_api::DiagnosticSeverity::Info => "Info",
+                                agora_game_api::DiagnosticSeverity::Warning => "Warning",
+                                agora_game_api::DiagnosticSeverity::Error => "Error",
+                            };
+                            println!("- {label}: {}", diagnostic.message);
                         }
                     }
                     if refuses {

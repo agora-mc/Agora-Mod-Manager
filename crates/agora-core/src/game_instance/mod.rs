@@ -1293,11 +1293,44 @@ pub fn launch_checks(
 ) -> Result<LaunchChecks, LaunchChecksError> {
     let id = record.instance_id.as_str();
     let pinned = matches!(record.base, BaseReference::Pinned { .. });
+    let (runtime, links) = std::thread::scope(|scope| {
+        let runtime = scope.spawn(|| runtime_check(ctx, id, definition));
+        let links = scope.spawn(|| {
+            if pinned {
+                crate::game_load_order::plan_for_instance(ctx, id, definition)
+            } else {
+                Ok(None)
+            }
+        });
+        (join_scoped(runtime), join_scoped(links))
+    });
+    let (runtime, framework_passes) = runtime?;
+    let links = links?;
+    // The load order is planned before the hook so a diagnostics hook can see which plugins the
+    // game will load. Without it the hook would have to guess "enabled" from the files present.
+    let orders = if pinned {
+        crate::game_load_order::orders_with_view(ctx, id, definition, links.as_ref())?
+    } else {
+        Vec::new()
+    };
     // A package's script can add findings to the same launch checks the page
     // already shows. A failing hook is reported, never silently dropped.
     let diagnostics = match ctx.games.package_for(&definition.id).cloned() {
         Some(package) => {
-            let context = hook_context(ctx, record, definition)?;
+            let mut context = hook_context(ctx, record, definition)?;
+            context.load_order = agora_game_api::LoadOrder {
+                entries: orders
+                    .iter()
+                    .flat_map(|order| order.entries.iter())
+                    .map(|entry| agora_game_api::LoadOrderEntry {
+                        id: entry.name.clone(),
+                        enabled: entry.active,
+                        locked: entry.locked,
+                        present: entry.present,
+                    })
+                    .collect(),
+                rules: Vec::new(),
+            };
             match crate::game_registry::block_on_hook(package.diagnostics(context)) {
                 Ok(diagnostics) => diagnostics,
                 Err(error) => vec![agora_game_api::Diagnostic {
@@ -1313,18 +1346,6 @@ pub fn launch_checks(
         }
         None => Vec::new(),
     };
-    let (runtime, links) = std::thread::scope(|scope| {
-        let runtime = scope.spawn(|| runtime_check(ctx, id, definition));
-        let links = scope.spawn(|| {
-            if pinned {
-                crate::game_load_order::plan_for_instance(ctx, id, definition)
-            } else {
-                Ok(None)
-            }
-        });
-        (join_scoped(runtime), join_scoped(links))
-    });
-    let (runtime, framework_passes) = runtime?;
     if !pinned {
         return Ok(LaunchChecks {
             runtime,
@@ -1335,8 +1356,6 @@ pub fn launch_checks(
             passed: Vec::new(),
         });
     }
-    let links = links?;
-    let orders = crate::game_load_order::orders_with_view(ctx, id, definition, links.as_ref())?;
     let plugin_count: Option<usize> = if definition.load_orders.is_empty() {
         None
     } else {
