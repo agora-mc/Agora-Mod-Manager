@@ -82,8 +82,15 @@ export class AmbienceEngine {
   private fxCtx: CanvasRenderingContext2D;
   private particles = new ParticleLayer();
   private buddy: BuddyState;
-  /** Zoom + pan applied to the background canvas as one CSS transform. */
+  /**
+   * Zoom + pan. Applied in the canvas's own drawing transform, so a zoomed
+   * view is redrawn at full resolution. It used to be a CSS transform on the
+   * element, which only magnified the pixels already drawn: zoom in and the
+   * whole world went soft.
+   */
   private view = { zoom: 1, tx: 0, ty: 0 };
+  /** Buffer pixels per client px (the display's pixel ratio, capped). */
+  private dpr = 1;
   /**
    * The background canvas's untransformed top-left, in client coordinates.
    *
@@ -103,6 +110,10 @@ export class AmbienceEngine {
   private scale = 1;
   /** When the last pointermove arrived; a long gap means the cursor left. */
   private lastPointerMs = 0;
+  /** Last pointer position, in both viewport and host px. Null until the pointer moves. */
+  private pointer: { clientX: number; clientY: number; x: number; y: number } | null = null;
+  /** The site never holds the world still (reduced motion skips it entirely), so there is nothing to repaint. */
+  private scheduleStill(): void { /* no still frame on the web */ }
   private profile: AmbienceProfile;
   private options: AmbienceEngineOptions;
   private running = false;
@@ -201,25 +212,129 @@ export class AmbienceEngine {
     const next = Math.max(0.9, Math.min(2, z));
     const changedCoverage = (next < 1) !== (this.view.zoom < 1) || next < 1;
     this.view.zoom = next;
-    if (next >= 1) { this.view.tx = 0; this.view.ty = 0; }
+    if (next <= 1) { this.view.tx = 0; this.view.ty = 0; }
+    else this.setPan(this.view.tx, this.view.ty);   // keep the pan inside the new limits
     if (changedCoverage) this.size();   // re-cover the viewport at the new scale
     this.applyView();
   }
 
   /** Pan the world (only meaningful while zoomed in). */
   setPan(tx: number, ty: number): void {
-    this.view.tx = tx;
-    this.view.ty = ty;
+    // Bound the pan so the world can never be dragged fully off-screen. The
+    // pan is client px, so it bounds against the ELEMENT, not the world units
+    // drawn inside it.
+    const b = this.bounds();
+    const w = this.css.w || b.w || 1;
+    const h = this.css.h || b.h || 1;
+    const maxX = Math.max(0, (w * (this.view.zoom - 1)) / 2);
+    const maxY = Math.max(0, (h * (this.view.zoom - 1)) / 2);
+    this.view.tx = Math.max(-maxX, Math.min(maxX, tx));
+    this.view.ty = Math.max(-maxY, Math.min(maxY, ty));
     this.applyView();
+    this.scheduleStill();
+  }
+
+  /** Pan by a number of client px (a controller's right stick). */
+  panBy(dx: number, dy: number): void {
+    if (this.view.zoom <= 1) return;
+    this.setPan(this.view.tx + dx, this.view.ty + dy);
+  }
+
+  /* ── a cursor that is not the mouse ───────────────────────────────────
+   * A controller (or anything else without a pointer) drives the world
+   * through these: the engine keeps a cursor position, treats moving it
+   * exactly like moving the mouse, and draws a small reticle there so there
+   * is something to aim with. The first real pointer move hands control back.
+   */
+
+  /** True while the cursor is being driven by `moveCursorBy`, not the mouse. */
+  private virtualCursor = false;
+
+  /** Move the cursor by client px. Pushing against an edge pans a zoomed view. */
+  moveCursorBy(dx: number, dy: number): void {
+    const b = this.bounds();
+    const from = this.pointer ?? { x: b.w / 2, y: b.h / 2 };
+    let x = from.x + dx, y = from.y + dy;
+    if (this.view.zoom > 1) {
+      const m = 24;
+      if (x < m) { this.panBy(m - x, 0); x = m; }
+      if (x > b.w - m) { this.panBy(b.w - m - x, 0); x = b.w - m; }
+      if (y < m) { this.panBy(0, m - y); y = m; }
+      if (y > b.h - m) { this.panBy(0, b.h - m - y); y = b.h - m; }
+    }
+    x = Math.max(2, Math.min(b.w - 2, x));
+    y = Math.max(2, Math.min(b.h - 2, y));
+    this.virtualCursor = true;
+    this.pointTo(x + b.left, y + b.top);
+    this.scheduleStill();
+  }
+
+  /** Show or hide the reticle (hidden also drops the hover highlight). */
+  setCursorVisible(on: boolean): void {
+    if (on && !this.pointer) { this.moveCursorBy(0, 0); return; }
+    this.virtualCursor = on;
+    if (!on) {
+      const world = this.state.world as WorldState | null;
+      if (world) world.hover = null;
+    }
+    this.scheduleStill();
+  }
+
+  /** Press on whatever is under the cursor, as a click would. */
+  clickAtCursor(): void {
+    if (!this.pointer) this.moveCursorBy(0, 0);
+    const p = this.pointer;
+    if (!p) return;
+    this.worldClick(p.x, p.y);
+    if (!this.state.reduce && this.profile !== 'calm') this.particles.burst(p.x, p.y, '#9FF5E2', 6, 5);
+    this.scheduleStill();
+  }
+
+  /** Put down whatever is being carried, at the cursor. Returns false if empty-handed. */
+  dropCarried(): boolean {
+    const world = this.state.world as WorldState | null;
+    if (!world || !world.carry) return false;
+    const p = this.pointer ?? { x: this.bounds().w / 2, y: this.bounds().h / 2 };
+    const c = this.toCanvas(p.x, p.y);
+    world.drop(c.x, c.y);
+    this.scheduleStill();
+    return true;
+  }
+
+  /** A click at a box-relative point: interact with what is there, or drop the carried item. */
+  private worldClick(x: number, y: number): void {
+    const world = this.state.world as WorldState | null;
+    if (!world) return;
+    const p = this.toCanvas(x, y);
+    const hit = world.hit(p.x, p.y);
+    if (hit) world.interact(hit);
+    else if (world.carry) world.drop(p.x, p.y);
+  }
+
+  /** The reticle, drawn on the fx canvas (client px). */
+  private drawReticle(): void {
+    if (!this.virtualCursor || !this.pointer) return;
+    const c = this.fxCtx, x = Math.round(this.pointer.x), y = Math.round(this.pointer.y);
+    c.save();
+    c.globalAlpha = 1;
+    for (const [col, o] of [['rgba(8,14,26,.85)', 1], ['#FFFFFF', 0]] as Array<[string, number]>) {
+      c.fillStyle = col;
+      c.fillRect(x - 11 - o, y - 1 - o, 7 + o * 2, 2 + o * 2);
+      c.fillRect(x + 4 - o, y - 1 - o, 7 + o * 2, 2 + o * 2);
+      c.fillRect(x - 1 - o, y - 11 - o, 2 + o * 2, 7 + o * 2);
+      c.fillRect(x - 1 - o, y + 4 - o, 2 + o * 2, 7 + o * 2);
+    }
+    c.fillStyle = '#9FF5E2';
+    c.fillRect(x - 1, y - 1, 2, 2);
+    c.restore();
   }
 
   getView(): { zoom: number; tx: number; ty: number } { return { ...this.view }; }
 
   private applyView(): void {
-    const { zoom, tx, ty } = this.view;
-    this.bg.style.transformOrigin = '50% 50%';
-    const none = zoom === 1 && tx === 0 && ty === 0;
-    this.bg.style.transform = none ? '' : `translate(${tx}px, ${ty}px) scale(${zoom})`;
+    // Nothing to style: the view is part of the drawing transform, set at the
+    // top of every frame. The element itself always fills its box.
+    this.bg.style.transform = '';
   }
 
   /**
@@ -514,16 +629,22 @@ export class AmbienceEngine {
     this.css.w = v.cssW;
     this.css.h = v.cssH;
     this.scale = v.scale;
-    this.bg.style.width = `${v.cssW}px`;
-    this.bg.style.height = `${v.cssH}px`;
-    this.bg.style.left = `${this.origin.left}px`;
-    this.bg.style.top = `${this.origin.top}px`;
-    // The buffer keeps the element's own pixel size — full resolution — and the
-    // fit rides on a context transform instead. Shrinking the buffer to
-    // WORLD_W and letting the browser stretch it would have been fewer lines
-    // and a soft, resampled world on every screen wider than 1280.
-    this.bg.width = v.cssW;
-    this.bg.height = v.cssH;
+    // The element always fills the box exactly. `css`/`origin` describe the
+    // world's untransformed footprint (larger than the box and centred over it
+    // when zoomed out) and are what the drawing transform and `toCanvas` use.
+    this.bg.style.width = `${vw}px`;
+    this.bg.style.height = `${vh}px`;
+    this.bg.style.left = '0px';
+    this.bg.style.top = '0px';
+    // One buffer pixel per DEVICE pixel, so the world is sharp on scaled
+    // displays too, with a ceiling so a huge window cannot allocate a huge
+    // canvas. The fit, the zoom and the pan all ride on the context transform.
+    const ratio = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    this.dpr = Math.max(1, Math.min(ratio, 4096 / Math.max(1, vw), 3));
+    const bw = Math.max(1, Math.round(vw * this.dpr));
+    const bh = Math.max(1, Math.round(vh * this.dpr));
+    if (this.bg.width !== bw) this.bg.width = bw;
+    if (this.bg.height !== bh) this.bg.height = bh;
     this.state.W = v.W;
     this.state.H = v.H;
     this.applyWorldScale();
@@ -553,7 +674,15 @@ export class AmbienceEngine {
    * from raw client coordinates, so their context stays 1:1 with the viewport.
    */
   private applyWorldScale(): void {
-    this.bgCtx.setTransform(this.scale, 0, 0, this.scale, 0, 0);
+    // world unit -> client px is `(u * scale - css/2) * zoom + css/2 + pan + origin`
+    // (the inverse of `viewToCanvas`), then client px -> buffer px is `* dpr`.
+    const { zoom, tx, ty } = this.view;
+    const k = this.dpr * this.scale * zoom;
+    const ox = this.dpr * ((this.css.w / 2) * (1 - zoom) + tx + this.origin.left);
+    const oy = this.dpr * ((this.css.h / 2) * (1 - zoom) + ty + this.origin.top);
+    this.bgCtx.setTransform(k, 0, 0, k, ox, oy);
+    // Pixel art: when anything does get resampled, keep the edges hard.
+    this.bgCtx.imageSmoothingEnabled = false;
   }
 
   private buildWorld(): void {
@@ -588,6 +717,50 @@ export class AmbienceEngine {
     sfxBlip(this.state, f, d, t, v);
   }
 
+  /**
+   * The cursor is at this viewport point: feed parallax, the companion, the
+   * trail and the hover test. Shared by real pointer moves and the virtual
+   * cursor.
+   *
+   * Pointer coordinates arrive viewport-relative (clientX/Y), but the world
+   * draws into a box whose own origin is bounds.left/top. Offset once before
+   * normalising or before feeding anything that paints on the fx canvas or
+   * hits the world. The default bounds are {0,0} + the window, so this is a
+   * no-op on desktop.
+   */
+  private pointTo(clientX: number, clientY: number): void {
+    const state = this.state;
+    const b = this.bounds();
+    const x = clientX - b.left;
+    const y = clientY - b.top;
+    state.mx = x / (b.w || 1);
+    state.my = y / (b.h || 1);
+    // A gap in pointer events means the cursor was somewhere we could not see
+    // it — off-window, or over another surface — and it can come back
+    // anywhere. Easing from the stale position looks like the companion is
+    // lost; snap it to where the cursor actually is and carry on.
+    const now = performance.now();
+    const gap = now - this.lastPointerMs;
+    this.lastPointerMs = now;
+    if (gap > 400) {
+      buddySnap(this.buddy, x, y);
+      this.particles.pointerJumped?.(x, y);
+    }
+    this.particles.pointerMoved(x, y);
+    buddyTarget(this.buddy, x, y);
+    this.pointer = { clientX, clientY, x, y };
+    const p = this.toCanvas(x, y);
+    state.pcx = p.x;
+    state.pcy = p.y;
+    if (state.world) {
+      const w = state.world as WorldState;
+      const m = w.hit(p.x, p.y);
+      if (m !== w.hover) this.scheduleStill();
+      w.hover = m;
+      this.bg.style.cursor = m ? 'pointer' : this.view.zoom > 1 ? 'grab' : 'default';
+    }
+  }
+
   private attach(): void {
     const state = this.state;
     // A host box scopes the world's interaction to itself: pointermove follows
@@ -617,36 +790,8 @@ export class AmbienceEngine {
     // hits the world. The default bounds are {0,0} + the window, so this is a
     // no-op on desktop.
     const pointerMove = ((e: PointerEvent) => {
-      const b = this.bounds();
-      const x = e.clientX - b.left;
-      const y = e.clientY - b.top;
-      state.mx = x / (b.w || 1);
-      state.my = y / (b.h || 1);
-      // A gap in pointer events means the cursor was somewhere we could not see
-      // it — off-window, or over another surface — and it can come back
-      // anywhere. Easing from the stale position looks like the companion is
-      // lost; snap it to where the cursor actually is and carry on.
-      const now = performance.now();
-      const gap = now - this.lastPointerMs;
-      this.lastPointerMs = now;
-      if (gap > 400) {
-        buddySnap(this.buddy, x, y);
-        this.particles.pointerJumped?.(x, y);
-      }
-      this.particles.pointerMoved(x, y);
-      buddyTarget(this.buddy, x, y);
-      {
-        const p = this.toCanvas(x, y);
-        state.pcx = p.x;
-        state.pcy = p.y;
-      }
-      if (state.world) {
-        const w = state.world as WorldState;
-        const p = this.toCanvas(x, y);
-        const m = w.hit(p.x, p.y);
-        w.hover = m;
-        this.bg.style.cursor = m ? 'pointer' : this.view.zoom > 1 ? 'grab' : 'default';
-      }
+      this.virtualCursor = false;
+      this.pointTo(e.clientX, e.clientY);
     }) as EventListener;
     on(host ?? window, 'pointermove', pointerMove);
 
@@ -657,13 +802,8 @@ export class AmbienceEngine {
       if (Date.now() - (state.justDragged || 0) < 250) return;
       const target = e.target as Element | null;
       if (target && target.closest && target.closest(INTERACTIVE_SELECTOR)) return;
-      const world = state.world as WorldState | null;
-      if (!world) return;
       const b = this.bounds();
-      const p = this.toCanvas(e.clientX - b.left, e.clientY - b.top);
-      const hit = world.hit(p.x, p.y);
-      if (hit) world.interact(hit);
-      else if (world.carry) world.drop(p.x, p.y);
+      this.worldClick(e.clientX - b.left, e.clientY - b.top);
     }) as EventListener;
     on(host ?? document, 'click', click, true);
 
@@ -689,18 +829,7 @@ export class AmbienceEngine {
       if (!dragging) return;
       const dx = e.clientX - dragging.x;
       const dy = e.clientY - dragging.y;
-      // Bound the pan so the world can never be dragged fully off-screen. The
-      // pan is client px, so it bounds against the ELEMENT, not the world units
-      // drawn inside it.
-      const b = this.bounds();
-      const w = this.css.w || b.w || 1;
-      const h = this.css.h || b.h || 1;
-      const maxX = (w * (this.view.zoom - 1)) / 2;
-      const maxY = (h * (this.view.zoom - 1)) / 2;
-      this.setPan(
-        Math.max(-maxX, Math.min(maxX, dragging.tx + dx)),
-        Math.max(-maxY, Math.min(maxY, dragging.ty + dy)),
-      );
+      this.setPan(dragging.tx + dx, dragging.ty + dy);
       // Suppress the click that ends a real drag, so panning never also pokes
       // whatever ended up under the cursor.
       if (Math.abs(dx) + Math.abs(dy) > 4) state.justDragged = Date.now();
@@ -753,6 +882,7 @@ export class AmbienceEngine {
     if (this.buddy.on && !state.reduce) {
       drawBuddy(this.fxCtx, this.buddy, ts < this.blinkUntil);
     }
+    this.drawReticle();
     this.raf = requestAnimationFrame(this.frame);
   };
 }

@@ -14,6 +14,24 @@ import { Mountain, Music, Volume2, CloudRain, CloudSnow, Sun, ZoomIn, ZoomOut, S
 import { MUSIC_TRACK_CHOICES, INSTRUMENT_CHOICES } from '../features/ambience/engine/audio/trackChoices';
 import { useAmbience } from '../features/ambience/AmbienceProvider';
 import { PageHero } from '../components/PageHero';
+import { useController } from '../features/controller/ControllerProvider';
+import { useControllerLayer } from '../features/controller/useControllerLayer';
+import type { ControllerIntent } from '../features/controller/intents';
+import { readGamepadAnalog } from '../lib/useGamepad';
+
+/** Stick deflection below this is drift, not intent. */
+const STICK_DEADZONE = 0.16;
+/** Cursor and pan speed at full deflection, in px per second. */
+const CURSOR_SPEED = 620;
+const PAN_SPEED = 520;
+
+/** Deadzone, then a gentle curve so small movements stay precise. */
+function shapeAxis(v: number): number {
+  const m = Math.abs(v);
+  if (m < STICK_DEADZONE) return 0;
+  const k = (m - STICK_DEADZONE) / (1 - STICK_DEADZONE);
+  return Math.sign(v) * k * (0.35 + 0.65 * k);
+}
 
 /**
  * "Leave this alone" for one of the world's own clocks. Pressed, the day stops
@@ -65,8 +83,14 @@ export function LivingBackground() {
     setMusicAuto,
     shuffleMusic,
     setBuddy,
+    moveCursorBy,
+    panBy,
+    clickAtCursor,
+    dropCarried,
+    setCursorVisible,
     ready,
   } = useAmbience();
+  const { connected: padConnected } = useController();
 
   const [time, setTime] = useState(0.3);
   // Fifth tick of the old range (0.5 + 4×0.1) is now BOTH the minimum and the
@@ -201,6 +225,67 @@ export function LivingBackground() {
     setBuddyValue(true);
     setBuddy(true);
   };
+  /**
+   * Controller play. With the controls folded away, a pad drives the world
+   * itself: the left stick (or D-pad) moves a cursor, the right stick looks
+   * around a zoomed view, and the face buttons poke and put down. With the
+   * panel open the pad goes back to moving between its controls as usual.
+   */
+  const worldPlay = !panelOpen && padConnected;
+  const pageRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  useControllerLayer({
+    active: worldPlay,
+    rootRef: pageRef,
+    // Only the bindings below are taken; the menu button still reaches the app.
+    transparent: true,
+    onIntent: (intent: ControllerIntent) => {
+      switch (intent.type) {
+        case 'accept': clickAtCursor(); return true;
+        case 'secondary': dropCarried(); return true;
+        // Back puts down what is being carried first, then brings the controls back.
+        case 'cancel': if (!dropCarried()) setPanelOpen(true); return true;
+        case 'page': changeZoom(zoomRef.current + (intent.direction === 'next' ? 0.1 : -0.1)); return true;
+        // The sticks are read every frame below, so their coarse repeats are spent here.
+        case 'navigate': case 'scroll': return true;
+        default: return false;
+      }
+    },
+  });
+  useEffect(() => {
+    if (!worldPlay) return undefined;
+    setCursorVisible(true);
+    let frame = 0;
+    let last = performance.now();
+    let zoomHold = 0.14;
+    const tick = (now: number) => {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const pad = readGamepadAnalog();
+      if (pad) {
+        const lx = shapeAxis(pad.lx), ly = shapeAxis(pad.ly);
+        if (lx || ly) moveCursorBy(lx * CURSOR_SPEED * dt, ly * CURSOR_SPEED * dt);
+        const rx = shapeAxis(pad.rx), ry = shapeAxis(pad.ry);
+        // pushing the stick right looks right, so the world slides left
+        if (rx || ry) panBy(-rx * PAN_SPEED * dt, -ry * PAN_SPEED * dt);
+        // triggers zoom while held, a step at a time
+        if (Math.abs(pad.triggers) > 0.5) {
+          zoomHold += dt;
+          if (zoomHold >= 0.14) { zoomHold = 0; changeZoom(zoomRef.current + Math.sign(pad.triggers) * 0.1); }
+        } else zoomHold = 0.14;
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(frame);
+      setCursorVisible(false);
+    };
+    // changeZoom reads the zoom through a ref, so it is safe to leave out.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [worldPlay, moveCursorBy, panBy, setCursorVisible]);
+
   const toggleBuddy = () => {
     const next = !buddy;
     setBuddyValue(next);
@@ -208,7 +293,7 @@ export function LivingBackground() {
   };
 
   return (
-    <div className="space-y-6" data-testid="living-background-page">
+    <div ref={pageRef} className="space-y-6" data-testid="living-background-page">
       {/* Collapsed, the page gets out of the way entirely — no title, no
           description, no panel chrome — because the whole point of this screen is
           to look at the world. Only the reopen button stays. */}
@@ -230,6 +315,14 @@ export function LivingBackground() {
           <ChevronRight className="h-4 w-4" aria-hidden="true" />
           Show controls
         </button>
+      )}
+      {worldPlay && (
+        <p
+          className="w-fit rounded-full border border-primary/30 bg-background/80 px-4 py-1.5 text-xs text-muted-foreground shadow-lg backdrop-blur-md"
+          data-testid="living-bg-pad-hint"
+        >
+          Left stick moves the pointer · A pokes · X puts down · Right stick looks around · Bumpers or triggers zoom · B brings the controls back
+        </p>
       )}
 
       {/* The control panel — the same set as the prototype's top control bar,
@@ -257,6 +350,11 @@ export function LivingBackground() {
               Open Full Living Background
             </button>
           </div>
+          {padConnected && (
+            <p className="mb-3 text-xs text-muted-foreground" data-testid="living-bg-pad-tip">
+              Playing with a controller? Open the full view and the left stick becomes a pointer you can poke the world with.
+            </p>
+          )}
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
               Locks stop the world changing the time of day or the weather on its own; unlocked, both keep cycling.

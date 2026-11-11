@@ -10,7 +10,7 @@ const ambience = {
   readView: () => ({ zoom: 1.6, tx: 0, ty: 0 }),
   setZoom: vi.fn(), setRainbow: vi.fn(), isRainbowPinned: () => false,
   setTrack: vi.fn(), setInstrument: vi.fn(), currentTrackId: () => null,
-  setMusicAuto: vi.fn(), shuffleMusic: vi.fn(), setBuddy: vi.fn(), ready: true,
+  setMusicAuto: vi.fn(), shuffleMusic: vi.fn(), setBuddy: vi.fn(), moveCursorBy: vi.fn(), panBy: vi.fn(), clickAtCursor: vi.fn(), dropCarried: vi.fn(() => false), setCursorVisible: vi.fn(), ready: true,
 };
 vi.mock('../features/ambience/AmbienceProvider', () => ({ useAmbience: () => ambience }));
 

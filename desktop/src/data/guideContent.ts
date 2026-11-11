@@ -1633,7 +1633,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Where you may still want a keyboard',
-          body: 'The on-screen keyboard covers basic letters and numbers, which is plenty for a search or a folder name. For accented letters or other languages, a physical keyboard works better. Color pickers and file pickers open windows a controller cannot reach. The living background can only be used with a mouse and keyboard.',
+          body: 'The on-screen keyboard covers basic letters and numbers, which is plenty for a search or a folder name. For accented letters or other languages, a physical keyboard works better. Color pickers and file pickers open windows a controller cannot reach. The living background works with a controller on its own page: open Living Background, choose Open Full Living Background, and the left stick becomes a pointer you can poke the world with. Everywhere else it is scenery, and takes a mouse.',
         },
         {
           title: 'Launching works the same',

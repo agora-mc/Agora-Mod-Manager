@@ -1,9 +1,8 @@
 /**
  * Terrain: parallax ridges, the carved basin, and the ground-column math.
  *
- * Ported 1:1 from `v4-world.html` (sections "living background" and "engine
- * core"). The comments are not decoration — they record why the code is
- * shaped that way, and most of them exist because something was wrong first.
+ * The comments here are not decoration — they record why the code is shaped
+ * that way, and most of them exist because something was wrong first.
  *
  * F1: `Math.floor`, never `Math.round`, for the ground column index.
  * F7: `wx` is a WORLD x; screen x is derived only at draw/hit time via
@@ -33,10 +32,16 @@ export function ridge(seed: number, amp: number, base: number, step: number, W: 
  * wavy to trust a single rim sample, so we take the LOWER rim (max y).
  */
 export function carveBasin(arr: number[], step: number, c: number, widthCols: number, depth: number): Basin {
-  for (let i = c - widthCols; i <= c + widthCols; i++) {
-    if (i < 0 || i >= arr.length) continue;
+  // The water will stand at the lower of the two rims. Land between the rims
+  // that rises above that line is cut down to it first, and the bowl is dug
+  // from there. Digging straight into whatever the ridge happened to be doing
+  // left a hill in the middle of the pond on most seeds: two puddles with
+  // lily pads floating over the dry ground between them.
+  const l = Math.max(0, c - widthCols), r = Math.min(arr.length - 1, c + widthCols);
+  const level = Math.max(arr[l], arr[r]);
+  for (let i = l + 1; i < r; i++) {
     const d = Math.cos((i - c) / widthCols * Math.PI / 2); // smooth bowl, 0 at rim
-    arr[i] += Math.round(depth * d * d / step) * step;     // keep it quantised to the grid
+    arr[i] = Math.max(arr[i], level) + Math.round(depth * d * d / step) * step; // keep it quantised to the grid
   }
   return { c: c, half: widthCols };
 }
