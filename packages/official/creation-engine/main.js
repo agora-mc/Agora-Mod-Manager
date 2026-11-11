@@ -80,6 +80,7 @@ function readHeader(name) {
   }
 
   const masters = [];
+  let headerVersion = null;
   let at = 24;
   const end = 24 + dataSize;
   let large = 0;
@@ -107,12 +108,23 @@ function readHeader(name) {
     if (kind === "MAST") {
       masters.push(text(bytes, start, start + size));
     }
+    if (kind === "HEDR") {
+      // HEDR is a 12-byte struct whose first field is the header version (a float32): 0.94 for
+      // older games, 1.7 for Skyrim SE, 1.71 for the format 1.6.1130 introduced. Source:
+      // UESP's TES4 format page and xEdit's `gdHEDRVersion` in wbDefinitionsTES5.pas.
+      if (size < 4) {
+        return { error: "the HEDR subrecord is too short" };
+      }
+      const version = view.getFloat32(start, true);
+      if (Number.isFinite(version)) headerVersion = version;
+    }
     at = start + size;
   }
 
   const extension = extensionOf(name);
   return {
     masters: masters,
+    headerVersion: headerVersion,
     master:
       (flags & MASTER_FLAG) !== 0 ||
       extension === ".esm" ||
@@ -1714,6 +1726,16 @@ const SKSE_VERSION_DATA_SIZE = 0x350;
 const SKSE_STRUCT_CHANGE = [1, 6, 629, 0];
 const SKSE_EXPORT_NAME = "SKSEPlugin_Version";
 
+const SKSE_PLUGINS_DIR = "Data/SKSE/Plugins";
+// HEDR 1.71 is the plugin header format that shipped with game 1.6.1130. A plugin with it may use
+// the larger ESL form-id range, which older games cannot read. Source: xEdit's `gdHEDRVersion`
+// (wbDefinitionsTES5.pas) and UESP's TES4 format page (HEDR Version); see crash/FACTS.md.
+const EXTENDED_ESL_HEADER = 1.71;
+const EXTENDED_ESL_GAME = [1, 6, 1130, 0];
+// Backported Extended ESL Support backports the 1.6.1130 ESL range to 1.5.97. Source: the mod's
+// own package (Nexus Mods, Skyrim Special Edition); see crash/FACTS.md.
+const BACKPORTED_ESL_DLL = "BackportedESLSupport.dll";
+
 function skseU16(bytes, at) {
   return bytes[at] | (bytes[at + 1] << 8);
 }
@@ -1787,12 +1809,21 @@ function skseResult(result, detail, facts) {
   return answer;
 }
 
-/// What an SKSE plugin DLL declares, and whether the running game version fits it.
-export async function inspectSksePluginDeclaration(request) {
-  const artifact = request.artifact.id;
-  const running = skseParseRunning(request.game && request.game.runtime_version);
+// One read window over whichever scope supplied the bytes: the crash inspector's artifact or the
+// pre-flight check's instance view. A read that fails is an empty window, which every check below
+// already treats as `unknown`, so an unreadable file can never pass.
+function skseBytes(read, offset, length) {
+  try {
+    return new Uint8Array(read(offset, length));
+  } catch (error) {
+    return new Uint8Array(0);
+  }
+}
 
-  const dos = new Uint8Array(crash.readBytes(artifact, 0, 64));
+// The one reader of an SKSE plugin declaration and the one pass/fail/unknown decision. The crash
+// inspector and the pre-flight check both call this, so they can never disagree.
+function skseDeclaration(read, running, targetName) {
+  const dos = skseBytes(read, 0, 64);
   if (dos.length < 64 || dos[0] !== 0x4d || dos[1] !== 0x5a) {
     return skseResult("unknown", "the file does not start with a DOS header");
   }
@@ -1801,7 +1832,7 @@ export async function inspectSksePluginDeclaration(request) {
     return skseResult("unknown", "the DOS header points outside the file");
   }
 
-  const coff = new Uint8Array(crash.readBytes(artifact, peOffset, 24));
+  const coff = skseBytes(read, peOffset, 24);
   if (coff.length < 24) {
     return skseResult("unknown", "the file ends before its PE header");
   }
@@ -1817,7 +1848,7 @@ export async function inspectSksePluginDeclaration(request) {
     return skseResult("unknown", "the PE optional header is too short");
   }
 
-  const optional = new Uint8Array(crash.readBytes(artifact, peOffset + 24, optionalSize));
+  const optional = skseBytes(read, peOffset + 24, optionalSize);
   if (optional.length < optionalSize) {
     return skseResult("unknown", "the file ends before its optional header");
   }
@@ -1836,7 +1867,7 @@ export async function inspectSksePluginDeclaration(request) {
   }
 
   const tableOffset = peOffset + 24 + optionalSize;
-  const table = new Uint8Array(crash.readBytes(artifact, tableOffset, sectionCount * 40));
+  const table = skseBytes(read, tableOffset, sectionCount * 40);
   if (table.length < sectionCount * 40) {
     return skseResult("unknown", "the file ends before its section table");
   }
@@ -1846,7 +1877,7 @@ export async function inspectSksePluginDeclaration(request) {
   if (exportOffset === null) {
     return skseResult("unknown", "the export directory is not inside a section");
   }
-  const directory = new Uint8Array(crash.readBytes(artifact, exportOffset, 40));
+  const directory = skseBytes(read, exportOffset, 40);
   if (directory.length < 40) {
     return skseResult("unknown", "the export directory is truncated");
   }
@@ -1863,8 +1894,8 @@ export async function inspectSksePluginDeclaration(request) {
   if (namesOffset === null || ordinalsOffset === null) {
     return skseResult("unknown", "the export name table is not inside a section");
   }
-  const names = new Uint8Array(crash.readBytes(artifact, namesOffset, nameCount * 4));
-  const ordinals = new Uint8Array(crash.readBytes(artifact, ordinalsOffset, nameCount * 2));
+  const names = skseBytes(read, namesOffset, nameCount * 4);
+  const ordinals = skseBytes(read, ordinalsOffset, nameCount * 2);
   if (names.length < nameCount * 4 || ordinals.length < nameCount * 2) {
     return skseResult("unknown", "the export name table is truncated");
   }
@@ -1873,7 +1904,7 @@ export async function inspectSksePluginDeclaration(request) {
   for (let index = 0; index < nameCount; index += 1) {
     const nameOffset = mapRva(skseU32(names, index * 4));
     if (nameOffset === null) continue;
-    const raw = new Uint8Array(crash.readBytes(artifact, nameOffset, 32));
+    const raw = skseBytes(read, nameOffset, 32);
     if (skseCString(raw, 0, raw.length) === SKSE_EXPORT_NAME) {
       exportIndex = index;
       break;
@@ -1894,9 +1925,7 @@ export async function inspectSksePluginDeclaration(request) {
   if (functionsOffset === null) {
     return skseResult("unknown", "the export function table is not inside a section");
   }
-  const functionEntry = new Uint8Array(
-    crash.readBytes(artifact, functionsOffset + ordinal * 4, 4),
-  );
+  const functionEntry = skseBytes(read, functionsOffset + ordinal * 4, 4);
   if (functionEntry.length < 4) {
     return skseResult("unknown", "the export function table is truncated");
   }
@@ -1909,7 +1938,7 @@ export async function inspectSksePluginDeclaration(request) {
     return skseResult("unknown", "the version data is not inside a section");
   }
 
-  const data = new Uint8Array(crash.readBytes(artifact, dataOffset, SKSE_VERSION_DATA_SIZE));
+  const data = skseBytes(read, dataOffset, SKSE_VERSION_DATA_SIZE);
   if (data.length < SKSE_VERSION_DATA_SIZE) {
     return skseResult("unknown", "the version data is truncated");
   }
@@ -1946,9 +1975,9 @@ export async function inspectSksePluginDeclaration(request) {
   const fact = {
     kind: "creation.skse_plugin_declaration",
     attrs,
-    refs: [{ kind: "module", value: request.artifact.name, strength: "mention" }],
+    refs: [{ kind: "module", value: targetName, strength: "mention" }],
   };
-  const label = name || request.artifact.name;
+  const label = name || targetName;
 
   if (!running) {
     return skseResult(
@@ -2033,6 +2062,247 @@ export async function inspectSksePluginDeclaration(request) {
       ".",
     [fact],
   );
+}
+
+/// What an SKSE plugin DLL declares, and whether the running game version fits it.
+export async function inspectSksePluginDeclaration(request) {
+  const artifact = request.artifact.id;
+  const running = skseParseRunning(request.game && request.game.runtime_version);
+  return skseDeclaration(
+    (offset, length) => crash.readBytes(artifact, offset, length),
+    running,
+    request.artifact.name,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight checks (MASTER_SPEC §30.12 diagnostics hook)
+//
+// Two causes that stop a Skyrim game before it finishes loading: an SKSE plugin built for another
+// game version, and a plugin in the header format that only 1.6.1130 (or Backported Extended ESL
+// Support) can read. Both are warnings: the user decides. The SKSE decision is the crash
+// inspector's own function, not a second copy.
+// ---------------------------------------------------------------------------
+
+function creationDiagnostic(code, message, severity, repairs) {
+  return { code: code, message: message, severity: severity, repairs: repairs || [] };
+}
+
+function pluginFileName(name) {
+  const extension = extensionOf(name);
+  return extension === ".esp" || extension === ".esm" || extension === ".esl";
+}
+
+function sksePluginFiles() {
+  let reply;
+  try {
+    reply = game.list(SKSE_PLUGINS_DIR);
+  } catch (error) {
+    return {
+      error: String(error && error.message ? error.message : error),
+      entries: [],
+    };
+  }
+  const entries = (reply && reply.entries) || [];
+  return {
+    error: null,
+    entries: entries.filter(
+      (entry) => entry && entry.name && !entry.dir && extensionOf(String(entry.name)) === ".dll",
+    ),
+  };
+}
+
+/// Whether the backported ESL support plugin is installed. `null` means the view could not tell.
+function backportedEslSupport(listed) {
+  if (!listed.error) {
+    const wanted = BACKPORTED_ESL_DLL.toLowerCase();
+    return listed.entries.some((entry) => String(entry.name).toLowerCase() === wanted);
+  }
+  try {
+    game.readBytes(SKSE_PLUGINS_DIR + "/" + BACKPORTED_ESL_DLL, 0, 1);
+    return true;
+  } catch (error) {
+    const message = String(error && error.message ? error.message : error).toLowerCase();
+    if (
+      message.includes("not in this instance") ||
+      message.includes("not_found") ||
+      message.includes("there is no") ||
+      message.includes("no such") ||
+      message.includes("does not exist")
+    ) {
+      return false;
+    }
+    return null;
+  }
+}
+
+function declaresExtendedEsl(headerVersion) {
+  // HEDR is a float32, so 1.71 reads back as 1.7100000381469727. Anything at or above the value is
+  // the newer format.
+  return typeof headerVersion === "number" && headerVersion >= EXTENDED_ESL_HEADER - 0.0001;
+}
+
+/// The launch checks a Creation Engine game adds: SKSE plugin declarations and plugin header
+/// formats. A warning never blocks a launch.
+export function creationEngineDiagnostics(args) {
+  const context = (args && args.context) || {};
+  const runtime = String((context.runtime && context.runtime.version) || "").trim();
+  const running = skseParseRunning(runtime);
+  const findings = [];
+  if (!running) {
+    findings.push(
+      creationDiagnostic(
+        "CE_PREFLIGHT_NO_GAME_VERSION",
+        "Could not check the SKSE plugins or the plugin headers: the instance does not say which " +
+          "game version is installed. Start the game once, or set the game's version, and run the " +
+          "check again.",
+        "warning",
+      ),
+    );
+    return findings;
+  }
+
+  const listed = sksePluginFiles();
+  if (listed.error) {
+    findings.push(
+      creationDiagnostic(
+        "CE_SKSE_PLUGINS_NOT_CHECKED",
+        "Could not check the SKSE plugins for another game version: Data/SKSE/Plugins could not " +
+          "be listed (" +
+          listed.error +
+          ").",
+        "warning",
+      ),
+    );
+  } else {
+    let passed = 0;
+    let failed = 0;
+    let unknown = 0;
+    for (const entry of listed.entries) {
+      const name = String(entry.name);
+      const verdict = skseDeclaration(
+        (offset, length) => game.readBytes(SKSE_PLUGINS_DIR + "/" + name, offset, length),
+        running,
+        name,
+      );
+      if (verdict.result === "pass") {
+        passed += 1;
+      } else if (verdict.result === "fail") {
+        failed += 1;
+        findings.push(
+          creationDiagnostic(
+            "CE_SKSE_PLUGIN_OTHER_GAME_VERSION",
+            "'" +
+              name +
+              "': " +
+              verdict.detail +
+              " Update it to the build for game version " +
+              skseVersionText(running) +
+              ", or remove it. Removing a plugin partway through a playthrough can damage a save, " +
+              "so back up the save or test on a new game first.",
+            "warning",
+            [
+              "Install the " +
+                name +
+                " build that supports game version " +
+                skseVersionText(running) +
+                ".",
+            ],
+          ),
+        );
+      } else {
+        unknown += 1;
+      }
+    }
+    if (listed.entries.length === 0) {
+      findings.push(
+        creationDiagnostic(
+          "CE_SKSE_PLUGINS_NOTHING_TO_READ",
+          "There are no SKSE plugins in Data/SKSE/Plugins, so there is nothing to check for " +
+            "another game version.",
+          "info",
+        ),
+      );
+    } else if (unknown > 0) {
+      findings.push(
+        creationDiagnostic(
+          "CE_SKSE_PLUGIN_COULD_NOT_JUDGE",
+          "Read " +
+            listed.entries.length +
+            " SKSE plugin DLL" +
+            (listed.entries.length === 1 ? "" : "s") +
+            ": " +
+            passed +
+            " declare support for game version " +
+            skseVersionText(running) +
+            ", " +
+            failed +
+            " were built for another version, and " +
+            unknown +
+            " could not be judged (an older declaration format is normal).",
+          "info",
+        ),
+      );
+    }
+  }
+
+  const entries = (context.load_order && context.load_order.entries) || [];
+  const enabled = entries.filter(
+    (entry) =>
+      entry &&
+      entry.enabled &&
+      entry.present !== false &&
+      pluginFileName(String(entry.id)),
+  );
+  const backport = backportedEslSupport(listed);
+  let skipped = 0;
+  for (const entry of enabled) {
+    const name = String(entry.id);
+    const header = readHeader(name);
+    if (header.error || !declaresExtendedEsl(header.headerVersion)) continue;
+    if (skseAtLeast(running, EXTENDED_ESL_GAME)) continue;
+    if (backport === true) continue;
+    if (backport === null) {
+      skipped += 1;
+      continue;
+    }
+    findings.push(
+      creationDiagnostic(
+        "CE_PLUGIN_HEADER_NEEDS_NEWER_GAME",
+        "'" +
+          name +
+          "' uses the plugin header format that game version 1.6.1130 introduced. Game version " +
+          skseVersionText(running) +
+          " may stop while reading it. Update the plugin, use its build for this game version, " +
+          "install Backported Extended ESL Support, or remove it. Removing a plugin partway " +
+          "through a playthrough can damage a save, so back up the save or test on a new game " +
+          "first.",
+        "warning",
+        [
+          "Install Backported Extended ESL Support, or use the " +
+            name +
+            " build for game version " +
+            skseVersionText(running) +
+            ".",
+        ],
+      ),
+    );
+  }
+  if (skipped > 0) {
+    findings.push(
+      creationDiagnostic(
+        "CE_PLUGIN_HEADER_NOT_CHECKED",
+        "Could not tell whether Backported Extended ESL Support is installed, so the header " +
+          "format of " +
+          skipped +
+          " plugin" +
+          (skipped === 1 ? "" : "s") +
+          " could not be judged.",
+        "info",
+      ),
+    );
+  }
+  return findings;
 }
 
 // ---------------------------------------------------------------------------

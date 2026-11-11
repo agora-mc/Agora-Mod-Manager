@@ -10,7 +10,7 @@ use agora_core::game_base::BaseMode;
 use agora_core::game_deploy::{add_content, deploy, DeployMode, DeployOutcome};
 use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
 use agora_core::game_instance::{
-    create, prepare_launch_with, GameInstanceRecord, LaunchOptions, VfsFailure,
+    create, launch_checks, prepare_launch_with, GameInstanceRecord, LaunchOptions, VfsFailure,
 };
 use agora_core::game_launch::SystemLauncher;
 use agora_core::game_load_order::{self, Finding, LoadOrderError};
@@ -19,9 +19,9 @@ use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
-    DeploymentStrategy, GameContext, GameDefinition, GameError, GameFuture, GameId, GamePackage,
-    GamePath, InstallId, InstallKind, LoadOrderDefinition, LoadOrderFormat, LoadOrderLine,
-    LoadOrderRule, LoadOrderRules, LoadOrderRulesReply, PackageDefinition, RelPath,
+    DeploymentStrategy, Diagnostic, GameContext, GameDefinition, GameError, GameFuture, GameId,
+    GamePackage, GamePath, InstallId, InstallKind, LoadOrderDefinition, LoadOrderFormat,
+    LoadOrderLine, LoadOrderRule, LoadOrderRules, LoadOrderRulesReply, PackageDefinition, RelPath,
     RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
@@ -35,6 +35,8 @@ struct ScriptHooks {
     fail_rules: bool,
     fail_parse: bool,
     fail_render: bool,
+    /// Where a diagnostics hook records the context core gave it.
+    diagnostics: Option<Arc<Mutex<Option<GameContext>>>>,
 }
 
 struct TestPackage {
@@ -119,6 +121,16 @@ impl GamePackage for TestPackage {
                 out.push('\n');
             }
             Ok(Some(out.into_bytes()))
+        })
+    }
+
+    fn diagnostics<'a>(&'a self, context: GameContext) -> GameFuture<'a, Vec<Diagnostic>> {
+        let seen = self.hooks.diagnostics.clone();
+        Box::pin(async move {
+            if let Some(seen) = seen {
+                *seen.lock().unwrap() = Some(context);
+            }
+            Ok(Vec::new())
         })
     }
 }
@@ -849,4 +861,39 @@ fn folder_items_list_folders_not_files() {
     let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, Some("mods")).unwrap();
     assert_eq!(names(&order.entries), ["Alpha", "Beta"]);
     assert!(order.entries.iter().all(|entry| entry.present));
+}
+
+#[test]
+fn the_launch_checks_give_the_diagnostics_hook_the_enabled_plugins() {
+    let seen: Arc<Mutex<Option<GameContext>>> = Arc::new(Mutex::new(None));
+    let hooks = ScriptHooks {
+        diagnostics: Some(seen.clone()),
+        ..ScriptHooks::default()
+    };
+    let h = Harness::with_hooks(vec![lines_rule("plugins", "Plugins.txt")], hooks);
+    let inst = h.instance("diagnostics-order");
+    let item = h.item("mod", &[("Data/On.esp", b"on"), ("Data/Off.esp", b"off")]);
+    h.add(&inst, &item);
+    h.write(&inst, "Plugins.txt", b"*On.esp\nOff.esp\n");
+
+    let checks = launch_checks(&h.ctx, &inst, &h.def).expect("the launch checks run");
+    assert!(checks.diagnostics.is_empty(), "{:?}", checks.diagnostics);
+    let context = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the diagnostics hook ran");
+    let entries = context.load_order.entries;
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.id == "On.esp" && entry.enabled && entry.present),
+        "{entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.id == "Off.esp" && !entry.enabled && entry.present),
+        "{entries:?}"
+    );
 }

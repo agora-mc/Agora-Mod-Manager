@@ -15,12 +15,15 @@ use agora_core::crash_packs::{
 use agora_game_api::crash::{
     AttrValue, Fact, GameHandle, InspectResult, InspectorDecl, ParserLimits,
 };
-use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
+use agora_plugin_api::host::{
+    ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
+};
 use agora_plugin_api::manifest::{PluginId, PluginManifest};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
 use agora_plugin_host::QuickJsHost;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 
 use dll_fixture::{dll, dll_exporting, dll_without_exports, VersionData};
@@ -355,4 +358,116 @@ fn a_hostile_export_name_count_cannot_make_it_pass() {
     bytes[0x200 + 24..0x200 + 28].copy_from_slice(&u32::MAX.to_le_bytes());
     let dispatch = inspect(&running, &bytes, Some("1.6.1170"));
     assert_eq!(result(&dispatch), InspectResult::Unknown);
+}
+
+/// The same DLL, reached through the pre-flight hook's `game.*` scope.
+struct PreflightView {
+    name: String,
+    bytes: Vec<u8>,
+}
+
+impl GameReads for PreflightView {
+    fn read_bytes(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ScriptReadError> {
+        let wanted = format!("Data/SKSE/Plugins/{}", self.name);
+        if !path.eq_ignore_ascii_case(&wanted) {
+            return Err(ScriptReadError::new(
+                "not_found",
+                "that path is not in this instance",
+            ));
+        }
+        let start = (offset as usize).min(self.bytes.len());
+        let end = start.saturating_add(len as usize).min(self.bytes.len());
+        Ok(self.bytes[start..end].to_vec())
+    }
+
+    fn read_lines(
+        &self,
+        _path: &str,
+        _from_line: u64,
+        _max_lines: u32,
+    ) -> Result<serde_json::Value, ScriptReadError> {
+        Err(ScriptReadError::new("unreadable", "no lines here"))
+    }
+
+    fn list(&self, path: &str) -> Result<serde_json::Value, ScriptReadError> {
+        if !path.eq_ignore_ascii_case("Data/SKSE/Plugins") {
+            return Err(ScriptReadError::new("not_found", "no such folder"));
+        }
+        Ok(serde_json::json!({
+            "entries": [{ "name": self.name, "dir": false, "size": self.bytes.len() }],
+            "cut": false,
+        }))
+    }
+}
+
+fn preflight(running: &Running, name: &str, bytes: &[u8], runtime: &str) -> Vec<serde_json::Value> {
+    let reads = Arc::new(PreflightView {
+        name: name.to_string(),
+        bytes: bytes.to_vec(),
+    });
+    let args = serde_json::json!({
+        "context": {
+            "instance": "test",
+            "runtime": { "game": "skyrim-se", "store": "steam", "version": runtime },
+            "load_order": { "entries": [], "rules": [] }
+        }
+    });
+    running
+        .host
+        .invoke_with_game_reads(
+            &PluginId::parse(PLUGIN).unwrap(),
+            "creationEngineDiagnostics",
+            args,
+            Duration::from_secs(5),
+            reads,
+        )
+        .expect("the pre-flight hook runs")
+        .as_array()
+        .expect("the hook returns a list")
+        .clone()
+}
+
+fn flags_another_game_version(diagnostics: &[serde_json::Value]) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        diagnostic["code"] == "CE_SKSE_PLUGIN_OTHER_GAME_VERSION"
+            && diagnostic["severity"] == "warning"
+    })
+}
+
+#[test]
+fn the_inspector_and_the_preflight_give_the_same_verdict() {
+    let running = start();
+    let cases = [
+        (
+            "a plugin for this game",
+            dll(&VersionData {
+                compatible: vec![[1, 6, 1170, 0]],
+                ..VersionData::default()
+            }),
+            InspectResult::Pass,
+        ),
+        (
+            "a plugin for another game",
+            dll(&VersionData {
+                compatible: vec![[1, 5, 97, 0]],
+                ..VersionData::default()
+            }),
+            InspectResult::Fail,
+        ),
+        (
+            "an old-format plugin",
+            dll_exporting("SomethingElse", None),
+            InspectResult::Unknown,
+        ),
+    ];
+    for (label, bytes, expected) in cases {
+        let dispatch = inspect(&running, &bytes, Some("1.6.1170"));
+        assert_eq!(result(&dispatch), expected, "{label}: inspector");
+        let diagnostics = preflight(&running, "InventedPlugin.dll", &bytes, "1.6.1170");
+        assert_eq!(
+            flags_another_game_version(&diagnostics),
+            expected == InspectResult::Fail,
+            "{label}: the pre-flight disagrees: {diagnostics:#?}"
+        );
+    }
 }

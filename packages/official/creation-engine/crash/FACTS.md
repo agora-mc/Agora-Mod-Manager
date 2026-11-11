@@ -77,6 +77,22 @@ it, and the game line is matched without that first letter.
 |---|---|---|
 | T | 1.2.1–1.4.0 | `SkyrimSE`/`SkyrimVR`, then `trainwreck v…`. Four-space indentation. `PROBABLE CALL STACK` frames are `[n] 0xADDR module+offset symbol`, followed by instruction and `[source:line]` lines. `MODULES` has `Address`, `SHA` (SHA-512) and `Version`. `SCRIPT EXTENDER PLUGINS`. No process block and no load-order `PLUGINS`. |
 
+## Plugin headers (pre-flight)
+
+The `diagnostics` hook reads each enabled plugin's `HEDR` subrecord. Its first field is a
+float32 header version: UESP's [TES4 format page](https://en.uesp.net/wiki/Skyrim_Mod:Mod_File_Format/TES4)
+says 0.94 for older files and 1.7 for Skyrim SE, and xEdit's `gdHEDRVersion`
+([wbDefinitionsTES5.pas, `dev-4.1.6`](https://github.com/TES5Edit/TES5Edit/blob/dev-4.1.6/Core/wbDefinitionsTES5.pas))
+writes 1.71 for SSE. Game [1.6.1130](https://en.uesp.net/wiki/Skyrim:Special_Edition_Patch) raised
+the ESL form-id range from 2048 to 4096 records, so a 1.71 header needs 1.6.1130 or later. A plugin
+with 1.71 on an older game can stop the game while it loads its plugin list.
+
+**Backported Extended ESL Support** backports that range to 1.5.97. The check treats
+`Data/SKSE/Plugins/BackportedESLSupport.dll` as the exception and never reads its version. The DLL
+name is the one the mod's own package installs (Nexus Mods, Skyrim Special Edition); the page
+blocks automated fetches, so the name was confirmed from its published file listing rather than
+read from source here.
+
 ## Facts
 
 Every example below is invented for this file. `place` is a register name or a
