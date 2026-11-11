@@ -7,7 +7,7 @@ use agora_game_api::crash::{
     CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding, InspectResult,
     InspectionRecord, Level, LocalText, MatchOps, NextStepKind, ParseNoteKind, Ref, RepairOffer,
     RepairRequest, ResolvedRepair, Role, Rule, RuleText, Scalar, Scope, Signal, SourceAttribution,
-    Strength, TextMatch, TrustNote, Truth, MAX_RULE_BRANCHES,
+    Strength, TextMatch, TrustNote, Truth,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -211,7 +211,8 @@ impl View {
             }
         }
         annotate_frames(&mut facts, resolver);
-        facts.sort_by_key(FactEntry::sort_key);
+        // Each key serialises a fact, so compute it once per fact, not once per comparison.
+        facts.sort_by_cached_key(FactEntry::sort_key);
         Self { facts, coverage }
     }
 
@@ -298,10 +299,10 @@ struct EvalResult {
     overflow: bool,
 }
 
-fn cap_branches(mut branches: Vec<Branch>, overflow: &mut bool) -> Vec<Branch> {
-    if branches.len() > MAX_RULE_BRANCHES {
+fn cap_branches(mut branches: Vec<Branch>, limit: usize, overflow: &mut bool) -> Vec<Branch> {
+    if branches.len() > limit {
         *overflow = true;
-        branches.truncate(MAX_RULE_BRANCHES);
+        branches.truncate(limit);
     }
     branches
 }
@@ -319,6 +320,7 @@ fn merge_unknown(a: &[UnknownNote], b: &[UnknownNote]) -> Vec<UnknownNote> {
 fn eval_condition(
     condition: &Condition,
     view: &View,
+    limit: usize,
     resolver: &dyn RefResolver,
     bindings: &Bindings,
 ) -> EvalResult {
@@ -335,7 +337,8 @@ fn eval_condition(
                         next.push(branch);
                         continue;
                     }
-                    let child_result = eval_condition(child, view, resolver, &branch.bindings);
+                    let child_result =
+                        eval_condition(child, view, limit, resolver, &branch.bindings);
                     result.overflow |= child_result.overflow;
                     for outcome in child_result.branches {
                         let truth = branch.truth.and(outcome.truth);
@@ -349,7 +352,7 @@ fn eval_condition(
                         });
                     }
                 }
-                result.branches = cap_branches(next, &mut result.overflow);
+                result.branches = cap_branches(next, limit, &mut result.overflow);
             }
             result
         }
@@ -371,7 +374,8 @@ fn eval_condition(
                         next.push(branch.clone());
                         continue;
                     }
-                    let child_result = eval_condition(child, view, resolver, &branch.bindings);
+                    let child_result =
+                        eval_condition(child, view, limit, resolver, &branch.bindings);
                     result.overflow |= child_result.overflow;
                     for outcome in child_result.branches {
                         let truth = branch.truth.or(outcome.truth);
@@ -394,12 +398,12 @@ fn eval_condition(
                         });
                     }
                 }
-                result.branches = cap_branches(next, &mut result.overflow);
+                result.branches = cap_branches(next, limit, &mut result.overflow);
             }
             result
         }
         Condition::Not(inner) => {
-            let evaluated = eval_condition(inner, view, resolver, bindings);
+            let evaluated = eval_condition(inner, view, limit, resolver, bindings);
             let any_true = evaluated
                 .branches
                 .iter()
@@ -437,7 +441,7 @@ fn eval_condition(
             let mut unknown = Vec::new();
             let mut overflow = false;
             for child in of {
-                let evaluated = eval_condition(child, view, resolver, bindings);
+                let evaluated = eval_condition(child, view, limit, resolver, bindings);
                 overflow |= evaluated.overflow;
                 let mut child_true: Option<Branch> = None;
                 let mut child_unknown = false;
@@ -494,9 +498,9 @@ fn eval_condition(
                 overflow,
             }
         }
-        Condition::Fact(query) => eval_fact(query, view, resolver, bindings),
-        Condition::Count(query) => eval_count(query, view, resolver, bindings),
-        Condition::Text(text) => eval_text(text, view, bindings),
+        Condition::Fact(query) => eval_fact(query, view, limit, resolver, bindings),
+        Condition::Count(query) => eval_count(query, view, limit, resolver, bindings),
+        Condition::Text(text) => eval_text(text, view, limit, bindings),
     }
 }
 
@@ -521,6 +525,7 @@ fn common_bindings(branches: &[Bindings]) -> Bindings {
 fn eval_fact(
     query: &FactQuery,
     view: &View,
+    limit: usize,
     resolver: &dyn RefResolver,
     bindings: &Bindings,
 ) -> EvalResult {
@@ -568,9 +573,9 @@ fn eval_fact(
             }
             Truth::False => {}
         }
-        if branches.len() > MAX_RULE_BRANCHES {
+        if branches.len() > limit {
             overflow = true;
-            branches.truncate(MAX_RULE_BRANCHES);
+            branches.truncate(limit);
             break;
         }
     }
@@ -688,11 +693,15 @@ fn fact_matches(
         starts = next;
     }
     let evidence = entry.evidence();
-    if truth != Truth::True {
+    // An attribute that cannot be judged leaves the fact unknown, unless its ref rules it out:
+    // unknown and false is false (a fact about another module is simply not a match).
+    let attr_truth = truth;
+    let attr_reason = reason;
+    if attr_truth != Truth::True && query.reference.is_none() {
         return FactOutcome {
-            truth,
+            truth: attr_truth,
             branches: Vec::new(),
-            reason,
+            reason: attr_reason,
         };
     }
     let Some(reference_query) = &query.reference else {
@@ -749,10 +758,22 @@ fn fact_matches(
         }
     }
     if out.is_empty() {
+        let truth = attr_truth.and(ref_truth);
+        let reason = if truth == Truth::Unknown {
+            merge_reason(attr_reason, ref_reason)
+        } else {
+            None
+        };
         FactOutcome {
-            truth: ref_truth,
+            truth,
             branches: Vec::new(),
-            reason: ref_reason,
+            reason,
+        }
+    } else if attr_truth != Truth::True {
+        FactOutcome {
+            truth: attr_truth,
+            branches: Vec::new(),
+            reason: attr_reason,
         }
     } else {
         FactOutcome {
@@ -824,6 +845,7 @@ fn fact_truth(
 fn eval_count(
     query: &CountQuery,
     view: &View,
+    _limit: usize,
     resolver: &dyn RefResolver,
     bindings: &Bindings,
 ) -> EvalResult {
@@ -908,7 +930,7 @@ fn count_truth(query: &CountQuery, known: u32, unknown: u32) -> Truth {
     at_least.and(at_most)
 }
 
-fn eval_text(text: &TextMatch, view: &View, bindings: &Bindings) -> EvalResult {
+fn eval_text(text: &TextMatch, view: &View, limit: usize, bindings: &Bindings) -> EvalResult {
     let lines: Vec<&FactEntry> = view.facts_of_kind("core.log_line").collect();
     if lines.is_empty() {
         return match view.coverage_of("core.log_line") {
@@ -1009,9 +1031,9 @@ fn eval_text(text: &TextMatch, view: &View, bindings: &Bindings) -> EvalResult {
                     evidence: vec![entry.evidence()],
                     unknown: Vec::new(),
                 });
-                if branches.len() > MAX_RULE_BRANCHES {
+                if branches.len() > limit {
                     overflow = true;
-                    branches.truncate(MAX_RULE_BRANCHES);
+                    branches.truncate(limit);
                     break;
                 }
             }
@@ -1319,9 +1341,12 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         )
     });
 
+    // Most rules see every parsed artifact plus the engine's facts, so they share one view.
+    let all: Vec<&ParsedArtifact> = input.parsed.iter().collect();
+    let shared = View::build(&all, input.engine_facts, true, input.resolver);
     let mut products: Vec<RuleProducts> = Vec::new();
     for (plugin, rule) in rules {
-        let Some(product) = evaluate_rule(input, plugin, rule) else {
+        let Some(product) = evaluate_rule(input, plugin, rule, &shared) else {
             continue;
         };
         products.push(product);
@@ -1464,6 +1489,7 @@ fn evaluate_rule(
     input: &EvaluateInput<'_>,
     plugin: &PluginIdentity,
     rule: &Rule,
+    shared: &View,
 ) -> Option<RuleProducts> {
     let producer = rule.scope.producer.as_ref();
     let mut scope_unknown = Vec::new();
@@ -1543,13 +1569,21 @@ fn evaluate_rule(
         });
     }
 
-    let view = View::build(
-        &allowed,
-        input.engine_facts,
-        producer.is_none(),
+    let gated;
+    let view = if producer.is_none() {
+        shared
+    } else {
+        gated = View::build(&allowed, input.engine_facts, false, input.resolver);
+        &gated
+    };
+    let limit = rule.branch_limit();
+    let result = eval_condition(
+        &rule.when,
+        view,
+        limit,
         input.resolver,
+        &Bindings::default(),
     );
-    let result = eval_condition(&rule.when, &view, input.resolver, &Bindings::default());
 
     let mut product = RuleProducts {
         plugin_id: plugin.id.clone(),
@@ -1778,7 +1812,8 @@ fn overflow_note(plugin: &PluginIdentity, rule: &Rule) -> CouldNotCheck {
         reason: CouldNotCheckReason::TooManyMatches,
         subject: rule.id.clone(),
         detail: Some(format!(
-            "the rule matched more than {MAX_RULE_BRANCHES} branches"
+            "the rule matched more than {} branches",
+            rule.branch_limit()
         )),
         source: Some(rule_source(plugin, rule, None)),
     }

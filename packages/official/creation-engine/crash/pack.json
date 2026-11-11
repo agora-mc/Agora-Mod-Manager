@@ -1161,7 +1161,8 @@
         }
       },
       "next_step": "confirm_experiment",
-      "reference": "CommonLibSSE-NG include/SKSE/Interfaces.h lines 536-622 (struct and flags), include/REL/Version.h lines 94-107 (packing)"
+      "reference": "CommonLibSSE-NG include/SKSE/Interfaces.h lines 536-622 (struct and flags), include/REL/Version.h lines 94-107 (packing)",
+      "max_branches": 512
     },
     {
       "id": "stack_module_built_for_another_game_version",
@@ -1229,7 +1230,8 @@
         }
       },
       "next_step": "confirm_experiment",
-      "reference": "CommonLibSSE-NG include/SKSE/Interfaces.h lines 536-622 (struct and flags), include/REL/Version.h lines 94-107 (packing)"
+      "reference": "CommonLibSSE-NG include/SKSE/Interfaces.h lines 536-622 (struct and flags), include/REL/Version.h lines 94-107 (packing)",
+      "max_branches": 512
     }
   ]
 }

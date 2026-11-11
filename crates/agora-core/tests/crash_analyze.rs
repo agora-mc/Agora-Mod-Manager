@@ -586,3 +586,133 @@ fn another_games_rules_stay_out_of_a_loose_file_read_for_one_game() {
     assert!(rules.contains(&"every_game_rule"), "{rules:?}");
     assert!(!rules.contains(&"other_game_rule"), "{rules:?}");
 }
+
+fn many_faults(count: usize) -> String {
+    let mut text = String::from("== FAULTS ==\n");
+    for index in 0..count {
+        text.push_str(&format!("module Invented{index}.dll failed\n"));
+    }
+    text
+}
+
+fn with_max_branches(rule: String, limit: u32) -> String {
+    rule.replacen(
+        r#""version": 1,"#,
+        &format!(r#""version": 1, "max_branches": {limit},"#),
+        1,
+    )
+}
+
+#[test]
+fn a_rule_over_a_long_list_fires_only_when_it_asks_for_enough_branches() {
+    let host = idle_host();
+    let log = many_faults(40);
+
+    let (_a, default_limit) = plugin_folder(
+        "acme.harbor",
+        "Acme Harbor crash rules",
+        &generic_pack("", &fault_rule("every_fault")),
+        None,
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: &[default_limit],
+        files: &[file("crash.txt", &log)],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+    assert!(output.answer.candidates.is_empty());
+    assert!(output
+        .answer
+        .could_not_check
+        .iter()
+        .any(|note| note.reason == agora_game_api::crash::CouldNotCheckReason::TooManyMatches));
+
+    let (_b, raised) = plugin_folder(
+        "acme.harbor",
+        "Acme Harbor crash rules",
+        &generic_pack("", &with_max_branches(fault_rule("every_fault"), 64)),
+        None,
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: &[raised],
+        files: &[file("crash.txt", &log)],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+    assert_eq!(output.answer.candidates.len(), 40);
+    assert!(!output
+        .answer
+        .could_not_check
+        .iter()
+        .any(|note| note.reason == agora_game_api::crash::CouldNotCheckReason::TooManyMatches));
+}
+
+#[test]
+fn a_fact_about_something_else_is_not_a_match_even_when_its_attribute_is_unknown() {
+    // The rule wants `Wanted.dll` with a size it cannot judge on these facts (no `size` attribute).
+    // A fault about another module is simply not a match: no "could not check" for it.
+    let rule = r#"{
+  "id": "wanted_with_size",
+  "version": 1,
+  "when": {
+    "fact": { "kind": "acme.fault", "where": { "size": { "gte": 1 } },
+              "ref": { "kind": "module", "value": "Wanted.dll", "bind": "m" } }
+  },
+  "effects": [
+    { "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 16 } }
+  ],
+  "text": { "headline": { "en": "{owner:m} failed." } }
+}"#;
+    let (_dir, pack) = plugin_folder(
+        "acme.harbor",
+        "Acme Harbor crash rules",
+        &generic_pack("", rule),
+        None,
+    );
+    let host = idle_host();
+    let run = |text: &str| {
+        analyze(&AnalyzeInput {
+            packs: std::slice::from_ref(&pack),
+            files: &[file("crash.txt", text)],
+            runtime_version: None,
+            host: &host,
+            built_in: &[],
+            instance: None,
+        })
+        .unwrap()
+    };
+    let unknown_notes = |output: &agora_core::crash_engine::AnalyzeOutput| {
+        output
+            .answer
+            .could_not_check
+            .iter()
+            .filter(|note| {
+                note.source
+                    .as_ref()
+                    .and_then(|source| source.rule_id.as_deref())
+                    == Some("wanted_with_size")
+            })
+            .count()
+    };
+    let elsewhere = run("== FAULTS ==\nmodule Other.dll failed\n");
+    assert_eq!(
+        unknown_notes(&elsewhere),
+        0,
+        "{:#?}",
+        elsewhere.answer.could_not_check
+    );
+    // The same unknown attribute on the module it asks about still says it could not check.
+    let wanted = run("== FAULTS ==\nmodule Wanted.dll failed\n");
+    assert_eq!(
+        unknown_notes(&wanted),
+        1,
+        "{:#?}",
+        wanted.answer.could_not_check
+    );
+}

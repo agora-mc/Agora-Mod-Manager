@@ -303,6 +303,18 @@ pub fn lint_rule(rule: &Rule) -> Vec<LintProblem> {
             "an id is lower-case letters, digits, `_`, `-` and `.`",
         );
     }
+    if let Some(limit) = rule.max_branches {
+        let limit = limit as usize;
+        if !(MAX_RULE_BRANCHES..=MAX_RULE_BRANCHES_CEILING).contains(&limit) {
+            lint.push(
+                LintCode::BadEffect,
+                format!(
+                    "`max_branches` is from {MAX_RULE_BRANCHES} to {MAX_RULE_BRANCHES_CEILING}, \
+                     and this one is {limit}"
+                ),
+            );
+        }
+    }
     if let Some(runtime) = &rule.scope.runtime {
         lint.version_gate(runtime);
     }

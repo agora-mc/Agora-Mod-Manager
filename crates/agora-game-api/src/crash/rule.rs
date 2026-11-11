@@ -22,8 +22,12 @@ use super::{Family, Level, Role, Scalar, Scope, Strength};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
-/// The most branches one rule may produce. The engine stops there and says so.
+/// The most branches one rule may produce unless it asks for more. The engine stops there and
+/// says so.
 pub const MAX_RULE_BRANCHES: usize = 32;
+/// The most a rule may raise its own limit to, with `max_branches`. A rule that checks every item
+/// in a list (each script-extender plugin a log lists, say) needs more than the default.
+pub const MAX_RULE_BRANCHES_CEILING: usize = 512;
 /// The longest regex a rule may hold, in bytes.
 pub const MAX_RULE_REGEX_LEN: usize = 256;
 /// The compiled size limit for `regex::RegexBuilder`. Rust's `regex` runs in linear time, so this
@@ -70,6 +74,19 @@ pub struct Rule {
     /// Where the knowledge came from, for people reading the pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
+    /// How many branches this rule may produce, from [`MAX_RULE_BRANCHES`] up to
+    /// [`MAX_RULE_BRANCHES_CEILING`]. Past it the rule does not fire and says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_branches: Option<u32>,
+}
+
+impl Rule {
+    /// The branch limit the engine applies: the rule's own, never beyond the ceiling.
+    pub fn branch_limit(&self) -> usize {
+        self.max_branches
+            .map(|limit| (limit as usize).clamp(1, MAX_RULE_BRANCHES_CEILING))
+            .unwrap_or(MAX_RULE_BRANCHES)
+    }
 }
 
 /// When the rule applies at all. A version the gate can't judge makes the rule `Unknown`.
