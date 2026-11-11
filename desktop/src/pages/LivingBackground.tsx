@@ -18,6 +18,7 @@ import { useController } from '../features/controller/ControllerProvider';
 import { useControllerLayer } from '../features/controller/useControllerLayer';
 import type { ControllerIntent } from '../features/controller/intents';
 import { readGamepadAnalog } from '../lib/useGamepad';
+import { reloadPage } from '../lib/reloadPage';
 
 /** Stick deflection below this is drift, not intent. */
 const STICK_DEADZONE = 0.16;
@@ -265,21 +266,12 @@ export function LivingBackground() {
     setZoom(clamped);
   };
   /**
-   * Put the scene back the way it starts: default zoom, both clocks free-running,
-   * the standard background visible, the companion on. The time and weather
-   * themselves are left alone (they keep cycling once unlocked).
+   * Start the scene over by reloading the app window: the world is rebuilt from
+   * scratch and the view, the clocks and the rainbow all go back to how they
+   * open. Saved settings (sound, music, the hidden background) are kept, and
+   * the app comes back on this page.
    */
-  const resetScene = () => {
-    setZoomValue(DEFAULT_ZOOM);
-    setZoom(DEFAULT_ZOOM);
-    setTodLockedValue(false);
-    setTodLocked(false);
-    setWeatherLockedValue(false);
-    setWeatherLocked(false);
-    setClearBackground(false);
-    setBuddyValue(true);
-    setBuddy(true);
-  };
+  const resetScene = () => reloadPage();
   /**
    * Controller play. With the controls folded away, a pad drives the world
    * itself: the left stick (or D-pad) moves a cursor, the right stick looks
@@ -389,7 +381,7 @@ export function LivingBackground() {
                 data-testid="living-bg-zoom-float-reset"
               >
                 <RotateCcw className="h-3 w-3" aria-hidden="true" />
-                Reset scene
+                Reload Scene
               </button>
             )}
           />
@@ -445,7 +437,7 @@ export function LivingBackground() {
               data-testid="living-bg-reset"
             >
               <RotateCcw className="h-3 w-3" aria-hidden="true" />
-              Reset scene
+              Reload Scene
             </button>
           </div>
           <div id="living-bg-panel-body" className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">

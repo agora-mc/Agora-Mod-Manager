@@ -108,6 +108,7 @@ export function createWorld(state: EngineState, opts: WorldOpts): WorldState {
     mid: pal.mid ? sh(pal.mid) : undefined,
     belly: pal.belly ? sh(pal.belly) : undefined,
     eye: pal.eye,
+    horn: pal.horn ? sh(pal.horn) : undefined,
     beak: pal.beak ? sh(pal.beak) : undefined,
     head: pal.head ? sh(pal.head) : undefined,
   });

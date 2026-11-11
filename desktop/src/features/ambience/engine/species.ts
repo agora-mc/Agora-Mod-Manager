@@ -258,7 +258,16 @@ export function drawQuad(
   }
   // --- snout, with a nose at its tip ---
   const noseC = '#241C18';
-  if (shapeDef.snout) {
+  if (shapeDef.snout && shapeDef.droop) {
+    // a moose: a long nose that overhangs the jaw, and a bell under the chin
+    const sn = shapeDef.snout * s;
+    const sx0 = dir > 0 ? hx + hw * 0.7 : hx - sn * 0.85 + hw * 0.12;
+    F(sx0, hy + hh * 0.3, sn + hw * 0.18, hh * 0.85, pal.body);
+    F(sx0, hy + hh * 0.3, sn + hw * 0.18, Math.max(1, hh * 0.16), light);
+    F(dir > 0 ? sx0 + sn * 0.45 : sx0, hy + hh * 0.85, sn * 0.55 + hw * 0.18, hh * 0.3, mid);
+    F(dir > 0 ? sx0 + sn + hw * 0.18 - 1.6 * s : sx0, hy + hh * 0.62, 1.6 * s, Math.max(1, s), noseC);
+    F(dir > 0 ? hx + hw * 0.3 : hx + hw * 0.7 - 1.8 * s, hy + hh, 1.8 * s, 3 * s, pal.dark);
+  } else if (shapeDef.snout) {
     const sn = shapeDef.snout * s;
     const sx0 = dir > 0 ? hx + hw * 0.82 : hx - sn * 0.9;
     F(sx0, hy + hh * 0.42, sn, hh * 0.42, pal.belly || mid);
@@ -278,7 +287,9 @@ export function drawQuad(
     F(tx0, hy + hh * 0.5, 1.6 * s, 3.4 * s);
     F(tx0 + (dir > 0 ? -1.8 * s : 1.8 * s), hy + hh * 0.34, 1.4 * s, 2.4 * s);
   }
-  // --- ears, with a paler inside ---
+  /** A block on the head, placed from the back of the skull: `d` runs towards the nose. */
+  const ahead = (d: number, w: number): number => (dir > 0 ? hx + d : hx + hw - d - w);
+  // --- ears, with a paler inside. Drawn before antlers, which stand in front of them. ---
   const earK = shapeDef.earShape || (shapeDef.ears === false ? 'none' : 'point');
   if (shapeDef.ears !== false && earK !== 'none') {
     const ew = (shapeDef.ew || 3) * s, eh = (shapeDef.eh || 5) * s;
@@ -287,6 +298,11 @@ export function drawQuad(
       F(hx + hw * 0.14, hy - eh * 1.9, ew * 0.85, eh * 2.0, pal.dark);
       F(hx + hw * 0.55, hy - eh * 1.7, ew * 0.85, eh * 1.85, pal.dark);
       if (ew * 0.85 >= 2) F(hx + hw * 0.55 + ew * 0.25, hy - eh * 1.4, Math.max(1, ew * 0.3), eh * 1.2, inner);
+    } else if (earK === 'side') {                             // deer / moose: a leaf-shaped ear held out behind the head
+      F(ahead(-ew * 0.9, ew * 1.3), hy + hh * 0.02, ew * 1.3, eh * 0.55, pal.body);
+      F(ahead(-ew * 1.5, ew * 1.1), hy - eh * 0.35, ew * 1.1, eh * 0.55, pal.body);
+      F(ahead(-ew * 1.5, ew * 1.1), hy - eh * 0.35, ew * 1.1, Math.max(1, s * 0.8), pal.dark);
+      F(ahead(-ew * 0.7, ew * 0.7), hy + hh * 0.02 + eh * 0.12, ew * 0.7, eh * 0.3, mid);
     } else if (earK === 'round') {                            // bear / mouse / raccoon
       F(hx + hw * 0.02, hy - eh * 0.6, ew * 1.5, eh * 0.85, pal.dark);
       F(hx + hw * 0.6, hy - eh * 0.6, ew * 1.5, eh * 0.85, pal.dark);
@@ -296,22 +312,35 @@ export function drawQuad(
       if (ew >= 2.5) F(hx + hw * 0.58 + ew * 0.3, hy - eh * 0.5, Math.max(1, ew * 0.35), eh * 0.5, inner);
     }
   }
-  // --- antlers (deer, moose) ---
-  // Over the ears, so an ear's pale inner strip cannot stripe the beams; and
-  // every tine starts INSIDE its beam rather than a fixed gap away from it,
-  // which left a detached pixel floating beside the antler.
+  // --- antlers ---
   if (shapeDef.antlers) {
-    ctx.fillStyle = pal.dark;
-    [0.18, 0.62].forEach((off) => {
-      const ax = hx + hw * off;
-      const tine = (y: number, len: number, inset: number): void => {
-        const x0 = dir > 0 ? ax + inset * s : ax + 1.6 * s - (inset + len) * s;
-        F(x0, y, len * s, 1.5 * s);
+    const horn = pal.horn || light;
+    const a0 = hw * 0.3;
+    if (shapeDef.antlerShape === 'moose') {
+      // Broad flat paddles held out level, with short points along the top.
+      // The far one shows behind the near one, a little higher and in shadow.
+      F(ahead(a0 - 3 * s, 10 * s), hy - 7 * s, 10 * s, 2 * s, pal.dark);
+      for (let i = 0; i < 3; i++) F(ahead(a0 - 2 * s + i * 3.4 * s, 1.3 * s), hy - 8.5 * s, 1.3 * s, 1.6 * s, pal.dark);
+      F(ahead(a0, 1.8 * s), hy - 3 * s, 1.8 * s, 3 * s + 1, horn);
+      F(ahead(a0 - 5.5 * s, 13 * s), hy - 5.5 * s, 13 * s, 2.6 * s, horn);
+      F(ahead(a0 - 5.5 * s, 13 * s), hy - 3.6 * s, 13 * s, 0.7 * s, mid);
+      F(ahead(a0 - 6.5 * s, 2 * s), hy - 7 * s, 2 * s, 2.6 * s, horn);
+      F(ahead(a0 + 6.5 * s, 2.2 * s), hy - 6.8 * s, 2.2 * s, 2.2 * s, horn);
+      for (let i = 0; i < 4; i++) F(ahead(a0 - 3.6 * s + i * 2.9 * s, 1.4 * s), hy - 7.4 * s, 1.4 * s, 2 * s, horn);
+    } else {
+      // A deer's rack: a beam that rises from the brow and sweeps forward
+      // over the head, with tines standing up along it.
+      const rack = (ox: number, oy: number, col: string): void => {
+        F(ahead(a0 + ox, 1.3 * s), hy - 3.2 * s + oy, 1.3 * s, 3.2 * s + 1, col);
+        F(ahead(a0 - 1.6 * s + ox, 7.6 * s), hy - 4.4 * s + oy, 7.6 * s, 1.3 * s, col);
+        F(ahead(a0 - 1.6 * s + ox, 1.2 * s), hy - 7.4 * s + oy, 1.2 * s, 3.2 * s, col);
+        F(ahead(a0 + 1.4 * s + ox, 1.2 * s), hy - 8.6 * s + oy, 1.2 * s, 4.4 * s, col);
+        F(ahead(a0 + 4.2 * s + ox, 1.2 * s), hy - 7.2 * s + oy, 1.2 * s, 3 * s, col);
+        F(ahead(a0 + 5.8 * s + ox, 1.2 * s), hy - 5.8 * s + oy, 1.2 * s, 1.6 * s, col);
       };
-      F(ax, hy - hh * 0.95, 1.6 * s, hh * 1.0);                    // main beam
-      tine(hy - hh * 0.62, 3.4, 0.5);                              // lower tine
-      tine(hy - hh * 1.0, 3.0, 0.8);                               // upper tine
-    });
+      rack(1.8 * s, -0.8 * s, pal.dark);
+      rack(0, 0, horn);
+    }
   }
   // --- eye ---
   F(hx + (dir > 0 ? hw * 0.58 : hw * 0.42 - Math.max(1, s)), hy + hh * 0.28, Math.max(1, s), Math.max(1, s * 1.4), pal.eye || '#161616');
@@ -512,8 +541,8 @@ export function buildSpecies(api: GameApi): Species[] {
     },
     {
       key: 'deer', name: 'Deer', w: 8, t: 'D', layer: 2, layerRange: [1, 2], speed: 22, kind: 'quad',
-      shape: shape({ bw: 18, bh: 12, hw: 8, hh: 9, lh: 9, lw: 2, neck: 6, antlers: true, earShape: 'long', eh: 4, tailShape: 'stub' }),
-      pal: P('#A6693B', '#7A4A26', '#EAD9BE'),
+      shape: shape({ bw: 18, bh: 10, hw: 8, hh: 7, lh: 10, lw: 2, neck: 6, antlers: true, earShape: 'side', ew: 3, eh: 5, snout: 4, tailShape: 'stub', tw: 5, th: 5 }),
+      pal: { ...P('#A6693B', '#EAD9BE', '#EAD9BE'), horn: '#D8C7A0' },
       voice: { freqs: [520, 700] }, onClick: function (e) {
         if (e.data.atCampfire) { W().campfireClick(e, 'deer'); return; }
         if (W().carry === 'flower' && !e.data.tame) { e.data.tame = true; W().dropCarry(); reactState(e, 'pet', 1.2); playVoice({ freqs: [660, 880, 1100], gap: 90 }); findEgg('flower-deer'); return; }
@@ -703,8 +732,11 @@ export function buildSpecies(api: GameApi): Species[] {
     },
     {
       key: 'moose', name: 'Moose', w: 1, t: 'D', layer: 1, layerRange: [0, 1], speed: 10, size: 1.7, kind: 'quad',
-      shape: shape({ bw: 30, bh: 19, hw: 14, hh: 12, lh: 10, lw: 4, tail: false, antlers: true, neck: 7, hump: 5, snout: 5, earShape: 'long', eh: 4 }),
-      pal: P('#4A3B2E', '#2E241B'),
+      shape: shape({
+        bw: 28, bh: 17, hw: 12, hh: 11, lh: 13, lw: 3, tail: false, antlers: true, antlerShape: 'moose', neck: 5, hump: 5,
+        snout: 7, droop: true, earShape: 'side', ew: 3, eh: 5,
+      }),
+      pal: { ...P('#4A3B2E', '#2E241B'), horn: '#CDB98C' },
       voice: { freqs: [90], t: 'sawtooth', d: 0.6 }, onClick: function (e) { reactState(e, 'bellow', 1.2); playVoice(this.voice); findEgg('moose-bellow'); },
     },
     {

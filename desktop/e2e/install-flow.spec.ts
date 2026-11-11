@@ -790,20 +790,26 @@ test.describe('Release C3 — Install flow entry points', () => {
     await expectResultView(page);
   });
 
-  test('ModDetail Back restores Browse scroll position', async ({ page }) => {    await installFlowMock(page);
+  test('ModDetail Back restores Browse scroll position', async ({ page }) => {
+    await installFlowMock(page);
     await page.goto('/');
     await page.getByRole('button', { name: 'Browse', exact: true }).click();
     await expect(page.getByRole('button', { name: 'View Details', exact: true })).toBeVisible();
 
     const main = page.locator('main');
-    const browseScrollTop = await main.evaluate((element) => {
+    await main.evaluate((element) => {
       element.style.paddingBottom = '1000px';
       element.scrollTop = 240;
-      return element.scrollTop;
     });
+    // Clicking scrolls a partly hidden button into view first, which moves the
+    // list a few pixels. Let that happen before reading the offset, so the test
+    // compares against where the list really was when the click landed.
+    const viewDetails = page.getByRole('button', { name: 'View Details', exact: true });
+    await viewDetails.scrollIntoViewIfNeeded();
+    const browseScrollTop = await main.evaluate((element) => element.scrollTop);
     expect(browseScrollTop).toBeGreaterThan(0);
 
-    await page.getByRole('button', { name: 'View Details', exact: true }).click();
+    await viewDetails.click();
     await expect(page.getByRole('heading', { name: 'Test Mod', exact: true })).toBeVisible();
     await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBe(0);
 

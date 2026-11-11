@@ -17,6 +17,8 @@ export interface Palette {
   mid?: string;
   belly?: string;
   eye?: string;
+  /** Antler colour. */
+  horn?: string;
   /** Birds: beak and head colours, when they differ from the body. */
   beak?: string;
   head?: string;
@@ -27,13 +29,17 @@ export interface ShapeDef {
   lw?: number; lh?: number; tw?: number; th?: number;
   ew?: number; eh?: number;
   ears?: boolean; tail?: boolean; legs?: boolean;
-  earShape?: 'point' | 'round' | 'long' | 'none';
+  earShape?: 'point' | 'round' | 'long' | 'side' | 'none';
   tailShape?: 'stub' | 'bushy' | 'long' | 'flat' | 'cat' | 'none';
   snout?: number; neck?: number; hump?: number;
   /** How it moves: a walk (default) or a bounding hop. */
   gait?: 'walk' | 'hop';
   antlers?: boolean; tusks?: boolean; spikes?: boolean; shell?: boolean;
   mane?: boolean; mask?: boolean;
+  /** Antler form: a deer's tined beams (default) or a moose's flat paddles. */
+  antlerShape?: 'deer' | 'moose';
+  /** A long muzzle that hangs below the jaw, with a bell under the chin (moose). */
+  droop?: boolean;
   /** Tabby bars across the back, whiskers at the muzzle. */
   stripes?: boolean; whiskers?: boolean;
   /** Not a four-legged animal at all: a snail, drawn as a foot, a spiral shell and eye stalks. */

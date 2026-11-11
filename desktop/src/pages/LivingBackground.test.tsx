@@ -13,28 +13,27 @@ const ambience = {
   setMusicAuto: vi.fn(), shuffleMusic: vi.fn(), setBuddy: vi.fn(), moveCursorBy: vi.fn(), panBy: vi.fn(), clickAtCursor: vi.fn(), dropCarried: vi.fn(() => false), setCursorVisible: vi.fn(), ready: true,
 };
 vi.mock('../features/ambience/AmbienceProvider', () => ({ useAmbience: () => ambience }));
+const reloadPage = vi.fn();
+vi.mock('../lib/reloadPage', () => ({ reloadPage: () => reloadPage() }));
 
 import { LivingBackground } from './LivingBackground';
 
 describe('LivingBackground reset scene', () => {
-  it('shows the zoom readout and resets zoom, locks, visibility and companion', () => {
+  it('shows the zoom readout and reloads the page without touching settings', () => {
+    reloadPage.mockClear();
     render(<LivingBackground />);
     expect(screen.getByTestId('living-bg-zoom-readout').textContent).toBe('1.6×');
-    fireEvent.click(screen.getByLabelText('Cursor companion')); // companion off
-    expect(ambience.setBuddy).toHaveBeenLastCalledWith(false);
 
     fireEvent.click(screen.getByTestId('living-bg-reset'));
 
-    expect(screen.getByTestId('living-bg-zoom-readout').textContent).toBe('0.9×');
-    expect(ambience.setZoom).toHaveBeenLastCalledWith(0.9);
-    expect(ambience.setTodLocked).toHaveBeenLastCalledWith(false);
-    expect(ambience.setWeatherLocked).toHaveBeenLastCalledWith(false);
-    expect(ambience.setClearBackground).toHaveBeenLastCalledWith(false);
-    expect(ambience.setBuddy).toHaveBeenLastCalledWith(true);
-    expect((screen.getByLabelText('Cursor companion') as HTMLInputElement).checked).toBe(true);
+    expect(reloadPage).toHaveBeenCalledTimes(1);
+    // A refresh, not a settings reset: nothing saved is changed on the way.
+    expect(ambience.setClearBackground).not.toHaveBeenCalled();
+    expect(ambience.setZoom).not.toHaveBeenCalled();
   });
 
   it('moves the zoom slider to a floating top-right control while the panel is hidden', () => {
+    reloadPage.mockClear();
     render(<LivingBackground />);
     expect(screen.queryByTestId('living-bg-zoom-float')).toBeNull();
     expect(screen.getAllByText('(click and drag to move the view)')).toHaveLength(1);
@@ -48,7 +47,6 @@ describe('LivingBackground reset scene', () => {
 
     fireEvent.click(screen.getByTestId('living-bg-zoom-float-reset'));
 
-    expect(screen.getByTestId('living-bg-zoom-float-readout').textContent).toBe('0.9×');
-    expect(ambience.setZoom).toHaveBeenLastCalledWith(0.9);
+    expect(reloadPage).toHaveBeenCalledTimes(1);
   });
 });

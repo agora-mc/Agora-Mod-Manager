@@ -16,7 +16,7 @@
 //!   `trusted_unhashed_library_paths` **only** when a valid receipt binds
 //!   the current profile hash + curated installer SHA.
 
-use crate::download::{stable_version_json, sha256_hex};
+use crate::download::{sha256_hex, stable_version_json};
 use crate::error::LauncherError;
 use crate::launch::{merge_forge_version, parse_maven_descriptor, VersionInfo};
 use crate::network;

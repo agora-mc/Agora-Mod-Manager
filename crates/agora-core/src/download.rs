@@ -393,10 +393,7 @@ mod tests {
 
         // Verify structure: no time/releaseTime, keys sorted
         assert!(!stable.contains("\"time\""), "must drop time");
-        assert!(
-            !stable.contains("\"releaseTime\""),
-            "must drop releaseTime"
-        );
+        assert!(!stable.contains("\"releaseTime\""), "must drop releaseTime");
         // id should appear before inheritsFrom (sorted)
         assert!(
             stable.find("\"id\"").unwrap() < stable.find("\"inheritsFrom\"").unwrap(),
