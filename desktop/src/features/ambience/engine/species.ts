@@ -41,6 +41,30 @@ export function shape(o: ShapeDef): ShapeDef {
   return s;
 }
 
+/** Fraction of a hop spent in the air; the rest is the crouch between hops. */
+export const HOP_AIR = 0.68;
+
+/** Where in its hop cycle (0..1) an animal is for a given gait phase. */
+export function hopCycle(phase: number): number {
+  const u = (phase / (Math.PI * 2)) % 1;
+  return u < 0 ? u + 1 : u;
+}
+
+/**
+ * How fast the gait phase should advance, in radians per second, for an
+ * animal covering `speed` px/s. One full turn of the phase is one stride (or
+ * one hop), so the rate is the speed divided by the ground a stride covers.
+ * A fixed rate for every animal made a rabbit drift along in slow arcs and a
+ * fox's feet slide under it.
+ */
+export function gaitRate(shapeDef: ShapeDef | undefined, s: number, speed: number): number {
+  if (!speed) return 0;
+  const sd = shapeDef || {};
+  if (sd.gait === 'hop') return (Math.PI * 2 * speed) / (Math.max(26, speed * 0.45) * s);
+  const reach = Math.min((sd.lh || 6) * 0.75, 4.5) * s;
+  return Math.min(24, (Math.PI * 2 * speed) / (4 * reach));
+}
+
 /**
  * A four-legged animal, built from blocks on the same grid as the props.
  *
@@ -64,10 +88,13 @@ export function drawQuad(
   // the whole animal leaves the ground, front legs reaching and back legs
   // trailing, then gathers itself to land.
   const hopping = walking && shapeDef.gait === 'hop';
-  const air = hopping ? Math.abs(Math.sin(phase * 0.5)) : 0;
+  const hopU = hopping ? hopCycle(phase) : 0;
+  const air = hopping && hopU < HOP_AIR ? Math.sin(Math.PI * hopU / HOP_AIR) : 0;
+  // between hops it gathers itself: a short crouch on the ground
+  const crouch = hopping && hopU >= HOP_AIR ? Math.sin(Math.PI * (hopU - HOP_AIR) / (1 - HOP_AIR)) * Math.min(1.5, lh * 0.3) * s : 0;
   const bob = walking && !hopping ? Math.abs(Math.sin(phase)) * Math.min(1.2, lh * 0.12) * s : 0;
-  const rise = air * (running ? 7 : 5) * s;
-  const by = gy - lh - bh - bob - rise;
+  const rise = air * (running ? 7 : 6) * s;
+  const by = gy - lh - bh - bob - rise + crouch;
   const bx0 = x - bw / 2;
   const R = Math.round;
   const light = pal.light || pal.body, mid = pal.mid || pal.dark;
@@ -77,6 +104,29 @@ export function drawQuad(
   };
   /** A block placed from the animal's back end: `d` runs towards the head. */
   const along = (d: number, w: number): number => (dir > 0 ? bx0 + d : bx0 + bw - d - w);
+  if (shapeDef.snail) {
+    // A snail: a long flat foot, a head with two eye stalks, and a spiral
+    // shell riding on its back. It used to borrow the turtle's dome.
+    const ripple = walking ? Math.sin(phase) * 0.6 * s : 0;
+    F(along(-2 * s, bw + 5 * s + ripple), gy - 2.5 * s, bw + 5 * s + ripple, 2.5 * s, pal.body);
+    F(along(-2 * s, bw + 5 * s + ripple), gy - 1 * s, bw + 5 * s + ripple, 1 * s, mid);
+    F(along(bw + 0.5 * s + ripple, 2.5 * s), gy - 6 * s, 2.5 * s, 4 * s, pal.body);
+    F(along(bw + 0.5 * s + ripple, 1 * s), gy - 9 * s, 1 * s, 3 * s, pal.body);
+    F(along(bw + 2.5 * s + ripple, 1 * s), gy - 8.5 * s, 1 * s, 2.5 * s, pal.body);
+    F(along(bw + 0.5 * s + ripple, 1 * s), gy - 9.5 * s, 1 * s, 1 * s, pal.eye || '#161616');
+    F(along(bw + 2.5 * s + ripple, 1 * s), gy - 9 * s, 1 * s, 1 * s, pal.eye || '#161616');
+    const shell = pal.accent || pal.dark;
+    F(along(0.5 * s, 8 * s), gy - 8.5 * s, 8 * s, 6 * s, shell);
+    F(along(1.5 * s, 6 * s), gy - 10 * s, 6 * s, 1.5 * s, shell);
+    F(along(1.5 * s, 6 * s), gy - 2.5 * s - 0.5 * s, 6 * s, 0.5 * s, shell);
+    // the spiral
+    F(along(2 * s, 5 * s), gy - 8 * s, 5 * s, 1 * s, light);
+    F(along(6 * s, 1 * s), gy - 8 * s, 1 * s, 4 * s, light);
+    F(along(3 * s, 4 * s), gy - 5 * s, 4 * s, 1 * s, light);
+    F(along(3 * s, 1 * s), gy - 7 * s + 0.5 * s, 1 * s, 2.5 * s, light);
+    F(along(4.5 * s, 1 * s), gy - 6.5 * s, 1 * s, 1 * s, light);
+    return { w: bw + 6 * s, h: 11 * s };
+  }
   // --- legs: hips fixed to the body's underside (F2); thigh and shin, so a step bends at the knee ---
   if (shapeDef.legs !== false) {
     const hipY = by + bh;
@@ -87,7 +137,7 @@ export function drawQuad(
       if (hopping) {
         // front pair reaches ahead, back pair trails; all tuck up in the air
         swing = (d > bw * 0.5 ? 1 : -1) * air * reach;
-        len = lh * (1 - air * 0.35);
+        len = lh * (1 - air * 0.35) - crouch;
         lift = 0;
       } else {
         swing = walking ? Math.sin(phase + a) * reach : 0;
@@ -136,6 +186,14 @@ export function drawQuad(
       // a pale tip on the plume
       if (pal.belly) F(rear(tw * 0.5 + wag, tw * 0.35), ty - th * 0.8, tw * 0.35, th * 0.25, pal.belly);
       else F(rear(tw * 0.5 + wag, tw * 0.35), ty - th * 0.8, tw * 0.35, Math.max(1, s), light);
+    } else if (tailK === 'cat') {                             // cat: carried straight up, with a crook at the tip
+      const rear = (d: number, w: number): number => (dir > 0 ? bx0 - d - w : bx0 + bw + d);
+      const sway = walking ? Math.sin(phase * 0.5) * 0.8 * s : 0;
+      const ty = by + bh * 0.15;
+      F(rear(-1 * s, 2.2 * s), ty, 2.2 * s, 2 * s, pal.body);
+      F(rear(0.2 * s, 1.6 * s), ty - th * 0.5, 1.6 * s, th * 0.5 + 1, pal.body);
+      F(rear(0.2 * s + sway * 0.5, 1.6 * s), ty - th, 1.6 * s, th * 0.5 + 1, pal.body);
+      F(rear(1.4 * s + sway, 2 * s), ty - th, 2 * s, 1.6 * s, pal.accent || pal.dark);
     } else if (tailK === 'long') {                            // wolf: low straight sweep
       F(back + (dir > 0 ? -tw * 0.35 : tw * 0.35), by + bh * 0.34, tw * 1.15, th * 0.36);
     } else if (tailK === 'flat') {                            // beaver-ish paddle
@@ -156,6 +214,9 @@ export function drawQuad(
   if (pal.belly) F(bx0, by + bh * 0.55, bw, bh * 0.42, pal.belly);
   else F(bx0, by + bh * 0.72, bw, bh * 0.28, mid);
   if (!shapeDef.shell && !shapeDef.spikes) F(bx0 + bw * 0.08, by, bw * 0.84, Math.max(1, bh * 0.2), light);
+  if (shapeDef.stripes) {                                    // tabby bars across the back
+    for (let b = 0; b < 3; b++) F(along(bw * (0.3 + b * 0.2), 1.3 * s), by, 1.3 * s, bh * 0.5, pal.accent || pal.dark);
+  }
   // the haunch: a darker block where the back leg meets the body
   if (shapeDef.legs !== false && bw > 12 * s) F(along(bw * 0.04, bw * 0.2), by + bh * 0.3, bw * 0.2, bh * 0.42, mid);
   // --- spikes along the back (hedgehog) ---
@@ -204,6 +265,11 @@ export function drawQuad(
     F(dir > 0 ? sx0 + sn - Math.max(1, s) : sx0, hy + hh * 0.42, Math.max(1, s), Math.max(1, s), noseC);
   } else {
     F(dir > 0 ? hx + hw - Math.max(1, s) : hx, hy + hh * 0.55, Math.max(1, s), Math.max(1, s), noseC);
+  }
+  if (shapeDef.whiskers) {
+    const wx = dir > 0 ? hx + hw : hx - 2 * s;
+    F(wx, hy + hh * 0.62, 2 * s, Math.max(1, s * 0.6), '#F2F4F6');
+    F(wx, hy + hh * 0.82, 1.5 * s, Math.max(1, s * 0.6), '#F2F4F6');
   }
   // --- tusks (boar) ---
   if (shapeDef.tusks) {
@@ -660,8 +726,11 @@ export function buildSpecies(api: GameApi): Species[] {
     },
     {
       key: 'cat', name: 'Cat', w: 0, t: 'A', layer: 2, speed: 20, kind: 'quad',
-      shape: shape({ bw: 11, bh: 8, tw: 7, th: 9 }),
-      pal: P('#4A4A4E', '#2C2C2E'),
+      shape: shape({
+        bw: 13, bh: 6, hw: 7, hh: 6, lh: 5, lw: 2, th: 10, tailShape: 'cat', earShape: 'point', ew: 2.4, eh: 4,
+        stripes: true, whiskers: true,
+      }),
+      pal: { ...P('#8E8E96', '#5E5E66', '#ECE7DA'), eye: '#3F8A2A' },
       gate: function () { return (W().t - (W().lastInteractAt || 0)) > 60; },
       voice: { freqs: [600, 700, 600], gap: 110 }, onClick: function (e) {
         reactState(e, 'purr', 2); W().pet('cat'); playVoice(this.voice);
@@ -683,8 +752,8 @@ export function buildSpecies(api: GameApi): Species[] {
     },
     {
       key: 'snail', name: 'Snail', w: 1, t: 'A', layer: 2, speed: 3, kind: 'quad',
-      shape: shape({ bw: 10, bh: 7, ears: false, tail: false, legs: false, shell: true, neck: 2 }),
-      pal: P('#8A9A6E', '#5E6C48', '#D9E6BE'),
+      shape: shape({ bw: 9, bh: 7, ears: false, tail: false, legs: false, snail: true }),
+      pal: P('#D9C9A0', '#B5652B'),
       voice: { freqs: [400], t: 'sine', d: 0.2 }, onClick: function (e) {
         reactState(e, 'retract', 1); playVoice(this.voice);
         if (W().nearPond(e.x)) { W().dropCarry(); findEgg('snail-lily'); return; }

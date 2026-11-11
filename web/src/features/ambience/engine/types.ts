@@ -28,12 +28,16 @@ export interface ShapeDef {
   ew?: number; eh?: number;
   ears?: boolean; tail?: boolean; legs?: boolean;
   earShape?: 'point' | 'round' | 'long' | 'none';
-  tailShape?: 'stub' | 'bushy' | 'long' | 'flat' | 'none';
+  tailShape?: 'stub' | 'bushy' | 'long' | 'flat' | 'cat' | 'none';
   snout?: number; neck?: number; hump?: number;
   /** How it moves: a walk (default) or a bounding hop. */
   gait?: 'walk' | 'hop';
   antlers?: boolean; tusks?: boolean; spikes?: boolean; shell?: boolean;
   mane?: boolean; mask?: boolean;
+  /** Tabby bars across the back, whiskers at the muzzle. */
+  stripes?: boolean; whiskers?: boolean;
+  /** Not a four-legged animal at all: a snail, drawn as a foot, a spiral shell and eye stalks. */
+  snail?: boolean;
 }
 
 export interface Species {

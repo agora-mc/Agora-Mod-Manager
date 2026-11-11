@@ -21,7 +21,7 @@ import type { EngineState, AmbienceEvent } from './state';
 import { regenerateTerrain } from './sky';
 import { drawItemSprite, drawLilyPad, drawPropSprite, LILY_FRACTIONS, shader } from './sprites';
 import { paraX, paraY, groundYWorld, screenOf, stepFor, waterSurfaceY, waterSpan } from './terrain';
-import { SPECIES, SPECIES_BY_KEY, buildSpecies, drawBird, drawFlutter, drawFrog, drawQuad, P } from './species';
+import { SPECIES, SPECIES_BY_KEY, buildSpecies, drawBird, drawFlutter, drawFrog, drawQuad, gaitRate, hopCycle, HOP_AIR, P } from './species';
 import type { Box, Entity, Palette, PerchSpot, Prop, Species, WorldState, WorldItem } from './types';
 
 /**
@@ -150,6 +150,21 @@ export function createWorld(state: EngineState, opts: WorldOpts): WorldState {
     let top = Math.min(here, groundYWorld(state, hi, layer));
     for (let wx = lo; wx < hi; wx += st) top = Math.min(top, groundYWorld(state, wx, layer));
     return top;
+  };
+
+  /**
+   * Move a ground animal along and turn its gait phase to match.
+   *
+   * The phase advances with the distance covered, so legs keep pace with the
+   * ground. A hopper only travels while it is in the air and stands still for
+   * the crouch between hops, at the same average speed.
+   */
+  const stride = (e: Entity, dt: number, v: number): void => {
+    const sd = e.sp.shape;
+    if (e.sp.kind !== 'quad') { e.x += v * dt; e.phase += dt * 6; return; }
+    e.phase += dt * gaitRate(sd, e.scale, Math.abs(v));
+    if (sd && sd.gait === 'hop') { if (hopCycle(e.phase) < HOP_AIR) e.x += (v * dt) / HOP_AIR; }
+    else e.x += v * dt;
   };
 
   /** World x of each lily pad's centre. */
@@ -707,7 +722,8 @@ export function createWorld(state: EngineState, opts: WorldOpts): WorldState {
           // F8a: sleeping animals wake and wander off — nothing is terminal
           if (this.t - (e.sleepStart || 0) > (e.sleepFor || 30)) { e.state = 'walk'; e.fx = null; e.sleepFor = 0; }
         } else if (e.state === 'walk') {
-          e.phase += dt * 6;
+          const afoot = typeof e.layer === 'number' && !e.perch;
+          if (!afoot) e.phase += dt * 6;
           if (e.perch) {
             // sitting still
           } else if (e.layer === 'sky') {
@@ -738,7 +754,7 @@ export function createWorld(state: EngineState, opts: WorldOpts): WorldState {
               e.dir = e.vx >= 0 ? 1 : -1;
             }
           } else {
-            e.x += e.vx * dt;
+            stride(e, dt, e.vx);
             if (e.vx) e.dir = e.vx > 0 ? 1 : -1;
             if (sp.kind === 'quad' && Math.random() < dt * 0.15) { e.state = 'idle'; e.stateT = 0.6 + Math.random() * 1.4; }
           }
@@ -756,7 +772,8 @@ export function createWorld(state: EngineState, opts: WorldOpts): WorldState {
             }
           }
         } else if (e.state === 'flee') {
-          e.x += e.vx * dt; e.phase += dt * 12;
+          if (typeof e.layer === 'number') stride(e, dt, e.vx);
+          else { e.x += e.vx * dt; e.phase += dt * 12; }
           if (e.vx) e.dir = e.vx > 0 ? 1 : -1;
         } else if (e.state === 'jump') { // F3: fish arc — gravity, then splash back down
           e.vy = (e.vy || 0) + 900 * dt; e.jy = (e.jy || 0) + (e.vy || 0) * dt; e.x += e.vx * dt;
@@ -771,8 +788,8 @@ export function createWorld(state: EngineState, opts: WorldOpts): WorldState {
           const tx = e.data.exitTarget as number;
           const dir = tx > e.x ? 1 : -1;
           e.dir = dir;
-          e.x += Math.abs(e.vx) * dir * dt;
-          e.phase += dt * 8;
+          if (typeof e.layer === 'number') stride(e, dt, Math.abs(e.vx) * dir);
+          else { e.x += Math.abs(e.vx) * dir * dt; e.phase += dt * 8; }
           if (Math.abs(e.x - tx) < 6) {
             if (e.data.fetchQuest) {
               e.data.fetched = true; e.state = 'react'; e.fx = 'fetch'; e.t = 0; e.reactDur = 1;
