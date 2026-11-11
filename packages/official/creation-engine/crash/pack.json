@@ -1101,6 +1101,234 @@
       "reference": "Phostwood dllCompatibleSkyrimVersionsMap.js entry SkyClimb.dll (GPL-3)"
     },
     {
+      "id": "hair_mesh_in_use",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "name": {
+              "regex": "^Hair(Male|Female)"
+            }
+          },
+          "bind": {
+            "hair": "name"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A hair mesh ({hair}) was being handled when the game crashed. Hair mods, and the physics mods that move hair, are a common cause of crashes like this: check that each is up to date and made for this game version."
+        },
+        "why_not_sure": {
+          "en": "Hair is everywhere on screen, so it may only have been in use."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood diagnoses.js checkHairModCompatibility (GPL-3)"
+    },
+    {
+      "id": "hair_mesh_with_smp",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.object",
+              "where": {
+                "name": {
+                  "regex": "^Hair(Male|Female)"
+                }
+              },
+              "bind": {
+                "hair": "name"
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.script_extender_plugin",
+              "ref": {
+                "kind": "module",
+                "value": {
+                  "glob": "hdtSMP64.dll"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "supersedes": [
+        "hair_mesh_in_use"
+      ],
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A hair mesh ({hair}) was being handled when the game crashed, and HDT-SMP physics is installed. SMP hair on NPCs is a known source of random crashes: make sure HDT-SMP and your hair mods are current, and consider the SMP-NPC crash fix mod."
+        },
+        "why_not_sure": {
+          "en": "Hair is everywhere on screen, so it may only have been in use."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood diagnoses.js checkHairModCompatibility (GPL-3)"
+    },
+    {
+      "id": "engine_fixes_outdated",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.game",
+              "where": {
+                "version": {
+                  "version": {
+                    "exact": [
+                      "1.5.97",
+                      "1.6.1170"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.script_extender_plugin",
+              "where": {
+                "version": {
+                  "version": {
+                    "below": "7.0.20"
+                  }
+                }
+              },
+              "ref": {
+                "kind": "module",
+                "value": {
+                  "glob": "EngineFixes.dll"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "context": {
+            "text": {
+              "en": "SSE Engine Fixes is older than 7.0.20. Newer versions prevent some crash types, so updating it is a cheap step (carry over any settings you changed in its .toml file)."
+            }
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SSE Engine Fixes could be updated."
+        }
+      },
+      "reference": "Phostwood diagnoses.js checkEngineFixesUpdate (GPL-3)"
+    },
+    {
+      "id": "shadow_scene_crash_engine_fixes_can_prevent",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.object",
+              "where": {
+                "rtti": "ShadowSceneNode"
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.script_extender_plugin",
+              "where": {
+                "version": {
+                  "version": {
+                    "below": "7.0.18"
+                  }
+                }
+              },
+              "ref": {
+                "kind": "module",
+                "value": {
+                  "glob": "EngineFixes.dll"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game crashed while drawing shadows, and this Engine Fixes version is older than 7.0.18, which fixes a crash of this kind. Updating SSE Engine Fixes is the first thing to try."
+        },
+        "why_not_sure": {
+          "en": "Shadow drawing is involved in many crashes; the update fixes one known kind."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood diagnoses.js checkEngineFixesUpdate (GPL-3)"
+    },
+    {
+      "id": "crash_logger_outdated",
+      "version": 1,
+      "scope": {
+        "producer": {
+          "format": "crash_logger",
+          "version": {
+            "below": "1.20.1"
+          }
+        }
+      },
+      "when": {
+        "fact": {
+          "kind": "creation.game"
+        }
+      },
+      "effects": [
+        {
+          "context": {
+            "text": {
+              "en": "This log comes from an older Crash Logger. Version 1.20.1 or later writes more detail, which makes the next crash easier to diagnose."
+            }
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "Crash Logger could be updated."
+        }
+      },
+      "reference": "Phostwood diagnoses.js checkCrashLoggerVersionUpdate (GPL-3)"
+    },
+    {
       "id": "skse_plugin_built_for_another_game_version",
       "version": 1,
       "when": {

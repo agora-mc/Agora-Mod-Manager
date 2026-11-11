@@ -363,3 +363,118 @@ fn the_missing_master_site_is_recognised_only_on_its_own_game_build() {
     let on_1170 = run(&running, &on_build(&at_site, "1.6.1170", None));
     assert!(!rule_fired(&on_1170, "missing_masters_known_site"));
 }
+
+fn mesh_in(place: &str, name: &str) -> [String; 2] {
+    [
+        format!("\t{place} 0x2F000000000      (BSDynamicTriShape*)"),
+        format!("\t\tName: \"{name}\""),
+    ]
+}
+
+fn registers(groups: &[&[String]]) -> String {
+    log(
+        "EXCEPTION_ACCESS_VIOLATION",
+        &["SkyrimSE.exe"],
+        &lines(groups).iter().map(String::as_str).collect::<Vec<_>>(),
+        &[],
+    )
+}
+
+#[test]
+fn a_hair_mesh_in_use_is_a_finding_and_with_smp_it_says_so() {
+    let running = start();
+    let hair = mesh_in("R13", "HairFemaleNord01");
+    let plain = run(&running, &registers(&[&hair]));
+    assert!(rule_fired(&plain, "hair_mesh_in_use"));
+    assert!(!rule_fired(&plain, "hair_mesh_with_smp"));
+    assert!(plain.answer.candidates.is_empty(), "it accuses nobody");
+
+    let with_smp = run(
+        &running,
+        &on_build(&registers(&[&hair]), "1.6.1170", Some("hdtSMP64.dll")),
+    );
+    assert!(rule_fired(&with_smp, "hair_mesh_with_smp"));
+    assert!(
+        !rule_fired(&with_smp, "hair_mesh_in_use"),
+        "the SMP wording replaces the plain one"
+    );
+}
+
+#[test]
+fn a_mesh_that_is_not_hair_is_not_a_hair_finding() {
+    let running = start();
+    let other = mesh_in("R13", "CrosshairMarker");
+    let output = run(&running, &registers(&[&other]));
+    assert!(!rule_fired(&output, "hair_mesh_in_use"));
+    assert!(!rule_fired(&output, "hair_mesh_with_smp"));
+}
+
+#[test]
+fn an_old_engine_fixes_is_noted_only_on_the_builds_it_applies_to() {
+    let running = start();
+    let base = log("EXCEPTION_ACCESS_VIOLATION", &["SkyrimSE.exe"], &[], &[]);
+    let old = run(
+        &running,
+        &on_build(&base, "1.6.1170", Some("EngineFixes.dll v7.0.19")),
+    );
+    assert!(rule_fired(&old, "engine_fixes_outdated"));
+    let current = run(
+        &running,
+        &on_build(&base, "1.6.1170", Some("EngineFixes.dll v7.0.20")),
+    );
+    assert!(!rule_fired(&current, "engine_fixes_outdated"));
+    let other_build = run(
+        &running,
+        &on_build(&base, "1.6.640", Some("EngineFixes.dll v7.0.19")),
+    );
+    assert!(!rule_fired(&other_build, "engine_fixes_outdated"));
+}
+
+#[test]
+fn a_shadow_crash_names_the_engine_fixes_update_only_when_it_is_too_old() {
+    let running = start();
+    let shadow = [
+        "\tR14 0x2F000000000      (ShadowSceneNode*)".to_string(),
+        "\t\tRTTIName: \"ShadowSceneNode\"".to_string(),
+    ];
+    let text = registers(&[&shadow]);
+    let old = run(
+        &running,
+        &on_build(&text, "1.6.1170", Some("EngineFixes.dll v7.0.10")),
+    );
+    let fixed = run(
+        &running,
+        &on_build(&text, "1.6.1170", Some("EngineFixes.dll v7.0.19")),
+    );
+    let none = run(&running, &on_build(&text, "1.6.1170", None));
+    assert!(
+        rule_fired(&old, "shadow_scene_crash_engine_fixes_can_prevent"),
+        "{:#?}",
+        old.parsed
+            .iter()
+            .flat_map(|parsed| parsed.output.facts.iter())
+            .filter(|fact| fact.kind == "creation.object")
+            .collect::<Vec<_>>()
+    );
+    assert!(!rule_fired(
+        &fixed,
+        "shadow_scene_crash_engine_fixes_can_prevent"
+    ));
+    assert!(!rule_fired(
+        &none,
+        "shadow_scene_crash_engine_fixes_can_prevent"
+    ));
+}
+
+#[test]
+fn an_older_crash_logger_is_noted_and_a_current_one_is_not() {
+    let running = start();
+    let base = log("EXCEPTION_ACCESS_VIOLATION", &["SkyrimSE.exe"], &[], &[]);
+    let old = run(&running, &base);
+    assert!(rule_fired(&old, "crash_logger_outdated"));
+    let current = run(
+        &running,
+        &base.replace("CrashLoggerSSE v1-16-0-0", "CrashLoggerSSE v1-20-1-0"),
+    );
+    assert!(!rule_fired(&current, "crash_logger_outdated"));
+}

@@ -141,7 +141,7 @@ fn headline(
     };
     if candidates.is_empty() {
         return english(&format!(
-            "{subject}, and Agora could not name one cause. A bisect can narrow it down, or you can ask another analyzer for a second opinion."
+            "{subject}, and Agora could not name one cause. A bisect can narrow it down, or you can ask another analyzer for a second opinion. Removing mods partway through a playthrough can damage a save, so back it up or test on a new game first."
         ));
     }
     if abstained && candidates.len() > 1 {
@@ -151,7 +151,7 @@ fn headline(
             .map(|candidate| owner_name(&candidate.owner))
             .collect();
         return english(&format!(
-            "Not sure: {} both have evidence. Try disabling one at a time.",
+            "Not sure: {} both have evidence. Try disabling one at a time, after backing up your save: removing a mod partway through a playthrough can damage it.",
             names.join(" and ")
         ));
     }

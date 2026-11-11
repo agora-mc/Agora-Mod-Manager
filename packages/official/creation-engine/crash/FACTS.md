@@ -601,6 +601,10 @@ cause); the test set is never read. One family alone tops out at `possible`
 | `win24h2_upscaler_fault` | finding, environment | `possible` | `KERNELBASE.dll` fault with the Skyrim Upscaler on the stack. From Phostwood. |
 | `dragons_eye_minimap_fault` | known signature | 6 | The minimap loaded with camera or image-space objects live. From Phostwood. |
 | `skyclimb_outdated` | known signature | 6 | SkyClimb older than 1.1.2 on game 1.6.1130 or later (8 right, 2 wrong on dev; both wrong rows did have an old SkyClimb). From Phostwood's version table. |
+| `hair_mesh_in_use` / `hair_mesh_with_smp` | finding, mechanism | `possible` | A `HairMale*`/`HairFemale*` mesh in use (a `BSDynamicTriShape` name). The only dev case was an HDT-SMP version mismatch; Phostwood flags it on the owner's own logs. Names no plugin: vanilla hair records come from `Skyrim.esm`. From Phostwood. |
+| `engine_fixes_outdated` | context | - | Engine Fixes below 7.0.20 on 1.5.97 or 1.6.1170. From Phostwood. |
+| `shadow_scene_crash_engine_fixes_can_prevent` | finding, environment | `possible` | A `ShadowSceneNode` in use with Engine Fixes below 7.0.18, which fixes that crash. From Phostwood. |
+| `crash_logger_outdated` | context | - | A Crash Logger log older than 1.20.1, which writes more detail. From Phostwood. |
 | `skse_plugin_built_for_another_game_version` | verified asset + known signature | 16 + 8 | The inspector opened a listed plugin's DLL and its declared versions exclude the running game. Only an instance has the file, so the rule requires `core.instance.game`. |
 | `stack_module_built_for_another_game_version` | verified asset + execution | 16 + 8 | The same check for a DLL on the crash stack (actionable frames 0-16). The inspector reads the DLL's own declaration; the rule says only that it does not support this game. |
 
