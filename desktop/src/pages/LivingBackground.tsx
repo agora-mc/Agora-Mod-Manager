@@ -9,7 +9,7 @@
  * It only appears in the sidebar while the living background is enabled.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Mountain, Music, Volume2, CloudRain, CloudSnow, Sun, ZoomIn, ZoomOut, Sparkles, Rainbow, Maximize2, ChevronRight, Lock, LockOpen, RotateCcw } from 'lucide-react';
 import { MUSIC_TRACK_CHOICES, INSTRUMENT_CHOICES } from '../features/ambience/engine/audio/trackChoices';
 import { useAmbience } from '../features/ambience/AmbienceProvider';
@@ -31,6 +31,66 @@ function shapeAxis(v: number): number {
   if (m < STICK_DEADZONE) return 0;
   const k = (m - STICK_DEADZONE) / (1 - STICK_DEADZONE);
   return Math.sign(v) * k * (0.35 + 0.65 * k);
+}
+
+// Fifth tick of the old range (0.5 + 4×0.1) is now BOTH the minimum and the
+// default: below this the world was scaled so far down that the extra terrain
+// generated to cover the viewport was mostly wasted, and the props got tiny.
+const MIN_ZOOM = 0.9;
+const DEFAULT_ZOOM = MIN_ZOOM;
+
+/**
+ * The zoom slider, shared by the control panel and the floating copy that
+ * takes over its job when the panel is folded away. `action` lets the floating
+ * copy carry the scene reset too, since the panel (and its own reset) is gone.
+ */
+function ZoomControl({ zoom, onChange, readoutTestId, action }: {
+  zoom: number;
+  onChange: (z: number) => void;
+  readoutTestId: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="space-y-1 text-sm">
+      <div className="flex items-center gap-2">
+        <span className="inline-flex items-center gap-2 font-medium">
+          <Mountain className="h-4 w-4" aria-hidden="true" />
+          Zoom
+          <span className="text-xs font-normal text-muted-foreground" data-testid={readoutTestId}>{zoom.toFixed(1)}×</span>
+        </span>
+        {action && <div className="ml-auto">{action}</div>}
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => onChange(zoom - 0.1)}
+          aria-label="Zoom out"
+          className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
+        >
+          <ZoomOut className="h-4 w-4" aria-hidden="true" />
+        </button>
+        <input
+          type="range"
+          aria-label="Zoom"
+          min={MIN_ZOOM}
+          max="2"
+          step="0.1"
+          value={zoom}
+          onChange={(e) => onChange(Number(e.target.value))}
+          className="w-full accent-primary"
+        />
+        <button
+          type="button"
+          onClick={() => onChange(zoom + 0.1)}
+          aria-label="Zoom in"
+          className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
+        >
+          <ZoomIn className="h-4 w-4" aria-hidden="true" />
+        </button>
+      </div>
+      <span className="block text-xs text-muted-foreground">(click and drag to move the view)</span>
+    </div>
+  );
 }
 
 /**
@@ -93,11 +153,6 @@ export function LivingBackground() {
   const { connected: padConnected } = useController();
 
   const [time, setTime] = useState(0.3);
-  // Fifth tick of the old range (0.5 + 4×0.1) is now BOTH the minimum and the
-  // default: below this the world was scaled so far down that the extra terrain
-  // generated to cover the viewport was mostly wasted, and the props got tiny.
-  const MIN_ZOOM = 0.9;
-  const DEFAULT_ZOOM = MIN_ZOOM;
   const [zoom, setZoomValue] = useState(DEFAULT_ZOOM);
   const [buddy, setBuddyValue] = useState(true);
   const [weather, setWeatherValue] = useState<'clear' | 'rain' | 'snow'>('clear');
@@ -316,6 +371,30 @@ export function LivingBackground() {
           Show controls
         </button>
       )}
+      {!panelOpen && (
+        <div
+          className="fixed right-6 top-6 z-40 w-72 max-w-[calc(100vw-3rem)] rounded-2xl border border-border bg-card/85 p-3 shadow-lg backdrop-blur-md"
+          aria-label="Living background zoom"
+          data-testid="living-bg-zoom-float"
+        >
+          <ZoomControl
+            zoom={zoom}
+            onChange={changeZoom}
+            readoutTestId="living-bg-zoom-float-readout"
+            action={(
+              <button
+                type="button"
+                onClick={resetScene}
+                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted px-3 py-1 text-xs font-semibold text-foreground hover:bg-muted/70"
+                data-testid="living-bg-zoom-float-reset"
+              >
+                <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                Reset scene
+              </button>
+            )}
+          />
+        </div>
+      )}
       {worldPlay && (
         <p
           className="w-fit rounded-full border border-primary/30 bg-background/80 px-4 py-1.5 text-xs text-muted-foreground shadow-lg backdrop-blur-md"
@@ -479,41 +558,7 @@ export function LivingBackground() {
               </div>
             </div>
 
-            <div className="space-y-1 text-sm">
-              <span className="inline-flex items-center gap-2 font-medium">
-                <Mountain className="h-4 w-4" aria-hidden="true" />
-                Zoom
-                <span className="text-xs font-normal text-muted-foreground" data-testid="living-bg-zoom-readout">{zoom.toFixed(1)}×</span>
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => changeZoom(zoom - 0.1)}
-                  aria-label="Zoom out"
-                  className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
-                >
-                  <ZoomOut className="h-4 w-4" aria-hidden="true" />
-                </button>
-                <input
-                  type="range"
-                  aria-label="Zoom"
-                  min={MIN_ZOOM}
-                  max="2"
-                  step="0.1"
-                  value={zoom}
-                  onChange={(e) => changeZoom(Number(e.target.value))}
-                  className="w-full accent-primary"
-                />
-                <button
-                  type="button"
-                  onClick={() => changeZoom(zoom + 0.1)}
-                  aria-label="Zoom in"
-                  className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
-                >
-                  <ZoomIn className="h-4 w-4" aria-hidden="true" />
-                </button>
-              </div>
-            </div>
+            <ZoomControl zoom={zoom} onChange={changeZoom} readoutTestId="living-bg-zoom-readout" />
 
             <label className="flex items-center gap-3 text-sm">
               <input

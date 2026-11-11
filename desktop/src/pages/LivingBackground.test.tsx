@@ -33,4 +33,22 @@ describe('LivingBackground reset scene', () => {
     expect(ambience.setBuddy).toHaveBeenLastCalledWith(true);
     expect((screen.getByLabelText('Cursor companion') as HTMLInputElement).checked).toBe(true);
   });
+
+  it('moves the zoom slider to a floating top-right control while the panel is hidden', () => {
+    render(<LivingBackground />);
+    expect(screen.queryByTestId('living-bg-zoom-float')).toBeNull();
+    expect(screen.getAllByText('(click and drag to move the view)')).toHaveLength(1);
+
+    fireEvent.click(screen.getByTestId('living-bg-hide'));
+
+    expect(screen.queryByTestId('living-bg-controls')).toBeNull();
+    expect(screen.getByTestId('living-bg-zoom-float').classList.contains('fixed')).toBe(true);
+    expect(screen.getByTestId('living-bg-zoom-float-readout').textContent).toBe('1.6×');
+    expect(screen.getAllByText('(click and drag to move the view)')).toHaveLength(1);
+
+    fireEvent.click(screen.getByTestId('living-bg-zoom-float-reset'));
+
+    expect(screen.getByTestId('living-bg-zoom-float-readout').textContent).toBe('0.9×');
+    expect(ambience.setZoom).toHaveBeenLastCalledWith(0.9);
+  });
 });

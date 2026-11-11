@@ -238,7 +238,7 @@ export function Guide({ onNavigateTab, initialTopicId }: { onNavigateTab: (tab: 
     <div className="space-y-6" data-testid="guide-page">
       <PageHero
         icon={BookOpen}
-        title="Learn the launcher."
+        title="Help & Guide"
         subtitle={`${GUIDE_TOPICS.length} topics, each with a beginner-friendly walkthrough and a separate advanced guide. Start anywhere and move at your own pace.`}
         actions={
           <div className="w-full rounded-xl border border-white/15 bg-black/15 p-4 backdrop-blur-xs sm:w-[22rem]">

@@ -278,16 +278,6 @@ export function drawQuad(
     F(tx0, hy + hh * 0.5, 1.6 * s, 3.4 * s);
     F(tx0 + (dir > 0 ? -1.8 * s : 1.8 * s), hy + hh * 0.34, 1.4 * s, 2.4 * s);
   }
-  // --- antlers (deer, moose) ---
-  if (shapeDef.antlers) {
-    ctx.fillStyle = pal.dark;
-    [0.18, 0.62].forEach((off) => {
-      const ax = hx + hw * off;
-      F(ax, hy - hh * 0.95, 1.6 * s, hh * 1.0);                    // main beam
-      F(ax + (dir > 0 ? 2.2 * s : -2.2 * s), hy - hh * 0.6, 2.6 * s, 1.5 * s); // lower branch
-      F(ax + (dir > 0 ? 3.0 * s : -3.0 * s), hy - hh * 1.0, 2.2 * s, 1.5 * s); // upper branch
-    });
-  }
   // --- ears, with a paler inside ---
   const earK = shapeDef.earShape || (shapeDef.ears === false ? 'none' : 'point');
   if (shapeDef.ears !== false && earK !== 'none') {
@@ -305,6 +295,23 @@ export function drawQuad(
       F(hx + hw * 0.58, hy - eh * 0.85, ew, eh, pal.dark);
       if (ew >= 2.5) F(hx + hw * 0.58 + ew * 0.3, hy - eh * 0.5, Math.max(1, ew * 0.35), eh * 0.5, inner);
     }
+  }
+  // --- antlers (deer, moose) ---
+  // Over the ears, so an ear's pale inner strip cannot stripe the beams; and
+  // every tine starts INSIDE its beam rather than a fixed gap away from it,
+  // which left a detached pixel floating beside the antler.
+  if (shapeDef.antlers) {
+    ctx.fillStyle = pal.dark;
+    [0.18, 0.62].forEach((off) => {
+      const ax = hx + hw * off;
+      const tine = (y: number, len: number, inset: number): void => {
+        const x0 = dir > 0 ? ax + inset * s : ax + 1.6 * s - (inset + len) * s;
+        F(x0, y, len * s, 1.5 * s);
+      };
+      F(ax, hy - hh * 0.95, 1.6 * s, hh * 1.0);                    // main beam
+      tine(hy - hh * 0.62, 3.4, 0.5);                              // lower tine
+      tine(hy - hh * 1.0, 3.0, 0.8);                               // upper tine
+    });
   }
   // --- eye ---
   F(hx + (dir > 0 ? hw * 0.58 : hw * 0.42 - Math.max(1, s)), hy + hh * 0.28, Math.max(1, s), Math.max(1, s * 1.4), pal.eye || '#161616');

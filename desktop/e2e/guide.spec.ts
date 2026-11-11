@@ -65,7 +65,7 @@ test('links the guide from the sidebar and Home page', async ({ page }) => {
   await page.getByRole('button', { name: /Open Help & Guide/ }).click();
 
   await expect(page.getByTestId('guide-page')).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Learn the launcher.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Help & Guide' })).toBeVisible();
   await expect(page.getByText(/\d+ topics, each with a beginner-friendly walkthrough/)).toBeVisible();
 });
 
