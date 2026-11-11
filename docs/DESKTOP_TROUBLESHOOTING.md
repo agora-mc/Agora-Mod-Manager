@@ -132,6 +132,6 @@ If you're still stuck, other people or AI assitants can help much faster with th
 
 1. Open Crash Doctor and select **Copy crash report**. It copies a report with your file paths and username removed. Nothing else is filtered, so give it a quick read for anything private, such as server addresses.
 2. Post it on the [Agora Discord](https://discord.gg/56tpsa2sTZ), along with your Agora version, what you were doing, and what you have already tried.
-3. If you've found a bug in Agora itself that someone else could reproduce, please [open a bug report](https://github.com/agora-mc/Agora-Launcher/issues/new?template=bug_report.yml).
+3. If you've found a bug in Agora itself that someone else could reproduce, please [open a bug report](https://github.com/agora-mc/Agora-Mod-Manager/issues/new?template=bug_report.yml).
 
 You can also paste the report into an AI assistant, or [let one work with Agora directly](https://agoramc.com/docs/guides/ai-assistant). Whatever you paste goes to the company that runs it.

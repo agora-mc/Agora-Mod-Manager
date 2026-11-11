@@ -2159,7 +2159,7 @@ mod transport_failure_tests {
         let err = checked_request(
             &clients,
             ClientCategory::GitHub,
-            "https://api.github.com/repos/agora-mc/Agora-Launcher/releases/latest",
+            "https://api.github.com/repos/agora-mc/Agora-Mod-Manager/releases/latest",
         )
         .await
         .expect_err("a dead proxy must fail the request");

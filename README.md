@@ -19,7 +19,7 @@ Windows is tested and signed, I don't have macOS or Linux right now so they are 
 - [Website](https://agoramc.com/) - if you aren't a contributor or developer, this is the place to go!
 - [Documentation home](https://agoramc.com/docs) - start here; it routes you by what you are trying to do.
 - [Help & guide](https://agoramc.com/docs/guides) - every workflow, written both as steps and as an explanation.
-- [Desktop and CLI releases](https://github.com/agora-mc/Agora-Launcher/releases) - choose the newest published `v*` release, not a `registry-*` data release.
+- [Desktop and CLI releases](https://github.com/agora-mc/Agora-Mod-Manager/releases) - choose the newest published `v*` release, not a `registry-*` data release.
 - [Troubleshooting](https://agoramc.com/docs/desktop-troubleshooting) and [FAQ](https://agoramc.com/docs/faq) for the desktop app
 - [CLI troubleshooting](https://agoramc.com/docs/troubleshooting)
 - [CLI reference](https://agoramc.com/docs/cli)
@@ -99,7 +99,7 @@ npm run build
 
 cd ../web
 npm install
-NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Launcher npm run build
+NEXT_PUBLIC_GITHUB_REPOSITORY=agora-mc/Agora-Mod-Manager npm run build
 ```
 
 See [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) for prerequisites, environment boundaries, disposable profiles, and the full validation matrix.

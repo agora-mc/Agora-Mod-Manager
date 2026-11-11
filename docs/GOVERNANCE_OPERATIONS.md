@@ -57,7 +57,7 @@ python compiler/compile.py `
   --skip-sign `
   --governance-mode read-only `
   --governance-policy production `
-  --governance-repo agora-mc/Agora-Launcher `
+  --governance-repo agora-mc/Agora-Mod-Manager `
   --governance-state-in registry/governance/governance-state.json `
   --out tmp/governance-read-only/registry.db
 ```

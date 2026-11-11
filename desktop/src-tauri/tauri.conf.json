@@ -33,7 +33,7 @@
     },
     "updater": {
       "endpoints": [
-        "https://github.com/agora-mc/Agora-Launcher/releases/latest/download/latest.json"
+        "https://github.com/agora-mc/Agora-Mod-Manager/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY0RURFOTU4MzkzQ0VENjMKUldSajdUdzVXT250OUQwSEFWREVIam5pUlduY3dIUkhRa2lObUMyY1ZEa2dYREtUNUMvUEhVY2UK",
       "windows": {

@@ -53,7 +53,7 @@ Yes. Turn on Modrinth under Services to search it alongside the catalog. Results
 
 ### How do I suggest a mod for the catalog?
 
-Fill in the [mod submission form](https://github.com/agora-mc/Agora-Launcher/issues/new?template=mod-submission.yml) on GitHub.
+Fill in the [mod submission form](https://github.com/agora-mc/Agora-Mod-Manager/issues/new?template=mod-submission.yml) on GitHub.
 
 ### Can I bring my instances from another launcher?
 

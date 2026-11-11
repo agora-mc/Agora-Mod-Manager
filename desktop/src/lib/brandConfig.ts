@@ -2,7 +2,7 @@ const repositorySlug = import.meta.env.VITE_AGORA_REPOSITORY?.trim();
 
 // Fall back to the main repository so informational pages always render
 // a working GitHub link even when the build env var is unset (e.g. e2e/dev).
-const DEFAULT_REPOSITORY_SLUG = 'agora-mc/Agora-Launcher';
+const DEFAULT_REPOSITORY_SLUG = 'agora-mc/Agora-Mod-Manager';
 
 export const agoraRepositoryUrl = repositorySlug && /^[^/\s]+\/[^/\s]+$/.test(repositorySlug)
   ? `https://github.com/${repositorySlug}`

@@ -33,7 +33,7 @@ def validate(path: Path) -> list[str]:
             f"schema_version must be 1, got {data.get('schema_version')!r}"
         )
 
-    expected_repo = "agora-mc/Agora-Launcher"
+    expected_repo = "agora-mc/Agora-Mod-Manager"
     actual_repo = data.get("governance_repository")
     if actual_repo != expected_repo:
         errors.append(
