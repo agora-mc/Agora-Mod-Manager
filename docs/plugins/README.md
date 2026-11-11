@@ -232,6 +232,10 @@ missing target, a file the inspector does not accept, or a file outside the inst
 `missing`, which takes the rule's `on_unknown` effects. A script error, timeout or invalid output is
 "could not check" and names the plugin, never a pass.
 
+A rule that matches more than 32 times does not fire, and says so: a match set that large usually
+means the rule is too loose. A rule meant to check every item in a list (each script-extender
+plugin a log lists, say) can raise its own limit with `"max_branches"`, up to 512.
+
 ### The runtime
 
 Scripts run in QuickJS through `rquickjs 0.13`, with separate bounded runtimes on host-owned worker threads. This is **not an OS process sandbox**. QuickJS supports ES modules, promises, and async functions; the host adds the `agora` module. It does not add `require`, `process`, filesystem access, DOM APIs, native modules, or global `fetch`. Bundle third-party JavaScript and mark `agora` external. Use the standalone declarations in `sdk/` for TypeScript.
