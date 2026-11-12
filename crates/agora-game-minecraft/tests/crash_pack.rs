@@ -506,6 +506,270 @@ java.lang.IllegalStateException: decorated frames\n\
     }
 
     #[test]
+    fn a_forge_failure_message_names_the_mod_that_failed() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Time: 2026-01-02 03:04:05\n\
+Description: Mod loading error has occurred\n\
+\n\
+java.lang.Exception: Mod loading failed\n\
+\n\
+\tMod File: /mods/examplemod.jar\n\
+\tFailure message: Example Mod (examplemod) has failed to load correctly\n\
+\tMod Version: 1.2.3\n\
+\tException message: java.lang.IllegalStateException: nope\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let crash = find(&output, "minecraft.mod_crash", "id", "examplemod").expect("a mod crash");
+        assert_eq!(text_of(crash, "phase"), "load");
+        assert_eq!(number_of(crash, "order"), 0.0);
+        assert_eq!(text_of(crash, "name"), "Example Mod");
+        assert!(crash
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mod_id" && reference.value == "examplemod"));
+    }
+
+    #[test]
+    fn a_fabric_entrypoint_failure_names_the_mod() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Description: Initializing game\n\
+\n\
+java.lang.RuntimeException: Could not execute entrypoint stage 'main' due to errors, provided by 'examplemod'!\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let crash = find(&output, "minecraft.mod_crash", "id", "examplemod").expect("a mod crash");
+        assert_eq!(text_of(crash, "phase"), "entrypoint");
+    }
+
+    #[test]
+    fn a_crash_report_mixin_failure_names_its_owner() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Description: Initializing game\n\
+\n\
+org.spongepowered.asm.mixin.transformer.throwables.MixinTransformerError: An unexpected critical error was encountered\n\
+Caused by: org.spongepowered.asm.mixin.throwables.MixinApplyError: Mixin [examplemod.mixins.json:ExampleMixin from mod examplemod] from phase [DEFAULT] in config [examplemod.mixins.json] FAILED during APPLY\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let failure = output
+            .facts
+            .iter()
+            .find(|fact| fact.kind == "minecraft.mixin_failure")
+            .expect("a mixin failure");
+        assert_eq!(text_of(failure, "config"), "examplemod.mixins.json");
+        assert_eq!(failure.refs[0].kind, "mod_id");
+        assert_eq!(failure.refs[0].value, "examplemod");
+    }
+
+    #[test]
+    fn a_mixin_that_lost_its_target_to_another_transformer_is_not_blamed() {
+        let report = "---- Minecraft Crash Report ----\n\
+Description: Initializing game\n\
+\n\
+org.spongepowered.asm.mixin.transformer.throwables.MixinTransformerError: An unexpected critical error was encountered\n\
+Caused by: org.spongepowered.asm.mixin.throwables.MixinApplyError: Mixin [examplemod.mixins.json:ExampleMixin from mod examplemod] from phase [DEFAULT] in config [examplemod.mixins.json] FAILED during APPLY\n\
+Caused by: org.spongepowered.asm.mixin.injection.throwables.InvalidInjectionException: target was removed by another injector [INJECT Applicator Phase]\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        assert!(!output
+            .facts
+            .iter()
+            .any(|fact| fact.kind == "minecraft.mixin_failure"));
+    }
+
+    #[test]
+    fn unsupported_class_version_records_the_required_java() {
+        let report = "---- Minecraft Crash Report ----\n\
+Description: Initializing game\n\
+\n\
+java.lang.UnsupportedClassVersionError: com/example/Thing has been compiled by a more recent version of the Java Runtime (class file version 61.0), this version of the Java Runtime only recognizes class file versions up to 52.0\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let exception = find(&output, "core.exception", "category", "load_failure")
+            .expect("a load failure exception");
+        assert_eq!(
+            text_of(exception, "class"),
+            "java.lang.UnsupportedClassVersionError"
+        );
+        let problem = find(&output, "minecraft.jvm_problem", "kind", "class_version")
+            .expect("a class-version problem");
+        assert_eq!(number_of(problem, "required_java"), 17.0);
+    }
+
+    #[test]
+    fn a_ticking_entity_report_names_the_type_and_location() {
+        let report = "---- Minecraft Crash Report ----\n\
+Description: Ticking entity\n\
+\n\
+java.lang.IllegalStateException: the entity failed\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- Entity being ticked --\n\
+Details:\n\
+\tEntity Type: examplemod:example_entity\n\
+\tEntity Name: Example\n\
+\tEntity's Exact location: 1.5, 64.0, -2.5\n\
+\tLevel dimension: minecraft:overworld\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let object =
+            find(&output, "minecraft.ticking_object", "kind", "entity").expect("a ticking entity");
+        assert_eq!(text_of(object, "type"), "examplemod:example_entity");
+        assert_eq!(text_of(object, "name"), "Example");
+        assert_eq!(text_of(object, "dimension"), "minecraft:overworld");
+        assert_eq!(number_of(object, "x"), 1.5);
+        assert_eq!(number_of(object, "y"), 64.0);
+        assert_eq!(number_of(object, "z"), -2.5);
+        assert!(object
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mod_id" && reference.value == "examplemod"));
+    }
+
+    #[test]
+    fn a_ticking_block_entity_report_names_the_block() {
+        let report = "---- Minecraft Crash Report ----\n\
+Description: Ticking block entity\n\
+\n\
+java.lang.IllegalStateException: the block failed\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- Block entity being ticked --\n\
+Details:\n\
+\tBlock type: examplemod:example_block\n\
+\tBlock location: World: (3, 70, 4), Chunk: (0, 4, 0)\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let object = find(&output, "minecraft.ticking_object", "kind", "block_entity")
+            .expect("a ticking block entity");
+        assert_eq!(text_of(object, "type"), "examplemod:example_block");
+        assert_eq!(number_of(object, "x"), 3.0);
+        assert_eq!(number_of(object, "y"), 70.0);
+        assert_eq!(number_of(object, "z"), 4.0);
+    }
+
+    #[test]
+    fn loader_lines_that_name_a_failed_mod_are_their_own_fact() {
+        let create = "[01:02:03] [main/ERROR]: Failed to create mod instance. ModID: examplemod, for mod Example Mod\n";
+        let output = run_ok("latest_log", create.as_bytes());
+        let crash = find(&output, "minecraft.mod_crash", "id", "examplemod").expect("a mod crash");
+        assert_eq!(text_of(crash, "phase"), "load");
+        assert_eq!(number_of(crash, "order"), 0.0);
+
+        let caught =
+            "[01:02:03] [main/ERROR]: LoaderExceptionModCrash: Caught exception from Example Mod (othermod)\n";
+        let output = run_ok("latest_log", caught.as_bytes());
+        assert!(find(&output, "minecraft.mod_crash", "id", "othermod").is_some());
+    }
+
+    #[test]
+    fn duplicate_mod_lines_from_the_loader_are_recognised() {
+        for line in [
+            "Mod ID: 'examplemod' from mod files: one.jar, two.jar\n",
+            "java.lang.RuntimeException: Duplicate versions for mod ID 'examplemod': [1.2.3 at /mods/examplemod.jar]\n",
+        ] {
+            let output = run_ok("latest_log", line.as_bytes());
+            let duplicate = find(&output, "minecraft.duplicate_mod", "id", "examplemod")
+                .unwrap_or_else(|| panic!("no duplicate for {line}"));
+            assert_eq!(duplicate.refs[0].value, "examplemod");
+        }
+    }
+
+    #[test]
+    fn a_named_conflict_carries_both_mods() {
+        let output = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/ERROR]: Found conflicting mods: examplemod conflicts with othermod\n",
+        );
+        let conflict = output
+            .facts
+            .iter()
+            .find(|fact| fact.kind == "minecraft.mod_conflict")
+            .expect("a conflict");
+        assert_eq!(text_of(conflict, "first"), "examplemod");
+        assert_eq!(text_of(conflict, "second"), "othermod");
+        assert_eq!(conflict.refs.len(), 2);
+    }
+
+    #[test]
+    fn a_world_saved_with_a_missing_or_changed_mod_is_reported() {
+        let missing = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/WARN]: This world was saved with mod examplemod which appears to be missing, things may not work well\n",
+        );
+        let fact = find(&missing, "minecraft.world_mod", "kind", "missing").expect("a missing mod");
+        assert_eq!(text_of(fact, "mod"), "examplemod");
+
+        let changed = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/WARN]: This world was saved with mod examplemod version 1.0 and it is now at version 2.0, things may not work well\n",
+        );
+        let fact = find(&changed, "minecraft.world_mod", "kind", "version").expect("a version");
+        assert_eq!(text_of(fact, "expected"), "1.0");
+        assert_eq!(text_of(fact, "current"), "2.0");
+    }
+
+    #[test]
+    fn a_jvm_problem_is_recorded_without_naming_a_mod() {
+        let missing = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/ERROR]: java.lang.UnsatisfiedLinkError: Failed to locate library: examplegfx\n",
+        );
+        assert!(find(&missing, "minecraft.jvm_problem", "kind", "native_library").is_some());
+
+        let memory = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/ERROR]: # There is insufficient memory for the Java Runtime Environment to continue.\n",
+        );
+        assert!(find(&memory, "minecraft.jvm_problem", "kind", "memory_startup").is_some());
+
+        let ids = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/ERROR]: maximum id range exceeded\n",
+        );
+        assert!(find(&ids, "minecraft.loader_problem", "kind", "id_limit").is_some());
+    }
+
+    #[test]
+    fn an_existing_file_is_reported_so_the_answer_can_name_it() {
+        let output = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/ERROR]: java.nio.file.FileAlreadyExistsException: C:\\\\games\\\\config\\\\examplemod.toml.old\n",
+        );
+        let problem = find(&output, "minecraft.file_problem", "kind", "already_exists")
+            .expect("a file problem");
+        assert_eq!(text_of(problem, "path"), "examplemod.toml.old");
+        assert_eq!(problem.refs[0].kind, "file");
+        assert_eq!(problem.refs[0].value, "examplemod.toml.old");
+    }
+
+    #[test]
     fn the_hs_err_file_names_the_signal_frame_and_library() {
         let output = run_ok("hs_err", &fixture("hs_err_sample.log"));
         let exception = output

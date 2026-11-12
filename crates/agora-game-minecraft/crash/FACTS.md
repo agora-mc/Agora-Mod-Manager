@@ -42,7 +42,7 @@ refs name a native library; `file` refs name the jar a frame annotation named. T
 | `category` | one of the contract's categories: `managed`, `oom`, `load_failure`, `assert`, `access_violation`, `fast_fail`, `unknown` |
 | `message` | the exception message, when it printed one |
 | `depth` | 0 for the outermost exception, then 1 for each `Caused by` |
-| `access`, `fault_address`, `near_null` | native faults only (`hs_err`) |
+| `access`, `fault_address`, `near_null`, `pointer_class` | native faults only (`hs_err`; `pointer_class` describes how a bad address was formed) |
 
 Refs: `class` (Mention) from a crash report or log. Provided by all three artifact kinds.
 
@@ -146,6 +146,7 @@ Provided by `latest_log`. Use it only to quote; prefer a fact.
 | `java_bits` | 32 or 64 when the file states it |
 | `memory_max_mb` | the JVM's maximum heap, MiB |
 | `java_vm` | the `hs_err` Java VM line |
+| `launcher_brand` | the launcher a crash report names (`crash_report`) |
 | `os` | from a log line, when the report has no System Details |
 
 Provided by all three artifact kinds. A rule can compare `java_version` with a version gate, or
@@ -227,11 +228,13 @@ that map misses. A report with no mod list, or an empty one, leaves the class na
 |---|---|
 | `severity` | `critical` |
 | `config` | the mixin config, without its `:MixinClass` suffix |
-| `target` | the class the mixin tried to change |
+| `target` | the class the mixin tried to change, when the line names one |
 
 Refs: `mod_id` of the owning mod. For the `Mixin apply failed` form that does not name a mod, the
-config's leading token is used and marked Mention; it is usually the mod id. Provided by
-`latest_log`.
+config's leading token is used and marked Mention; it is usually the mod id. A crash report's
+`Mixin [...] ... FAILED during` line is read too; when another transformer took the target
+(`removed by another injector`, `could not find any targets matching`) the owner is the victim, so
+no fact is emitted. Provided by `crash_report` and `latest_log`.
 
 ```json
 { "kind": "minecraft.mixin_failure", "attrs": { "severity": "critical", "config": "examplemod.mixins.json", "target": "net.minecraft.class_123" },
@@ -275,6 +278,108 @@ Provided by `latest_log`.
 { "kind": "minecraft.mod_error", "attrs": { "message": "Failed to load mod file examplemod-1.2.3.jar" } }
 ```
 
+### `minecraft.mod_crash`
+
+| Attribute | Meaning |
+|---|---|
+| `id` | the loader's mod id (also a ref) |
+| `phase` | `load` or `entrypoint` |
+| `order` | 0 for the first mod the file names, then 1, 2, ... |
+| `name` | the display name the loader printed, when present |
+| `message` | the loader line that named the mod |
+
+Refs: `mod_id` (Mention). The shapes read are Forge's `Failure message: <name> (<id>) has failed to
+load correctly`, `Caught exception from <name> (<id>)`, `Failed to create mod instance. ModID:
+<id>`, `... encountered an error during ...`, and Fabric's `Could not execute entrypoint stage
+'<stage>' due to errors, provided by '<id>'!`. Provided by `crash_report` and `latest_log`.
+
+```json
+{ "kind": "minecraft.mod_crash", "attrs": { "id": "examplemod", "phase": "load", "order": 0, "name": "Example Mod", "message": "Example Mod (examplemod) has failed to load correctly" },
+  "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "mention" }] }
+```
+
+### `minecraft.jvm_problem`
+
+| Attribute | Meaning |
+|---|---|
+| `kind` | `class_version`, `too_new`, `native_library`, `memory_startup`, `graphics` or `id_limit` |
+| `message` | the exception or log line |
+| `required_java` | for `class_version`, the Java the class-file version needs |
+
+No refs: it names the JVM, the driver or the mod set, not one mod. `class_version` comes from
+`UnsupportedClassVersionError`; `too_new` from the JDK-accessibility and removed-Nashorn shapes;
+`native_library` from `UnsatisfiedLinkError`; `memory_startup` from heap-reservation and
+native-memory messages; `graphics` from OpenGL context and pixel-format failures; `id_limit` from
+`maximum id range exceeded`. Provided by `crash_report` and `latest_log`.
+
+```json
+{ "kind": "minecraft.jvm_problem", "attrs": { "kind": "class_version", "required_java": 17, "message": "class file version 61.0" } }
+```
+
+### `minecraft.file_problem`
+
+| Attribute | Meaning |
+|---|---|
+| `kind` | `already_exists` |
+| `path` | the file name, without its folders |
+| `message` | the exception message |
+
+Refs: `file` (Mention) of that name. Provided by `crash_report` and `latest_log`.
+
+```json
+{ "kind": "minecraft.file_problem", "attrs": { "kind": "already_exists", "path": "examplemod.toml.old", "message": "C:\\games\\config\\examplemod.toml.old" },
+  "refs": [{ "kind": "file", "value": "examplemod.toml.old", "strength": "mention" }] }
+```
+
+### `minecraft.ticking_object`
+
+| Attribute | Meaning |
+|---|---|
+| `kind` | `entity` or `block_entity` |
+| `type` | the entity or block type, e.g. `examplemod:example_entity` |
+| `name` | the entity's name, when the report prints one |
+| `dimension` | the level dimension, when the report prints one |
+| `x`, `y`, `z` | the exact or block coordinates, when the report prints them |
+
+Refs: `mod_id` of the type's namespace when it is not `minecraft`, `forge` or `neoforge`.
+Provided by `crash_report`, from `-- Entity being ticked --` and `-- Block entity being ticked --`.
+
+```json
+{ "kind": "minecraft.ticking_object", "attrs": { "kind": "entity", "type": "examplemod:example_entity", "x": 1.5, "y": 64, "z": -2.5 },
+  "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "mention" }] }
+```
+
+### `minecraft.mod_conflict`
+
+| Attribute | Meaning |
+|---|---|
+| `first` | the first mod the loader named |
+| `second` | the mod it conflicts with |
+| `message` | the loader's line |
+
+Refs: `mod_id` for both names (Mention). Provided by `latest_log` (`Found conflicting mods: ...`).
+
+```json
+{ "kind": "minecraft.mod_conflict", "attrs": { "first": "examplemod", "second": "othermod", "message": "Found conflicting mods" },
+  "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "mention" }, { "kind": "mod_id", "value": "othermod", "strength": "mention" }] }
+```
+
+### `minecraft.world_mod`
+
+| Attribute | Meaning |
+|---|---|
+| `kind` | `missing` or `version` |
+| `mod` | the mod id the world was saved with |
+| `expected`, `current` | the saved and installed versions, for `version` |
+
+Refs: `mod_id` (Mention). Provided by `latest_log`, from Forge's `This world was saved with mod
+<id> ...` lines.
+
+```json
+{ "kind": "minecraft.world_mod", "attrs": { "kind": "missing", "mod": "examplemod" },
+  "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "mention" }] }
+```
+
 ### `minecraft.config_error`
 
 | Attribute | Meaning |
@@ -306,9 +411,9 @@ parser looked for and found none in is `checked`.
 
 | Parser | `checked` | `absent` with a reason |
 |---|---|---|
-| `crash_report` | `minecraft.crash`, `core.exception`, `core.frame`, `core.process`, `core.system`, `minecraft.system`, `minecraft.loader`, `minecraft.mod`, `minecraft.section` | any of those with no data in this report |
-| `crash_report` | | `core.log_line`, `core.dependency_problem`, `core.module` are `not_applicable` |
-| `latest_log` | `core.exception`, `core.frame`, `core.dependency_problem`, `minecraft.mixin_failure`, `minecraft.duplicate_mod`, `minecraft.loader_problem`, `minecraft.mod_error`, `minecraft.config_error`, `minecraft.world_error`, `core.log_line` | `minecraft.loader`, `minecraft.system`, `core.process` when the log does not state them; `minecraft.mod` because `latest.log` does not list the whole mod set |
+| `crash_report` | `minecraft.crash`, `core.exception`, `core.frame`, `core.process`, `core.system`, `minecraft.system`, `minecraft.loader`, `minecraft.mod`, `minecraft.section`, `minecraft.mod_crash`, `minecraft.mixin_failure`, `minecraft.ticking_object`, `minecraft.jvm_problem`, `minecraft.file_problem` | any of those with no data in this report |
+| `crash_report` | | `core.log_line`, `core.dependency_problem`, `core.module`, `minecraft.loader_problem`, `minecraft.mod_conflict`, `minecraft.world_mod` are `not_applicable` |
+| `latest_log` | `core.exception`, `core.frame`, `core.dependency_problem`, `minecraft.mixin_failure`, `minecraft.duplicate_mod`, `minecraft.loader_problem`, `minecraft.mod_error`, `minecraft.config_error`, `minecraft.world_error`, `minecraft.mod_crash`, `minecraft.mod_conflict`, `minecraft.world_mod`, `minecraft.jvm_problem`, `minecraft.file_problem`, `core.log_line` | `minecraft.loader`, `minecraft.system`, `core.process` when the log does not state them; `minecraft.mod` because `latest.log` does not list the whole mod set; `minecraft.ticking_object` is `not_applicable` |
 | `hs_err` | `core.exception`, `core.system` | `core.frame` and `core.module` when there is no problematic frame; `core.process` without a pid; `minecraft.system` without Java details |
 
 When a parser's read budget runs out, a kind it did not reach becomes `absent` with

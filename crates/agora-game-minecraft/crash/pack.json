@@ -98,7 +98,21 @@
     { "kind": "class", "value": "org.objectweb.asm", "match": "prefix_dot", "role": "framework" },
     { "kind": "class", "value": "com.llamalad7", "match": "prefix_dot", "role": "framework" },
     { "kind": "class", "value": "kotlin", "match": "prefix_dot", "role": "framework" },
-    { "kind": "class", "value": "scala", "match": "prefix_dot", "role": "framework" }
+    { "kind": "class", "value": "scala", "match": "prefix_dot", "role": "framework" },
+    { "kind": "module", "value": "nvoglv64.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "nvoglv32.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "nvwgf2umx.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "igxelpicd64.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "igc64.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "igd10iumd64.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "atio6axx.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "atioglxx.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "amdvlk64.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "opengl32.dll", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "libgl.so", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "libgl.so.1", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "libegl.so", "match": "casefold", "role": "system" },
+    { "kind": "module", "value": "libegl.so.1", "match": "casefold", "role": "system" }
   ],
   "rules": [
     {
@@ -480,7 +494,7 @@
     },
     {
       "id": "java_too_old",
-      "version": 1,
+      "version": 2,
       "when": {
         "all": [
           {
@@ -502,7 +516,7 @@
           {
             "fact": {
               "kind": "core.process",
-              "where": { "image_version": { "version": { "min": "1.17" } } }
+              "where": { "image_version": { "version": { "min": "1.18" } } }
             }
           }
         ]
@@ -511,6 +525,48 @@
       "text": {
         "headline": {
           "en": "This game version needs Java 17 or newer, and the log reports an older Java. Installing a newer Java is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "An old Java can stop the game from starting, but a mod can still be the cause."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "java_too_old_1_17",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "fact": {
+                  "kind": "minecraft.system",
+                  "where": { "java_version": { "regex": "^1\\." } }
+                }
+              },
+              {
+                "fact": {
+                  "kind": "minecraft.system",
+                  "where": { "java_version": { "version": { "below": "16" } } }
+                }
+              }
+            ]
+          },
+          {
+            "fact": {
+              "kind": "core.process",
+              "where": {
+                "image_version": { "version": { "min": "1.17", "below": "1.18" } }
+              }
+            }
+          }
+        ]
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "text": {
+        "headline": {
+          "en": "This game version needs Java 16 or newer, and the log reports an older Java. Installing a newer Java is a likely next step."
         },
         "why_not_sure": {
           "en": "An old Java can stop the game from starting, but a mod can still be the cause."
@@ -585,6 +641,479 @@
           "en": "The failing native frame is in {owner:module}."
         }
       }
+    },
+    {
+      "id": "mod_failed_to_load",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.mod_crash",
+          "where": { "order": 0 },
+          "ref": { "kind": "mod_id", "bind": "mod" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "likely",
+            "candidate": { "owner_of": "mod" },
+            "family": "known_signature",
+            "weight": 16
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The mod loader says {owner:mod} failed while it was loading. Updating it, or installing the build for this game and loader version, is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The loader named the mod that threw, but a missing dependency of that mod can make it fail the same way."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "unsupported_class_version",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.jvm_problem",
+          "where": { "kind": "class_version" },
+          "bind": { "required_java": "required_java", "message": "message" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "text": {
+        "headline": {
+          "en": "A class was compiled for Java {required_java} or newer, and the game is running an older Java ({message}). Installing that Java, or using a build of the mod for the selected Java, is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The class-file version names the Java the class needs; it does not say which mod shipped it."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "java_too_new",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "minecraft.jvm_problem",
+              "where": { "kind": "too_new" },
+              "bind": { "message": "message" }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.process",
+              "where": { "image_version": { "version": { "below": "1.17" } } }
+            }
+          }
+        ]
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "text": {
+        "headline": {
+          "en": "The selected Java is newer than this old game or loader can work with ({message}). Selecting the Java version the game expects is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The failure names the JVM, not a mod, but a mod built for another Java can fail in the same place."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "missing_native_library",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.jvm_problem",
+          "where": { "kind": "native_library" },
+          "bind": { "message": "message" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "text": {
+        "headline": {
+          "en": "A native library the game needs is missing or blocked ({message}). Reinstalling the game files, or allowing the file in antivirus, is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The error names the library, not the mod that shipped it."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "jvm_memory_startup",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.jvm_problem",
+          "where": { "kind": "memory_startup" },
+          "bind": { "message": "message" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "text": {
+        "headline": {
+          "en": "Java could not start with the memory it was given ({message}). Using 64-bit Java, lowering the maximum heap, or freeing memory on the machine is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The JVM refused the requested memory before the game or any mod could run."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "graphics_driver_problem",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.jvm_problem",
+          "where": { "kind": "graphics" },
+          "bind": { "message": "message" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "text": {
+        "headline": {
+          "en": "The game could not create a working graphics context ({message}). Updating or reinstalling the graphics driver, and closing overlays, is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "A graphics driver problem can look like a game or mod crash, but this message names the driver side."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "graphics_driver_frame",
+      "version": 1,
+      "when": {
+        "any": [
+          {
+            "fact": {
+              "kind": "core.frame",
+              "where": { "kind": "probable", "symbol": { "glob": "nvoglv*" } },
+              "bind": { "symbol": "symbol" }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.frame",
+              "where": { "kind": "probable", "symbol": { "glob": "atio*" } },
+              "bind": { "symbol": "symbol" }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.frame",
+              "where": { "kind": "probable", "symbol": { "glob": "amdvlk*" } },
+              "bind": { "symbol": "symbol" }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.frame",
+              "where": { "kind": "probable", "symbol": { "glob": "opengl32*" } },
+              "bind": { "symbol": "symbol" }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.frame",
+              "where": { "kind": "probable", "symbol": { "glob": "libgl*" } },
+              "bind": { "symbol": "symbol" }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.frame",
+              "where": { "kind": "probable", "symbol": { "glob": "libegl*" } },
+              "bind": { "symbol": "symbol" }
+            }
+          }
+        ]
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "text": {
+        "headline": {
+          "en": "The native fault is inside a graphics library ({symbol}). Updating or reinstalling the graphics driver is a likely next step, not a mod."
+        },
+        "why_not_sure": {
+          "en": "A driver can fault because a game or mod asked it for something invalid, but the fault location names the driver side."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "registry_limit",
+      "version": 1,
+      "when": {
+        "any": [
+          {
+            "fact": {
+              "kind": "minecraft.jvm_problem",
+              "where": { "kind": "id_limit" }
+            }
+          },
+          {
+            "fact": {
+              "kind": "minecraft.loader_problem",
+              "where": { "kind": "id_limit" }
+            }
+          }
+        ]
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "text": {
+        "headline": {
+          "en": "The mod set uses more block, item or entity ids than this game version allows. Removing some content mods, or moving to a version without that limit, is a possible next step."
+        },
+        "why_not_sure": {
+          "en": "The limit is a property of the whole mod set, not one mod. Removing a mod partway through a playthrough can damage the save, so back it up or test on a new game first."
+        }
+      },
+      "next_step": "bisect"
+    },
+    {
+      "id": "mixin_failed_crash_report",
+      "version": 1,
+      "scope": { "producer": { "format": "minecraft_crash_report" } },
+      "when": {
+        "fact": {
+          "kind": "minecraft.mixin_failure",
+          "ref": { "kind": "mod_id", "bind": "owner" },
+          "bind": { "config": "config" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": { "owner_of": "owner" },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "{owner:owner} failed to apply its mixin {config} to the game. That can mean the mod is built for another game or loader version, or that another transformer changed the same class."
+        },
+        "why_not_sure": {
+          "en": "A mixin failure often belongs to the other mod in a clash, so this is not certain. Removing a mod partway through a playthrough can damage the save, so back it up or test on a new game first."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "missing_member_wrong_version",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "class": {
+              "in": [
+                "java.lang.NoSuchMethodError",
+                "java.lang.NoSuchFieldError",
+                "java.lang.IllegalAccessError",
+                "java.lang.AbstractMethodError"
+              ]
+            }
+          },
+          "bind": { "message": "message" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "text": {
+        "headline": {
+          "en": "Code expected a method or field this game version does not have ({message}). That usually means a mod or loader component is built for another game, loader or Java version."
+        },
+        "why_not_sure": {
+          "en": "The message names the missing member, not the mod that should have provided it."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "ticking_object",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.ticking_object",
+          "bind": { "object_kind": "kind", "type": "type" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "text": {
+        "headline": {
+          "en": "The game crashed while ticking a {object_kind} of type {type}. Restoring a world backup, or testing a new world, is a possible next step."
+        },
+        "why_not_sure": {
+          "en": "A placed object can crash because of the game, the world data or a mod. Removing a mod partway through a playthrough can damage the save, so back the world up first."
+        }
+      },
+      "next_step": "restore_save"
+    },
+    {
+      "id": "ticking_object_at",
+      "version": 1,
+      "supersedes": ["ticking_object"],
+      "when": {
+        "fact": {
+          "kind": "minecraft.ticking_object",
+          "where": { "x": { "present": true } },
+          "bind": {
+            "object_kind": "kind",
+            "type": "type",
+            "x": "x",
+            "y": "y",
+            "z": "z"
+          }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "text": {
+        "headline": {
+          "en": "The game crashed while ticking a {object_kind} of type {type} at {x}, {y}, {z}. Back the world up first, then remove or replace that object, or test a new world."
+        },
+        "why_not_sure": {
+          "en": "A placed object can crash because of the game, the world data or a mod. Removing a mod partway through a playthrough can damage the save, so back the world up first."
+        }
+      },
+      "next_step": "restore_save"
+    },
+    {
+      "id": "ticking_modded_object",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.ticking_object",
+          "ref": { "kind": "mod_id", "bind": "owner" },
+          "bind": { "type": "type" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": { "owner_of": "owner" },
+            "family": "known_signature",
+            "weight": 4
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The ticking object is a {type} from {owner:owner}. A modded object in the tick loop can be the cause, but the world it was placed in can be the cause too."
+        },
+        "why_not_sure": {
+          "en": "Removing a mod partway through a playthrough can damage the save, so back it up or test on a new game first."
+        }
+      },
+      "next_step": "restore_save"
+    },
+    {
+      "id": "mod_conflict_named",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.mod_conflict",
+          "bind": { "first": "first", "second": "second" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "text": {
+        "headline": {
+          "en": "The loader says {first} conflicts with {second}. Using versions of both that are built for this game and loader version, or choosing one, is a possible next step."
+        },
+        "why_not_sure": {
+          "en": "The loader names the conflict, not which of the two is wrong for this setup. Removing a mod partway through a playthrough can damage the save, so back it up or test on a new game first."
+        }
+      },
+      "next_step": "bisect"
+    },
+    {
+      "id": "world_missing_mod",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.world_mod",
+          "where": { "kind": "missing" },
+          "ref": { "kind": "mod_id", "bind": "mod" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "text": {
+        "headline": {
+          "en": "This world was saved with {owner:mod}, which is not installed now. Installing the mod again, or restoring a world backup, is a possible next step."
+        },
+        "why_not_sure": {
+          "en": "A world can often open without an old mod, but things that mod placed may be lost. Removing a mod partway through a playthrough can damage the save, so back it up first."
+        }
+      },
+      "next_step": "restore_save"
+    },
+    {
+      "id": "world_changed_mod",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.world_mod",
+          "where": { "kind": "version" },
+          "ref": { "kind": "mod_id", "bind": "mod" },
+          "bind": { "expected": "expected", "current": "current" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "text": {
+        "headline": {
+          "en": "This world was saved with {owner:mod} {expected}, and {current} is installed now. Installing the saved version, or restoring a world backup, is a possible next step."
+        },
+        "why_not_sure": {
+          "en": "A different version can change the data the world relies on. Back the world up before changing mods."
+        }
+      },
+      "next_step": "restore_save"
+    },
+    {
+      "id": "file_already_exists",
+      "version": 1,
+      "supersedes": ["mod_failed_to_load"],
+      "when": {
+        "fact": {
+          "kind": "minecraft.file_problem",
+          "where": { "kind": "already_exists" },
+          "ref": { "kind": "file", "bind": "file" },
+          "bind": { "path": "path" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "likely",
+            "candidate": { "owner_of": "file" },
+            "family": "known_signature",
+            "weight": 12
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game could not create {path} because it already exists. Moving it aside, after backing it up, is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "A leftover file can stop a mod from starting, but another file problem can print the same message."
+        }
+      },
+      "next_step": "confirm_experiment"
     }
   ]
 }
