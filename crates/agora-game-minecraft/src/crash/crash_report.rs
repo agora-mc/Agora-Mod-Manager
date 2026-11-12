@@ -1,8 +1,9 @@
 //! The `---- Minecraft Crash Report ----` file, whichever loader wrote it.
 
 use super::shared::{
-    absent, checked, collect_lines, fact, frame_symbol_and_class, jar_from_frame,
-    java_exception_category, looked_for, not_applicable, notes_for, number, reference,
+    absent, checked, collect_lines, crash_mixin_line, fact, file_problem, frame_symbol_and_class,
+    is_mod_id, jar_from_frame, java_exception_category, jvm_problem, looked_for,
+    mod_crash_from_message, mod_crash_line, not_applicable, notes_for, number, reference,
     source_location, text,
 };
 use agora_game_api::crash::{
@@ -61,11 +62,29 @@ impl BuiltInParser for CrashReportParser {
         let mut saw_system_details = false;
         let mut saw_mod_list = false;
         let mut mod_list = ModList::None;
+        let mut ticking: Option<Ticking> = None;
+        let mut mod_crash_order = 0u32;
+        // A mixin that lost its target to another transformer is a conflict, not that mixin's fault.
+        let mixin_conflict = collected.lines.iter().any(|line| {
+            line.contains("was removed by another injector")
+                || line.contains("could not find any targets matching")
+        });
 
         for (offset, line) in collected.lines.iter().enumerate().skip(start + 1) {
             let line_no = offset + 1;
 
             if let Some(name) = section_header(line) {
+                if let Some(object) = ticking.take() {
+                    if let Some(object_fact) = object.into_fact() {
+                        facts.push(object_fact);
+                    }
+                }
+                if name == "Entity being ticked" {
+                    ticking = Some(Ticking::new("entity", line_no));
+                } else if name == "Block entity being ticked" || name == "BlockEntity being ticked"
+                {
+                    ticking = Some(Ticking::new("block_entity", line_no));
+                }
                 section = Some(name.clone());
                 walkthrough = true;
                 if name == "System Details" {
@@ -103,6 +122,10 @@ impl BuiltInParser for CrashReportParser {
                 mod_list = ModList::None;
             }
 
+            if let Some(object) = ticking.as_mut() {
+                object.absorb(line);
+            }
+
             if !walkthrough {
                 if line.starts_with("A detailed walkthrough") {
                     walkthrough = true;
@@ -117,18 +140,38 @@ impl BuiltInParser for CrashReportParser {
                     have_exception = true;
                     trace_index = 0;
                     let category = java_exception_category(&class);
+                    let text_message = message.clone().unwrap_or_default();
                     facts.push(fact(
                         "core.exception",
                         vec![
                             ("class", text(class.clone())),
                             ("category", text(category)),
-                            ("message", text(message.clone().unwrap_or_default())),
+                            ("message", text(text_message.clone())),
                             ("depth", number(current_depth as f64)),
                         ],
                         vec![reference("class", class.clone(), Strength::Mention)],
                         line_no,
                         "exception",
                     ));
+                    if let Some(problem) = jvm_problem(&class, &text_message, line_no, "exception")
+                    {
+                        facts.push(problem);
+                    }
+                    if let Some(problem) = file_problem(&class, &text_message, line_no, "exception")
+                    {
+                        facts.push(problem);
+                    }
+                    if let Some(crash) =
+                        mod_crash_line(line).or_else(|| mod_crash_from_message(&text_message))
+                    {
+                        facts.push(crash.into_fact(mod_crash_order, line_no));
+                        mod_crash_order += 1;
+                    }
+                    if !mixin_conflict {
+                        if let Some(failure) = crash_mixin_line(line, line_no) {
+                            facts.push(failure);
+                        }
+                    }
                     if current_depth == 0 {
                         bucket = vec![BucketPart {
                             scheme: "crash_report".to_string(),
@@ -155,6 +198,16 @@ impl BuiltInParser for CrashReportParser {
                     }
                     continue;
                 }
+                if let Some(crash) = mod_crash_line(line) {
+                    facts.push(crash.into_fact(mod_crash_order, line_no));
+                    mod_crash_order += 1;
+                }
+                continue;
+            }
+
+            if let Some(crash) = mod_crash_line(line) {
+                facts.push(crash.into_fact(mod_crash_order, line_no));
+                mod_crash_order += 1;
                 continue;
             }
 
@@ -219,6 +272,12 @@ impl BuiltInParser for CrashReportParser {
                 }
                 "FML" => fml_version = Some(value.to_string()),
                 _ => {}
+            }
+        }
+
+        if let Some(object) = ticking.take() {
+            if let Some(object_fact) = object.into_fact() {
+                facts.push(object_fact);
             }
         }
 
@@ -363,9 +422,17 @@ impl BuiltInParser for CrashReportParser {
                 budget,
             ),
             checked("minecraft.section"),
+            checked("minecraft.mod_crash"),
+            checked("minecraft.mixin_failure"),
+            checked("minecraft.ticking_object"),
+            checked("minecraft.jvm_problem"),
+            checked("minecraft.file_problem"),
             not_applicable("core.log_line"),
             not_applicable("core.dependency_problem"),
             not_applicable("core.module"),
+            not_applicable("minecraft.loader_problem"),
+            not_applicable("minecraft.mod_conflict"),
+            not_applicable("minecraft.world_mod"),
         ];
         let coverage = if budget {
             coverage
@@ -398,6 +465,131 @@ impl BuiltInParser for CrashReportParser {
             coverage,
             notes: notes_for(&collected, request.limits),
         })
+    }
+}
+
+struct Ticking {
+    kind: &'static str,
+    type_name: Option<String>,
+    name: Option<String>,
+    dimension: Option<String>,
+    x: Option<f64>,
+    y: Option<f64>,
+    z: Option<f64>,
+    line: usize,
+}
+
+impl Ticking {
+    fn new(kind: &'static str, line: usize) -> Self {
+        Self {
+            kind,
+            type_name: None,
+            name: None,
+            dimension: None,
+            x: None,
+            y: None,
+            z: None,
+            line,
+        }
+    }
+
+    fn absorb(&mut self, line: &str) {
+        let trimmed = line.trim();
+        let (key, value) = match trimmed.split_once(": ") {
+            Some((key, value)) => (key, value.trim()),
+            None => return,
+        };
+        match key {
+            "Entity Type" | "Block type" | "Block" | "Block entity type" => {
+                if let Some(token) = value.split_whitespace().next() {
+                    if !token.is_empty() {
+                        self.type_name.get_or_insert_with(|| token.to_string());
+                    }
+                }
+            }
+            "Entity Name" => {
+                if !value.is_empty() {
+                    self.name.get_or_insert_with(|| value.to_string());
+                }
+            }
+            "Name" if self.type_name.is_none() => {
+                if let Some(token) = value.split_whitespace().next() {
+                    self.type_name.get_or_insert_with(|| token.to_string());
+                }
+            }
+            "Entity's Exact location" => {
+                if let Some((x, y, z)) = parse_xyz(value) {
+                    self.x.get_or_insert(x);
+                    self.y.get_or_insert(y);
+                    self.z.get_or_insert(z);
+                }
+            }
+            "Block location" => {
+                let inner = value
+                    .split("World: ")
+                    .nth(1)
+                    .or_else(|| value.split("World:").nth(1))
+                    .unwrap_or(value)
+                    .trim_start_matches('(')
+                    .split(')')
+                    .next()
+                    .unwrap_or("");
+                if let Some((x, y, z)) = parse_xyz(inner) {
+                    self.x.get_or_insert(x);
+                    self.y.get_or_insert(y);
+                    self.z.get_or_insert(z);
+                }
+            }
+            "Level dimension" | "Dimension" if !value.is_empty() => {
+                self.dimension.get_or_insert_with(|| value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn into_fact(self) -> Option<Fact> {
+        let type_name = self.type_name?;
+        let mut attrs = vec![("kind", text(self.kind)), ("type", text(type_name.clone()))];
+        if let Some(name) = self.name {
+            attrs.push(("name", text(name)));
+        }
+        if let Some(dimension) = self.dimension {
+            attrs.push(("dimension", text(dimension)));
+        }
+        if let (Some(x), Some(y), Some(z)) = (self.x, self.y, self.z) {
+            attrs.push(("x", number(x)));
+            attrs.push(("y", number(y)));
+            attrs.push(("z", number(z)));
+        }
+        let mut refs = Vec::new();
+        if let Some((namespace, _)) = type_name.split_once(':') {
+            if !matches!(
+                namespace.to_ascii_lowercase().as_str(),
+                "minecraft" | "forge" | "neoforge"
+            ) && is_mod_id(namespace)
+            {
+                refs.push(reference(
+                    "mod_id",
+                    namespace.to_string(),
+                    Strength::Mention,
+                ));
+            }
+        }
+        Some(fact(
+            "minecraft.ticking_object",
+            attrs,
+            refs,
+            self.line,
+            "ticking",
+        ))
+    }
+}
+
+fn parse_xyz(value: &str) -> Option<(f64, f64, f64)> {
+    let mut parts = value.split(',').map(|part| part.trim().parse::<f64>());
+    match (parts.next()?, parts.next()?, parts.next()?) {
+        (Ok(x), Ok(y), Ok(z)) => Some((x, y, z)),
+        _ => None,
     }
 }
 
@@ -465,7 +657,7 @@ fn exception_line(line: &str) -> Option<(bool, String, Option<String>)> {
             None => (rest, None),
         },
     };
-    let class = class_part.trim();
+    let class = super::shared::plain_class(class_part);
     if class.is_empty()
         || class.contains(char::is_whitespace)
         || !class.contains('.')

@@ -1,8 +1,9 @@
 //! The game's `latest.log`: the loader's own account of what it refused to load.
 
 use super::shared::{
-    collect_lines, fact, frame_symbol_and_class, jar_from_frame, java_exception_category,
-    looked_for, notes_for, number, reference, source_location, text,
+    collect_lines, fact, file_problem, frame_symbol_and_class, is_mod_id, jar_from_frame,
+    java_exception_category, jvm_problem, looked_for, mod_crash_from_message, mod_crash_line,
+    notes_for, number, reference, source_location, text,
 };
 use agora_game_api::crash::{
     BucketPart, BuiltInParser, BuiltInParserError, Coverage, CoverageState, Fact, ParserOutput,
@@ -35,12 +36,13 @@ impl BuiltInParser for LatestLogParser {
         let mut java_vendor: Option<String> = None;
         let mut os: Option<String> = None;
         let mut fatal_line: Option<(usize, String)> = None;
+        let mut mod_crash_order = 0u32;
 
         for (offset, line) in collected.lines.iter().enumerate() {
             let line_no = offset + 1;
             let trimmed = line.trim();
-
-            let message = strip_log_prefix(line);
+            let profile = strip_log_prefix(line);
+            let message = profile;
             if let Some(rest) = message.strip_prefix("Loading Minecraft ") {
                 if let Some((version, rest)) = rest.split_once(" with ") {
                     if game_version.is_none() {
@@ -193,6 +195,50 @@ impl BuiltInParser for LatestLogParser {
                         line_no,
                         "loader",
                     ));
+                }
+            }
+
+            if let Some(crash) = mod_crash_line(profile).or_else(|| mod_crash_from_message(profile))
+            {
+                let key = format!("mod_crash\0{}", crash.id());
+                if seen.insert(key) {
+                    facts.push(crash.into_fact(mod_crash_order, line_no));
+                    mod_crash_order += 1;
+                }
+            }
+
+            if exception_line(profile).is_none() {
+                if let Some(problem) = jvm_problem("", profile, line_no, "fatal") {
+                    if seen.insert(format!("jvm\0{profile}")) {
+                        facts.push(problem);
+                    }
+                }
+            }
+
+            if let Some(conflict) = mod_conflict(trimmed) {
+                let key = format!("conflict\0{}\0{}", conflict.0, conflict.1);
+                if seen.insert(key) {
+                    facts.push(fact(
+                        "minecraft.mod_conflict",
+                        vec![
+                            ("first", text(conflict.0.clone())),
+                            ("second", text(conflict.1.clone())),
+                            ("message", text(trimmed.to_string())),
+                        ],
+                        vec![
+                            reference("mod_id", conflict.0, Strength::Mention),
+                            reference("mod_id", conflict.1, Strength::Mention),
+                        ],
+                        line_no,
+                        "loader",
+                    ));
+                }
+            }
+
+            if let Some(world) = world_mod(trimmed) {
+                let key = format!("world_mod\0{}\0{}", world.kind, world.id);
+                if seen.insert(key) {
+                    facts.push(world.into_fact(line_no));
                 }
             }
 
@@ -421,6 +467,36 @@ impl BuiltInParser for LatestLogParser {
                 why: None,
             },
             Coverage {
+                kind: "minecraft.mod_crash".to_string(),
+                state: CoverageState::Checked,
+                why: None,
+            },
+            Coverage {
+                kind: "minecraft.mod_conflict".to_string(),
+                state: CoverageState::Checked,
+                why: None,
+            },
+            Coverage {
+                kind: "minecraft.world_mod".to_string(),
+                state: CoverageState::Checked,
+                why: None,
+            },
+            Coverage {
+                kind: "minecraft.jvm_problem".to_string(),
+                state: CoverageState::Checked,
+                why: None,
+            },
+            Coverage {
+                kind: "minecraft.file_problem".to_string(),
+                state: CoverageState::Checked,
+                why: None,
+            },
+            Coverage {
+                kind: "minecraft.ticking_object".to_string(),
+                state: CoverageState::NotApplicable,
+                why: None,
+            },
+            Coverage {
                 kind: "core.log_line".to_string(),
                 state: CoverageState::Checked,
                 why: None,
@@ -523,18 +599,25 @@ fn push_exception(
     depth: usize,
     line_no: usize,
 ) {
+    let message = message.unwrap_or_default();
     facts.push(fact(
         "core.exception",
         vec![
             ("class", text(class.to_string())),
             ("category", text(java_exception_category(class))),
-            ("message", text(message.unwrap_or_default())),
+            ("message", text(message.clone())),
             ("depth", number(depth as f64)),
         ],
         vec![reference("class", class.to_string(), Strength::Mention)],
         line_no,
         "fatal",
     ));
+    if let Some(problem) = jvm_problem(class, &message, line_no, "fatal") {
+        facts.push(problem);
+    }
+    if let Some(problem) = file_problem(class, &message, line_no, "fatal") {
+        facts.push(problem);
+    }
 }
 
 fn frame_fact(line: &str, index: u32, line_no: usize) -> Option<Fact> {
@@ -600,7 +683,7 @@ fn exception_line(line: &str) -> Option<(bool, String, Option<String>)> {
             None => (rest, None),
         },
     };
-    let class = class_part.trim();
+    let class = super::shared::plain_class(class_part);
     if class.is_empty()
         || class.contains(char::is_whitespace)
         || !class.contains('.')
@@ -740,13 +823,90 @@ fn mixin_failure(line: &str) -> Option<(Option<String>, String, String)> {
 }
 
 fn duplicate_mod(line: &str) -> Option<String> {
-    let rest = line.split("Found a duplicate mod ").nth(1)?;
-    let id = rest.split_whitespace().next()?.trim();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id.to_string())
+    if let Some(rest) = line.split("Found a duplicate mod ").nth(1) {
+        let id = rest.split_whitespace().next()?.trim();
+        if is_mod_id(id) {
+            return Some(id.to_string());
+        }
     }
+    if line.contains("from mod files:") {
+        if let Some(rest) = line.split("Mod ID: '").nth(1) {
+            let (id, _) = rest.split_once('\'')?;
+            if is_mod_id(id.trim()) {
+                return Some(id.trim().to_string());
+            }
+        }
+    }
+    if let Some(rest) = line.split("Duplicate versions for mod ID '").nth(1) {
+        let (id, _) = rest.split_once('\'')?;
+        if is_mod_id(id.trim()) {
+            return Some(id.trim().to_string());
+        }
+    }
+    None
+}
+
+/// `Found conflicting mods: <a> conflicts with <b>`.
+fn mod_conflict(line: &str) -> Option<(String, String)> {
+    let rest = line.split("Found conflicting mods: ").nth(1)?;
+    let (first, rest) = rest.split_once(" conflicts with ")?;
+    let second = rest.trim().trim_end_matches('.').trim();
+    let first = first.trim();
+    (is_mod_id(first) && is_mod_id(second)).then(|| (first.to_string(), second.to_string()))
+}
+
+struct WorldMod {
+    kind: &'static str,
+    id: String,
+    expected: Option<String>,
+    current: Option<String>,
+}
+
+impl WorldMod {
+    fn into_fact(self, line: usize) -> Fact {
+        let mut attrs = vec![("kind", text(self.kind)), ("mod", text(self.id.clone()))];
+        if let Some(expected) = self.expected {
+            attrs.push(("expected", text(expected)));
+        }
+        if let Some(current) = self.current {
+            attrs.push(("current", text(current)));
+        }
+        fact(
+            "minecraft.world_mod",
+            attrs,
+            vec![reference("mod_id", self.id, Strength::Mention)],
+            line,
+            "world",
+        )
+    }
+}
+
+/// The world was saved with a mod that is missing, or with a different version of it.
+fn world_mod(line: &str) -> Option<WorldMod> {
+    let rest = line.split("This world was saved with mod ").nth(1)?;
+    let rest = rest.trim();
+    if let Some((id, _)) = rest.split_once(" which appears to be missing") {
+        if is_mod_id(id.trim()) {
+            return Some(WorldMod {
+                kind: "missing",
+                id: id.trim().to_string(),
+                expected: None,
+                current: None,
+            });
+        }
+    }
+    let (id, rest) = rest.split_once(" version ")?;
+    let (expected, rest) = rest.split_once(" and it is now at version ")?;
+    let current = rest.split(',').next()?.trim();
+    if !is_mod_id(id.trim()) || expected.is_empty() || current.is_empty() {
+        return None;
+    }
+    Some(WorldMod {
+        kind: "version",
+        id: id.trim().to_string(),
+        expected: Some(expected.trim().to_string()),
+        current: Some(current.to_string()),
+    })
 }
 
 fn loader_problem(line: &str) -> Option<&'static str> {
@@ -764,6 +924,9 @@ fn loader_problem(line: &str) -> Option<&'static str> {
     }
     if lower.starts_with("missing or unsupported mandatory dependencies") {
         return Some("missing_dependency");
+    }
+    if lower.contains("maximum id range exceeded") {
+        return Some("id_limit");
     }
     None
 }
