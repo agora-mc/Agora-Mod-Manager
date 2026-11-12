@@ -478,3 +478,24 @@ fn an_older_crash_logger_is_noted_and_a_current_one_is_not() {
     );
     assert!(!rule_fired(&current, "crash_logger_outdated"));
 }
+
+#[test]
+fn a_cpp_bad_alloc_is_out_of_memory_and_another_cpp_exception_is_not() {
+    let running = start();
+    let with_cpp = |kind: &str| {
+        log(
+            "C++ Exception",
+            &["KERNELBASE.dll", "SkyrimSE.exe"],
+            &[],
+            &[],
+        )
+        .replace(
+            "\nSYSTEM SPECS:",
+            &format!("\nC++ EXCEPTION:\n\tType: (std::{kind})\n\tInfo: invented\n\nSYSTEM SPECS:"),
+        )
+    };
+    let oom = run(&running, &with_cpp("bad_alloc"));
+    assert!(rule_fired(&oom, "out_of_memory"));
+    let other = run(&running, &with_cpp("runtime_error"));
+    assert!(!rule_fired(&other, "out_of_memory"));
+}

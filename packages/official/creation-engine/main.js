@@ -1145,7 +1145,8 @@ function crashParseException(state, limits, sections, lines, game, logType) {
       if (match) {
         const type = crashTrim(match[1]).replace(/\*+$/, "");
         crashAddAttr(attrs, "class", type, limits);
-        crashAddAttr(attrs, "category", "unknown", limits);
+        // The C++ type says what kind of failure it was (`std::bad_alloc` is out of memory).
+        crashAddAttr(attrs, "category", crashExceptionCategory(type), limits);
       }
       match = text.match(/^Info:\s*(.*)$/);
       if (match) crashAddAttr(attrs, "message", match[1], limits);
