@@ -214,6 +214,10 @@ pub const ENGINE_ATTRS: &[(&str, &[&str])] = &[
 /// Every `core.exception.category`. Anything a parser can't place is `unknown`.
 pub const EXCEPTION_CATEGORIES: &[&str] = &[
     "access_violation",
+    "in_page_error",
+    "stack_overflow",
+    "heap_corruption",
+    "gpu_device_lost",
     "fast_fail",
     "managed",
     "oom",

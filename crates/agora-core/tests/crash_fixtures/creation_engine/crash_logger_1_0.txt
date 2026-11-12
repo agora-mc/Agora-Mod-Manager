@@ -40,7 +40,7 @@ SKSE PLUGINS:
 	ExamplePlugin.dll
 
 PLUGINS:
-	Light: 2	Regular: 3	Total: 5
+	Light: 1	Regular: 2	Total: 3
 	[00]     ExampleBase.esm
 	[01]     ExamplePatch.esp
 	[FE:000] ExampleLight.esl

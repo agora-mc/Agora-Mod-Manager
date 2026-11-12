@@ -507,9 +507,18 @@ function crashPointerClass(address) {
 
 function crashExceptionCategory(code) {
   const name = crashText(code).toUpperCase();
+  // Some logs print only the NTSTATUS code. Check the specific ones before the broad "memory"
+  // words, because C0000374 is heap corruption, not OOM.
+  const status = name.replace(/^0X/, "");
+  if (status === "C0000006") return "in_page_error";
+  if (status === "C00000FD") return "stack_overflow";
+  if (status === "C0000374") return "heap_corruption";
+  if (status === "C0000005") return "access_violation";
+  if (status === "80000003") return "assert";
+  if (name.includes("IN_PAGE_ERROR")) return "in_page_error";
+  if (name.includes("STACK_OVERFLOW")) return "stack_overflow";
+  if (name.includes("HEAP_CORRUPTION")) return "heap_corruption";
   if (name.includes("ACCESS_VIOLATION")) return "access_violation";
-  if (name.includes("IN_PAGE_ERROR")) return "access_violation";
-  if (name.includes("STACK_OVERFLOW")) return "unknown";
   if (name.includes("BREAKPOINT")) return "assert";
   if (name.includes("ASSERT")) return "assert";
   if (name.includes("OUT_OF_MEMORY") || name.includes("MEMORY") || name.includes("BAD_ALLOC")) {
@@ -517,6 +526,21 @@ function crashExceptionCategory(code) {
   }
   if (name.includes("FAST_FAIL")) return "fast_fail";
   return "unknown";
+}
+
+/// A lost GPU device arrives as a C++ exception whose message names a DXGI failure, not as its own
+/// exception code. Returns the category when the text says the device went away.
+function crashGpuCategory(text) {
+  const upper = crashText(text).toUpperCase();
+  if (
+    upper.includes("DXGI_ERROR_DEVICE_REMOVED") ||
+    upper.includes("DXGI_ERROR_DEVICE_HUNG") ||
+    upper.includes("DXGI_ERROR_DEVICE_RESET") ||
+    upper.includes("DXGI_ERROR_DRIVER_INTERNAL_ERROR")
+  ) {
+    return "gpu_device_lost";
+  }
+  return undefined;
 }
 
 function crashIsObjectType(type) {
@@ -678,6 +702,12 @@ function crashObjectAttrs(object, limits) {
   }
   for (const flags of crashFieldList(object, ["Flags"])) {
     crashAddAttr(attrs, "flags", crashTrim(flags), limits);
+    break;
+  }
+  // Kept even when it is "None": an empty object reference is a clue of its own, and `name`
+  // deliberately drops it.
+  for (const reference of crashFieldList(object, ["Object Reference"])) {
+    crashAddAttr(attrs, "object_reference", crashUnquote(reference), limits);
     break;
   }
   for (const rtti of crashFieldList(object, ["RTTIName"])) {
@@ -1054,15 +1084,19 @@ function crashParseException(state, limits, sections, lines, game, logType) {
     }
   }
 
-  const accessLine = crashFindLine(lines, /^\s*(?:Access Violation|In-Page Error):\s*Tried to\s+(read|write|execute)\s+memory at\s+0x([0-9A-Fa-f]+)/);
+  const accessLine = crashFindLine(lines, /^\s*(Access Violation|In-Page Error):\s*Tried to\s+(read|write|execute)\s+memory at\s+0x([0-9A-Fa-f]+)/);
+  let accessKind;
   if (accessLine) {
-    access = accessLine.match[1];
-    faultAddress = crashHex(accessLine.match[2]);
+    accessKind = accessLine.match[1];
+    access = accessLine.match[2];
+    faultAddress = crashHex(accessLine.match[3]);
   }
 
   if (mainCode !== undefined || site.address !== undefined || access !== undefined) {
     const attrs = {};
-    const exceptionClass = mainCode !== undefined ? mainCode : access !== undefined ? "EXCEPTION_ACCESS_VIOLATION" : undefined;
+    const fallbackClass =
+      accessKind === "In-Page Error" ? "EXCEPTION_IN_PAGE_ERROR" : "EXCEPTION_ACCESS_VIOLATION";
+    const exceptionClass = mainCode !== undefined ? mainCode : access !== undefined ? fallbackClass : undefined;
     crashAddAttr(attrs, "class", exceptionClass, limits);
     crashAddAttr(attrs, "category", crashExceptionCategory(exceptionClass), limits);
     crashAddAttr(attrs, "access", access, limits);
@@ -1146,8 +1180,6 @@ function crashParseException(state, limits, sections, lines, game, logType) {
       if (match) {
         const type = crashTrim(match[1]).replace(/\*+$/, "");
         crashAddAttr(attrs, "class", type, limits);
-        // The C++ type says what kind of failure it was (`std::bad_alloc` is out of memory).
-        crashAddAttr(attrs, "category", crashExceptionCategory(type), limits);
       }
       match = text.match(/^Info:\s*(.*)$/);
       if (match) crashAddAttr(attrs, "message", match[1], limits);
@@ -1159,6 +1191,10 @@ function crashParseException(state, limits, sections, lines, game, logType) {
         crashAddRef(refs, "module", match[1], "exec_top", limits);
       }
     }
+    // The C++ type says what kind of failure it was (`std::bad_alloc` is out of memory), and the
+    // message can name a lost GPU device even when the type is a plain runtime error.
+    const cppCategory = crashGpuCategory(attrs.message) || crashExceptionCategory(attrs.class);
+    crashAddAttr(attrs, "category", cppCategory, limits);
     crashPushFact(state, limits, {
       kind: "core.exception",
       attrs,
@@ -1436,16 +1472,24 @@ function crashParseScriptExtender(state, limits, sections, lines, logType) {
 }
 
 function crashParseLoadOrder(state, limits, sections, lines, logType) {
-  if (logType === "trainwreck") return { present: false, entries: 0, unreadable: false };
+  if (logType === "trainwreck") {
+    return { present: false, entries: 0, unreadable: false, summaryTotal: undefined, incomplete: false };
+  }
   const section = crashFindSection(sections, "PLUGINS");
-  if (!section) return { present: false, entries: 0, unreadable: false };
+  if (!section) {
+    return { present: false, entries: 0, unreadable: false, summaryTotal: undefined, incomplete: false };
+  }
   let entries = 0;
   let unreadable = false;
+  let summaryTotal;
+  // Held until the whole list is read: a cut list must not be reported as facts of a checked kind.
+  const pending = [];
   for (let index = section.start + 1; index < section.end; index += 1) {
     const text = lines[index].trim();
     if (!text) continue;
     const summary = text.match(/^Light:\s*(\d+)\s+Regular:\s*(\d+)\s+Total:\s*(\d+)/);
     if (summary) {
+      summaryTotal = Number(summary[3]);
       crashPushFact(state, limits, {
         kind: "creation.load_order_summary",
         attrs: {
@@ -1476,14 +1520,21 @@ function crashParseLoadOrder(state, limits, sections, lines, logType) {
     const indexText = light ? "FE:" + match[1].trim().toUpperCase() : match[1].trim().toUpperCase();
     const refs = new Map();
     crashAddRef(refs, "plugin", match[2], "object", limits);
-    crashPushFact(state, limits, {
+    pending.push({
       kind: "creation.plugin",
       attrs: { index: indexText, light },
       refs: crashRefList(refs, limits, state),
       span: crashSpan("PLUGINS", index, index),
     });
   }
-  return { present: true, entries, unreadable };
+  // The list prints its own total. Fewer entries than that means the logger stopped writing partway
+  // through, so the list cannot prove a plugin is absent: its facts are dropped and coverage says
+  // it was not checked, which leaves every absence rule as "could not check".
+  const incomplete = summaryTotal !== undefined && entries < summaryTotal;
+  if (!incomplete) {
+    for (const fact of pending) crashPushFact(state, limits, fact);
+  }
+  return { present: true, entries, unreadable, summaryTotal, incomplete };
 }
 
 function crashParseModels(state, limits, sections, lines) {
@@ -1557,7 +1608,18 @@ function crashCoverage(state, limits, sections, flags) {
     } else {
       coverage.push({ kind: "creation.load_order_summary", state: "checked" });
       coverage.push({ kind: "creation.load_order_error", state: "checked" });
-      if (flags.loadOrderEntries > 0 || !flags.loadOrderUnreadable) {
+      if (flags.loadOrderIncomplete) {
+        coverage.push({
+          kind: "creation.plugin",
+          state: "absent",
+          why:
+            "The PLUGINS list stopped after " +
+            flags.loadOrderEntries +
+            " of the " +
+            flags.loadOrderSummaryTotal +
+            " plugins its own summary names, so it cannot show that a plugin is missing.",
+        });
+      } else if (flags.loadOrderEntries > 0 || !flags.loadOrderUnreadable) {
         coverage.push({ kind: "creation.plugin", state: "checked" });
       } else {
         coverage.push({ kind: "creation.plugin", state: "absent", why: "The logger wrote an error instead of the plugin list." });
@@ -1652,6 +1714,8 @@ function crashParseCreationEngine(request, logType) {
     loadOrder: loadOrder.present,
     loadOrderEntries: loadOrder.entries,
     loadOrderUnreadable: loadOrder.unreadable,
+    loadOrderSummaryTotal: loadOrder.summaryTotal,
+    loadOrderIncomplete: loadOrder.incomplete,
     loadOrderApplicable: logType === "crash_logger",
     models,
   };
@@ -1707,6 +1771,180 @@ export async function parseTrainwreck(request) {
 }
 
 // ---------------------------------------------------------------------------
+// SKSE's own log (skse64.log)
+//
+// SKSE checks every plugin before loading it and writes one verdict per DLL:
+//   plugin <dll> (<dataVersion> <name> <pluginVersion>) <status> [<code>] (handle N)
+// The shapes and status wording are from Tullius's SkseLogParser.cpp (GPL-3) and
+// PluginRules.cpp DescribeSkseLoadStatus; its ADR-0008 is the source for the rule
+// that a DLL SKSE refused never ran, so it cannot be the crashing code. The last
+// line for a DLL wins: a plugin can load and then crash during its post-load setup.
+// This log has no time or process id, so a swept copy is a supplement, never proof
+// of a crash.
+// ---------------------------------------------------------------------------
+
+const SKSE_LOG_HEADER = /^SKSE64 runtime: initialize \(version = (\S+)/;
+
+const SKSE_LOG_STATUSES = [
+  [/^loaded correctly$/, "loaded", "loaded"],
+  [/^disabled, incompatible with current version of the game$/, "refused", "different_game_version"],
+  [/^disabled, address library needs to be updated$/, "refused", "address_library_outdated"],
+  [/^must be recompiled for new address library$/, "refused", "address_library_outdated"],
+  [/^disabled, only compatible with versions earlier than 1\.6\.629$/, "refused", "structs_post_629"],
+  [/^disabled, requires newer script extender$/, "refused", "newer_skse"],
+  [/^disabled, bad version data$/, "refused", "invalid_version_data"],
+  [/^disabled, no name specified$/, "refused", "invalid_version_data"],
+  [/^disabled, unsupported version independence method$/, "refused", "invalid_version_data"],
+  [/^does not appear to be an skse plugin$/, "refused", "not_an_skse_plugin"],
+  [/^le plugin cannot be used with se$/, "refused", "32_bit_plugin"],
+  [/^reported as incompatible during load$/, "failed", "self_incompatible"],
+  [/^crashed during postload$/, "failed", "post_load_crash"],
+  [/^disabled, fatal error occurred while loading plugin$/, "failed", "fatal_load_error"],
+  [/^disabled, fatal error occurred while checking plugin compatibility$/, "failed", "fatal_load_error"],
+];
+
+function skseLoadVerdict(status, errorCode) {
+  const text = crashTrim(status).toLowerCase();
+  if (text === "couldn't load plugin") {
+    if (errorCode === 126) return { outcome: "failed", reason: "dependent_dll_missing" };
+    return { outcome: "failed", reason: "load_error" };
+  }
+  for (const [pattern, outcome, reason] of SKSE_LOG_STATUSES) {
+    if (pattern.test(text)) return { outcome, reason };
+  }
+  return { outcome: "last_seen", reason: "unknown_status" };
+}
+
+function skseLogLine(line) {
+  const match = line.match(
+    /^plugin (.+?\.dll) \(([0-9A-Fa-f]{8}) (.*?) ([0-9A-Fa-f]{8})\) (.*?) \(handle (\d+)\)$/,
+  );
+  if (!match) return null;
+  let status = crashTrim(match[5]);
+  let code;
+  if (/^couldn't load plugin\b/.test(status)) {
+    const tail = status.match(/^(.*\S)\s+(-?\d+)$/);
+    if (tail) {
+      status = crashTrim(tail[1]);
+      code = Number(tail[2]);
+    }
+  }
+  return {
+    dll: match[1],
+    dataVersion: match[2],
+    name: crashTrim(match[3]),
+    version: match[4],
+    status,
+    code,
+    handle: Number(match[6]),
+  };
+}
+
+/// Read SKSE's own log into load verdicts. An empty or unreadable file is an error, and a file
+/// without SKSE's header is not claimed.
+function skseParseLog(request) {
+  const read = crashReadAllLines(request);
+  if (read.error) throw new Error(read.error);
+  const lines = read.lines;
+  if (lines.length === 0) {
+    return {
+      contract: CRASH_CONTRACT,
+      producer: { format: "skse_log" },
+      facts: [],
+      notes: [{ kind: "wrong_format", message: "the file is empty" }],
+    };
+  }
+  const header = crashFindLine(lines, SKSE_LOG_HEADER);
+  if (!header) {
+    return {
+      contract: CRASH_CONTRACT,
+      producer: { format: "skse_log" },
+      facts: [],
+      notes: [{ kind: "wrong_format", message: "the file is not SKSE's own log" }],
+    };
+  }
+
+  const limits = request.limits;
+  const state = { facts: [], kinds: {}, budgetSpent: false, refsTruncated: false };
+  const byDll = new Map();
+  let checked = 0;
+  for (let index = header.index + 1; index < lines.length; index += 1) {
+    const text = lines[index].trim();
+    if (!text) continue;
+    if (/^checking plugin\b/.test(text)) {
+      checked += 1;
+      continue;
+    }
+    const parsed = skseLogLine(text);
+    if (!parsed) continue;
+    byDll.set(parsed.dll.toLowerCase(), { parsed, index });
+  }
+
+  let loaded = 0;
+  for (const { parsed, index } of Array.from(byDll.values()).sort(
+    (left, right) => left.index - right.index,
+  )) {
+    const verdict = skseLoadVerdict(parsed.status, parsed.code);
+    if (verdict.outcome === "loaded") loaded += 1;
+    const refs = new Map();
+    crashAddRef(refs, "module", parsed.dll, "mention", limits);
+    const refList = crashRefList(refs, limits, state);
+    const verdictAttrs = { outcome: verdict.outcome, reason: verdict.reason };
+    crashPushFact(state, limits, {
+      kind: "core.load_verdict",
+      attrs: verdictAttrs,
+      refs: refList,
+      span: crashSpan("SKSE LOG", index, index),
+    });
+    const detail = { dll: parsed.dll, status: parsed.status };
+    if (parsed.name) crashAddAttr(detail, "plugin_name", parsed.name, limits);
+    if (parsed.code !== undefined) detail.code = parsed.code;
+    // The plugin version is the same packed `major.minor.patch.build` form the declaration uses.
+    crashAddAttr(
+      detail,
+      "plugin_version",
+      skseVersionText(skseVersionParts(Number.parseInt(parsed.version, 16) >>> 0)),
+      limits,
+    );
+    crashPushFact(state, limits, {
+      kind: "creation.skse_load",
+      attrs: detail,
+      refs: refList,
+      span: crashSpan("SKSE LOG", index, index),
+    });
+  }
+
+  const notes = [];
+  if (read.cut) notes.push({ kind: "truncated", message: "a line was longer than the read limit and was cut" });
+  if (read.gap) notes.push({ kind: "truncated", message: "the kept head and tail are not adjacent" });
+  if (read.budget || state.budgetSpent) {
+    notes.push({ kind: "budget_spent", message: "the parser reached its fact or line budget" });
+  }
+  if (checked > 0 && byDll.size === 0) {
+    notes.push({
+      kind: "unknown_section",
+      message: "SKSE listed plugins to check but wrote no load verdict",
+    });
+  }
+
+  return {
+    contract: CRASH_CONTRACT,
+    producer: { format: "skse_log", version: crashVersion(header.match[1]) },
+    facts: state.facts,
+    coverage: [
+      { kind: "core.load_verdict", state: "checked" },
+      { kind: "creation.skse_load", state: "checked" },
+    ],
+    notes,
+  };
+}
+
+/// SKSE's own log, `skse64.log`, next to the crash logs.
+export async function parseSkseLog(request) {
+  return skseParseLog(request);
+}
+
+// ---------------------------------------------------------------------------
 // SKSE plugin declarations (MASTER_SPEC §30.11)
 //
 // An SKSE plugin DLL exports `SKSEPlugin_Version`, a pointer to an
@@ -1735,9 +1973,11 @@ const SKSE_PLUGINS_DIR = "Data/SKSE/Plugins";
 // (wbDefinitionsTES5.pas) and UESP's TES4 format page (HEDR Version); see crash/FACTS.md.
 const EXTENDED_ESL_HEADER = 1.71;
 const EXTENDED_ESL_GAME = [1, 6, 1130, 0];
-// Backported Extended ESL Support backports the 1.6.1130 ESL range to 1.5.97. Source: the mod's
-// own package (Nexus Mods, Skyrim Special Edition); see crash/FACTS.md.
-const BACKPORTED_ESL_DLL = "BackportedESLSupport.dll";
+// Backported Extended ESL Support backports the 1.6.1130 ESL range to 1.5.97. The package installs
+// `BackportedESLSupport.dll`; Tullius's preflight and capture also accept the `bees.dll` alias
+// (`Analyzer.CaptureInputs.cpp:758-763`, `CompatibilityPreflight.cpp:410-411`). Source: the mod's
+// own package (Nexus Mods, Skyrim Special Edition) and Tullius (GPL-3); see crash/FACTS.md.
+const BACKPORTED_ESL_DLLS = ["BackportedESLSupport.dll", "bees.dll"];
 
 function skseU16(bytes, at) {
   return bytes[at] | (bytes[at + 1] << 8);
@@ -2117,26 +2357,27 @@ function sksePluginFiles() {
 
 /// Whether the backported ESL support plugin is installed. `null` means the view could not tell.
 function backportedEslSupport(listed) {
+  const wanted = BACKPORTED_ESL_DLLS.map((name) => name.toLowerCase());
   if (!listed.error) {
-    const wanted = BACKPORTED_ESL_DLL.toLowerCase();
-    return listed.entries.some((entry) => String(entry.name).toLowerCase() === wanted);
+    return listed.entries.some((entry) => wanted.includes(String(entry.name).toLowerCase()));
   }
-  try {
-    game.readBytes(SKSE_PLUGINS_DIR + "/" + BACKPORTED_ESL_DLL, 0, 1);
-    return true;
-  } catch (error) {
-    const message = String(error && error.message ? error.message : error).toLowerCase();
-    if (
-      message.includes("not in this instance") ||
-      message.includes("not_found") ||
-      message.includes("there is no") ||
-      message.includes("no such") ||
-      message.includes("does not exist")
-    ) {
-      return false;
+  let missing = true;
+  for (const name of BACKPORTED_ESL_DLLS) {
+    try {
+      game.readBytes(SKSE_PLUGINS_DIR + "/" + name, 0, 1);
+      return true;
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error).toLowerCase();
+      const absent =
+        message.includes("not in this instance") ||
+        message.includes("not_found") ||
+        message.includes("there is no") ||
+        message.includes("no such") ||
+        message.includes("does not exist");
+      if (!absent) missing = false;
     }
-    return null;
   }
+  return missing ? false : null;
 }
 
 function declaresExtendedEsl(headerVersion) {

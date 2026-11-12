@@ -1,0 +1,16 @@
+Skyrim SSE v1.6.1170
+CrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF700001000 ExampleGame.exe+001000	mov rax, [rcx]
+
+PROBABLE CALL STACK:
+	[ 0] 0x7FF700001000 ExampleGame.exe+001000
+
+MODULES:
+	ExampleGame.exe                           0x7FF700000000
+
+PLUGINS:
+	Light: 1	Regular: 4	Total: 5
+	[ 0]     ExampleBase.esm
+	[ 1]     ExamplePatch.esp
+	[FE:  0] ExampleLight.esl

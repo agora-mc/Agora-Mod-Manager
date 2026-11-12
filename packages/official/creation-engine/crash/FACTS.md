@@ -15,6 +15,7 @@ never script numbers.
 |---|---|---|---|---|
 | `crash_logger` | `Documents/My Games/Skyrim Special Edition/SKSE` | `crash-*.log` | `pid_in_facts`, else `time` (2 s before, 10 s after) | Verified |
 | `trainwreck` | the same folder | `crash_*.log` | `time` (2 s before, 10 s after) | **Unverified** |
+| `skse_log` | the same folder | `skse64.log` | `time` (2 s before, 10 s after) | Supplementary |
 
 Crash Logger writes `crash-<YYYY-MM-DD-HH-MM-SS>.log` in the SKSE log folder by
 default. That is from its own source: `src/main.cpp` (`SetupCrashLogPath` fails
@@ -29,8 +30,16 @@ The pack assumes the same SKSE folder and a `crash_` prefix. If a real
 installation disagrees, change `sources[1]`; the parser itself does not depend
 on the name.
 
-Both sources have no `format`, so the content decides which parser runs. A file
-that is not one of these logs is never claimed.
+Both crash-log sources have no `format`, so the content decides which parser runs.
+`skse_log` is `supplementary` and detected by its own header, so it is read
+alongside a crash, never as proof of one. A file that is not one of these logs is
+never claimed.
+
+`skse64.log` has no process id and no timestamp, and SKSE overwrites it every run.
+Tullius binds it to the session by the game executable's image base
+(`docs/adr/0008-skse-log-refused-plugins.md:29-46`). Our contract has no image-base
+bind, so this pack uses the session time window; a stale log that falls outside it
+is rejected rather than read as this run's.
 
 ## Function names
 
@@ -77,6 +86,24 @@ it, and the game line is matched without that first letter.
 |---|---|---|
 | T | 1.2.1–1.4.0 | `SkyrimSE`/`SkyrimVR`, then `trainwreck v…`. Four-space indentation. `PROBABLE CALL STACK` frames are `[n] 0xADDR module+offset symbol`, followed by instruction and `[source:line]` lines. `MODULES` has `Address`, `SHA` (SHA-512) and `Version`. `SCRIPT EXTENDER PLUGINS`. No process block and no load-order `PLUGINS`. |
 
+### SKSE's own log (`skse64.log`)
+
+This is not a crash log. SKSE writes it while it starts the game, overwriting the
+previous run's copy. The parser reads the header `SKSE64 runtime: initialize
+(version = …)`, then one verdict per DLL:
+
+```
+plugin <dll> (<dataVersion> <name> <pluginVersion>) <status> [<code>] (handle N)
+```
+
+The line shapes and status wording are from Tullius's `SkseLogParser.cpp:116-258`
+and `PluginRules.cpp:348-399` (GPL-3). The last line for a DLL wins, because a
+plugin can load correctly and then crash during its post-load setup. A DLL whose
+last line is `loaded correctly` is `loaded`; the others are `refused` (SKSE did not
+run it) or `failed` (it started loading and did not finish). SKSE's ADR-0008 says a
+refused DLL cannot be the cause of that run's crash; the rules here say it is a
+version-mismatch problem to fix, and that it was not the code that crashed.
+
 ## Plugin headers (pre-flight)
 
 The `diagnostics` hook reads each enabled plugin's `HEDR` subrecord. Its first field is a
@@ -88,10 +115,12 @@ the ESL form-id range from 2048 to 4096 records, so a 1.71 header needs 1.6.1130
 with 1.71 on an older game can stop the game while it loads its plugin list.
 
 **Backported Extended ESL Support** backports that range to 1.5.97. The check treats
-`Data/SKSE/Plugins/BackportedESLSupport.dll` as the exception and never reads its version. The DLL
-name is the one the mod's own package installs (Nexus Mods, Skyrim Special Edition); the page
-blocks automated fetches, so the name was confirmed from its published file listing rather than
-read from source here.
+`Data/SKSE/Plugins/BackportedESLSupport.dll` as the exception and never reads its version. The
+package installs that name, and Tullius's capture and preflight also accept `bees.dll`
+(`Analyzer.CaptureInputs.cpp:758-763`, `CompatibilityPreflight.cpp:410-411`), so the check accepts
+either spelling. The primary name is the one the mod's own package installs (Nexus Mods, Skyrim
+Special Edition); the page blocks automated fetches, so it was confirmed from its published file
+listing rather than read from source here.
 
 ## Save risk
 
@@ -120,8 +149,8 @@ The unhandled exception, including a C++ exception block one level deeper.
 
 | Attribute | Meaning |
 |---|---|
-| `class` | The quoted code (`EXCEPTION_ACCESS_VIOLATION`, `C06D007E`) or the C++ type. If the log omits the code but states an access violation, this is `EXCEPTION_ACCESS_VIOLATION`. |
-| `category` | `access_violation`, `assert`, `oom`, `fast_fail` or `unknown`. |
+| `class` | The quoted code (`EXCEPTION_ACCESS_VIOLATION`, `C06D007E`) or the C++ type. If the log omits the code but states an access violation, this is `EXCEPTION_ACCESS_VIOLATION` (or `EXCEPTION_IN_PAGE_ERROR` for an In-Page Error line). |
+| `category` | `access_violation`, `in_page_error`, `stack_overflow`, `heap_corruption`, `gpu_device_lost`, `assert`, `oom`, `fast_fail`, `load_failure`, `managed` or `unknown`. A C++ message naming a DXGI device-removed/hung/reset failure is `gpu_device_lost`; `std::bad_alloc` is `oom`; `C0000374` is `heap_corruption`. |
 | `message` | The C++ exception's `Info` text, when present. |
 | `access` | `read`, `write` or `execute`, from the `Access Violation` or `In-Page Error` line. |
 | `fault_address` | The address the faulting access touched, as text. |
@@ -334,6 +363,37 @@ Refs: `module` (the plugin is a native module).
 { "kind": "creation.script_extender_plugin", "attrs": { "version": "1.0.0" },
   "refs": [{ "kind": "module", "value": "ExampleBridge.dll", "strength": "mention" }] }
 ```
+
+### `core.load_verdict`
+
+One DLL's last verdict in SKSE's own log. This kind is absent from a crash log.
+
+| Attribute | Meaning |
+|---|---|
+| `outcome` | `loaded`, `refused`, `failed` or `last_seen` (a line whose status this parser does not know). |
+| `reason` | A stable word: `loaded`, `different_game_version`, `structs_post_629`, `address_library_outdated`, `newer_skse`, `invalid_version_data`, `not_an_skse_plugin`, `32_bit_plugin`, `dependent_dll_missing`, `load_error`, `fatal_load_error`, `post_load_crash`, `self_incompatible` or `unknown_status`. |
+
+Refs: `module` (the DLL, a mention).
+
+```json
+{ "kind": "core.load_verdict",
+  "attrs": { "outcome": "refused", "reason": "different_game_version" },
+  "refs": [{ "kind": "module", "value": "ExamplePlugin.dll", "strength": "mention" }] }
+```
+
+### `creation.skse_load`
+
+The display detail behind a load verdict: the status text exactly as SKSE wrote it.
+
+| Attribute | Meaning |
+|---|---|
+| `dll` | The DLL name. |
+| `status` | The status text, without the error code or handle. |
+| `code` | The error code, for a `couldn't load plugin` line. |
+| `plugin_name` | The name SKSE read from the plugin's version data, when non-empty. |
+| `plugin_version` | That data's packed version, decoded to `1.2.3.4`. |
+
+Refs: `module` (the DLL, a mention).
 
 ### `creation.plugin`
 
@@ -567,12 +627,13 @@ and no `checked` entry reads as **could not check**, never as "not there".
 | `creation.frame_name` | A call-stack section was present. | No call-stack section. | Never |
 | `creation.module_hash` | `MODULES` was present. | No `MODULES`. | Never |
 | `creation.script_extender_plugin` | The script-extender plugin section was present. | That section is missing. | Never |
-| `creation.plugin` | `PLUGINS` was present and readable. | No `PLUGINS`, or the logger wrote `ERROR` instead. | Trainwreck |
+| `creation.plugin` | `PLUGINS` was present, readable, and as long as the list's own `Total`. | No `PLUGINS`, the logger wrote `ERROR` instead, or the list stopped before its own `Total` (either way it cannot show that a plugin is absent). | Trainwreck |
 | `creation.load_order_summary` | `PLUGINS` was present. | No `PLUGINS`. | Trainwreck |
 | `creation.load_order_error` | `PLUGINS` was present. | No `PLUGINS`. | Trainwreck |
 | `creation.model_request` | A model-loading section was present. | No model-loading section. | Never |
 | `core.log_line` | — | — | Always: these parsers do not emit raw log lines. |
-| `core.load_verdict` | — | — | Always: a crash log has no load verdict. |
+| `core.load_verdict` | The SKSE log's header was read. | — | A crash log has no load verdict, so a crash-log-only analysis reads as not applicable. |
+| `creation.skse_load` | The SKSE log's header was read. | — | Never (a crash log has no such lines). |
 | `core.dependency_problem` | — | — | Always: a crash log has no dependency verdict. |
 
 ## Roles and what is left out
@@ -581,19 +642,36 @@ The pack marks as `system` the Windows modules and graphics drivers that must
 not be accused (`ntdll`, `KERNEL32`, `KERNELBASE`, `user32`, `win32u`, `gdi32`,
 `gdi32full`, `ucrtbase`, `msvcrt`, `advapi32`, `sechost`, `rpcrt4`, `combase`,
 `ole32`, `dxgi`, `d3d11`, `nvldumdx`, `atiumd64`, `atidxx64`, `amdxx64`,
-`amdxc64`, `nvwgf2umx`, and the C++ runtime `vcruntime140`, `vcruntime140_1`,
-`msvcp140`). `SkyrimSE.exe` and `SkyrimVR.exe` are `platform`, and so are the
-base game's plugins (`Skyrim.esm`, `Update.esm`, the three DLC masters,
-`_ResourcePack.esl`). The SKSE loader, the known SKSE DLL names and the
-Unofficial Skyrim Special Edition Patch are `framework`. `CrashLogger.dll`,
-`trainwreck.dll`, `hdtSMP64.dll`, `EngineFixes.dll` and `tbbmalloc.dll` are
-`hook_framework`: they sit on stacks they did not cause.
+`amdxc64`, `nvwgf2umx`, `dinput8`, and the C++ runtime `vcruntime140`,
+`vcruntime140_1`, `msvcp140`). `SkyrimSE.exe` and `SkyrimVR.exe` are `platform`,
+and so are the base game's plugins (`Skyrim.esm`, `Update.esm`, the three DLC
+masters, `_ResourcePack.esl`). The SKSE loaders and runtime, the versioned SKSE
+DLLs, `skse64.dll`, `skyrimvresl.dll` and the Unofficial Skyrim Special Edition
+Patch are `framework`. `CrashLogger.dll`, `CrashLoggerSSE.dll`, `trainwreck.dll`,
+`hdtSMP64.dll`, `hdtssephysics.dll`, `EngineFixes.dll`, `SSEDisplayTweaks.dll`,
+`po3_Tweaks.dll`, `StorageUtil.dll`, the MO2 VFS hooks (`usvfs_x64.dll`,
+`uvsfs64.dll`), `sl.interposer.dll`, `d3dcompiler_46e.dll`, `cbp.dll` and
+`tbbmalloc.dll` are `hook_framework`: they sit on stacks they did not cause.
+These additions are from Tullius's `hook_frameworks.json:1-24` (GPL-3) and
+Phostwood's first-line victim list. `PapyrusUtil.dll`, `JContainers64.dll`,
+`po3_PapyrusExtender.dll`, `PapyrusTweaks.dll`, `DbSkseFunctions.dll`,
+`skee64.dll` and `fiss.dll` are `framework`; `XAudio2_7.dll`, `d3dx9_42.dll`,
+`dinput8.dll` and `tbb.dll` are `system`. On the dev set `skee64.dll` and
+`fiss.dll` are each the first non-system frame on one row and the named culprit
+on neither; demoting skee64 removed it from one row's candidate list, which lost
+no right answer. The other new names are first on no row.
+`hdtSMP64.dll` (10 rows as first non-system frame) and the versioned
+`skse64_*_1170.dll` (5 rows) were already demoted. `SkyrimUpscaler.dll` was
+checked and is **not** demoted: it was the first non-system frame and the named
+culprit on the same dev row.
 
 Left out on purpose: every other module. A short, sure list is better than a
 long guess. The pack does not name versioned SKSE DLLs generically (the role
 matcher has no wildcard), so only the common exact names are listed; a new SKSE
 version needs a new role entry. The Address Library is a `.bin` file, not a
-module on the stack, so it has no role.
+module on the stack, so it has no role. `ConsoleUtilSSE.dll` was checked and is
+**not** demoted: it was the first non-system frame on three dev rows and the
+culprit on two of them.
 
 ## Decisions and unverified points
 
@@ -610,6 +688,22 @@ module on the stack, so it has no role.
   names the image and version. The pid is simply absent.
 - **A line longer than the 8 KiB read limit is cut.** The parser keeps what it
   read, emits `truncated`, and never throws the log away.
+- **A `PLUGINS` list shorter than its own `Total` is `absent`, not `checked`.**
+  Phostwood (`utils.js:1559-1596`, `diagnoses.js:580-615`) compares the list with
+  its summary; a cut list must not prove a plugin is missing. This is a parser
+  coverage fix, not a rule.
+- **The SKSE log is bound by the session time window, not by image base.** Tullius
+  matches `imagebase =` to the game EXE's base; our contract has no such bind, so a
+  stale copy whose time falls outside the crash session is rejected instead.
+- **A live `SettingT<INISettingCollection>` object is not a missing-master
+  signal here.** Phostwood (`diagnoses.js:580`) scopes it to the top half of the
+  objects; our facts have no section position, and the object type was live in 230
+  finding slots across the 129 dev rows, so the rule was measured too broad and
+  left out.
+- **`std::bad_alloc` already classified as `oom`** before this pass: the C++ block
+  reads `crashExceptionCategory(Type)`, so the review's "the rule never fires on
+  `bad_alloc`" claim was out of date. The test
+  `a_cpp_bad_alloc_is_out_of_memory_and_another_cpp_exception_is_not` covers it.
 
 ## Rules
 
@@ -627,7 +721,7 @@ cause); the test set is never read. One family alone tops out at `possible`
 | `out_of_memory` | finding, environment | `likely` | Only an out-of-memory exception (including `std::bad_alloc`); caps any mod at `possible`. |
 | `dll_dependency_failed_to_load` | finding, environment | `possible` | `C06D007E`: a DLL could not load a library it needs. |
 | `content_catalog_format_mismatch` | finding, environment | `likely` | `std::invalid_argument` "stoull" while an `InstalledContent` object is live: `ContentCatalog.txt` written by another game build (3 of 3 dev rows). From Tullius's signatures. |
-| `missing_masters_known_site` | finding, environment | `likely` | The `0198090` / `5E1F22` crash site, gated to the exact builds it belongs to (8 of 9 dev rows were missing masters or ESL support). From Phostwood. |
+| `missing_masters_known_site` | finding, environment | `likely` | The `5E1F22` site on 1.5.97 and the `0198090` site on 1.6.640, each gated to its own build by a version range (8 of 9 dev rows were missing masters or ESL support). From Phostwood. |
 | `cot_divide_by_zero` | known signature | 7 | Integer divide-by-zero with Climates of Tamriel loaded (2 of 2). From Phostwood. |
 | `d3d11_graphics_injector_fault` | finding, environment | `possible` | The fault is in `d3d11.dll`, where ENB or ReShade hook in. From Phostwood and Tullius. |
 | `win24h2_upscaler_fault` | finding, environment | `possible` | `KERNELBASE.dll` fault with the Skyrim Upscaler on the stack. From Phostwood. |
@@ -639,6 +733,23 @@ cause); the test set is never read. One family alone tops out at `possible`
 | `crash_logger_outdated` | context | - | A Crash Logger log older than 1.20.1, which writes more detail. From Phostwood. |
 | `skse_plugin_built_for_another_game_version` | verified asset + known signature | 16 + 8 | The inspector opened a listed plugin's DLL and its declared versions exclude the running game. Only an instance has the file, so the rule requires `core.instance.game`. |
 | `stack_module_built_for_another_game_version` | verified asset + execution | 16 + 8 | The same check for a DLL on the crash stack (actionable frames 0-16). The inspector reads the DLL's own declaration; the rule says only that it does not support this game. |
+| `fault_inside_module` | execution | 7 | The module on the exception line. Names the crash site, which can be a victim; one family tops out at `possible`, so Tullius's direct-fault weight is cut from 8 to 7. |
+| `graphics_injector_fault` | environment | `possible` | The fault is inside the ENB shader compiler, ReShade or DXVK DLL; the log cannot say whether it came from the game folder. No dev row. |
+| `skse_plugin_for_another_game_version` | known signature | 6 | SKSE's own log says it refused the DLL because it is for another game version. Possible, because a refused DLL never ran; it is a version-mismatch problem the user must fix. No dev row supplies a `skse64.log`, so this fires on no dev row in the benchmark. |
+| `skse_plugin_address_library_outdated` | known signature | 6 | SKSE refused it because the Address Library for this game version is missing or stale. Same caveat. |
+| `skse_plugin_needs_newer_skse` | known signature | 6 | SKSE refused it because it needs a newer SKSE. Same caveat. |
+| `skse_plugin_invalid_version_data` | known signature | 6 | SKSE refused it for invalid version data, or it is not an SKSE plugin. Same caveat. |
+| `skse_plugin_32_bit` | known signature | 6 | SKSE refused a 32-bit (old game) plugin. Same caveat. |
+| `skse_plugin_missing_dependency` | known signature | 6 | SKSE could not load it because a DLL it needs is missing (error 126). |
+| `skse_plugin_failed_to_load` | known signature | 6 | SKSE reported a fatal load error, a post-load crash, or self-reported incompatibility. |
+| `crash_suppressor_loaded` | trust cap | - | `SkyrimCrashGuard.dll` is loaded, so evidence is capped at `possible`. No dev row. |
+| `forced_termination_site` | trust cap | - | The `0CB748E` 1.5.97 site where an externally closed process often stops; capped, not diagnosed. No dev row. |
+| `in_page_error` / `stack_overflow` / `heap_corruption` / `gpu_device_lost` / `breakpoint_assert` | mechanism or environment | `possible` | Exception categories that used to be folded into `access_violation`/`unknown`. Each names a mechanism, never a mod. |
+| `dxgi_graphics_injector_fault` / `input_injector_fault` | environment | `possible` | The fault is inside `dxgi.dll` or `dinput8.dll`; the log cannot say whether the system copy or a game-folder injector was loaded. No dev row. |
+| `save_subsystem_fault` / `load_subsystem_fault` | mechanism | `possible` | `BGSSaveLoadManager` / `BGSLoadGameBuffer` names from the Address Library table. Names the subsystem, not a save. No dev row. |
+| `deleted_record_in_use` / `object_reference_none` | mechanism | `possible` | A record marked `kDeleted`, or an `Object Reference: None`. Rare and specific; no dev row. |
+| `dynamic_form_id_object` | context | - | An object with an `FF` run-time form id belongs to the save, not to a mod's static data. |
+| `missing_masters_short_plugin_list` | environment | `possible` | The crash log lists so few plugins that the load order did not finish loading. |
 
 What the dev set taught, kept here so nobody re-learns it:
 

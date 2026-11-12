@@ -415,6 +415,20 @@ fn the_backported_esl_plugin_makes_a_171_header_acceptable() {
 }
 
 #[test]
+fn the_bees_alias_also_makes_a_171_header_acceptable() {
+    let diagnostics = run(
+        vec![
+            ("Data/InventedPlugin.esp".into(), plugin_bytes(1.71, 0, &[])),
+            (dll_path("bees.dll"), dll_without_exports()),
+        ],
+        Vec::new(),
+        "1.5.97",
+        &[entry("InventedPlugin.esp")],
+    );
+    assert!(warnings(&diagnostics).is_empty(), "{diagnostics:#?}");
+}
+
+#[test]
 fn an_unreadable_plugin_header_is_not_a_warning() {
     let diagnostics = run(
         vec![("Data/Broken.esp".into(), b"not a plugin".to_vec())],

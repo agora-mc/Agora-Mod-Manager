@@ -60,6 +60,27 @@
       ],
       "role": "primary",
       "privacy": "personal"
+    },
+    {
+      "id": "skse_log",
+      "where": {
+        "root": "user_data",
+        "location": "documents",
+        "path": "My Games/Skyrim Special Edition/SKSE"
+      },
+      "match": {
+        "glob": "skse64.log"
+      },
+      "bind": [
+        {
+          "time": {
+            "before_s": 2,
+            "after_s": 10
+          }
+        }
+      ],
+      "role": "supplementary",
+      "privacy": "personal"
     }
   ],
   "parsers": [
@@ -95,6 +116,19 @@
         "any": [
           "(?m)^Unhandled exception ",
           "(?m)^SYSTEM SPECS:"
+        ]
+      }
+    },
+    {
+      "id": "skse_log",
+      "entry": {
+        "script": {
+          "export": "parseSkseLog"
+        }
+      },
+      "detect": {
+        "all": [
+          "(?m)^SKSE64 runtime: initialize "
         ]
       }
     }
@@ -413,6 +447,156 @@
       "value": "tbbmalloc.dll",
       "match": "casefold",
       "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "CrashLoggerSSE.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "SSEDisplayTweaks.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "po3_Tweaks.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "hdtssephysics.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "StorageUtil.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "usvfs_x64.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "uvsfs64.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "sl.interposer.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "d3dcompiler_46e.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "cbp.dll",
+      "match": "casefold",
+      "role": "hook_framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_loader.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skse64_steam_loader.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skyrimvresl.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "dinput8.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "XAudio2_7.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "d3dx9_42.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "tbb.dll",
+      "match": "casefold",
+      "role": "system"
+    },
+    {
+      "kind": "module",
+      "value": "PapyrusUtil.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "JContainers64.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "po3_PapyrusExtender.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "PapyrusTweaks.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "DbSkseFunctions.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "skee64.dll",
+      "match": "casefold",
+      "role": "framework"
+    },
+    {
+      "kind": "module",
+      "value": "fiss.dll",
+      "match": "casefold",
+      "role": "framework"
     },
     {
       "kind": "plugin",
@@ -762,24 +946,22 @@
       "id": "missing_masters_known_site",
       "version": 1,
       "when": {
-        "all": [
+        "any": [
           {
-            "fact": {
-              "kind": "creation.game",
-              "where": {
-                "version": {
-                  "version": {
-                    "exact": [
-                      "1.5.97",
-                      "1.6.640"
-                    ]
+            "all": [
+              {
+                "fact": {
+                  "kind": "creation.game",
+                  "where": {
+                    "version": {
+                      "version": {
+                        "min": "1.5.97",
+                        "below": "1.5.98"
+                      }
+                    }
                   }
                 }
-              }
-            }
-          },
-          {
-            "any": [
+              },
               {
                 "fact": {
                   "kind": "creation.exception_site",
@@ -789,6 +971,23 @@
                     },
                     "offset": {
                       "glob": "*5E1F22"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "fact": {
+                  "kind": "creation.game",
+                  "where": {
+                    "version": {
+                      "version": {
+                        "min": "1.6.640",
+                        "below": "1.6.641"
+                      }
                     }
                   }
                 }
@@ -1474,6 +1673,916 @@
       "next_step": "confirm_experiment",
       "reference": "CommonLibSSE-NG include/SKSE/Interfaces.h lines 536-622 (struct and flags), include/REL/Version.h lines 94-107 (packing)",
       "max_branches": 512
+    },
+    {
+      "id": "fault_inside_module",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "ref": {
+            "kind": "module",
+            "strength": "exec_top",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "execution",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "weight": 7
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The exception line names {owner:d} as the module that faulted. That is the crash site; it can be where a fault shows rather than where it started."
+        },
+        "why_not_sure": {
+          "en": "Being at the fault address shows where the game stopped, not who set the failure up."
+        }
+      },
+      "reference": "Tullius dump_tool/src/CrashLoggerParseCore.cpp:633-651 (GPL-3, idea)"
+    },
+    {
+      "id": "graphics_injector_fault",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.exception_site",
+          "where": {
+            "module": {
+              "regex": "^(?:d3dcompiler_46e\\.dll|reshade64?\\.dll|d3d9\\.dll|dxvk_d3d11\\.dll)$"
+            }
+          },
+          "bind": {
+            "shader_module": "module"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The fault is inside {shader_module}, where ENB, ReShade or DXVK puts its own copy. An injector binary built for a different game version, or a mismatched preset, is a common reason; the graphics driver is the other. The log cannot say which copy was loaded."
+        },
+        "why_not_sure": {
+          "en": "The log sees the DLL's name, not the folder it was loaded from."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius dump_tool/data/graphics_injection_rules.json (GPL-3, idea); Phostwood diagnoses.js:5035 (GPL-3)"
+    },
+    {
+      "id": "skse_plugin_for_another_game_version",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": {
+            "outcome": "refused",
+            "reason": {
+              "in": [
+                "different_game_version",
+                "structs_post_629"
+              ]
+            }
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE refused to load {owner:d} because it is built for a different game version. It could not be running in this session, so it is not the code that crashed, but the mismatch is a real problem to fix: update it, or use the build made for this game version."
+        },
+        "why_not_sure": {
+          "en": "This names a plugin the game did not load; the crash itself may have another cause."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius helper/src/SkseLogParser.cpp:189-258 and dump_tool/src/PluginRules.cpp:348-399 (GPL-3, idea); docs/adr/0008-skse-log-refused-plugins.md"
+    },
+    {
+      "id": "skse_plugin_address_library_outdated",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": {
+            "outcome": "refused",
+            "reason": "address_library_outdated"
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE refused to load {owner:d} because the Address Library for this game version is missing or out of date. Installing the Address Library build for this game version, or the plugin build made for it, is the usual fix. The plugin never ran in this session."
+        },
+        "why_not_sure": {
+          "en": "This names a plugin the game did not load; the crash itself may have another cause."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius helper/src/SkseLogParser.cpp:189-258 and dump_tool/src/PluginRules.cpp:348-399 (GPL-3, idea)"
+    },
+    {
+      "id": "skse_plugin_needs_newer_skse",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": {
+            "outcome": "refused",
+            "reason": "newer_skse"
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE refused to load {owner:d} because it needs a newer SKSE than the one installed. Updating SKSE to the build for this game version is the usual fix. The plugin never ran in this session."
+        },
+        "why_not_sure": {
+          "en": "This names a plugin the game did not load; the crash itself may have another cause."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius helper/src/SkseLogParser.cpp:189-258 and dump_tool/src/PluginRules.cpp:348-399 (GPL-3, idea)"
+    },
+    {
+      "id": "skse_plugin_invalid_version_data",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": {
+            "outcome": "refused",
+            "reason": {
+              "in": [
+                "invalid_version_data",
+                "not_an_skse_plugin"
+              ]
+            }
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE refused to load {owner:d} because its version data is invalid, or it is not an SKSE plugin at all. Reinstalling the build made for this game version is the usual fix. The plugin never ran in this session."
+        },
+        "why_not_sure": {
+          "en": "This names a plugin the game did not load; the crash itself may have another cause."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius helper/src/SkseLogParser.cpp:189-258 and dump_tool/src/PluginRules.cpp:348-399 (GPL-3, idea)"
+    },
+    {
+      "id": "skse_plugin_32_bit",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": {
+            "outcome": "refused",
+            "reason": "32_bit_plugin"
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE refused to load {owner:d}: it is a 32-bit plugin from the older game, which this 64-bit game cannot load. Use the Special Edition build of it, or remove it."
+        },
+        "why_not_sure": {
+          "en": "This names a plugin the game did not load; the crash itself may have another cause."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius helper/src/SkseLogParser.cpp:189-258 and dump_tool/src/PluginRules.cpp:348-399 (GPL-3, idea)"
+    },
+    {
+      "id": "skse_plugin_missing_dependency",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": {
+            "outcome": "failed",
+            "reason": "dependent_dll_missing"
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE could not load {owner:d} because another DLL it needs is missing (error 126). Installing the missing requirement, or a complete build of this plugin, is the usual fix."
+        },
+        "why_not_sure": {
+          "en": "The log names the plugin that failed, not the missing library itself."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius helper/src/SkseLogParser.cpp:189-258 and dump_tool/src/PluginRules.cpp:348-399 (GPL-3, idea)"
+    },
+    {
+      "id": "skse_plugin_failed_to_load",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.load_verdict",
+          "where": {
+            "outcome": "failed",
+            "reason": {
+              "in": [
+                "load_error",
+                "fatal_load_error",
+                "post_load_crash",
+                "self_incompatible"
+              ]
+            }
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "d"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": {
+              "owner_of": "d"
+            },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE reported that {owner:d} did not finish loading. Reinstalling the build made for this game version, or removing it, is the usual fix. Removing a plugin partway through a playthrough can damage a save, so back up the save or test on a new game first."
+        },
+        "why_not_sure": {
+          "en": "The log says this plugin failed to load; it does not prove the failure caused the crash."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius helper/src/SkseLogParser.cpp:189-258 and dump_tool/src/PluginRules.cpp:348-399 (GPL-3, idea)"
+    },
+    {
+      "id": "crash_suppressor_loaded",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.module",
+          "ref": {
+            "kind": "module",
+            "value": {
+              "glob": "SkyrimCrashGuard.dll"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "trust": {
+            "cap": "possible",
+            "text": {
+              "en": "A crash suppressor is loaded, so the log may not describe the real failure. Test again with it disabled before trusting any name here."
+            }
+          }
+        },
+        {
+          "context": {
+            "text": {
+              "en": "SkyrimCrashGuard is a crash suppressor: it can hide the original fault, so this evidence is weaker than usual."
+            }
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A crash suppressor is loaded."
+        }
+      },
+      "next_step": "recapture",
+      "reference": "Phostwood diagnoses.js:5004 (GPL-3); Tullius ADR-0013 and ProblematicModules.cpp (GPL-3)"
+    },
+    {
+      "id": "forced_termination_site",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "creation.game",
+              "where": {
+                "version": {
+                  "version": {
+                    "min": "1.5.97",
+                    "below": "1.5.98"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.exception_site",
+              "where": {
+                "module": {
+                  "glob": "SkyrimSE.exe"
+                },
+                "offset": {
+                  "glob": "*0CB748E"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "trust": {
+            "cap": "possible",
+            "text": {
+              "en": "This location is where an externally closed process often stops, so the log may be incomplete."
+            }
+          }
+        },
+        {
+          "context": {
+            "text": {
+              "en": "If you or a tool closed the game, this is not a crash."
+            }
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game stopped at a location where a process closed from outside often stops."
+        }
+      },
+      "next_step": "recapture",
+      "reference": "Phostwood js/analyzeLog.js:1186-1189 (GPL-3, idea)"
+    },
+    {
+      "id": "in_page_error",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "category": "in_page_error"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash was an in-page error: Windows could not read a page of a file the game was using. A file that moved or is unreadable, a disk problem, or an antivirus lock can cause it. Checking the drive and the game's files is a sensible first step."
+        },
+        "why_not_sure": {
+          "en": "The log names the mechanism, not the file that could not be read."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius dump_tool/data/crash_signatures.json IN_PAGE_ERROR (GPL-3, idea)"
+    },
+    {
+      "id": "stack_overflow",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "category": "stack_overflow"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash was a stack overflow, usually runaway recursion: a script, a mod, or a save with a cyclic structure is the common source. It is a different failure from a plain access violation."
+        },
+        "why_not_sure": {
+          "en": "The log names the mechanism, not the code that recursed."
+        }
+      },
+      "next_step": "bisect",
+      "reference": "Tullius dump_tool/data/crash_signatures.json STACK_OVERFLOW (GPL-3, idea)"
+    },
+    {
+      "id": "heap_corruption",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "category": "heap_corruption"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "Windows reported heap corruption. The heap was already damaged before this point, so the crash site cannot name the corrupter; testing recent changes one at a time is the reliable way to find it."
+        },
+        "why_not_sure": {
+          "en": "The code that noticed the damage is rarely the code that caused it."
+        }
+      },
+      "next_step": "bisect",
+      "reference": "Tullius dump_tool/data/crash_signatures.json HEAP_CORRUPTION (GPL-3, idea)"
+    },
+    {
+      "id": "gpu_device_lost",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "category": "gpu_device_lost"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The graphics device was lost: the message names a DXGI device-removed or device-hung failure. The graphics driver, an overclock, heat or power are the usual reasons, not a mod. Updating or rolling back the driver is a small first test."
+        },
+        "why_not_sure": {
+          "en": "The log names the device failure, not what made the driver give up."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius dump_tool/data/troubleshooting_guides.json DXGI block (GPL-3, idea)"
+    },
+    {
+      "id": "breakpoint_assert",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "where": {
+            "category": "assert"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The game stopped on a breakpoint or assertion, which a mod's own check can raise. The first non-system module on the stack is the usual place to start looking."
+        },
+        "why_not_sure": {
+          "en": "An assertion says a check failed; it does not say which mod set it off."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius dump_tool/data/crash_signatures.json breakpoint class (GPL-3, idea)"
+    },
+    {
+      "id": "dxgi_graphics_injector_fault",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.exception_site",
+          "where": {
+            "module": {
+              "glob": "dxgi.dll"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The fault is inside dxgi.dll. A graphics injector such as ReShade or DXVK often puts its own dxgi.dll in the game folder, and a build for a different game version is a common reason; the graphics driver is the other. The log cannot say which dxgi.dll was loaded."
+        },
+        "why_not_sure": {
+          "en": "The log sees the DLL's name, not the folder it was loaded from."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius dump_tool/data/graphics_injection_rules.json CRASH_IN_RESHADE (GPL-3, idea)"
+    },
+    {
+      "id": "input_injector_fault",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.exception_site",
+          "where": {
+            "module": {
+              "glob": "dinput8.dll"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The fault is inside dinput8.dll, where an input mod or an overlay puts its own copy. The log cannot say whether the Windows copy or a game-folder copy was loaded; checking the mods that install dinput8.dll is the sensible first step."
+        },
+        "why_not_sure": {
+          "en": "The log sees the DLL's name, not the folder it was loaded from."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Tullius dump_tool/data/graphics_injection_rules.json CRASH_IN_INPUT_INJECTION (GPL-3, idea)"
+    },
+    {
+      "id": "save_subsystem_fault",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.frame_name",
+          "where": {
+            "name": {
+              "glob": "*BGSSaveLoadManager::Save_Impl*"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash is inside the game's save code. That names the subsystem, not a mod: a save, a missing master or a setting can all reach it. Removing mods partway through a playthrough can damage a save, so back up the save or test on a new game first."
+        },
+        "why_not_sure": {
+          "en": "Crashing while saving does not show that the save itself is damaged."
+        }
+      },
+      "next_step": "restore_save",
+      "reference": "Phostwood js/diagnoses.js:1763 (GPL-3, idea); names from crash/addrlib-names.json"
+    },
+    {
+      "id": "load_subsystem_fault",
+      "version": 1,
+      "when": {
+        "any": [
+          {
+            "fact": {
+              "kind": "creation.frame_name",
+              "where": {
+                "name": {
+                  "glob": "*BGSSaveLoadManager::Load_Impl*"
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.frame_name",
+              "where": {
+                "name": {
+                  "glob": "*BGSSaveLoadManager::PopulateSaveList*"
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.frame_name",
+              "where": {
+                "name": {
+                  "glob": "*BGSSaveLoadManager::LoadMostRecentSaveGame*"
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.frame_name",
+              "where": {
+                "name": {
+                  "glob": "*BGSLoadGameBuffer::*"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash is inside the game's save-loading code. That names the subsystem, not a mod: a save, a missing master or a recently changed asset can all reach it. Test a new game or a backup of the save before changing the load order, because removing mods partway through a playthrough can damage a save."
+        },
+        "why_not_sure": {
+          "en": "Crashing while loading does not show that the save itself is damaged."
+        }
+      },
+      "next_step": "restore_save",
+      "reference": "Phostwood js/diagnoses.js:1763 (GPL-3, idea); names from crash/addrlib-names.json"
+    },
+    {
+      "id": "deleted_record_in_use",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": {
+              "regex": "^R[A-Z0-9]{1,2}$"
+            },
+            "flags": {
+              "glob": "*kDeleted*"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A record the game was using is marked deleted. A mod or the save removed a record that something still points at. Removing mods partway through a playthrough can damage a save, so back up the save or test on a new game first."
+        },
+        "why_not_sure": {
+          "en": "The deleted record's owner is not necessarily the mod that deleted it."
+        }
+      },
+      "next_step": "restore_save",
+      "reference": "Phostwood js/analyzeLog.js:1364-1388 (GPL-3, idea)"
+    },
+    {
+      "id": "object_reference_none",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": {
+              "regex": "^R[A-Z0-9]{1,2}$"
+            },
+            "object_reference": "None"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A record's object reference is None: it points at an object that is not there. A missing master, a deleted record or a save that no longer matches the load order can leave this behind. Back up the save and check the missing-master list first."
+        },
+        "why_not_sure": {
+          "en": "The log shows the empty reference, not which plugin removed the object."
+        }
+      },
+      "next_step": "restore_save",
+      "reference": "Phostwood js/diagnoses.js:94 (GPL-3, idea)"
+    },
+    {
+      "id": "dynamic_form_id_object",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": {
+              "regex": "^R[A-Z0-9]{1,2}$"
+            },
+            "form_id": {
+              "regex": "^0x?[Ff][Ff]"
+            }
+          }
+        }
+      },
+      "effects": [
+        {
+          "context": {
+            "text": {
+              "en": "An object in memory has a form id in the FF range, which the save generates at run time. It belongs to the save rather than a mod's static record, so it is not by itself evidence against the plugin that appears with it."
+            }
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A run-time object from the save was in memory."
+        }
+      },
+      "reference": "Phostwood js/logSummaryAdvanced.js:362-374 (GPL-3, idea)"
+    },
+    {
+      "id": "missing_masters_short_plugin_list",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.load_order_summary",
+          "where": {
+            "total": {
+              "lte": 4
+            }
+          },
+          "bind": {
+            "total": "total"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "environment",
+            "level": "possible"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash log lists only {total} plugins, fewer than a working game loads, so the load order may not have finished loading. Check the missing-master list and whether a plugin stops the game while it reads the plugin list."
+        },
+        "why_not_sure": {
+          "en": "A short list shows the load order was incomplete; it does not say why."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Phostwood js/diagnoses.js:55, 580 (GPL-3, idea)"
     }
   ]
 }
