@@ -299,7 +299,8 @@ or contains a word (`loose_top1_hits`, `loose_top3_hits`). Because answers are p
 tools predict file names, loose is usually the fairer reading, but it can over-credit: a short
 answer word inside a longer unrelated name still counts. Treat it as a measuring aid, not a
 verdict; strict stays the rule for a claim. `score` reports top-1, top-3, both matching modes,
-abstained, wrong, missing and error rows overall and by game, log type, difficulty and whether the
+abstained, wrong (not a strict hit), loose wrong (named someone who is not even a loose match),
+missing and error rows overall and by game, log type, difficulty and whether the
 culprit is in the log. An error row is a tool that failed, not one that abstained. `compare` adds
 an `abstain-always` baseline so a tool that answers badly can rank below silence. Pass
 `--expect-sha256` to refuse a changed key, `--json` for machine output, or `--detail` for per-row

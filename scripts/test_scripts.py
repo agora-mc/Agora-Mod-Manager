@@ -3661,6 +3661,9 @@ class TestCrashBenchmark(unittest.TestCase):
             self.assertEqual(overall["top1_hits"], 0, culprit)
             self.assertEqual(overall["loose_top1_hits"], 1, culprit)
             self.assertEqual(overall["loose_top3_hits"], 1, culprit)
+            # Strictly wrong, but right by the loose reading: not counted as truly wrong.
+            self.assertEqual(overall["wrong"], 1, culprit)
+            self.assertEqual(overall["loose_wrong"], 0, culprit)
 
     def test_a_short_answer_inside_a_longer_unrelated_name_misses_both_ways(self):
         key = self._write_jsonl(
@@ -3676,6 +3679,7 @@ class TestCrashBenchmark(unittest.TestCase):
         self.assertEqual(overall["top1_hits"], 0)
         self.assertEqual(overall["loose_top1_hits"], 0)
         self.assertEqual(overall["loose_top3_hits"], 0)
+        self.assertEqual(overall["loose_wrong"], 1)
 
     def test_a_segment_under_four_characters_never_matches(self):
         key = self._write_jsonl(

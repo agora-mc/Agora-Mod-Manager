@@ -414,6 +414,7 @@ def _empty_metrics() -> dict[str, int]:
         "loose_top3_hits": 0,
         "abstained": 0,
         "wrong": 0,
+        "loose_wrong": 0,
         "missing": 0,
         "errors": 0,
     }
@@ -589,6 +590,9 @@ def _score(
                 metrics["loose_top1_hits"] = 1
             if top3_loose:
                 metrics["loose_top3_hits"] = 1
+            if not top1_loose:
+                # Named someone, and not even loosely the culprit: wrong by any reading.
+                metrics["loose_wrong"] = 1
             outcome = "hit" if top1_hit else "wrong"
 
         _add(overall, metrics)
@@ -689,6 +693,7 @@ def _metrics_cells(metrics: dict[str, int]) -> list[Any]:
         metrics["loose_top3_hits"],
         metrics["abstained"],
         metrics["wrong"],
+        metrics["loose_wrong"],
         metrics["missing"],
         metrics["errors"],
     ]
@@ -702,6 +707,7 @@ METRIC_HEADERS = [
     "loose top-3",
     "abstained",
     "wrong",
+    "loose wrong",
     "missing",
     "errors",
 ]
