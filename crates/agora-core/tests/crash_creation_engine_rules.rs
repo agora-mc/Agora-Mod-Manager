@@ -108,13 +108,17 @@ fn object_in(place: &str, file: &str) -> [String; 4] {
     ]
 }
 
-fn run(running: &Running, text: &str) -> AnalyzeOutput {
+fn run_files(running: &Running, files: &[(&str, &str)]) -> AnalyzeOutput {
+    let crash_files: Vec<CrashFile> = files
+        .iter()
+        .map(|(name, text)| CrashFile {
+            name: (*name).into(),
+            bytes: text.as_bytes().to_vec(),
+        })
+        .collect();
     let output = analyze(&AnalyzeInput {
         packs: std::slice::from_ref(&running.pack),
-        files: &[CrashFile {
-            name: "crash-2026-01-01-12-00-00.log".into(),
-            bytes: text.as_bytes().to_vec(),
-        }],
+        files: &crash_files,
         runtime_version: None,
         host: &running.host,
         built_in: &[],
@@ -123,6 +127,19 @@ fn run(running: &Running, text: &str) -> AnalyzeOutput {
     .unwrap();
     assert!(output.read_any(), "{:#?}", output.files);
     output
+}
+
+fn run(running: &Running, text: &str) -> AnalyzeOutput {
+    run_files(running, &[("crash-2026-01-01-12-00-00.log", text)])
+}
+
+fn skse_log(verdict: &str) -> String {
+    format!(
+        "SKSE64 runtime: initialize (version = 2.2.6 01064920 0011223344556677, os = 6.2 (9200))\n\
+imagebase = 00007FF712340000\n\
+plugin directory = C:\\Games\\Invented Game\\Data\\SKSE\\Plugins\\\n\
+plugin ExampleOld.dll (00000001 ExampleOld 01000000) {verdict} (handle 1)\n"
+    )
 }
 
 fn names(output: &AnalyzeOutput) -> Vec<String> {
@@ -498,4 +515,70 @@ fn a_cpp_bad_alloc_is_out_of_memory_and_another_cpp_exception_is_not() {
     assert!(rule_fired(&oom, "out_of_memory"));
     let other = run(&running, &with_cpp("runtime_error"));
     assert!(!rule_fired(&other, "out_of_memory"));
+}
+
+#[test]
+fn the_exception_line_names_its_module_when_there_is_no_call_stack() {
+    let running = start();
+    let text = "Skyrim SSE v1.6.1170\nCrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00\n\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 InventedMod.dll+001000\tmov rax, [rcx]\n\n\
+SYSTEM SPECS:\n\tOS: Microsoft Windows 11 Pro v10.0.26200\n\n\
+MODULES:\n\tInventedMod.dll                           0x7FF700000000\n";
+    let output = run(&running, text);
+    assert_eq!(names(&output), vec!["InventedMod.dll"]);
+    assert_eq!(output.answer.candidates[0].level, Level::Possible);
+    assert!(signalled(&output, "fault_inside_module"));
+}
+
+#[test]
+fn an_skse_refusal_for_another_game_version_names_the_plugin_at_possible() {
+    let running = start();
+    let output = run(
+        &running,
+        &skse_log("disabled, incompatible with current version of the game"),
+    );
+    assert!(rule_fired(&output, "skse_plugin_for_another_game_version"));
+    assert_eq!(names(&output), vec!["ExampleOld.dll"]);
+    assert_eq!(output.answer.candidates[0].level, Level::Possible);
+    let findings = serde_json::to_string(&output.answer.findings).unwrap();
+    assert!(findings.contains("refused to load"), "{findings}");
+}
+
+#[test]
+fn an_skse_plugin_that_loaded_is_not_named() {
+    let running = start();
+    let output = run(&running, &skse_log("loaded correctly"));
+    assert!(output.answer.candidates.is_empty(), "{:?}", names(&output));
+    assert!(!rule_fired(&output, "skse_plugin_for_another_game_version"));
+}
+
+#[test]
+fn a_crash_log_and_the_skse_log_together_keep_both_their_clues() {
+    let running = start();
+    let crash = log(
+        "EXCEPTION_ACCESS_VIOLATION",
+        &["InventedMod.dll", "SkyrimSE.exe"],
+        &[],
+        &[],
+    );
+    let output = run_files(
+        &running,
+        &[
+            ("crash-2026-01-01-12-00-00.log", &crash),
+            (
+                "skse64.log",
+                &skse_log("disabled, address library needs to be updated"),
+            ),
+        ],
+    );
+    assert_eq!(output.files.len(), 2);
+    assert!(
+        output.files.iter().all(|file| file.read_by.is_some()),
+        "both files must be read: {:#?}",
+        output.files
+    );
+    assert!(signalled(&output, "module_near_top_of_stack"));
+    assert!(rule_fired(&output, "skse_plugin_address_library_outdated"));
+    assert!(names(&output).contains(&"InventedMod.dll".to_string()));
+    assert!(names(&output).contains(&"ExampleOld.dll".to_string()));
 }

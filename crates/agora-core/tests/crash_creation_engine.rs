@@ -209,6 +209,90 @@ fn the_official_pack_loads_and_both_parsers_detect_their_logs() {
     let parsed = parse_by_detection(&running, "crash_1.log", &fixture("trainwreck_1_4.txt"));
     assert_eq!(parsed.attempts.len(), 1);
     assert_eq!(parsed.attempts[0].parser_id, "trainwreck");
+    let parsed = parse_by_detection(&running, "skse64.log", &fixture("skse_log.txt"));
+    assert_eq!(parsed.attempts.len(), 1);
+    assert_eq!(parsed.attempts[0].parser_id, "skse_log");
+}
+
+#[test]
+fn the_skse_log_keeps_one_verdict_per_dll_and_the_last_line_wins() {
+    let running = start();
+    let output = parse_by_detection(&running, "skse64.log", &fixture("skse_log.txt"));
+    let output = parsed(&output);
+
+    assert_eq!(output.producer.format, "skse_log");
+    assert_eq!(output.producer.version.as_deref(), Some("2.2.6"));
+    assert_eq!(coverage(output, "core.load_verdict"), "Checked");
+    assert_eq!(coverage(output, "creation.skse_load"), "Checked");
+
+    let verdicts = facts(output, "core.load_verdict");
+    assert_eq!(verdicts.len(), 5, "one verdict per DLL, not per line");
+    let verdict_for = |dll: &str| {
+        verdicts
+            .iter()
+            .find(|fact| ref_values(fact, "module") == vec![dll.to_string()])
+            .unwrap_or_else(|| panic!("no verdict for {dll}"))
+    };
+
+    let loaded = verdict_for("ExampleLoaded.dll");
+    assert_eq!(text_attr(loaded, "outcome").as_deref(), Some("loaded"));
+    let old = verdict_for("ExampleOld.dll");
+    assert_eq!(text_attr(old, "outcome").as_deref(), Some("refused"));
+    assert_eq!(
+        text_attr(old, "reason").as_deref(),
+        Some("different_game_version")
+    );
+    let missing = verdict_for("ExampleMissing.dll");
+    assert_eq!(text_attr(missing, "outcome").as_deref(), Some("failed"));
+    assert_eq!(
+        text_attr(missing, "reason").as_deref(),
+        Some("dependent_dll_missing")
+    );
+    let post = verdict_for("ExamplePostLoad.dll");
+    assert_eq!(
+        text_attr(post, "outcome").as_deref(),
+        Some("failed"),
+        "the post-load crash is the last line, so it wins over loaded correctly"
+    );
+    assert_eq!(
+        text_attr(post, "reason").as_deref(),
+        Some("post_load_crash")
+    );
+    let spaced = verdict_for("Example Spaced.dll");
+    assert_eq!(text_attr(spaced, "outcome").as_deref(), Some("loaded"));
+
+    let detail = facts(output, "creation.skse_load")
+        .into_iter()
+        .find(|fact| ref_values(fact, "module") == vec!["ExampleOld.dll".to_string()])
+        .expect("the display detail must be kept");
+    assert_eq!(
+        text_attr(detail, "status").as_deref(),
+        Some("disabled, incompatible with current version of the game")
+    );
+    assert_eq!(
+        text_attr(detail, "plugin_name").as_deref(),
+        Some("ExampleOld")
+    );
+}
+
+#[test]
+fn a_crash_log_is_not_read_as_skse_own_log_and_the_reverse() {
+    let running = start();
+    let crash = parse_by_detection(&running, "crash-1.log", &fixture("crash_logger_1_16.txt"));
+    assert!(
+        crash
+            .attempts
+            .iter()
+            .all(|attempt| attempt.parser_id != "skse_log"),
+        "the crash-log parser claims it; SKSE's parser must not"
+    );
+    let skse = parse_with_format(
+        &running,
+        "skse64.log",
+        &fixture("skse_log.txt"),
+        "crash_logger",
+    );
+    assert!(skse.parsed().is_none(), "{skse:#?}");
 }
 
 #[test]
@@ -708,6 +792,111 @@ fn a_missing_section_is_absent_not_a_clean_bill_of_health() {
         entry.kind == "creation.plugin" && entry.why.as_deref().unwrap_or("").contains("PLUGINS")
     }));
     assert_eq!(facts(output, "creation.plugin").len(), 0);
+}
+
+#[test]
+fn a_plugin_list_shorter_than_its_own_summary_is_not_checked_for_absence() {
+    let running = start();
+    let output = parse_with_format(
+        &running,
+        "crash-short-list.log",
+        &fixture("incomplete_plugins.txt"),
+        "crash_logger",
+    );
+    let output = parsed(&output);
+
+    assert_eq!(
+        coverage(output, "creation.plugin"),
+        "Absent",
+        "a list that stops before its own Total cannot prove a plugin is missing"
+    );
+    assert!(
+        output
+            .coverage
+            .iter()
+            .any(|entry| entry.kind == "creation.plugin"
+                && entry.why.as_deref().unwrap_or("").contains("summary")),
+        "{:#?}",
+        output.coverage
+    );
+    assert!(
+        facts(output, "creation.plugin").is_empty(),
+        "a partial list must not be reported as checked facts"
+    );
+    assert_eq!(
+        coverage(output, "creation.load_order_summary"),
+        "Checked",
+        "the summary line itself was read"
+    );
+}
+
+fn one_exception_log(code: &str) -> String {
+    format!(
+        "Skyrim SSE v1.6.1170\nCrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00\n\n\
+Unhandled exception \"{code}\" at 0x7FF700001000 ExampleGame.exe+001000\tmov rax, [rcx]\n\n\
+PROBABLE CALL STACK:\n\t[ 0] 0x7FF700001000 ExampleGame.exe+001000\n"
+    )
+}
+
+#[test]
+fn the_exception_category_keeps_the_specific_failure_apart() {
+    let running = start();
+    let category = |code: &str| {
+        let output = parse_with_format(
+            &running,
+            "crash-category.log",
+            one_exception_log(code).as_bytes(),
+            "crash_logger",
+        );
+        let output = parsed(&output);
+        text_attr(facts(output, "core.exception")[0], "category").unwrap_or_default()
+    };
+
+    assert_eq!(category("EXCEPTION_ACCESS_VIOLATION"), "access_violation");
+    assert_eq!(category("C0000006"), "in_page_error");
+    assert_eq!(category("EXCEPTION_STACK_OVERFLOW"), "stack_overflow");
+    assert_eq!(category("C0000374"), "heap_corruption");
+    assert_eq!(category("EXCEPTION_BREAKPOINT"), "assert");
+}
+
+#[test]
+fn an_in_page_error_line_without_a_code_is_still_an_in_page_error() {
+    let running = start();
+    let text = one_exception_log("EXCEPTION_ACCESS_VIOLATION")
+        .replace("\"EXCEPTION_ACCESS_VIOLATION\" ", "")
+        .replace(
+            "mov rax, [rcx]",
+            "mov rax, [rcx]\nIn-Page Error: Tried to read memory at 0x000000000010",
+        );
+    let output = parse_with_format(&running, "crash-page.log", text.as_bytes(), "crash_logger");
+    let output = parsed(&output);
+    assert_eq!(
+        text_attr(facts(output, "core.exception")[0], "category").as_deref(),
+        Some("in_page_error")
+    );
+}
+
+#[test]
+fn a_lost_gpu_device_in_a_cpp_message_is_its_own_category() {
+    let running = start();
+    let text = one_exception_log("C++ Exception").replace(
+        "\nPROBABLE CALL STACK:",
+        "\nC++ EXCEPTION:\n\tType: (std::runtime_error)\n\tInfo: DXGI_ERROR_DEVICE_REMOVED\n\nPROBABLE CALL STACK:",
+    );
+    let output = parse_with_format(&running, "crash-gpu.log", text.as_bytes(), "crash_logger");
+    let output = parsed(&output);
+    let cpp = facts(output, "core.exception")
+        .into_iter()
+        .find(|fact| number_attr(fact, "depth") == Some(1.0))
+        .expect("the C++ exception is one level in");
+    assert_eq!(
+        text_attr(cpp, "category").as_deref(),
+        Some("gpu_device_lost")
+    );
+    assert_eq!(
+        text_attr(cpp, "message").as_deref(),
+        Some("DXGI_ERROR_DEVICE_REMOVED")
+    );
 }
 
 #[test]

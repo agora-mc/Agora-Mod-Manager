@@ -1,0 +1,23 @@
+SKSE64 runtime: initialize (version = 2.2.6 01064920 0011223344556677, os = 6.2 (9200))
+imagebase = 00007FF712340000
+reloc mgr imagebase = 00007FF712340000
+plugin directory = C:\Games\Invented Game\Data\SKSE\Plugins\
+scanning plugin directory C:\Games\Invented Game\Data\SKSE\Plugins\
+checking plugin ExampleLoaded.dll
+checking plugin ExampleOld.dll
+checking plugin ExampleMissing.dll
+checking plugin ExamplePostLoad.dll
+checking plugin Example Spaced.dll
+loading plugin "ExampleLoaded"
+plugin ExampleLoaded.dll (00000001 ExampleLoaded 01020070) loaded correctly (handle 1)
+loading plugin "ExampleOld"
+plugin ExampleOld.dll (00000001 ExampleOld 01000000) disabled, incompatible with current version of the game (handle 2)
+loading plugin "ExampleMissing"
+plugin ExampleMissing.dll (00000001 ExampleMissing 01000000) couldn't load plugin 126 (handle 3)
+loading plugin "ExamplePostLoad"
+plugin ExamplePostLoad.dll (00000001 ExamplePostLoad 01000000) loaded correctly (handle 4)
+plugin 4 allocated 16 bytes from branch pool
+plugin ExamplePostLoad.dll (00000001 ExamplePostLoad 01000000) crashed during postload (handle 4)
+loading plugin "Example Spaced"
+plugin Example Spaced.dll (00000001 Example Name 01000000) loaded correctly (handle 5)
+init complete
