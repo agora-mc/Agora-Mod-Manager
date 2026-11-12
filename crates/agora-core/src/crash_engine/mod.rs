@@ -12,9 +12,11 @@ mod answer;
 pub mod attribution;
 mod consensus;
 mod evaluate;
+pub mod history;
 mod inspector;
 pub mod parsers;
 mod profile;
+pub mod save_risk;
 mod types;
 
 pub mod evidence;

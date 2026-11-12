@@ -166,6 +166,27 @@ impl InstanceView {
         self.listing.is_complete()
     }
 
+    /// The game-relative files one installed item provides, or `None` when the listing is not
+    /// complete. A turned-off layer provides nothing.
+    pub fn item_files(&self, content_key: &str) -> Option<Vec<String>> {
+        if !self.is_complete() {
+            return None;
+        }
+        let mut files: Vec<String> = self
+            .layers
+            .iter()
+            .filter(|layer| layer.enabled)
+            .filter(|layer| match &layer.owner {
+                LayerOwner::Item { key, .. } => key == content_key,
+                _ => false,
+            })
+            .flat_map(|layer| layer.files.iter().cloned())
+            .collect();
+        files.sort();
+        files.dedup();
+        Some(files)
+    }
+
     pub(crate) fn index(&self) -> &FileIndex {
         &self.index
     }

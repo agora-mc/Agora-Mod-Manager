@@ -793,7 +793,7 @@ agora crash list <INSTANCE>
 agora crash inspect <INSTANCE> <FILE>
 agora crash investigate <INSTANCE>
 agora crash investigate <INSTANCE> --file extra-log.txt
-agora crash analyze <FILE>... [--instance <ID>] [--plugin-dir <FOLDER>]... [--game-version <V>] [--allow-code] [--json [--facts]]
+agora crash analyze <FILE>... [--each] [--instance <ID>] [--plugin-dir <FOLDER>]... [--game-version <V>] [--allow-code] [--json [--facts]]
 ```
 
 `--file` may be repeated. Review logs for local paths, usernames, server addresses, tokens, or private chat before sharing output.
@@ -802,7 +802,9 @@ agora crash analyze <FILE>... [--instance <ID>] [--plugin-dir <FOLDER>]... [--ga
 
 `--instance` names the instance the crash came from. Only that game's crash packs, plus packs for every game, take part; a ref is attributed to the mod that provides the file in the instance's deployed view; and a rule may ask an inspector to open one file (for example, an SKSE plugin DLL) and report pass, fail or unknown. The instance's own game version is used unless `--game-version` overrides it. An unknown instance is an error. Without `--instance` nothing is inspected and the loose-file answer is unchanged.
 
-The text output is the headline, `How sure:`, then `Suspects:`, `Findings:`, `Inspections:` (each deeper check, its target, result and detail), `Could not check:` and `Files:` (each file is `read by <plugin>` or `not recognised by any installed crash pack`). Empty sections are omitted. `--json` prints exactly `{ "answer": <CrashAnswer>, "files": [<per-file report>] }`, and an inspection's detail and facts are part of the answer. The command exits 0 when at least one file was read, and non-zero otherwise; when no installed plugin contributes a crash pack it says so and exits non-zero.
+`--each` analyzes every file as its own crash, one `analyze` call per file, and then prints a summary across them. The summary counts how often each suspect owner was named, how often it was the top suspect, and at how many distinct crash places it came up; it also counts crashes Agora could not read and crashes that named nobody. It is a count, not a verdict. Framework and hook-framework owners are listed apart, because they are always running and appear in many crashes for that reason. With `--json`, the output is `{ "crashes": [ { "file", "answer", "files" } ], "summary": <CrashHistory> }` (each crash also gets `parsed` with `--facts`). With `--instance`, each suspect that is an installed item also carries a `save_risk` label: `safe` when every file is an asset, `risky` when a file can add records or run code, and `unknown` when Agora cannot tell. Use it to warn the user: testing a risky mod on an existing save can damage it, so test on a new game or back the save up first.
+
+The text output is the headline, `How sure:`, then `Suspects:` (with a save-risk label when `--instance` gives one), `Findings:`, `Inspections:` (each deeper check, its target, result and detail), `Could not check:` and `Files:` (each file is `read by <plugin>` or `not recognised by any installed crash pack`). Empty sections are omitted. `--json` prints exactly `{ "answer": <CrashAnswer>, "files": [<per-file report>] }`, and an inspection's detail and facts are part of the answer. With `--each`, the text is each crash's headline and suspects, then the cross-crash summary. The command exits 0 when at least one file was read, and non-zero otherwise; when no installed plugin contributes a crash pack it says so and exits non-zero.
 
 ### Guide for AI agents
 

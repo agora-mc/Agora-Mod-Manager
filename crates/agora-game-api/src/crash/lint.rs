@@ -41,6 +41,8 @@ pub enum LintCode {
     BadParser,
     /// A ref map or role that could match everything, or nothing.
     BadRefMap,
+    /// A `save_risk` pattern that is empty, absolute or climbs out of the instance.
+    BadSaveRisk,
     /// Parser output over a limit or breaking a shape rule.
     BadOutput,
 }
@@ -223,6 +225,9 @@ pub fn lint_pack(pack: &CrashPack) -> Vec<LintProblem> {
             ));
         }
     }
+    if let Some(save_risk) = &pack.save_risk {
+        lint_save_risk(save_risk, &mut out);
+    }
     for rule in &pack.rules {
         out.extend(lint_rule(rule));
         for gone in &rule.supersedes {
@@ -246,6 +251,52 @@ fn refuse_segment(out: &mut Vec<LintProblem>, at: &str, matching: NameMatch) {
             at,
             "`segment` matching is only valid with a `facts` lookup",
         ));
+    }
+}
+
+fn lint_save_risk(save_risk: &SaveRisk, out: &mut Vec<LintProblem>) {
+    if save_risk.is_empty() {
+        out.push(problem(
+            LintCode::BadSaveRisk,
+            "save_risk",
+            "`save_risk` needs at least one `risky` or `safe` pattern; omit it to say nothing",
+        ));
+        return;
+    }
+    for (label, patterns) in [("risky", &save_risk.risky), ("safe", &save_risk.safe)] {
+        for pattern in patterns {
+            let at = format!("save_risk.{label} `{pattern}`");
+            if pattern.trim().is_empty() {
+                out.push(problem(LintCode::BadSaveRisk, &at, "the pattern is empty"));
+                continue;
+            }
+            if pattern.contains('\\') {
+                out.push(problem(
+                    LintCode::BadSaveRisk,
+                    &at,
+                    "write paths with `/`, not `\\`",
+                ));
+                continue;
+            }
+            if pattern.starts_with('/') || pattern.contains(':') {
+                out.push(problem(
+                    LintCode::BadSaveRisk,
+                    &at,
+                    "a `save_risk` pattern is game-relative; it cannot be absolute",
+                ));
+                continue;
+            }
+            if pattern
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == ".." || segment == ".")
+            {
+                out.push(problem(
+                    LintCode::BadSaveRisk,
+                    &at,
+                    "the pattern has an empty, `.` or `..` path segment",
+                ));
+            }
+        }
     }
 }
 

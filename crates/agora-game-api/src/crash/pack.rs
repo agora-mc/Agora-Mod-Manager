@@ -24,8 +24,33 @@ pub struct CrashPack {
     pub ref_maps: Vec<RefMap>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<RoleRule>,
+    /// What makes a mod a risk to an existing save. Absent means the pack says nothing, so every
+    /// suspect is `unknown`; it never guesses "safe".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_risk: Option<SaveRisk>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
+}
+
+/// Which files make removing a mod dangerous to the player's save.
+///
+/// A file path is game-relative and `/`-separated. `*` matches within one path segment and `**`
+/// matches any number of segments. The first matching `risky` pattern wins; otherwise a file is
+/// safe only when a `safe` pattern matches it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveRisk {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risky: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe: Vec<String>,
+}
+
+impl SaveRisk {
+    /// Whether the pack declares any pattern at all.
+    pub fn is_empty(&self) -> bool {
+        self.risky.is_empty() && self.safe.is_empty()
+    }
 }
 
 /// Where a game's crash evidence appears. Agora's sweep finds more on its own; this says what the

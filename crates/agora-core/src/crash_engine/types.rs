@@ -53,6 +53,12 @@ pub struct Resolved {
 /// Answers "who owns this ref, and what role has it".
 pub trait RefResolver {
     fn resolve(&self, reference: &Ref) -> Resolved;
+
+    /// The game-relative files an installed item provides, for checking whether removing it is
+    /// safe for a save. `None` means this resolver cannot list the instance, so nothing is claimed.
+    fn item_files(&self, _content_key: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// One inspector call. `plugin_id` is the plugin whose rule asked: inspector ids are local to a

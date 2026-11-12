@@ -164,6 +164,19 @@ pub struct Finding {
     pub evidence: Vec<EvidenceLine>,
 }
 
+/// Whether removing a suspect is safe for an existing save. It is only known for an installed item
+/// when an instance can list that item's files and its game's pack declares what is risky.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SaveRiskLabel {
+    /// Every file is an asset, so testing it on the real save is safe.
+    Safe,
+    /// At least one file can add records or run code. Test on a new game or a backed-up save.
+    Risky,
+    /// Agora could not decide: an unmatched file, no files, or a listing it could not read.
+    Unknown,
+}
+
 /// A suspect after consensus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
@@ -176,6 +189,10 @@ pub struct Candidate {
     /// Others that also provide what it was blamed through.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also_provided_by: Vec<String>,
+    /// Whether removing this suspect is safe for the save. Absent without an instance or when the
+    /// game says nothing about saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_risk: Option<SaveRiskLabel>,
 }
 
 /// Something Agora wanted to know and couldn't find out. Shown, never swallowed.

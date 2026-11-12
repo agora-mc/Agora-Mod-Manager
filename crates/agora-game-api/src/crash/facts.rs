@@ -106,9 +106,12 @@ pub struct SourceSpan {
 /// about goes in `refs`: a frame's module, a load verdict's subject.
 ///
 /// - `core.exception`: `category` is required and one of [`EXCEPTION_CATEGORIES`]; `depth` is the
-///   position in a cause chain, 0 outermost.
+///   position in a cause chain, 0 outermost; `offset` is where in the faulting module the exception
+///   happened, as text, when the log gives it. That module and offset are the crash place the
+///   cross-crash summary counts.
 /// - `core.frame`: `index` is required, 0 is the top. `kind` is `probable`, `scan` (found by
-///   scanning stack memory, weak) or `managed`.
+///   scanning stack memory, weak) or `managed`. A frame's module or class and its `rva`, `symbol`
+///   or address are the crash place when no exception names one.
 /// - `core.load_verdict`: `outcome` is `loaded`, `refused`, `failed` or `last_seen`.
 /// - `core.dependency_problem`: `state` is `absent`, `disabled` or `wrong_version`.
 /// - `core.log_line`: a line kept for rule text search.
@@ -124,6 +127,7 @@ pub const CORE_FACT_KINDS: &[(&str, &[&str])] = &[
             "near_null",
             "pointer_class",
             "depth",
+            "offset",
         ],
     ),
     (

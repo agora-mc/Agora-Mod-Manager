@@ -93,6 +93,21 @@ name is the one the mod's own package installs (Nexus Mods, Skyrim Special Editi
 blocks automated fetches, so the name was confirmed from its published file listing rather than
 read from source here.
 
+## Save risk
+
+A mod is safe to remove from an existing save only when it ships nothing that the save can refer
+to. The pack declares the patterns in `save_risk`; the table says why each risky one is risky.
+
+| Pattern | Why removing it can damage a save |
+|---|---|
+| `Data/**/*.esp`, `Data/**/*.esm`, `Data/**/*.esl` | A plugin adds records and form IDs. The save stores references to those form IDs, so removing the plugin leaves the save pointing at records that no longer exist. |
+| `Data/**/*.pex` | Compiled Papyrus scripts. The save stores script instances and their properties, so removing the script can leave running quests and aliases without their code. |
+| `Data/**/*.dll` | A script-extender plugin runs native code and may register game-event handlers or write its own save data (a co-save). Removing it can leave that state behind or skip the code that restores it. |
+| `Data/textures/**`, `Data/meshes/**`, `Data/sound/**` | Safe assets: the game reads them but the save does not store records or scripts that refer to them. |
+
+A file that matches neither list makes the item `unknown`, and so does an item with no files.
+There is no pattern for "this is safe because it is small": the classifier never guesses.
+
 ## Facts
 
 Every example below is invented for this file. `place` is a register name or a
@@ -113,6 +128,7 @@ The unhandled exception, including a C++ exception block one level deeper.
 | `near_null` | `true` when the fault address is below `0x10000`. |
 | `pointer_class` | `null`, `near_null`, `non_canonical`, `kernel` or `user`, a documented guess from the fault address. |
 | `depth` | 0 for the main exception, 1 for a C++ exception beside it. |
+| `offset` | The offset inside the faulting module, as text, when the exception line names one. This and the `module` ref are the crash place the cross-crash summary counts. |
 
 Refs: `module` (strength `exec_top`) when the log names the faulting module.
 
@@ -120,7 +136,7 @@ Refs: `module` (strength `exec_top`) when the log names the faulting module.
 { "kind": "core.exception",
   "attrs": { "class": "EXCEPTION_ACCESS_VIOLATION", "category": "access_violation",
              "access": "read", "fault_address": "0x000000000010", "near_null": true,
-             "pointer_class": "near_null", "depth": 0 },
+             "pointer_class": "near_null", "depth": 0, "offset": "0x001000" },
   "refs": [{ "kind": "module", "value": "ExampleGame.exe", "strength": "exec_top" }] }
 ```
 

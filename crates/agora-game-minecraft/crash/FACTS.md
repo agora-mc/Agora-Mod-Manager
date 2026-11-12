@@ -21,6 +21,13 @@ the public parser contract, so a plugin's script can produce the same facts.
 Empty input is an error ("there is nothing to read"), never a clean parse. A file that only looks
 like the format returns a `wrong_format` note and no facts, so the engine reads "could not check".
 
+## Save risk
+
+This pack declares no `save_risk`: every Minecraft suspect is `unknown` when an instance is
+present. A mod jar can add blocks, items, entities or dimensions to a world, and there is no cheap
+way to tell from the jar alone, so Agora does not guess that any Minecraft mod is safe to remove
+from an existing world. The answer tells the user to back the world up first.
+
 ## Facts
 
 An example below is invented. `mod_id` refs name a mod; `class` refs name a Java class; `module`

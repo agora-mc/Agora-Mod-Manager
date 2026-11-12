@@ -156,6 +156,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             families: scored.families.clone(),
             sources: scored.sources.clone(),
             also_provided_by: Vec::new(),
+            save_risk: None,
         })
         .collect();
 

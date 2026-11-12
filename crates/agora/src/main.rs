@@ -1797,6 +1797,9 @@ enum CrashCmd {
         /// The crash file to read. May be repeated.
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Analyze each file as its own crash, then summarize the pattern across them.
+        #[arg(long)]
+        each: bool,
         /// The instance the crash came from. Lets an inspector open a file in its deployed view.
         #[arg(long = "instance")]
         instance: Option<String>,
@@ -4745,6 +4748,7 @@ async fn run_crash_command(
         }
         CrashCmd::Analyze {
             files,
+            each,
             instance,
             plugin_dirs,
             game_version,
@@ -4755,6 +4759,7 @@ async fn run_crash_command(
                 ctx,
                 cli_crash::AnalyzeArgs {
                     files,
+                    each,
                     instance,
                     plugin_dirs,
                     game_version,
@@ -13212,6 +13217,7 @@ mod tests {
                 action:
                     super::CrashCmd::Analyze {
                         files,
+                        each,
                         instance,
                         plugin_dirs,
                         game_version,
@@ -13220,6 +13226,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(files.len(), 2);
+                assert!(!each);
                 assert_eq!(instance, None);
                 assert_eq!(plugin_dirs.len(), 1);
                 assert_eq!(game_version.as_deref(), Some("1.2.3"));
@@ -13245,6 +13252,22 @@ mod tests {
             Commands::Crash {
                 action: super::CrashCmd::Analyze { instance, .. },
             } => assert_eq!(instance.as_deref(), Some("my-instance")),
+            _ => panic!("expected crash analyze"),
+        }
+    }
+
+    #[test]
+    fn crash_analyze_each_parses_as_a_flag_with_files() {
+        let cli =
+            Cli::try_parse_from(["agora", "crash", "analyze", "--each", "one.log", "two.log"])
+                .expect("should parse");
+        match cli.command {
+            Commands::Crash {
+                action: super::CrashCmd::Analyze { files, each, .. },
+            } => {
+                assert!(each);
+                assert_eq!(files.len(), 2);
+            }
             _ => panic!("expected crash analyze"),
         }
     }

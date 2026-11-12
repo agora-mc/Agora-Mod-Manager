@@ -44,6 +44,7 @@ pub struct CrashFile {
 }
 
 /// What an analysis did not have to build for itself: the instance behind the crash.
+#[derive(Clone, Copy)]
 pub struct InstanceAnalysis<'a> {
     /// The game the instance runs. Only this game's packs, and those for every game, take part.
     pub game_id: &'a str,
@@ -109,6 +110,9 @@ pub struct AnalyzeOutput {
     pub files: Vec<AnalyzedFile>,
     /// What each parser found, for someone writing or checking rules. The answer never needs it.
     pub parsed: Vec<ParsedArtifact>,
+    /// What this crash contributes to a cross-crash summary. One incident even when several files
+    /// were handed to one call.
+    pub record: super::history::CrashRecord,
 }
 
 impl AnalyzeOutput {
@@ -354,6 +358,44 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         consensus: &scored,
     });
 
+    // With an instance and a pack that says what is risky, label each installed-item suspect from
+    // the files the resolver can list. Without either, nothing is added: no guessing.
+    if input.instance.is_some() {
+        if let Some(rules) =
+            super::save_risk::merge(packs.iter().filter_map(|pack| pack.pack.save_risk.as_ref()))
+        {
+            super::save_risk::apply(&mut crash_answer.candidates, &rules, resolver);
+        }
+    }
+
+    let place = super::history::crash_place(
+        parsed
+            .iter()
+            .flat_map(|artifact| artifact.output.facts.iter()),
+    );
+    let candidates = crash_answer
+        .candidates
+        .iter()
+        .map(|candidate| super::history::HistorySuspect {
+            owner: candidate.owner.clone(),
+            role: evaluated
+                .roles
+                .get(&super::owner_key(&candidate.owner))
+                .copied(),
+        })
+        .collect();
+    let record = super::history::CrashRecord {
+        artifact: input
+            .files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        readable: reports.iter().any(|report| report.read_by.is_some()),
+        candidates,
+        place,
+    };
+
     for (file, failure) in &failures {
         crash_answer.could_not_check.push(CouldNotCheck {
             reason: CouldNotCheckReason::CodeFailed,
@@ -402,6 +444,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         answer: crash_answer,
         files: reports,
         parsed,
+        record,
     })
 }
 
