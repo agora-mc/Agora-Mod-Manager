@@ -203,8 +203,8 @@ A plugin installed or enabled while Agora runs takes effect on the next start.
 
 ### Crash packs
 
-A crash pack is JSON with `sources`, `parsers`, `inspectors`, `ref_maps`, `roles` and `rules`. A
-`ref_map` says how a ref kind traces to the content that provides it:
+A crash pack is JSON with `sources`, `parsers`, `inspectors`, `ref_maps`, `roles`, `save_risk` and
+`rules`. A `ref_map` says how a ref kind traces to the content that provides it:
 
 | `lookup` | What it reads |
 |---|---|
@@ -235,6 +235,28 @@ missing target, a file the inspector does not accept, or a file outside the inst
 A rule that matches more than 32 times does not fire, and says so: a match set that large usually
 means the rule is too loose. A rule meant to check every item in a list (each script-extender
 plugin a log lists, say) can raise its own limit with `"max_branches"`, up to 512.
+
+An optional `save_risk` says what makes removing a mod dangerous to an existing save:
+
+```json
+"save_risk": {
+  "risky": ["Data/**/*.esp", "Data/**/*.pex", "Data/**/*.dll"],
+  "safe": ["Data/textures/**", "Data/meshes/**", "Data/sound/**"]
+}
+```
+
+Patterns are game-relative and `/`-separated. `*` matches within one path segment; `**` matches
+any number of segments. A suspect is `risky` when any of its files matches a `risky` pattern,
+`safe` only when every file matches a `safe` pattern, and `unknown` otherwise: an unmatched file,
+an item with no files, or an instance that cannot be listed. A pack that declares nothing leaves
+every suspect `unknown`; it is never guessed to be safe. The label is added to each installed-item
+suspect in the answer, so a screen can show it. Only an instance has a file list, so a loose crash
+file carries no label.
+
+The cross-crash summary counts a **crash place** from the contract's facts, never from a game's
+own names: either a `core.exception` with a `module` ref and an `offset` attribute, or the first
+`core.frame` with its module or class ref and its `rva`, `symbol`, `address` or `symbol_offset`.
+Two crashes at the same place are treated as the same bug repeating.
 
 ### The runtime
 

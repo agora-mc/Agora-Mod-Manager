@@ -400,6 +400,10 @@ impl RefResolver for Resolver {
             role: attribution.role,
         }
     }
+
+    fn item_files(&self, content_key: &str) -> Option<Vec<String>> {
+        self.view.item_files(content_key)
+    }
 }
 
 /// The resolver for a crash file the user handed Agora with no instance behind it.

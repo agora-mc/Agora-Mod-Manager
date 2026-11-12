@@ -94,6 +94,7 @@ fn pack(plugin_id: &str, rules: Vec<Value>) -> PackInput {
             inspectors: Vec::new(),
             ref_maps: Vec::new(),
             roles: Vec::new(),
+            save_risk: None,
             rules,
         },
     }

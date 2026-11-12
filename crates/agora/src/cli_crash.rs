@@ -7,6 +7,7 @@
 //! changes nothing.
 
 use agora_core::crash_engine::attribution::{from_instance, Resolver};
+use agora_core::crash_engine::history::{summarize, CrashHistory, HistoryOwner};
 use agora_core::crash_engine::{
     analyze, owner_name, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
     InstanceInspector,
@@ -15,7 +16,7 @@ use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
 use agora_core::game_script::instance_reads;
 use agora_core::plugins::PluginService;
 use agora_game_api::crash::{
-    CodeEntry, CouldNotCheckReason, GameHandle, LocalText, RefMap, RoleRule,
+    CodeEntry, CouldNotCheckReason, GameHandle, LocalText, RefMap, RoleRule, SaveRiskLabel,
 };
 use agora_plugin_api::host::{ActivationRequest, GameReads, ScriptHost};
 use agora_plugin_api::manifest::PluginId;
@@ -26,6 +27,8 @@ use std::sync::Arc;
 
 pub struct AnalyzeArgs {
     pub files: Vec<PathBuf>,
+    /// Analyze each file as its own crash, then summarize the pattern across them.
+    pub each: bool,
     pub instance: Option<String>,
     pub plugin_dirs: Vec<PathBuf>,
     pub game_version: Option<String>,
@@ -157,6 +160,49 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         _ => None,
     };
 
+    if args.each {
+        let mut outputs = Vec::with_capacity(crash_files.len());
+        for file in &crash_files {
+            outputs.push(analyze(&AnalyzeInput {
+                packs: &packs,
+                files: std::slice::from_ref(file),
+                runtime_version: effective_version.as_deref(),
+                host: host.as_ref(),
+                built_in: &built_in,
+                instance,
+            })?);
+        }
+        if args.json {
+            let crashes: Vec<serde_json::Value> = outputs
+                .iter()
+                .map(|output| {
+                    let mut value = serde_json::json!({
+                        "file": output.record.artifact,
+                        "answer": output.answer,
+                        "files": output.files,
+                    });
+                    if args.facts {
+                        value["parsed"] = parsed_json(output);
+                    }
+                    value
+                })
+                .collect();
+            let records: Vec<_> = outputs.iter().map(|output| output.record.clone()).collect();
+            let summary = summarize(&records);
+            let value = serde_json::json!({
+                "crashes": crashes,
+                "summary": summary,
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            print_each_text(&outputs);
+        }
+        if !outputs.iter().any(|output| output.read_any()) {
+            anyhow::bail!("No crash file could be read.");
+        }
+        return Ok(());
+    }
+
     let output = analyze(&AnalyzeInput {
         packs: &packs,
         files: &crash_files,
@@ -172,19 +218,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
             "files": output.files,
         });
         if args.facts {
-            let parsed: Vec<serde_json::Value> = output
-                .parsed
-                .iter()
-                .map(|parsed| {
-                    serde_json::json!({
-                        "file": parsed.artifact,
-                        "plugin_id": parsed.plugin.id,
-                        "parser_id": parsed.parser_id,
-                        "output": parsed.output,
-                    })
-                })
-                .collect();
-            value["parsed"] = serde_json::Value::Array(parsed);
+            value["parsed"] = parsed_json(&output);
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
@@ -195,6 +229,24 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         anyhow::bail!("No crash file could be read.");
     }
     Ok(())
+}
+
+/// What each parser found, for `--json --facts`.
+fn parsed_json(output: &AnalyzeOutput) -> serde_json::Value {
+    serde_json::Value::Array(
+        output
+            .parsed
+            .iter()
+            .map(|parsed| {
+                serde_json::json!({
+                    "file": parsed.artifact,
+                    "plugin_id": parsed.plugin.id,
+                    "parser_id": parsed.parser_id,
+                    "output": parsed.output,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Read one development folder the way `agora plugin validate` does, and name the plugin ids that
@@ -313,11 +365,7 @@ fn print_text(output: &AnalyzeOutput) {
     if !answer.candidates.is_empty() {
         println!("Suspects:");
         for candidate in &answer.candidates {
-            println!(
-                "  - {}: {}",
-                owner_name(&candidate.owner),
-                candidate.level.label()
-            );
+            println!("  - {}", suspect_line(candidate));
         }
     }
 
@@ -384,6 +432,110 @@ fn print_text(output: &AnalyzeOutput) {
     }
 
     print_files(output);
+}
+
+fn print_each_text(outputs: &[AnalyzeOutput]) {
+    for output in outputs {
+        println!("{}", output.record.artifact);
+        if !output.read_any() {
+            println!("  Agora could not read this crash.");
+            println!();
+            continue;
+        }
+        let answer = &output.answer;
+        println!("  {}", english(&answer.headline));
+        if !answer.candidates.is_empty() {
+            println!("  Suspects:");
+            for candidate in answer.candidates.iter().take(3) {
+                println!("    - {}", suspect_line(candidate));
+            }
+        }
+        println!();
+    }
+    let records: Vec<_> = outputs.iter().map(|output| output.record.clone()).collect();
+    print_history(&summarize(&records));
+}
+
+fn print_history(summary: &CrashHistory) {
+    println!(
+        "Across {} crashes. This is a count of how often each suspect came up, not a verdict.",
+        summary.crashes
+    );
+    if summary.suspects.is_empty() {
+        println!("Suspects: none was named.");
+    } else {
+        println!("Suspects:");
+        for owner in &summary.suspects {
+            print_history_owner(owner);
+        }
+    }
+    if !summary.always_running.is_empty() {
+        println!("Always running (framework or hook framework; appears in many crashes for that reason):");
+        for owner in &summary.always_running {
+            print_history_owner(owner);
+        }
+    }
+    if summary.unreadable > 0 {
+        println!(
+            "Could not read: {} {}.",
+            summary.unreadable,
+            crashes_word(summary.unreadable)
+        );
+    }
+    println!(
+        "Named nobody: {} {}.",
+        summary.named_nobody,
+        crashes_word(summary.named_nobody)
+    );
+}
+
+fn print_history_owner(owner: &HistoryOwner) {
+    println!(
+        "  - {}: named in {} {} ({} as the top suspect), {} distinct {}",
+        owner_name(&owner.owner),
+        owner.crashes_named,
+        crashes_word(owner.crashes_named),
+        owner.crashes_top,
+        owner.distinct_places,
+        places_word(owner.distinct_places)
+    );
+}
+
+fn crashes_word(count: usize) -> &'static str {
+    if count == 1 {
+        "crash"
+    } else {
+        "crashes"
+    }
+}
+
+fn places_word(count: usize) -> &'static str {
+    if count == 1 {
+        "crash place"
+    } else {
+        "crash places"
+    }
+}
+
+fn suspect_line(candidate: &agora_game_api::crash::Candidate) -> String {
+    let risk = candidate
+        .save_risk
+        .map(save_risk_words)
+        .map(|words| format!(" - {words}"))
+        .unwrap_or_default();
+    format!(
+        "{}: {}{risk}",
+        owner_name(&candidate.owner),
+        candidate.level.label()
+    )
+}
+
+fn save_risk_words(label: SaveRiskLabel) -> &'static str {
+    match label {
+        SaveRiskLabel::Safe => "safe to test on your save",
+        SaveRiskLabel::Risky => "risky: test on a new game or a backup of your save",
+        SaveRiskLabel::Unknown => "not sure: back up your save first",
+    }
 }
 
 fn print_files(output: &AnalyzeOutput) {

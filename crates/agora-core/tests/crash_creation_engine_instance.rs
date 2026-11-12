@@ -11,7 +11,7 @@ use agora_core::crash_engine::{
     analyze, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis, InstanceInspector,
 };
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
-use agora_game_api::crash::{Family, GameHandle, InspectResult, Level, Owner};
+use agora_game_api::crash::{Family, GameHandle, InspectResult, Level, Owner, SaveRiskLabel};
 use agora_plugin_api::host::{
     ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
 };
@@ -267,6 +267,45 @@ fn an_instance_names_a_listed_dll_that_declares_another_game_version() {
         .as_deref()
         .unwrap_or("")
         .contains("built for another game version"));
+}
+
+#[test]
+fn an_instance_labels_a_dll_as_risky_to_remove() {
+    let running = start();
+    let data = VersionData {
+        compatible: vec![[1, 5, 97, 0]],
+        ..VersionData::default()
+    };
+    let output = with_instance(&running, dll(&data));
+    let suspect = output
+        .answer
+        .candidates
+        .first()
+        .expect("the instance names the mod");
+    assert_eq!(suspect.save_risk, Some(SaveRiskLabel::Risky));
+}
+
+#[test]
+fn a_loose_file_never_carries_a_save_risk_label() {
+    let running = start();
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile {
+            name: "crash-2026-01-01-12-00-00.log".into(),
+            bytes: log().into_bytes(),
+        }],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+    assert!(output.read_any(), "{:#?}", output.files);
+    assert!(output
+        .answer
+        .candidates
+        .iter()
+        .all(|candidate| candidate.save_risk.is_none()));
 }
 
 #[test]

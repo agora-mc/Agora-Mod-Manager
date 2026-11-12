@@ -3,6 +3,20 @@
   "games": [
     "skyrim-se"
   ],
+  "save_risk": {
+    "risky": [
+      "Data/**/*.esp",
+      "Data/**/*.esm",
+      "Data/**/*.esl",
+      "Data/**/*.pex",
+      "Data/**/*.dll"
+    ],
+    "safe": [
+      "Data/textures/**",
+      "Data/meshes/**",
+      "Data/sound/**"
+    ]
+  },
   "sources": [
     {
       "id": "crash_logger",

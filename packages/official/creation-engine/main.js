@@ -1080,6 +1080,7 @@ function crashParseException(state, limits, sections, lines, game, logType) {
       attrs.near_null = nearNull;
     }
     attrs.depth = 0;
+    if (site.offset) crashAddAttr(attrs, "offset", site.offset, limits);
     const refs = new Map();
     if (site.module) crashAddRef(refs, "module", site.module, "exec_top", limits);
     crashPushFact(state, limits, {
@@ -1154,6 +1155,7 @@ function crashParseException(state, limits, sections, lines, game, logType) {
       if (match) {
         site2.module = match[1];
         site2.offset = crashHex(match[2]);
+        crashAddAttr(attrs, "offset", site2.offset, limits);
         crashAddRef(refs, "module", match[1], "exec_top", limits);
       }
     }

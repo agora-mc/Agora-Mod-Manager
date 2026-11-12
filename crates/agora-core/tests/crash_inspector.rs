@@ -139,6 +139,7 @@ fn pack(export: &str, accepts: &[&str]) -> LoadedCrashPack {
             }],
             ref_maps: Vec::new(),
             roles: Vec::new(),
+            save_risk: None,
             rules: Vec::new(),
         },
     }

@@ -1565,6 +1565,64 @@ fn crash_analyze_of_a_file_nobody_reads_states_no_diagnosis() {
 }
 
 #[test]
+fn crash_analyze_each_judges_three_logs_and_summarizes_the_pattern() {
+    let (tmp, data_dir) = temp_data_dir();
+    let (plugin, logs) = write_each_crash_fixtures(tmp.path());
+    let mut args = vec!["crash", "analyze", "--each"];
+    args.extend(logs.iter().map(|log| log.to_str().unwrap()));
+    args.push("--plugin-dir");
+    args.push(plugin.to_str().unwrap());
+    let output = run_agora(&data_dir, &args);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("each-alpha.log"), "{stdout}");
+    assert!(stdout.contains("AlphaMod.dll"), "{stdout}");
+    assert!(stdout.contains("BetaMod.dll"), "{stdout}");
+    assert!(stdout.contains("Across 3 crashes"), "{stdout}");
+    assert!(stdout.contains("not a verdict"), "{stdout}");
+    assert!(stdout.contains("Could not read: 1 crash."), "{stdout}");
+}
+
+#[test]
+fn crash_analyze_each_json_is_the_same_count_as_data() {
+    let (tmp, data_dir) = temp_data_dir();
+    let (plugin, logs) = write_each_crash_fixtures(tmp.path());
+    let mut args = vec!["crash", "analyze", "--each", "--json"];
+    args.extend(logs.iter().map(|log| log.to_str().unwrap()));
+    args.push("--plugin-dir");
+    args.push(plugin.to_str().unwrap());
+    let output = run_agora_json(&data_dir, &args);
+    assert!(output.status.success());
+    let parsed = assert_json_stdout(&output);
+    assert_eq!(parsed["crashes"].as_array().unwrap().len(), 3);
+    assert_eq!(parsed["summary"]["crashes"], 3);
+    assert_eq!(parsed["summary"]["unreadable"], 1);
+    assert_eq!(parsed["summary"]["named_nobody"], 0);
+    let names: Vec<&str> = parsed["summary"]["suspects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|suspect| suspect["owner"]["name"].as_str())
+        .collect();
+    assert_eq!(names, ["AlphaMod.dll", "BetaMod.dll"]);
+}
+
+fn write_each_crash_fixtures(root: &Path) -> (PathBuf, Vec<PathBuf>) {
+    let (plugin, _) = write_crash_analyze_fixtures(root);
+    let alpha = root.join("each-alpha.log");
+    let beta = root.join("each-beta.log");
+    let notes = root.join("each-notes.log");
+    std::fs::write(&alpha, "== FAULTS ==\nmodule AlphaMod.dll failed\n").unwrap();
+    std::fs::write(&beta, "== FAULTS ==\nmodule BetaMod.dll failed\n").unwrap();
+    std::fs::write(&notes, "a shopping list, not a crash log\n").unwrap();
+    (plugin, vec![alpha, beta, notes])
+}
+
+#[test]
 fn instance_memory_recommendation_is_read_only_and_explained() {
     let (_tmp, data_dir) = temp_data_dir();
     run_agora(&data_dir, &["paths"]);
