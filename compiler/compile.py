@@ -1677,7 +1677,7 @@ logger = logging.getLogger("compiler")
 # Schema setup
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 CREATE_INDEXES = [
@@ -1790,13 +1790,22 @@ def create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Community crash signatures (format v2). The app converts each row into a
+    # rule in its own crash pack, so every column here is data the engine's rule
+    # format already understands. `games_json` is a non-empty JSON array of game
+    # ids; a rule only applies to those games.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS crash_signatures (
             id TEXT PRIMARY KEY,
             name TEXT,
+            games_json TEXT NOT NULL,
             regex_pattern TEXT,
-            solution_markdown TEXT,
-            action_button_json TEXT
+            level TEXT,
+            cause TEXT,
+            text TEXT,
+            action_kind TEXT,
+            action_content_key TEXT,
+            action_label TEXT
         )
     """)
 
@@ -4282,23 +4291,138 @@ def insert_pack_versions(
 # ---------------------------------------------------------------------------
 
 
+# Format v2 of a community crash signature. The app turns each row into a
+# crash rule, so these are the only values its closed types accept.
+SIGNATURE_LEVELS = ("possible", "likely")
+SIGNATURE_CAUSES = (
+    "mod",
+    "version_mismatch",
+    "missing_requirement",
+    "file",
+    "setting",
+    "save",
+    "memory",
+    "driver",
+    "game_install",
+    "other",
+)
+SIGNATURE_ACTION_KINDS = (
+    "install_content",
+    "open_console",
+    "open_jvm_settings",
+    "open_crash_log",
+    "review_mods",
+)
+_SIGNATURE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def validate_crash_signature(sig: Any) -> list[str]:
+    """Every reason *sig* is not a v2 community crash signature.
+
+    The format is a plain data shape the Rust engine can turn into one rule: a
+    non-empty `games` list, a regex over log lines, a plain-text headline, and an
+    optional action from the UI's closed set. An empty list means valid.
+    """
+    if not isinstance(sig, dict):
+        return ["a crash signature is a JSON object"]
+
+    errors: list[str] = []
+    signature_id = sig.get("id")
+    if not isinstance(signature_id, str) or not _SIGNATURE_ID_RE.match(signature_id):
+        errors.append(
+            "`id` is a non-empty string of lower-case letters, digits, `.`, `_` or `-`"
+        )
+
+    name = sig.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("`name` is a non-empty string")
+
+    games = sig.get("games")
+    if not isinstance(games, list) or not games:
+        errors.append("`games` is a non-empty list of game ids")
+    else:
+        for game in games:
+            if not isinstance(game, str) or not _SIGNATURE_ID_RE.match(game):
+                errors.append(
+                    f"game id {game!r} is not lower-case letters, digits, `.`, `_` or `-`"
+                )
+
+    pattern = sig.get("regex_pattern")
+    if not isinstance(pattern, str) or not pattern:
+        errors.append("`regex_pattern` is a non-empty string")
+
+    level = sig.get("level", "possible")
+    if level not in SIGNATURE_LEVELS:
+        errors.append(
+            f"`level` is one of {', '.join(SIGNATURE_LEVELS)}; got {level!r}"
+        )
+
+    cause = sig.get("cause", "other")
+    if cause not in SIGNATURE_CAUSES:
+        errors.append(
+            f"`cause` is one of {', '.join(SIGNATURE_CAUSES)}; got {cause!r}"
+        )
+
+    text = sig.get("text")
+    if not isinstance(text, str) or not text.strip():
+        errors.append("`text` is a non-empty plain-text headline")
+
+    action = sig.get("action")
+    if action is not None:
+        if not isinstance(action, dict):
+            errors.append("`action` is an object with a `kind`")
+        else:
+            kind = action.get("kind")
+            if kind not in SIGNATURE_ACTION_KINDS:
+                errors.append(
+                    f"`action.kind` is one of {', '.join(SIGNATURE_ACTION_KINDS)}; "
+                    f"got {kind!r}"
+                )
+            content_key = action.get("content_key")
+            if kind == "install_content":
+                if not isinstance(content_key, str) or not content_key.strip():
+                    errors.append(
+                        "`action.content_key` is required for `install_content`"
+                    )
+            elif content_key is not None:
+                errors.append("only `install_content` uses `action.content_key`")
+            label = action.get("label")
+            if label is not None and (
+                not isinstance(label, str) or not label.strip()
+            ):
+                errors.append("`action.label` is a non-empty string when present")
+
+    return errors
+
+
 def insert_crash_signature(
     conn: sqlite3.Connection,
     sig: dict[str, Any],
     rejected: list[int],
 ) -> None:
-    """Insert a crash signature after validating its regex pattern.
+    """Insert a v2 crash signature after validating its shape and regex.
 
-    Validation per ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§2.4.1:
+    Validation per §2.4.1:
+    - The fields follow the v2 signature format (see `validate_crash_signature`).
     - Reject patterns longer than 256 characters.
     - Test each pattern against a 100 KB corpus with a 1 s timeout to catch
       catastrophic backtracking.
 
-    *rejected* is a one-element list used as a mutable counter so the caller
-    can track how many signatures were skipped.
+    A row that fails validation is skipped and logged, never silently stored;
+    *rejected* is a one-element list used as a mutable counter so the caller can
+    track how many signatures were skipped.
     """
+    errors = validate_crash_signature(sig)
+    if errors:
+        signature_id = sig.get("id", "<no id>") if isinstance(sig, dict) else "<no id>"
+        logger.error(
+            "Crash signature '%s' rejected: %s", signature_id, "; ".join(errors)
+        )
+        rejected[0] += 1
+        return
+
     name = sig.get("name", sig["id"])
-    raw_pattern = sig.get("regex_pattern", "")
+    raw_pattern = sig["regex_pattern"]
 
     # --- Length check ---
     if len(raw_pattern) > 256:
@@ -4321,19 +4445,26 @@ def insert_crash_signature(
         return
 
     # --- Insert ---
+    action = sig.get("action") or {}
     cursor = conn.cursor()
-    action_button = sig.get("action_button")
     cursor.execute(
         """
-        INSERT INTO crash_signatures (id, name, regex_pattern, solution_markdown, action_button_json)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO crash_signatures
+            (id, name, games_json, regex_pattern, level, cause, text,
+             action_kind, action_content_key, action_label)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             sig["id"],
             sig["name"],
-            sig["regex_pattern"],
-            sig["solution_markdown"],
-            json.dumps(action_button, separators=(",", ":")) if action_button else None,
+            json.dumps(sig["games"], separators=(",", ":")),
+            raw_pattern,
+            sig.get("level", "possible"),
+            sig.get("cause", "other"),
+            sig["text"],
+            action.get("kind"),
+            action.get("content_key"),
+            action.get("label"),
         ),
     )
 

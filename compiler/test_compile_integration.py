@@ -146,19 +146,35 @@ class TestModJarAliasesPopulated(_CompileFixtures):
 
 
 class TestCrashSignaturesPopulated(_CompileFixtures):
-    """Test 7: crash_signatures has >= 3 rows."""
+    """Every file in crash-signatures/ compiles into one v2 row."""
 
     def test_crash_signatures_populated(self):
-        """crash_signatures should have at least 3 entries."""
+        """The row count matches the JSON files, and the v2 columns exist."""
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        files = sorted(
+            pathlib.Path(repo_root, "crash-signatures").glob("*.json")
+        )
         conn = self._open_db()
         try:
             count = conn.execute(
                 "SELECT COUNT(*) FROM crash_signatures"
             ).fetchone()[0]
-            self.assertGreaterEqual(count, 3,
-                                    f"Expected >= 3 crash_signatures, got {count}")
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(crash_signatures)")
+            }
         finally:
             conn.close()
+        self.assertEqual(
+            count,
+            len(files),
+            f"Expected {len(files)} crash_signatures from {len(files)} files, got {count}",
+        )
+        self.assertTrue(
+            {"games_json", "level", "cause", "text", "action_kind"} <= columns,
+            f"v2 columns missing: {sorted(columns)}",
+        )
+        self.assertNotIn("solution_markdown", columns)
 
 
 class TestAuditLogPopulated(_CompileFixtures):
@@ -487,7 +503,7 @@ class TestOtherGamesLeavePreExistingTablesAlone(unittest.TestCase):
         self.assertEqual(after_entries - before_entries, {"crash-logger"})
         self.assertEqual(before_entries - after_entries, set())
 
-    def test_registry_items_keeps_its_schema_9_columns(self):
+    def test_registry_items_keeps_its_schema_10_columns(self):
         compile_module = self._compile_module()
         with tempfile.TemporaryDirectory() as tmp:
             compile_registry_rows(compile_module, REPO_ROOT / "registry", pathlib.Path(tmp))
@@ -499,7 +515,7 @@ class TestOtherGamesLeavePreExistingTablesAlone(unittest.TestCase):
                 conn.close()
         self.assertNotIn("game", columns)
         self.assertNotIn("game_compatibility_json", columns)
-        self.assertEqual(version, 9)
+        self.assertEqual(version, 10)
 
 
 class TestCuratorWarningCompiled(_CompileFixtures):

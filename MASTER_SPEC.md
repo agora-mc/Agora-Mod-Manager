@@ -267,14 +267,27 @@ If present, the launcher uses this data to populate `compatible_versions_json` i
 {
   "id": "fabric-api-missing",
   "name": "Missing Fabric API",
-  "regex_pattern": "net\\.fabricmc\\.loader\\.impl\\.discovery\\.ModResolutionException: Mod resolution encountered an incompatible mod set!.*requires \\{fabric @",
-  "solution_markdown": "A mod you installed requires **Fabric API**, but it is missing from your mod folder. Click the button below to install it automatically.",
-  "action_button": {
-    "label": "Install Fabric API",
-    "mod_id": "fabric-api"
+  "games": ["minecraft"],
+  "regex_pattern": "requires \\\\{fabric @",
+  "level": "likely",
+  "cause": "missing_requirement",
+  "text": "A mod you installed requires Fabric API, but it is missing from your mod folder.",
+  "action": {
+    "kind": "install_content",
+    "content_key": "fabric-api",
+    "label": "Install Fabric API"
   }
 }
 ```
+
+Format v2: `id`, `name`, non-empty `games`, `regex_pattern`, optional `level` (`possible` or
+`likely`, default `possible`), optional `cause` (the closed cause set, default `other`), plain-text
+`text`, and an optional `action` whose `kind` is one the UI already knows. `install_content` needs a
+`content_key`. The old `solution_markdown` and `action_button` fields are gone. A signature works for
+any game: `games` gates which game ids it applies to. The compiler stores rows in `registry.db`; the
+launcher converts them into rules in the community crash pack (`agora.community`) wherever packs are
+loaded. A community signature never names a suspect, and a bad row is reported as "could not check",
+never dropped silently.
 
 #### 2.4.1 Regex DoS Prevention
 
@@ -288,7 +301,7 @@ Community-submitted regex patterns create a ReDoS (Regular Expression Denial of 
 
 3. **PR Review Enforcement:** Curators must test every new crash signature against a representative crash log (≥100KB) before merging. The compilation CI rejects any pattern that takes longer than **50ms** to evaluate against the test corpus.
 
-4. **Compiled Regex Caching:** The Tauri client pre-compiles all `crash_signatures` patterns on startup and caches them in memory. Matching is then a simple linear scan with no per-match compilation overhead.
+4. **Rule Linting:** Every compiled row goes through the same crash-rule linter as a plugin's pack, so an over-long or unanchored pattern is reported rather than run.
 
 ---
 
@@ -450,9 +463,14 @@ The database **never stores binary image data**. All images are hotlinked via UR
 |---|---|---|
 | `id` | TEXT | PRIMARY KEY |
 | `name` | TEXT | Human-readable crash name |
-| `regex_pattern` | TEXT | Regex to match against crash log text |
-| `solution_markdown` | TEXT | User-facing fix description |
-| `action_button_json` | TEXT | JSON: `{ "label": "...", "mod_id": "..." }` |
+| `games_json` | TEXT | JSON array of game ids this signature applies to (non-empty) |
+| `regex_pattern` | TEXT | Regex to match against crash log lines |
+| `level` | TEXT | `possible` or `likely` (default `possible`) |
+| `cause` | TEXT | Closed cause kind (default `other`) |
+| `text` | TEXT | Plain-text headline shown to the user |
+| `action_kind` | TEXT | Optional action kind the UI knows how to perform |
+| `action_content_key` | TEXT | Content to install; only for `install_content` |
+| `action_label` | TEXT | Optional button text |
 
 **Note on Mutable State:** User instances, crash telemetry, settings, and MCP approval grants are **not** stored in `registry.db`. They live in the separate `local_state.db` database defined in §4.1b. This split ensures `registry.db` is read-only and replaceable at runtime without data loss.
 

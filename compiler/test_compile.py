@@ -677,9 +677,14 @@ class TestRegexDosProtection(unittest.TestCase):
             CREATE TABLE IF NOT EXISTS crash_signatures (
                 id TEXT PRIMARY KEY,
                 name TEXT,
+                games_json TEXT NOT NULL,
                 regex_pattern TEXT,
-                solution_markdown TEXT,
-                action_button_json TEXT
+                level TEXT,
+                cause TEXT,
+                text TEXT,
+                action_kind TEXT,
+                action_content_key TEXT,
+                action_label TEXT
             )
         """)
 
@@ -691,16 +696,21 @@ class TestRegexDosProtection(unittest.TestCase):
     def tearDown(self):
         self._conn.close()
 
+    def _signature(self, **overrides):
+        sig = {
+            "id": "example_signature",
+            "name": "Example Crash",
+            "games": ["minecraft"],
+            "regex_pattern": r"java\.lang\.ExampleException",
+            "text": "An example thing failed.",
+        }
+        sig.update(overrides)
+        return sig
+
     def test_long_pattern_rejected(self):
         """A pattern >256 characters is rejected."""
         long_pattern = "a" * 257
-        sig = {
-            "id": "long_test",
-            "name": "Long Pattern",
-            "regex_pattern": long_pattern,
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="long_test", regex_pattern=long_pattern)
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 1)
         # Should not have been inserted.
@@ -711,13 +721,12 @@ class TestRegexDosProtection(unittest.TestCase):
 
     def test_valid_pattern_accepted(self):
         """A normal short pattern is accepted and inserted."""
-        sig = {
-            "id": "nullptr_test",
-            "name": "Null Pointer",
-            "regex_pattern": r"java\.lang\.NullPointerException",
-            "solution_markdown": "Check for nulls.",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(
+            id="nullptr_test",
+            name="Null Pointer",
+            regex_pattern=r"java\.lang\.NullPointerException",
+            text="A null pointer was the failure.",
+        )
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 0)
         row = self._conn.execute(
@@ -730,32 +739,123 @@ class TestRegexDosProtection(unittest.TestCase):
 
     def test_invalid_regex_rejected(self):
         """An invalid regex pattern is rejected."""
-        sig = {
-            "id": "bad_regex",
-            "name": "Bad Regex",
-            "regex_pattern": "[invalid(regex",
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="bad_regex", regex_pattern="[invalid(regex")
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 1)
 
     def test_exact_256_pattern_accepted(self):
         """A pattern exactly 256 characters is accepted (boundary)."""
         pattern_256 = "a" * 256
-        sig = {
-            "id": "boundary_test",
-            "name": "Boundary",
-            "regex_pattern": pattern_256,
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="boundary_test", regex_pattern=pattern_256)
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 0)
         row = self._conn.execute(
             "SELECT id FROM crash_signatures WHERE id = ?", ("boundary_test",)
         ).fetchone()
         self.assertIsNotNone(row)
+
+
+class TestCrashSignatureFormat(unittest.TestCase):
+    """V2 signature validation: the app converts every row into a crash rule."""
+
+    def _create_schema(self, conn):
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS crash_signatures (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                games_json TEXT NOT NULL,
+                regex_pattern TEXT,
+                level TEXT,
+                cause TEXT,
+                text TEXT,
+                action_kind TEXT,
+                action_content_key TEXT,
+                action_label TEXT
+            )
+        """)
+
+    def setUp(self):
+        self._conn = _compile.sqlite3.connect(":memory:")
+        self._create_schema(self._conn)
+        self._rejected: list[int] = [0]
+
+    def tearDown(self):
+        self._conn.close()
+
+    def _signature(self, **overrides):
+        sig = {
+            "id": "example_signature",
+            "name": "Example Crash",
+            "games": ["skyrim-se"],
+            "regex_pattern": r"Unhandled exception",
+            "text": "An example thing failed.",
+        }
+        sig.update(overrides)
+        return sig
+
+    def test_defaults_are_possible_and_other(self):
+        _compile.insert_crash_signature(self._conn, self._signature(), self._rejected)
+        self.assertEqual(self._rejected[0], 0)
+        row = self._conn.execute(
+            "SELECT games_json, level, cause, action_kind FROM crash_signatures"
+        ).fetchone()
+        self.assertEqual(row, ('["skyrim-se"]', "possible", "other", None))
+
+    def test_missing_games_is_rejected(self):
+        sig = self._signature()
+        del sig["games"]
+        _compile.insert_crash_signature(self._conn, sig, self._rejected)
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_empty_games_is_rejected(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(games=[]), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_level_must_be_possible_or_likely(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(level="very_likely"), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_unknown_cause_is_rejected(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(cause="banana"), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_install_action_needs_a_content_key(self):
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(action={"kind": "install_content"}),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_action_is_stored(self):
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(
+                level="likely",
+                cause="missing_requirement",
+                action={
+                    "kind": "install_content",
+                    "content_key": "example-api",
+                    "label": "Install Example API",
+                },
+            ),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 0)
+        row = self._conn.execute(
+            "SELECT level, cause, action_kind, action_content_key, action_label "
+            "FROM crash_signatures"
+        ).fetchone()
+        self.assertEqual(
+            row,
+            ("likely", "missing_requirement", "install_content", "example-api", "Install Example API"),
+        )
 
 
 
@@ -1740,8 +1840,9 @@ class OtherGameEntryTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(version, _compile.SCHEMA_VERSION)
-        # Schema 9 stays: registry_items is unchanged, and the new table is additive.
-        self.assertEqual(_compile.SCHEMA_VERSION, 9)
+        # Schema 10: crash_signatures changed shape (format v2), and that is a
+        # table older clients read, so the version moves with it.
+        self.assertEqual(_compile.SCHEMA_VERSION, 10)
 
     # -- folder and game ----------------------------------------------------
 
@@ -2442,7 +2543,7 @@ class OfficialPluginTests(unittest.TestCase):
         self.assertIn("::warning::", printed.getvalue())
         self.assertIn("left out of the catalog", printed.getvalue())
 
-    def test_the_schema_version_is_unchanged_so_older_clients_still_read_the_registry(self):
+    def test_an_additive_table_does_not_hide_the_schema_version(self):
         self.write(self.entry())
         out = self.compile()
         conn = sqlite3.connect(str(out))
@@ -2451,7 +2552,7 @@ class OfficialPluginTests(unittest.TestCase):
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         finally:
             conn.close()
-        self.assertEqual(version, 9)
+        self.assertEqual(version, _compile.SCHEMA_VERSION)
         # Everything an older client reads is still there; the new table is purely additive.
         self.assertIn("registry_items", tables)
         self.assertIn("game_catalog_items", tables)

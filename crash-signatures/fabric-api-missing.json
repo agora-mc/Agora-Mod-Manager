@@ -1,10 +1,14 @@
 {
   "id": "fabric-api-missing",
   "name": "Missing Fabric API",
+  "games": ["minecraft"],
   "regex_pattern": "requires \\\\{fabric @",
-  "solution_markdown": "A mod you installed requires **Fabric API**, but it is missing from your mod folder. Click the button below to install it automatically.",
-  "action_button": {
-    "label": "Install Fabric API",
-    "mod_id": "fabric-api"
+  "level": "likely",
+  "cause": "missing_requirement",
+  "text": "A mod you installed requires Fabric API, but it is missing from your mod folder.",
+  "action": {
+    "kind": "install_content",
+    "content_key": "fabric-api",
+    "label": "Install Fabric API"
   }
 }

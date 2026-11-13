@@ -578,7 +578,11 @@ Compiler-generated; do not edit manually. Appended to on every compile.
 
 ## 7. Crash signatures (`crash-signatures/<id>.json`)
 
-Not under `registry/` — these live at the repo root in `crash-signatures/`. Each file defines a regex pattern that matches a known crash type + a human-readable fix hint + an optional action button.
+Not under `registry/` — these live at the repo root in `crash-signatures/`. Each file is a
+**format v2** signature: a regex over log lines, the games it applies to, a plain-text headline, and
+an optional action. The compiler stores each one as a row in `crash_signatures`; the launcher reads
+that table from the signed `registry.db` and turns every valid row into a rule in its community
+crash pack, so a signature works for **any game**, not only Minecraft.
 
 ### Example
 
@@ -586,24 +590,43 @@ Not under `registry/` — these live at the repo root in `crash-signatures/`. Ea
 {
   "id": "fabric-api-missing",
   "name": "Missing Fabric API",
-  "regex_pattern": "requires \\{fabric @",
-  "solution_markdown": "A mod you installed requires **Fabric API**, but it is missing from your mod folder. Click the button below to install it automatically.",
-  "action_button": {
-    "label": "Install Fabric API",
-    "mod_id": "fabric-api"
+  "games": ["minecraft"],
+  "regex_pattern": "requires \\\\{fabric @",
+  "level": "likely",
+  "cause": "missing_requirement",
+  "text": "A mod you installed requires Fabric API, but it is missing from your mod folder.",
+  "action": {
+    "kind": "install_content",
+    "content_key": "fabric-api",
+    "label": "Install Fabric API"
   }
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `id` | string | Unique slug matching the filename. |
-| `name` | string | Display name shown in the crash diagnostic UI. |
+| `id` | string | Unique slug matching the filename: lower-case letters, digits, `.`, `_`, `-`. |
+| `name` | string | Display name for the signature. |
+| `games` | string[] | Required, non-empty. Game ids the signature applies to, e.g. `["minecraft"]` or `["skyrim-se"]`. The rule only runs when the crash's game is in this list. |
 | `regex_pattern` | string | Rust regex (no backreferences, no unbounded backtracking). Max 256 chars. Test against a ≥100KB crash log before merging. |
-| `solution_markdown` | string | Markdown shown to the user explaining the fix. |
-| `action_button` | object\|null | Optional `{label, mod_id}` — renders a button that installs the named mod. |
-| `action_button.label` | string | Button text. |
-| `action_button.mod_id` | string | Catalog mod ID to install when clicked. |
+| `level` | string | Optional, default `possible`. One of `possible`, `likely`. Agora never says a mod is certainly the cause. |
+| `cause` | string | Optional, default `other`. One of `mod`, `version_mismatch`, `missing_requirement`, `file`, `setting`, `save`, `memory`, `driver`, `game_install`, `other`. |
+| `text` | string | Plain-text headline shown to the user. **No Markdown and no HTML**: community text is rendered as text, never as markup. |
+| `action` | object\|null | Optional action from the launcher's closed set. |
+| `action.kind` | string | One of `install_content`, `open_console`, `open_jvm_settings`, `open_crash_log`, `review_mods`. |
+| `action.content_key` | string | Required for `install_content`; refused for every other kind. |
+| `action.label` | string | Optional button text. |
+
+A community signature **never names a suspect**. It produces a finding (with its action) and cannot
+raise any mod's level. A row that fails validation or the rule linter is reported as "could not
+check" with its id; it never silently disappears and never stops the other signatures.
+
+### Testing a signature locally
+
+Build a crash log or log fragment that contains the line the regex should match, run
+`agora crash analyze <file> --instance <id>` (or paste the text into Crash Doctor), and check that a
+finding appears with the signature's headline and action. A log line from a real crash must not be
+committed to the repository; write an invented one.
 
 ### Regex DoS safety rules
 
