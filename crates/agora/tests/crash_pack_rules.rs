@@ -388,6 +388,25 @@ mod crash {
     }
 
     #[test]
+    fn a_loader_problem_from_a_crash_report_fires_the_same_rules() {
+        for (kind, rule) in [
+            ("resolution", "mod_resolution_failed"),
+            ("missing_dependency", "mod_resolution_failed"),
+            ("incompatible", "incompatible_mods"),
+        ] {
+            let evaluated = evaluate_one(output(
+                "minecraft_crash_report",
+                vec![fact(
+                    "minecraft.loader_problem",
+                    &[("kind", text(kind)), ("message", text("a loader message"))],
+                    Vec::new(),
+                )],
+            ));
+            assert!(fired(&evaluated, rule), "{kind}: {rule}");
+        }
+    }
+
+    #[test]
     fn a_mod_error_a_config_error_and_a_world_error_each_fire() {
         let mod_error = evaluate_one(output(
             "minecraft_latest_log",

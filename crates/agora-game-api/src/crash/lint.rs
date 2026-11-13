@@ -825,29 +825,34 @@ impl RuleLint {
                 .chain(&verify.on_unknown)
         });
         for effect in rule.effects.iter().chain(verify_effects) {
-            let Effect::Finding {
-                candidate: Some(_),
-                cause: Some(cause),
-                text,
-                ..
-            } = effect
-            else {
-                continue;
+            let (cause, text, what) = match effect {
+                Effect::Finding {
+                    candidate: Some(_),
+                    cause: Some(cause),
+                    text,
+                    ..
+                } => (
+                    *cause,
+                    text.as_ref().and_then(|text| text.why_not_sure.as_ref()),
+                    "finding",
+                ),
+                // A signal has no text of its own, so the rule's explanation is the only one.
+                Effect::Signal {
+                    cause: Some(cause), ..
+                } => (*cause, None, "signal"),
+                _ => continue,
             };
             if matches!(cause, Cause::Mod | Cause::VersionMismatch | Cause::File) {
                 continue;
             }
-            let why = text
-                .as_ref()
-                .and_then(|text| text.why_not_sure.as_ref())
-                .or(rule.text.why_not_sure.as_ref());
+            let why = text.or(rule.text.why_not_sure.as_ref());
             let has_reason =
                 why.is_some_and(|why| why.get("en").is_some_and(|words| !words.trim().is_empty()));
             if !has_reason {
                 self.push(
                     LintCode::BadEffect,
                     format!(
-                        "a `{}` finding names a candidate, so it needs `why_not_sure`: `{}` rarely \
+                        "a `{}` {what} names a candidate, so it needs `why_not_sure`: `{}` rarely \
                          singles out one mod, and the user must see why this one is named",
                         cause.label(),
                         cause.label()

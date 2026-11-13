@@ -6,7 +6,7 @@ use agora_core::crash_engine::attribution::{InstanceView, LayerOwner, LayerView}
 use agora_core::crash_engine::save_risk::{apply, classify, merge};
 use agora_core::crash_engine::{RefResolver, Resolved};
 use agora_game_api::crash::{
-    lint_pack_json, Candidate, Family, Level, LintCode, Owner, Ref, SaveRisk, SaveRiskLabel,
+    lint_pack_json, Candidate, Cause, Family, Level, LintCode, Owner, Ref, SaveRisk, SaveRiskLabel,
 };
 use std::collections::BTreeMap;
 
@@ -240,6 +240,7 @@ fn candidate(owner: Owner) -> Candidate {
         owner,
         level: Level::Possible,
         score: 1,
+        cause: Cause::Mod,
         families: vec![Family::Execution],
         sources: Vec::new(),
         also_provided_by: Vec::new(),

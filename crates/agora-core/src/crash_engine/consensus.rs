@@ -5,7 +5,9 @@
 //! strongest level needs either independent groups and a lead or a decisive family.
 
 use super::*;
-use agora_game_api::crash::{Candidate, Family, Level, Owner, Role, Signal, SourceAttribution};
+use agora_game_api::crash::{
+    Candidate, Cause, Family, Level, Owner, Role, Signal, SourceAttribution,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct ConsensusInput<'a> {
@@ -27,9 +29,21 @@ struct Bucket {
     owner: Owner,
     families: BTreeMap<Family, u32>,
     sources: BTreeMap<String, SourceAttribution>,
+    /// The strongest clue that states a cause, as (weight, specificity, cause). The candidate's
+    /// cause comes from it; without one, the candidate is `mod`.
+    cause: Option<(u32, u8, Cause)>,
 }
 
 impl Bucket {
+    /// Offer a clue's cause. A heavier clue wins; on a tie the more specific kind wins, and `mod`
+    /// is the fallback rather than the specific answer.
+    fn offer_cause(&mut self, weight: u32, cause: Cause) {
+        let rank = (weight, cause_specificity(cause), cause);
+        if self.cause.is_none_or(|best| rank > best) {
+            self.cause = Some(rank);
+        }
+    }
+
     fn core(&self) -> u32 {
         self.families
             .iter()
@@ -73,6 +87,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             owner: signal.candidate.clone(),
             families: BTreeMap::new(),
             sources: BTreeMap::new(),
+            cause: None,
         });
         bucket
             .families
@@ -83,6 +98,9 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             .sources
             .entry(source_key(&signal.source))
             .or_insert_with(|| signal.source.clone());
+        if let Some(cause) = signal.cause {
+            bucket.offer_cause(signal.weight, cause);
+        }
     }
 
     struct Scored {
@@ -90,6 +108,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         key: String,
         core: u32,
         score: u32,
+        cause: Cause,
         families: Vec<Family>,
         sources: Vec<SourceAttribution>,
         demoted: bool,
@@ -119,11 +138,16 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         let boost = demote(bucket.boost(), role, profile);
         let families = bucket.families();
         let sources = bucket.sources();
+        let cause = bucket
+            .cause
+            .map(|(_, _, cause)| cause)
+            .unwrap_or(Cause::Mod);
         scored.push(Scored {
             owner: bucket.owner,
             key,
             core,
             score: core + boost,
+            cause,
             families,
             sources,
             demoted: matches!(role, Some(Role::HookFramework | Role::Framework)),
@@ -153,6 +177,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             owner: scored.owner.clone(),
             level: Level::NotSure,
             score: scored.score,
+            cause: scored.cause,
             families: scored.families.clone(),
             sources: scored.sources.clone(),
             also_provided_by: Vec::new(),
@@ -223,6 +248,16 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         candidates,
         level,
         abstained,
+    }
+}
+
+/// How specific a cause kind is when two clues tie on weight. `other` is the open door, so it is
+/// the least specific; `mod` is the fallback for a clue that names no other kind.
+fn cause_specificity(cause: Cause) -> u8 {
+    match cause {
+        Cause::Other => 0,
+        Cause::Mod => 1,
+        _ => 2,
     }
 }
 

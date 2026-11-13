@@ -281,6 +281,9 @@ pub enum Effect {
         family: Family,
         candidate: OwnerOf,
         weight: u32,
+        /// What kind of cause this clue points at. Absent: the candidate's own default (`mod`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
     /// A statement for the user, in the rule's `text` unless it brings its own. A `root_cause`
     /// finding names a candidate, with a family and weight. A `mechanism` or `environment` one says

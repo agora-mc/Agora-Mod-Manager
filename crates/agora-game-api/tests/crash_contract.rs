@@ -1068,6 +1068,80 @@ fn a_non_mod_cause_naming_a_candidate_needs_an_explanation() {
 }
 
 #[test]
+fn a_signal_can_state_a_cause_and_an_unknown_one_is_refused() {
+    let rule = |cause: &str| {
+        format!(
+            r#"{{
+              "contract": 1,
+              "rules": [{{
+                "id": "r",
+                "version": 1,
+                "when": {{ "fact": {{ "kind": "core.frame", "ref": {{ "kind": "module", "bind": "m" }} }} }},
+                "effects": [{{ "signal": {{
+                  "family": "known_signature",
+                  "candidate": {{ "owner_of": "m" }},
+                  "weight": 6,
+                  "cause": "{cause}"
+                }} }}],
+                "text": {{ "headline": {{ "en": "A clue." }} }}
+              }}]
+            }}"#
+        )
+    };
+    let pack = lint_pack_json(&rule("version_mismatch")).expect("a known cause parses");
+    assert_eq!(
+        pack.rules[0].effects[0],
+        Effect::Signal {
+            family: Family::KnownSignature,
+            candidate: OwnerOf {
+                owner_of: "m".to_string()
+            },
+            weight: 6,
+            cause: Some(Cause::VersionMismatch),
+        }
+    );
+    assert!(
+        lint_pack_json(&rule("banana")).is_err(),
+        "an unknown cause is not a kind"
+    );
+}
+
+#[test]
+fn a_non_mod_signal_cause_needs_an_explanation() {
+    let rule = |why: &str| {
+        format!(
+            r#"{{
+              "contract": 1,
+              "rules": [{{
+                "id": "r",
+                "version": 1,
+                "when": {{ "fact": {{ "kind": "core.frame", "ref": {{ "kind": "module", "bind": "m" }} }} }},
+                "effects": [{{ "signal": {{
+                  "family": "known_signature",
+                  "candidate": {{ "owner_of": "m" }},
+                  "weight": 6,
+                  "cause": "save"
+                }} }}],
+                "text": {{ "headline": {{ "en": "A clue." }}{why} }}
+              }}]
+            }}"#
+        )
+    };
+    let bare = lint_pack_json(&rule("")).expect_err("no explanation is refused");
+    assert!(
+        bare.iter()
+            .any(|problem| problem.code == LintCode::BadEffect
+                && problem.message.contains("why_not_sure")),
+        "{bare:#?}"
+    );
+    assert!(
+        lint_pack_json(&rule(r#", "why_not_sure": { "en": "The log names the save it was reading, not the code that failed." }"#))
+            .is_ok(),
+        "an explanation lets a signal name a candidate"
+    );
+}
+
+#[test]
 fn an_extra_reader_may_not_emit_core_facts() {
     let output = ParserOutput {
         contract: CRASH_CONTRACT_VERSION,
