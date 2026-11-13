@@ -147,7 +147,7 @@ async function installHomeMock(page: Page, opts: HomeMockOptions = {}) {
           // Multi-session launch state is a list; the backend never returns null.
           if (command === 'query_launch_state') return Promise.resolve([]);
           if (command === 'list_instances') return Promise.resolve(instances);
-          if (command === 'check_instance_crash') return Promise.resolve(crashResult);
+          if (command === 'list_crash_answers') return Promise.resolve(crashResult ?? { answers: [], latestVerdict: null, retainedCrashes: 40 });
           if (command === 'check_instance_updates') {
             updateChecks += 1;
             return Promise.resolve(updatesResult);
@@ -232,9 +232,17 @@ test.describe('Home — zone A: Alerts', () => {
 
   test('crash alert shows View & restore when LKG exists', async ({ page }) => {
     const crashData = {
-      filename: 'crash-2026-07-12_10.05.23-server.txt',
-      modified_at: '2026-07-12T10:05:23Z',
-      size_bytes: 45210,
+      answers: [{
+        sessionId: 's1',
+        instanceId: 'inst-1',
+        verdict: { kind: 'crashed', how: 'pid' },
+        endedAt: '2026-07-12T10:05:23Z',
+        createdAt: '2026-07-12T10:06:00Z',
+        status: 'analyzed',
+        headline: 'The game crashed, and Example Mod is likely the cause.',
+      }],
+      latestVerdict: { kind: 'crashed', how: 'pid' },
+      retainedCrashes: 40,
     };
     const lkg = {
       currentLkgSnapshotId: 'snap-lkg-001',
@@ -264,7 +272,7 @@ test.describe('Home — zone A: Alerts', () => {
 
     // Crash alert
     await expect(page.getByText(/did not exit cleanly/)).toBeVisible();
-    await expect(page.getByText(/crash-2026-07-12_10.05.23-server\.txt/)).toBeVisible();
+    await expect(page.getByText(/Example Mod is likely the cause/)).toBeVisible();
 
     // Because LKG exists, the button says "View & restore"
     await expect(page.getByRole('button', { name: 'View & restore' })).toBeVisible();
@@ -272,9 +280,17 @@ test.describe('Home — zone A: Alerts', () => {
 
   test('crash alert shows View instance when LKG is absent', async ({ page }) => {
     const crashData = {
-      filename: 'crash-2026-07-12_10.05.23-server.txt',
-      modified_at: '2026-07-12T10:05:23Z',
-      size_bytes: 45210,
+      answers: [{
+        sessionId: 's1',
+        instanceId: 'inst-1',
+        verdict: { kind: 'crashed', how: 'pid' },
+        endedAt: '2026-07-12T10:05:23Z',
+        createdAt: '2026-07-12T10:06:00Z',
+        status: 'analyzed',
+        headline: 'The game crashed, and Example Mod is likely the cause.',
+      }],
+      latestVerdict: { kind: 'crashed', how: 'pid' },
+      retainedCrashes: 40,
     };
 
     await installHomeMock(page, {

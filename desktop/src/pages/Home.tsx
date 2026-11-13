@@ -4,7 +4,6 @@ import type { QuickPlay } from '@/lib/tauri';
 import { useRegistryState } from '../lib/useRegistryState';
 import { RegistryStatusView } from '../components/registry-status-view';
 import {
-  checkInstanceCrash,
   detectDrift,
   downloadSourceLabel,
   downloadSourcesOf,
@@ -28,6 +27,7 @@ import { GUIDE_OVERVIEW } from '../data/guideContent';
 import { healthCounts } from '@/lib/healthSummary';
 import { HealthNotice, ReviewBeforeLaunchButtons } from '../components/HealthLaunchControls';
 import { MoreGamesCard } from '../features/games/support/MoreGames';
+import { listCrashAnswers } from '../features/games/instances/crashAnswerApi';
 
 // ---------------------------------------------------------------------------
 // D1: Action-oriented Home
@@ -59,7 +59,7 @@ export function Home({
 
   const [instances, setInstances] = useState<InstanceRow[]>([]);
   const [instancesLoading, setInstancesLoading] = useState(true);
-  const [lastCrash, setLastCrash] = useState<{ instanceId: string; name: string; filename?: string } | null>(null);
+  const [lastCrash, setLastCrash] = useState<{ instanceId: string; name: string; headline?: string } | null>(null);
   const [knownGood, setKnownGood] = useState<{
     instanceId: string;
     instanceName: string;
@@ -90,8 +90,16 @@ export function Home({
         (a, b) => new Date(b.last_launched_at!).getTime() - new Date(a.last_launched_at!).getTime(),
       );
 
+      // The newest session's verdict decides whether Home warns. A stored answer is only kept
+      // for a session that crashed, so a normal ending hides the alert without guessing.
       const crashPromise = launched.length > 0
-        ? checkInstanceCrash(launched[0].instance_id).catch(() => null)
+        ? listCrashAnswers(launched[0].instance_id)
+            .then((list) => {
+              const kind = list.latestVerdict?.kind;
+              const crashed = kind === 'crashed' || kind === 'failed_to_start' || kind === 'froze';
+              return crashed ? list.answers[0] ?? null : null;
+            })
+            .catch(() => null)
         : Promise.resolve(null);
       const lkgPromise = (async () => {
         // Resolve exact promoted LKG pointers and current drift, never arbitrary snapshots.
@@ -132,7 +140,7 @@ export function Home({
 
       const [crash, lkgResults] = await Promise.all([crashPromise, lkgPromise]);
       if (crash) {
-        setLastCrash({ instanceId: launched[0].instance_id, name: launched[0].name, filename: crash.filename ?? undefined });
+        setLastCrash({ instanceId: launched[0].instance_id, name: launched[0].name, headline: crash.headline });
       } else {
         setLastCrash(null);
       }
@@ -293,7 +301,7 @@ export function Home({
       {lastCrash && (
         <CrashAlert
           instanceName={lastCrash.name}
-          crashFilename={lastCrash.filename}
+          headline={lastCrash.headline}
           canRestore={Boolean(crashKnownGood)}
           onRestore={() => {
             if (crashKnownGood) {
@@ -385,9 +393,9 @@ export function Home({
 // Card components
 // ---------------------------------------------------------------------------
 
-function CrashAlert({ instanceName, crashFilename, canRestore, onRestore }: {
+function CrashAlert({ instanceName, headline, canRestore, onRestore }: {
   instanceName: string;
-  crashFilename?: string;
+  headline?: string;
   canRestore: boolean;
   onRestore: () => void;
 }) {
@@ -395,7 +403,7 @@ function CrashAlert({ instanceName, crashFilename, canRestore, onRestore }: {
     <div className="rounded-lg border border-destructive bg-destructive/10 p-3 flex items-center justify-between gap-3">
       <div className="text-xs text-destructive flex-1">
         <span className="font-semibold">{instanceName}</span> did not exit cleanly.
-        {crashFilename && <span className="text-muted-foreground ml-1">({crashFilename})</span>}
+        {headline && <span className="text-muted-foreground ml-1">{headline}</span>}
       </div>
       <button onClick={onRestore} className="rounded-lg bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground hover:bg-destructive/90">
         {canRestore ? 'View & restore' : 'View instance'}

@@ -37,6 +37,7 @@ import { HealthDialog } from './components/HealthDialog';
 import { ControlifyOfferDialog } from './components/controller/ControlifyOfferDialog';
 import { InstallFlow } from './components/InstallFlow';
 import { CrashInvestigator } from './components/CrashInvestigator';
+import { requestEditorTab } from './lib/editorDeepLink';
 import { showToast, ToastContainer } from './components/Toast';
 import { useDestination, type Destination, type GameTabId, type Tab } from './lib/useDestination';
 import { MINECRAFT_GAME_ID } from './features/games/shared/types';
@@ -340,7 +341,6 @@ function AppContent() {
   const [shellLayout, setShellLayout] = useState<ShellLayout>(loadShellLayout);
   const [crashInvestigation, setCrashInvestigation] = useState<{
     instanceId: string;
-    crashFilename: string | null;
     manualLogText: string | null;
     directLaunch: boolean;
   } | null>(null);
@@ -929,7 +929,6 @@ function AppContent() {
     void resolveDirectLaunch(instanceId).then((directLaunch) => {
       setCrashInvestigation({
         instanceId,
-        crashFilename: null,
         manualLogText: null,
         directLaunch,
       });
@@ -1305,7 +1304,6 @@ function AppContent() {
         {crashInvestigation && (
           <CrashInvestigator
             instanceId={crashInvestigation.instanceId}
-            crashFilename={crashInvestigation.crashFilename}
             manualLogText={crashInvestigation.manualLogText}
             onClose={() => setCrashInvestigation(null)}
             onLaunch={(onAwaitingHealth) => launchDetailedWithControlify(
@@ -1314,6 +1312,28 @@ function AppContent() {
               onAwaitingHealth,
             )}
             processState={processState}
+            onOpenContent={() => {
+              const id = crashInvestigation.instanceId;
+              setCrashInvestigation(null);
+              requestEditorTab('mods');
+              navigateToInstanceDetail(id);
+            }}
+            onOpenJvmSettings={() => {
+              const id = crashInvestigation.instanceId;
+              setCrashInvestigation(null);
+              requestEditorTab('java-args');
+              navigateToInstanceDetail(id);
+            }}
+            onOpenConsole={() => {
+              const id = crashInvestigation.instanceId;
+              setCrashInvestigation(null);
+              requestEditorTab('console');
+              navigateToInstanceDetail(id);
+            }}
+            onOpenBrowse={() => {
+              setCrashInvestigation(null);
+              navigateToTab('browse');
+            }}
           />
         )}
       </div>

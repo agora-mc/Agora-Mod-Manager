@@ -249,6 +249,33 @@ describe('the primary button', () => {
   });
 });
 
+describe('actions on a rule', () => {
+  it('renders each action with the pack’s words and reports it', () => {
+    let offered: string | null = null;
+    renderView({
+      status: 'analyzed',
+      answer: answer({
+        actions: [{
+          action: { kind: 'install_content', content_key: 'example-api', label: { en: 'Install Example API' } },
+          source,
+        }],
+      }),
+      onAction: (offer) => { offered = offer.action.kind; },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Install Example API' }));
+    expect(offered).toBe('install_content');
+  });
+
+  it('uses a plain label when the pack gave none', () => {
+    renderView({
+      status: 'analyzed',
+      answer: answer({ actions: [{ action: { kind: 'open_console' }, source }] }),
+      onAction: () => undefined,
+    });
+    expect(screen.getByRole('button', { name: 'Open console' })).toBeInTheDocument();
+  });
+});
+
 describe('could not check', () => {
   it('is collapsed until opened, then names each reason', () => {
     renderView({

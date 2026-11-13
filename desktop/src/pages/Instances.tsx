@@ -89,7 +89,6 @@ export function Instances({
   onKillProcess: () => Promise<void>;
   onStartCrashInvestigation: (investigation: {
     instanceId: string;
-    crashFilename: string | null;
     manualLogText: string | null;
     directLaunch: boolean;
   }) => void;
@@ -302,7 +301,6 @@ export function Instances({
   const openCrashInvestigator = (instanceId: string) => {
     onStartCrashInvestigation({
       instanceId,
-      crashFilename: null,
       manualLogText: null,
       directLaunch,
     });

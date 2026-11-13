@@ -1323,19 +1323,6 @@ export const getAuthStatus = () => invoke<boolean>('get_auth_status');
 export const getGithubProfile = () =>
   invoke<GithubProfile | null>('get_github_profile');
 
-export interface CrashReportInfo {
-  filename: string;
-  modified_at: string;
-  size_bytes: number;
-}
-
-export interface CrashTriageResult {
-  matched: boolean;
-  signature_name: string | null;
-  solution_markdown: string | null;
-  action_button_json: string | null;
-}
-
 export type EvidenceSourceKind =
   | 'CrashReport'
   | 'LatestLog'
@@ -1368,24 +1355,12 @@ export interface CrashInvestigation {
     any_stale: boolean;
     failure_category: 'CrashReport' | 'Oom' | 'JvmFatal' | 'NoEvidence';
   };
-  fingerprint: CrashFingerprint | null;
-  triage: CrashTriageResult;
   suspects: SuspectScore[];
   failure_category: 'CrashReport' | 'Oom' | 'JvmFatal' | 'NoEvidence';
 }
 
-export const checkInstanceCrash = (instanceId: string) =>
-  invoke<CrashReportInfo | null>('check_instance_crash', { instanceId });
-export const triageCrashReport = (instanceId: string, filename: string) =>
-  invoke<CrashTriageResult>('triage_crash_report', { instanceId, filename });
-export const listCrashReports = (instanceId: string) =>
-  invoke<CrashReportInfo[]>('list_crash_reports_cmd', { instanceId });
-export const readCrashLog = (instanceId: string, filename: string) =>
-  invoke<string>('read_crash_log_cmd', { instanceId, filename });
 export const investigateInstanceEvidence = (instanceId: string) =>
   invoke<CrashInvestigation>('investigate_instance_evidence', { instanceId });
-export const pickAndInvestigateCrashEvidence = (instanceId: string) =>
-  invoke<CrashInvestigation | null>('pick_and_investigate_crash_evidence', { instanceId });
 
 export interface ModVersionCandidate {
   version: string;
@@ -2158,11 +2133,6 @@ export const listModReviews = (itemId: string) =>
 
 // --- Crash Investigation (guided isolation) ---
 
-export interface CrashFingerprint {
-  exception_class: string;
-  top_frames: string[];
-}
-
 export interface SuspectScore {
   mod_id: string;
   filename: string;
@@ -2175,22 +2145,16 @@ export interface SuspectScore {
 
 export type SuggestedAction =
   | { kind: 'GuidedDisable'; next_suspect: SuspectScore }
-  | { kind: 'ConfidenceAutoDisable'; mod_id: string; filename: string }
   | { kind: 'NoSuspects' };
 
 export interface InvestigationResult {
-  fingerprint: CrashFingerprint | null;
-  signature_name: string | null;
   suspects: SuspectScore[];
   suggested_action: SuggestedAction;
   ruled_out: string[];
 }
 
-export const investigateCrash = (instanceId: string, filename?: string) =>
-  invoke<InvestigationResult>('investigate_crash', { instanceId, filename });
-
-export const investigateManual = (instanceId: string, logText: string) =>
-  invoke<InvestigationResult>('investigate_manual', { instanceId, logText });
+export const investigateCrash = (instanceId: string) =>
+  invoke<InvestigationResult>('investigate_crash', { instanceId });
 
 export const disableModForTest = (instanceId: string, filename: string) =>
   invoke<void>('disable_mod_for_test', { instanceId, filename });
@@ -2198,21 +2162,20 @@ export const disableModForTest = (instanceId: string, filename: string) =>
 export const enableModForTest = (instanceId: string, filename: string) =>
   invoke<void>('enable_mod_for_test', { instanceId, filename });
 
-export const confirmCrashFix = (fingerprint: CrashFingerprint, modId: string) =>
-  invoke<void>('confirm_crash_fix', { fingerprint, modId });
+/** Record the user's confirmed fix under the crash bucket, so a later diagnosis of the same
+ * bucket gets boost-only local-memory evidence. */
+export const confirmCrashFix = (bucket: string, ownerKey: string) =>
+  invoke<void>('confirm_crash_fix', { bucket, ownerKey });
 
-export const reportStillCrashing = (
-  instanceId: string,
-  fingerprint: CrashFingerprint,
-  ruledOutModId: string,
-  crashLogText: string,
-) =>
+export const reportStillCrashing = (instanceId: string, ruledOutOwnerKey: string) =>
   invoke<InvestigationResult>('report_still_crashing', {
     instanceId,
-    fingerprint,
-    ruledOutModId,
-    crashLogText,
+    ruledOutOwnerKey,
   });
+
+/** The file an engine suspect provides, so the experiment flow can disable it. */
+export const resolveCrashSuspectFile = (instanceId: string, ownerKey: string) =>
+  invoke<string>('resolve_crash_suspect_file', { instanceId, ownerKey });
 
 // --- Dependency Plans (PREVIEW) ---
 
@@ -2350,7 +2313,8 @@ export const regenerateMCPToken = () => invoke<McpTokenData>('regenerate_mcp_tok
 export interface CrashReportContext {
   instance_id: string | null;
   crash_log: string | null;
-  crash_signatures: string | null;
+  /** The engine answer, rendered as text. */
+  answer: string | null;
   suspects: string | null;
 }
 

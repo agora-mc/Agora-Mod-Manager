@@ -1,243 +1,233 @@
 import { test, expect, type Page } from '@playwright/test';
 
-const RECOVERY_SNAPSHOT_ID = 'snap-recovery-001';
+/**
+ * The Crash Doctor is the engine answer screen for Minecraft plus its test-it flow. Every command
+ * the page calls is answered from the table below; anything else returns null and would crash a
+ * page that reads it. The names are invented, as are the logs and files.
+ */
 
-// ---------------------------------------------------------------------------
-// Single addInitScript — config passed as JSON string to avoid structured-clone
-// data loss for nested objects.
-// ---------------------------------------------------------------------------
+async function installMock(page: Page) {
+  await page.addInitScript(() => {
+    const callbacks = new Map<number, (...a: unknown[]) => void>();
+    let callbackId = 0;
+    const eventListeners = new Map<string, number>();
+    const commandCalls: Record<string, number> = {};
+    const lastArgs: Record<string, Record<string, unknown>> = {};
 
-interface CrashCfg {
-  healthOk?: boolean;
-  healthWarning?: boolean;
-  withDependents?: boolean;
-  snapshotId?: string;
-  investigateError?: string;
-  exportFail?: boolean;
-  noSuspects?: boolean;
-  noLogs?: boolean;
-  stillCrashingSuspects?: number;
-  stillCrashingRuledOut?: string;
-  launchError?: string;
-  underReview?: boolean;
-}
+    const instanceRow = {
+      instance_id: 'crash-test-instance',
+      name: 'Crash Test',
+      loader: 'fabric',
+      loader_version: '0.16',
+      minecraft_version: '1.21',
+      is_locked: false,
+      last_launched_at: null,
+    };
 
-async function installMock(page: Page, cfg: CrashCfg = {}) {
-  const defaults: Required<CrashCfg> = {
-    healthOk: true,
-    healthWarning: false,
-    withDependents: false,
-    snapshotId: RECOVERY_SNAPSHOT_ID,
-    investigateError: '',
-    exportFail: false,
-    noSuspects: false,
-    noLogs: false,
-    stillCrashingSuspects: 1,
-    stillCrashingRuledOut: 'suspect-mod',
-    launchError: '',
-    underReview: false,
-  };
-  const merged = { ...defaults, ...cfg };
+    const internals = {
+      transformCallback(cb: (...a: unknown[]) => void) {
+        const id = ++callbackId;
+        callbacks.set(id, cb);
+        return id;
+      },
+      unregisterCallback(id: number) { callbacks.delete(id); },
+      invoke(command: string, args: Record<string, unknown> = {}) {
+        commandCalls[command] = (commandCalls[command] ?? 0) + 1;
+        lastArgs[command] = { ...args };
 
-  await page.addInitScript(
-    (payload: string) => {
-      const cfg: Required<CrashCfg> = JSON.parse(payload);
+        if (command === 'get_setting') {
+          const key = args.key as string;
+          if (key === 'onboarding_complete') return Promise.resolve(true);
+          if (key === 'launch_mode') return Promise.resolve('direct');
+          if (key === 'modrinth_enabled') return Promise.resolve(true);
+          if (key === 'last_home_visit') return Promise.resolve(null);
+          return Promise.resolve(false);
+        }
+        if (command === 'set_setting') return Promise.resolve(null);
+        if (command === 'get_windows_accent_color') return Promise.resolve(null);
+        if (command === 'get_registry_status') return Promise.resolve({ has_cached_db: true, cached_tag: 'test', cached_schema_version: 5, latest_tag: 'test', update_available: false, checked: true, message: 'Catalog ready.' });
+        if (command === 'check_registry_update') return Promise.resolve(null);
+        if (command === 'list_categories') return Promise.resolve([]);
+        if (command === 'list_manifest_loaders') return Promise.resolve([]);
+        if (command === 'list_manifest_mc_versions') return Promise.resolve([]);
+        if (command === 'for_you_items') return Promise.resolve([]);
+        if (command === 'browse_search') return Promise.resolve({ items: [], total: 0, page: 0, hasMore: false });
+        if (command === 'query_launch_state') return Promise.resolve([]);
+        if (command === 'check_all_instance_health') return Promise.resolve([]);
 
-      const callbacks = new Map<number, (...a: unknown[]) => void>();
-      let callbackId = 0;
-      const eventListeners = new Map<string, number>();
-      const commandCalls: Record<string, number> = {};
-      const lastArgs: Record<string, Record<string, unknown>> = {};
+        if (command === 'plugin:event|listen') {
+          eventListeners.set(args.event as string, args.handler as number);
+          return Promise.resolve(1);
+        }
+        if (command === 'plugin:event|unlisten') return Promise.resolve(1);
+        if (command.startsWith('plugin:event|')) return Promise.resolve(1);
+        if (command.startsWith('plugin:sql|')) return Promise.resolve(null);
+        if (command.startsWith('plugin:dialog|')) return Promise.resolve(null);
 
-      // Pre-built suspect data (immune to structured-clone issues)
-      const SUSPECT_1 = { mod_id: 'suspect-mod', filename: 'suspect-mod.jar', total_score: 0.85, breakdown: { stack_frame_score: 0.65, curated_conflict_score: 0.2 }, is_dependent_of: null, under_review: cfg.underReview };
-      const SUSPECT_2 = { mod_id: 'second-suspect', filename: 'second-suspect.jar', total_score: 0.45, breakdown: { stack_frame_score: 0.3, prior_local_crashes: 0.15 }, is_dependent_of: null };
+        if (command === 'list_instances') return Promise.resolve([instanceRow]);
+        if (command === 'check_instance_updates') return Promise.resolve([]);
+        if (command === 'get_lkg_marker') return Promise.resolve(null);
+        if (command === 'list_snapshots') return Promise.resolve([]);
+        if (command === 'detect_drift') return Promise.resolve({ added: [], removed: [], modified: [] });
 
-      function makeInitialResult() {
-        if (cfg.noSuspects) return { fingerprint: null, signature_name: null, suspects: [], suggested_action: { kind: 'NoSuspects' }, ruled_out: [] };
-        return { fingerprint: { exception_class: 'java.lang.NullPointerException', top_frames: ['test'] }, signature_name: 'NullPointerException in rendering', suspects: [SUSPECT_1, SUSPECT_2], suggested_action: { kind: 'GuidedDisable', next_suspect: SUSPECT_1 }, ruled_out: [] };
-      }
+        if (command === 'list_crash_answers') return Promise.resolve(listReplyFromScript());
+        if (command === 'get_crash_answer') return Promise.resolve(detailReplyFromScript());
+        if (command === 'analyze_crash_text') {
+          return Promise.resolve({ status: 'analyzed', answer: pastedAnswerFromScript(), bucket: 'pasted-bucket' });
+        }
+        if (command === 'analyze_crash_file') {
+          return Promise.resolve({ status: 'analyzed', answer: pastedAnswerFromScript(), bucket: 'file-bucket' });
+        }
+        if (command === 'reveal_crash_artifact') return Promise.resolve(null);
+        if (command === 'read_crash_artifact') return Promise.resolve('invented crash log');
 
-      function makeStillCrashingResult() {
-        const suspects = cfg.stillCrashingSuspects > 0 ? [SUSPECT_2] : [];
-        const ruledOut = cfg.stillCrashingRuledOut ? cfg.stillCrashingRuledOut.split(',') : [];
-        const top = suspects[0] ?? null;
-        return { fingerprint: top ? { exception_class: 'java.lang.RuntimeException', top_frames: ['test'] } : null, signature_name: top ? 'RuntimeException in physics' : null, suspects, suggested_action: top ? { kind: 'GuidedDisable', next_suspect: top } : { kind: 'NoSuspects' }, ruled_out: ruledOut };
-      }
-
-      const initialResult = makeInitialResult();
-      const stillCrashingResult = makeStillCrashingResult();
-      const evidenceResult = {
-        evidence: {
-          sources: cfg.noLogs ? [] : [{
-            meta: {
-              basename: 'latest.log', kind: 'LatestLog', size_bytes: 120,
-              truncated: false, stale: false, supplementary: false,
-              modified_at: '2026-07-12T18:00:00Z', line_count: 3,
+        if (command === 'investigate_crash') {
+          return Promise.resolve({
+            suspects: [
+              { mod_id: 'item:mods/example.jar:abc', filename: 'example.jar', total_score: 9, breakdown: {}, is_dependent_of: null, under_review: false },
+              { mod_id: 'item:mods/second.jar:def', filename: 'second.jar', total_score: 4, breakdown: {}, is_dependent_of: null, under_review: false },
+            ],
+            suggested_action: {
+              kind: 'GuidedDisable',
+              next_suspect: { mod_id: 'item:mods/example.jar:abc', filename: 'example.jar', total_score: 9, breakdown: {}, is_dependent_of: null, under_review: false },
             },
-            text: 'Mock crash log:\njava.lang.NullPointerException\n\tat net.minecraft.class_123',
-          }],
-          primary_index: 0,
-          aggregate_bytes: 120,
-          any_truncated: false,
-          any_stale: false,
-          failure_category: 'CrashReport',
-        },
-        fingerprint: initialResult.fingerprint,
-        triage: {
-          matched: !cfg.noSuspects,
-          signature_name: initialResult.signature_name,
-          solution_markdown: cfg.noSuspects ? null : 'Disable the identified rendering mod and test again.',
-          action_button_json: null,
-        },
-        suspects: initialResult.suspects,
-        failure_category: 'CrashReport',
+            ruled_out: [],
+          });
+        }
+        if (command === 'resolve_crash_suspect_file') return Promise.resolve('example.jar');
+        if (command === 'get_disable_plan') return Promise.resolve({ dependents: [] });
+        if (command === 'disable_mod_for_test') return Promise.resolve(null);
+        if (command === 'enable_mod_for_test') return Promise.resolve(null);
+        if (command === 'confirm_crash_fix') return Promise.resolve(null);
+        if (command === 'report_still_crashing') {
+          return Promise.resolve({
+            suspects: [
+              { mod_id: 'item:mods/second.jar:def', filename: 'second.jar', total_score: 4, breakdown: {}, is_dependent_of: null, under_review: false },
+            ],
+            suggested_action: {
+              kind: 'GuidedDisable',
+              next_suspect: { mod_id: 'item:mods/second.jar:def', filename: 'second.jar', total_score: 4, breakdown: {}, is_dependent_of: null, under_review: false },
+            },
+            ruled_out: ['item:mods/example.jar:abc'],
+          });
+        }
+
+        if (command === 'create_snapshot') {
+          return Promise.resolve({ id: 'snap-1', label: 'Recovery snapshot', created_at: '2026-11-12T21:00:00Z', file_count: 1, size_estimate: 1024, is_lkg: false, is_current_lkg: false, is_pre_restore: false });
+        }
+        if (command === 'delete_snapshot') return Promise.resolve(null);
+        if (command === 'restore_snapshot') return Promise.resolve(null);
+
+        if (command === 'check_instance_health') {
+          return Promise.resolve({ score: 'green', blockers: [], warnings: [], recommendations: [], scan_token: 'scan' });
+        }
+        if (command === 'launch_instance_direct') return Promise.resolve(4242);
+        if (command === 'launch_instance') return Promise.resolve(null);
+
+        if (command === 'export_crash_report') return Promise.resolve('# Minecraft crash report\n## Agora\'s Crash Answer');
+
+        return Promise.resolve(null);
+      },
+    };
+
+    // The constants above are serialized through the page's own copy; these small builders keep
+    // the shapes readable without relying on closures from the test process.
+    function listReplyFromScript() {
+      return {
+        answers: [{
+          sessionId: 'session-42',
+          instanceId: 'crash-test-instance',
+          verdict: { kind: 'crashed', how: 'pid' },
+          endedAt: '2026-11-12T21:14:00Z',
+          createdAt: '2026-11-12T21:15:00Z',
+          status: 'analyzed',
+          headline: 'The game crashed, and Example Mod is likely the cause.',
+          level: 'likely',
+          cause: 'mod',
+        }],
+        latestVerdict: { kind: 'crashed', how: 'pid' },
+        retainedCrashes: 40,
       };
+    }
 
-      const instanceRow = { instance_id: 'crash-test-instance', name: 'Crash Test', loader: 'fabric', loader_version: '0.16', minecraft_version: '1.21', is_locked: false, last_launched_at: null };
-
-      const internals = {
-        transformCallback(cb: (...a: unknown[]) => void) { const id = ++callbackId; callbacks.set(id, cb); return id; },
-        unregisterCallback(id: number) { callbacks.delete(id); },
-        invoke(command: string, args: Record<string, unknown> = {}) {
-          commandCalls[command] = (commandCalls[command] ?? 0) + 1;
-          lastArgs[command] = { ...args };
-
-          if (command === 'get_setting') {
-            const key = args.key as string;
-            if (key === 'onboarding_complete') return Promise.resolve(true);
-            if (key === 'launch_mode') return Promise.resolve('direct');
-            if (key === 'modrinth_enabled') return Promise.resolve(true);
-            if (key === 'last_home_visit') return Promise.resolve(null);
-            return Promise.resolve(false);
-          }
-          if (command === 'export_crash_report') {
-            if (cfg.exportFail) return Promise.reject(new Error('ERR_EXPORT_FAILED'));
-            return Promise.resolve('# Minecraft crash report' + String.fromCharCode(10) + '## Crash Log');
-          }
-          if (command === 'set_setting') return Promise.resolve(null);
-          if (command === 'get_windows_accent_color') return Promise.resolve(null);
-          if (command === 'get_registry_status') return Promise.resolve({ has_cached_db: true, cached_tag: 'test', cached_schema_version: 5, latest_tag: 'test', update_available: false, checked: true, message: 'Catalog ready.' });
-          if (command === 'check_registry_update') return Promise.resolve(null);
-          if (command === 'list_categories') return Promise.resolve([]);
-          if (command === 'list_manifest_loaders') return Promise.resolve([]);
-          if (command === 'list_manifest_mc_versions') return Promise.resolve([]);
-          if (command === 'for_you_items') return Promise.resolve([]);
-          if (command === 'browse_search') return Promise.resolve({ items: [], total: 0, page: 0, hasMore: false });
-          if (command === 'query_launch_state') return Promise.resolve([]);
-
-          if (command === 'plugin:event|listen') { eventListeners.set(args.event as string, args.handler as number); return Promise.resolve(1); }
-          if (command === 'plugin:event|unlisten') return Promise.resolve(1);
-          if (command.startsWith('plugin:event|')) return Promise.resolve(1);
-          if (command.startsWith('plugin:sql|')) return Promise.resolve(null);
-
-          if (command === 'list_instances') return Promise.resolve([instanceRow]);
-          if (command === 'check_instance_crash') return Promise.resolve(null);
-          if (command === 'check_instance_updates') return Promise.resolve([]);
-          if (command === 'get_lkg_marker') return Promise.resolve(null);
-          if (command === 'list_snapshots') return Promise.resolve([]);
-          if (command === 'detect_drift') return Promise.resolve({ added: [], removed: [], modified: [] });
-
-          if (command === 'create_snapshot') {
-            if (!cfg.snapshotId) return Promise.reject(new Error('Snapshot creation failed'));
-            return Promise.resolve({ id: cfg.snapshotId, label: (args.label as string) ?? 'Recovery snapshot', created_at: '2026-07-12T18:00:00Z', file_count: 42, size_estimate: 2_500_000, is_lkg: false, is_current_lkg: false, is_pre_restore: false });
-          }
-          if (command === 'restore_snapshot') { lastArgs['restore_snapshot'].restoredId = args.snapshotId as string; return Promise.resolve(null); }
-
-          if (command === 'investigate_manual') {
-            if (cfg.investigateError) return Promise.reject(new Error(cfg.investigateError));
-            return Promise.resolve(initialResult);
-          }
-          if (command === 'investigate_crash') {
-            if (cfg.investigateError) return Promise.reject(new Error(cfg.investigateError));
-            return Promise.resolve(initialResult);
-          }
-          if (command === 'investigate_instance_evidence') {
-            if (cfg.investigateError) return Promise.reject(new Error(cfg.investigateError));
-            return Promise.resolve(evidenceResult);
-          }
-          if (command === 'pick_and_investigate_crash_evidence') return Promise.resolve(evidenceResult);
-          if (command === 'read_crash_log') return Promise.resolve('Mock crash log:\njava.lang.NullPointerException\n\tat net.minecraft.class_123');
-
-          if (command === 'get_disable_plan') {
-            if (cfg.withDependents) return Promise.resolve({ dependents: [{ mod_id: 'dependent-mod', filename: 'dependent-mod.jar', requirement: 'required', source: 'jar' }] });
-            return Promise.resolve({ dependents: [] });
-          }
-          if (command === 'disable_mod_for_test') return Promise.resolve(null);
-          if (command === 'enable_mod_for_test') return Promise.resolve(null);
-
-          if (command === 'confirm_crash_fix') return Promise.resolve(null);
-          if (command === 'report_still_crashing') return Promise.resolve(stillCrashingResult);
-
-          if (command === 'check_instance_health') {
-            return Promise.resolve({
-              score: cfg.healthWarning ? 'yellow' : cfg.healthOk ? 'green' : 'red',
-              blockers: cfg.healthOk || cfg.healthWarning ? [] : [{ kind: 'incompatible_mod', mod_id: 'blocker-mod', filename: 'blocker.jar', message: 'Health blocker', suggested_action: null }],
-              warnings: cfg.healthWarning ? [{ kind: 'unknown_mod', mod_id: 'warning-mod', filename: 'warning.jar', message: 'Review this warning', suggested_action: null }] : [],
-              recommendations: [],
-              scan_token: 'crash-e2e-scan',
-            });
-          }
-          if (command === 'launch_instance_direct') {
-            if (cfg.launchError) return Promise.reject(new Error(cfg.launchError));
-            return Promise.resolve(4242);
-          }
-          if (command === 'launch_instance') return Promise.resolve(null);
-
-          return Promise.resolve(null);
-        },
+    function detailReplyFromScript() {
+      return {
+        sessionId: 'session-42',
+        instanceId: 'crash-test-instance',
+        verdict: { kind: 'crashed', how: 'pid' },
+        endedAt: '2026-11-12T21:14:00Z',
+        createdAt: '2026-11-12T21:15:00Z',
+        status: 'analyzed',
+        answer: answerFromScript(),
+        bucket: 'bucket-1',
+        changes: [],
       };
+    }
 
-      Object.assign(window as unknown as Record<string, unknown>, {
-        __TAURI_INTERNALS__: internals,
-        __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener() {} },
-        __commandCalls: commandCalls,
-        __lastCommandArgs: lastArgs,
-        __tauriEventListeners: eventListeners,
-        __callbacks: callbacks,
-      });
-    },
-    JSON.stringify(merged),
-  );
+    function answerFromScript() {
+      return {
+        contract: 1,
+        verdict: { kind: 'crashed', how: 'pid' },
+        headline: { en: 'The game crashed, and Example Mod is likely the cause.' },
+        level: 'likely',
+        cause: 'mod',
+        candidates: [
+          { owner: { kind: 'item', key: 'mods/example.jar:abc', name: 'Example Mod' }, level: 'likely', score: 9, cause: 'mod', families: ['execution'], sources: [sourceFromScript()], save_risk: 'unknown' },
+          { owner: { kind: 'item', key: 'mods/second.jar:def', name: 'Second Mod' }, level: 'possible', score: 4, cause: 'mod', families: ['known_signature'], sources: [sourceFromScript()] },
+          { owner: { kind: 'framework', name: 'Invented Engine' }, level: 'possible', score: 3, cause: 'mod', role: 'framework', families: ['execution'], sources: [sourceFromScript()] },
+        ],
+        findings: [],
+        inspections: [],
+        could_not_check: [],
+        trust_notes: [],
+        next: { kind: 'confirm_experiment', keys: ['mods/example.jar:abc'] },
+        repairs: [],
+        actions: [{ action: { kind: 'open_crash_log' }, source: sourceFromScript() }],
+        artifacts: [{ id: 'log-1', name: 'crash-2026-11-12-21-14.log', size: 48_320, privacy: 'personal', retained: { kind: 'whole' } }],
+      };
+    }
+
+    function sourceFromScript() {
+      return {
+        plugin_id: 'agora.minecraft',
+        plugin_name: 'Minecraft crash rules',
+        plugin_version: '0.1.0',
+        rule_id: 'invented_rule',
+        rule_version: 1,
+      };
+    }
+
+    function pastedAnswerFromScript() {
+      const value = answerFromScript();
+      value.headline = { en: 'The pasted log names Example Mod.' };
+      return value;
+    }
+
+    Object.assign(window as unknown as Record<string, unknown>, {
+      __TAURI_INTERNALS__: internals,
+      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener() {} },
+      __commandCalls: commandCalls,
+      __lastCommandArgs: lastArgs,
+      __tauriEventListeners: eventListeners,
+      __callbacks: callbacks,
+    });
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-async function getCalls(page: Page) {
-  return page.evaluate(() => (window as any).__commandCalls as Record<string, number>);
-}
-async function getArgs(page: Page) {
-  return page.evaluate(() => (window as any).__lastCommandArgs as Record<string, Record<string, unknown>>);
-}
-
-async function openDialog(page: Page) {
+async function openDoctor(page: Page) {
   await page.goto('/');
   await page.getByRole('button', { name: 'My Instances' }).click();
-  await expect(page.getByRole('button', { name: 'Troubleshoot' })).toBeVisible({ timeout: 10000 });
+  await expect(page.getByRole('button', { name: 'Troubleshoot' })).toBeVisible({ timeout: 10_000 });
   await page.getByRole('button', { name: 'Troubleshoot' }).click();
-  await expect(page.getByRole('heading', { name: 'Crash Doctor' })).toBeVisible({ timeout: 5000 });
-}
-
-async function waitForContent(page: Page) {
-  await expect(
-    page.getByText(/Mods that might be causing this/).or(page.getByText(/We couldn’t tell which mod caused this/)),
-  ).toBeVisible({ timeout: 10000 });
-}
-
-async function relaunch(page: Page) {
-  await page.getByRole('button', { name: /Try without/ }).first().click();
-  await finishSuccessfulLaunch(page);
+  await expect(page.getByRole('heading', { name: 'Crash Doctor' })).toBeVisible({ timeout: 5_000 });
 }
 
 async function finishSuccessfulLaunch(page: Page) {
   const waiting = page.getByText(/Game is running without/);
-  await expect(waiting.or(page.getByText(/The game didn’t start for the test/))).toBeVisible({ timeout: 8000 });
-  if (await waiting.count() === 0) return;
+  await expect(waiting).toBeVisible({ timeout: 8_000 });
   await page.evaluate(() => {
-    const listeners = (window as any).__tauriEventListeners as Map<string, number>;
-    const callbacks = (window as any).__callbacks as Map<number, (...args: unknown[]) => void>;
+    const listeners = (window as unknown as { __tauriEventListeners: Map<string, number> }).__tauriEventListeners;
+    const callbacks = (window as unknown as { __callbacks: Map<number, (...args: unknown[]) => void> }).__callbacks;
     const handlerId = listeners.get('game-exited');
     const callback = handlerId == null ? undefined : callbacks.get(handlerId);
     callback?.({
@@ -251,333 +241,81 @@ async function finishSuccessfulLaunch(page: Page) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+async function calls(page: Page) {
+  return page.evaluate(() => (window as unknown as { __commandCalls: Record<string, number> }).__commandCalls);
+}
+
+async function lastArgs(page: Page) {
+  return page.evaluate(() => (window as unknown as { __lastCommandArgs: Record<string, Record<string, unknown>> }).__lastCommandArgs);
+}
 
 test.describe('CrashInvestigator', () => {
-  test('defers recovery snapshot during read-only analysis', async ({ page }) => {
+  test.beforeEach(async ({ page }) => {
     await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    const calls = await getCalls(page);
-    expect(calls['create_snapshot'] ?? 0).toBe(0);
   });
 
-  test('snapshot failure shows error state', async ({ page }) => {
-    await installMock(page, { snapshotId: '' });
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByText('Snapshot creation failed')).toBeVisible({ timeout: 8000 });
+  test('shows the stored engine answer for the newest crashed session', async ({ page }) => {
+    await openDoctor(page);
+    await expect(page.getByTestId('crash-headline')).toContainText('Example Mod is likely the cause');
+    await expect(page.getByTestId('crash-save-warning')).toContainText(
+      'Removing a mod partway through a playthrough can damage your save.',
+    );
+    const suspects = page.getByTestId('crash-suspect');
+    await expect(suspects).toHaveCount(3);
+    await expect(suspects.first()).toContainText('Example Mod');
+    await expect(page.getByText('Invented Engine')).toBeVisible();
   });
 
-  test('displays suspects with readable cues', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await expect(page.getByText('0.85')).toBeVisible();
-    await expect(page.getByText('0.45')).toBeVisible();
-    // Breakdown gibberish (A/B/C etc) was removed for user-friendly UI — ensure it's not shown
-    await expect(page.getByText('ubiquity dampener')).toHaveCount(0);
-    await expect(page.getByText('conflict pairs')).toHaveCount(0);
-    await expect(page.getByText('Looks like the most likely cause').first()).toBeVisible();
+  test('a pasted log runs through analyze_crash_text and shows its answer', async ({ page }) => {
+    await openDoctor(page);
+    await page.getByRole('button', { name: 'Check another crash log' }).click();
+    await page.getByPlaceholder('Paste the crash log here').fill('invented pasted crash text');
+    await page.getByRole('button', { name: 'Check this text' }).click();
+    await expect(page.getByTestId('crash-headline')).toContainText('The pasted log names Example Mod.');
+    expect((await calls(page)).analyze_crash_text).toBe(1);
   });
 
-  test('a suspect under curator review can still be tested', async ({ page }) => {
-    await installMock(page, { underReview: true });
-    await openDialog(page);
-    await waitForContent(page);
-    await expect(page.getByText('curators are reviewing this project')).toHaveCount(1);
-    await expect(page.getByRole('button', { name: /Try without "suspect-mod\.jar"/ })).toBeVisible();
+  test('an action button calls the existing handler', async ({ page }) => {
+    await openDoctor(page);
+    await page.getByRole('button', { name: 'Open crash log' }).click();
+    const args = await lastArgs(page);
+    expect(args.reveal_crash_artifact).toMatchObject({ sessionId: 'session-42', artifactId: 'log-1' });
   });
 
-  test('displays exception class and signature name', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await expect(page.getByText(/Error: java\.lang\.NullPointerException/).first()).toBeVisible();
-    await expect(page.getByText('NullPointerException in rendering')).toBeVisible();
-  });
-
-  test('nothing-detected wording when the logs show no crash', async ({ page }) => {
-    await installMock(page, { noSuspects: true });
-    await openDialog(page);
-    await expect(page.getByText(/We didn’t detect a problem automatically, but let’s diagnose it/)).toBeVisible({ timeout: 10000 });
-    // The generic "couldn't tell" card would only repeat the header.
-    await expect(page.getByText(/We couldn’t tell which mod caused this/)).toHaveCount(0);
-  });
-
-  test('says plainly when there were no crash logs to read', async ({ page }) => {
-    await installMock(page, { noLogs: true, noSuspects: true });
-    await openDialog(page);
-    await expect(page.getByText('No crash logs yet: this checks what happened in a crashed game, not whether the setup is ready')).toBeVisible();
-    await expect(page.getByText(/We checked 0 files/)).toHaveCount(0);
-  });
-
-  test('ruled-out absent initially, appears after still-crashing', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await expect(page.getByText(/We already tried without/)).toHaveCount(0);
-
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-    await page.getByRole('button', { name: /No, still crashing/ }).click();
-    await expect(page.getByText('second-suspect.jar').first()).toBeVisible({ timeout: 8000 });
-    await expect(page.getByText(/We already tried without/)).toBeVisible();
-  });
-
-  test('Disable & Relaunch calls disable_mod_for_test and launches', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-
-    const calls = await getCalls(page);
-    expect(calls['disable_mod_for_test']).toBe(1);
-    expect(calls['launch_instance_direct']).toBeGreaterThanOrEqual(1);
-    const args = await getArgs(page);
-    expect(args['disable_mod_for_test'].filename).toBe('suspect-mod.jar');
-  });
-
-  test('shows recovery snapshot ID in footer', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByText(/We saved a backup before changing anything/)).toBeVisible();
-  });
-
-  test('Restore All & Close restores snapshot and closes', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await relaunch(page);
-    await page.getByRole('button', { name: /Undo and close/ }).click();
-    await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 8000 });
-    const args = await getArgs(page);
-    expect(args['restore_snapshot']).toBeDefined();
-  });
-
-  test('shows dependency prompt when disable plan has dependents', async ({ page }) => {
-    await installMock(page, { withDependents: true });
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByText(/needs other mods/)).toBeVisible();
-    await expect(page.getByText('dependent-mod')).toBeVisible();
-  });
-
-  test('DependencyPrompt Cancel returns to suspect list', async ({ page }) => {
-    await installMock(page, { withDependents: true });
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByText(/needs other mods/)).toBeVisible();
-    await page.getByRole('button', { name: 'Cancel' }).click();
-    await expect(page.getByText(/Mods that might be causing this/)).toBeVisible();
-  });
-
-  test('DependencyPrompt confirm disables all and launches', async ({ page }) => {
-    await installMock(page, { withDependents: true });
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByText(/needs other mods/)).toBeVisible();
-    await page.getByRole('button', { name: /Turn off selected and try again/ }).click();
+  test('Test without it disables the top installable suspect, never a framework', async ({ page }) => {
+    await openDoctor(page);
+    await page.getByRole('button', { name: 'Test without Example Mod' }).click();
     await finishSuccessfulLaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-    const calls = await getCalls(page);
-    expect(calls['disable_mod_for_test']).toBe(2);
+
+    const recorded = await calls(page);
+    expect(recorded.disable_mod_for_test).toBe(1);
+    const args = await lastArgs(page);
+    expect(args.disable_mod_for_test.filename).toBe('example.jar');
+    // The framework candidate is never the one that gets turned off.
+    expect(args.disable_mod_for_test.filename).not.toContain('Invented Engine');
   });
 
-  test('launched=true shows FixConfirmation prompt', async ({ page }) => {
-    await installMock(page, { healthOk: true });
-    await openDialog(page);
-    await waitForContent(page);
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-    await expect(page.getByRole('button', { name: 'Yes, it worked' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'No, still crashing' })).toBeVisible();
-  });
-
-  test('launched=false shows error without FixConfirmation', async ({ page }) => {
-    await installMock(page, { launchError: 'ERR_MSA_AUTH_REQUIRED' });
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByText(/The game didn’t start for the test/)).toBeVisible({ timeout: 8000 });
-    await expect(page.getByText(/Did the game start properly without/)).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Yes, it worked' })).toHaveCount(0);
-    const calls = await getCalls(page);
-    expect(calls['restore_snapshot']).toBeGreaterThanOrEqual(1);
-  });
-
-  test('health approval preserves the pending guided experiment', async ({ page }) => {
-    await installMock(page, { healthWarning: true });
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByText(/Game is running without/)).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Health Check' })).toBeVisible();
-    await page.getByRole('button', { name: 'Launch Anyway' }).click();
+  test('a confirmed fix records the crash bucket and the owner key', async ({ page }) => {
+    await openDoctor(page);
+    await page.getByRole('button', { name: 'Test without Example Mod' }).click();
     await finishSuccessfulLaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-  });
-
-  test('cancelling health approval restores the guided experiment', async ({ page }) => {
-    await installMock(page, { healthWarning: true });
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: /Try without/ }).first().click();
-    await expect(page.getByRole('heading', { name: 'Health Check' })).toBeVisible();
-    await page.getByRole('button', { name: 'Cancel' }).last().click();
-    await expect(page.getByText(/We put your mods back how they were/)).toBeVisible({ timeout: 8000 });
-    const calls = await getCalls(page);
-    expect(calls['restore_snapshot']).toBeGreaterThanOrEqual(1);
-  });
-
-  test('confirmed fix calls confirmCrashFix, shows success, auto-closes', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
     await page.getByRole('button', { name: 'Yes, it worked' }).click();
 
-    const calls = await getCalls(page);
-    expect(calls['confirm_crash_fix']).toBe(1);
-    expect(calls['delete_snapshot']).toBe(1);
-    await expect(page.getByText(/Got it — keeping/)).toBeVisible({ timeout: 5000 });
-    await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 5000 });
+    const args = await lastArgs(page);
+    expect(args.confirm_crash_fix).toMatchObject({ bucket: 'bucket-1', ownerKey: 'item:mods/example.jar:abc' });
+    await expect(page.getByText(/Got it — keeping/)).toBeVisible({ timeout: 5_000 });
   });
 
-  test('still-crashing restores snapshot and advances to next suspect', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
+  test('still crashing restores the setup and moves past the ruled-out suspect', async ({ page }) => {
+    await openDoctor(page);
+    await page.getByRole('button', { name: 'Test without Example Mod' }).click();
+    await finishSuccessfulLaunch(page);
     await page.getByRole('button', { name: 'No, still crashing' }).click();
-    await expect(page.getByText('second-suspect.jar').first()).toBeVisible({ timeout: 8000 });
 
-    const calls = await getCalls(page);
-    expect(calls['restore_snapshot']).toBeGreaterThanOrEqual(1);
-    expect(calls['report_still_crashing']).toBe(1);
-  });
-
-  test('still-crashing advances to No Suspects when all ruled out', async ({ page }) => {
-    await installMock(page, { stillCrashingSuspects: 0, stillCrashingRuledOut: 'suspect-mod,second-suspect' });
-    await openDialog(page);
-    await waitForContent(page);
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-    await page.getByRole('button', { name: 'No, still crashing' }).click();
-    await expect(page.getByText(/We couldn’t tell which mod caused this/)).toBeVisible({ timeout: 8000 });
-  });
-
-  test('read-only close does not restore a snapshot', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await page.keyboard.press('Escape');
-    await page.keyboard.press('Escape');
-    await page.keyboard.press('Escape');
-    await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 8000 });
-    const calls = await getCalls(page);
-    expect(calls['restore_snapshot'] ?? 0).toBe(0);
-  });
-
-  test('close after success does not attempt restore', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-    await page.getByRole('button', { name: 'Yes, it worked' }).click();
-    await expect(page.getByRole('dialog')).toHaveCount(0, { timeout: 5000 });
-    const calls = await getCalls(page);
-    expect(calls['restore_snapshot'] ?? 0).toBe(0);
-  });
-
-  test('a failed export surfaces an error and leaves the deterministic flow intact', async ({ page }) => {
-    await installMock(page, { exportFail: true });
-    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: 'Copy crash report' }).click();
-
-    await expect(page.getByText(/ERR_EXPORT_FAILED/)).toBeVisible({ timeout: 8000 });
-    // Export is an optional escape hatch; local diagnosis must not depend on it.
-    await expect(page.getByText('0.85')).toBeVisible();
-    await relaunch(page);
-    await expect(page.getByText(/Did the game start properly without/)).toBeVisible({ timeout: 8000 });
-  });
-
-  test('rapid export clicks only trigger one invocation', async ({ page }) => {
-    await installMock(page);
-    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
-    await openDialog(page);
-    await waitForContent(page);
-    await page.getByRole('button', { name: 'Copy crash report' }).click({ clickCount: 3 });
-    await expect(page.getByRole('button', { name: 'Copied to clipboard' })).toBeVisible({ timeout: 8000 });
-    const calls = await getCalls(page);
-    expect(calls['export_crash_report']).toBe(1);
-  });
-
-  test('loading state shows Investigating crash text', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    // Before the investigation completes (instantly in mock), the loading state
-    // briefly shows “Looking at your crash…” text.
-    // Since the mock resolves immediately, check the text rather than spinner.
-    await expect(page.getByText('Looking at your crash…').or(page.getByText(/Mods that might be causing this/))).toBeVisible({ timeout: 3000 });
-  });
-
-  test('keeps internal breakdown keys hidden', async ({ page }) => {
-    // Breakdown gibberish removed for user-friendly UI — ensure it stays hidden
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await expect(page.getByTestId('breakdown-key-stack_frame_score')).toHaveCount(0);
-    await expect(page.getByText('ubiquity dampener')).toHaveCount(0);
-    await expect(page.getByText('conflict pairs')).toHaveCount(0);
-    await expect(page.getByText('0.85')).toBeVisible();
-  });
-
-  test('dialog has correct title', async ({ page }) => {
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await expect(page.getByText('Crash Doctor')).toBeVisible();
-  });
-
-  test('crash report is exported to the clipboard', async ({ page }) => {
-    await installMock(page);
-    // Clipboard writes need permission in a headless context.
-    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
-    await openDialog(page);
-    await waitForContent(page);
-
-    await page.getByRole('button', { name: 'Copy crash report' }).click();
-
-    // The button confirms rather than silently succeeding — this is the only
-    // feedback the user gets that anything reached the clipboard.
-    await expect(page.getByRole('button', { name: 'Copied to clipboard' })).toBeVisible({ timeout: 5000 });
-
-    const clipboard = await page.evaluate(() => navigator.clipboard.readText());
-    expect(clipboard).toContain('# Minecraft crash report');
-  });
-
-  test('the export entry points are always available', async ({ page }) => {
-    // Sharing a crash report is not gated behind any setting, so both entry
-    // points must be present unconditionally.
-    await installMock(page);
-    await openDialog(page);
-    await waitForContent(page);
-    await expect(page.getByRole('button', { name: 'Copy report for help' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Copy crash report' })).toBeVisible();
+    await expect(page.getByText(/It still crashed without/)).toBeVisible({ timeout: 8_000 });
+    await expect(page.getByTestId('crash-suspect').filter({ hasText: 'Second Mod' })).toBeVisible();
+    await expect(page.getByTestId('crash-suspect').filter({ hasText: 'Example Mod' })).toHaveCount(0);
+    expect((await calls(page)).report_still_crashing).toBe(1);
+    expect((await calls(page)).restore_snapshot).toBeGreaterThanOrEqual(1);
   });
 });

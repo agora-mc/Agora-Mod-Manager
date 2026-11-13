@@ -677,11 +677,29 @@ test('docs screenshot: crash doctor', async ({ page }) => {
     const SUSPECT_2 = { mod_id: 'second-suspect', filename: 'second-suspect.jar', total_score: 0.45, breakdown: { stack_frame_score: 0.3, prior_local_crashes: 0.15 }, is_dependent_of: null };
 
     const initialResult = {
-      fingerprint: { exception_class: 'java.lang.NullPointerException', top_frames: ['test'] },
-      signature_name: 'NullPointerException in rendering',
       suspects: [SUSPECT_1, SUSPECT_2],
       suggested_action: { kind: 'GuidedDisable', next_suspect: SUSPECT_1 },
       ruled_out: [],
+    };
+
+    const engineAnswer = {
+      contract: 1,
+      verdict: { kind: 'crashed', how: 'pid' },
+      headline: { en: 'The game crashed, and Suspect Mod is likely the cause.' },
+      level: 'likely',
+      cause: 'mod',
+      candidates: [
+        { owner: { kind: 'item', key: 'suspect-mod', name: 'Suspect Mod' }, level: 'likely', score: 9, cause: 'mod', families: ['execution'], sources: [{ plugin_id: 'agora.minecraft', plugin_name: 'Minecraft crash rules', plugin_version: '0.1.0' }] },
+        { owner: { kind: 'item', key: 'second-suspect', name: 'Second Suspect' }, level: 'possible', score: 4, cause: 'mod', families: ['execution'], sources: [{ plugin_id: 'agora.minecraft', plugin_name: 'Minecraft crash rules', plugin_version: '0.1.0' }] },
+      ],
+      findings: [],
+      inspections: [],
+      could_not_check: [],
+      trust_notes: [],
+      next: { kind: 'confirm_experiment', keys: ['suspect-mod'] },
+      repairs: [],
+      actions: [{ action: { kind: 'review_mods' }, source: { plugin_id: 'agora.minecraft', plugin_name: 'Minecraft crash rules', plugin_version: '0.1.0' } }],
+      artifacts: [],
     };
 
     const evidenceResult = {
@@ -699,13 +717,6 @@ test('docs screenshot: crash doctor', async ({ page }) => {
         any_truncated: false,
         any_stale: false,
         failure_category: 'CrashReport',
-      },
-      fingerprint: initialResult.fingerprint,
-      triage: {
-        matched: true,
-        signature_name: initialResult.signature_name,
-        solution_markdown: 'Disable the identified rendering mod and test again.',
-        action_button_json: null,
       },
       suspects: initialResult.suspects,
       failure_category: 'CrashReport',
@@ -744,6 +755,20 @@ test('docs screenshot: crash doctor', async ({ page }) => {
         if (command.startsWith('plugin:sql|')) return Promise.resolve(null);
 
         if (command === 'list_instances') return Promise.resolve([instanceRow]);
+        if (command === 'list_crash_answers') return Promise.resolve({
+          answers: [{
+            sessionId: 'session-42', instanceId: 'crash-test-instance', verdict: { kind: 'crashed', how: 'pid' },
+            endedAt: '2026-07-12T18:04:00Z', createdAt: '2026-07-12T18:05:00Z', status: 'analyzed',
+            headline: engineAnswer.headline.en, level: 'likely', cause: 'mod',
+          }],
+          latestVerdict: { kind: 'crashed', how: 'pid' },
+          retainedCrashes: 40,
+        });
+        if (command === 'get_crash_answer') return Promise.resolve({
+          sessionId: 'session-42', instanceId: 'crash-test-instance', verdict: { kind: 'crashed', how: 'pid' },
+          endedAt: '2026-07-12T18:04:00Z', createdAt: '2026-07-12T18:05:00Z', status: 'analyzed',
+          answer: engineAnswer, bucket: 'bucket-1', changes: [],
+        });
         if (command === 'check_instance_crash') return Promise.resolve(null);
         if (command === 'check_instance_updates') return Promise.resolve([]);
         if (command === 'get_lkg_marker') return Promise.resolve(null);
@@ -809,8 +834,7 @@ test('docs screenshot: crash doctor', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Troubleshoot' })).toBeVisible({ timeout: 10000 });
   await page.getByRole('button', { name: 'Troubleshoot' }).click();
   await expect(page.getByRole('heading', { name: 'Crash Doctor' })).toBeVisible({ timeout: 10000 });
-  await expect(page.getByText(/Mods that might be causing this/)).toBeVisible({ timeout: 10000 });
-  await expect(page.getByText('0.85')).toBeVisible();
+  await expect(page.getByTestId('crash-headline')).toContainText('Suspect Mod is likely the cause', { timeout: 10000 });
   await page.waitForTimeout(300);
   await shoot(page, 'crash-doctor');
 });

@@ -66,11 +66,15 @@ export interface CrashEvidenceLine {
   quote?: string;
 }
 
+export type CrashRole = 'system' | 'platform' | 'framework' | 'hook_framework';
+
 export interface CrashCandidate {
   owner: CrashOwner;
   level: CrashLevel;
   score: number;
   cause: CrashCause;
+  /** What part the owner plays, when the pack's roles say. */
+  role?: CrashRole;
   families: string[];
   sources: CrashSource[];
   also_provided_by?: string[];
@@ -118,6 +122,24 @@ export interface CrashArtifact {
   children?: CrashArtifact[];
 }
 
+export type CrashActionKind =
+  | 'install_content'
+  | 'open_console'
+  | 'open_jvm_settings'
+  | 'open_crash_log'
+  | 'review_mods';
+
+export interface CrashActionRequest {
+  kind: CrashActionKind;
+  content_key?: string;
+  label?: LocalText;
+}
+
+export interface CrashActionOffer {
+  action: CrashActionRequest;
+  source: CrashSource;
+}
+
 export interface CrashAnswer {
   contract: number;
   verdict: CrashVerdict;
@@ -131,6 +153,7 @@ export interface CrashAnswer {
   trust_notes: CrashTrustNote[];
   next: CrashNextStep;
   repairs: unknown[];
+  actions?: CrashActionOffer[];
   artifacts: CrashArtifact[];
 }
 
@@ -170,6 +193,8 @@ export interface CrashAnswerDetail {
   createdAt: string;
   status: AnswerStatus;
   answer?: CrashAnswer;
+  /** The crash bucket a confirmed fix is recorded under, when the answer kept one. */
+  bucket?: string;
   files?: unknown[];
   changes?: CrashChange[];
   reason?: string;
@@ -178,6 +203,7 @@ export interface CrashAnswerDetail {
 export interface SuppliedCrashAnswer {
   status: 'analyzed' | 'nothing_to_read';
   answer?: CrashAnswer;
+  bucket?: string;
   files?: unknown[];
   reason?: string;
 }
@@ -257,6 +283,7 @@ function isCandidate(value: unknown): value is CrashCandidate {
     && isLevel(value.level)
     && typeof value.score === 'number'
     && isCause(value.cause)
+    && (value.role === undefined || (typeof value.role === 'string' && ['system', 'platform', 'framework', 'hook_framework'].includes(value.role)))
     && Array.isArray(value.families)
     && Array.isArray(value.sources)
     && value.sources.every(isSource)
@@ -294,6 +321,16 @@ function isArtifact(value: unknown): value is CrashArtifact {
     && typeof value.retained.kind === 'string';
 }
 
+function isActionOffer(value: unknown): value is CrashActionOffer {
+  return isRecord(value)
+    && isRecord(value.action)
+    && typeof value.action.kind === 'string'
+    && ['install_content', 'open_console', 'open_jvm_settings', 'open_crash_log', 'review_mods'].includes(value.action.kind)
+    && (value.action.content_key === undefined || typeof value.action.content_key === 'string')
+    && (value.action.label === undefined || isText(value.action.label))
+    && isSource(value.source);
+}
+
 function isAnswer(value: unknown): value is CrashAnswer {
   return isRecord(value)
     && typeof value.contract === 'number'
@@ -313,6 +350,7 @@ function isAnswer(value: unknown): value is CrashAnswer {
     && typeof value.next.kind === 'string'
     && NEXT_STEPS.includes(value.next.kind)
     && Array.isArray(value.next.keys)
+    && (value.actions === undefined || (Array.isArray(value.actions) && value.actions.every(isActionOffer)))
     && Array.isArray(value.artifacts)
     && value.artifacts.every(isArtifact);
 }
@@ -362,6 +400,7 @@ export async function getCrashAnswer(sessionId: string): Promise<CrashAnswerDeta
     || typeof reply.status !== 'string'
     || !STATUSES.includes(reply.status)
     || (reply.answer !== undefined && !isAnswer(reply.answer))
+    || (reply.bucket !== undefined && typeof reply.bucket !== 'string')
     || (reply.reason !== undefined && typeof reply.reason !== 'string')
     || (reply.changes !== undefined && !Array.isArray(reply.changes))
   ) {
@@ -376,6 +415,7 @@ export async function analyzeCrashText(instanceId: string | null, text: string):
     !isRecord(reply)
     || (reply.status !== 'analyzed' && reply.status !== 'nothing_to_read')
     || (reply.answer !== undefined && !isAnswer(reply.answer))
+    || (reply.bucket !== undefined && typeof reply.bucket !== 'string')
     || (reply.reason !== undefined && typeof reply.reason !== 'string')
   ) {
     throw shapeError('analyze_crash_text');
@@ -389,6 +429,7 @@ export async function analyzeCrashFile(instanceId: string | null, path: string):
     !isRecord(reply)
     || (reply.status !== 'analyzed' && reply.status !== 'nothing_to_read')
     || (reply.answer !== undefined && !isAnswer(reply.answer))
+    || (reply.bucket !== undefined && typeof reply.bucket !== 'string')
     || (reply.reason !== undefined && typeof reply.reason !== 'string')
   ) {
     throw shapeError('analyze_crash_file');

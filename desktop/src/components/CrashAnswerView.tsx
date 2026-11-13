@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import type {
   AnswerStatus,
+  CrashActionOffer,
   CrashAnswer,
   CrashArtifact,
   CrashCandidate,
@@ -51,6 +52,8 @@ export interface CrashAnswerViewProps {
   onTestWithout?: (candidate: CrashCandidate) => void;
   onOpenModPage?: (candidate: CrashCandidate) => void;
   onShowSuspectFiles?: (candidate: CrashCandidate) => void;
+  /** The answer's own buttons, from a pack's closed set of actions. */
+  onAction?: (offer: CrashActionOffer) => void;
 }
 
 /** The level words, exactly as the design gives them. */
@@ -108,6 +111,7 @@ export function CrashAnswerView({
   onTestWithout,
   onOpenModPage,
   onShowSuspectFiles,
+  onAction,
 }: CrashAnswerViewProps) {
   if (status === 'nothing_to_read' && origin === 'session') {
     return (
@@ -165,6 +169,8 @@ export function CrashAnswerView({
       <TrustNotes notes={answer.trust_notes} />
 
       {suspects.length > 0 && <NextStepButton answer={answer} onNext={onNext} />}
+
+      <Actions actions={answer.actions} onAction={onAction} />
 
       {saveWarning && (
         <div
@@ -307,6 +313,42 @@ export function CrashAnswerCard({
       </div>
     </section>
   );
+}
+
+function Actions({
+  actions,
+  onAction,
+}: {
+  actions?: CrashActionOffer[];
+  onAction?: (offer: CrashActionOffer) => void;
+}) {
+  if (actions === undefined || actions.length === 0 || onAction === undefined) return null;
+  return (
+    <div className="flex flex-wrap gap-2" data-testid="crash-actions">
+      {actions.map((offer, index) => (
+        <Button key={`${offer.action.kind}-${index}`} type="button" variant="outline" onClick={() => onAction(offer)}>
+          {english(offer.action.label) || actionLabel(offer)}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+function actionLabel(offer: CrashActionOffer): string {
+  switch (offer.action.kind) {
+    case 'install_content':
+      return 'Install it';
+    case 'open_console':
+      return 'Open console';
+    case 'open_jvm_settings':
+      return 'Open JVM settings';
+    case 'open_crash_log':
+      return 'Open crash log';
+    case 'review_mods':
+      return 'Review installed mods';
+    default:
+      return 'Do this';
+  }
 }
 
 function NextStepButton({
