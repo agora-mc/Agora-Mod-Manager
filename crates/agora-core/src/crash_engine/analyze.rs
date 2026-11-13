@@ -10,6 +10,7 @@
 //! "could not check", naming the plugin; none is ever read as "nothing found".
 
 use super::attribution::LooseResolver;
+use super::history::{CrashHistory, RecordedCrash};
 use super::{
     answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusProfile, EvaluateInput,
     Inspection, InspectionOutcome, InspectionRequest, Inspector, ParsedArtifact, PluginIdentity,
@@ -27,6 +28,7 @@ use agora_game_api::crash::{
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The artifact id a parser is given. A parser sees a name and an id, never a path.
@@ -212,6 +214,17 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
     analyze_with_facts(input, &[], &[])
 }
 
+/// The earlier crashes an analysis compares this one with. Supplied by the caller, which owns the
+/// store; the engine only counts them.
+pub struct CrashHistoryInput<'a> {
+    /// Earlier crashes for this instance, newest or oldest first. Never includes this crash.
+    pub prior: &'a [RecordedCrash],
+    /// How many sessions have run since a bucket first appeared, by [`RecordedCrash::bucket_key`].
+    pub sessions_since_first: &'a BTreeMap<String, u64>,
+    /// When the setup this crash ran began, in Unix milliseconds, when known.
+    pub setup_since_unix_ms: Option<i64>,
+}
+
 /// [`analyze`] with facts only a live session can supply: `core.session` and `core.change`.
 /// `changes` are the same differences those facts describe, used for the boost signals and for
 /// the finding shown when nothing else is named. A loose file passes neither.
@@ -219,6 +232,18 @@ pub fn analyze_with_facts(
     input: &AnalyzeInput<'_>,
     extra_facts: &[Fact],
     changes: &[crate::session_ledger::ManifestChange],
+) -> LauncherResult<AnalyzeOutput> {
+    analyze_with_history(input, extra_facts, changes, None)
+}
+
+/// [`analyze_with_facts`] plus the pattern across earlier crashes, which becomes the engine's
+/// `core.history` facts, a boost-only `HistoryRepeat` signal and a finding when a named suspect
+/// recurs at different places. `None` is a crash with no history behind it.
+pub fn analyze_with_history(
+    input: &AnalyzeInput<'_>,
+    extra_facts: &[Fact],
+    changes: &[crate::session_ledger::ManifestChange],
+    history: Option<&CrashHistoryInput<'_>>,
 ) -> LauncherResult<AnalyzeOutput> {
     let mut packs: Vec<&LoadedCrashPack> = input.packs.iter().collect();
     packs.sort_by(|a, b| {
@@ -464,6 +489,13 @@ pub fn analyze_with_facts(
         reports.push(report);
     }
 
+    // The pattern across earlier crashes is a count over what was already stored. The identity of
+    // this crash is what its parsers said (or the place they named), so a caller need not decide
+    // that before parsing.
+    let history_summary: Option<CrashHistory> =
+        history.map(|history| super::history::summarize_recorded(history.prior));
+    let current_bucket = history.and_then(|_| super::history::current_bucket(&parsed));
+
     // With an instance, the game is known and only its packs, plus those for every game, take part.
     // A loose file names no game, so it stands for the games of the packs that read it: another
     // game's rules must not accuse a module in this one. Packs for every game always take part.
@@ -527,6 +559,14 @@ pub fn analyze_with_facts(
         span: None,
     }];
     engine_facts.extend(extra_facts.iter().cloned());
+    if let Some(history) = history {
+        engine_facts.extend(super::history::engine_facts(
+            history.prior,
+            current_bucket.as_deref(),
+            history.sessions_since_first,
+            history.setup_since_unix_ms,
+        ));
+    }
     let loose_resolver = LooseResolver::from_packs(packs.iter().map(|pack| &pack.pack), &parsed);
     let resolver: &dyn RefResolver = match &input.instance {
         Some(instance) => instance.resolver,
@@ -558,6 +598,12 @@ pub fn analyze_with_facts(
         });
         evaluated.level_cap = super::lower_cap(evaluated.level_cap, Level::Possible);
     }
+    // A suspect from earlier crashes is the same kind of lead: boost-only, never an accusation.
+    if let Some(summary) = &history_summary {
+        evaluated
+            .signals
+            .extend(super::history::repeat_signals(summary));
+    }
     let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
     let scored = consensus(
         &ConsensusInput {
@@ -567,6 +613,12 @@ pub fn analyze_with_facts(
         },
         &ConsensusProfile::default(),
     );
+    // The finding is for a suspect consensus actually named, so a recurrence can never invent one.
+    if let Some(summary) = &history_summary {
+        evaluated
+            .findings
+            .extend(super::history::repeat_findings(summary, &scored.candidates));
+    }
     let mut crash_answer = answer(&AnswerInput {
         verdict: SessionVerdict::Crashed {
             how: MatchedBy::Supplied,

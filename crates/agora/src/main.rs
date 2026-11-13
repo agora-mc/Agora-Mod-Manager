@@ -1789,6 +1789,8 @@ enum CrashCmd {
     Last { instance: String },
     /// Print a stored crash answer by session id.
     Show { session: String },
+    /// Print the pattern across this instance's crash logs and stored crash answers.
+    Patterns { instance: String },
     /// Collect recent logs and run the full local crash investigation.
     Investigate {
         instance: String,
@@ -4793,6 +4795,9 @@ async fn run_crash_command(
                 anyhow::bail!("No crash answer is stored for session '{session}'.");
             };
             cli_crash::print_stored(&stored, json)?;
+        }
+        CrashCmd::Patterns { instance } => {
+            cli_crash::run_patterns(ctx, &instance, json)?;
         }
         CrashCmd::Investigate { instance, files } => {
             let investigation =
@@ -13250,6 +13255,18 @@ mod tests {
             show.command,
             Commands::Crash {
                 action: super::CrashCmd::Show { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn crash_patterns_parses() {
+        let cli = Cli::try_parse_from(["agora", "crash", "patterns", "my-instance"])
+            .expect("should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Crash {
+                action: super::CrashCmd::Patterns { .. }
             }
         ));
     }

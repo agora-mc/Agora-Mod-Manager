@@ -377,6 +377,7 @@ fn detail(
             answer,
             files,
             changes,
+            ..
         } => CrashAnswerDetail {
             session_id: stored.session_id,
             instance_id: stored.instance_id,
@@ -485,6 +486,7 @@ mod tests {
                     from_version: None,
                     to_version: Some("2.1".to_string()),
                 }],
+                record: None,
             },
         }
     }

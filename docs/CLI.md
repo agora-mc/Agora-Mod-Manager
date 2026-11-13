@@ -795,6 +795,7 @@ agora crash investigate <INSTANCE>
 agora crash investigate <INSTANCE> --file extra-log.txt
 agora crash analyze <FILE>... [--each] [--instance <ID>] [--plugin-dir <FOLDER>]... [--game-version <V>] [--allow-code] [--json [--facts]]
 agora crash analyze --paste [--each] ...
+agora crash patterns <INSTANCE>
 ```
 
 `--file` may be repeated. Review logs for local paths, usernames, server addresses, tokens, or private chat before sharing output.
@@ -804,6 +805,10 @@ agora crash analyze --paste [--each] ...
 `--paste` reads the text from stdin as a pasted fragment. Only pasted text may be read by a pack's `snippet` parsers, which handle a fragment whose whole-file header is missing; it still needs a recognisable shape (an exception line, a stack frame), and the answer says Agora read a snippet, caps its confidence at `possible` and tells the user to paste or pick the whole log for a better result. Files named on the command line are whole files and never use the fallback. `--paste` can be combined with files, and with `--each` each input is its own crash.
 
 `--instance` names the instance the crash came from. Only that game's crash packs, plus packs for every game, take part; a ref is attributed to the mod that provides the file in the instance's deployed view; and a rule may ask an inspector to open one file (for example, an SKSE plugin DLL) and report pass, fail or unknown. The instance's own game version is used unless `--game-version` overrides it. An unknown instance is an error. Without `--instance` nothing is inspected and the loose-file answer is unchanged.
+
+`crash patterns` prints the pattern across the crashes Agora already knows for one instance. If no older log has been stored yet, it sweeps the folders the instance game's crash packs' `sources` name first. The output is the same cross-crash summary `--each` prints, plus what the sweep found and any source it could not read. An instance with no logs and no stored session answers says so; that is not a clean result.
+
+With `--instance`, `crash analyze` sweeps those same sources for older crash logs, analyses each once (keyed by the file's content hash), and adds the cross-crash count to the answer and to `--each`'s summary. A failed sweep or a source folder that could not be read is listed under `Could not check`, never treated as no earlier crashes. The sweep is bounded, and older logs it left for a later run are named. With `--json` a result for an instance also carries `stored_history` and `sweep`.
 
 `--each` analyzes every file as its own crash, one `analyze` call per file, and then prints a summary across them. The summary counts how often each suspect owner was named, how often it was the top suspect, and at how many distinct crash places it came up; it also counts crashes Agora could not read and crashes that named nobody. It is a count, not a verdict. Framework and hook-framework owners are listed apart, because they are always running and appear in many crashes for that reason. With `--json`, the output is `{ "crashes": [ { "file", "answer", "files" } ], "summary": <CrashHistory> }` (each crash also gets `parsed` with `--facts`). With `--instance`, each suspect that is an installed item also carries a `save_risk` label: `safe` when every file is an asset, `risky` when a file can add records or run code, and `unknown` when Agora cannot tell. Use it to warn the user: testing a risky mod on an existing save can damage it, so test on a new game or back the save up first.
 

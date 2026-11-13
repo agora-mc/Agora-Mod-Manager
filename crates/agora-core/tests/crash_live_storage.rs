@@ -45,6 +45,7 @@ fn answer(session: &str, instance: &str, created: &str, headline: &str) -> Sessi
             }),
             files: Vec::new(),
             changes: Vec::new(),
+            record: None,
         },
     }
 }
@@ -188,6 +189,7 @@ fn the_change_summary_survives_a_round_trip() {
             from_version: Some("1.0".to_string()),
             to_version: Some("2.0".to_string()),
         }],
+        record: None,
     };
     store_answer(&conn, &stored).unwrap();
 
