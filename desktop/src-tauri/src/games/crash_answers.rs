@@ -172,10 +172,11 @@ pub async fn analyze_crash_text(
 ) -> Result<SuppliedCrashAnswer, GamesError> {
     let ctx = crate::core_context(&app)?;
     blocking(move || {
-        // origin: pasted once CrashFile carries it. Until then a pasted log is a supplied file.
+        // Pasted text may be a fragment: only pasted text may use a pack's snippet parsers.
         let files = vec![CrashFile {
             name: "pasted-crash-log.txt".to_string(),
             bytes: text.into_bytes(),
+            origin: agora_core::crash_engine::CrashFileOrigin::Pasted,
         }];
         supplied(&ctx, instance_id.as_deref(), files)
     })
@@ -207,7 +208,7 @@ pub async fn analyze_crash_file(
         supplied(
             &ctx,
             instance_id.as_deref(),
-            vec![CrashFile { name, bytes }],
+            vec![CrashFile::new(name, bytes)],
         )
     })
     .await

@@ -83,7 +83,7 @@ const CAUSE_GROUPS: ReadonlyArray<{ cause: CrashCause; heading: string }> = [
 const SECOND_OPINION_NOTE = 'Copies the crash log and opens a website.';
 
 const SAVE_WARNING =
-  'Removing a mod partway through a playthrough can damage your save. Agora backs up your saves and this setup before any test and can put both back, but test on a new game when you can.';
+  'Removing a mod partway through a playthrough can damage your save. Back up your saves before you test, or test on a new game.';
 
 /** The sentence shown when a log was read and Agora named nobody. */
 const NAMED_NOBODY =
@@ -382,7 +382,7 @@ function TrustNotes({ notes }: { notes: CrashTrustNote[] }) {
     <ul className="space-y-1" aria-label="Notes about the evidence">
       {notes.map((note, index) => (
         <li key={index} className="text-xs text-muted-foreground">
-          {english(note.text)} <span className="whitespace-nowrap">from {note.source.plugin_name}</span>
+          {english(note.text)} <span className="whitespace-nowrap">(from {note.source.plugin_name})</span>
         </li>
       ))}
     </ul>

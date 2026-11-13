@@ -54,10 +54,7 @@ fn pack() -> LoadedCrashPack {
 }
 
 fn file(name: &str, text: &str) -> CrashFile {
-    CrashFile {
-        name: name.to_string(),
-        bytes: text.as_bytes().to_vec(),
-    }
+    CrashFile::new(name, text.as_bytes().to_vec())
 }
 
 fn analyze(text: &str) -> SuppliedAnswer {

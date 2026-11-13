@@ -178,7 +178,7 @@ describe('empty states', () => {
 
 describe('the save warning', () => {
   const words =
-    'Removing a mod partway through a playthrough can damage your save. Agora backs up your saves and this setup before any test and can put both back, but test on a new game when you can.';
+    'Removing a mod partway through a playthrough can damage your save. Back up your saves before you test, or test on a new game.';
 
   it('shows for a test-without step and for a bisect', () => {
     for (const kind of ['confirm_experiment', 'bisect'] as const) {
