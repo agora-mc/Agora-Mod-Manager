@@ -1600,8 +1600,7 @@ The crash log text is streamed through the local `crash_signatures` table in ord
 ```rust
 for signature in db.query("SELECT * FROM crash_signatures") {
     if Regex::new(&signature.regex_pattern)?.is_match(&crash_text) {
-        // Display solution_markdown to user
-        // Render action_button if present (e.g., "Install Fabric API" auto-installs the mod)
+        // Show signature.text, and offer signature.action when it has one
         return Triage::Resolved(signature);
     }
 }
@@ -4993,6 +4992,8 @@ The importer reads a copy of Vortex's state (opening the original changes it). A
 A plugin contributes **crash packs**: JSON files listed under `contributions.crashPacks`, needing the `crash:contribute` capability. Official and community packs are the same thing. A game's normal exit codes stay in `session.normal_exit_codes`.
 
 **Built-in packs** *(built)*. A game compiled into Agora may hand over packs itself (`agora_game_api::crash::BuiltInPack`: the pack JSON plus the Rust parsers it names), so its crash analysis works with nothing installed. Minecraft's lives in `agora-game-minecraft` (owner's decision: Minecraft crash support stays inside Agora, not in a plugin). A built-in pack is the same format, goes through the same linter (`load_built_in_packs`), and its parsers sit behind the same contract as a script's, so a plugin could do the same job. Its findings name their source as Agora (`BUILT_IN_PLUGIN_ID`). A plugin's pack can write rules over a built-in parser's facts with no change to Agora. Core holds no game words for this.
+
+**Community signatures** *(built)*. `crash-signatures/*.json` files are format v2 data (see §2.4), compiled into `registry.db` and read back by core into one `agora.community` pack wherever installed packs are loaded: live diagnosis, `agora crash analyze`, the desktop's analyze entry points and MCP. Each row becomes a rule gated on `games` over `core.log_line`, with one finding that names no suspect and its optional action. A row that fails to convert or lint is reported as "could not check" with its id and never hides the others; a catalog without the table simply has no community pack. Built-in Minecraft rules retire the six signatures that duplicated them.
 
 **Loose files** *(built)*. `agora crash analyze <file>...` runs the same pipeline over files with no instance: names in the log stand for themselves (`LooseResolver`), and anything that needs the instance comes out "could not check". `--json --facts` also prints what each parser found.
 

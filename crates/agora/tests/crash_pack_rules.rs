@@ -957,6 +957,163 @@ mod crash {
     }
 }
 
+/// The community signatures retired into the built-in pack. Each test writes a small invented log
+/// line for one of them and checks that the built-in pack still produces the same finding and the
+/// same action.
+mod retired_signatures {
+    use agora_core::crash_engine::gate::NoHost;
+    use agora_core::crash_engine::{analyze, AnalyzeInput, AnalyzeOutput, CrashFile};
+    use agora_core::crash_packs::load_built_in_packs;
+    use agora_game_api::crash::ActionKind;
+    use agora_game_minecraft::crash::built_in_packs;
+
+    fn header() -> &'static str {
+        "[01:02:03] [main/INFO]: Loading Minecraft 1.20.1 with Fabric Loader 0.16.0\n"
+    }
+
+    fn analyze_text(text: &str) -> AnalyzeOutput {
+        let built_in = built_in_packs();
+        let report = load_built_in_packs(&built_in);
+        assert!(report.is_clean(), "{:#?}", report.problems);
+        analyze(&AnalyzeInput {
+            packs: &report.packs,
+            files: &[CrashFile::new(
+                "invented-latest.log".to_string(),
+                text.as_bytes().to_vec(),
+            )],
+            runtime_version: Some("1.20.1"),
+            host: &NoHost,
+            built_in: &built_in,
+            instance: None,
+        })
+        .expect("the invented log is read")
+    }
+
+    fn finding<'a>(output: &'a AnalyzeOutput, rule: &str) -> &'a agora_game_api::crash::Finding {
+        output
+            .answer
+            .findings
+            .iter()
+            .find(|finding| finding.source.rule_id.as_deref() == Some(rule))
+            .unwrap_or_else(|| panic!("`{rule}` did not fire: {:#?}", output.answer.findings))
+    }
+
+    fn action(output: &AnalyzeOutput, rule: &str) -> Option<ActionKind> {
+        output
+            .answer
+            .actions
+            .iter()
+            .find(|offer| offer.source.rule_id.as_deref() == Some(rule))
+            .map(|offer| offer.action.kind)
+    }
+
+    #[test]
+    fn missing_fabric_api_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/WARN]: Warnings were found!\n \
+             - Mod 'Example Gadget' (examplegadget) 1.2.3 requires any version of fabric-api, which is missing!\n"
+        );
+        let output = analyze_text(&log);
+        let found = finding(&output, "missing_fabric_api");
+        assert_eq!(found.source.plugin_id, "agora");
+        assert!(found.candidate.is_none());
+        let offer = output
+            .answer
+            .actions
+            .iter()
+            .find(|offer| offer.source.rule_id.as_deref() == Some("missing_fabric_api"))
+            .expect("the install action");
+        assert_eq!(offer.action.kind, ActionKind::InstallContent);
+        assert_eq!(offer.action.content_key.as_deref(), Some("fabric-api"));
+    }
+
+    #[test]
+    fn a_missing_dependency_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/WARN]: Warnings were found!\n \
+             - Mod 'Example Gadget' (examplegadget) 1.2.3 requires any version of examplelib, which is missing!\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "missing_dependency");
+        assert_eq!(
+            action(&output, "missing_dependency"),
+            Some(ActionKind::ReviewMods)
+        );
+    }
+
+    #[test]
+    fn a_mixin_apply_failure_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: Mixin apply for mod examplegadget failed \
+             examplegadget.mixins.json:ExampleMixin -> net.minecraft.class_123: \
+             java.lang.RuntimeException: mixin failure\n \
+             Caused by: org.spongepowered.asm.mixin.throwables.MixinApplyError: \
+             Mixin [examplegadget.mixins.json:ExampleMixin from mod examplegadget] \
+             from phase [DEFAULT] in config [examplegadget.mixins.json] FAILED during APPLY\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "mixin_apply_failed");
+        assert_eq!(
+            action(&output, "mixin_apply_failed"),
+            Some(ActionKind::OpenCrashLog)
+        );
+    }
+
+    #[test]
+    fn a_mod_resolution_failure_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: net.fabricmc.loader.impl.FormattedException: \
+             net.fabricmc.loader.api.metadata.ModResolutionException: Mod resolution \
+             encountered an incompatible mod set!\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "mod_resolution_failed");
+        assert_eq!(
+            action(&output, "mod_resolution_failed"),
+            Some(ActionKind::ReviewMods)
+        );
+    }
+
+    #[test]
+    fn duplicate_classpath_libraries_are_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: Duplicate ASM classes found on classpath: \
+             [org/example/Thing.class]\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "duplicate_classpath_libraries");
+        assert_eq!(
+            action(&output, "duplicate_classpath_libraries"),
+            Some(ActionKind::OpenConsole)
+        );
+    }
+
+    #[test]
+    fn running_out_of_memory_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: java.lang.OutOfMemoryError: Java heap space\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "out_of_memory");
+        assert_eq!(
+            action(&output, "out_of_memory"),
+            Some(ActionKind::OpenJvmSettings)
+        );
+    }
+}
+
 /// A loose file keeps no original name (a forum paste, a renamed copy) and often has Windows line
 /// ends; detection must still pick the right parser from the content alone.
 mod detection {

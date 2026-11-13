@@ -1880,7 +1880,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Export the report',
-          body: 'Open Crash Doctor for the affected instance and choose Copy crash report. The report is assembled on your machine and placed on your clipboard. It contains the crash log, any matched crash signatures, the ranked suspect mods, and the instance\'s installed mod list — the same evidence Agora used for its own diagnosis.',
+          body: 'Open Crash Doctor for the affected instance and choose Copy crash report. The report is assembled on your machine and placed on your clipboard. It contains the crash log, any matched crash signatures, the ranked suspect mods, and the instance\'s installed mod list — the same evidence Agora used for its own diagnosis. Community signatures come from the signed catalog and can cover any supported game, not only Minecraft.',
         },
         {
           title: 'Know what is shared',
