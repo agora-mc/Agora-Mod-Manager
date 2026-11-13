@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
 """Unit tests for pure functions in Agora utility scripts."""
 
+import contextlib
 import hashlib
 import http.client
+import io
 import json
 import os
+import re
+import shutil
 import sys
 import tempfile
 import unittest
 import urllib.error
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import build_loot_wasm
+import build_official_plugin as bop
+import gen_addrlib_names as gan
+import crash_benchmark as cb
 import fetch_loader_manifests
-import fetch_registry_db
 import deploy_release_assets
 import finalize_release_assets as fra
 import refresh_loader_manifests
 import validate_loader_catalog_delta
 import build_docs_web as bdw
+import check_package_docs as cpd
+import pin_hashes
 import stage_cli_sidecar
+import stage_vfs_files
 
 
 def _response(read_side_effect=None, read_value=b"data"):
@@ -654,16 +665,144 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         )
         self.assertEqual(entries[0]["release_channel"], "stable")
 
+    def _quilt_maven_jar(
+        self, directory: str, loader_version: str, provided: str | None
+    ) -> Path:
+        if provided is None:
+            payload = {
+                "schema_version": 1,
+                "quilt_loader": {
+                    "id": "quilt_loader",
+                    "version": loader_version,
+                    "provides": [{"id": "other", "version": "1.0"}],
+                },
+            }
+        else:
+            payload = {
+                "schema_version": 1,
+                "quilt_loader": {
+                    "id": "quilt_loader",
+                    "version": loader_version,
+                    "provides": [{"id": "fabricloader", "version": provided}],
+                },
+            }
+        path = Path(directory) / f"quilt-loader-{loader_version}.jar"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("quilt.mod.json", json.dumps(payload))
+        return path
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
     @mock.patch("fetch_loader_manifests._fetch_profile_json")
     @mock.patch("fetch_loader_manifests._fetch_json")
-    def test_quilt_new_entry_writes_capabilities(self, fetch_json, fetch_profile):
+    def test_quilt_new_entry_writes_capabilities(
+        self, fetch_json, fetch_profile, download
+    ):
         fetch_json.return_value = [{"loader": {"version": "0.28.0-beta.5"}}]
         fetch_profile.return_value = b'{"loader": {"version": "0.28.0-beta.5"}}'
-        entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.28.0-beta.5", "0.16.0"
+            )
+            entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
         self.assertEqual(
-            entries[0]["provided_versions"], {"quilt_loader": "0.28.0-beta.5"}
+            entries[0]["provided_versions"],
+            {"quilt_loader": "0.28.0-beta.5", "fabricloader": "0.16.0"},
         )
         self.assertEqual(entries[0]["release_channel"], "prerelease")
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_fabricloader_is_read_per_loader_version(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [
+            {"loader": {"version": "0.30.1"}},
+            {"loader": {"version": "0.26.3"}},
+        ]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            jars = {
+                "0.30.1": self._quilt_maven_jar(directory, "0.30.1", "0.19.3"),
+                "0.26.3": self._quilt_maven_jar(directory, "0.26.3", "0.15.11"),
+            }
+
+            def served(url: str, _name: str, **_kw: Any) -> Path:
+                version = url.split("/quilt-loader/")[1].split("/", 1)[0]
+                return jars[version]
+
+            download.side_effect = served
+            entries = fetch_loader_manifests._fetch_quilt("1.21", refresh_profiles=True)
+
+        by_version = {entry["loader_version"]: entry for entry in entries}
+        self.assertEqual(
+            by_version["0.30.1"]["provided_versions"],
+            {"quilt_loader": "0.30.1", "fabricloader": "0.19.3"},
+        )
+        self.assertEqual(
+            by_version["0.26.3"]["provided_versions"],
+            {"quilt_loader": "0.26.3", "fabricloader": "0.15.11"},
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_unreadable_fabricloader_is_left_out_not_guessed(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.30.1", None
+            )
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_unreadable_jar_is_left_out(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "quilt-loader-0.30.1.jar"
+            path.write_text("not a zip", encoding="utf-8")
+            download.return_value = path
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
+
+    @mock.patch("fetch_loader_manifests._download_to_cache")
+    @mock.patch("fetch_loader_manifests._fetch_profile_json")
+    @mock.patch("fetch_loader_manifests._fetch_json")
+    def test_quilt_placeholder_fabricloader_is_left_out(
+        self, fetch_json, fetch_profile, download
+    ):
+        fetch_json.return_value = [{"loader": {"version": "0.30.1"}}]
+        fetch_profile.return_value = b"{}"
+        with tempfile.TemporaryDirectory() as directory:
+            download.return_value = self._quilt_maven_jar(
+                directory, "0.30.1", "${fabric_loader_version}"
+            )
+            with self.assertLogs("fetch_loader_manifests", level="WARNING"):
+                entries = fetch_loader_manifests._fetch_quilt(
+                    "1.21", refresh_profiles=True
+                )
+        self.assertEqual(
+            entries[0]["provided_versions"], {"quilt_loader": "0.30.1"}
+        )
 
     @mock.patch("fetch_loader_manifests._download_to_cache")
     @mock.patch("fetch_loader_manifests._fetch_bytes")
@@ -754,6 +893,49 @@ class TestLoaderManifestEnrichment(unittest.TestCase):
         self.assertEqual(
             merged[0]["provided_versions"], {"fabricloader": "0.1.0"}
         )
+
+    def test_merge_adds_a_newly_declared_capability(self):
+        # Existing Quilt entries were published with only their own loader; a
+        # refresh that now reads fabricloader must enrich them, not fail.
+        existing = self._entry(
+            provided_versions={"quilt_loader": "0.30.1"}
+        )
+        fresh = dict(existing)
+        fresh["provided_versions"] = {
+            "quilt_loader": "0.30.1",
+            "fabricloader": "0.19.3",
+        }
+
+        merged = fetch_loader_manifests._merge_entries(
+            [existing], [fresh], loader="quilt"
+        )
+
+        self.assertEqual(
+            merged[0]["provided_versions"],
+            {"quilt_loader": "0.30.1", "fabricloader": "0.19.3"},
+        )
+        # A second refresh, with the same data, is unchanged.
+        rerun = fetch_loader_manifests._merge_entries(
+            merged, [fresh], loader="quilt"
+        )
+        self.assertEqual(rerun, merged)
+
+    def test_merge_rejects_removed_capability(self):
+        existing = self._entry(
+            provided_versions={
+                "quilt_loader": "0.30.1",
+                "fabricloader": "0.19.3",
+            }
+        )
+        fresh = dict(existing)
+        fresh["provided_versions"] = {"quilt_loader": "0.30.1"}
+
+        with self.assertRaises(fetch_loader_manifests.ExistingEntryMutationError) as raised:
+            fetch_loader_manifests._merge_entries(
+                [existing], [fresh], loader="quilt"
+            )
+
+        self.assertIn("provided_versions", raised.exception.mutations[0]["fields"])
 
     def test_merge_rejects_changed_capability(self):
         existing = self._entry(provided_versions={"fabricloader": "0.1.0"})
@@ -922,75 +1104,6 @@ class TestStableJsonSha256(unittest.TestCase):
         hash1 = fetch_loader_manifests._stable_json_sha256(b'{"a":1}')
         hash2 = fetch_loader_manifests._stable_json_sha256(b'{"a":2}')
         self.assertNotEqual(hash1, hash2)
-
-
-class TestSha256File(unittest.TestCase):
-    """Tests for fetch_registry_db.sha256_file."""
-
-    def test_known_content(self):
-        """SHA-256 of a temp file with known content matches expected hash."""
-        expected = (
-            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-        )
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(b"hello")
-            tmp_path = tmp.name
-        try:
-            self.assertEqual(fetch_registry_db.sha256_file(Path(tmp_path)), expected)
-        finally:
-            os.unlink(tmp_path)
-
-    def test_empty_file(self):
-        """SHA-256 of an empty file matches the known empty-hash constant."""
-        expected = (
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        )
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            self.assertEqual(fetch_registry_db.sha256_file(Path(tmp_path)), expected)
-        finally:
-            os.unlink(tmp_path)
-
-
-class TestVerifySha256AgainstDigest(unittest.TestCase):
-    """Tests for fetch_registry_db.verify_sha256_against_digest."""
-
-    def test_no_digest_skips(self):
-        """When digest_field is None, no verification is performed (no exit)."""
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(b"hello")
-            tmp_path = tmp.name
-        try:
-            # Should not raise or call sys.exit
-            fetch_registry_db.verify_sha256_against_digest(Path(tmp_path), None)
-        except SystemExit:
-            self.fail("verify_sha256_against_digest called sys.exit with no digest")
-        finally:
-            os.unlink(tmp_path)
-
-    def test_hex_digest_matches(self):
-        """When digest is a hex string matching the file's SHA-256, no exit occurs."""
-        expected = hashlib.sha256(b"hello").hexdigest()
-        digest_field = f"sha256:{expected}"
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(b"hello")
-            tmp_path = tmp.name
-        try:
-            fetch_registry_db.verify_sha256_against_digest(Path(tmp_path), digest_field)
-        except SystemExit:
-            self.fail("verify_sha256_against_digest called sys.exit on matching digest")
-        finally:
-            os.unlink(tmp_path)
-
-
-
-
-
-
-
-
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2248,6 +2361,47 @@ class TestBuildDocsWebStripTitle(unittest.TestCase):
         self.assertEqual(bdw.strip_title(""), "")
 
 
+class TestPinHashesOtherGames(unittest.TestCase):
+    """pin_hashes accepts a direct_hash entry for another game (MASTER_SPEC §26.8)."""
+
+    def _entry(self, **overrides):
+        entry = {
+            "id": "skyrim-archive-mod",
+            "game": "skyrim-se",
+            "content_type": "mod",
+            "download_strategy": "direct_hash",
+            "source_identifier": "https://example.com/files/Mod-1.0.7z",
+            "sha256": "0" * 64,
+            "game_compatibility": [{"stores": ["steam"], "game_versions": ["1.6.1170.0"]}],
+        }
+        entry.update(overrides)
+        return entry
+
+    def test_other_game_entry_passes_without_compatible_versions(self):
+        self.assertEqual(
+            pin_hashes._validate_direct_hash_contract(self._entry()),
+            "https://example.com/files/Mod-1.0.7z",
+        )
+
+    def test_other_game_entry_needs_game_compatibility(self):
+        entry = self._entry()
+        del entry["game_compatibility"]
+        with self.assertRaises(SystemExit) as caught:
+            pin_hashes._validate_direct_hash_contract(entry)
+        self.assertIn("game_compatibility", str(caught.exception.code))
+
+    def test_other_game_entry_still_needs_an_https_filename(self):
+        with self.assertRaises(SystemExit):
+            pin_hashes._validate_direct_hash_contract(
+                self._entry(source_identifier="https://example.com/download?id=12")
+            )
+
+    def test_minecraft_entry_still_needs_compatible_versions(self):
+        entry = self._entry(game="minecraft", source_identifier="https://example.com/files/m-1.0.jar")
+        del entry["game_compatibility"]
+        with self.assertRaises(SystemExit) as caught:
+            pin_hashes._validate_direct_hash_contract(entry)
+        self.assertIn("compatible_versions", str(caught.exception.code))
 class TestFinalizeReleaseAssetsNames(unittest.TestCase):
     """Tests for finalize_release_assets tag, rename, and plan helpers."""
 
@@ -2273,25 +2427,75 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
             with self.subTest(old_name=old_name):
                 self.assertEqual(fra.desktop_asset_rename(old_name, "0.9.3"), new_name)
 
+    def test_desktop_asset_rename_covers_the_product_stem_names(self):
+        # GitHub turns the spaces in "Agora Mod Manager" into dots on upload.
+        cases = {
+            "Agora.Mod.Manager_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+            "Agora.Mod.Manager_0.9.3_x64_en-US.msi": "agora-desktop-v0.9.3-windows-x64.msi",
+            "Agora.Mod.Manager_0.9.3_aarch64.dmg": "agora-desktop-v0.9.3-macos-arm64.dmg",
+            "Agora.Mod.Manager_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg",
+            "Agora.Mod.Manager_0.9.3_amd64.AppImage": "agora-desktop-v0.9.3-linux-x64.AppImage",
+            "Agora.Mod.Manager_0.9.3_amd64.deb": "agora-desktop-v0.9.3-linux-x64.deb",
+            "Agora.Mod.Manager-0.9.3-1.x86_64.rpm": "agora-desktop-v0.9.3-linux-x64.rpm",
+            "Agora.Mod.Manager_aarch64.app.tar.gz": "agora-desktop-v0.9.3-macos-arm64.app.tar.gz",
+            "Agora.Mod.Manager_x64.app.tar.gz": "agora-desktop-v0.9.3-macos-x64.app.tar.gz",
+        }
+        for old_name, new_name in cases.items():
+            with self.subTest(old_name=old_name):
+                self.assertEqual(fra.desktop_asset_rename(old_name, "0.9.3"), new_name)
+
     def test_desktop_asset_rename_accepts_any_msi_locale(self):
         self.assertEqual(
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64_pt-BR.msi", "0.9.3"),
+            "agora-desktop-v0.9.3-windows-x64.msi",
+        )
+        self.assertEqual(
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.9.3_x64_pt-BR.msi", "0.9.3"),
             "agora-desktop-v0.9.3-windows-x64.msi",
         )
 
     def test_desktop_asset_rename_rejects_mismatched_version(self):
         with self.assertRaisesRegex(fra.ReleaseAssetError, "0.1.0"):
             fra.desktop_asset_rename("Agora.Launcher_0.1.0_x64-setup.exe", "0.9.3")
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "0.1.0"):
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.1.0_x64-setup.exe", "0.9.3")
 
     def test_desktop_asset_rename_rejects_unknown_bundle(self):
         with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64.snap", "0.9.3")
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+            fra.desktop_asset_rename("Agora.Mod.Manager_0.9.3_x64.snap", "0.9.3")
+
+    def test_desktop_asset_rename_rejects_unknown_product_stems(self):
+        # Hostile near-misses: a mixed stem, a wrong case, a raw spaced name
+        # (GitHub never stores one), and an empty product before the version.
+        for name in (
+            "Agora.Mod.Launcher_0.9.3_x64-setup.exe",
+            "Agora.Modmanager_0.9.3_x64-setup.exe",
+            "agora.mod.manager_0.9.3_x64-setup.exe",
+            "Agora Mod Manager_0.9.3_x64-setup.exe",
+            "_0.9.3_x64-setup.exe",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+                    fra.desktop_asset_rename(name, "0.9.3")
 
     def test_desktop_asset_rename_rejects_drifted_updater_archive(self):
         # Tauri does not version .app.tar.gz names; if that ever changes, the
         # table must be updated rather than silently mis-renaming the archive.
         with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
             fra.desktop_asset_rename("Agora.Launcher_0.9.3_x64.app.tar.gz", "0.9.3")
+        # No arch suffix: which macOS build it belongs to cannot be told, so it is refused.
+        with self.assertRaisesRegex(fra.ReleaseAssetError, "Unrecognized"):
+            fra.desktop_asset_rename("Agora.Mod.Manager.app.tar.gz", "0.9.3")
+
+    def test_is_tauri_bundle_name_matches_both_product_stems_only(self):
+        for name in ("Agora.Launcher_0.9.3_x64.dmg", "Agora.Mod.Manager_0.9.3_x64.dmg"):
+            with self.subTest(name=name):
+                self.assertTrue(fra.is_tauri_bundle_name(name))
+        for name in ("", "agora-desktop-v0.9.3-windows-x64.msi", "Agora Mod Manager_0.9.3.msi", "Agora.Modmanager_0.9.3.msi", "agora.mod.manager_0.9.3.msi"):
+            with self.subTest(name=name):
+                self.assertFalse(fra.is_tauri_bundle_name(name))
 
     def test_plan_desktop_renames_skips_signature_sidecars(self):
         names = [
@@ -2304,6 +2508,20 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
             {"Agora.Launcher_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg"},
         )
 
+    def test_plan_desktop_renames_skips_signature_sidecars_of_product_stem_names(self):
+        names = [
+            "Agora.Mod.Manager_0.9.3_x64.dmg",
+            "Agora.Mod.Manager_0.9.3_x64.dmg.sig",
+            "Agora.Mod.Manager_x64.app.tar.gz.sig",
+        ]
+        self.assertEqual(
+            fra.plan_desktop_renames(names, "0.9.3"),
+            {"Agora.Mod.Manager_0.9.3_x64.dmg": "agora-desktop-v0.9.3-macos-x64.dmg"},
+        )
+
+    def test_plan_desktop_renames_handles_an_empty_release(self):
+        self.assertEqual(fra.plan_desktop_renames([], "0.9.3"), {})
+
     def test_plan_desktop_renames_rejects_colliding_targets(self):
         names = [
             "Agora.Launcher_0.9.3_x64_en-US.msi",
@@ -2311,6 +2529,26 @@ class TestFinalizeReleaseAssetsNames(unittest.TestCase):
         ]
         with self.assertRaises(fra.ReleaseAssetError):
             fra.plan_desktop_renames(names, "0.9.3")
+        product_names = [
+            "Agora.Mod.Manager_0.9.3_x64_en-US.msi",
+            "Agora.Mod.Manager_0.9.3_x64_pt-BR.msi",
+        ]
+        with self.assertRaises(fra.ReleaseAssetError):
+            fra.plan_desktop_renames(product_names, "0.9.3")
+
+    def test_plan_desktop_renames_maps_a_mixed_old_and_new_release(self):
+        # A draft published before the rename can hold old names beside new ones.
+        names = [
+            "Agora.Launcher_0.9.3_x64-setup.exe",
+            "Agora.Mod.Manager_0.9.3_aarch64.dmg",
+        ]
+        self.assertEqual(
+            fra.plan_desktop_renames(names, "0.9.3"),
+            {
+                "Agora.Launcher_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+                "Agora.Mod.Manager_0.9.3_aarch64.dmg": "agora-desktop-v0.9.3-macos-arm64.dmg",
+            },
+        )
 
 
 class TestFinalizeReleaseAssetsChecksums(unittest.TestCase):
@@ -2410,6 +2648,32 @@ class TestFinalizeReleaseAssetsLatestJson(unittest.TestCase):
         latest = {
             "platforms": {
                 "windows-x86_64": {"url": "https://example.test/Agora.Launcher_0.9.3_x64.msi"}
+            }
+        }
+        with self.assertRaises(fra.ReleaseAssetError):
+            fra.rewrite_latest_urls(latest, {})
+
+    def test_rewrites_product_stem_urls(self):
+        latest = {
+            "platforms": {
+                "windows-x86_64-nsis": {
+                    "url": "https://github.com/o/r/releases/download/v0.9.3/Agora.Mod.Manager_0.9.3_x64-setup.exe",
+                },
+            }
+        }
+        renames = {
+            "Agora.Mod.Manager_0.9.3_x64-setup.exe": "agora-desktop-v0.9.3-windows-x64-setup.exe",
+        }
+        rewritten = fra.rewrite_latest_urls(latest, renames)
+        self.assertEqual(
+            rewritten["platforms"]["windows-x86_64-nsis"]["url"],
+            "https://github.com/o/r/releases/download/v0.9.3/agora-desktop-v0.9.3-windows-x64-setup.exe",
+        )
+
+    def test_uncovered_product_stem_url_is_an_error(self):
+        latest = {
+            "platforms": {
+                "windows-x86_64": {"url": "https://example.test/Agora.Mod.Manager_0.9.3_x64.msi"}
             }
         }
         with self.assertRaises(fra.ReleaseAssetError):
@@ -2530,6 +2794,63 @@ class TestFinalizeReleaseAssetsApply(unittest.TestCase):
             self.assertEqual(fra.main(["--repo", "o/r", "--tag", self.TAG]), 0)
         plan.assert_called_once_with("o/r", self.TAG, "0.9.3")
 
+    def test_plan_and_apply_renames_product_stem_bundles(self):
+        new_names = tuple(name.replace("Agora.Launcher", "Agora.Mod.Manager") for name in self.OLD_NAMES)
+        expected = fra.expected_asset_names(self.TAG)
+        bundle_targets = {fra.desktop_asset_rename(name, "0.9.3") for name in new_names}
+        # Everything the release must hold that no bundle rename produces (CLI, portable, checksum).
+        non_bundle = [name for name in expected if name not in bundle_targets]
+        before = [
+            *(self._asset(name, index + 1) for index, name in enumerate(new_names)),
+            *(self._asset(name + ".sig", 100 + index) for index, name in enumerate(new_names)),
+            *(self._asset(name, 300 + index) for index, name in enumerate(non_bundle)),
+            self._asset("latest.json", 600),
+        ]
+        after = [self._asset(name, 200 + index) for index, name in enumerate(expected)]
+        after.append(self._asset("latest.json", 600))
+        latest = {
+            "platforms": {
+                "windows-x86_64-nsis": {
+                    "url": f"https://github.com/o/r/releases/download/{self.TAG}/Agora.Mod.Manager_0.9.3_x64-setup.exe",
+                },
+            }
+        }
+        uploads: dict[str, str] = {}
+
+        def fake_download(repo, tag, name, directory):
+            path = Path(directory) / name
+            path.write_text(json.dumps(latest), encoding="utf-8")
+            return path
+
+        def fake_upload(repo, tag, path):
+            uploads[Path(path).name] = Path(path).read_text(encoding="utf-8")
+
+        manager = mock.Mock()
+        with (
+            mock.patch.object(fra, "fetch_assets", side_effect=[before, after]),
+            mock.patch.object(fra, "delete_asset", manager.delete),
+            mock.patch.object(fra, "rename_asset", manager.rename),
+            mock.patch.object(fra, "download_asset", side_effect=fake_download),
+            mock.patch.object(fra, "upload_asset", side_effect=fake_upload),
+            mock.patch.object(fra, "asset_digest", return_value="a" * 64),
+        ):
+            fra.plan_and_apply("o/r", self.TAG, "0.9.3")
+
+        renamed = {call.args[1]["name"]: call.args[2] for call in manager.rename.call_args_list}
+        self.assertEqual(set(renamed), set(new_names))
+        self.assertEqual(
+            renamed["Agora.Mod.Manager_0.9.3_x64-setup.exe"],
+            "agora-desktop-v0.9.3-windows-x64-setup.exe",
+        )
+        deleted = sorted(call.args[1]["name"] for call in manager.delete.call_args_list)
+        self.assertEqual(deleted, sorted(name + ".sig" for name in new_names))
+        rewritten = json.loads(uploads["latest.json"])
+        self.assertTrue(
+            rewritten["platforms"]["windows-x86_64-nsis"]["url"].endswith(
+                "/agora-desktop-v0.9.3-windows-x64-setup.exe"
+            )
+        )
+
 
 class TestStageCliSidecar(unittest.TestCase):
     """Tests for stage_cli_sidecar's path rules, which must match Tauri's."""
@@ -2555,6 +2876,1360 @@ class TestStageCliSidecar(unittest.TestCase):
             stage_cli_sidecar.built_cli_path(t, "x86_64-apple-darwin", explicit_target=True),
             t / "x86_64-apple-darwin" / "release" / "agora",
         )
+
+
+def fake_pe(machine: int) -> bytes:
+    """The smallest bytes pe_machine reads: MZ, the PE offset at 0x3C, the PE signature, the machine."""
+    data = bytearray(0x88)
+    data[0:2] = b"MZ"
+    data[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    data[0x80:0x84] = b"PE\0\0"
+    data[0x84:0x86] = machine.to_bytes(2, "little")
+    return bytes(data)
+
+
+class TestStageVfsFiles(unittest.TestCase):
+    """stage_vfs_files builds the x86-folder layout and refuses a file of the wrong bitness."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.x64 = root / "release"
+        self.x86 = root / "i686" / "release"
+        self.stage_dir = root / "stage"
+        self.x64.mkdir(parents=True)
+        self.x86.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, folder, name, machine):
+        (folder / name).write_bytes(fake_pe(machine))
+
+    def write_all(self, x64_machine=0x8664, x86_machine=0x014C):
+        self.write(self.x64, "agora_vfs.dll", x64_machine)
+        self.write(self.x64, "agora-vfs-helper.exe", x64_machine)
+        self.write(self.x86, "agora_vfs.dll", x86_machine)
+        self.write(self.x86, "agora-vfs-helper.exe", x86_machine)
+
+    def test_pe_machine_reads_the_machine_type(self):
+        path = self.x64 / "probe.dll"
+        path.write_bytes(fake_pe(0x014C))
+        self.assertEqual(stage_vfs_files.pe_machine(path), 0x014C)
+
+    def test_pe_machine_refuses_a_file_that_is_not_a_pe_image(self):
+        path = self.x64 / "text.dll"
+        path.write_bytes(b"not a dll at all, just some text padding out to be long enough")
+        with self.assertRaises(ValueError):
+            stage_vfs_files.pe_machine(path)
+
+    def test_stages_the_64_bit_pair_and_the_x86_folder(self):
+        self.write_all()
+        staged = stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertEqual(
+            sorted(p.relative_to(self.stage_dir).as_posix() for p in staged),
+            [
+                "agora-vfs-helper.exe",
+                "agora_vfs.dll",
+                "x86/agora-vfs-helper.exe",
+                "x86/agora_vfs.dll",
+            ],
+        )
+        self.assertEqual(
+            stage_vfs_files.pe_machine(self.stage_dir / "x86" / "agora_vfs.dll"), 0x014C
+        )
+        self.assertEqual(
+            stage_vfs_files.pe_machine(self.stage_dir / "agora_vfs.dll"), 0x8664
+        )
+
+    def test_a_64_bit_build_in_the_x86_folder_is_refused_and_nothing_is_staged(self):
+        self.write_all(x86_machine=0x8664)
+        with self.assertRaises(SystemExit) as caught:
+            stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertIn("expected 0x014c", str(caught.exception))
+        self.assertFalse(self.stage_dir.exists())
+
+    def test_a_missing_file_is_refused_and_named(self):
+        self.write_all()
+        (self.x86 / "agora-vfs-helper.exe").unlink()
+        with self.assertRaises(SystemExit) as caught:
+            stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertIn("agora-vfs-helper.exe", str(caught.exception))
+        self.assertFalse(self.stage_dir.exists())
+
+    def test_main_takes_the_build_folders_and_stage_folder_as_arguments(self):
+        self.write_all()
+        out = self.stage_dir.parent / "cli-vfs"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = stage_vfs_files.main(
+                [
+                    "--x64-build", str(self.x64),
+                    "--x86-build", str(self.x86),
+                    "--stage-dir", str(out),
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertTrue((out / "x86" / "agora-vfs-helper.exe").is_file())
+        self.assertFalse(self.stage_dir.exists())
+
+    def test_an_earlier_stage_is_replaced_not_merged(self):
+        self.write_all()
+        stale = self.stage_dir / "x86" / "old-helper.exe"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"stale")
+        stage_vfs_files.stage(self.x64, self.x86, self.stage_dir)
+        self.assertFalse(stale.exists())
+
+
+class OfficialPluginPackageTests(unittest.TestCase):
+    """The official plugin zip and the registry entry that pins it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.out = self.root / "out"
+        self.folder = self.root / "skyrim-se"
+        shutil.copytree(bop.OFFICIAL_ROOT / "skyrim-se", self.folder)
+
+    def test_the_skyrim_plugin_declares_one_game_and_game_define(self):
+        manifest = bop.plugin_manifest(bop.OFFICIAL_ROOT / "skyrim-se")
+        self.assertEqual(manifest["id"], "agora.skyrim-se")
+        self.assertIn("game:define", manifest["capabilities"]["required"])
+        self.assertEqual(
+            manifest["dependencies"], {"agora.creation-engine": "^0.1"}
+        )
+        self.assertEqual(
+            bop.game_ids(bop.OFFICIAL_ROOT / "skyrim-se", manifest), ["skyrim-se"]
+        )
+
+    def test_the_creation_engine_base_has_no_game_of_its_own(self):
+        folder = bop.OFFICIAL_ROOT / "creation-engine"
+        manifest = bop.plugin_manifest(folder)
+        self.assertEqual(manifest["id"], "agora.creation-engine")
+        self.assertEqual(manifest["entrypoint"], "main.js")
+        self.assertIn("game:read", manifest["capabilities"]["required"])
+        self.assertEqual(bop.game_ids(folder, manifest), [])
+
+    def test_the_zip_is_identical_across_builds_and_mtimes(self):
+        first = bop.build_zip(self.folder, self.out, "0.1.0").read_bytes()
+        for path in self.folder.rglob("*"):
+            os.utime(path, (1_234_567_890, 1_234_567_890))
+        second = bop.build_zip(self.folder, self.out, "0.1.0").read_bytes()
+        self.assertEqual(first, second)
+
+    def test_entries_are_sorted_stored_and_fixed(self):
+        archive = bop.build_zip(self.folder, self.out, "0.1.0")
+        with zipfile.ZipFile(archive) as bundle:
+            infos = bundle.infolist()
+        names = [info.filename for info in infos]
+        self.assertEqual(names, sorted(names))
+        for info in infos:
+            self.assertEqual(info.date_time, bop.FIXED_DATE)
+            self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
+            self.assertEqual(info.external_attr, bop.FIXED_MODE << 16)
+
+    def test_a_crlf_text_file_is_refused_by_name(self):
+        manifest = self.folder / "agora-plugin.json"
+        manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
+        with self.assertRaises(SystemExit) as raised:
+            bop.build_zip(self.folder, self.out, "0.1.0")
+        self.assertIn("agora-plugin.json", str(raised.exception))
+        self.assertIn("CRLF", str(raised.exception))
+
+    def test_the_registry_entry_is_derived_from_the_built_zip(self):
+        built = bop.describe(bop.OFFICIAL_ROOT / "skyrim-se", self.out)
+        entry = bop.read_json(bop.registry_path(built["id"]))
+        self.assertEqual(entry["current"]["sha256"], built["sha256"])
+        self.assertEqual(entry["current"]["size"], built["size"])
+        self.assertEqual(entry["current"]["package_url"], built["package_url"])
+        self.assertEqual(
+            entry, bop.registry_entry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+        )
+        bop.verify_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+
+    def test_verify_refuses_a_stale_hash(self):
+        built = bop.describe(bop.OFFICIAL_ROOT / "skyrim-se", self.out)
+        registry = self.root / "registry"
+        with mock.patch.object(bop, "REGISTRY_ROOT", registry):
+            path = bop.update_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["current"]["sha256"] = "0" * 64
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                bop.verify_registry(built, bop.OFFICIAL_ROOT / "skyrim-se")
+        self.assertIn("current.sha256", str(caught.exception))
+
+
+class TestPackageDocsSurfaceCheck(unittest.TestCase):
+    """Tests for the game-package documentation surface check."""
+
+    def test_documented_names_are_inline_code_spans(self):
+        names = cpd.documented_names("Use `foo` and `bar`, not `baz qux`.")
+        self.assertEqual(names, {"foo", "bar", "baz qux"})
+
+    def test_map_values_are_not_schema_keys(self):
+        data = {
+            "game_templates": {"engine": {"content_layout": {"data_path": "Data"}}},
+            "environment": {"LD_PRELOAD": {"kind": "literal", "value": "x"}},
+            "behaviours": {"classify": "classifyItem"},
+        }
+        keys = {key for key, _ in cpd.iter_json_keys(data)}
+
+        self.assertIn("game_templates", keys)
+        self.assertIn("content_layout", keys)
+        self.assertIn("data_path", keys)
+        self.assertIn("environment", keys)
+        self.assertIn("kind", keys)
+        self.assertIn("value", keys)
+        self.assertIn("behaviours", keys)
+        self.assertIn("classify", keys)
+
+        self.assertNotIn("engine", keys)
+        self.assertNotIn("LD_PRELOAD", keys)
+        self.assertNotIn("classifyItem", keys)
+
+    def test_rust_fields_honour_serde_rename_and_skip_type_paths(self):
+        source = """
+pub struct ContentRule {
+    pub kind: String,
+    #[serde(rename = "match")]
+    pub matching: ContentMatch,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub when: Option<Condition>,
+}
+
+pub enum LoadOrderRule {
+    Before {
+        first: String,
+        second: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+    },
+    Requires {
+        item: String,
+        master: String,
+    },
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / f"game-{os.getpid()}.rs"
+            path.write_text(source, encoding="utf-8")
+            fields = cpd.rust_fields(path)
+
+        self.assertEqual(
+            fields,
+            {
+                "kind",
+                "match",
+                "when",
+                "first",
+                "second",
+                "optional",
+                "item",
+                "master",
+            },
+        )
+        self.assertNotIn("std", fields)
+        self.assertNotIn("ops", fields)
+        self.assertNotIn("Not", fields)
+
+    def test_this_repository_documents_every_key_and_field(self):
+        self.assertEqual(cpd.check(), [])
+
+    def test_both_package_roots_are_checked(self):
+        files = cpd.package_files()
+        self.assertEqual(len(files), 7, [str(path) for path in files])
+        self.assertTrue(any("official" in path.parts for path in files))
+        self.assertTrue(any("tracers" in path.parts for path in files))
+
+
+class TestGamePackageGuideExamples(unittest.TestCase):
+    """The guide's complete package examples must parse into a package."""
+
+    GUIDE = (
+        Path(__file__).resolve().parent.parent
+        / "docs"
+        / "plugins"
+        / "game-packages.md"
+    )
+    REQUIRED_PACKAGE = {
+        "id",
+        "version",
+        "api_range",
+        "games",
+    }
+    REQUIRED_GAME = {
+        "id",
+        "name",
+        "stores",
+        "version_sources",
+        "deployment",
+    }
+    REQUIRED_LAUNCH = {
+        "executable",
+        "working_directory",
+    }
+
+    def _json_blocks(self):
+        text = self.GUIDE.read_text(encoding="utf-8")
+        return re.findall(r"```json\n(.*?)```", text, re.DOTALL)
+
+    def test_complete_package_examples_have_the_required_fields(self):
+        complete = []
+        for block in self._json_blocks():
+            try:
+                value = json.loads(block)
+            except json.JSONDecodeError:
+                # A fragment such as `"load_orders": [...]` is not a document.
+                continue
+            if isinstance(value, dict) and {
+                "games",
+                "version",
+                "api_range",
+            } <= value.keys():
+                complete.append(value)
+
+        self.assertTrue(complete, "the guide has no complete package example")
+        for package in complete:
+            self.assertEqual(
+                self.REQUIRED_PACKAGE - package.keys(),
+                set(),
+                f"package example is missing {self.REQUIRED_PACKAGE - package.keys()}",
+            )
+            for game in package["games"]:
+                self.assertEqual(
+                    self.REQUIRED_GAME - game.keys(),
+                    set(),
+                    f"game example is missing {self.REQUIRED_GAME - game.keys()}",
+                )
+                launch = game.get("launch")
+                if launch is not None:
+                    self.assertEqual(
+                        self.REQUIRED_LAUNCH - launch.keys(),
+                        set(),
+                        "launch example is missing "
+                        f"{self.REQUIRED_LAUNCH - launch.keys()}",
+                    )
+
+
+class TestBuildLootWasm(unittest.TestCase):
+    """The LOOT module build must not embed the machine it was built on."""
+
+    def test_remap_flags_cover_the_repo_registry_and_sysroot(self):
+        repo = Path("/repo")
+        cargo_home = Path("/home/user/.cargo")
+        sysroot = Path("/sysroot")
+        flags = build_loot_wasm.remap_flags(repo, cargo_home, sysroot)
+        self.assertIn(f"--remap-path-prefix={repo}=/agora", flags)
+        self.assertIn(
+            f"--remap-path-prefix={cargo_home / 'registry' / 'src'}=/cargo/registry/src",
+            flags,
+        )
+        self.assertIn(f"--remap-path-prefix={sysroot}=/rust", flags)
+
+    def test_build_environment_pins_the_target_and_removes_plain_rustflags(self):
+        sysroot = Path("/sysroot")
+        with mock.patch.dict(
+            os.environ,
+            {"CARGO_HOME": "/home/user/.cargo", "RUSTFLAGS": "-C debuginfo=0"},
+            clear=False,
+        ), mock.patch.object(build_loot_wasm, "rust_sysroot", return_value=sysroot):
+            env = build_loot_wasm.build_environment(Path("/tmp/target"))
+        self.assertEqual(env["CARGO_TARGET_DIR"], str(Path("/tmp/target")))
+        self.assertEqual(env["CARGO_INCREMENTAL"], "0")
+        self.assertNotIn("RUSTFLAGS", env)
+        flags = env["CARGO_ENCODED_RUSTFLAGS"].split(build_loot_wasm.ENCODED_SEPARATOR)
+        self.assertIn(f"--remap-path-prefix={build_loot_wasm.REPO_ROOT}=/agora", flags)
+        self.assertIn(f"--remap-path-prefix={sysroot}=/rust", flags)
+
+    def test_reference_platform_is_linux_only(self):
+        with mock.patch.object(build_loot_wasm.sys, "platform", "linux"):
+            self.assertTrue(build_loot_wasm.is_reference_platform())
+        for other in ("win32", "darwin"):
+            with mock.patch.object(build_loot_wasm.sys, "platform", other):
+                self.assertFalse(build_loot_wasm.is_reference_platform())
+
+    def test_non_linux_check_says_it_cannot_compare(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            build_loot_wasm, "is_reference_platform", return_value=False
+        ), mock.patch.object(build_loot_wasm, "build") as build, contextlib.redirect_stderr(
+            stderr
+        ):
+            code = build_loot_wasm.main(["--check"])
+        self.assertEqual(code, 0)
+        build.assert_not_called()
+        self.assertIn("cannot compare", stderr.getvalue())
+
+    def test_non_linux_build_refuses_to_overwrite_the_reference(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            build_loot_wasm, "is_reference_platform", return_value=False
+        ), mock.patch.object(build_loot_wasm, "build") as build, contextlib.redirect_stderr(
+            stderr
+        ):
+            code = build_loot_wasm.main([])
+        self.assertEqual(code, 1)
+        build.assert_not_called()
+        self.assertIn("refusing to overwrite", stderr.getvalue())
+
+    def test_sha256_file_matches_hashlib(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "blob"
+            path.write_bytes(b"loot wasm")
+            self.assertEqual(
+                build_loot_wasm.sha256_file(path),
+                hashlib.sha256(b"loot wasm").hexdigest(),
+            )
+
+    def test_sources_document_lists_versions_checksums_licences_and_vendored_crates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            crate = root / "crate"
+            crate.mkdir()
+            (crate / "Cargo.toml").write_text(
+                '[package]\nname = "loot-sort"\n\n'
+                '[patch.crates-io]\nlibloot = { path = "vendor/libloot" }\n',
+                encoding="utf-8",
+            )
+            lock = root / "Cargo.lock"
+            lock.write_text(
+                'version = 4\n\n'
+                '[[package]]\nname = "loot-sort"\nversion = "0.1.0"\n\n'
+                '[[package]]\nname = "adler2"\nversion = "2.0.1"\n'
+                'checksum = "abc123"\n\n'
+                '[[package]]\nname = "libloot"\nversion = "0.29.7"\n',
+                encoding="utf-8",
+            )
+            registry = root / "registry" / "src" / "index.crates.io-test"
+            (registry / "adler2-2.0.1").mkdir(parents=True)
+            (registry / "adler2-2.0.1" / "Cargo.toml").write_text(
+                '[package]\nname = "adler2"\nversion = "2.0.1"\n'
+                'license = "0BSD OR MIT OR Apache-2.0"\n',
+                encoding="utf-8",
+            )
+            (crate / "vendor" / "libloot").mkdir(parents=True)
+            (crate / "vendor" / "libloot" / "Cargo.toml").write_text(
+                '[package]\nname = "libloot"\nversion = "0.29.7"\n'
+                'license = "GPL-3.0-or-later"\n',
+                encoding="utf-8",
+            )
+            document = build_loot_wasm.sources_document(
+                lockfile=lock,
+                manifest=crate / "Cargo.toml",
+                cargo_home=root,
+                crate_dir=crate,
+            )
+        self.assertIn("| `adler2` | 2.0.1 | `abc123` | 0BSD OR MIT OR Apache-2.0 |", document)
+        self.assertIn("https://crates.io/crates/adler2/2.0.1", document)
+        self.assertIn("| `libloot` | 0.29.7 | vendored | GPL-3.0-or-later |", document)
+        self.assertIn("patched sources in `vendor/libloot`", document)
+        self.assertNotIn("`loot-sort`", document)
+
+
+class TestCrashBenchmark(unittest.TestCase):
+    """Tests for the game-agnostic crash benchmark skeleton."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_jsonl(self, name: str, rows: list[dict[str, Any]]) -> Path:
+        path = self.tmp / name
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        return path
+
+    def _gold(self, row_id: str, culprit: str = "Mod.jar", **extra: Any) -> dict[str, Any]:
+        row = {
+            "id": row_id,
+            "label": "gold",
+            "poster_confirmed": True,
+            "culprit": culprit,
+            "culprit_kind": "mod",
+            "culprit_in_log": True,
+            "fix": None,
+            "quote": "quote",
+            "difficulty": "easy",
+            "template_risk": False,
+        }
+        row.update(extra)
+        return row
+
+    def _manifest_row(
+        self,
+        row_id: str,
+        sha: str | None = None,
+        game: str = "minecraft",
+        log_type: str = "crash",
+    ) -> dict[str, Any]:
+        return {
+            "id": row_id,
+            "game": game,
+            "log_type": log_type,
+            "file": f"{row_id}.log",
+            "sha256": sha or f"sha-{row_id}",
+        }
+
+    def _key_row(self, row_id: str, culprit: str = "Mod.jar") -> dict[str, Any]:
+        return {
+            "id": row_id,
+            "game": "minecraft",
+            "log_type": "crash",
+            "difficulty": "easy",
+            "culprit_kind": "mod",
+            "culprit_in_log": True,
+            "culprit": culprit,
+        }
+
+    def _freeze(
+        self,
+        labels: list[dict[str, Any]],
+        manifest: list[dict[str, Any]],
+        out_name: str = "out",
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], Path]:
+        out = self.tmp / out_name
+        summary = cb.freeze(
+            self._write_jsonl("labels.jsonl", labels),
+            self._write_jsonl("manifest.jsonl", manifest),
+            out,
+            **kwargs,
+        )
+        return summary, out
+
+    def test_freeze_puts_already_studied_ids_in_dev(self):
+        ids = [f"row-{n}" for n in range(12)]
+        labels = [self._gold(i) for i in ids]
+        manifest = [self._manifest_row(i) for i in ids]
+        # row-0 shares its log with dup, so both must follow it to dev.
+        labels.append(self._gold("dup"))
+        manifest.append(self._manifest_row("dup", sha="sha-row-0"))
+        studied = self.tmp / "studied.txt"
+
+        def test_ids(out: Path) -> set[str]:
+            text = (out / "test-key.jsonl").read_text(encoding="utf-8")
+            return {json.loads(line)["id"] for line in text.splitlines() if line.strip()}
+
+        # Everything is test without the list, so the list is what moves them.
+        _, plain = self._freeze(labels, manifest, "plain", test_fraction=1.0)
+        self.assertEqual(test_ids(plain), set(ids) | {"dup"})
+
+        studied.write_text('row-0\n{"id": "row-5"}\nnot-in-the-key\n', encoding="utf-8")
+        summary, out = self._freeze(
+            labels, manifest, "forced", test_fraction=1.0, dev_ids_path=studied
+        )
+        self.assertEqual(test_ids(out), set(ids) - {"row-0", "row-5", "dup"})
+        self.assertEqual(summary["forced_dev"], 2)
+        self.assertEqual(self._key_ids(out), set(ids) | {"dup"})
+
+        studied.write_text("\n", encoding="utf-8")
+        with self.assertRaises(cb.BenchmarkError):
+            self._freeze(labels, manifest, "empty", dev_ids_path=studied)
+
+    def _key_ids(self, out: Path) -> set[str]:
+        ids: set[str] = set()
+        for name in ("dev-key.jsonl", "test-key.jsonl"):
+            for line in (out / name).read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    ids.add(json.loads(line)["id"])
+        return ids
+
+    def _prediction(
+        self,
+        row_id: str,
+        *suspects: str,
+        abstained: bool = False,
+        cause: str | None = None,
+    ) -> dict[str, Any]:
+        row = {
+            "id": row_id,
+            "suspects": [
+                {"name": suspect, "confidence": None} for suspect in suspects
+            ],
+            "abstained": abstained,
+        }
+        if cause is not None:
+            row["cause"] = cause
+        return row
+
+    def test_empty_predictions_are_an_error_not_a_perfect_score(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        empty = self.tmp / "predictions.jsonl"
+        empty.write_text("", encoding="utf-8")
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, empty)
+
+    def test_empty_key_is_an_error(self):
+        key = self.tmp / "key.jsonl"
+        key.write_text("", encoding="utf-8")
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod", abstained=False)]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_a_missing_prediction_counts_as_abstained_not_as_skipped(self):
+        key = self._write_jsonl(
+            "key.jsonl", [self._key_row("a"), self._key_row("b")]
+        )
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod")]
+        )
+
+        result = cb.score(key, predictions)
+
+        overall = result["overall"]
+        self.assertEqual(overall["rows"], 2)
+        self.assertEqual(overall["top1_hits"], 1)
+        self.assertEqual(overall["abstained"], 1)
+        self.assertEqual(overall["missing"], 1)
+        self.assertEqual(overall["wrong"], 0)
+
+    def test_unknown_prediction_id_is_an_error(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("ghost", "Mod")]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_duplicate_id_is_an_error(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [self._prediction("a", "Mod"), self._prediction("a", "Mod")],
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_the_split_is_deterministic_and_duplicates_of_one_log_stay_together(self):
+        labels = [
+            self._gold("a"),
+            self._gold("b"),
+            self._gold("c"),
+            self._gold("d"),
+        ]
+        manifest = [
+            self._manifest_row("a", sha="same-log"),
+            self._manifest_row("b", sha="same-log"),
+            self._manifest_row("c", sha="log-c"),
+            self._manifest_row("d", sha="log-d"),
+        ]
+
+        _, first = self._freeze(labels, manifest, out_name="first", salt="pepper")
+        _, second = self._freeze(labels, manifest, out_name="second", salt="pepper")
+
+        for name in ("dev-key.jsonl", "test-key.jsonl"):
+            self.assertEqual(
+                (first / name).read_bytes(), (second / name).read_bytes()
+            )
+
+        placed = {
+            row_id: name
+            for name in ("dev-key.jsonl", "test-key.jsonl")
+            for row_id in (
+                json.loads(line)["id"]
+                for line in (first / name).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            )
+        }
+        self.assertEqual(placed["a"], placed["b"])
+
+    def test_template_risk_rows_never_enter_the_key(self):
+        summary, out = self._freeze(
+            [self._gold("a"), self._gold("b", template_risk=True)],
+            [self._manifest_row("a"), self._manifest_row("b")],
+        )
+
+        self.assertEqual(self._key_ids(out), {"a"})
+        self.assertEqual(summary["dropped"]["template_risk"], 1)
+
+    def test_silver_rows_never_enter_the_key(self):
+        silver = {
+            "id": "b",
+            "label": "silver",
+            "culprit": "Other.jar",
+            "template_risk": False,
+        }
+        summary, out = self._freeze(
+            [self._gold("a"), silver],
+            [self._manifest_row("a"), self._manifest_row("b")],
+        )
+
+        self.assertEqual(self._key_ids(out), {"a"})
+        self.assertEqual(summary["dropped"]["label_silver"], 1)
+
+    def test_out_inside_a_git_tree_is_refused(self):
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        out = repo / "key"
+
+        with self.assertRaises(cb.BenchmarkError) as raised:
+            cb.freeze(
+                self._write_jsonl("labels.jsonl", [self._gold("a")]),
+                self._write_jsonl("manifest.jsonl", [self._manifest_row("a")]),
+                out,
+            )
+
+        self.assertIn("git", str(raised.exception).lower())
+        self.assertFalse(out.exists())
+
+    def test_detail_on_the_test_key_is_refused(self):
+        key = self._write_jsonl("test-key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod")]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions, detail=True)
+
+        result = cb.score(
+            key, predictions, detail=True, i_am_done_writing_rules=True
+        )
+        self.assertEqual(len(result["rows"]), 1)
+
+    def test_a_changed_key_fails_expect_sha256(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod")]
+        )
+        actual = hashlib.sha256(key.read_bytes()).hexdigest()
+
+        self.assertEqual(
+            cb.score(key, predictions, expect_sha256=actual)["overall"]["rows"], 1
+        )
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions, expect_sha256="0" * 64)
+
+    def test_name_matching_ignores_extension_and_punctuation_but_is_not_fuzzy(self):
+        self.assertEqual(
+            cb.normalize_name("Cool Mod.DLL"), cb.normalize_name("cool-mod")
+        )
+        self.assertEqual(cb.normalize_name("Plugin.esp"), "plugin")
+        self.assertNotEqual(cb.normalize_name("Foo"), cb.normalize_name("FooBar"))
+
+        key = self._write_jsonl(
+            "key.jsonl", [self._key_row("a", culprit="Cool Mod.dll")]
+        )
+        exact = self._write_jsonl(
+            "exact.jsonl", [self._prediction("a", "cool-mod")]
+        )
+        fuzzy = self._write_jsonl(
+            "fuzzy.jsonl", [self._prediction("a", "coolmod-extra")]
+        )
+
+        self.assertEqual(cb.score(key, exact)["overall"]["top1_hits"], 1)
+        self.assertEqual(cb.score(key, fuzzy)["overall"]["top1_hits"], 0)
+
+    def test_abstain_always_scores_zero_hits(self):
+        key = self._write_jsonl(
+            "key.jsonl", [self._key_row("a"), self._key_row("b")]
+        )
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [self._prediction("a", "Wrong"), self._prediction("b", "Wrong")],
+        )
+
+        results = cb.compare(key, [("bad-tool", predictions)])
+
+        self.assertEqual(results[0]["tool"], "abstain-always")
+        baseline = results[0]["overall"]
+        self.assertEqual(baseline["rows"], 2)
+        self.assertEqual(baseline["top1_hits"], 0)
+        self.assertEqual(baseline["top3_hits"], 0)
+        self.assertEqual(baseline["abstained"], 2)
+        self.assertEqual(baseline["wrong"], 0)
+        self.assertEqual(results[1]["tool"], "bad-tool")
+        self.assertEqual(results[1]["overall"]["top1_hits"], 0)
+
+    def test_person_words_hit_loosely_and_miss_strictly(self):
+        cases = [
+            ("SMIM (Static Mesh Improvement Mod)", "SMIM-SE-Merged-All.esp"),
+            ("SkyClimb and po3_PapyrusExtender", "SkyClimb.dll"),
+            ("QuickLootRE", "QuickLootRE SE.esp"),
+        ]
+        for index, (culprit, prediction) in enumerate(cases):
+            key = self._write_jsonl(
+                f"loose-key-{index}.jsonl",
+                [self._key_row("a", culprit=culprit)],
+            )
+            predictions = self._write_jsonl(
+                f"loose-pred-{index}.jsonl", [self._prediction("a", prediction)]
+            )
+            overall = cb.score(key, predictions)["overall"]
+            self.assertEqual(overall["top1_hits"], 0, culprit)
+            self.assertEqual(overall["loose_top1_hits"], 1, culprit)
+            self.assertEqual(overall["loose_top3_hits"], 1, culprit)
+            # Strictly wrong, but right by the loose reading: not counted as truly wrong.
+            self.assertEqual(overall["wrong"], 1, culprit)
+            self.assertEqual(overall["loose_wrong"], 0, culprit)
+
+    def test_a_short_answer_inside_a_longer_unrelated_name_misses_both_ways(self):
+        key = self._write_jsonl(
+            "skyrim-key.jsonl",
+            [self._key_row("a", culprit="Skyrim Immersive Creatures")],
+        )
+        predictions = self._write_jsonl(
+            "skyrim-pred.jsonl", [self._prediction("a", "Skyrim.esm")]
+        )
+
+        overall = cb.score(key, predictions)["overall"]
+
+        self.assertEqual(overall["top1_hits"], 0)
+        self.assertEqual(overall["loose_top1_hits"], 0)
+        self.assertEqual(overall["loose_top3_hits"], 0)
+        self.assertEqual(overall["loose_wrong"], 1)
+
+    def test_a_segment_under_four_characters_never_matches(self):
+        key = self._write_jsonl(
+            "short-key.jsonl", [self._key_row("a", culprit="Foo & Bar")]
+        )
+        predictions = self._write_jsonl(
+            "short-pred.jsonl", [self._prediction("a", "Foo.dll")]
+        )
+
+        overall = cb.score(key, predictions)["overall"]
+
+        self.assertEqual(overall["loose_top1_hits"], 0)
+
+    def test_an_accept_entry_makes_a_strict_hit_and_freeze_copies_it(self):
+        labels = [
+            self._gold(
+                "a", culprit="Cool Mod (the loud one)", accept=["coolmod"]
+            )
+        ]
+        _, out = self._freeze(
+            labels,
+            [self._manifest_row("a")],
+            out_name="accept",
+            test_fraction=1.0,
+        )
+        key_path = out / "test-key.jsonl"
+        key_row = json.loads(
+            key_path.read_text(encoding="utf-8").splitlines()[0]
+        )
+        self.assertEqual(key_row["accept"], ["coolmod"])
+
+        predictions = self._write_jsonl(
+            "accept-pred.jsonl", [self._prediction("a", "cool-mod")]
+        )
+        overall = cb.score(key_path, predictions)["overall"]
+        self.assertEqual(overall["top1_hits"], 1)
+
+    def test_an_invalid_accept_is_an_error_at_freeze_naming_the_row(self):
+        for bad in ("coolmod", [""], ["ok", 3], [None], []):
+            with self.subTest(accept=bad):
+                labels = [self._gold("bad-row", accept=bad)]
+                if bad == []:
+                    _, out = self._freeze(
+                        labels,
+                        [self._manifest_row("bad-row")],
+                        out_name="empty-accept",
+                        test_fraction=1.0,
+                    )
+                    row = json.loads(
+                        (out / "test-key.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()[0]
+                    )
+                    self.assertEqual(row["accept"], [])
+                    continue
+                with self.assertRaises(cb.BenchmarkError) as raised:
+                    self._freeze(labels, [self._manifest_row("bad-row")])
+                self.assertIn("bad-row", str(raised.exception))
+
+    def test_error_predictions_are_counted_separately(self):
+        key = self._write_jsonl(
+            "error-key.jsonl", [self._key_row("a"), self._key_row("b")]
+        )
+        predictions = self._write_jsonl(
+            "error-pred.jsonl",
+            [
+                self._prediction("a", "Wrong"),
+                {"id": "b", "error": "timed out after 1 s"},
+            ],
+        )
+
+        result = cb.score(key, predictions)
+        overall = result["overall"]
+        self.assertEqual(overall["rows"], 2)
+        self.assertEqual(overall["errors"], 1)
+        self.assertEqual(overall["abstained"], 0)
+        self.assertEqual(overall["missing"], 0)
+
+        compared = cb.compare(key, [("tool", predictions)])
+        self.assertEqual(compared[1]["overall"]["errors"], 1)
+
+    def test_detail_shows_whether_strict_or_loose_matched(self):
+        key = self._write_jsonl(
+            "detail-key.jsonl",
+            [self._key_row("a", culprit="SMIM (Static Mesh Improvement Mod)")],
+        )
+        predictions = self._write_jsonl(
+            "detail-pred.jsonl", [self._prediction("a", "SMIM-SE-Merged-All.esp")]
+        )
+
+        result = cb.score(key, predictions, detail=True)
+        row = result["rows"][0]
+
+        self.assertEqual(row["outcome"], "wrong")
+        self.assertEqual(row["matched_by"], "loose")
+        self.assertFalse(row["strict_top1_hit"])
+        self.assertTrue(row["loose_top1_hit"])
+        self.assertTrue(row["loose_top3_hit"])
+
+    def _analyzer(self, body: str) -> Path:
+        script = self.tmp / "fake_analyzer.py"
+        script.write_text(body, encoding="utf-8")
+        return script
+
+    def _predict(
+        self,
+        ids: list[str],
+        script: Path,
+        *,
+        corpus_name: str,
+        manifest_rows: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], Path]:
+        corpus = self.tmp / f"corpus-{corpus_name}"
+        corpus.mkdir(parents=True)
+        rows = manifest_rows or [
+            self._manifest_row(row_id) for row_id in ids
+        ]
+        for row in rows:
+            target = corpus / row["file"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("synthetic log\n", encoding="utf-8")
+        manifest = self._write_jsonl(
+            f"manifest-{corpus_name}.jsonl", rows
+        )
+        ids_path = self._write_jsonl(
+            f"ids-{corpus_name}.jsonl", [{"id": row_id} for row_id in ids]
+        )
+        out = self.tmp / f"predictions-{corpus_name}.jsonl"
+        summary = cb.predict(
+            manifest,
+            corpus,
+            ids_path,
+            out,
+            f'"{sys.executable}" "{script}"',
+            **kwargs,
+        )
+        return summary, out
+
+    @staticmethod
+    def _rows(path: Path) -> list[dict[str, Any]]:
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def test_a_non_mod_cause_counts_when_nobody_is_named(self):
+        key_row = self._key_row("a")
+        key_row["culprit_kind"] = "setting"
+        key_row["culprit"] = "a setting"
+        key = self._write_jsonl("key.jsonl", [key_row])
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [self._prediction("a", abstained=True, cause="setting")],
+        )
+
+        result = cb.score(key, predictions)
+
+        overall = result["overall"]
+        self.assertEqual(overall["abstained"], 1)
+        self.assertEqual(overall["cause_rows"], 1)
+        self.assertEqual(overall["cause_hits"], 1)
+
+    def test_score_counts_the_cause_kind_per_group(self):
+        mod_row = self._key_row("a")
+        version_row = self._key_row("b")
+        version_row["culprit_kind"] = "version_mismatch"
+        other_row = self._key_row("c")
+        other_row["culprit_kind"] = "save"
+        key = self._write_jsonl("key.jsonl", [mod_row, version_row, other_row])
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [
+                self._prediction("a", "Mod.jar", cause="mod"),
+                self._prediction("b", abstained=True, cause="version_mismatch"),
+                self._prediction("c", abstained=True, cause="other"),
+            ],
+        )
+
+        result = cb.score(key, predictions)
+
+        overall = result["overall"]
+        self.assertEqual(overall["cause_rows"], 3)
+        self.assertEqual(overall["cause_hits"], 2)
+        self.assertEqual(
+            result["by"]["game"]["minecraft"]["cause_hits"], 2
+        )
+
+    def test_key_cause_kinds_map_onto_the_closed_set(self):
+        self.assertEqual(cb.cause_kind("version_mismatch"), "version_mismatch")
+        self.assertEqual(cb.cause_kind("Out Of Memory"), "memory")
+        self.assertEqual(cb.cause_kind("missing_dependency"), "missing_requirement")
+        self.assertEqual(cb.cause_kind("something-new"), "other")
+        self.assertIsNone(cb.cause_kind(None))
+        self.assertIsNone(cb.cause_kind("  "))
+
+    def test_an_unknown_prediction_cause_is_an_error(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod", cause="made-up")]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_predict_records_the_answer_cause(self):
+        script = self._analyzer(
+            "import json\n"
+            "print(json.dumps({'answer': {'cause': 'memory', 'candidates': []}, "
+            "'files': []}))\n"
+        )
+
+        _, out = self._predict(["a"], script, corpus_name="cause")
+
+        self.assertEqual(self._rows(out)[0]["cause"], "memory")
+
+    def test_predict_reads_candidates_and_skips_unnamed_owners(self):
+        script = self._analyzer(
+            "import json\n"
+            "print(json.dumps({'answer': {'candidates': ["
+            "{'owner': {'kind': 'item', 'key': 'a', 'name': 'SkyClimb.dll'}}, "
+            "{'owner': {'kind': 'system'}}, "
+            "{'owner': {'kind': 'framework', 'name': 'FancyHooks'}}]}, "
+            "'files': [{'name': 'a.log', 'read_by': "
+            "{'plugin_id': 'p', 'plugin_name': 'P', 'parser_id': 'r'}}]}))\n"
+        )
+
+        summary, out = self._predict(["a"], script, corpus_name="read")
+        row = self._rows(out)[0]
+
+        self.assertEqual(
+            [suspect["name"] for suspect in row["suspects"]],
+            ["SkyClimb.dll", "FancyHooks"],
+        )
+        self.assertFalse(row["abstained"])
+        self.assertEqual(row["read_by"]["parser_id"], "r")
+        self.assertEqual(row["skipped_unnamed"], 1)
+        self.assertEqual(summary["skipped_unnamed"], 1)
+        self.assertEqual(summary["no_parser"], 0)
+
+    def test_predict_keeps_id_order_whatever_the_job_count(self):
+        script = self._analyzer(
+            "import json, os, sys\n"
+            "print(json.dumps({'answer': {'candidates': [{'owner': "
+            "{'kind': 'item', 'key': 'k', "
+            "'name': os.path.basename(sys.argv[3])}}]}, 'files': []}))\n"
+        )
+
+        summary, out = self._predict(
+            ["c", "a", "b"], script, corpus_name="order", jobs=3
+        )
+        rows = self._rows(out)
+
+        self.assertEqual([row["id"] for row in rows], ["c", "a", "b"])
+        self.assertEqual(
+            [row["suspects"][0]["name"] for row in rows],
+            ["c.log", "a.log", "b.log"],
+        )
+        self.assertEqual(summary["errors"], 0)
+
+    def test_predict_passes_a_path_with_spaces_as_one_argument(self):
+        script = self._analyzer(
+            "import json, os, sys\n"
+            "path = sys.argv[3]\n"
+            "if not os.path.isfile(path):\n"
+            "    sys.exit(9)\n"
+            "print(json.dumps({'answer': {'candidates': [{'owner': "
+            "{'kind': 'item', 'key': 'k', 'name': os.path.basename(path)}}]}, "
+            "'files': []}))\n"
+        )
+        manifest_rows = [
+            {
+                "id": "spaced",
+                "game": "minecraft",
+                "log_type": "crash",
+                "file": "logs/a log with spaces.log",
+                "sha256": "sha-spaced",
+            }
+        ]
+
+        summary, out = self._predict(
+            ["spaced"],
+            script,
+            corpus_name="spaces",
+            manifest_rows=manifest_rows,
+        )
+        row = self._rows(out)[0]
+
+        self.assertNotIn("error", row)
+        self.assertEqual(row["suspects"][0]["name"], "a log with spaces.log")
+        self.assertEqual(summary["errors"], 0)
+
+    def test_predict_passes_plugin_options(self):
+        script = self._analyzer(
+            "import json, sys\n"
+            "if '--allow-code' not in sys.argv or '--plugin-dir' not in sys.argv:\n"
+            "    sys.exit(7)\n"
+            "print(json.dumps({'answer': {'candidates': []}, 'files': []}))\n"
+        )
+
+        summary, out = self._predict(
+            ["a"],
+            script,
+            corpus_name="plugins",
+            plugin_dirs=[self.tmp / "plugins"],
+            allow_code=True,
+        )
+
+        self.assertTrue(self._rows(out)[0]["abstained"])
+        self.assertEqual(summary["errors"], 0)
+
+    def test_predict_keeps_a_nonzero_run_with_json_as_an_abstention(self):
+        script = self._analyzer(
+            "import json, sys\n"
+            "print(json.dumps({'answer': {'candidates': []}, 'files': ["
+            "{'name': 'a.log', 'reason': "
+            "'the file is empty; there is nothing to read'}]}))\n"
+            "sys.exit(1)\n"
+        )
+
+        summary, out = self._predict(["a"], script, corpus_name="nonzero-json")
+        row = self._rows(out)[0]
+
+        self.assertTrue(row["abstained"])
+        self.assertNotIn("error", row)
+        self.assertIn("nothing to read", row["reason"])
+        self.assertEqual(summary["errors"], 0)
+        self.assertEqual(summary["abstained"], 1)
+
+    def test_predict_makes_a_nonzero_run_without_json_an_error(self):
+        script = self._analyzer(
+            "import sys\nprint('the analyzer fell over', file=sys.stderr)\nsys.exit(2)\n"
+        )
+
+        summary, out = self._predict(["a"], script, corpus_name="nonzero")
+        row = self._rows(out)[0]
+
+        self.assertIn("exit", row["error"])
+        self.assertIn("fell over", row["error"])
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["abstained"], 0)
+
+    def test_predict_makes_garbage_output_an_error(self):
+        script = self._analyzer("print('not json')\n")
+
+        summary, out = self._predict(["a"], script, corpus_name="garbage")
+        row = self._rows(out)[0]
+
+        self.assertIn("JSON", row["error"])
+        self.assertEqual(summary["errors"], 1)
+
+    def test_predict_makes_a_timeout_an_error_not_an_abstention(self):
+        script = self._analyzer("import time\ntime.sleep(10)\n")
+
+        summary, out = self._predict(
+            ["a"], script, corpus_name="timeout", timeout=0.2
+        )
+        row = self._rows(out)[0]
+
+        self.assertIn("timed out", row["error"])
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["abstained"], 0)
+
+    def test_predict_refuses_an_out_inside_a_git_tree(self):
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        corpus = self.tmp / "corpus-git"
+        corpus.mkdir()
+        (corpus / "a.log").write_text("synthetic log\n", encoding="utf-8")
+        manifest = self._write_jsonl(
+            "manifest-git.jsonl", [self._manifest_row("a")]
+        )
+        ids = self._write_jsonl("ids-git.jsonl", [{"id": "a"}])
+        script = self._analyzer("print('{}')\n")
+
+        with self.assertRaises(cb.BenchmarkError) as raised:
+            cb.predict(
+                manifest,
+                corpus,
+                ids,
+                repo / "predictions.jsonl",
+                f'"{sys.executable}" "{script}"',
+            )
+
+        self.assertIn("git", str(raised.exception).lower())
+        self.assertFalse((repo / "predictions.jsonl").exists())
+
+    def test_predict_refuses_an_id_that_is_not_in_the_manifest(self):
+        corpus = self.tmp / "corpus-missing"
+        corpus.mkdir()
+        manifest = self._write_jsonl(
+            "manifest-missing.jsonl", [self._manifest_row("a")]
+        )
+        ids = self._write_jsonl("ids-missing.jsonl", [{"id": "ghost"}])
+        script = self._analyzer("print('{}')\n")
+
+        with self.assertRaises(cb.BenchmarkError) as raised:
+            cb.predict(
+                manifest,
+                corpus,
+                ids,
+                self.tmp / "missing-predictions.jsonl",
+                f'"{sys.executable}" "{script}"',
+            )
+
+        self.assertIn("ghost", str(raised.exception))
+
+
+class TestGenAddrlibNames(unittest.TestCase):
+    """The Address Library name generator, on a tiny invented checkout."""
+
+    CPS = "void Thing::Go()\n{\n\tusing func_t = decltype(&Thing::Go);\n\tstatic REL::Relocation<func_t> func{ RELOCATION_ID(100, 200) };\n}\n"
+
+    def _checkout(self, root: Path) -> Path:
+        (root / "src" / "A").mkdir(parents=True)
+        (root / "src" / "Z").mkdir(parents=True)
+        (root / "include" / "E").mkdir(parents=True)
+        (root / "src" / "A" / "Example.cpp").write_text(
+            "namespace Example {\n"
+            "void Thing::Go()\n{\n"
+            "\tusing func_t = decltype(&Thing::Go);\n"
+            "\tstatic REL::Relocation<func_t> func{ RELOCATION_ID(100, 200) };\n"
+            "}\n"
+            "void First::One()\n{\n"
+            "\tstatic REL::Relocation<func_t> func{ REL::RelocationID(108, 208) };\n"
+            "}\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "Z" / "Conflict.cpp").write_text(
+            "namespace Example {\n"
+            "void Second::Two()\n{\n"
+            "\tstatic REL::Relocation<func_t> func{ RELOCATION_ID(108, 208) };\n"
+            "}\n"
+            "}\n"
+            "// RELOCATION_ID(999, 999) in a comment is not a source shape\n",
+            encoding="utf-8",
+        )
+        (root / "include" / "E" / "Example.h").write_text(
+            "namespace Example {\n"
+            "class ExampleThing {\n"
+            "public:\n"
+            "\tint GetValue()\n"
+            "\t{\n"
+            "\t\tusing func_t = decltype(&ExampleThing::GetValue);\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::RelocationID(101, 201) };\n"
+            "\t\treturn func(this);\n"
+            "\t}\n"
+            "\tvoid MakeVariant()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::VariantID(102, 202, 0x999) };\n"
+            "\t}\n"
+            "\tstruct Holder {\n"
+            "\t\tinline static REL::Relocation<int*> value{ RELOCATION_ID(109, 209) };\n"
+            "\t};\n"
+            "#ifdef ENABLE_SKYRIM_AE\n"
+            "\tvoid AeOnly()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::ID(103) };\n"
+            "\t}\n"
+            "#endif\n"
+            "#ifdef ENABLE_SKYRIM_VR\n"
+            "\tvoid VrOnly()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::ID(110) };\n"
+            "\t}\n"
+            "#endif\n"
+            "\tvoid Ambiguous()\n"
+            "\t{\n"
+            "\t\tstatic REL::Relocation<func_t> func{ REL::ID(104) };\n"
+            "\t}\n"
+            "};\n"
+            "constexpr std::array<REL::VariantID, 1> VTABLE_Ignored{ REL::VariantID(105, 205, 0x8) };\n"
+            "constexpr REL::VariantID NiRTTI_Ignored(106, 206, 0x9);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        root.with_name(root.name + ".commit").write_text(
+            "https://example.test/invented deadbeef\nMIT\n", encoding="utf-8"
+        )
+        return root
+
+    def test_names_are_split_by_runtime_and_first_path_wins(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "checkout"
+            self._checkout(root)
+            out = Path(temporary) / "names.json"
+            result = gan.generate(root, out, out.with_suffix(".js"))
+
+            table = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(table["source"]["repo"], "https://example.test/invented")
+            self.assertEqual(table["source"]["commit"], "deadbeef")
+            self.assertEqual(table["source"]["licence"], "MIT")
+            self.assertEqual(table["se"]["100"], "Thing::Go")
+            self.assertEqual(table["ae"]["200"], "Thing::Go")
+            self.assertEqual(table["se"]["101"], "ExampleThing::GetValue")
+            self.assertEqual(table["se"]["102"], "ExampleThing::MakeVariant")
+            self.assertEqual(table["se"]["109"], "ExampleThing::Holder::value")
+            self.assertEqual(table["se"]["108"], "First::One")
+            self.assertEqual(table["ae"]["208"], "First::One")
+            self.assertEqual(table["ae"]["103"], "ExampleThing::AeOnly")
+            self.assertNotIn("103", table["se"])
+            self.assertNotIn("104", table["se"])
+            self.assertNotIn("104", table["ae"])
+            self.assertNotIn("105", table["se"])
+            self.assertNotIn("106", table["ae"])
+            self.assertNotIn("999", table["se"])
+            self.assertNotIn("999", table["ae"])
+            self.assertEqual(result["conflicts"], 2)
+            self.assertTrue(any("offset table" in shape for shape in result["unparsed"]))
+            self.assertTrue(
+                any("namespace-scope id constant" in shape for shape in result["unparsed"])
+            )
+            self.assertTrue(
+                any("REL::ID with no single runtime" in shape for shape in result["unparsed"])
+            )
+            js = out.with_suffix(".js").read_text(encoding="utf-8")
+            self.assertIn("export const SE_NAMES", js)
+            self.assertIn('"100": "Thing::Go"', js)
+
+    def test_a_rerun_on_the_same_checkout_is_byte_identical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "checkout"
+            self._checkout(root)
+            first = Path(temporary) / "one.json"
+            second = Path(temporary) / "two.json"
+            gan.generate(root, first, first.with_suffix(".js"))
+            gan.generate(root, second, second.with_suffix(".js"))
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(
+                first.with_suffix(".js").read_bytes(),
+                second.with_suffix(".js").read_bytes(),
+            )
+
+    def test_missing_source_metadata_is_an_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "checkout"
+            root.mkdir()
+            with self.assertRaises(gan.GenerationError):
+                gan.generate(root, Path(temporary) / "names.json")
 
 
 if __name__ == "__main__":

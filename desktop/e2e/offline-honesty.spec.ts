@@ -171,6 +171,6 @@ test.describe('catalog and create failures say why', () => {
     await installOfflineMock(page, { connectivity: 'reachable' });
     await page.goto('/');
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
-    await expect(page.getByRole('checkbox', { name: 'Show advanced settings' })).toBeVisible();
+    await expect(page.getByRole('switch', { name: 'Show advanced settings' })).toBeVisible();
   });
 });

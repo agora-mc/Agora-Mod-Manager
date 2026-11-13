@@ -1,0 +1,68 @@
+CRASH TIME: 2026-03-01 12:00:00
+Skyrim SSE v1.6.1170
+CrashLoggerSSE v1-20-1-0 Mar  1 2026 00:00:00
+
+Unhandled exception "EXCEPTION_ACCESS_VIOLATION" at 0x7FF700001000 ExampleGame.exe+001000	call [rdi+0x10]
+Exception Flags: 0x00000000 (Continuable)
+Number of Parameters: 2
+Exception Thread ID: 4244
+Access Violation: Tried to read memory at 0x000000000010
+ACCESS VIOLATION ANALYSIS:
+	Instruction: call [rdi+0x10]
+	Memory Operand: [base=rdi, index=none, scale=0, disp=+0x10]
+	Base Register: rdi = 0x0000027EDCEFFF80
+	Computed Address: 0x0000027EDCEFFF90
+	Fault Address:   0x000000000010 (mismatch)
+
+POSSIBLE RELEVANT OBJECTS:
+	R12: (ExamplePlayer*) "Invented Player" [0x00000014] ("ExampleBase.esm") [0x00000014]
+	RCX: (ExampleScript*) [0xFF000001]
+
+PROCESS INFO:
+	Process ID: 9003
+	Crash Thread ID: 4244
+	Process Uptime: 00:02:30 (150000ms)
+	Working Directory: C:\Games\Invented Game
+	Command Line: "C:\Games\Invented Game\ExampleGame.exe"
+
+THREAD CONTEXT (HEURISTIC):
+	Thread Priority: 0
+	Likely Role: Unknown (main or worker thread)
+
+SYSTEM SPECS:
+	OS: Microsoft Windows 11 Pro v10.0.26200
+	CPU: InventedVendor Invented CPU 9400
+	CPU Cores: 24 logical, 16 physical, 1 packages
+	GPU #1: Invented Graphics 9400
+	PHYSICAL MEMORY: 10.00 GB/16.00 GB
+	VIRTUAL MEMORY: 11.00 GB/131072.00 GB
+	GPU MEMORY: 4.00/8.00 GB
+
+CALL STACK ([P]robable / [S]tack scan):
+	[ 0][P] 0x7FF700001000 ExampleGame.exe+001000 -> 55555+0x69	mov rax, [rdi+0x10]
+	[ 1][P] 0x7FF700002000 ExamplePlugin.dll+002000
+	[ 2][S] 0x7FF700003000 ExampleGame.exe+003000
+
+REGISTERS:
+	RAX 0x0                (size_t) [0]
+	RDX 0x2F000000000      (ExampleForm*)
+		File: "ExampleBase.esm"
+		FormID: 0x00012345
+
+STACK:
+	[RSP+0   ] 0x2F000000100      (ExampleRef*)
+		FormID: 0x00054321
+
+MODULES:
+	ExampleGame.exe                                    0x7FF700000000
+	ExamplePlugin.dll                                  0x7FF700004000
+
+SKSE PLUGINS:
+	ExamplePlugin.dll v1.8.0
+
+PLUGINS:
+	Light: 1	Regular: 3	Total: 4
+	[ 0]     ExampleBase.esm
+	[ 1]     ExamplePatch.esp
+	[ 2]     ExampleOther.esp
+	[FE:  0] ExampleLight.esl

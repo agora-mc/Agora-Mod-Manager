@@ -4,6 +4,7 @@
  * saved-file row can open its folder; the status banner can be dismissed.
  */
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { InstanceEditor } from './InstanceEditor';
 import { PackInstallProvider } from '../components/PackInstallProgress';
@@ -73,6 +74,7 @@ function editor(instanceId: string) {
 
 async function openExportTab(instanceId = 'alpha') {
   const view = render(editor(instanceId));
+  fireEvent.click(await screen.findByRole('button', { name: 'Import & Export' }));
   fireEvent.click(await screen.findByRole('button', { name: 'Export' }));
   await screen.findByRole('heading', { name: 'Export Instance' });
   return view;
@@ -182,7 +184,8 @@ describe('export of mods with no download source', () => {
 describe('in-instance pack import', () => {
   it('is labelled as creating a new instance, and its file dialog says so too', async () => {
     render(editor('alpha'));
-    fireEvent.click(await screen.findByRole('button', { name: /Import pack as new instance$/ }));
+    await userEvent.click(await screen.findByRole('button', { name: 'More' }));
+    await userEvent.click(await screen.findByRole('menuitem', { name: /Import pack as new instance$/ }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('pick_open_file', {
       title: 'Import pack as new instance',
       extensions: ['mrpack', 'agora-pack.json', 'json'],

@@ -1,0 +1,14 @@
+{
+  "id": "agora.creation-engine",
+  "name": "Creation Engine",
+  "description": "Shared rules for games built on Bethesda's Creation Engine.",
+  "game_ids": [],
+  "min_agora_version": "0.1.0",
+  "current": {
+    "version": "0.1.0",
+    "package_url": "https://github.com/agora-mc/Agora-Mod-Manager/releases/download/official-creation-engine-v0.1.0/creation-engine-0.1.0.zip",
+    "sha256": "a495f45e2d05bf155bf9d4130e2c1e05ae5ed857dc1bda9a541cbb4fe697db38",
+    "tree_sha256": "7c68d92bbb76ea389a78fc0f6af28e3a35a61e12420d8247133e7280bb1aad83",
+    "size": 5360810
+  }
+}

@@ -35,8 +35,20 @@ pub async fn check_and_download_update<R: tauri::Runtime>(
         ctx.lock_manager(),
     )
     .await?;
-    for warning in ctx.reload_runtime_catalog()? {
+    for warning in ctx.reload_game_catalogs()? {
         eprintln!("[agora] {warning}");
+    }
+    // A new registry can revoke an official plugin. Re-verify the installed
+    // plugins now, so a revoked one that is running stops in this session rather
+    // than at the next launch. (Game packages are loaded once at startup; those
+    // stop loading at the next launch.)
+    match crate::plugins::service(app) {
+        Ok(service) => {
+            if let Err(error) = service.reload() {
+                eprintln!("[agora] could not re-verify plugins after the catalog update: {error}");
+            }
+        }
+        Err(error) => eprintln!("[agora] could not re-verify plugins: {error}"),
     }
     Ok(status)
 }

@@ -38,7 +38,9 @@ export type PluginStatus =
   | { state: 'incompatibleApi'; detail: { required: string; host: string } }
   | { state: 'unresolvedDependency'; detail: { dependency: string; reason: string } }
   | { state: 'dependencyCycle'; detail: { cycle: string[] } }
-  | { state: 'failed'; detail: { message: string } };
+  | { state: 'failed'; detail: { message: string } }
+  /** An official plugin, or one using an official id, that does not verify; never runs. */
+  | { state: 'blocked'; detail: { reason: string } };
 
 export interface ReplacementOffer {
   id: string;
@@ -116,6 +118,57 @@ export interface PluginSummary {
   /** A saved copy of this plugin's data that could be put back, if any. */
   restorableData: CheckpointSummary | null;
   droppedEvents: number;
+  /**
+   * Whether the signed registry currently vouches for this plugin. Decided by
+   * core, never read from the manifest; absent on builds that predate it.
+   */
+  official?: OfficialStatus;
+  /** The plugin has code (scripts). A data-only plugin, such as game support, runs none. */
+  runsCode?: boolean;
+  /** The user allowed this plugin's code to run. Per plugin; the emergency stop overrides it. */
+  scriptsAllowed?: boolean;
+}
+
+/** Standing of an installed plugin as an official one. */
+export type OfficialStatus =
+  | { state: 'official'; version: string }
+  | { state: 'community' }
+  /** Installed as official but no longer verifies; blocked from loading. */
+  | { state: 'unverified'; reason: string }
+  /** Catalog missing/corrupt/offline: installed files still match, so it loads. */
+  | { state: 'catalogUnavailable'; reason: string }
+  /** Catalog no longer lists this version: it loads, with an update if offered. */
+  | { state: 'notListed'; reason: string };
+
+export type OfficialInstallState =
+  | 'notInstalled'
+  | 'upToDate'
+  | 'updateAvailable'
+  | 'notOfficial';
+
+export interface OfficialPluginInfo {
+  id: string;
+  name: string;
+  description: string | null;
+  /** Games this plugin adds, if any. */
+  gameIds: string[];
+  /** The version an install or update moves to. */
+  version: string;
+  previousVersion: string | null;
+  sizeBytes: number;
+  minAgoraVersion: string;
+  state: OfficialInstallState;
+  installedVersion: string | null;
+  canRollBack: boolean;
+  installedStatus: OfficialStatus | null;
+  /** Why it cannot be installed or updated right now, if it cannot. */
+  problem: string | null;
+}
+
+export interface OfficialPluginList {
+  plugins: OfficialPluginInfo[];
+  /** Set when the catalog could not be verified; the list is then empty on purpose. */
+  unavailableReason: string | null;
 }
 
 export interface CapabilityDescription {
@@ -139,11 +192,26 @@ export interface InstallPreview {
   /** Hosts this package would reach that the installed version could not. */
   addedHosts: string[];
   updateSource: UpdateSourceSummary | null;
+  /** This update is signed by a different publisher than the one pinned. */
+  publisherChanged?: boolean;
   migratesData: boolean;
   /** Reaches any host, or a very long host list: needs Reduced security mode. */
   needsReducedSecurity?: boolean;
   fileCount: number;
   uncompressedBytes: number;
+  /** The plugin has code: the prompt asks "<name> runs code. Allow it?". */
+  runsCode?: boolean;
+  /** The plugin has code and the installed version did not. */
+  addsCode?: boolean;
+  /** The code is new or changed, so "<name> runs code. Allow it?" is asked again. */
+  codeChanged?: boolean;
+  /**
+   * Official dependencies this install will write too, dependencies first. The
+   * one consent covers them as well.
+   */
+  alsoInstalls?: InstallPreview[];
+  /** Served from the signed official catalog, so the prompt recommends its code. */
+  official?: boolean;
 }
 
 export type UpdateVerdict =
@@ -187,6 +255,8 @@ export interface PluginManifest {
   source?: string | null;
   apiRange: string;
   entrypoint?: string | null;
+  /** One sentence on what stops working when the plugin's code is not allowed. */
+  withoutCode?: string | null;
   network?: { hosts: string[] };
   contributions?: {
     pages?: { id: string; title: string; icon?: string | null }[];

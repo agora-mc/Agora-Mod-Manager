@@ -37,6 +37,16 @@ export interface Store {
   set(key: string, value: Json): Promise<{ stored: boolean }>;
   all(): Promise<Record<string, Json>>;
   remove(key: string): Promise<{ removed: boolean }>;
+  /**
+   * Store bytes in this plugin's own blob store. Keys are plain names; a path
+   * (`/`, `\`, `..`), a Windows device name and an over-quota write are
+   * refused. The write is atomic, so a failure leaves the old bytes.
+   */
+  putBytes(key: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
+  /** Read a blob, or `null` when the key was never saved. */
+  getBytes(key: string): Promise<Uint8Array | null>;
+  /** Delete a blob. Returns whether it existed. */
+  deleteBytes(key: string): Promise<{ deleted: boolean }>;
 }
 export const instances: {
   list(): Promise<Instance[]>;
@@ -85,6 +95,117 @@ export const net: {
    * with `NETWORK_DENIED` otherwise. Responses above 2 MiB are refused.
    */
   fetchJson(url: string, options?: Record<string, Json>): Promise<{ status: number; body: Json }>;
+};
+/** A mount taken from the instance view the current hook is bound to. */
+export interface WasmViewMount {
+  /** Absolute guest path, like `/data`. Cannot nest or repeat another mount. */
+  guest: string;
+  view: {
+    /** Game path of the folder in the instance's merged view. */
+    folder: string;
+    /** Glob patterns for files below `folder`. Empty means every file. */
+    patterns?: string[];
+  };
+}
+/** A mount of bytes your script hands over. */
+export interface WasmFilesMount {
+  /** Absolute guest path, like `/input`. Cannot nest or repeat another mount. */
+  guest: string;
+  files: Record<string, string | Uint8Array>;
+}
+/** A mount of blobs from `storage.putBytes`, hardlinked into the sandbox. */
+export interface WasmStoredMount {
+  /** Absolute guest path, like `/input`. Cannot nest or repeat another mount. */
+  guest: string;
+  /** Blob keys from this plugin's own store. */
+  stored: string[];
+}
+export type WasmMount = WasmViewMount | WasmFilesMount | WasmStoredMount;
+/** Limits a script may lower, never raise. */
+export interface WasmLimits {
+  /** Defaults to 1 GiB; a larger value is refused. */
+  memoryBytes?: number;
+  /** Defaults to 120000 ms; a larger value is refused. */
+  timeoutMs?: number;
+}
+export interface WasmRunOptions {
+  /** A string is sent as UTF-8. */
+  stdin?: string | Uint8Array;
+  mounts?: WasmMount[];
+  limits?: WasmLimits;
+}
+export interface WasmRunResult {
+  exitCode: number;
+  /** Raw stdout bytes, so the result can be returned from an export as JSON. */
+  stdout: number[];
+  stderr: number[];
+  /** `stdout` decoded as UTF-8, with invalid sequences replaced. */
+  stdoutText: string;
+  stderrText: string;
+}
+export const wasm: {
+  /**
+   * Run a WASI command module shipped inside your package. Needs no capability
+   * of its own. A `view` mount needs `game:read` and a hook bound to an
+   * instance, exactly like `game.readBytes`.
+   */
+  run(module: string, options?: WasmRunOptions): WasmRunResult;
+};
+/** The lines reply a crash parser gets from `crash.readLines`. */
+export interface CrashLinesReply {
+  lines: string[];
+  /** The line to ask for next; absent at the end of the artifact. */
+  next_line?: number;
+  /** Some line was longer than the limit and was cut. */
+  cut?: boolean;
+}
+export const crash: {
+  /**
+   * Bytes of the artifact in scope for this parser or inspector call. Returns an
+   * `ArrayBuffer`; a short reply at the end of the file is normal. Throws when
+   * this call has no artifact in scope.
+   */
+  readBytes(artifactId: string, offset: number, len: number): ArrayBuffer;
+  /** Text lines of the artifact in scope. Throws outside a parser call. */
+  readLines(artifactId: string, fromLine: number, maxLines: number): CrashLinesReply;
+};
+/** One entry in a game path listing. */
+export interface GameListEntry {
+  name: string;
+  dir: boolean;
+  size: number;
+}
+/** A listing, possibly cut at the host's entry cap. */
+export interface GameListReply {
+  entries: GameListEntry[];
+  cut: boolean;
+}
+/** A reply from `game.readLines`, shaped like the crash contract's. */
+export interface GameLinesReply {
+  lines: string[];
+  nextLine?: number;
+  cut?: boolean;
+}
+/** Reads and writes against one game instance, by game path. */
+export const game: {
+  /** Bytes at `path` in this call's instance view. Throws when there is no view in scope. */
+  readBytes(path: string, offset?: number, len?: number): ArrayBuffer;
+  /** Text lines at `path` in this call's instance view. */
+  readLines(path: string, fromLine?: number, maxLines?: number): GameLinesReply;
+  /** Direct children of `path` in this call's instance view. */
+  list(path?: string): GameListReply;
+  /** Write bytes into this plugin's own generated layer for `instanceId`. */
+  writeBytes(instanceId: string, path: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
+  /** Write text into this plugin's own generated layer for `instanceId`. */
+  writeText(instanceId: string, path: string, text: string): Promise<{ written: number }>;
+  /** The same reads and writes for an ordinary plugin call, naming the instance. */
+  forInstance(instanceId: string): {
+    readBytes(path: string, offset?: number, len?: number): Promise<ArrayBuffer>;
+    readLines(path: string, fromLine?: number, maxLines?: number): Promise<GameLinesReply>;
+    list(path?: string): Promise<GameListReply>;
+    writeBytes(path: string, bytes: Uint8Array | number[]): Promise<{ written: number }>;
+    writeText(path: string, text: string): Promise<{ written: number }>;
+  };
 };
 export const log: { debug(...values: unknown[]): void; info(...values: unknown[]): void; warn(...values: unknown[]): void; error(...values: unknown[]): void };
 export function on(eventName: string, handler: (event: PluginEvent) => void | Promise<void>): () => void;

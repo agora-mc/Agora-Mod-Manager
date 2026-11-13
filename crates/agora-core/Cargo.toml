@@ -10,6 +10,19 @@ description = "Agora launcher core — shared business logic for the Tauri GUI, 
 name = "agora_core"
 path = "src/lib.rs"
 
+# A test tool that does the file operations some tests need, instead of a copy of the machine's
+# `cmd.exe`. Integration tests reach it through `CARGO_BIN_EXE_agora-tool-test-helper`.
+[[bin]]
+name = "agora-tool-test-helper"
+path = "src/bin/agora-tool-test-helper.rs"
+
+# A stand-in for a game that exits with a chosen code, crashes, or starts a child and exits first
+# (the shape of `skse64_loader.exe`). It lets the session ledger be tested with no game. Tests
+# reach it through `CARGO_BIN_EXE_agora-session-crasher`; nothing ships or starts it.
+[[bin]]
+name = "agora-session-crasher"
+path = "src/bin/agora-session-crasher.rs"
+
 [features]
 test-support = []
 
@@ -17,6 +30,7 @@ test-support = []
 # The plugin contract. Types only: no script engine, no transport, nothing
 # that would breach the "no tauri/clap/MCP in core" rule.
 agora-plugin-api = { path = "../agora-plugin-api" }
+agora-game-api = { path = "../agora-game-api" }
 
 # Pure logic only. NO tauri, clap, or MCP-protocol crates may appear here —
 # the core must stay UI-agnostic so all three front-ends (Tauri GUI, agora
@@ -36,7 +50,7 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 ed25519-dalek = { workspace = true }
 zip = { version = "9", default-features = false, features = ["aes-crypto", "bzip2", "deflate-flate2", "time", "zstd"] }
-toml = "0.8.2"
+sevenz-rust2 = "0.23"
 urlencoding = "2"
 async-trait = { workspace = true }
 keyring = "2"
@@ -47,10 +61,21 @@ uuid = { workspace = true }
 sysinfo = { workspace = true }
 rand = { workspace = true }
 semver = { workspace = true }
-tar = "0.4"
+thiserror = { workspace = true }
 flate2 = "1"
-fastnbt = "2"
-walkdir = { workspace = true }
+roxmltree = "0.20"
+
+# LOOT's plugin header reader (GPL-3.0, the licence Agora itself uses). Header only: the
+# Creation Engine load order (MASTER_SPEC §26.6) takes masters and the master and light flags.
+
+# MicrosoftGame.config, read by Microsoft Store game discovery.
+quick-xml = "0.39"
+
+# A real file identity for staged view files: inode on Unix, volume serial and
+# file index on Windows. Already in the lock through `walkdir`, so this adds no
+# download; it lets a swap between the view walk and the hardlink be refused
+# instead of trusting timestamps and size.
+same-file = "1"
 
 # Directory junctions for shared folders on Windows. `std`'s symlink_dir needs
 # Developer Mode or elevation and, when it fails, callers silently fall back to
@@ -59,6 +84,13 @@ walkdir = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 junction = "2"
 
+# Starting a game under agora_vfs.dll: import-table injection, with a remote thread as the fallback.
+# The DLL itself is never linked, only found at runtime.
+agora-vfs-inject = { path = "../agora-vfs-inject" }
+
+# Store discovery reads Steam, GOG and Microsoft Store install records from the registry.
+winreg = "0.55"
+
 # DPAPI for the credential fallback. Windows Credential Manager caps a secret at
 # CRED_MAX_CREDENTIAL_BLOB_SIZE (2560 bytes, so 1280 chars once keyring encodes
 # UTF-16), which a Minecraft access token plus an Entra refresh token exceeds on
@@ -66,7 +98,18 @@ junction = "2"
 # msal-extensions uses to persist a token cache on Windows.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

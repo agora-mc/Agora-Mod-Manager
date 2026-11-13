@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-import { TOUR_STEPS } from '../src/features/tour/tourModel';
+import { TOUR_STEPS, visibleTourSteps } from '../src/features/tour/tourModel';
 
 // ---------------------------------------------------------------------------
 // One Tauri mock for the walkthrough and onboarding checks in this file. Any
@@ -101,7 +101,9 @@ async function installMock(page: Page, options: MockOptions) {
 
 /** Seed a running walkthrough at the step with this id. */
 async function resumeTourAt(page: Page, stepId: string) {
-  const index = TOUR_STEPS.findIndex((step) => step.id === stepId);
+  // The tour drops conditional steps it cannot show; this app has one game, so
+  // seed the index into the same list the tour walks.
+  const index = visibleTourSteps(TOUR_STEPS, { multipleGames: false }).findIndex((step) => step.id === stepId);
   expect(index).toBeGreaterThan(-1);
   await page.addInitScript((i) => {
     localStorage.setItem('agora-tour', JSON.stringify({ version: 1, status: 'running', index: i, completed: false }));

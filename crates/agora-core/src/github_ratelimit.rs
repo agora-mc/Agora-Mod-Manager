@@ -46,7 +46,7 @@ static GITHUB_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         Err(_) => {
             // Fallback: minimal client if TLS init fails unexpectedly.
             reqwest::Client::builder()
-                .user_agent("AgoraLauncher/1.0")
+                .user_agent("AgoraModManager/1.0")
                 .timeout(Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()

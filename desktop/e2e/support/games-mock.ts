@@ -1,0 +1,312 @@
+import type { Page } from '@playwright/test';
+import { expect } from '@playwright/test';
+
+/**
+ * A mock of Tauri's `__TAURI_INTERNALS__` for specs that exercise the multi-game shell.
+ *
+ * Unlike the older specs, which answer any unknown command with `null`, this one answers from a
+ * per-test table and treats every other command as a bug in the test: it records the name and
+ * rejects the call, and `expectNoUnmockedCommands` fails the test when anything was recorded.
+ * A `null` reply therefore means "the command answered with nothing", never "I forgot it".
+ *
+ * Settings are the one stateful part. `get_setting` and `set_setting` read and write
+ * `localStorage`, so a value written before a reload is still there after it, the way the real
+ * settings store behaves across restarts.
+ *
+ * Tauri's own `plugin:*` protocol calls (event listeners and the like) are not application
+ * commands and are answered without being recorded.
+ */
+
+/** Replies by command name. Values are plain data: they cross into the page as JSON. */
+export interface GamesMockTable {
+  replies: Record<string, unknown>;
+  /**
+   * Replies handed out in order for one command, then `replies` takes over.
+   * Used where the real command answers differently per call, such as an
+   * install that first asks for consent and then installs.
+   */
+  sequences?: Record<string, unknown[]>;
+  /** Settings the app starts with. Values written later by `set_setting` take precedence. */
+  settings?: Record<string, unknown>;
+}
+
+const SETTINGS_STORE_KEY = '__agora_games_mock_settings';
+const UNMOCKED_LOG_KEY = '__agora_games_mock_unmocked';
+
+/** Installs the mock before any page script runs. Call it before `page.goto`. */
+export async function installGamesMock(page: Page, table: GamesMockTable): Promise<void> {
+  await page.addInitScript(
+    ({ table, settingsKey, unmockedKey }) => {
+      // The shell asks which games are turned off on every start. A null answer is a failed list,
+      // which hides nothing (specs that need rows pass their own). The game switcher asks for each
+      // game's exe icon; null means "this game has none".
+      const replies: Record<string, unknown> = {
+        games_support_list: null,
+        games_icon: null,
+        // A game instance's own image; null means it has none and shows its generated tile.
+        games_instance_icon: null,
+        // A game's Home (where a game opens) shows a strip of its catalog. Empty unless a spec
+        // passes entries.
+        games_catalog_list: { entries: [], instances: [] },
+        // A verified registry that lists no official plugins. Specs that need a
+        // card pass their own entry; an unanswered command would fail the test.
+        list_official_plugins: { plugins: [], unavailableReason: null },
+        // An instance's crash answers: none unless a spec passes one. The overview card stays
+        // hidden for an empty list, so every other instance-page spec sees the page it did before.
+        list_crash_answers: { answers: [], latestVerdict: null, retainedCrashes: 40 },
+        // A game with no load order lists keeps the single-list wording, and a game page's
+        // content tab asks for the tools that run on one item. Specs that need rows pass their own.
+        games_plugins_lists: { lists: [] },
+        games_tools_list: { instanceId: '', tools: [], known: [] },
+        // The sharing setting lives on the Minecraft Settings page; a game-page
+        // spec never changes it, but answering it keeps an errant visit honest.
+        get_content_sharing: 'link',
+        preview_content_sharing_conversion: {
+          instances: 0,
+          summary: { filesConverted: 0, filesAlready: 0, bytes: 0, skipped: [] },
+          warnings: [],
+        },
+        set_content_sharing: null,
+        // The shell asks for recognised downloads on every page for the Library badge. A null
+        // list is a failed read; an empty one is "nothing new", which is what these specs mean.
+        downloads_list: [],
+        downloads_scan: 0,
+        downloads_default_folder: null,
+        downloads_ignore: null,
+        ...table.replies,
+      };
+      const sequences: Record<string, unknown[]> = {};
+      // An exhausted sequence keeps answering its last reply. A page may ask again for the same
+      // command (React StrictMode runs effects twice in the dev config), and the scripted answer
+      // that was true for the second call stays the true one until the test changes it.
+      const sequenceLast: Record<string, unknown> = {};
+      // A command may be asked twice in the same task (React StrictMode runs an effect twice in
+      // the dev config). Both calls must see the same scripted answer, or the second step of a
+      // sequence would be used before the thing it answers for has happened. Calls in later tasks
+      // advance the sequence.
+      const turnReplies: Record<string, unknown> = {};
+      const turnPending: Record<string, boolean> = {};
+      for (const [command, queue] of Object.entries(table.sequences ?? {})) {
+        sequences[command] = [...queue];
+      }
+      const seeded: Record<string, unknown> = { onboarding_complete: true, ...table.settings };
+      const stored = JSON.parse(localStorage.getItem(settingsKey) ?? '{}') as Record<string, unknown>;
+      const settings: Record<string, unknown> = { ...seeded, ...stored };
+      const persistSettings = () => localStorage.setItem(settingsKey, JSON.stringify(settings));
+      persistSettings();
+
+      const recordUnmocked = (command: string) => {
+        const list = JSON.parse(sessionStorage.getItem(unmockedKey) ?? '[]') as string[];
+        list.push(command);
+        sessionStorage.setItem(unmockedKey, JSON.stringify(list));
+      };
+
+      Object.assign(window as unknown as Record<string, unknown>, {
+        __TAURI_INTERNALS__: {
+          transformCallback() { return 1; },
+          unregisterCallback() {},
+          invoke(command: string, args: Record<string, unknown> = {}) {
+            if (command.startsWith('plugin:')) return Promise.resolve(1);
+            if (command === 'get_setting') {
+              const key = String(args.key);
+              return Promise.resolve(Object.prototype.hasOwnProperty.call(settings, key) ? settings[key] : null);
+            }
+            if (command === 'set_setting') {
+              settings[String(args.key)] = args.value;
+              persistSettings();
+              return Promise.resolve(null);
+            }
+            if (command === 'downloads_add' || command === 'downloads_ignore') {
+              // Adding or ignoring a recognised download takes it out of the Library list, as the
+              // real store does. A spec may still answer the command itself through `replies`.
+              const list = replies.downloads_list;
+              if (Array.isArray(list)) {
+                const index = list.findIndex(
+                  (row) =>
+                    row !== null
+                    && typeof row === 'object'
+                    && (row as { sha256?: unknown }).sha256 === args.sha256,
+                );
+                if (index >= 0) list.splice(index, 1);
+              }
+              if (Object.prototype.hasOwnProperty.call(replies, command)) {
+                return Promise.resolve(replies[command]);
+              }
+              return Promise.resolve(
+                command === 'downloads_add'
+                  ? { status: 'added', itemId: 'f'.repeat(64) }
+                  : null,
+              );
+            }
+            // Instance actions answer from their arguments, so a spec that renames, clones,
+            // stops or restores sees the data it asked for instead of a fixed sample. A spec that
+            // scripts one of them (a refusal, a list with entries) answers it itself.
+            const scriptedHere = Object.prototype.hasOwnProperty.call(replies, command)
+              || Object.prototype.hasOwnProperty.call(sequences, command);
+            if (!scriptedHere && command === 'games_instance_rename') {
+              return Promise.resolve({ instanceId: args.instanceId, name: args.name });
+            }
+            if (!scriptedHere && command === 'games_instance_clone') {
+              return Promise.resolve({ instanceId: `${String(args.instanceId)}-copy`, name: args.name });
+            }
+            if (!scriptedHere && command === 'games_instance_stop') {
+              return Promise.resolve({ instanceId: args.instanceId, processesEnded: 1, playTimeMs: 0 });
+            }
+            if (!scriptedHere && command === 'games_instance_deleted_list') {
+              return Promise.resolve({ entries: [], retentionDays: 30 });
+            }
+            if (!scriptedHere && command === 'games_instance_restore_deleted') {
+              return Promise.resolve({
+                instanceId: 'restored-1',
+                originalInstanceId: 'grounded-1',
+                renamed: Boolean(args.name),
+              });
+            }
+            if (!scriptedHere && command === 'games_instance_purge_deleted') {
+              return Promise.resolve({ purged: 0, failed: 0, kept: 0 });
+            }
+            if (command === 'games_support_set_enabled') {
+              // The list a Settings toggle changes is the same one later reads get.
+              const rows = replies.games_support_list;
+              if (Array.isArray(rows)) {
+                for (const row of rows) {
+                  if (row && typeof row === 'object' && (row as { gameId?: unknown }).gameId === args.gameId) {
+                    (row as { enabled?: unknown }).enabled = args.enabled;
+                  }
+                }
+              }
+              return Promise.resolve(null);
+            }
+            const queued = sequences[command];
+            const scripted =
+              Array.isArray(queued) || Object.prototype.hasOwnProperty.call(sequenceLast, command);
+            if (scripted) {
+              if (turnPending[command]) {
+                const held = turnReplies[command];
+                return Promise.resolve(Array.isArray(held) ? structuredClone(held) : held);
+              }
+              let next: unknown;
+              if (Array.isArray(queued) && queued.length > 0) {
+                next = queued.shift();
+                sequenceLast[command] = next;
+              } else {
+                next = sequenceLast[command];
+              }
+              turnReplies[command] = next;
+              turnPending[command] = true;
+              setTimeout(() => {
+                delete turnPending[command];
+                delete turnReplies[command];
+              }, 0);
+              return Promise.resolve(Array.isArray(next) ? structuredClone(next) : next);
+            }
+            if (Object.prototype.hasOwnProperty.call(replies, command)) {
+              const reply = replies[command];
+              // A list is copied on the way out: a page that asks again after a toggle must see a
+              // new value, not the same array object it already holds.
+              return Promise.resolve(Array.isArray(reply) ? structuredClone(reply) : reply);
+            }
+            recordUnmocked(command);
+            return Promise.reject(new Error(`Unmocked Tauri command in a games test: ${command}`));
+          },
+        },
+        __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener() {} },
+      });
+    },
+    { table, settingsKey: SETTINGS_STORE_KEY, unmockedKey: UNMOCKED_LOG_KEY },
+  );
+}
+
+/** Commands that were called without a table entry. Survives reloads within the test. */
+export async function unmockedCommands(page: Page): Promise<string[]> {
+  return page.evaluate((key) => JSON.parse(sessionStorage.getItem(key) ?? '[]') as string[], UNMOCKED_LOG_KEY);
+}
+
+/** The stored value of a setting, as the app last wrote it (or the table's seed if it never did). */
+export async function storedSetting(page: Page, key: string): Promise<unknown> {
+  return page.evaluate(
+    ({ storeKey, key }) => (JSON.parse(localStorage.getItem(storeKey) ?? '{}') as Record<string, unknown>)[key] ?? null,
+    { storeKey: SETTINGS_STORE_KEY, key },
+  );
+}
+
+/** Fails the test if the app called a command the table does not answer. */
+export async function expectNoUnmockedCommands(page: Page): Promise<void> {
+  expect(await unmockedCommands(page), 'commands the games table does not answer').toEqual([]);
+}
+
+/**
+ * Replies for the sections other slices mount on the same game page, empty. The Setup tab shows
+ * installs, bases, game folders and recovery together, the Library shows the store and the
+ * catalog, and the Instances tab lists instances: a spec about one of them still renders the
+ * others, and an unanswered command fails the test. Put this first in a spec's boot replies so
+ * the spec's own entries override it.
+ */
+/**
+ * What the header of a game instance page reads on every one of its pages: the instance and its
+ * launch checks. Specs for the other pages spread this in so the header has an answer.
+ */
+export function instanceHeaderReplies(instanceId: string): Record<string, unknown> {
+  return {
+    games_instance_get: {
+      instanceId,
+      gameId: 'skyrim-se',
+      gameName: 'Skyrim Special Edition',
+      name: 'Test instance',
+      pinned: true,
+      store: 'steam',
+      version: '1.6.1170',
+      build: null,
+      baseId: 'skyrim-se_steam_1.6.1170',
+      installId: null,
+      unpinnedReason: null,
+      deployment: null,
+      saves: 'shared',
+      createdAt: '2026-10-01 10:00:00',
+      lastLaunchedAt: null,
+      lastPlayedAt: null,
+      playTimeMs: 0,
+      running: false,
+      capabilities: {
+        launch: true,
+        stop: true,
+        rename: true,
+        clone: true,
+        trash: true,
+        openFolder: true,
+        playTime: true,
+      },
+    },
+    games_instance_check: { instanceId, checked: true, status: 'ok', findings: [], passed: [] },
+  };
+}
+
+export const OTHER_SLICES_REPLIES: Record<string, unknown> = {
+  games_instance_list: { instances: [] },
+  games_discover: { folders: [], warnings: [] },
+  games_user_files_status: { sessions: [] },
+  games_base_list: { bases: [], damaged: [] },
+  games_content_list: { items: [], damaged: [] },
+  games_catalog_list: { entries: [], instances: [] },
+  games_library_list: { items: [], damaged: [], warnings: [] },
+  games_library_fill_details: { considered: 0, updated: 0, skipped: [], warnings: [] },
+  games_library_unused: { items: [], totalSize: 0, warnings: [] },
+  games_library_instances: { instances: [], warnings: [] },
+  games_library_icon: null,
+  games_library_cache_icon: { saved: false, matched: 0, iconDataUrl: null },
+  downloads_list: [],
+  downloads_scan: 0,
+  downloads_default_folder: null,
+};
+
+/**
+ * What the Settings page reads when it opens, for tests that reach a game's own Settings pages
+ * (Installs, Bases, Recovery). Signed out, keyring storage unknown, not portable.
+ */
+export const SETTINGS_PAGE_REPLIES: Record<string, unknown> = {
+  is_portable_mode: false,
+  msa_get_status: null,
+  msa_list_accounts: [],
+  credential_storage_status: null,
+  get_auth_status: false,
+};

@@ -144,7 +144,7 @@
   - **Acceptance:** New user sees welcome → toggles → can skip OAuth → lands on Home with registry loaded.
 
 - [x] **Crash diagnostics** (§9, Phase 4)
-  - **Short:** Pre-launch interceptor, regex signature matching, GitHub issue duplicate search, preview-before-submit, manual log viewer. Implemented in `desktop/src-tauri/src/crash_diagnostics.rs` (`check_for_crash`, `triage_crash`, `list_crash_reports`, `read_crash_log`).
+  - **Short:** Pre-launch interceptor, crash log analysis, GitHub issue duplicate search, preview-before-submit, manual log viewer. Implemented by the crash engine (`crash analyze`, stored session answers) and the shared `CrashAnswerView`; the old regex-signature diagnoser (`crash_diagnostics.rs`) was deleted when Minecraft moved fully to the engine (MASTER_SPEC §30.11).
   - **Detail:** (a) Pre-launch interceptor reads `last_launched_at` (already fixed to update before spawn); if the previous launch crashed, show crash prompt. (b) Add Rust `regex` crate; read `crash_signatures` table; match against latest crash log. (c) Search GitHub issues for known duplicate patterns. (d) Show preview of what will be submitted before creating a GitHub issue. (e) Manual log viewer panel for browsing `crash-reports/`. (f) Local crash telemetry already has `record_co_crash()` + retention purge; wire it into the crash detection flow.
   - **Spec:** §9, Phase 4
   - **Acceptance:** A simulated crash matches a regex signature, shows the fix hint, and the user can preview + submit a GitHub issue.
@@ -246,6 +246,7 @@
   - **Detail:** New `scripts/fetch_registry_db.py` (stdlib only) queries the GitHub Releases API for the latest `registry-*` release and downloads `registry.db` (+ `.sig` if present) to a target dir. New `.github/workflows/web-build.yml` (dispatch / daily schedule / push to `web/**`) sets up Node 20 + Python 3.11, runs the fetch script to place `registry.db` at the repo root (matching `web/src/lib/db.ts` fallback), then `npm ci && npm run build`, uploading `web/out` as `web-static`. Depends on a `registry-*` release existing (created by `compile.yml`).
   - **Spec:** §13
   - **Acceptance:** `npm run build` in CI works without a local `registry.db`.
+  - **Superseded:** `scripts/fetch_registry_db.py` was deleted with the catalog hash-policy change. `web-build.yml` compiles the catalog itself and never called it.
 
 - [x] **Category / MC version / loader filters on web**
   - **Short:** Category chips + MC version dropdown + loader filter in the web catalog. Implemented in `web/src/components/Catalog.tsx`.
@@ -345,6 +346,8 @@
 ---
 
 ## Deferred 
+- [ ] **Catalog `provides` field:** let a game catalog entry say which framework it provides, so the link from an unmet framework stops relying on the narrow id and name match in `framework_catalog_entry` (`crates/agora-core/src/catalog_install.rs`).
+
 - [x] **Cross-cutting Pack Overrides: mrpack `overrides/` extraction + non-mod file round-trip**
    - **Short:** When importing or exporting `.mrpack` packs, honor Modrinth's `overrides/` (and `client-overrides/` / `server-overrides/`) directory convention and broaden the agora-pack JSON to round-trip non-mod files.
    - **Detail:** `import_mrpack` in `mod_install.rs` now extracts override directories (`overrides/`, `client_overrides/`) alongside mod `.jar`s, applying the override sanitizer's whitelist: `config/`, `defaultconfigs/`, `resourcepacks/`, `shaderpacks/`, `datapacks/`, `kubejs/`. Sanitization runs inline in `import_mrpack` (the archive is already open in-memory, so `override_sanitizer::extract_overrides`'s zip-path API is not used directly). Banned extensions and Zip Slip protection apply.
@@ -602,4 +605,6 @@ Both switches ship **off**: `plugins_enabled` and `network_plugins_enabled`.
         Native companions only if a concrete plugin justifies them.
 
 **Explicitly out of scope for v1:** MO2 integration, Steam discovery, generic
-game adapters. These are a separate initiative and block none of the above.
+game adapters. These are a separate initiative and block none of the above. The
+plan for after v1 is MASTER_SPEC §26 (multi-game support), backed by the spike in
+`scripts/spikes/game-support/`.

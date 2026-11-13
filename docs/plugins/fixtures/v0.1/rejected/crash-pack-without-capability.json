@@ -1,0 +1,13 @@
+{
+  "manifest": 1,
+  "id": "fixture.crash-pack-without-capability",
+  "name": "Crash pack without capability",
+  "version": "1.0.0",
+  "license": "MIT",
+  "apiRange": ">=0.1, <0.2",
+  "contributions": {
+    "crashPacks": [
+      { "path": "crash/pack.json" }
+    ]
+  }
+}

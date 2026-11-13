@@ -29,8 +29,11 @@ on:
       - "crates/**"
       - "desktop/**"
       - "compiler/**"
-      # Embedded at compile time into agora-core via include_str!/include_bytes!
-      # (loader_manifests.rs, runtime_catalog.rs, crash_diagnostics.rs), so a
+      - "packages/**"
+      - "registry/official-plugins/**"
+      # Embedded at compile time via include_str!/include_bytes! (agora-core's
+      # crash_diagnostics.rs; agora-game-minecraft's loader_manifests.rs and
+      # runtime_catalog.rs), so a
       # change here changes every Rust artifact the release ships.
       - "crash-signatures/**"
       - "loader-manifests/**"
@@ -50,8 +53,11 @@ on:
       - "crates/**"
       - "desktop/**"
       - "compiler/**"
-      # Embedded at compile time into agora-core via include_str!/include_bytes!
-      # (loader_manifests.rs, runtime_catalog.rs, crash_diagnostics.rs), so a
+      - "packages/**"
+      - "registry/official-plugins/**"
+      # Embedded at compile time via include_str!/include_bytes! (agora-core's
+      # crash_diagnostics.rs; agora-game-minecraft's loader_manifests.rs and
+      # runtime_catalog.rs), so a
       # change here changes every Rust artifact the release ships.
       - "crash-signatures/**"
       - "loader-manifests/**"
@@ -96,8 +102,8 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
-      - name: Clippy core and CLI (no Tauri system libs required)
-        run: cargo clippy -p agora-core -p agora-cli --all-targets --all-features -- -D warnings
+      - name: Clippy core, game packages, plugin host and CLI (no Tauri system libs required)
+        run: cargo clippy -p agora-core -p agora-game-api -p agora-game-minecraft -p agora-game-creation -p agora-plugin-host -p agora-cli --all-targets --all-features -- -D warnings
 
   desktop-clippy:
     runs-on: windows-latest
@@ -109,8 +115,8 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
-      - name: Clippy desktop
-        run: cargo clippy -p agora-desktop --all-targets -- -D warnings
+      - name: Clippy desktop and the Windows VFS crates
+        run: cargo clippy -p agora-desktop -p agora-vfs -p agora-vfs-inject --all-targets -- -D warnings
 
   rust-tests:
     strategy:
@@ -126,6 +132,18 @@ jobs:
           workspaces: . -> target
       - name: Core unit and integration tests
         run: cargo test -p agora-core --lib --tests
+      - name: Game contract and Minecraft package tests
+        run: cargo test -p agora-game-api -p agora-game-minecraft -p agora-game-creation --lib --tests
+      - name: Plugin host tests
+        run: cargo test -p agora-plugin-host --lib --tests
+      - name: VFS and injector build and tests
+        if: matrix.os == 'windows-latest'
+        run: cargo test -p agora-vfs -p agora-vfs-inject --lib --tests
+      - name: Build the 32-bit VFS pair
+        if: matrix.os == 'windows-latest'
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build -p agora-vfs --target i686-pc-windows-msvc
       - name: CLI tests
         run: cargo test -p agora-cli
       - name: Build CLI
@@ -136,6 +154,36 @@ jobs:
       - name: Desktop Rust lib tests (includes MCP HTTP transport tests)
         if: matrix.os == 'windows-latest'
         run: cargo test -p agora-desktop --lib
+
+  # The ignored VFS tests start their own helper processes and inject agora_vfs.dll into them.
+  # They need no administrator rights (checked on a non-elevated Windows 11 machine) and never
+  # start a real game: the executables are copies of cmd.exe and Agora's own probe fixtures.
+  vfs-injection:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Add the 32-bit Windows target
+        run: rustup target add i686-pc-windows-msvc
+      - name: Build the VFS and its test fixtures
+        run: |
+          cargo build -p agora-vfs -p agora-vfs-early-import
+          cargo build -p agora-vfs --target i686-pc-windows-msvc
+      - name: VFS write matrix
+        run: cargo test -p agora-vfs --test matrix -- --ignored --test-threads=1
+      - name: Real injection (game deploy)
+        env:
+          AGORA_VFS_DLL: ${{ github.workspace }}/target/debug/agora_vfs.dll
+          AGORA_VFS_DLL_X86: ${{ github.workspace }}/target/i686-pc-windows-msvc/debug/agora_vfs.dll
+        run: cargo test -p agora-core --test game_deploy real_injection_ -- --ignored --test-threads=1
+      - name: Real injection (tool runs)
+        env:
+          AGORA_VFS_DLL: ${{ github.workspace }}/target/debug/agora_vfs.dll
+          AGORA_VFS_DLL_X86: ${{ github.workspace }}/target/i686-pc-windows-msvc/debug/agora_vfs.dll
+        run: cargo test -p agora-core --test game_tools real_injection_ -- --ignored --test-threads=1
 
   compiler:
     runs-on: ubuntu-latest
@@ -156,6 +204,25 @@ jobs:
         run: python compiler/test_governance_integration.py -v
       - name: Script unit tests
         run: python scripts/test_scripts.py -v
+
+  loot-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The committed module is byte-reproducible only with the toolchain
+          # that produced it; pin it here instead of following stable.
+          toolchain: "1.99.0"
+          targets: wasm32-wasip1
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Check the committed LOOT WebAssembly module
+        run: python scripts/build_loot_wasm.py --check
 
   frontend:
     runs-on: ubuntu-latest
@@ -186,6 +253,8 @@ jobs:
           python-version: "3.12"
       - name: Architecture boundary analysis (hard failures)
         run: python scripts/check_architecture.py
+      - name: Architecture game boundary regression tests
+        run: python -m unittest discover -s scripts -p test_check_architecture.py
 
   tauri-bindings:
     runs-on: ubuntu-latest
@@ -206,6 +275,8 @@ jobs:
           python-version: "3.12"
       - name: Documentation quality gates (internal links, guide integrity, stale claims)
         run: python scripts/check_docs.py
+      - name: Game-package guide covers every package key and Rust field
+        run: python scripts/check_package_docs.py
 
   version-metadata:
     runs-on: ubuntu-latest
@@ -220,3 +291,10 @@ jobs:
       # and a mismatched Cargo.lock breaks every `cargo build --locked`.
       - name: Version metadata agrees across package files
         run: python scripts/set_release_version.py --check
+      # A workspace crate the script does not stamp leaves a stale Cargo.lock
+      # entry that only the tagged release build finds (v0.9.3). The test stamps
+      # a copy of the workspace and resolves it offline, so fetch first.
+      - name: Tag stamping keeps Cargo.lock resolvable
+        run: |
+          cargo fetch --locked
+          python -m unittest discover -s scripts -p test_set_release_version.py

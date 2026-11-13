@@ -1,0 +1,39 @@
+{
+  "id": "skyrim-together",
+  "name": "Skyrim Together Reborn",
+  "content_type": "mod",
+  "author": "Tilted Phoques",
+  "license": "GPL-3.0",
+  "game": "skyrim-se",
+  "download_strategy": "github_release",
+  "source_identifier": "tiltedphoques/TiltedEvolution",
+  "page_url": "https://github.com/tiltedphoques/TiltedEvolution/releases",
+  "description": "Multiplayer for Skyrim Special Edition, started from its own launcher.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.7.104.*"],
+      "requires": [
+        { "framework": "address-library" }
+      ],
+      "asset": "SkyrimTogether-*-windows-x64.zip"
+    },
+    {
+      "stores": ["steam"],
+      "game_versions": ["1.6.1170.*"],
+      "requires": [
+        { "framework": "address-library" }
+      ],
+      "asset": "SkyrimTogether-*-windows-x64-sse1.6.1170.zip"
+    },
+    {
+      "stores": ["gog"],
+      "game_versions": ["1.6.1179.*"],
+      "requires": [
+        { "framework": "address-library" }
+      ],
+      "asset": "SkyrimTogether-*-windows-x64-sse1.6.1170.zip"
+    }
+  ],
+  "curator_note": "Checked on 2026-11-08 against release 1.8.4. Each release ships two Windows builds: SkyrimTogether-<version>-windows-x64.zip for Skyrim Special Edition 1.7.104 on Steam and GOG (the project's main target), and SkyrimTogether-<version>-windows-x64-sse1.6.1170.zip for 1.6.1170 on Steam and 1.6.1179 on GOG. Sources: kSupportedGameVersions in Code/client/main.cpp (index 1 Steam, 2 GOG) and the skyrim_version option in xmake.lua and .github/workflows/release.yml, all at https://github.com/tiltedphoques/TiltedEvolution. It has its own launcher (SkyrimTogether.exe) and needs Address Library; it does not need SKSE. Neither pattern matches a debug-symbols asset, and the 1.7.104 pattern does not match the 1.6.1170 build."
+}

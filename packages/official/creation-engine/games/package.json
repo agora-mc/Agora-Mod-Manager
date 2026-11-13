@@ -1,0 +1,42 @@
+{
+  "id": "creation-engine",
+  "version": "0.1.0",
+  "api_range": ">=0.1, <0.2",
+  "parents": [],
+  "games": [],
+  "frameworks": [],
+  "tools": [],
+  "behaviours": {
+    "load_order_rules": "creationEngineRules",
+    "diagnostics": "creationEngineDiagnostics"
+  },
+  "game_templates": {
+    "creation-engine": {
+      "load_orders": [
+        {
+          "id": "plugins",
+          "name": "Plugins",
+          "items": {
+            "folder": "Data",
+            "patterns": ["*.esm", "*.esl", "*.esp"],
+            "folders": false
+          },
+          "format": {
+            "type": "lines",
+            "active_prefix": "*"
+          },
+          "rules": {
+            "kind": "script",
+            "sorter": {
+              "hook": "lootSort",
+              "update": "lootUpdate",
+              "update_label": "Update masterlist"
+            }
+          },
+          "intro": "The game reads plugins from the top of this list down. When two plugins change the same thing, the one lower down wins. A plugin's masters must load above it.",
+          "item_heading": "Plugin"
+        }
+      ]
+    }
+  }
+}

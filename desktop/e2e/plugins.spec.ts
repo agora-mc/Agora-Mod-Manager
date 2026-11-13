@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 
 /**
- * The app with plugins switched **on**.
+ * The app with plugin code running (the emergency stop not engaged).
  *
  * Everything else in this suite runs with them off, which is the default and
  * the important case — but it means a plugin surface that crashed the app
@@ -76,11 +76,10 @@ async function boot(page: import('@playwright/test').Page, selectedSurface: stri
           invoke(command: string, args: Record<string, unknown> = {}) {
             if (command === 'get_setting') {
               if (args.key === 'onboarding_complete') return Promise.resolve(true);
-              if (args.key === 'plugins_enabled') return Promise.resolve(true);
               return Promise.resolve(null);
             }
             if (command === 'set_setting') return Promise.resolve(null);
-            if (command === 'plugins_enabled') return Promise.resolve(true);
+            if (command === 'plugins_emergency_stop') return Promise.resolve(false);
             if (command === 'start_plugins') return Promise.resolve([]);
             if (command === 'list_plugins') return Promise.resolve([plugin]);
             if (command === 'list_plugin_contributions') return Promise.resolve([contribution]);

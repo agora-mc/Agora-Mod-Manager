@@ -7,6 +7,8 @@ dist
 registry.db
 registry.db.sig
 *.log
+# Test fixtures are often logs; keep them tracked.
+!crates/*/tests/**/*.log
 .DS_Store
 __pycache__
 .idea
@@ -33,3 +35,9 @@ tmp/
 
 # The CLI copied in for release bundling (scripts/stage_cli_sidecar.py)
 desktop/src-tauri/binaries/
+
+# The VFS DLLs and helpers copied in for release bundling (scripts/stage_vfs_files.py)
+desktop/src-tauri/vfs/
+
+# Local screenshots taken by agents (never committed)
+.shots/

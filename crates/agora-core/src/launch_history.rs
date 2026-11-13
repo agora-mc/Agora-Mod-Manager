@@ -5,6 +5,13 @@
 //! got slower after you added ten mods, how often an instance actually crashes,
 //! whether a config change helped.
 //!
+//! # The session ledger
+//!
+//! The same rows carry the session ledger of [`crate::session_ledger`]: for a game instance, the
+//! manifest of what ran, the exit observation of the game's own process, whether the player
+//! pressed Stop, and the verdict. [`LaunchRecord`] is unchanged, so Minecraft's history and its
+//! interface are untouched; the ledger is read through `session_ledger::get` and `list`.
+//!
 //! # Local only, deliberately
 //!
 //! There is no endpoint and there never will be. This lives in `local_state.db`
@@ -214,6 +221,27 @@ pub fn prune_history(conn: &Connection, instance_id: &str) -> anyhow::Result<usi
                  LIMIT ?2
             )",
         params![instance_id, HISTORY_LIMIT as i64],
+    )?;
+    // A stored manifest lives exactly as long as a row points at it (see `session_ledger`).
+    conn.execute(
+        "DELETE FROM launch_manifests
+          WHERE instance_id = ?1
+            AND hash NOT IN (
+                SELECT manifest_hash FROM launch_history
+                 WHERE instance_id = ?1 AND manifest_hash IS NOT NULL
+            )",
+        params![instance_id],
+    )?;
+    // An answer lives exactly as long as its session row. This is the one retention limit both
+    // share: the history row and the answer are trimmed together, never one without the other.
+    conn.execute(
+        "DELETE FROM session_answers
+          WHERE instance_id = ?1
+            AND session_id NOT IN (
+                SELECT session_id FROM launch_history
+                 WHERE instance_id = ?1 AND session_id IS NOT NULL
+            )",
+        params![instance_id],
     )?;
     Ok(removed)
 }

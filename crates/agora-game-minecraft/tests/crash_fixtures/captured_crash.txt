@@ -1,0 +1,9 @@
+# Agora captured Java output (sanitized, last 200 lines)
+# exit_code=1
+# runtime_ms=5000
+[stderr] ---- Minecraft Crash Report ----
+[stderr] Time: 2026-01-01 00:00:00
+[stderr] Description: Example crash
+[stderr]
+[stderr] java.lang.NullPointerException: Example message
+[stderr] 	at example.mod.ExampleClass.example(ExampleClass.java:10)

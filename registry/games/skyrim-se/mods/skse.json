@@ -1,0 +1,22 @@
+{
+  "id": "skse",
+  "name": "SKSE64",
+  "content_type": "mod",
+  "author": "SKSE Team",
+  "license": "LicenseRef-Proprietary",
+  "game": "skyrim-se",
+  "download_strategy": "manual_link",
+  "source_identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/30379",
+  "provides_framework": "skse",
+  "page_url": "https://www.nexusmods.com/skyrimspecialedition/mods/30379",
+  "description": "The Skyrim Script Extender, which most script mods need. Pick the build for your game version.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.5.*", "1.6.*", "1.7.*"],
+      "asset": "*-30379-*",
+      "download_hint": "Main file: the SKSE64 build for your game version"
+    }
+  ],
+  "curator_note": "Supports Steam and GOG. Epic, Windows Store and Game Pass are not supported. The Nexus page publishes no checksum Agora can read, so a manual install is reported as not verified."
+}

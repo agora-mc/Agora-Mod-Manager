@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import {
   AlertTriangle,
   Bot,
@@ -6,8 +6,12 @@ import {
   Coffee,
   Compass,
   Cpu,
+  FolderOpen,
   FolderSearch,
+  Gamepad2,
   Landmark,
+  Layers,
+  LifeBuoy,
   PackageCheck,
   Paintbrush,
   Plug,
@@ -84,8 +88,25 @@ import {
 } from './settings/AppearanceSettings';
 import { TemplateSettings } from './settings/TemplateSettings';
 import { RuntimeReclaim } from './settings/RuntimeReclaim';
+import { ContentSharingSettings } from './settings/ContentSharingSettings';
+import { DownloadWatchSettings } from './settings/DownloadWatchSettings';
 import { DegradedCredentialNotice } from './settings/DegradedCredentialNotice';
 import { SettingsSection } from './settings/SettingsSection';
+import { GameSupportSettings } from './settings/GameSupportSettings';
+import { NewInstancesSettings } from './settings/game/NewInstancesSettings';
+import { RecentlyDeletedSettings } from './settings/RecentlyDeletedSettings';
+import { settingsFrame } from './settings/game/settingsFrame';
+import { InstallsSection } from '../features/games/discovery';
+import { BasesSection } from '../features/games/bases';
+import { RecoverySection } from '../features/games/userFiles';
+import { GameIcon } from '../features/games/shared/GameIcon';
+import { gameShortName } from '../features/games/shared/gameNames';
+import {
+  gameDisplayName,
+  isMinecraftSelected,
+  isSettingsCardVisible,
+  type SettingsCardId,
+} from './settings/gameScope';
 import { AiAssistantCard } from './settings/AiAssistantCard';
 import { PluginManager } from '../features/plugins/PluginManager';
 import { SettingsSubNav, SettingsTabRail } from './settings/SettingsNav';
@@ -97,6 +118,7 @@ import {
   takePendingSettingsSection,
 } from '../lib/settingsSection';
 import { useConfirm } from '@/components/ui/confirm';
+import { Switch } from '@/components/ui/switch';
 import { ContentProvidersList } from '../components/ContentProvidersList';
 import { UpdateCenter } from '../features/updates/UpdateCenter';
 
@@ -104,6 +126,8 @@ import { UpdateCenter } from '../features/updates/UpdateCenter';
 interface SettingsPage {
   id: string;
   label: string;
+  /** The classified cards this page shows; a page with none is always shown. */
+  cards: SettingsCardId[];
   content: ReactNode;
 }
 
@@ -187,13 +211,38 @@ function TokenDisplay({ token }: { token: string }) {
 export function Settings({
   onResetLayout,
   onNavigateTab,
+  activeGame,
+  activeGameName,
+  onSwitchToMinecraft,
 }: {
   onResetLayout: () => void;
   /** Lets a settings card hand the user off to a full page (Living Background). */
   onNavigateTab?: (tab: Tab) => void;
+  /** The shell's remembered game. Minecraft until that choice has loaded. */
+  activeGame?: string | null;
+  /** The shell's name for that game, when it has one (discovery may not have found it). */
+  activeGameName?: string | null;
+  /** The shell's switch; Settings does not change the remembered game on its own. */
+  onSwitchToMinecraft?: () => void;
 }) {
   const ts = useTypedSettings();
   const { confirm } = useConfirm();
+  const minecraftSelected = isMinecraftSelected(activeGame);
+  const selectedGameName = gameDisplayName(activeGame ?? 'minecraft', activeGameName);
+  const selectedGameShortName = gameShortName(selectedGameName);
+  const selectedGameId = activeGame ?? 'minecraft';
+  // The selected game's exe icon in the rail and the hero. A component type, so it is made once
+  // per game rather than on every render (a new type would remount it and fetch the icon again).
+  const SelectedGameIcon = useMemo(() => {
+    function SelectedGameIcon({ className = 'h-4 w-4' }: { className?: string }) {
+      return <GameIcon gameId={selectedGameId} className={className} fallback={<Gamepad2 className={className} />} />;
+    }
+    return SelectedGameIcon;
+  }, [selectedGameId]);
+
+  /** True when a card belongs on the page for the selected game. */
+  const showsCard = (card: SettingsCardId): boolean => isSettingsCardVisible(card, minecraftSelected);
+  const card = (id: SettingsCardId, node: ReactNode): ReactNode => (showsCard(id) ? node : null);
 
   const [activeTabId, setActiveTabId] = useState<string>(() => peekPendingSettingsSection()?.tab ?? readStoredSettingsTab() ?? 'general');
   const [activePageId, setActivePageId] = useState<string | null>(() => peekPendingSettingsSection()?.page ?? null);
@@ -1056,6 +1105,7 @@ export function Settings({
 
   const walkthroughCard = (
     <SettingsSection
+      card="walkthrough"
       id="settings-walkthrough"
       icon={Compass}
       title="Guided walkthrough"
@@ -1075,18 +1125,17 @@ export function Settings({
     <SettingsSection
       id="settings-general"
       icon={Sparkles}
+      card="advanced-mode"
       title="Advanced mode"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Show advanced settings</span>
-        <input
-          type="checkbox"
+        <Switch
           aria-label="Show advanced settings"
           checked={advancedMode}
-          onChange={toggleAdvanced}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={() => toggleAdvanced()}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Reveal JVM arguments, garbage collector settings, custom commands, and other power-user options.
       </p>
@@ -1095,21 +1144,20 @@ export function Settings({
 
   const installationCard = (
     <SettingsSection
+      card="installation"
       id="settings-installation"
       icon={PackageCheck}
       title="Installation"
       description="How much of the install review Agora may skip for you."
     >
-      <label className="flex items-center justify-between gap-4">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Auto-confirm clean installs</span>
-        <input
-          type="checkbox"
+        <Switch
           aria-label="Auto-confirm clean installs"
           checked={autoConfirmCleanInstalls}
-          onChange={(e) => toggleAutoConfirmCleanInstalls(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleAutoConfirmCleanInstalls(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Skip the review screen only when the plan has no errors, warnings, conflicts, new dependencies, or existing files to change. Plans that need decisions always open for review.
       </p>
@@ -1117,17 +1165,15 @@ export function Settings({
         <p className="text-xs text-destructive">{ts.statuses['install_auto_confirm_clean']?.error}</p>
       )}
       <div className="rounded-lg border border-border bg-muted/20 p-3 space-y-2">
-        <label className="flex items-center justify-between gap-4">
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Always auto-confirm installs</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Always auto-confirm installs"
             checked={alwaysAutoConfirmInstalls}
             disabled={!autoConfirmCleanInstalls}
-            onChange={(e) => toggleAlwaysAutoConfirmInstalls(e.target.checked)}
-            className="h-5 w-5 accent-primary disabled:cursor-not-allowed disabled:opacity-40"
+            onCheckedChange={(checked) => toggleAlwaysAutoConfirmInstalls(checked)}
           />
-        </label>
+        </div>
         <p className="text-xs text-muted-foreground">
           Skip dependency details too and accept the default of not installing optional dependencies. Enable Auto-confirm clean installs first.
         </p>
@@ -1136,16 +1182,14 @@ export function Settings({
         )}
       </div>
       <div className="rounded-lg border border-border bg-muted/20 p-3 space-y-2">
-        <label className="flex items-center justify-between gap-4">
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Sort versions by date</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Sort versions by date"
             checked={versionSortByDate}
-            onChange={(e) => toggleVersionSortByDate(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleVersionSortByDate(checked)}
           />
-        </label>
+        </div>
         <p className="text-xs text-muted-foreground">
           When off (default), stable releases appear first with alpha/beta below them. When on, versions are sorted purely by release date, newest first, regardless of release type.
         </p>
@@ -1158,6 +1202,7 @@ export function Settings({
 
   const updatesCard = (
     <SettingsSection
+      card="updates"
       id="settings-updates"
       icon={RefreshCw}
       title="Software Updates"
@@ -1170,7 +1215,7 @@ export function Settings({
       )}
       {appVersion && (
         <p className="text-xs text-muted-foreground">
-          Agora Launcher <span className="font-medium">{appVersion}</span>
+          Agora Mod Manager <span className="font-medium">{appVersion}</span>
         </p>
       )}
       <div className="flex flex-wrap gap-2">
@@ -1236,6 +1281,7 @@ export function Settings({
 
   const instanceUpdatesCard = (
     <SettingsSection
+      card="instance-updates"
       id="settings-instance-updates"
       icon={PackageCheck}
       title="Instance mod updates"
@@ -1265,16 +1311,14 @@ export function Settings({
         <p className="text-xs text-destructive">{ts.statuses['update_sweep_interval_hours']?.error}</p>
       )}
 
-      <label className="mt-4 flex items-center justify-between">
+      <div className="mt-4 flex items-center justify-between gap-4">
         <span className="text-sm">Show changelogs before updating</span>
-        <input
-          type="checkbox"
+        <Switch
           checked={showUpdateChangelogs}
-          onChange={(e) => void handleShowUpdateChangelogsChange(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => void handleShowUpdateChangelogsChange(checked)}
           aria-label="Show changelogs before updating"
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Review what changed before an update is applied. Changelogs come from the signed catalog,
         so this works offline; mods with nothing published simply say so.
@@ -1287,19 +1331,19 @@ export function Settings({
 
   const launchModeCard = (
     <SettingsSection
+      card="launch-mode"
       id="settings-launching"
       icon={Rocket}
       title="Launch Mode"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Use in-app launcher (direct Java launch)</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="Use in-app launcher (direct Java launch)"
           checked={directLaunch}
-          onChange={(e) => toggleLaunchMode(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleLaunchMode(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         <strong>Off (default):</strong> Delegates to the official Mojang launcher — handles authentication and Minecraft execution.
         The Mojang launcher opens with your instance pre-selected via <code className="bg-muted px-1 py-0.5 rounded-sm">--profile</code>.
@@ -1315,6 +1359,7 @@ export function Settings({
 
   const launcherPathCard = (
     <SettingsSection
+      card="launcher-path"
       id="settings-launcher"
       icon={FolderSearch}
       title="Launcher Path"
@@ -1379,6 +1424,7 @@ export function Settings({
 
   const disclaimerCard = (
     <SettingsSection
+      card="disclaimer"
       id="settings-disclaimer"
       icon={AlertTriangle}
       title="Disclaimer"
@@ -1391,6 +1437,7 @@ export function Settings({
 
   const javaCard = (
     <SettingsSection
+      card="java-runtime"
       id="settings-java"
       icon={Coffee}
       title="Java Runtime Management"
@@ -1609,17 +1656,17 @@ export function Settings({
   const jvmCard = (
     <SettingsSection
       icon={Cpu}
+      card="jvm-defaults"
       title="JVM Defaults"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">AlwaysPreTouch</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="AlwaysPreTouch"
           checked={alwaysPreTouch}
-          onChange={(e) => toggleAlwaysPreTouch(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleAlwaysPreTouch(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Recommended for G1GC, may cause issues with ZGC/Shenandoah.
       </p>
@@ -1632,6 +1679,7 @@ export function Settings({
   const microsoftCard = (
     <SettingsSection
       icon={UserRound}
+      card="microsoft-account"
       title="Microsoft Account"
     >
       {msaLoading ? (
@@ -1736,6 +1784,7 @@ export function Settings({
 
   const githubCard = (
     <SettingsSection
+      card="github-account"
       id="settings-accounts"
       icon={Landmark}
       title="GitHub Account"
@@ -1802,21 +1851,21 @@ export function Settings({
 
   const contentSourcesCard = (
     <SettingsSection
+      card="content-sources"
       id="settings-services"
       icon={Boxes}
       title="Content sources"
       description="Where Agora may fetch content from, beyond the curated catalog."
       contentClassName="space-y-4"
     >
-      <label className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <span className="text-sm">Modrinth Integration</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="Modrinth Integration"
           checked={modrinth}
-          onChange={(e) => toggleModrinth(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleModrinth(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Search Modrinth's whole library alongside the curated catalog, and enable live Modrinth
         features, when permitted by Privacy settings (turn on Advanced mode in Settings &gt; General to
@@ -1838,88 +1887,80 @@ export function Settings({
           is on and reachable, so turning one off usually just moves installs to the next source
           rather than hiding the entry. An entry disappears only when every source it lists is off.
         </p>
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Modrinth-sourced catalog entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Modrinth-sourced catalog entries"
+            size="sm"
             checked={curatedSources['modrinth_id'] ?? true}
-            onChange={(e) => toggleCuratedSource('modrinth_id', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('modrinth_id', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">GitHub-sourced catalog entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="GitHub-sourced catalog entries"
+            size="sm"
             checked={curatedSources['github_release'] ?? true}
-            onChange={(e) => toggleCuratedSource('github_release', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('github_release', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Direct-hash catalog entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Direct-hash catalog entries"
+            size="sm"
             checked={curatedSources['direct_hash'] ?? true}
-            onChange={(e) => toggleCuratedSource('direct_hash', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('direct_hash', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Curated pack entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Curated pack entries"
+            size="sm"
             checked={curatedSources['curated_pack'] ?? true}
-            onChange={(e) => toggleCuratedSource('curated_pack', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('curated_pack', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Technic-sourced pack entries</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Technic-sourced pack entries"
+            size="sm"
             checked={curatedSources['technic_pack'] ?? true}
-            onChange={(e) => toggleCuratedSource('technic_pack', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('technic_pack', checked)}
           />
-        </label>
-        <label className="flex items-center justify-between">
+        </div>
+        <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Packs curated from content sources</span>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Packs curated from content sources"
+            size="sm"
             checked={curatedSources['provider_pack'] ?? true}
-            onChange={(e) => toggleCuratedSource('provider_pack', e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleCuratedSource('provider_pack', checked)}
           />
-        </label>
+        </div>
       </div>
 
       <div className="rounded-lg border border-border bg-card p-3">
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <span className="text-sm">Technic browsing</span>
             <p className="text-xs text-muted-foreground mt-0.5">
               Browse and install modpacks from Technic. Solder-backed and zip packs are downloaded from third-party hosts with the integrity the pack's author provides — see the install confirmation before files are written.
             </p>
           </div>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Technic browsing"
             checked={technic}
-            onChange={(e) => toggleTechnic(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleTechnic(checked)}
           />
-        </label>
+        </div>
       </div>
 
       <div className="rounded-lg border border-border bg-card p-3">
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <span className="text-sm">Allow low security downloads</span>
             <p className="text-xs text-muted-foreground mt-0.5">
@@ -1927,32 +1968,28 @@ export function Settings({
               Content with weaker checks (an MD5, or a host the source did not declare) does not need this: it installs after a warning.
             </p>
           </div>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Allow low security downloads"
             checked={allowUnverifiedPacks}
-            onChange={(e) => toggleAllowUnverifiedPacks(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleAllowUnverifiedPacks(checked)}
           />
-        </label>
+        </div>
       </div>
 
       <div className="rounded-lg border border-border bg-card p-3">
-        <label className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-4">
           <div>
             <span className="text-sm">Reduced security mode</span>
             <p className="text-xs text-muted-foreground mt-0.5">
               Lets plugins reach any website, and lets modpacks place files anywhere in their instance (including mods in their overrides). Programs are still refused and hashes are still checked. For plugins and packs you trust.
             </p>
           </div>
-          <input
-            type="checkbox"
+          <Switch
             aria-label="Reduced security mode"
             checked={reducedSecurity}
-            onChange={(e) => toggleReducedSecurity(e.target.checked)}
-            className="h-5 w-5 accent-primary"
+            onCheckedChange={(checked) => toggleReducedSecurity(checked)}
           />
-        </label>
+        </div>
       </div>
 
       <ContentProvidersList />
@@ -1962,6 +1999,7 @@ export function Settings({
   const aiCard = (
     <SettingsSection
       icon={Bot}
+      card="ai-mcp"
       title="AI & automation"
       description="The local MCP server, for AI apps that cannot run commands."
       contentClassName="space-y-4"
@@ -1982,15 +2020,14 @@ export function Settings({
         </p>
       </div>
 
-      <label className="flex items-center justify-between pt-2 border-t border-border">
+      <div className="flex items-center justify-between gap-4 pt-2 border-t border-border">
         <span className="text-sm">AI / MCP Server</span>
-        <input
-          type="checkbox"
+        <Switch
+          aria-label="AI / MCP Server"
           checked={aiMcp}
-          onChange={(e) => toggleAiMcp(e.target.checked)}
-          className="h-5 w-5 accent-primary"
+          onCheckedChange={(checked) => toggleAiMcp(checked)}
         />
-      </label>
+      </div>
       <p className="text-xs text-muted-foreground">
         Enable the local MCP server for external AI tools.
       </p>
@@ -2347,23 +2384,38 @@ export function Settings({
         {
           id: 'basics',
           label: 'Basics',
+          cards: ['advanced-mode', 'installation'],
           content: (
             <>
-              {advancedCard}
-              {installationCard}
+              {card('advanced-mode', advancedCard)}
+              {card('installation', installationCard)}
             </>
           ),
         },
-        { id: 'walkthrough', label: 'Walkthrough', content: walkthroughCard },
-        { id: 'templates', label: 'Templates', content: <TemplateSettings /> },
-        { id: 'storage', label: 'Storage', content: <RuntimeReclaim /> },
+        { id: 'walkthrough', label: 'Walkthrough', cards: ['walkthrough'], content: card('walkthrough', walkthroughCard) },
+        { id: 'games', label: 'Game support', cards: ['game-support'], content: card('game-support', <GameSupportSettings />) },
+        { id: 'templates', label: 'Templates', cards: ['template-settings'], content: card('template-settings', <TemplateSettings />) },
+        {
+          id: 'storage',
+          label: 'Storage',
+          cards: ['download-watch', 'runtime-reclaim', 'content-sharing', 'recently-deleted'],
+          content: (
+            <>
+              {card('download-watch', <DownloadWatchSettings />)}
+              {card('content-sharing', <ContentSharingSettings />)}
+              {card('recently-deleted', <RecentlyDeletedSettings />)}
+              {card('runtime-reclaim', <RuntimeReclaim />)}
+            </>
+          ),
+        },
         {
           id: 'updates',
           label: 'Updates',
+          cards: ['updates', 'instance-updates'],
           content: (
             <>
-              {gate(updatesCard)}
-              {gate(instanceUpdatesCard)}
+              {card('updates', gate(updatesCard))}
+              {card('instance-updates', gate(instanceUpdatesCard))}
             </>
           ),
         },
@@ -2377,16 +2429,17 @@ export function Settings({
       blurb: 'Colour, type, and the living world behind every page.',
       footer: <AppearanceResetControls onResetLayout={onResetLayout} />,
       pages: [
-        { id: 'theme', label: 'Theme', content: <AppearanceThemeSettings /> },
-        { id: 'interface', label: 'Interface', content: <AppearanceInterfaceSettings /> },
+        { id: 'theme', label: 'Theme', cards: ['appearance-theme'], content: card('appearance-theme', <AppearanceThemeSettings />) },
+        { id: 'interface', label: 'Interface', cards: ['appearance-type', 'appearance-motion'], content: card('appearance-type', <AppearanceInterfaceSettings />) },
         {
           id: 'living-background',
           label: 'Living background',
-          content: (
+          cards: ['appearance-living-background'],
+          content: card('appearance-living-background', (
             <LivingBackgroundSettings
               onOpenLivingBackground={onNavigateTab ? () => onNavigateTab('living-background') : undefined}
             />
-          ),
+          )),
         },
       ],
     },
@@ -2400,14 +2453,75 @@ export function Settings({
         {
           id: 'sign-in',
           label: 'Sign in',
+          cards: ['microsoft-account', 'github-account'],
           content: (
             <>
-              {microsoftCard}
-              {githubCard}
+              {card('microsoft-account', microsoftCard)}
+              {card('github-account', githubCard)}
             </>
           ),
         },
-        { id: 'skin', label: 'Skin & cape', content: msaCreds && !msaCreds.needs_reauth ? <SkinSettings /> : <p className="rounded-xl border border-border bg-card p-4 text-sm text-muted-foreground">Sign in with a Microsoft account on the Sign in page to change your skin and cape.</p> },
+        {
+          id: 'skin',
+          label: 'Skin & cape',
+          cards: ['skin'],
+          content: card('skin', msaCreds && !msaCreds.needs_reauth ? <SkinSettings /> : <p className="rounded-xl border border-border bg-card p-4 text-sm text-muted-foreground">Sign in with a Microsoft account on the Sign in page to change your skin and cape.</p>),
+        },
+      ],
+    },
+    // The selected game's own section, in the rail slot Launching has for Minecraft. The id stays
+    // `game` for every game, so a deep link (`requestSettingsSection`) works whichever is selected;
+    // with Minecraft selected it has no cards, so it is not in the rail.
+    {
+      id: 'game',
+      label: selectedGameShortName,
+      icon: SelectedGameIcon,
+      hint: 'Instances, installs, bases',
+      blurb: `Your choices for ${selectedGameName}.`,
+      pages: [
+        {
+          id: 'new-instances',
+          label: 'Instances',
+          cards: ['game-new-instances'],
+          content: card('game-new-instances', (
+            <NewInstancesSettings gameId={selectedGameId} gameName={selectedGameShortName} />
+          )),
+        },
+        {
+          id: 'installs',
+          label: 'Installs',
+          cards: ['game-installs'],
+          content: card('game-installs', (
+            <InstallsSection
+              gameId={selectedGameId}
+              frame={settingsFrame('game-installs', FolderOpen, (
+                <p className="text-xs text-muted-foreground">
+                  To stop offering {selectedGameShortName}, turn it off in{' '}
+                  <button type="button" onClick={() => openGameSupport()} className="font-medium text-primary hover:underline">
+                    Game support
+                  </button>
+                  .
+                </p>
+              ))}
+            />
+          )),
+        },
+        {
+          id: 'bases',
+          label: 'Bases',
+          cards: ['game-bases'],
+          content: card('game-bases', (
+            <BasesSection gameId={selectedGameId} gameName={selectedGameShortName} frame={settingsFrame('game-bases', Layers)} />
+          )),
+        },
+        {
+          id: 'recovery',
+          label: 'Recovery',
+          cards: ['game-recovery'],
+          content: card('game-recovery', (
+            <RecoverySection gameId={selectedGameId} frame={settingsFrame('game-recovery', LifeBuoy)} />
+          )),
+        },
       ],
     },
     {
@@ -2420,26 +2534,28 @@ export function Settings({
         {
           id: 'mode',
           label: 'Launch mode',
+          cards: ['launch-mode', 'when-game-starts', 'launcher-path', 'disclaimer'],
           content: (
             <>
-              {launchModeCard}
-              <GameStartWindowSettings />
-              {gate(launcherPathCard)}
-              {disclaimerCard}
+              {card('launch-mode', launchModeCard)}
+              {card('when-game-starts', <GameStartWindowSettings />)}
+              {card('launcher-path', gate(launcherPathCard))}
+              {card('disclaimer', disclaimerCard)}
             </>
           ),
         },
         {
           id: 'java',
           label: 'Java',
+          cards: ['java-runtime', 'jvm-defaults'],
           content: (
             <>
-              {gate(javaCard)}
-              {gate(jvmCard)}
+              {card('java-runtime', gate(javaCard))}
+              {card('jvm-defaults', gate(jvmCard))}
             </>
           ),
         },
-        { id: 'window', label: 'Game window', content: <GameWindowSettings /> },
+        { id: 'window', label: 'Game window', cards: ['game-window'], content: card('game-window', <GameWindowSettings />) },
       ],
     },
     {
@@ -2449,18 +2565,19 @@ export function Settings({
       hint: 'Sources & AI',
       blurb: 'Third-party content sources and the AI integrations.',
       pages: [
-        { id: 'sources', label: 'Content sources', content: gate(contentSourcesCard) },
+        { id: 'sources', label: 'Content sources', cards: ['content-sources'], content: card('content-sources', gate(contentSourcesCard)) },
         {
           id: 'ai',
           label: 'AI assistant',
+          cards: ['ai-assistant', 'ai-mcp'],
           content: (
             <>
-              <AiAssistantCard />
-              {gate(aiCard)}
+              {card('ai-assistant', <AiAssistantCard />)}
+              {card('ai-mcp', gate(aiCard))}
             </>
           ),
         },
-        { id: 'plugins', label: 'Plugins', content: <PluginManager /> },
+        { id: 'plugins', label: 'Plugins', cards: ['plugins'], content: <PluginManager /> },
       ],
     },
     ...(advancedMode
@@ -2473,18 +2590,35 @@ export function Settings({
         pages: [{
           id: 'privacy',
           label: 'Privacy',
+          cards: ['privacy'],
           content: <div id="settings-privacy" className="scroll-mt-24"><Privacy /></div>,
         }],
       } as SettingsTab]
       : []),
   ];
 
-  const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0];
+  // A page with no cards left for this game disappears; a section left with no
+  // pages disappears from the rail. That keeps Minecraft-only sections (Java,
+  // launching, mod updates, skins) out of another game's Settings entirely.
+  const visibleTabs: SettingsTab[] = tabs
+    .map((tab) => ({
+      ...tab,
+      pages: tab.pages.filter((page) =>
+        page.cards.length === 0 || page.cards.some((id) => showsCard(id))),
+    }))
+    .filter((tab) => tab.pages.length > 0);
+
+  const activeTab = visibleTabs.find((tab) => tab.id === activeTabId) ?? visibleTabs[0];
   const activePage = activeTab.pages.find((page) => page.id === activePageId) ?? activeTab.pages[0];
   const selectTab = (id: string) => {
     setActiveTabId(id);
     setActivePageId(null);
     storeSettingsTab(id);
+  };
+  const openGameSupport = () => {
+    setActiveTabId('general');
+    setActivePageId('games');
+    storeSettingsTab('general');
   };
 
   return (
@@ -2493,7 +2627,35 @@ export function Settings({
         icon={SettingsIcon}
         title="Settings"
         subtitle={activeTab.blurb}
-        actions={appVersion ? <span className="hero-chip">Agora {appVersion}</span> : null}
+        actions={(
+          <>
+            {!minecraftSelected && (
+              // Which game the page is for. Minecraft's own sections come back when Minecraft is
+              // selected, which this chip can do without leaving Settings.
+              <span
+                className="hero-chip inline-flex items-center gap-1.5"
+                data-testid="settings-game-chip"
+                title={`Showing settings for ${selectedGameName}. Minecraft settings appear when Minecraft is selected.`}
+              >
+                <SelectedGameIcon className="h-3.5 w-3.5" />
+                <span>For {selectedGameShortName}</span>
+                {onSwitchToMinecraft && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={onSwitchToMinecraft}
+                      className="rounded-sm underline decoration-1 underline-offset-2 hover:decoration-2 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      Switch to Minecraft
+                    </button>
+                  </>
+                )}
+              </span>
+            )}
+            {appVersion && <span className="hero-chip">Agora {appVersion}</span>}
+          </>
+        )}
       />
 
       {/* Inline error banner for any setting that failed to load. Page-level:
@@ -2512,7 +2674,7 @@ export function Settings({
 
       <div className="settings-layout">
         <SettingsTabRail
-          items={tabs.map(({ id, label, icon, hint }) => ({ id, label, icon, hint }))}
+          items={visibleTabs.map(({ id, label, icon, hint }) => ({ id, label, icon, hint }))}
           activeId={activeTab.id}
           onSelect={selectTab}
         />
@@ -2573,7 +2735,7 @@ function GameWindowSettings() {
   }, []);
 
   return (
-    <SettingsSection icon={Cpu} title="Game window">
+    <SettingsSection card="game-window" icon={Cpu} title="Game window">
       <p className="text-xs text-muted-foreground">
         The size Minecraft opens at when Agora starts it (direct launch). An instance can set its own size on
         its Java &amp; Args tab. With the official launcher, set the resolution on its installation instead.
@@ -2673,7 +2835,7 @@ function GameStartWindowSettings() {
   ];
 
   return (
-    <SettingsSection icon={Rocket} title="When the game starts">
+    <SettingsSection card="when-game-starts" icon={Rocket} title="When the game starts">
       {mode === null ? (
         <p className="text-xs text-muted-foreground">Loading…</p>
       ) : (

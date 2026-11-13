@@ -73,6 +73,15 @@ const storage = {
   set: (key, value) => call("storage.set", { key, value }),
   all: () => call("storage.all"),
   remove: (key) => call("storage.remove", { key }),
+  // Bytes live in this plugin's own blob store, as files core owns. The
+  // script names a key, never a path.
+  putBytes: (key, bytes) =>
+    call("storage.putBytes", { key, bytes: Array.from(bytes === undefined ? [] : bytes) }),
+  getBytes: (key) =>
+    call("storage.getBytes", { key }).then((reply) =>
+      reply === null || reply === undefined ? null : new Uint8Array(reply.bytes),
+    ),
+  deleteBytes: (key) => call("storage.deleteBytes", { key }),
   forInstance: (instanceId) => ({
     get: (key) => call("storage.get", { key, instanceId }),
     set: (key, value) => call("storage.set", { key, value, instanceId }),
@@ -88,6 +97,79 @@ const net = {
 const ui = {
   refresh: (viewId) => call("ui.refresh", { viewId }),
   notify: (tone, message) => call("ui.notify", { tone, message }),
+};
+
+// A WebAssembly module the plugin ships. It is a WASI command: the request
+// goes in on stdin, the answer comes back on stdout. `stdout` and `stderr` are
+// plain byte arrays so the result survives JSON, and the `*Text` fields are the
+// same bytes decoded as UTF-8.
+const wasm = {
+  run: (module, options) => {
+    const opts = options || {};
+    const encode = (value) => (typeof value === "string" ? value : Array.from(value || []));
+    const mounts = (opts.mounts || []).map((mount) => {
+      const out = { guest: mount.guest };
+      if (mount.view) {
+        out.view = { folder: mount.view.folder, patterns: mount.view.patterns || [] };
+      }
+      if (mount.files) {
+        out.files = {};
+        for (const [name, value] of Object.entries(mount.files)) {
+          out.files[name] = encode(value);
+        }
+      }
+      if (mount.stored) {
+        out.stored = mount.stored.map(String);
+      }
+      return out;
+    });
+    const payload = { mounts };
+    if (opts.stdin !== undefined) payload.stdin = encode(opts.stdin);
+    if (opts.limits) payload.limits = opts.limits;
+    return JSON.parse(__agora_wasm_run(module, JSON.stringify(payload)));
+  },
+};
+
+// Scoped reads for crash parsers and inspectors. They reach only the artifact
+// the host put in scope for this call, and throw when there is none.
+const crash = {
+  readBytes: (artifactId, offset, len) =>
+    __agora_crash_read_bytes(artifactId, offset, len),
+  readLines: (artifactId, fromLine, maxLines) =>
+    JSON.parse(__agora_crash_read_lines(artifactId, fromLine, maxLines)),
+};
+
+// The instance view. Reads use the game path the host put in scope for a hook
+// call; writes name an instance and land only in this plugin's own generated
+// layer. Neither ever exposes a real filesystem path.
+const game = {
+  readBytes: (path, offset, len) =>
+    __agora_game_read_bytes(path, offset || 0, len === undefined ? 65536 : len),
+  readLines: (path, fromLine, maxLines) =>
+    JSON.parse(__agora_game_read_lines(path, fromLine || 0, maxLines === undefined ? 1000 : maxLines)),
+  list: (path) => JSON.parse(__agora_game_list(path || "")),
+  writeBytes: (instanceId, path, bytes) =>
+    call("game.writeBytes", {
+      instanceId,
+      path,
+      bytes: Array.from(bytes || []),
+    }, { deadlineMs: 30000 }),
+  writeText: (instanceId, path, text) =>
+    call("game.writeText", { instanceId, path, text }, { deadlineMs: 30000 }),
+  // For an ordinary plugin call (a view, a command), where no hook has put an
+  // instance in scope: name the instance, and the same `game:read`/`game:write`
+  // grants are checked by the host.
+  forInstance: (instanceId) => ({
+    readBytes: (path, offset, len) =>
+      call("game.readBytes", { instanceId, path, offset, len }).then((reply) => new Uint8Array(reply.bytes).buffer),
+    readLines: (path, fromLine, maxLines) =>
+      call("game.readLines", { instanceId, path, fromLine, maxLines }),
+    list: (path) => call("game.list", { instanceId, path }),
+    writeBytes: (path, bytes) =>
+      call("game.writeBytes", { instanceId, path, bytes: Array.from(bytes || []) }, { deadlineMs: 30000 }),
+    writeText: (path, text) =>
+      call("game.writeText", { instanceId, path, text }, { deadlineMs: 30000 }),
+  }),
 };
 
 // --- events ---------------------------------------------------------------
@@ -141,8 +223,8 @@ const apiVersion = __agora_api_version;
 const pluginId = __agora_plugin_id;
 const settings = JSON.parse(__agora_settings);
 
-export { call, log, instances, content, launch, storage, net, ui, on, off, apiVersion, pluginId, settings };
-export default { call, log, instances, content, launch, storage, net, ui, on, off, apiVersion, pluginId, settings };
+export { call, log, instances, content, launch, storage, net, ui, wasm, crash, game, on, off, apiVersion, pluginId, settings };
+export default { call, log, instances, content, launch, storage, net, ui, wasm, crash, game, on, off, apiVersion, pluginId, settings };
 "#;
 
 /// Name plugins import: `import { instances } from "agora"`.

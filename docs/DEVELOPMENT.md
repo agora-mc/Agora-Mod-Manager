@@ -6,9 +6,14 @@ This page covers local builds and validation. Player instructions belong in the 
 
 | Path | Purpose |
 | --- | --- |
-| `crates/agora-core/` | Shared business logic |
+| `crates/agora-core/` | Shared, game-agnostic business logic |
+| `crates/agora-game-minecraft/` | Minecraft support, as a game package that registers into core |
+| `crates/agora-game-creation/` | Test helper that loads the Skyrim definition from its official plugin |
+| `packages/official/` | Official plugin packages released separately from the app (Skyrim SE) |
 | `crates/agora/` | Standalone CLI |
 | `crates/agora-plugin-api/`, `crates/agora-plugin-host/` | Plugin contract, and the QuickJS host that runs plugin scripts |
+| `crates/agora-vfs/`, `crates/agora-vfs-inject/` | Windows copy-on-write VFS injected into games, and the import-table injector it shares with the launcher |
+| `crates/agora-game-api/` | Experimental game package/host contract; [manifest v3 design](architecture/game-api.md) |
 | `sdk/`, `examples/plugins/`, `docs/plugins/` | Plugin author types, runnable examples (exercised by core's end-to-end tests), and the author guide |
 | `desktop/` | Tauri desktop application and React UI |
 | `web/` | Public static directory |
@@ -17,10 +22,10 @@ This page covers local builds and validation. Player instructions belong in the 
 | `loader-manifests/` | Pinned loader catalog inputs |
 | `scripts/` | Validation and maintenance helpers |
 | `docs/` | User, developer, release, and operator reference |
-| `.kilo/` | AI tooling configuration; `.kilo/plans/MASTER_SPEC.md` is the engineering blueprint |
+| `.kilo/` | AI tooling configuration; `MASTER_SPEC.md` is the engineering blueprint |
 | `BACKLOG.md` | Phase-by-phase task tracker |
 
-Keep reusable behavior in `agora-core`. Desktop, CLI, and MCP hosts should adapt the same services rather than implement parallel business rules.
+Keep reusable behavior in `agora-core`, and game-specific behavior in that game's package. Desktop, CLI, and MCP hosts should adapt the same services rather than implement parallel business rules.
 
 ## Prerequisites
 
@@ -78,11 +83,30 @@ Activate the environment, then:
 
 ```bash
 pip install -r requirements.txt
-python compile.py --skip-sign --no-governance-write --governance-mode off --out ../registry.db
+python compile.py --skip-sign --skip-official-asset-check --no-governance-write --governance-mode off --out ../registry.db
 python ../scripts/verify_db.py
 ```
 
 Use `--skip-sign` only for local development. Production clients must not trust unsigned catalog output.
+Use `--skip-official-asset-check` only for local development or tests: the release compile downloads
+every official plugin package, leaves out an entry whose asset is missing and warns, and refuses an
+entry whose bytes do not match its pinned size or sha256.
+
+## Official plugin packages
+
+Skyrim SE ships as two official plugins: the Creation Engine base in
+`packages/official/creation-engine/` and Skyrim in `packages/official/skyrim-se/`. Neither is a
+compiled package. The desktop and CLI register only Minecraft; Skyrim arrives from the installed
+plugin, which names the base as a dependency. To use them locally, install both folders as
+development plugins, base first, and turn community plugins on, as described in
+[plugins/README.md](plugins/README.md#official-plugins-in-this-repository).
+
+Build each release zip with `python scripts/build_official_plugin.py <folder>`, for example
+`creation-engine` or `skyrim-se`. Entries are sorted, stored uncompressed and given a fixed
+timestamp and mode, so the SHA-256 is the same across builds and checkouts. `--verify-registry`
+checks that `registry/official-plugins/<plugin id>.json` pins those exact bytes;
+`--update-registry` rewrites the entry from the build. The `Official plugins` workflow attaches each
+zip to its own `official-<folder>-v<version>` release.
 
 ## Environment boundaries
 
@@ -129,18 +153,32 @@ all of them before calling a substantial change done.
 Repository root, hermetic and fast:
 
 ```bash
-python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_tauri_bindings.py --check
+python scripts/check_architecture.py && python scripts/check_docs.py && python scripts/check_package_docs.py && python scripts/check_tauri_bindings.py --check
 ```
 
 Rust:
 
 ```bash
 cargo fmt --all --check
-cargo clippy -p agora-core -p agora-cli --all-targets --all-features -- -D warnings
+cargo clippy -p agora-core -p agora-game-api -p agora-game-minecraft -p agora-game-creation -p agora-plugin-host -p agora-cli --all-targets --all-features -- -D warnings
 cargo test -p agora-core --lib --tests
+cargo test -p agora-game-api -p agora-game-minecraft -p agora-game-creation --lib --tests
+cargo test -p agora-plugin-host --lib --tests
 cargo test -p agora-cli
 cargo check -p agora-desktop
 ```
+
+On Windows, also build and lint the VFS crates. The ignored matrix and real-injection tests
+run in the `vfs-injection` CI job; they need no administrator rights and start only Agora's
+test fixtures, never a real game:
+
+```bash
+cargo clippy -p agora-vfs -p agora-vfs-inject --all-targets -- -D warnings
+cargo test -p agora-vfs -p agora-vfs-inject --lib --tests
+```
+
+The commands for the ignored tests, and what each needs, are in
+[`crates/agora-vfs/README.md`](../crates/agora-vfs/README.md#tests).
 
 Desktop frontend (from `desktop/`): `npm run build && npm run typecheck:e2e && npm run test:unit`.
 `npm run build` runs the boundary checks, `tsc` and `vite build`. `typecheck:e2e` checks the
@@ -192,13 +230,13 @@ For a user-visible change:
 6. Verify links.
 7. Avoid copying secret-bearing operator commands into player documentation.
 
-Run the hermetic documentation gate:
+Run the hermetic documentation gates:
 
 ```bash
-python scripts/check_docs.py
+python scripts/check_docs.py && python scripts/check_package_docs.py
 ```
 
-It checks current internal Markdown links, website routes, guide-topic mappings, product spelling, and known stale claims without making network requests or rewriting files. CLI help-contract checks run under `cargo test -p agora-cli`.
+`check_docs.py` checks current internal Markdown links, website routes, guide-topic mappings, product spelling, and known stale claims. `check_package_docs.py` checks that every key in the official and tracer game packages, and every field on the package types, is documented in `docs/plugins/game-packages.md`. Neither makes network requests or rewrites files. CLI help-contract checks run under `cargo test -p agora-cli`.
 
 ### Documentation screenshots
 
@@ -230,6 +268,57 @@ npm run tauri:dev
 ```
 
 Close Agora before removing that temporary directory. Microsoft credentials use the operating-system credential store and are not isolated by `AGORA_DATA_DIR`; do not sign in or sign out with a personal account during disposable-profile tests.
+
+## Crash benchmark
+
+`scripts/crash_benchmark.py` scores Crash Doctor answers against a frozen answer key. It is
+game-agnostic: it never parses a crash log, only compares predicted culprit names with the key.
+
+The corpus and its answer key stay outside the repository. Test only with synthetic rows in a
+temporary folder, and keep `test-key.jsonl` away from anyone still writing rules: `score --detail`
+refuses that file unless `--i-am-done-writing-rules` is given.
+
+```bash
+python scripts/crash_benchmark.py freeze --labels labels.jsonl --manifest manifest.jsonl --out ../crash-key --salt "$SALT"
+python scripts/crash_benchmark.py score --key ../crash-key/dev-key.jsonl --predictions predictions.jsonl --tool crash-doctor
+python scripts/crash_benchmark.py compare --key ../crash-key/dev-key.jsonl tool-a=a.jsonl tool-b=b.jsonl
+python scripts/crash_benchmark.py predict --manifest manifest.jsonl --corpus-root ../crash-logs --ids ../crash-key/dev-key.jsonl --out predictions.jsonl --agora "target/debug/agora.exe"
+```
+
+`freeze` keeps gold rows with a culprit and no template risk, splits them into `dev-key.jsonl`
+and `test-key.jsonl` by manifest hash (so a log posted twice stays on one side), and writes
+`freeze.json` with the counts and the test key's SHA-256. A label row may carry `accept`, a list
+of other spellings of the same culprit; `freeze` copies it into the key, and an `accept` that is
+not a list of non-empty strings is an error naming the row.
+
+Every hit rate is shown twice. **Strict** is an exact normalised match against the culprit or one
+of its `accept` entries, and keeps the original field names (`top1_hits`, `top3_hits`). **Loose**
+splits the culprit and each accepted spelling at ` and `, ` with `, `&`, `,`, `/`, `(`, `)` and
+`;`, normalises each word, drops words under four characters, and counts a prediction that equals
+or contains a word (`loose_top1_hits`, `loose_top3_hits`). Because answers are people's words while
+tools predict file names, loose is usually the fairer reading, but it can over-credit: a short
+answer word inside a longer unrelated name still counts. Treat it as a measuring aid, not a
+verdict; strict stays the rule for a claim. `score` reports top-1, top-3, both matching modes,
+abstained, wrong (not a strict hit), loose wrong (named someone who is not even a loose match),
+missing and error rows overall and by game, log type, difficulty and whether the
+culprit is in the log. An error row is a tool that failed, not one that abstained. `compare` adds
+an `abstain-always` baseline so a tool that answers badly can rank below silence. Pass
+`--expect-sha256` to refuse a changed key, `--json` for machine output, or `--detail` for per-row
+results including which rule matched.
+
+`predict` runs a tool over the corpus and writes the predictions file. It finds each id's `file`
+in the manifest under `--corpus-root` and runs `<agora> crash analyze <file> --json` with any
+`--plugin-dir` and `--allow-code` options. Arguments are passed as a list, never through a shell,
+so a path with spaces or quotes is safe. The first named owner of each candidate becomes a suspect
+in order; candidates whose owner has no name (the system, an unknown) are skipped and counted. Per
+row it also records `files[0].read_by`, so a summary can say how many logs no parser recognised.
+A non-zero exit with parsable JSON is an abstention, keeping the file report's reason; a timeout, a
+non-zero exit with no JSON, or unparsable JSON is an `error` row, never an abstention. `--jobs`
+runs several analyses at once and rows stay in id order; `--timeout` caps each log (120 s by
+default). `--out` inside a git work tree is refused, and the file is written atomically.
+
+The Phostwood adapter that produces prediction files comes later; for now tools emit the JSONL
+format themselves or go through `predict`.
 
 ## Pull-request evidence
 

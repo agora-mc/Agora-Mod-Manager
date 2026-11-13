@@ -28,6 +28,18 @@ export type TourAnchor = string;
  */
 export type TourSignal = 'instance-created' | 'install-completed';
 
+/**
+ * Situations the app can be in that make a step meaningless. Steps declare one
+ * with `when`; `visibleTourSteps` drops the step when it does not hold.
+ */
+export type TourCondition = 'multipleGames';
+
+/** What the app reports to the tour so conditional steps can be filtered out. */
+export interface TourConditions {
+  /** More than one game is installed, so the sidebar switcher is on screen. */
+  multipleGames: boolean;
+}
+
 export type TourAdvance =
   /** The card's Continue button — used for steps that only explain. */
   | { kind: 'next' }
@@ -67,6 +79,12 @@ export interface TourStep {
    * rather than explaining something that is not on screen.
    */
   gate?: TourAnchor;
+  /**
+   * A situation this step depends on. When it does not hold the step is not
+   * part of the tour at all, so the step count and progress text match what
+   * the user can actually see.
+   */
+  when?: TourCondition;
   advance: TourAdvance;
   /** Shown while the tour waits for the user's action. */
   waitingHint?: string;
@@ -115,6 +133,15 @@ export const TOUR_STEPS: readonly TourStep[] = [
     gate: 'page-home',
     advance: { kind: 'next' },
     offTrackHint: 'Open Home in the sidebar to continue.',
+  },
+  {
+    id: 'game-switcher',
+    title: 'More than one game',
+    body:
+      'Agora manages more than Minecraft. Switch games here; each game keeps its own instances.',
+    anchors: ['game-switcher'],
+    when: 'multipleGames',
+    advance: { kind: 'next' },
   },
   {
     id: 'instances-nav',
@@ -337,8 +364,8 @@ export const TOUR_STEPS: readonly TourStep[] = [
     title: 'The instance editor',
     body:
       'This lists everything installed, and Play launches it. Like Browse, it has two modes — the one '
-      + 'you have open is fine. Everything else here (snapshots, loadouts, import and export, the '
-      + 'console) is for when you need it.',
+      + 'you have open is fine. Everything else here (Backups & Versions, Import & Export, and '
+      + 'Java & Logs) is for when you need it.',
     anchors: ['page-instance-editor'],
     gate: 'page-instance-editor',
     advance: { kind: 'next' },
@@ -384,6 +411,19 @@ export const TOUR_STEPS: readonly TourStep[] = [
     continueLabel: 'Finish',
   },
 ] as const;
+
+/**
+ * The steps the user can actually go through: a step whose `when` does not
+ * hold is left out, and one without a condition is always kept. Filtering
+ * here rather than hiding a step in the provider keeps the numbering, the
+ * skip targets and step ids in one list.
+ */
+export function visibleTourSteps(
+  steps: readonly TourStep[],
+  conditions: TourConditions,
+): readonly TourStep[] {
+  return steps.filter((step) => step.when === undefined || conditions[step.when]);
+}
 
 // ---------------------------------------------------------------------------
 // State machine

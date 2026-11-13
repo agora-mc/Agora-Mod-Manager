@@ -10,6 +10,7 @@ Ed25519 signature file registry.db.sig.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -23,7 +24,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 import requests
 
@@ -1675,7 +1677,7 @@ logger = logging.getLogger("compiler")
 # Schema setup
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 CREATE_INDEXES = [
@@ -1710,7 +1712,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
             -- primary source do not have to parse JSON.
             download_strategy TEXT NOT NULL,
             source_identifier TEXT NOT NULL,
-            sha256 TEXT NOT NULL,
+            -- The manifest's sha256 when it states one, NULL otherwise. An
+            -- install checks the file against what its source published
+            -- (download_sources_json pins, GitHub digests), not this column.
+            sha256 TEXT,
             upvotes INTEGER DEFAULT 0,
             downvotes INTEGER DEFAULT 0,
             net_score INTEGER DEFAULT 0,
@@ -1785,13 +1790,22 @@ def create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Community crash signatures (format v2). The app converts each row into a
+    # rule in its own crash pack, so every column here is data the engine's rule
+    # format already understands. `games_json` is a non-empty JSON array of game
+    # ids; a rule only applies to those games.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS crash_signatures (
             id TEXT PRIMARY KEY,
             name TEXT,
+            games_json TEXT NOT NULL,
             regex_pattern TEXT,
-            solution_markdown TEXT,
-            action_button_json TEXT
+            level TEXT,
+            cause TEXT,
+            text TEXT,
+            action_kind TEXT,
+            action_content_key TEXT,
+            action_label TEXT
         )
     """)
 
@@ -1963,6 +1977,62 @@ def create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Entries for games other than Minecraft (MASTER_SPEC §26.8). A separate
+    # table, so registry_items keeps its Minecraft-only shape and an older
+    # client, which never reads this table, cannot list them in Minecraft's browse.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS game_catalog_items (
+            id TEXT PRIMARY KEY,
+            game TEXT NOT NULL,
+            name TEXT NOT NULL,
+            author TEXT,
+            content_type TEXT NOT NULL,
+            download_strategy TEXT NOT NULL,
+            source_identifier TEXT NOT NULL,
+            sha256 TEXT,
+            download_sources_json TEXT NOT NULL DEFAULT '[]',
+            game_compatibility_json TEXT NOT NULL,
+            provides_framework TEXT,
+            description TEXT,
+            license_id TEXT,
+            page_url TEXT,
+            icon_url TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            date_added TEXT
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_game_catalog_items_game ON game_catalog_items(game)"
+    )
+
+    # Official plugins: plugin packages whose id, version and package SHA-256 this
+    # signed registry vouches for. Another additive table, for the same reason as
+    # game_catalog_items: the schema version is unchanged, an older client never
+    # reads it, and a newer client reading a registry without it finds no official
+    # plugins. One row per listed version: the current one and, when the source
+    # keeps it, the previous one, so a bad update can be rolled back.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS official_plugins (
+            plugin_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            channel TEXT NOT NULL CHECK (channel IN ('current', 'previous')),
+            name TEXT NOT NULL,
+            description TEXT,
+            game_ids_json TEXT NOT NULL DEFAULT '[]',
+            package_url TEXT NOT NULL,
+            package_sha256 TEXT NOT NULL,
+            package_tree_sha256 TEXT NOT NULL,
+            package_size INTEGER NOT NULL,
+            min_agora_version TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (plugin_id, version)
+        )
+    """)
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_official_plugins_channel "
+        "ON official_plugins(plugin_id, channel)"
+    )
+
     for index_sql in CREATE_INDEXES:
         cursor.execute(index_sql)
 
@@ -2046,6 +2116,108 @@ def validate_sha256(raw: Any) -> str:
     return raw
 
 
+def validate_optional_sha256(raw: Any, item_id: str) -> str | None:
+    """The manifest's sha256 when it states one, otherwise None.
+
+    Curators never hash files by hand. For a github_release or modrinth_id
+    entry the install checks the file against what its source published, so
+    the manifest may omit sha256. When it is present it must still be a
+    well-formed hash, and ``require_manifest_sha256`` decides whether it is
+    needed.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", raw):
+        logger.error(
+            "%s: sha256, when present, must be exactly 64 hex characters, got %r", item_id, raw
+        )
+        raise SystemExit(1)
+    return raw
+
+
+def require_manifest_sha256(item_id: str, sources: list[dict[str, Any]], raw: Any) -> None:
+    """Require the manifest's sha256 when any download source is pinned.
+
+    A pinned source (direct_hash, technic_pack, provider_pack) has no upstream
+    to check the file against, so the manifest hash is the only record of which
+    file it is. Every other strategy takes its hash from the source.
+    """
+    pinned = sorted(
+        {source["strategy"] for source in sources if is_pinned_strategy(source["strategy"])}
+    )
+    if pinned and raw is None:
+        logger.error(
+            "%s: sha256 is required because a download source is %s: "
+            "it is the only record of which file that source serves",
+            item_id,
+            ", ".join(pinned),
+        )
+        raise SystemExit(1)
+
+
+def canonical_source_pins(item_id: str, strategy: str, raw: Any) -> list[dict[str, str]]:
+    """Validate a download source's ``pins`` and return them in canonical form.
+
+    A pin names one exact file: a GitHub release ``tag``, the release ``asset``
+    filename, and the ``sha256`` the curator expects that file to have. A pin
+    is compared only with that file. Pins exist only on github_release sources.
+    """
+    if raw is None:
+        return []
+    if strategy not in ("github_release", "manual_link"):
+        logger.error(
+            "%s: pins are only for github_release and manual_link sources, not %s",
+            item_id,
+            strategy,
+        )
+        raise SystemExit(1)
+    if not isinstance(raw, list):
+        logger.error("%s: pins must be an array of {tag, asset, sha256} objects", item_id)
+        raise SystemExit(1)
+    pins: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, pin in enumerate(raw):
+        where = f"{item_id}: pins[{index}]"
+        if not isinstance(pin, dict):
+            logger.error("%s must be an object, got %r", where, pin)
+            raise SystemExit(1)
+        allowed = {"tag", "asset", "sha256"} if strategy == "github_release" else {
+            "asset",
+            "sha256",
+        }
+        unknown = sorted(str(key) for key in set(pin) - allowed)
+        if unknown:
+            logger.error("%s has unknown key(s): %s", where, ", ".join(unknown))
+            raise SystemExit(1)
+        # A GitHub release has a tag; a manual_link names its file, so its pin
+        # is the exact asset name and the hash, with no release tag.
+        tag = pin.get("tag", "")
+        if strategy == "github_release" and (not isinstance(tag, str) or not tag.strip()):
+            logger.error("%s.tag must be a non-empty release tag", where)
+            raise SystemExit(1)
+        if not isinstance(tag, str):
+            logger.error("%s.tag must be a string", where)
+            raise SystemExit(1)
+        asset = pin.get("asset")
+        if not isinstance(asset, str) or not asset.strip() or "/" in asset or "\\" in asset:
+            logger.error("%s.asset must be a non-empty release asset filename", where)
+            raise SystemExit(1)
+        sha = pin.get("sha256")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+            logger.error("%s.sha256 must be exactly 64 hex characters", where)
+            raise SystemExit(1)
+        key = (tag.strip(), asset.strip())
+        if key in seen:
+            logger.error("%s repeats the pin for release %s, asset %s", where, key[0], key[1])
+            raise SystemExit(1)
+        seen.add(key)
+        if strategy == "github_release":
+            pins.append({"tag": key[0], "asset": key[1], "sha256": sha.lower()})
+        else:
+            pins.append({"asset": key[1], "sha256": sha.lower()})
+    return pins
+
+
 # ---------------------------------------------------------------------------
 # Mod / pack insertion
 # ---------------------------------------------------------------------------
@@ -2101,6 +2273,13 @@ def validate_download_strategy(item: dict[str, Any]) -> str:
     """
     item_id = item.get("id", "<unknown>")
     strategy = item.get("download_strategy")
+    if strategy == "manual_link":
+        logger.error(
+            "%s: download_strategy manual_link is only for entries for other games; a Minecraft "
+            "entry downloads its file itself",
+            item_id,
+        )
+        raise SystemExit(1)
     if strategy not in VALID_DOWNLOAD_STRATEGIES:
         logger.error(
             "%s: download_strategy must be one of %s, got %r",
@@ -2121,20 +2300,33 @@ def validate_download_strategy(item: dict[str, Any]) -> str:
     return strategy
 
 
-def validate_pinned_source(
-    item_id: str,
-    strategy: str,
-    source: str,
-    declared: Any,
-) -> None:
-    """Enforce the hand-pinned contract for one ``direct_hash``/``technic_pack``
-    source.
+def _validate_manual_link_url(item_id: str, source: str) -> None:
+    """A manual_link identifier is the https page the player downloads from.
 
-    Applied per *source* rather than per *item* so that a manifest listing
-    several download sources gets every pinned entry checked, not just the
-    preferred one. A fallback that only fails once the preferred source is down
-    is worse than no fallback at all.
+    It is not a file URL: it names a page, so the file-name rule that pinned
+    sources obey does not apply. Plain ``http://`` is refused because the page
+    is opened in the player's browser and must not be downgraded.
     """
+    parsed = urlparse(source)
+    if parsed.scheme != "https" or not parsed.netloc:
+        reason = "must be an https:// URL" if parsed.scheme != "http" else (
+            "must be https://, not http://"
+        )
+        logger.error(
+            "%s: manual_link source_identifier %s, got %r", item_id, reason, source
+        )
+        raise SystemExit(1)
+    if any(ch.isspace() for ch in source):
+        logger.error(
+            "%s: manual_link source_identifier must not contain spaces, got %r",
+            item_id,
+            source,
+        )
+        raise SystemExit(1)
+
+
+def _validate_pinned_url(item_id: str, strategy: str, source: str) -> None:
+    """The URL rules every pinned source obeys, whatever game it is for."""
     if strategy == "provider_pack":
         if not PROVIDER_PACK_IDENTIFIER.fullmatch(source):
             logger.error(
@@ -2175,6 +2367,23 @@ def validate_pinned_source(
             source,
         )
         raise SystemExit(1)
+
+
+def validate_pinned_source(
+    item_id: str,
+    strategy: str,
+    source: str,
+    declared: Any,
+) -> None:
+    """Enforce the hand-pinned contract for one ``direct_hash``/``technic_pack``
+    source.
+
+    Applied per *source* rather than per *item* so that a manifest listing
+    several download sources gets every pinned entry checked, not just the
+    preferred one. A fallback that only fails once the preferred source is down
+    is worse than no fallback at all.
+    """
+    _validate_pinned_url(item_id, strategy, source)
 
     if not declared:
         logger.error(
@@ -2278,6 +2487,8 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
     same contract as a pinned primary, and a duplicate ``(strategy,
     identifier)`` pair is dropped rather than retried twice.
     """
+    if is_other_game(item):
+        return _canonical_other_game_sources(item)
     item_id = item.get("id", "<unknown>")
     raw = item.get("download_sources")
 
@@ -2308,6 +2519,13 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
                 )
                 raise SystemExit(1)
             strategy = entry.get("strategy")
+            if strategy == "manual_link":
+                logger.error(
+                    "%s: download_sources strategy manual_link is only for entries for other "
+                    "games; a Minecraft entry downloads its file itself",
+                    item_id,
+                )
+                raise SystemExit(1)
             if strategy not in VALID_DOWNLOAD_STRATEGIES:
                 logger.error(
                     "%s: download_sources strategy must be one of %s, got %r",
@@ -2324,7 +2542,11 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
                     entry,
                 )
                 raise SystemExit(1)
-            sources.append({"strategy": strategy, "identifier": identifier})
+            source: dict[str, Any] = {"strategy": strategy, "identifier": identifier}
+            pins = canonical_source_pins(item_id, strategy, entry.get("pins"))
+            if pins:
+                source["pins"] = pins
+            sources.append(source)
 
         # download_sources is authoritative when present. A manifest may still
         # spell out the legacy pair, but it must then agree with the preferred
@@ -2402,6 +2624,377 @@ def normalize_download_sources(item: dict[str, Any]) -> list[dict[str, str]]:
     return sources
 
 
+# ---------------------------------------------------------------------------
+# Catalog entries for other games (MASTER_SPEC §26.8)
+# ---------------------------------------------------------------------------
+
+MINECRAFT_GAME = "minecraft"
+
+# Strategies an entry for another game may use. The Minecraft-only strategies
+# (modrinth_id, technic_pack, curated_pack, provider_pack) do not apply.
+# manual_link is the player-downloads-it-themselves strategy: the entry links
+# to the page and names the file pattern Agora recognises.
+OTHER_GAME_STRATEGIES = frozenset({"github_release", "direct_hash", "manual_link"})
+
+# Fields that only mean something for Minecraft. An entry for another game
+# states its compatibility in game_compatibility instead. modrinth_id is
+# refused too: it would add a Modrinth source to a game Modrinth does not host.
+OTHER_GAME_FORBIDDEN_FIELDS = (
+    "compatible_versions",
+    "mod_dependencies",
+    "package_signatures",
+    "mod_jar_aliases",
+    "modrinth_id",
+)
+
+# Mods only for now. Packs and the other kinds stay Minecraft-only until a
+# game needs them.
+OTHER_GAME_KINDS = ("mods",)
+
+# Where game packages live. Read as data; nothing in them is executed.
+GAME_PACKAGE_GLOBS = (
+    "packages/official/*/games/package.json",
+    "packages/tracers/*/games/package.json",
+)
+
+_GAME_VERSION_RE = re.compile(r"(?:[0-9]+|\*)(?:\.(?:[0-9]+|\*))*")
+_NUMERIC_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+_OWNER_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+")
+_GAME_COMPAT_KEYS = frozenset({"stores", "game_versions", "requires", "asset", "download_hint"})
+_GAME_REQUIRE_KEYS = frozenset({"framework", "min_version"})
+_MAX_DOWNLOAD_HINT = 200
+
+
+@dataclass(frozen=True)
+class GameDeclaration:
+    """What a game package declares about one game: its stores and frameworks."""
+
+    id: str
+    stores: frozenset[str]
+    frameworks: frozenset[str]
+
+
+def game_package_paths() -> list[Path]:
+    paths: list[Path] = []
+    for pattern in GAME_PACKAGE_GLOBS:
+        paths.extend(sorted(REPO_ROOT.glob(pattern)))
+    return paths
+
+
+def load_game_declarations(package_paths: list[Path] | None = None) -> dict[str, GameDeclaration]:
+    """Read the games that game packages declare, keyed by game id.
+
+    A game's stores are its ``stores[].store`` values. Its frameworks are the
+    package's top-level ``frameworks`` whose ``game`` is that game, plus the
+    game's own ``framework_ids``.
+    """
+    declared: dict[str, GameDeclaration] = {}
+    paths = game_package_paths() if package_paths is None else package_paths
+    for path in paths:
+        try:
+            package = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"Cannot read game package {path}: {exc}") from exc
+        package_frameworks = [
+            fw for fw in package.get("frameworks", []) if isinstance(fw, dict) and fw.get("id")
+        ]
+        for game in package.get("games", []):
+            if not isinstance(game, dict):
+                raise SystemExit(f"{path}: every game must be an object")
+            game_id = str(game.get("id", "")).strip()
+            if not game_id:
+                raise SystemExit(f"{path}: a game has no id")
+            if game_id == MINECRAFT_GAME or game_id in declared:
+                raise SystemExit(
+                    f"{path}: game id {game_id!r} is declared more than once, "
+                    "or is reserved for Minecraft"
+                )
+            stores = frozenset(
+                str(store["store"])
+                for store in game.get("stores", [])
+                if isinstance(store, dict) and store.get("store")
+            )
+            frameworks = {
+                str(fw["id"])
+                for fw in package_frameworks
+                if str(fw.get("game", game_id)) == game_id
+            }
+            frameworks.update(str(framework) for framework in game.get("framework_ids", []))
+            declared[game_id] = GameDeclaration(game_id, stores, frozenset(frameworks))
+    return declared
+
+
+def is_other_game(item: dict[str, Any]) -> bool:
+    return item.get("game", MINECRAFT_GAME) != MINECRAFT_GAME
+
+
+def load_game_manifests(
+    declarations: dict[str, GameDeclaration],
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Load every manifest under ``registry/games/<game>/<kind>/``.
+
+    The folder names the game, and the manifest's ``game`` must say the same
+    thing. Archived entries are skipped, as everywhere else.
+    """
+    root = REGISTRY_DIR / "games"
+    results: list[tuple[Path, dict[str, Any]]] = []
+    if not root.exists():
+        return results
+    for path in sorted(root.rglob("*.json")):
+        parts = path.relative_to(root).parts
+        if "archived" in parts:
+            continue
+        if len(parts) != 3:
+            raise SystemExit(
+                f"{path}: entries for other games live at registry/games/<game>/<kind>/<id>.json"
+            )
+        game_id, kind = parts[0], parts[1]
+        if game_id not in declarations:
+            raise SystemExit(f"{path}: {game_id!r} is not a game that any game package defines")
+        if kind not in OTHER_GAME_KINDS:
+            raise SystemExit(
+                f"{path}: only {', '.join(OTHER_GAME_KINDS)} entries are accepted for other games, "
+                f"not {kind!r}"
+            )
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                item = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(f"{path}: cannot read manifest: {exc}") from exc
+        if not isinstance(item, dict):
+            raise SystemExit(f"{path}: a manifest must be a JSON object")
+        if item.get("game") != game_id:
+            raise SystemExit(
+                f'{path}: "game" must be {game_id!r} to match its folder, got {item.get("game")!r}'
+            )
+        results.append((path, item))
+    return results
+
+
+def check_game_scope(
+    path: Path,
+    item: dict[str, Any],
+    declarations: dict[str, GameDeclaration],
+) -> None:
+    """Enforce which game an entry is for, and which fields that game allows.
+
+    Every failure names the file and the field. Minecraft entries must not
+    carry ``game_compatibility``; entries for another game must carry it and
+    none of the Minecraft-only fields.
+    """
+    in_games_dir = path.is_relative_to(REGISTRY_DIR / "games")
+    game = item.get("game", MINECRAFT_GAME)
+    if not in_games_dir:
+        if game != MINECRAFT_GAME:
+            raise SystemExit(
+                f'{path}: "game" is {game!r}, but entries for other games live under '
+                f"registry/games/{game}/<kind>/"
+            )
+        if "game_compatibility" in item:
+            raise SystemExit(
+                f'{path}: "game_compatibility" is only for entries of other games; '
+                "Minecraft entries use compatible_versions"
+            )
+        return
+
+    if game not in declarations:
+        raise SystemExit(f"{path}: {game!r} is not a game that any game package defines")
+    decl = declarations[game]
+    for field_name in OTHER_GAME_FORBIDDEN_FIELDS:
+        if field_name in item:
+            raise SystemExit(
+                f'{path}: "{field_name}" is Minecraft-only and cannot appear on an entry for {game}'
+            )
+    if item.get("content_type") != "mod":
+        raise SystemExit(f'{path}: an entry for {game} must have content_type "mod"')
+    provides = item.get("provides_framework")
+    if provides is not None:
+        if not isinstance(provides, str) or provides not in decl.frameworks:
+            raise SystemExit(
+                f'{path}: "provides_framework" names {provides!r}, which {decl.id} does not '
+                f"declare (declared: {', '.join(sorted(decl.frameworks)) or 'none'})"
+            )
+    validate_optional_sha256(item.get("sha256"), str(path))
+    item["_manifest_path"] = str(path)
+    # Strategies first, so a Modrinth or unknown strategy is named as such
+    # rather than tripping an asset rule that only makes sense for GitHub.
+    sources = _canonical_other_game_sources(item)
+    require_manifest_sha256(str(path), sources, item.get("sha256"))
+    _validate_game_compatibility(path, item, decl)
+
+
+def _validate_game_compatibility(path: Path, item: dict[str, Any], decl: GameDeclaration) -> None:
+    where = f"{path}: game_compatibility"
+    entries = item.get("game_compatibility")
+    if not isinstance(entries, list) or not entries:
+        raise SystemExit(f"{where} must be a non-empty array")
+
+    raw_sources = item.get("download_sources")
+    if raw_sources is None:
+        raw_sources = [{"strategy": item.get("download_strategy")}]
+    if not isinstance(raw_sources, list):
+        raise SystemExit(f"{path}: download_sources must be an array")
+    # An asset picks one file out of a GitHub release, or names the file a
+    # matching manual_link download must look like, so either source needs it.
+    # A direct_hash mirror serves the same bytes and names its file in the URL,
+    # so it never takes one.
+    strategy_names = {
+        str(source.get("strategy"))
+        for source in raw_sources
+        if isinstance(source, dict)
+    }
+    needs_asset = bool(strategy_names & {"github_release", "manual_link"})
+
+    for index, entry in enumerate(entries):
+        label = f"{where}[{index}]"
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{label} must be an object")
+        unknown = sorted(str(key) for key in set(entry) - _GAME_COMPAT_KEYS)
+        if unknown:
+            raise SystemExit(f"{label} has unknown key(s): {', '.join(unknown)}")
+
+        stores = entry.get("stores")
+        if not isinstance(stores, list) or not stores:
+            raise SystemExit(f"{label}.stores must be a non-empty array")
+        for store in stores:
+            if not isinstance(store, str) or store not in decl.stores:
+                raise SystemExit(
+                    f"{label}.stores names {store!r}, which {decl.id} does not declare "
+                    f"(declared: {', '.join(sorted(decl.stores)) or 'none'})"
+                )
+
+        versions = entry.get("game_versions")
+        if not isinstance(versions, list) or not versions:
+            raise SystemExit(f"{label}.game_versions must be a non-empty array")
+        for version in versions:
+            if not isinstance(version, str) or not _GAME_VERSION_RE.fullmatch(version):
+                raise SystemExit(
+                    f"{label}.game_versions entry {version!r} must be an exact version such as "
+                    "1.6.1179.0, or a glob on whole components such as 1.6.1170.*"
+                )
+
+        requires = entry.get("requires", [])
+        if not isinstance(requires, list):
+            raise SystemExit(f"{label}.requires must be an array")
+        for requirement in requires:
+            req_label = f"{label}.requires"
+            if not isinstance(requirement, dict):
+                raise SystemExit(f"{req_label} entries must be objects")
+            unknown = sorted(str(key) for key in set(requirement) - _GAME_REQUIRE_KEYS)
+            if unknown:
+                raise SystemExit(f"{req_label} has unknown key(s): {', '.join(unknown)}")
+            framework = requirement.get("framework")
+            if not isinstance(framework, str) or framework not in decl.frameworks:
+                raise SystemExit(
+                    f"{req_label} names framework {framework!r}, which {decl.id} does not declare "
+                    f"(declared: {', '.join(sorted(decl.frameworks)) or 'none'})"
+                )
+            if "min_version" in requirement:
+                min_version = requirement["min_version"]
+                if not isinstance(min_version, str) or not _NUMERIC_VERSION_RE.fullmatch(min_version):
+                    raise SystemExit(
+                        f"{req_label} min_version {min_version!r} must be dot-separated numbers "
+                        "such as 2.2.6"
+                    )
+
+        if needs_asset:
+            asset = entry.get("asset")
+            if not isinstance(asset, str) or not asset.strip() or "/" in asset or "\\" in asset:
+                raise SystemExit(
+                    f"{label}.asset is required for github_release or manual_link: the release "
+                    "asset to pick, or the file-name pattern a download must match, such as "
+                    "CrashLogger-*.7z"
+                )
+        elif "asset" in entry:
+            raise SystemExit(
+                f"{label}.asset is only for github_release or manual_link; a direct_hash entry "
+                "names its file in the URL"
+            )
+
+        # A manual_link page can tell the player which file to pick. The hint
+        # is one short line in the dialog, so it is kept short and single-line.
+        if "download_hint" in entry:
+            hint = entry.get("download_hint")
+            if not isinstance(hint, str) or not hint.strip():
+                raise SystemExit(f"{label}.download_hint must be a non-empty string")
+            if "\n" in hint or "\r" in hint or len(hint) > _MAX_DOWNLOAD_HINT:
+                raise SystemExit(
+                    f"{label}.download_hint must be one line of at most "
+                    f"{_MAX_DOWNLOAD_HINT} characters"
+                )
+            if "manual_link" not in strategy_names:
+                raise SystemExit(
+                    f"{label}.download_hint is only for manual_link; an automatic source "
+                    "picks the file itself"
+                )
+
+
+def _canonical_other_game_sources(item: dict[str, Any]) -> list[dict[str, str]]:
+    """Validate and canonicalize the download sources of an entry for another game.
+
+    Only github_release and direct_hash are accepted. Each direct_hash source
+    gets the same URL rules as Minecraft's, without the Minecraft
+    compatible_versions requirement, which the entry does not have.
+    """
+    label = item.get("_manifest_path", item.get("id", "<unknown>"))
+    raw = item.get("download_sources")
+    if raw is None:
+        raw = [{"strategy": item.get("download_strategy"), "identifier": item.get("source_identifier", "")}]
+    if not isinstance(raw, list) or not raw:
+        raise SystemExit(f"{label}: download_sources must be a non-empty array")
+
+    sources: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise SystemExit(f"{label}: each download_sources entry must be an object")
+        strategy = entry.get("strategy")
+        if not isinstance(strategy, str) or strategy not in OTHER_GAME_STRATEGIES:
+            raise SystemExit(
+                f"{label}: strategy {strategy!r} is not available for {item.get('game')}; "
+                "use github_release or direct_hash"
+            )
+        identifier = str(entry.get("identifier", "")).strip()
+        if not identifier:
+            raise SystemExit(f"{label}: download_sources entry {entry!r} has no identifier")
+        if strategy == "direct_hash":
+            _validate_pinned_url(label, strategy, identifier)
+        elif strategy == "manual_link":
+            _validate_manual_link_url(label, identifier)
+        elif not _OWNER_REPO_RE.fullmatch(identifier):
+            raise SystemExit(f"{label}: github_release identifier must be owner/repo, got {identifier!r}")
+        source: dict[str, Any] = {"strategy": strategy, "identifier": identifier}
+        pins = canonical_source_pins(label, strategy, entry.get("pins"))
+        if pins:
+            source["pins"] = pins
+        sources.append(source)
+
+    # A manual_link is a fallback, not a source Agora can fetch from. It is
+    # allowed only last, after at least one automatic source, so the install
+    # never treats "ask the player to download it" as the primary answer.
+    manual_indexes = [
+        index for index, source in enumerate(sources) if source["strategy"] == "manual_link"
+    ]
+    if manual_indexes and manual_indexes != [len(sources) - 1]:
+        index = manual_indexes[0]
+        raise SystemExit(
+                f"{label}: download_sources[{index}].strategy is manual_link, which may only be "
+                "the last fallback, never before an automatic source"
+            )
+
+    if item.get("download_sources") is not None:
+        legacy_strategy = item.get("download_strategy")
+        if legacy_strategy is not None and legacy_strategy != sources[0]["strategy"]:
+            raise SystemExit(
+                f"{label}: download_strategy {legacy_strategy!r} disagrees with "
+                f"download_sources[0].strategy {sources[0]['strategy']!r}"
+            )
+
+    item["download_sources"] = sources
+    item["download_strategy"] = sources[0]["strategy"]
+    item["source_identifier"] = sources[0]["identifier"]
+    return sources
+
+
 def default_compatible_versions(item: dict[str, Any]) -> list[dict[str, str]]:
     """Return a sensible compatibility fallback when none is provided.
 
@@ -2468,6 +3061,326 @@ def manifest_date_added(path: Path) -> str:
     return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
 
+OFFICIAL_PLUGIN_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.[a-z0-9]+(?:-[a-z0-9]+)*")
+OFFICIAL_PLUGIN_ID_MAX = 96
+OFFICIAL_VERSION_RE = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
+OFFICIAL_GAME_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+# Matches the 64 MiB a plugin package may expand to; the zip is smaller still.
+OFFICIAL_PACKAGE_MAX_BYTES = 64 * 1024 * 1024
+OFFICIAL_PLUGIN_RELEASE_KEYS = {
+    "version", "package_url", "sha256", "tree_sha256", "size", "revoked",
+}
+# `revoked` is optional; its absence means "not revoked".
+OFFICIAL_PLUGIN_RELEASE_REQUIRED = OFFICIAL_PLUGIN_RELEASE_KEYS - {"revoked"}
+OFFICIAL_PLUGIN_KEYS = {
+    "id", "name", "description", "game_ids", "min_agora_version", "current", "previous",
+}
+OFFICIAL_FETCH_TIMEOUT_SECONDS = 30
+
+
+def _fetch_official_package(url: str) -> bytes:
+    """Download an official plugin package, refusing anything larger than the size cap."""
+    response = requests.get(url, timeout=OFFICIAL_FETCH_TIMEOUT_SECONDS, stream=True)
+    try:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > OFFICIAL_PACKAGE_MAX_BYTES:
+                raise ValueError(
+                    f"the package is larger than the {OFFICIAL_PACKAGE_MAX_BYTES}-byte cap"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        response.close()
+
+
+def _github_annotation_text(text: str) -> str:
+    """Escape a message for a GitHub Actions workflow command."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _official_asset_warning(message: str) -> None:
+    """Warn once in the log, and as an Actions annotation when the compile runs in Actions."""
+    logger.warning("%s", message)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::warning::{_github_annotation_text(message)}", flush=True)
+
+
+def _official_asset_missing(
+    path: Path,
+    label: str,
+    release: dict[str, Any],
+    fetch: Callable[[str], bytes],
+) -> str | None:
+    """Why a release's asset is missing, or None when the bytes match its pins.
+
+    A fetch failure means the asset was not published or is not reachable. That
+    is not a reason to block every other catalog entry, so the caller leaves this
+    plugin out and warns. A download that succeeds but does not match the pinned
+    size or sha256 is a wrong entry and stops the compile.
+    """
+    url = release["package_url"]
+    try:
+        data = fetch(url)
+    except Exception as exc:  # noqa: BLE001 - every fetch failure means the same thing
+        return f"{path}: {label}.package_url does not resolve to a package: {url}: {exc}"
+    if len(data) != release["size"]:
+        raise SystemExit(
+            f"{path}: {label}.size is {release['size']} but {url} served {len(data)} bytes"
+        )
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != release["sha256"]:
+        raise SystemExit(
+            f"{path}: {label}.sha256 is {release['sha256']} but {url} served {actual}"
+        )
+    return None
+
+
+def _official_release(path: Path, label: str, release: Any) -> dict[str, Any]:
+    if not isinstance(release, dict):
+        raise SystemExit(f"{path}: {label!r} must be an object")
+    unknown = sorted(set(release) - OFFICIAL_PLUGIN_RELEASE_KEYS)
+    if unknown:
+        raise SystemExit(f"{path}: {label!r} has unknown field(s): {', '.join(unknown)}")
+    missing = sorted(OFFICIAL_PLUGIN_RELEASE_REQUIRED - set(release))
+    if missing:
+        raise SystemExit(f"{path}: {label!r} is missing: {', '.join(missing)}")
+    revoked = release.get("revoked", False)
+    if not isinstance(revoked, bool):
+        raise SystemExit(f"{path}: {label}.revoked must be true or false, got {revoked!r}")
+    version = release["version"]
+    if not isinstance(version, str) or not OFFICIAL_VERSION_RE.fullmatch(version):
+        raise SystemExit(f"{path}: {label}.version must be a semantic version, got {version!r}")
+    url = release["package_url"]
+    # https only, and nothing in the authority but a host: no userinfo, no port,
+    # no whitespace. The app pins the host of this URL for the download.
+    if (
+        not isinstance(url, str)
+        or not re.fullmatch(r"https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?:/[^\s#]*)?", url)
+    ):
+        raise SystemExit(
+            f"{path}: {label}.package_url must be an https:// URL with a plain host, got {url!r}"
+        )
+    sha256 = release["sha256"]
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise SystemExit(
+            f"{path}: {label}.sha256 must be exactly 64 lowercase hex characters, got {sha256!r}"
+        )
+    # The digest of the files the zip unpacks to. Pinning it here, in the signed
+    # registry, is what lets the app check an installed folder against something
+    # local state cannot rewrite. scripts/official_plugin_digest.py computes it.
+    tree_sha256 = release["tree_sha256"]
+    if not isinstance(tree_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", tree_sha256):
+        raise SystemExit(
+            f"{path}: {label}.tree_sha256 must be exactly 64 lowercase hex characters, "
+            f"got {tree_sha256!r}"
+        )
+    size = release["size"]
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+        or size > OFFICIAL_PACKAGE_MAX_BYTES
+    ):
+        raise SystemExit(
+            f"{path}: {label}.size must be a whole number of bytes between 1 and "
+            f"{OFFICIAL_PACKAGE_MAX_BYTES}, got {size!r}"
+        )
+    return {
+        "version": version,
+        "package_url": url,
+        "sha256": sha256,
+        "tree_sha256": tree_sha256,
+        "size": size,
+        "revoked": revoked,
+    }
+
+
+def load_official_plugins(
+    fetch: Callable[[str], bytes] | None = _fetch_official_package,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Read ``registry/official-plugins/<id>.json``, one file per official plugin.
+
+    The folder is flat and the file name must be the plugin id, so an id cannot
+    be listed twice. Anything malformed refuses the whole compile: this table is
+    what the app trusts to decide which downloads count as official, so a typo
+    must not become a silently missing or silently different entry.
+
+    Each release's ``package_url`` must also serve the bytes its ``size`` and
+    ``sha256`` pin. Pass a fetcher in tests; ``None`` skips the download and is
+    only for tests that are not about the asset.
+    """
+    root = REGISTRY_DIR / "official-plugins"
+    results: list[tuple[Path, dict[str, Any]]] = []
+    if not root.exists():
+        return results
+    for path in sorted(root.rglob("*")):
+        if path.is_dir():
+            continue
+        parts = path.relative_to(root).parts
+        if "archived" in parts:
+            continue
+        if len(parts) != 1 or path.suffix != ".json":
+            raise SystemExit(
+                f"{path}: official plugins live at registry/official-plugins/<plugin-id>.json"
+            )
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(f"{path}: cannot read official plugin entry: {exc}") from exc
+        if not isinstance(data, dict):
+            raise SystemExit(f"{path}: an official plugin entry must be a JSON object")
+        unknown = sorted(set(data) - OFFICIAL_PLUGIN_KEYS)
+        if unknown:
+            raise SystemExit(f"{path}: unknown field(s): {', '.join(unknown)}")
+        plugin_id = data.get("id")
+        if (
+            not isinstance(plugin_id, str)
+            or len(plugin_id) > OFFICIAL_PLUGIN_ID_MAX
+            or not OFFICIAL_PLUGIN_ID_RE.fullmatch(plugin_id)
+        ):
+            raise SystemExit(
+                f"{path}: id must be `publisher.plugin` in lowercase letters, digits and inner "
+                f"hyphens, got {plugin_id!r}"
+            )
+        if path.stem != plugin_id:
+            raise SystemExit(f"{path}: the file name must be the plugin id, {plugin_id}.json")
+        name = data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise SystemExit(f"{path}: name is required")
+        description = data.get("description")
+        if description is not None and not isinstance(description, str):
+            raise SystemExit(f"{path}: description must be text")
+        game_ids = data.get("game_ids", [])
+        if not isinstance(game_ids, list) or any(
+            not isinstance(g, str) or not OFFICIAL_GAME_ID_RE.fullmatch(g) for g in game_ids
+        ):
+            raise SystemExit(f"{path}: game_ids must be a list of lowercase game ids")
+        if len(set(game_ids)) != len(game_ids):
+            raise SystemExit(f"{path}: game_ids lists a game twice")
+        min_version = data.get("min_agora_version")
+        if not isinstance(min_version, str) or not OFFICIAL_VERSION_RE.fullmatch(min_version):
+            raise SystemExit(
+                f"{path}: min_agora_version must be a semantic version, got {min_version!r}"
+            )
+        if "current" not in data:
+            raise SystemExit(f"{path}: current is required")
+        current = _official_release(path, "current", data["current"])
+        previous = None
+        if data.get("previous") is not None:
+            previous = _official_release(path, "previous", data["previous"])
+            if previous["version"] == current["version"]:
+                raise SystemExit(f"{path}: previous must be a different version from current")
+        if fetch is not None:
+            missing = _official_asset_missing(path, "current", current, fetch)
+            if missing is None and previous is not None:
+                missing = _official_asset_missing(path, "previous", previous, fetch)
+            if missing is not None:
+                _official_asset_warning(
+                    f"Official plugin {plugin_id} left out of the catalog: {missing}"
+                )
+                continue
+        results.append(
+            (
+                path,
+                {
+                    "id": plugin_id,
+                    "name": name.strip(),
+                    "description": description,
+                    "game_ids": list(game_ids),
+                    "min_agora_version": min_version,
+                    "current": current,
+                    "previous": previous,
+                },
+            )
+        )
+    return results
+
+
+def insert_official_plugins(
+    conn: sqlite3.Connection, entries: list[tuple[Path, dict[str, Any]]]
+) -> None:
+    """Write one official_plugins row per listed version (current, then previous)."""
+    cursor = conn.cursor()
+    for _path, entry in entries:
+        for channel in ("current", "previous"):
+            release = entry[channel]
+            if release is None:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO official_plugins (
+                    plugin_id, version, channel, name, description, game_ids_json,
+                    package_url, package_sha256, package_tree_sha256, package_size,
+                    min_agora_version, revoked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry["id"],
+                    release["version"],
+                    channel,
+                    entry["name"],
+                    entry["description"],
+                    json.dumps(entry["game_ids"], separators=(",", ":")),
+                    release["package_url"],
+                    release["sha256"],
+                    release["tree_sha256"],
+                    release["size"],
+                    entry["min_agora_version"],
+                    int(release["revoked"]),
+                ),
+            )
+
+
+def insert_game_catalog_item(conn: sqlite3.Connection, item: dict[str, Any], path: Path) -> None:
+    """Insert one entry for another game into game_catalog_items.
+
+    Only what an installer needs is stored. Votes, governance, categories,
+    curator notes and changelogs are Minecraft catalog features and are not
+    written for other games yet.
+    """
+    download_sources = normalize_download_sources(item)
+    sha256 = validate_optional_sha256(item.get("sha256"), item["id"])
+    require_manifest_sha256(item["id"], download_sources, item.get("sha256"))
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO game_catalog_items (
+            id, game, name, author, content_type, download_strategy, source_identifier,
+            sha256, download_sources_json, game_compatibility_json, provides_framework,
+            description, license_id, page_url, icon_url, status, date_added
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+        """,
+        (
+            item["id"],
+            item["game"],
+            item["name"],
+            item.get("author"),
+            item.get("content_type", "mod"),
+            item["download_strategy"],
+            item["source_identifier"],
+            sha256,
+            json.dumps(download_sources, separators=(",", ":")),
+            json.dumps(item["game_compatibility"], separators=(",", ":")),
+            item.get("provides_framework"),
+            item.get("description"),
+            item.get("license"),
+            item.get("page_url"),
+            item.get("icon_url"),
+            manifest_date_added(path),
+        ),
+    )
+
+
 def insert_registry_item(conn: sqlite3.Connection, item: dict[str, Any], path: Path) -> None:
     """Insert a mod/pack/asset row into registry_items."""
     cursor = conn.cursor()
@@ -2478,11 +3391,12 @@ def insert_registry_item(conn: sqlite3.Connection, item: dict[str, Any], path: P
     immunity_reason = governance.get("override_justification")
     allow_comments = bool(governance.get("allow_comments", True))
 
-    sha256 = validate_sha256(item.get("sha256"))
     # Idempotent: main() normalizes every item up front so hydration sees the
     # derived fields, but a caller that inserts a hand-built dict still gets a
     # validated source list.
     download_sources = normalize_download_sources(item)
+    sha256 = validate_optional_sha256(item.get("sha256"), item_id)
+    require_manifest_sha256(item_id, download_sources, item.get("sha256"))
     download_strategy = item["download_strategy"]
     gallery = item.get("gallery_urls", [])
     compatible_versions = (
@@ -3377,23 +4291,138 @@ def insert_pack_versions(
 # ---------------------------------------------------------------------------
 
 
+# Format v2 of a community crash signature. The app turns each row into a
+# crash rule, so these are the only values its closed types accept.
+SIGNATURE_LEVELS = ("possible", "likely")
+SIGNATURE_CAUSES = (
+    "mod",
+    "version_mismatch",
+    "missing_requirement",
+    "file",
+    "setting",
+    "save",
+    "memory",
+    "driver",
+    "game_install",
+    "other",
+)
+SIGNATURE_ACTION_KINDS = (
+    "install_content",
+    "open_console",
+    "open_jvm_settings",
+    "open_crash_log",
+    "review_mods",
+)
+_SIGNATURE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def validate_crash_signature(sig: Any) -> list[str]:
+    """Every reason *sig* is not a v2 community crash signature.
+
+    The format is a plain data shape the Rust engine can turn into one rule: a
+    non-empty `games` list, a regex over log lines, a plain-text headline, and an
+    optional action from the UI's closed set. An empty list means valid.
+    """
+    if not isinstance(sig, dict):
+        return ["a crash signature is a JSON object"]
+
+    errors: list[str] = []
+    signature_id = sig.get("id")
+    if not isinstance(signature_id, str) or not _SIGNATURE_ID_RE.match(signature_id):
+        errors.append(
+            "`id` is a non-empty string of lower-case letters, digits, `.`, `_` or `-`"
+        )
+
+    name = sig.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("`name` is a non-empty string")
+
+    games = sig.get("games")
+    if not isinstance(games, list) or not games:
+        errors.append("`games` is a non-empty list of game ids")
+    else:
+        for game in games:
+            if not isinstance(game, str) or not _SIGNATURE_ID_RE.match(game):
+                errors.append(
+                    f"game id {game!r} is not lower-case letters, digits, `.`, `_` or `-`"
+                )
+
+    pattern = sig.get("regex_pattern")
+    if not isinstance(pattern, str) or not pattern:
+        errors.append("`regex_pattern` is a non-empty string")
+
+    level = sig.get("level", "possible")
+    if level not in SIGNATURE_LEVELS:
+        errors.append(
+            f"`level` is one of {', '.join(SIGNATURE_LEVELS)}; got {level!r}"
+        )
+
+    cause = sig.get("cause", "other")
+    if cause not in SIGNATURE_CAUSES:
+        errors.append(
+            f"`cause` is one of {', '.join(SIGNATURE_CAUSES)}; got {cause!r}"
+        )
+
+    text = sig.get("text")
+    if not isinstance(text, str) or not text.strip():
+        errors.append("`text` is a non-empty plain-text headline")
+
+    action = sig.get("action")
+    if action is not None:
+        if not isinstance(action, dict):
+            errors.append("`action` is an object with a `kind`")
+        else:
+            kind = action.get("kind")
+            if kind not in SIGNATURE_ACTION_KINDS:
+                errors.append(
+                    f"`action.kind` is one of {', '.join(SIGNATURE_ACTION_KINDS)}; "
+                    f"got {kind!r}"
+                )
+            content_key = action.get("content_key")
+            if kind == "install_content":
+                if not isinstance(content_key, str) or not content_key.strip():
+                    errors.append(
+                        "`action.content_key` is required for `install_content`"
+                    )
+            elif content_key is not None:
+                errors.append("only `install_content` uses `action.content_key`")
+            label = action.get("label")
+            if label is not None and (
+                not isinstance(label, str) or not label.strip()
+            ):
+                errors.append("`action.label` is a non-empty string when present")
+
+    return errors
+
+
 def insert_crash_signature(
     conn: sqlite3.Connection,
     sig: dict[str, Any],
     rejected: list[int],
 ) -> None:
-    """Insert a crash signature after validating its regex pattern.
+    """Insert a v2 crash signature after validating its shape and regex.
 
-    Validation per ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§2.4.1:
+    Validation per §2.4.1:
+    - The fields follow the v2 signature format (see `validate_crash_signature`).
     - Reject patterns longer than 256 characters.
     - Test each pattern against a 100 KB corpus with a 1 s timeout to catch
       catastrophic backtracking.
 
-    *rejected* is a one-element list used as a mutable counter so the caller
-    can track how many signatures were skipped.
+    A row that fails validation is skipped and logged, never silently stored;
+    *rejected* is a one-element list used as a mutable counter so the caller can
+    track how many signatures were skipped.
     """
+    errors = validate_crash_signature(sig)
+    if errors:
+        signature_id = sig.get("id", "<no id>") if isinstance(sig, dict) else "<no id>"
+        logger.error(
+            "Crash signature '%s' rejected: %s", signature_id, "; ".join(errors)
+        )
+        rejected[0] += 1
+        return
+
     name = sig.get("name", sig["id"])
-    raw_pattern = sig.get("regex_pattern", "")
+    raw_pattern = sig["regex_pattern"]
 
     # --- Length check ---
     if len(raw_pattern) > 256:
@@ -3416,19 +4445,26 @@ def insert_crash_signature(
         return
 
     # --- Insert ---
+    action = sig.get("action") or {}
     cursor = conn.cursor()
-    action_button = sig.get("action_button")
     cursor.execute(
         """
-        INSERT INTO crash_signatures (id, name, regex_pattern, solution_markdown, action_button_json)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO crash_signatures
+            (id, name, games_json, regex_pattern, level, cause, text,
+             action_kind, action_content_key, action_label)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             sig["id"],
             sig["name"],
-            sig["regex_pattern"],
-            sig["solution_markdown"],
-            json.dumps(action_button, separators=(",", ":")) if action_button else None,
+            json.dumps(sig["games"], separators=(",", ":")),
+            raw_pattern,
+            sig.get("level", "possible"),
+            sig.get("cause", "other"),
+            sig["text"],
+            action.get("kind"),
+            action.get("content_key"),
+            action.get("label"),
         ),
     )
 
@@ -3776,8 +4812,14 @@ def compile_registry(
     registry_root: str | None = None,
     state_in_path: Path | None = None,
     state_out_path: Path | None = None,
+    official_fetcher: Callable[[str], bytes] | None = _fetch_official_package,
 ) -> None:
-    """Build the SQLite registry database at *output_path*."""
+    """Build the SQLite registry database at *output_path*.
+
+    ``official_fetcher`` downloads each official plugin package so its URL,
+    size and sha256 can be checked. Tests pass their own fetcher, or ``None``
+    when the test is not about the asset.
+    """
     global REGISTRY_DIR
     if registry_root:
         REGISTRY_DIR = Path(registry_root).resolve()
@@ -3809,6 +4851,14 @@ def compile_registry(
     all_items: list[tuple[Path, dict[str, Any]]] = []
     for dir_name in CONTENT_DIRS:
         all_items.extend(load_json_files(REGISTRY_DIR / dir_name))
+    # Entries for other games (registry/games/<game>/mods/), §26.8. They are kept
+    # apart from the Minecraft items: hydration, governance and the Minecraft
+    # tables never see them, and they land in game_catalog_items instead.
+    game_declarations = load_game_declarations()
+    game_items = load_game_manifests(game_declarations)
+    # Official plugins (registry/official-plugins/): read up front so a malformed
+    # entry stops the compile before any slow work, and written to their own table.
+    official_plugins = load_official_plugins(official_fetcher)
 
     # Identity must be normalized before hydration and governance. Keep the
     # legacy alias readable for existing registries, but never let downstream
@@ -3824,6 +4874,28 @@ def compile_registry(
                 "%s uses deprecated top-level pack_id; migrate to id + content_type='pack'.",
                 path,
             )
+
+    # Which game each entry is for, and the fields that game allows. Runs
+    # before download sources are normalized so every error names its file.
+    for path, item in all_items:
+        check_game_scope(path, item, game_declarations)
+    for path, item in game_items:
+        check_game_scope(path, item, game_declarations)
+
+    # Item ids are global across games: one id, one entry.
+    seen_ids: dict[str, Path] = {}
+    for path, item in all_items + game_items:
+        item_id = str(item.get("id", ""))
+        if item_id in seen_ids:
+            raise SystemExit(f"Duplicate catalog id {item_id!r}: {seen_ids[item_id]} and {path}")
+        seen_ids[item_id] = path
+
+    for path, item in game_items:
+        try:
+            normalize_download_sources(item)
+        except SystemExit:
+            logger.error("Invalid download sources in %s", path)
+            raise
 
     # Download sources must be normalized before hydration: the hydrators pick
     # a Modrinth project id off download_strategy/modrinth_id, and both of
@@ -3960,6 +5032,11 @@ def compile_registry(
             else:
                 other_count += 1
     logger.info("Inserted %d mod(s), %d pack(s), %d other item(s)", mod_count, pack_count, other_count)
+    for path, data in game_items:
+        insert_game_catalog_item(conn, data, path)
+    logger.info("Inserted %d entr(ies) for other games", len(game_items))
+    insert_official_plugins(conn, official_plugins)
+    logger.info("Inserted %d official plugin(s)", len(official_plugins))
 
     # Per-version changelogs — must run after registry_items so FK is satisfied.
     try:
@@ -4367,6 +5444,12 @@ def main() -> None:
         help="Root directory for registry manifests (default: registry/)",
     )
     parser.add_argument(
+        "--skip-official-asset-check",
+        action="store_true",
+        help="Do not download official plugin packages to check their URL, size and sha256 "
+             "(local development and tests only; the catalog release must not use it)",
+    )
+    parser.add_argument(
         "--governance-repo",
         type=str,
         default=None,
@@ -4422,6 +5505,7 @@ def main() -> None:
         registry_root=args.registry_root,
         state_in_path=Path(args.governance_state_in) if args.governance_state_in else None,
         state_out_path=Path(args.governance_state_out) if args.governance_state_out else None,
+        official_fetcher=None if args.skip_official_asset_check else _fetch_official_package,
     )
 
 

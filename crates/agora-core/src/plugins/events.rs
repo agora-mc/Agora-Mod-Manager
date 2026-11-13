@@ -322,6 +322,28 @@ mod tests {
         ) -> PluginResult<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
+
+        fn invoke_with_reads(
+            &self,
+            _plugin_id: &PluginId,
+            _export: &str,
+            _args: serde_json::Value,
+            _timeout: Duration,
+            _reads: Arc<dyn agora_plugin_api::host::ScriptReads>,
+        ) -> PluginResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+
+        fn invoke_with_game_reads(
+            &self,
+            _plugin_id: &PluginId,
+            _export: &str,
+            _args: serde_json::Value,
+            _timeout: Duration,
+            _reads: Arc<dyn agora_plugin_api::host::GameReads>,
+        ) -> PluginResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
         fn deliver_event(
             &self,
             plugin_id: &PluginId,

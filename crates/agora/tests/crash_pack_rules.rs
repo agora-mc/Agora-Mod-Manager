@@ -1,0 +1,1172 @@
+//! The game package's built-in crash rules: each fires on the facts it was written for and stays
+//! quiet on a case close to it. The parsers' own outputs are tested in the game package.
+
+use agora_core::crash_engine::{
+    consensus, evaluate, ConsensusInput, ConsensusProfile, EngineFacts, EvaluateInput,
+    EvaluateOutput, Inspection, InspectionOutcome, InspectionRequest, Inspector, PackInput,
+    ParsedArtifact, RefResolver, Resolved,
+};
+use agora_core::crash_packs::{built_in_identity, load_built_in_packs, BUILT_IN_PLUGIN_ID};
+use agora_game_api::crash::{
+    AttrValue, Coverage, CoverageState, Fact, Owner, ParserOutput, Producer, Ref, Role, Scalar,
+    CRASH_CONTRACT_VERSION,
+};
+use agora_game_minecraft::crash::built_in_packs;
+use std::collections::BTreeMap;
+
+struct MapResolver;
+
+impl RefResolver for MapResolver {
+    fn resolve(&self, reference: &Ref) -> Resolved {
+        if reference.kind == "mod_id" {
+            return Resolved {
+                owner: item(&reference.value),
+                role: None,
+            };
+        }
+        if reference.kind == "class" {
+            if reference.value.contains(".target.") {
+                return Resolved {
+                    owner: item("targetmod"),
+                    role: None,
+                };
+            }
+            if reference.value.starts_with("com.example") {
+                return Resolved {
+                    owner: item("examplemod"),
+                    role: None,
+                };
+            }
+            if reference.value.starts_with("net.minecraft") {
+                return Resolved {
+                    owner: Owner::Base,
+                    role: Some(Role::Platform),
+                };
+            }
+        }
+        if reference.kind == "module" {
+            return Resolved {
+                owner: item("examplegfx"),
+                role: None,
+            };
+        }
+        if matches!(reference.kind.as_str(), "mixin_config" | "named_class") {
+            let key = if reference.value.contains(".target.") {
+                "targetmod"
+            } else {
+                "examplemod"
+            };
+            return Resolved {
+                owner: item(key),
+                role: None,
+            };
+        }
+        if reference.kind == "file" {
+            return Resolved {
+                owner: item(&reference.value),
+                role: None,
+            };
+        }
+        Resolved {
+            owner: Owner::Unknown,
+            role: None,
+        }
+    }
+}
+
+struct NoInspector;
+
+impl Inspector for NoInspector {
+    fn inspect(&self, _request: &InspectionRequest<'_>) -> InspectionOutcome {
+        Inspection::Missing.into()
+    }
+}
+
+fn item(key: &str) -> Owner {
+    Owner::Item {
+        key: key.to_string(),
+        name: key.to_string(),
+    }
+}
+
+fn text(value: &str) -> AttrValue {
+    AttrValue::Scalar(Scalar::Text(value.to_string()))
+}
+
+fn number(value: f64) -> AttrValue {
+    AttrValue::Scalar(Scalar::Number(value))
+}
+
+fn fact(kind: &str, attrs: &[(&str, AttrValue)], refs: Vec<Ref>) -> Fact {
+    Fact {
+        kind: kind.to_string(),
+        attrs: attrs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        refs,
+        span: None,
+    }
+}
+
+fn reference(kind: &str, value: &str) -> Ref {
+    Ref {
+        kind: kind.to_string(),
+        value: value.to_string(),
+        strength: agora_game_api::crash::Strength::Mention,
+    }
+}
+
+fn strong_reference(kind: &str, value: &str) -> Ref {
+    Ref {
+        kind: kind.to_string(),
+        value: value.to_string(),
+        strength: agora_game_api::crash::Strength::Exec,
+    }
+}
+
+fn output(format: &str, facts: Vec<Fact>) -> ParserOutput {
+    let coverage = facts
+        .iter()
+        .map(|fact| Coverage {
+            kind: fact.kind.clone(),
+            state: CoverageState::Checked,
+            why: None,
+        })
+        .collect();
+    ParserOutput {
+        contract: CRASH_CONTRACT_VERSION,
+        producer: Producer {
+            format: format.to_string(),
+            version: None,
+        },
+        facts,
+        bucket: Vec::new(),
+        coverage,
+        notes: Vec::new(),
+    }
+}
+
+fn evaluate_one(output: ParserOutput) -> EvaluateOutput {
+    let built_in = built_in_packs();
+    let report = load_built_in_packs(&built_in);
+    assert!(report.is_clean(), "{:#?}", report.problems);
+    let pack = report.packs.into_iter().next().expect("one pack").pack;
+    let parsed = ParsedArtifact {
+        plugin: built_in_identity(),
+        parser_id: output.producer.format.clone(),
+        artifact: "fixture.log".to_string(),
+        source: None,
+        output,
+    };
+    let packs = vec![PackInput {
+        plugin: built_in_identity(),
+        pack,
+    }];
+    evaluate(&EvaluateInput {
+        packs: &packs,
+        parsed: std::slice::from_ref(&parsed),
+        texts: &[],
+        engine_facts: &EngineFacts::new(),
+        runtime_version: Some("1.20.1"),
+        resolver: &MapResolver,
+        inspector: &NoInspector,
+    })
+}
+
+fn candidates(evaluated: &EvaluateOutput) -> Vec<agora_game_api::crash::Candidate> {
+    let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
+    consensus(
+        &ConsensusInput {
+            signals: &evaluated.signals,
+            roles: &evaluated.roles,
+            level_caps: &level_caps,
+        },
+        &ConsensusProfile::default(),
+    )
+    .candidates
+}
+
+fn fired(evaluated: &EvaluateOutput, rule: &str) -> bool {
+    evaluated
+        .findings
+        .iter()
+        .any(|finding| finding.source.rule_id.as_deref() == Some(rule))
+}
+
+fn signalled(evaluated: &EvaluateOutput, rule: &str) -> bool {
+    evaluated
+        .signals
+        .iter()
+        .any(|signal| signal.source.rule_id.as_deref() == Some(rule))
+}
+
+fn dependency(state: &str, missing: &str) -> Fact {
+    fact(
+        "core.dependency_problem",
+        &[
+            ("state", text(state)),
+            ("requirement", text("2.0.0 or later")),
+            ("needed_by", text("examplemod")),
+        ],
+        vec![reference("mod_id", missing)],
+    )
+}
+
+mod crash {
+    use super::*;
+
+    #[test]
+    fn missing_dependency_fires_and_a_disabled_dependency_does_not() {
+        let fired_case = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![dependency("absent", "examplelib")],
+        ));
+        assert!(fired(&fired_case, "missing_dependency"));
+        assert_eq!(fired_case.findings[0].source.plugin_id, BUILT_IN_PLUGIN_ID);
+
+        let quiet = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![dependency("disabled", "examplelib")],
+        ));
+        assert!(!fired(&quiet, "missing_dependency"));
+        assert!(!fired(&quiet, "wrong_dependency_version"));
+    }
+
+    #[test]
+    fn the_fabric_api_rule_supersedes_the_general_one() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![dependency("absent", "fabric-api")],
+        ));
+        assert!(fired(&evaluated, "missing_fabric_api"));
+        assert!(!fired(&evaluated, "missing_dependency"));
+    }
+
+    #[test]
+    fn wrong_dependency_version_fires_only_for_that_state() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![dependency("wrong_version", "examplelib")],
+        ));
+        assert!(fired(&evaluated, "wrong_dependency_version"));
+        assert!(!fired(&evaluated, "missing_dependency"));
+    }
+
+    #[test]
+    fn a_wrong_game_version_is_recognised() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![dependency("wrong_version", "minecraft")],
+        ));
+        assert!(fired(&evaluated, "wrong_game_version"));
+        assert!(!fired(&evaluated, "wrong_dependency_version"));
+    }
+
+    #[test]
+    fn out_of_memory_fires_and_an_ordinary_exception_does_not() {
+        let oom = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "core.exception",
+                &[
+                    ("class", text("java.lang.OutOfMemoryError")),
+                    ("category", text("oom")),
+                    ("depth", number(0.0)),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&oom, "out_of_memory"));
+
+        let ordinary = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "core.exception",
+                &[
+                    ("class", text("java.lang.IllegalStateException")),
+                    ("category", text("managed")),
+                    ("depth", number(0.0)),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(!fired(&ordinary, "out_of_memory"));
+        assert!(!fired(&ordinary, "missing_class"));
+    }
+
+    #[test]
+    fn a_missing_class_names_the_class_but_not_a_certain_mod() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "core.exception",
+                &[
+                    ("class", text("java.lang.NoClassDefFoundError")),
+                    ("category", text("load_failure")),
+                    ("message", text("com/example/thing/Widget")),
+                    ("depth", number(0.0)),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&evaluated, "missing_class"));
+    }
+
+    #[test]
+    fn a_mixin_failure_names_the_mod_and_a_warning_does_not_fire() {
+        let failure = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.mixin_failure",
+                &[
+                    ("severity", text("critical")),
+                    ("config", text("examplemod.mixins.json")),
+                    ("target", text("net.minecraft.class_123")),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&failure, "mixin_apply_failed"));
+        assert!(!failure.signals.is_empty());
+
+        let warning = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.mixin_failure",
+                &[
+                    ("severity", text("warning")),
+                    ("config", text("examplemod.mixins.json")),
+                    ("target", text("net.minecraft.class_123")),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(!fired(&warning, "mixin_apply_failed"));
+    }
+
+    #[test]
+    fn a_duplicate_mod_is_named_and_a_single_mod_is_not() {
+        let duplicate = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.duplicate_mod",
+                &[("id", text("examplemod"))],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&duplicate, "duplicate_mod"));
+
+        let single = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.mod",
+                &[("id", text("examplemod"))],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(!fired(&single, "duplicate_mod"));
+    }
+
+    #[test]
+    fn loader_problems_have_their_own_rules() {
+        for (kind, rule) in [
+            ("resolution", "mod_resolution_failed"),
+            ("missing_dependency", "mod_resolution_failed"),
+            ("incompatible", "incompatible_mods"),
+            ("duplicate_classpath", "duplicate_classpath_libraries"),
+        ] {
+            let evaluated = evaluate_one(output(
+                "minecraft_latest_log",
+                vec![fact(
+                    "minecraft.loader_problem",
+                    &[("kind", text(kind)), ("message", text("a loader message"))],
+                    Vec::new(),
+                )],
+            ));
+            assert!(fired(&evaluated, rule), "{kind}: {rule}");
+        }
+    }
+
+    #[test]
+    fn a_loader_problem_from_a_crash_report_fires_the_same_rules() {
+        for (kind, rule) in [
+            ("resolution", "mod_resolution_failed"),
+            ("missing_dependency", "mod_resolution_failed"),
+            ("incompatible", "incompatible_mods"),
+        ] {
+            let evaluated = evaluate_one(output(
+                "minecraft_crash_report",
+                vec![fact(
+                    "minecraft.loader_problem",
+                    &[("kind", text(kind)), ("message", text("a loader message"))],
+                    Vec::new(),
+                )],
+            ));
+            assert!(fired(&evaluated, rule), "{kind}: {rule}");
+        }
+    }
+
+    #[test]
+    fn a_mod_error_a_config_error_and_a_world_error_each_fire() {
+        let mod_error = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.mod_error",
+                &[("message", text("Failed to load mod file examplemod.jar"))],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&mod_error, "mod_loading_error"));
+
+        let config = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.config_error",
+                &[(
+                    "message",
+                    text("Failed to load config file examplemod.toml"),
+                )],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&config, "broken_config"));
+
+        let world = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.world_error",
+                &[("message", text("Failed to load chunk 12,34"))],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&world, "corrupted_world"));
+    }
+
+    #[test]
+    fn old_java_fires_on_a_new_game_and_not_on_a_new_java() {
+        let old = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![
+                fact(
+                    "minecraft.system",
+                    &[("java_version", text("1.8.0_51"))],
+                    Vec::new(),
+                ),
+                fact(
+                    "core.process",
+                    &[("image_version", text("1.20.1"))],
+                    Vec::new(),
+                ),
+            ],
+        ));
+        assert!(fired(&old, "java_too_old"));
+
+        let new = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![
+                fact(
+                    "minecraft.system",
+                    &[("java_version", text("21.0.7"))],
+                    Vec::new(),
+                ),
+                fact(
+                    "core.process",
+                    &[("image_version", text("1.20.1"))],
+                    Vec::new(),
+                ),
+            ],
+        ));
+        assert!(!fired(&new, "java_too_old"));
+
+        let old_game = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![
+                fact(
+                    "minecraft.system",
+                    &[("java_version", text("1.8.0_51"))],
+                    Vec::new(),
+                ),
+                fact(
+                    "core.process",
+                    &[("image_version", text("1.12.2"))],
+                    Vec::new(),
+                ),
+            ],
+        ));
+        assert!(!fired(&old_game, "java_too_old"));
+    }
+
+    #[test]
+    fn thirty_two_bit_java_fires_and_sixty_four_does_not() {
+        let thirty_two = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.system",
+                &[("java_bits", number(32.0))],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&thirty_two, "java_32_bit"));
+
+        let sixty_four = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.system",
+                &[("java_bits", number(64.0))],
+                Vec::new(),
+            )],
+        ));
+        assert!(!fired(&sixty_four, "java_32_bit"));
+    }
+
+    #[test]
+    fn a_mod_class_on_the_stack_becomes_a_signal_but_a_platform_class_does_not() {
+        let on_stack = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "core.frame",
+                &[("index", number(0.0))],
+                vec![strong_reference("class", "com.example.mod.ExampleRenderer")],
+            )],
+        ));
+        assert!(signalled(&on_stack, "frame_on_stack"));
+        assert!(on_stack.signals.iter().any(
+            |signal| matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplemod")
+        ));
+
+        let platform = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "core.frame",
+                &[("index", number(0.0))],
+                vec![strong_reference("class", "net.minecraft.class_123")],
+            )],
+        ));
+        // The rule matches, but a platform class is not a culprit, so it makes no signal.
+        assert!(!signalled(&platform, "frame_on_stack"));
+        assert!(platform.signals.is_empty());
+    }
+
+    #[test]
+    fn the_loader_naming_a_failed_mod_becomes_a_candidate() {
+        let first = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.mod_crash",
+                &[
+                    ("id", text("examplemod")),
+                    ("phase", text("load")),
+                    ("order", number(0.0)),
+                    (
+                        "message",
+                        text("Example Mod (examplemod) has failed to load correctly"),
+                    ),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&first, "mod_failed_to_load"));
+        assert!(first.signals.iter().any(
+            |signal| matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplemod")
+        ));
+
+        let later = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.mod_crash",
+                &[
+                    ("id", text("examplemod")),
+                    ("phase", text("load")),
+                    ("order", number(1.0)),
+                    (
+                        "message",
+                        text("Example Mod (examplemod) has failed to load correctly"),
+                    ),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(!fired(&later, "mod_failed_to_load"));
+    }
+
+    #[test]
+    fn a_class_file_version_finds_the_java_it_needs() {
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.jvm_problem",
+                &[
+                    ("kind", text("class_version")),
+                    ("required_java", number(17.0)),
+                    ("message", text("class file version 61.0")),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&evaluated, "unsupported_class_version"));
+    }
+
+    #[test]
+    fn java_too_new_fires_only_on_an_old_game() {
+        let old = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![
+                fact(
+                    "minecraft.jvm_problem",
+                    &[
+                        ("kind", text("too_new")),
+                        ("message", text("module java.base does not export")),
+                    ],
+                    Vec::new(),
+                ),
+                fact(
+                    "core.process",
+                    &[("image_version", text("1.12.2"))],
+                    Vec::new(),
+                ),
+            ],
+        ));
+        assert!(fired(&old, "java_too_new"));
+
+        let new = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![
+                fact(
+                    "minecraft.jvm_problem",
+                    &[
+                        ("kind", text("too_new")),
+                        ("message", text("module java.base does not export")),
+                    ],
+                    Vec::new(),
+                ),
+                fact(
+                    "core.process",
+                    &[("image_version", text("1.20.1"))],
+                    Vec::new(),
+                ),
+            ],
+        ));
+        assert!(!fired(&new, "java_too_new"));
+    }
+
+    #[test]
+    fn jvm_problems_have_their_own_environment_rules() {
+        for (kind, rule) in [
+            ("native_library", "missing_native_library"),
+            ("memory_startup", "jvm_memory_startup"),
+            ("graphics", "graphics_driver_problem"),
+            ("id_limit", "registry_limit"),
+        ] {
+            let evaluated = evaluate_one(output(
+                "minecraft_crash_report",
+                vec![fact(
+                    "minecraft.jvm_problem",
+                    &[("kind", text(kind)), ("message", text("a message"))],
+                    Vec::new(),
+                )],
+            ));
+            assert!(fired(&evaluated, rule), "{kind}: {rule}");
+        }
+
+        let loader_line = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.loader_problem",
+                &[
+                    ("kind", text("id_limit")),
+                    ("message", text("maximum id range exceeded")),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&loader_line, "registry_limit"));
+
+        let driver = evaluate_one(output(
+            "minecraft_hs_err",
+            vec![fact(
+                "core.frame",
+                &[
+                    ("index", number(0.0)),
+                    ("kind", text("probable")),
+                    ("symbol", text("nvoglv64.dll+0x1234")),
+                ],
+                vec![strong_reference("module", "nvoglv64.dll")],
+            )],
+        ));
+        assert!(fired(&driver, "graphics_driver_frame"));
+    }
+
+    #[test]
+    fn a_named_conflict_names_both_mods() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.mod_conflict",
+                &[
+                    ("first", text("examplemod")),
+                    ("second", text("othermod")),
+                    ("message", text("Found conflicting mods")),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&evaluated, "mod_conflict_named"));
+    }
+
+    #[test]
+    fn a_world_saved_with_a_missing_or_changed_mod_is_reported() {
+        let missing = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.world_mod",
+                &[("kind", text("missing")), ("mod", text("examplemod"))],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&missing, "world_missing_mod"));
+
+        let changed = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![fact(
+                "minecraft.world_mod",
+                &[
+                    ("kind", text("version")),
+                    ("mod", text("examplemod")),
+                    ("expected", text("1.0")),
+                    ("current", text("2.0")),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&changed, "world_changed_mod"));
+    }
+
+    #[test]
+    fn a_ticking_object_is_described_at_its_location() {
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.ticking_object",
+                &[
+                    ("kind", text("entity")),
+                    ("type", text("examplemod:example_entity")),
+                    ("x", number(1.5)),
+                    ("y", number(64.0)),
+                    ("z", number(-2.5)),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&evaluated, "ticking_object_at"));
+        assert!(!fired(&evaluated, "ticking_object"));
+        assert!(signalled(&evaluated, "ticking_modded_object"));
+
+        let vanilla = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.ticking_object",
+                &[
+                    ("kind", text("entity")),
+                    ("type", text("minecraft:pig")),
+                    ("x", number(1.0)),
+                    ("y", number(64.0)),
+                    ("z", number(2.0)),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&vanilla, "ticking_object_at"));
+        assert!(!signalled(&vanilla, "ticking_modded_object"));
+    }
+
+    #[test]
+    fn an_existing_file_names_the_file_instead_of_the_mod() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![
+                fact(
+                    "minecraft.mod_crash",
+                    &[
+                        ("id", text("examplemod")),
+                        ("phase", text("entrypoint")),
+                        ("order", number(0.0)),
+                        ("message", text("entrypoint failed")),
+                    ],
+                    vec![reference("mod_id", "examplemod")],
+                ),
+                fact(
+                    "minecraft.file_problem",
+                    &[
+                        ("kind", text("already_exists")),
+                        ("path", text("examplemod.toml.old")),
+                        ("message", text("already exists")),
+                    ],
+                    vec![reference("file", "examplemod.toml.old")],
+                ),
+            ],
+        ));
+        assert!(fired(&evaluated, "file_already_exists"));
+        assert!(!fired(&evaluated, "mod_failed_to_load"));
+        assert!(evaluated.signals.iter().any(|signal| {
+            matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplemod.toml.old")
+        }));
+    }
+
+    #[test]
+    fn a_missing_member_is_a_version_mismatch_but_a_null_pointer_is_not() {
+        let missing = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "core.exception",
+                &[
+                    ("class", text("java.lang.NoSuchMethodError")),
+                    ("category", text("load_failure")),
+                    ("message", text("'void example.Thing.run()'")),
+                    ("depth", number(0.0)),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(fired(&missing, "missing_member_wrong_version"));
+
+        let ordinary = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "core.exception",
+                &[
+                    ("class", text("java.lang.NullPointerException")),
+                    ("category", text("managed")),
+                    ("message", text("a widget was null")),
+                    ("depth", number(0.0)),
+                ],
+                Vec::new(),
+            )],
+        ));
+        assert!(!fired(&ordinary, "missing_member_wrong_version"));
+    }
+
+    #[test]
+    fn a_native_module_on_the_stack_becomes_a_signal() {
+        let evaluated = evaluate_one(output(
+            "minecraft_hs_err",
+            vec![fact(
+                "core.frame",
+                &[("index", number(0.0))],
+                vec![strong_reference("module", "examplegfx.dll")],
+            )],
+        ));
+        assert!(signalled(&evaluated, "module_on_stack"));
+        assert!(evaluated.signals.iter().any(
+            |signal| matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplegfx")
+        ));
+    }
+
+    #[test]
+    fn a_mixin_config_owner_ranks_before_the_target_class_owner() {
+        let mut config = reference("mixin_config", "examplemod.mixins.json");
+        config.strength = agora_game_api::crash::Strength::Mention;
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.mixin_failure",
+                &[
+                    ("severity", text("critical")),
+                    ("config", text("examplemod.mixins.json")),
+                    ("target", text("com.target.mod.TargetScreen")),
+                ],
+                vec![
+                    reference("mod_id", "examplemod"),
+                    config,
+                    reference("class", "com.target.mod.TargetScreen"),
+                ],
+            )],
+        ));
+        assert!(signalled(&evaluated, "mixin_config_owner"));
+        assert!(signalled(&evaluated, "mixin_target_owner"));
+        let keys: Vec<String> = candidates(&evaluated)
+            .iter()
+            .filter_map(|candidate| match &candidate.owner {
+                Owner::Item { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.first().map(String::as_str), Some("examplemod"));
+        assert!(keys.iter().any(|key| key == "targetmod"));
+    }
+
+    #[test]
+    fn a_mixin_warning_creates_no_suspect() {
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.mixin_failure",
+                &[
+                    ("severity", text("warning")),
+                    ("config", text("examplemod.mixins.json")),
+                ],
+                vec![reference("mixin_config", "examplemod.mixins.json")],
+            )],
+        ));
+        assert!(!signalled(&evaluated, "mixin_config_owner"));
+        assert!(candidates(&evaluated).is_empty());
+    }
+
+    #[test]
+    fn a_class_named_in_an_exception_message_becomes_a_suspect() {
+        let mut named = reference("named_class", "com.example.mod.HiddenConfig");
+        named.strength = agora_game_api::crash::Strength::Mention;
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "core.exception",
+                &[
+                    (
+                        "class",
+                        text("org.example.mixin.ClassMetadataNotFoundException"),
+                    ),
+                    ("category", text("managed")),
+                    ("message", text("com.example.mod.HiddenConfig")),
+                    ("depth", number(0.0)),
+                ],
+                vec![named],
+            )],
+        ));
+        assert!(signalled(&evaluated, "exception_names_mod_class"));
+        assert!(evaluated.signals.iter().any(
+            |signal| matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplemod")
+        ));
+    }
+
+    #[test]
+    fn a_data_error_in_a_mods_namespace_names_that_mod() {
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.data_error",
+                &[
+                    ("namespace", text("examplemod")),
+                    ("message", text("data/examplemod/recipes/thing.json")),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&evaluated, "data_error_names_mod"));
+        assert!(candidates(&evaluated).iter().any(
+            |candidate| matches!(&candidate.owner, Owner::Item { key, .. } if key == "examplemod")
+        ));
+    }
+}
+
+/// The community signatures retired into the built-in pack. Each test writes a small invented log
+/// line for one of them and checks that the built-in pack still produces the same finding and the
+/// same action.
+mod retired_signatures {
+    use agora_core::crash_engine::gate::NoHost;
+    use agora_core::crash_engine::{analyze, AnalyzeInput, AnalyzeOutput, CrashFile};
+    use agora_core::crash_packs::load_built_in_packs;
+    use agora_game_api::crash::ActionKind;
+    use agora_game_minecraft::crash::built_in_packs;
+
+    fn header() -> &'static str {
+        "[01:02:03] [main/INFO]: Loading Minecraft 1.20.1 with Fabric Loader 0.16.0\n"
+    }
+
+    fn analyze_text(text: &str) -> AnalyzeOutput {
+        let built_in = built_in_packs();
+        let report = load_built_in_packs(&built_in);
+        assert!(report.is_clean(), "{:#?}", report.problems);
+        analyze(&AnalyzeInput {
+            packs: &report.packs,
+            files: &[CrashFile::new(
+                "invented-latest.log".to_string(),
+                text.as_bytes().to_vec(),
+            )],
+            runtime_version: Some("1.20.1"),
+            host: &NoHost,
+            built_in: &built_in,
+            instance: None,
+        })
+        .expect("the invented log is read")
+    }
+
+    fn finding<'a>(output: &'a AnalyzeOutput, rule: &str) -> &'a agora_game_api::crash::Finding {
+        output
+            .answer
+            .findings
+            .iter()
+            .find(|finding| finding.source.rule_id.as_deref() == Some(rule))
+            .unwrap_or_else(|| panic!("`{rule}` did not fire: {:#?}", output.answer.findings))
+    }
+
+    fn action(output: &AnalyzeOutput, rule: &str) -> Option<ActionKind> {
+        output
+            .answer
+            .actions
+            .iter()
+            .find(|offer| offer.source.rule_id.as_deref() == Some(rule))
+            .map(|offer| offer.action.kind)
+    }
+
+    #[test]
+    fn missing_fabric_api_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/WARN]: Warnings were found!\n \
+             - Mod 'Example Gadget' (examplegadget) 1.2.3 requires any version of fabric-api, which is missing!\n"
+        );
+        let output = analyze_text(&log);
+        let found = finding(&output, "missing_fabric_api");
+        assert_eq!(found.source.plugin_id, "agora");
+        assert!(found.candidate.is_none());
+        let offer = output
+            .answer
+            .actions
+            .iter()
+            .find(|offer| offer.source.rule_id.as_deref() == Some("missing_fabric_api"))
+            .expect("the install action");
+        assert_eq!(offer.action.kind, ActionKind::InstallContent);
+        assert_eq!(offer.action.content_key.as_deref(), Some("fabric-api"));
+    }
+
+    #[test]
+    fn a_missing_dependency_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/WARN]: Warnings were found!\n \
+             - Mod 'Example Gadget' (examplegadget) 1.2.3 requires any version of examplelib, which is missing!\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "missing_dependency");
+        assert_eq!(
+            action(&output, "missing_dependency"),
+            Some(ActionKind::ReviewMods)
+        );
+    }
+
+    #[test]
+    fn a_mixin_apply_failure_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: Mixin apply for mod examplegadget failed \
+             examplegadget.mixins.json:ExampleMixin -> net.minecraft.class_123: \
+             java.lang.RuntimeException: mixin failure\n \
+             Caused by: org.spongepowered.asm.mixin.throwables.MixinApplyError: \
+             Mixin [examplegadget.mixins.json:ExampleMixin from mod examplegadget] \
+             from phase [DEFAULT] in config [examplegadget.mixins.json] FAILED during APPLY\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "mixin_apply_failed");
+        assert_eq!(
+            action(&output, "mixin_apply_failed"),
+            Some(ActionKind::OpenCrashLog)
+        );
+    }
+
+    #[test]
+    fn a_mod_resolution_failure_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: net.fabricmc.loader.impl.FormattedException: \
+             net.fabricmc.loader.api.metadata.ModResolutionException: Mod resolution \
+             encountered an incompatible mod set!\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "mod_resolution_failed");
+        assert_eq!(
+            action(&output, "mod_resolution_failed"),
+            Some(ActionKind::ReviewMods)
+        );
+    }
+
+    #[test]
+    fn duplicate_classpath_libraries_are_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: Duplicate ASM classes found on classpath: \
+             [org/example/Thing.class]\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "duplicate_classpath_libraries");
+        assert_eq!(
+            action(&output, "duplicate_classpath_libraries"),
+            Some(ActionKind::OpenConsole)
+        );
+    }
+
+    #[test]
+    fn running_out_of_memory_is_still_recognised() {
+        let log = format!(
+            "{}{}",
+            header(),
+            "[01:02:04] [main/ERROR]: java.lang.OutOfMemoryError: Java heap space\n"
+        );
+        let output = analyze_text(&log);
+        finding(&output, "out_of_memory");
+        assert_eq!(
+            action(&output, "out_of_memory"),
+            Some(ActionKind::OpenJvmSettings)
+        );
+    }
+}
+
+/// A loose file keeps no original name (a forum paste, a renamed copy) and often has Windows line
+/// ends; detection must still pick the right parser from the content alone.
+mod detection {
+    use agora_core::crash_packs::detect_parsers;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../agora-game-minecraft/tests/crash_fixtures")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+    }
+
+    fn crlf(bytes: &[u8]) -> Vec<u8> {
+        String::from_utf8_lossy(bytes)
+            .replace('\n', "\r\n")
+            .into_bytes()
+    }
+
+    fn detected(bytes: &[u8]) -> Vec<String> {
+        let built_in = agora_game_minecraft::crash::built_in_packs();
+        let report = agora_core::crash_packs::load_built_in_packs(&built_in);
+        let pack = &report.packs[0].pack;
+        detect_parsers(pack, "pasted-3f9a.log", bytes)
+            .unwrap()
+            .into_iter()
+            .map(|parser| parser.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn each_minecraft_file_is_recognised_under_any_name_and_either_line_end() {
+        for (file, parser) in [
+            ("crash_fabric.txt", "crash_report"),
+            ("crash_forge.txt", "crash_report"),
+            ("latest_mixin.log", "latest_log"),
+            ("latest_fabric_missing.log", "latest_log"),
+            ("hs_err_sample.log", "hs_err"),
+        ] {
+            let lf = fixture(file);
+            assert_eq!(detected(&lf), vec![parser], "{file} with LF");
+            assert_eq!(detected(&crlf(&lf)), vec![parser], "{file} with CRLF");
+        }
+    }
+
+    #[test]
+    fn other_logs_are_not_claimed() {
+        let skyrim = b"Skyrim SSE v1.6.1170\r\nCrashLoggerSSE v1-15-0-0 Nov  1 2024\r\n\r\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF6C1A2B3C4 SkyrimSE.exe+0123456\r\n";
+        let plain_timestamps = b"[12:00:01] [info] service started\n[12:00:02] [warn] retrying\n";
+        assert!(detected(skyrim).is_empty());
+        assert!(detected(plain_timestamps).is_empty());
+        assert!(detected(&fixture("lookalike.txt")).is_empty());
+        assert!(detected(b"").is_empty());
+    }
+}

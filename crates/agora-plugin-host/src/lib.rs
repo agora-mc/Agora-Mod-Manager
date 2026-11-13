@@ -19,9 +19,12 @@
 mod modules;
 mod runtime;
 mod sdk;
+mod wasm;
 
 use agora_plugin_api::error::{PluginError, PluginErrorCode, PluginResult};
-use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
+use agora_plugin_api::host::{
+    ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReads, StoredBlobs,
+};
 use agora_plugin_api::manifest::PluginId;
 use agora_plugin_api::protocol::PluginEventEnvelope;
 use runtime::{Control, PluginHandle};
@@ -40,6 +43,57 @@ pub struct QuickJsHost {
 impl QuickJsHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_inner(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Option<Arc<dyn ScriptReads>>,
+        game_reads: Option<Arc<dyn GameReads>>,
+        blobs: Option<Arc<dyn StoredBlobs>>,
+    ) -> PluginResult<serde_json::Value> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        self.with_handle(plugin_id, |handle| {
+            handle.clear_interrupt();
+            handle
+                .control
+                .send(Control::Invoke {
+                    export: export.to_string(),
+                    args,
+                    timeout,
+                    reads,
+                    game_reads,
+                    blobs,
+                    reply: reply_tx,
+                })
+                .map_err(|_| {
+                    PluginError::new(
+                        PluginErrorCode::NotActivated,
+                        format!("`{plugin_id}` stopped running"),
+                    )
+                })
+        })?;
+
+        // Slack past the plugin's own timeout: the runtime thread is expected
+        // to answer with a precise Timeout error, and this only catches a
+        // thread that has stopped answering entirely.
+        match reply_rx.recv_timeout(timeout + Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = self.with_handle(plugin_id, |handle| {
+                    handle.interrupt();
+                    Ok(())
+                });
+                Err(PluginError::new(
+                    PluginErrorCode::Timeout,
+                    format!("`{plugin_id}` stopped responding while running `{export}`"),
+                ))
+            }
+        }
     }
 
     fn with_handle<T>(
@@ -140,41 +194,41 @@ impl ScriptHost for QuickJsHost {
         args: serde_json::Value,
         timeout: Duration,
     ) -> PluginResult<serde_json::Value> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-        self.with_handle(plugin_id, |handle| {
-            handle.clear_interrupt();
-            handle
-                .control
-                .send(Control::Invoke {
-                    export: export.to_string(),
-                    args,
-                    timeout,
-                    reply: reply_tx,
-                })
-                .map_err(|_| {
-                    PluginError::new(
-                        PluginErrorCode::NotActivated,
-                        format!("`{plugin_id}` stopped running"),
-                    )
-                })
-        })?;
+        self.invoke_inner(plugin_id, export, args, timeout, None, None, None)
+    }
 
-        // Slack past the plugin's own timeout: the runtime thread is expected
-        // to answer with a precise Timeout error, and this only catches a
-        // thread that has stopped answering entirely.
-        match reply_rx.recv_timeout(timeout + Duration::from_secs(2)) {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = self.with_handle(plugin_id, |handle| {
-                    handle.interrupt();
-                    Ok(())
-                });
-                Err(PluginError::new(
-                    PluginErrorCode::Timeout,
-                    format!("`{plugin_id}` stopped responding while running `{export}`"),
-                ))
-            }
-        }
+    fn invoke_with_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn ScriptReads>,
+    ) -> PluginResult<serde_json::Value> {
+        self.invoke_inner(plugin_id, export, args, timeout, Some(reads), None, None)
+    }
+
+    fn invoke_with_game_reads(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        reads: Arc<dyn GameReads>,
+    ) -> PluginResult<serde_json::Value> {
+        self.invoke_inner(plugin_id, export, args, timeout, None, Some(reads), None)
+    }
+
+    fn invoke_with_scopes(
+        &self,
+        plugin_id: &PluginId,
+        export: &str,
+        args: serde_json::Value,
+        timeout: Duration,
+        game_reads: Option<Arc<dyn GameReads>>,
+        blobs: Option<Arc<dyn StoredBlobs>>,
+    ) -> PluginResult<serde_json::Value> {
+        self.invoke_inner(plugin_id, export, args, timeout, None, game_reads, blobs)
     }
 
     fn deliver_event(

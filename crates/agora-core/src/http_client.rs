@@ -328,7 +328,7 @@ impl ClientCategory {
     }
 
     fn user_agent(&self) -> &'static str {
-        "AgoraLauncher/1.0"
+        "AgoraModManager/1.0"
     }
 
     fn max_response_bytes(&self) -> Option<u64> {
@@ -408,6 +408,18 @@ pub enum ProxySetting {
 }
 
 impl ProxySetting {
+    /// The setting as it may be printed: a manual proxy URL keeps its host and user name but
+    /// never its password (CodeQL rust/cleartext-logging).
+    pub fn redacted(&self) -> ProxySetting {
+        match self {
+            ProxySetting::Manual { url, username } => ProxySetting::Manual {
+                url: redact_proxy_url(url),
+                username: username.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// Refuse a manual proxy reqwest could not use, before it is saved.
     pub fn validate(&self) -> LauncherResult<()> {
         if let ProxySetting::Manual { url, .. } = self {
@@ -427,6 +439,42 @@ impl ProxySetting {
         }
         Ok(())
     }
+}
+
+/// A proxy URL with its password replaced, for showing to the player. A URL without credentials
+/// is returned as it was. An unparseable one is still stripped of anything before an `@`, so a
+/// typo cannot print a secret either.
+pub fn redact_proxy_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Ok(mut parsed) = reqwest::Url::parse(trimmed) else {
+        return redact_raw_userinfo(trimmed);
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return url.to_string();
+    }
+    if parsed.username().is_empty() {
+        let _ = parsed.set_password(None);
+        let _ = parsed.set_username("***");
+    } else {
+        let _ = parsed.set_password(Some("***"));
+    }
+    parsed.to_string()
+}
+
+fn redact_raw_userinfo(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_string();
+    };
+    let Some((userinfo, host)) = rest.rsplit_once('@') else {
+        return raw.to_string();
+    };
+    let user = userinfo.split(':').next().unwrap_or_default();
+    let shown = if user.is_empty() {
+        "***".to_string()
+    } else {
+        format!("{user}:***")
+    };
+    format!("{scheme}://{shown}@{host}")
 }
 
 static PROXY: std::sync::RwLock<Option<ProxySetting>> = std::sync::RwLock::new(None);
@@ -800,6 +848,21 @@ pub fn host_matches_domain(host: &str, domain: &str) -> bool {
 }
 
 /// Decide whether `host` is authorized under `policy`.
+/// The hosts a curator-pinned host always redirects its downloads to. A GitHub release URL
+/// (`github.com/<owner>/<repo>/releases/download/…`) answers with a redirect to GitHub's asset CDN,
+/// so a `direct_hash` pin on `github.com` could never download without them. The list is fixed and
+/// names the same origin's own hosts only; the pinned SHA-256 still has to match the bytes.
+fn pinned_host_redirects(pinned: &str) -> &'static [&'static str] {
+    if pinned.eq_ignore_ascii_case("github.com") {
+        &[
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+        ]
+    } else {
+        &[]
+    }
+}
+
 fn host_authorized(category: ClientCategory, host: &str, policy: HostPolicy<'_>) -> bool {
     match policy {
         HostPolicy::Allowlist => {
@@ -808,7 +871,12 @@ fn host_authorized(category: ClientCategory, host: &str, policy: HostPolicy<'_>)
                 .iter()
                 .any(|allowed| host_matches_domain(host, allowed))
         }
-        HostPolicy::SignedManifest(pinned) => host_matches_domain(host, pinned),
+        HostPolicy::SignedManifest(pinned) => {
+            host_matches_domain(host, pinned)
+                || pinned_host_redirects(pinned)
+                    .iter()
+                    .any(|allowed| host_matches_domain(host, allowed))
+        }
         HostPolicy::UserConsented => {
             // Host authorization is delegated to the core consent check that
             // precedes this request. The empty ConsentedContent allowlist
@@ -850,7 +918,7 @@ fn host_authorized(category: ClientCategory, host: &str, policy: HostPolicy<'_>)
 /// the same honest "no internet connection" story, and the failure is recorded
 /// for the Privacy status. Callers that have context attach it with
 /// [`LauncherError::while_attempting`].
-pub(crate) fn transport_failure() -> LauncherError {
+pub fn transport_failure() -> LauncherError {
     crate::connectivity::record_unreachable();
     LauncherError::NetworkOffline
 }
@@ -858,7 +926,7 @@ pub(crate) fn transport_failure() -> LauncherError {
 /// [`transport_failure`] for a request that failed in reqwest: the user still
 /// sees "offline", but the log keeps why (DNS, TLS, refused, timeout). The URL
 /// is stripped first, since a query string can carry a token.
-pub(crate) fn transport_failure_from(error: reqwest::Error) -> LauncherError {
+pub fn transport_failure_from(error: reqwest::Error) -> LauncherError {
     eprintln!("[http] request failed: {}", describe_transport_error(error));
     transport_failure()
 }
@@ -1497,6 +1565,77 @@ pub fn blocking_checked_get_bytes_with_policy(
     Ok(bytes.to_vec())
 }
 
+/// Blocking JSON POST through the same policy path as [`blocking_checked_request`], returning the
+/// response bytes under the category's size cap. Used by synchronous metadata lookups.
+///
+/// A redirect is refused rather than followed: the caller posted a body to a specific endpoint,
+/// and silently replaying it elsewhere is exactly what the async path only does for 307/308.
+pub fn blocking_checked_post_json(
+    _clients: &HttpClients,
+    category: ClientCategory,
+    url: &str,
+    body: &serde_json::Value,
+) -> LauncherResult<Vec<u8>> {
+    crate::network_gate::authorize(category)?;
+    check_request_url(category, url)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(category.timeout())
+        .user_agent(category.user_agent())
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(4)
+        .build()
+        .map_err(|e| LauncherError::Generic {
+            code: "ERR_HTTP_CLIENT_BUILD".into(),
+            message: format!("Failed to build blocking HTTP client: {e}"),
+        })?;
+
+    let response = client
+        .post(url)
+        .json(body)
+        .send()
+        .map_err(transport_failure_from)?;
+    crate::connectivity::record_reachable();
+
+    if response.status().is_redirection() {
+        return Err(LauncherError::Generic {
+            code: "ERR_UNEXPECTED_REDIRECT".into(),
+            message: format!(
+                "Refusing a redirect from {} for a posted lookup",
+                network::sanitized_url_for_log(url)
+            ),
+        });
+    }
+    if !response.status().is_success() {
+        return Err(LauncherError::Generic {
+            code: "ERR_HTTP_STATUS".into(),
+            message: format!(
+                "HTTP {} for {}",
+                response.status(),
+                network::sanitized_url_for_log(url)
+            ),
+        });
+    }
+
+    let max = category.max_response_bytes().unwrap_or(10 * 1024 * 1024);
+    let mut limited = response.take(max.saturating_add(1));
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|_| transport_failure())?;
+    if bytes.len() as u64 > max {
+        return Err(LauncherError::Generic {
+            code: "ERR_RESPONSE_TOO_LARGE".into(),
+            message: format!(
+                "Response exceeds {} bytes (downloaded {})",
+                max,
+                bytes.len()
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
 /// Log a sanitized summary of an HTTP response for diagnostics.
 pub fn log_response_error(response: &reqwest::Response, context: &str) {
     let status = response.status();
@@ -1807,6 +1946,40 @@ mod tests {
                 "{lookalike} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn a_github_pin_allows_only_githubs_own_asset_hosts() {
+        // A direct_hash pin on a GitHub release URL is redirected to GitHub's asset CDN.
+        let pinned = HostPolicy::SignedManifest("github.com");
+        for host in [
+            "github.com",
+            "release-assets.githubusercontent.com",
+            "objects.githubusercontent.com",
+        ] {
+            assert!(
+                host_authorized(ClientCategory::PinnedArtifact, host, pinned),
+                "{host}"
+            );
+        }
+        for host in [
+            "raw.githubusercontent.com",
+            "githubusercontent.com",
+            "release-assets.githubusercontent.com.attacker.example",
+            "evil-release-assets.githubusercontent.com",
+        ] {
+            assert!(
+                !host_authorized(ClientCategory::PinnedArtifact, host, pinned),
+                "{host}"
+            );
+        }
+        // Another pinned host gains nothing.
+        let other = HostPolicy::SignedManifest("cdn.example.com");
+        assert!(!host_authorized(
+            ClientCategory::PinnedArtifact,
+            "release-assets.githubusercontent.com",
+            other
+        ));
     }
 
     #[test]
@@ -2128,6 +2301,28 @@ mod tests {
         assert!(!category_allowlist(ClientCategory::Loader).is_empty());
         assert!(!category_allowlist(ClientCategory::MojangContent).is_empty());
         assert!(!category_allowlist(ClientCategory::Registry).is_empty());
+    }
+
+    #[test]
+    fn a_proxy_url_is_shown_without_its_password() {
+        let shown = redact_proxy_url("http://alice:s3cret@proxy.example:8080");
+        assert!(shown.contains("alice:***@proxy.example:8080"), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+
+        let shown = redact_proxy_url("socks5h://proxy.example:1080");
+        assert_eq!(shown, "socks5h://proxy.example:1080");
+
+        let shown = redact_proxy_url("http://:s3cret@proxy.example:8080");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("***@proxy.example:8080"), "{shown}");
+
+        let setting = ProxySetting::Manual {
+            url: "http://alice:s3cret@proxy.example:8080".into(),
+            username: Some("alice".into()),
+        };
+        let shown = serde_json::to_string(&setting.redacted()).unwrap();
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("alice:***@proxy.example:8080"), "{shown}");
     }
 }
 

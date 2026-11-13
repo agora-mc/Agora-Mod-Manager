@@ -96,6 +96,49 @@ impl Resolver for PackageResolver {
     }
 }
 
+/// Resolve a package-relative file the way [`PackageResolver`] resolves an
+/// import, and return the real path only when it is a file inside the package.
+///
+/// Used for a WebAssembly module: it must stay in the plugin's own folder, so
+/// `..`, an absolute path, a symlink out, or a missing file is refused with a
+/// message that names what the author wrote.
+pub(crate) fn resolve_package_file(
+    root: &Path,
+    relative: &str,
+) -> std::result::Result<PathBuf, String> {
+    let relative = relative.replace('\\', "/");
+    if relative.is_empty() {
+        return Err("the module path is empty".to_string());
+    }
+    if relative.starts_with('/') || Path::new(&relative).is_absolute() || relative.contains(':') {
+        return Err(format!(
+            "`{relative}` is absolute; a module path is inside the plugin's package"
+        ));
+    }
+    let joined = normalize(Path::new(&relative));
+    if joined
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("`{relative}` resolves outside the plugin package"));
+    }
+
+    let candidate = root.join(&joined);
+    let Ok(real) = candidate.canonicalize() else {
+        return Err(format!("`{relative}` does not exist in the plugin package"));
+    };
+    let Ok(real_root) = root.canonicalize() else {
+        return Err("the plugin package directory is unreadable".to_string());
+    };
+    if !real.starts_with(&real_root) {
+        return Err(format!("`{relative}` resolves outside the plugin package"));
+    }
+    if !real.is_file() {
+        return Err(format!("`{relative}` is not a file"));
+    }
+    Ok(real)
+}
+
 /// Reads modules the [`PackageResolver`] approved, plus the builtin SDK.
 pub struct PackageLoader {
     root: PathBuf,

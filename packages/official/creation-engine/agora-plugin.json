@@ -1,0 +1,30 @@
+{
+  "manifest": 1,
+  "id": "agora.creation-engine",
+  "name": "Creation Engine",
+  "version": "0.1.0",
+  "description": "Shared rules for games built on Bethesda's Creation Engine.",
+  "license": "GPL-3.0-only",
+  "source": "https://github.com/agora-mc/Agora-Mod-Manager/tree/master/packages/official/creation-engine",
+  "apiRange": ">=0.1, <0.2",
+  "entrypoint": "main.js",
+  "withoutCode": "Sort, masterlist updates and the plugin list's checks won't work.",
+  "capabilities": {
+    "required": ["game:define", "game:read", "network", "crash:contribute"]
+  },
+  "network": {
+    "hosts": ["api.github.com"]
+  },
+  "contributions": {
+    "gamePackages": [
+      {
+        "path": "games/package.json"
+      }
+    ],
+    "crashPacks": [
+      {
+        "path": "crash/pack.json"
+      }
+    ]
+  }
+}

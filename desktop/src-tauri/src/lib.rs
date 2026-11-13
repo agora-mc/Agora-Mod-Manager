@@ -1,10 +1,11 @@
 pub mod auth;
 pub mod commands;
-pub mod crash_diagnostics;
 pub mod crash_export;
-pub mod crash_investigator;
 pub mod dependency_ops;
-pub use agora_core::{download, error, loader_manifests, models};
+pub mod downloads;
+pub mod games;
+pub use agora_core::{download, error, models};
+pub use agora_game_minecraft::loader_manifests;
 
 pub mod governance;
 pub mod instances;
@@ -13,13 +14,13 @@ pub mod mod_install;
 pub mod modrinth_raw;
 pub mod mojang;
 pub mod providers;
-pub use agora_core::override_sanitizer;
+pub use agora_game_minecraft::override_sanitizer;
 pub mod mcp;
 pub mod paths;
 pub mod plugins;
 pub mod registry;
 pub mod registry_sync;
-pub use agora_core::state;
+pub use agora_game_minecraft::state;
 pub mod technic;
 pub mod version_cache;
 
@@ -28,6 +29,16 @@ use tauri::Manager;
 
 /// Shared type alias for the managed core context.
 type ManagedCoreContext = std::sync::Arc<std::sync::Mutex<agora_core::ctx::CoreContext>>;
+
+/// The games this build supports. A refused compiled package is a build bug,
+/// not user input. Skyrim is not compiled in: it arrives through the installed
+/// official plugin.
+fn build_game_registry() -> agora_core::game_registry::GameRegistryBuilder {
+    let mut builder = agora_core::game_registry::GameRegistry::builder();
+    agora_game_minecraft::register_into(&mut builder)
+        .expect("build bug: the Minecraft package was refused");
+    builder
+}
 
 /// Return a clone of the initialized core context for adapter commands.
 pub fn core_context<R: tauri::Runtime>(
@@ -48,7 +59,9 @@ pub fn core_context<R: tauri::Runtime>(
             message: error.to_string(),
         }
     })?;
-    agora_core::ctx::CoreContext::initialize(paths).map(|(ctx, _)| plugins::with_events(app, ctx))
+    let games = build_game_registry();
+    agora_core::ctx::CoreContext::initialize(paths, games)
+        .map(|(ctx, _)| plugins::with_events(app, ctx))
 }
 
 /// Pull the instance id out of a `--launch <id>` / `--launch=<id>` argv.
@@ -113,6 +126,8 @@ fn watch_external_changes(app: tauri::AppHandle, locks_root: std::path::PathBuf)
 
 pub fn run() {
     agora_core::lock_manager::set_program_name("Agora app");
+    // Minecraft is a game package; register it with core before any context
+    // is built (idempotent, so the helper below may repeat it).
     // Log startup so the user can verify from the log file that they are
     // actually running the freshly-compiled binary (not a stale one). When
     // diagnosing OAuth issues, the absence of this line means the running
@@ -144,6 +159,7 @@ pub fn run() {
         .manage(LauncherState::default())
         .manage(mcp::McpServerManager::default())
         .manage(plugins::ManagedPlugins::default())
+        .manage(downloads::DownloadsWatcher::default())
         .manage(pending_cli_launch)
         .plugin(tauri_plugin_shell::init())
         // Deliberately no `tauri_plugin_sql` or `tauri_plugin_store`. Every
@@ -180,7 +196,9 @@ pub fn run() {
             }
         }))
         .invoke_handler(tauri::generate_handler![
-            plugins::plugins_enabled,
+            plugins::plugins_emergency_stop,
+            plugins::set_plugins_emergency_stop,
+            plugins::set_plugin_scripts_allowed,
             plugins::start_plugins,
             plugins::list_plugins,
             plugins::list_plugin_contributions,
@@ -189,6 +207,10 @@ pub fn run() {
             plugins::install_plugin_package,
             plugins::plugin_check_update,
             plugins::plugin_apply_update,
+            plugins::list_official_plugins,
+            plugins::install_official_plugin,
+            plugins::update_official_plugin,
+            plugins::rollback_official_plugin,
             plugins::plugin_surfaces,
             plugins::plugin_set_surface,
             plugins::restore_plugin_data,
@@ -314,6 +336,11 @@ pub fn run() {
             commands::list_snapshot_versions,
             commands::export_crash_report,
             commands::get_setting,
+            downloads::downloads_list,
+            downloads::downloads_scan,
+            downloads::downloads_ignore,
+            downloads::downloads_add,
+            downloads::downloads_default_folder,
             commands::set_setting,
             commands::evaluate_controlify_offer,
             commands::decline_controlify_offer,
@@ -324,12 +351,13 @@ pub fn run() {
             commands::github_logout,
             commands::get_auth_status,
             commands::get_github_profile,
-            commands::check_instance_crash,
-            commands::triage_crash_report,
-            commands::list_crash_reports_cmd,
-            commands::read_crash_log_cmd,
+            games::crash_answers::get_crash_answer,
+            games::crash_answers::list_crash_answers,
+            games::crash_answers::analyze_crash_text,
+            games::crash_answers::analyze_crash_file,
+            games::crash_answers::read_crash_artifact,
+            games::crash_answers::reveal_crash_artifact,
             commands::investigate_instance_evidence,
-            commands::pick_and_investigate_crash_evidence,
             commands::list_mod_versions,
             commands::list_mod_versions_load_more,
             commands::check_mod_compat,
@@ -368,12 +396,16 @@ pub fn run() {
             commands::run_governance_diagnostics,
             commands::list_instance_content,
             commands::enrich_instance_content,
+            commands::get_content_sharing,
+            commands::preview_content_sharing_conversion,
+            commands::set_content_sharing,
             commands::investigate_crash,
-            commands::investigate_manual,
+            commands::resolve_crash_suspect_file,
             commands::disable_mod_for_test,
             commands::enable_mod_for_test,
             commands::disable_instance_mod,
             commands::enable_instance_mod,
+            commands::minecraft_add_stored_content,
             commands::set_datapack_worlds,
             commands::sync_instance_datapacks,
             commands::list_instance_worlds,
@@ -469,6 +501,92 @@ pub fn run() {
             commands::reveal_path,
             commands::restart_app,
             commands::open_external_url,
+            games::discovery::games_list,
+            games::icons::games_icon,
+            games::instance_icons::games_instance_set_icon,
+            games::instance_icons::games_instance_icon,
+            games::discovery::games_discover,
+            games::discovery::games_add_folder,
+            games::discovery::games_remove_folder,
+            games::bases::games_base_list,
+            games::bases::games_base_build,
+            games::bases::games_base_verify,
+            games::bases::games_base_remove,
+            games::instances::games_instance_list,
+            games::instances::games_instance_get,
+            games::instances::games_instance_create,
+            games::instances::games_instance_delete,
+            games::instances::games_instance_rename,
+            games::instances::games_instance_clone,
+            games::instances::games_instance_stop,
+            games::instances::games_instance_deleted_list,
+            games::instances::games_instance_restore_deleted,
+            games::instances::games_instance_purge_deleted,
+            games::instances::games_instance_check,
+            games::instances::games_instance_set_deployment,
+            games::instances::games_instance_launch,
+            games::content::games_content_list,
+            games::content::games_content_add,
+            games::content::games_content_verify,
+            games::content::games_content_remove,
+            games::content::games_instance_content_list,
+            games::content::games_instance_content_add,
+            games::content::games_instance_content_remove,
+            games::content::games_instance_content_set_enabled,
+            games::content::games_instance_content_move,
+            games::library::games_library_list,
+            games::library::games_library_fill_details,
+            games::library::games_library_unused,
+            games::library::games_library_instances,
+            games::library::games_library_icon,
+            games::library::games_library_cache_icon,
+            games::fomod::games_fomod_show,
+            games::fomod::games_fomod_install,
+            games::plugins::games_plugins_lists,
+            games::plugins::games_plugins_list,
+            games::plugins::games_plugins_sorter_notes,
+            games::plugins::games_plugins_set_active,
+            games::plugins::games_plugins_set_locked,
+            games::plugins::games_plugins_move,
+            games::plugins::games_plugins_sort,
+            games::plugins::games_plugins_update_masterlist,
+            games::plugins::games_plugins_check,
+            games::ini_saves::games_ini_get,
+            games::ini_saves::games_ini_set,
+            games::ini_saves::games_mod_inis_list,
+            games::ini_saves::games_mod_ini_get,
+            games::ini_saves::games_mod_ini_set,
+            games::ini_saves::games_mod_ini_reset,
+            games::ini_saves::games_mod_ini_keep_game_version,
+            games::ini_saves::games_mod_ini_restore_mine,
+            games::ini_saves::games_saves_get,
+            games::ini_saves::games_saves_set,
+            games::tools::games_tools_list,
+            games::tools::games_tools_save_inputs,
+            games::tools::games_tools_run,
+            games::tools::games_tools_rollback,
+            games::tools::games_tools_remove,
+            games::tools::games_tools_diff,
+            games::tools::games_tools_swap_costs,
+            games::tools::games_tools_swap_status,
+            games::tools::games_tools_swap_restore,
+            games::tools::games_user_tools_list,
+            games::tools::games_user_tools_add,
+            games::tools::games_user_tools_remove,
+            games::tools::games_user_tools_find,
+            games::tools::games_user_tools_run,
+            games::tools::games_user_tools_outputs,
+            games::tools::games_user_tools_use_output,
+            games::tools::games_tools_outputs,
+            games::tools::games_tools_use_output,
+            games::import::games_import_mo2_scan,
+            games::import::games_import_mo2,
+            games::catalog::games_catalog_list,
+            games::catalog::games_catalog_install,
+            games::user_files::games_user_files_status,
+            games::user_files::games_user_files_restore,
+            games::support::games_support_list,
+            games::support::games_support_set_enabled,
         ])
         .setup(|app| {
             #[cfg(target_os = "windows")]
@@ -491,7 +609,7 @@ pub fn run() {
             // Keep one clone for startup maintenance after the managed state is
             // installed; maintenance is optional and must never delay setup.
             let startup_maintenance_ctx = match crate::paths::app_paths(app.handle()) {
-                Ok(paths) => match agora_core::ctx::CoreContext::initialize(paths) {
+                Ok(paths) => match agora_core::ctx::CoreContext::initialize(paths, build_game_registry()) {
                     Ok((ctx, warnings)) => {
                         for w in &warnings {
                             eprintln!("[core] {w}");
@@ -501,7 +619,17 @@ pub fn run() {
                             app.handle().clone(),
                             ctx.lock_manager.locks_root().to_path_buf(),
                         );
+                        let downloads_ctx = ctx.clone();
                         app.manage(ManagedCoreContext::new(std::sync::Mutex::new(ctx)));
+                        let watcher = app
+                            .state::<downloads::DownloadsWatcher>()
+                            .inner()
+                            .clone();
+                        downloads::watch_downloads(
+                            app.handle().clone(),
+                            downloads_ctx,
+                            watcher,
+                        );
                         Some(maintenance_ctx)
                     }
                     Err(e) => {
@@ -531,7 +659,7 @@ pub fn run() {
                     // Prewarm remains bounded and launch never depends on it (maintenance.rs:1).
                     let prewarm_ctx = ctx.clone();
                     tauri::async_runtime::spawn(async move {
-                        match agora_core::maintenance::prewarm_recent_instances(prewarm_ctx).await {
+                        match agora_game_minecraft::maintenance::prewarm_recent_instances(prewarm_ctx).await {
                             Ok(summary) if summary.warmed > 0 => eprintln!(
                                 "[core] warmed {} recent instance cache(s) ({} skipped, {} failed)",
                                 summary.warmed, summary.skipped, summary.failed
@@ -542,13 +670,16 @@ pub fn run() {
                             }
                         }
                     });
-                    // Recently deleted: entries past 30 days (or over the size
-                    // budget) go to the OS trash; failures leave them in place.
+                    // Recently deleted: entries past the player's window (the
+                    // setting every game shares) or over the size budget go to
+                    // the OS trash; failures leave them in place.
                     let cleanup_ctx = ctx.clone();
                     tauri::async_runtime::spawn(async move {
-                        match agora_core::maintenance::cleanup_recently_deleted(
+                        let days = agora_core::game_instance::trash::retention_days(&cleanup_ctx);
+                        match agora_game_minecraft::maintenance::cleanup_recently_deleted(
                             cleanup_ctx,
                             crate::instances::trash_adapter(),
+                            days,
                         )
                         .await
                         {
@@ -568,7 +699,7 @@ pub fn run() {
                     // NetworkPolicy (network.rs), never errors.
                     let sweep_ctx = ctx.clone();
                     tauri::async_runtime::spawn(async move {
-                        match agora_core::update_cache::sweep_all_updates(sweep_ctx).await {
+                        match agora_game_minecraft::update_cache::sweep_all_updates(sweep_ctx).await {
                             Ok(summary) if summary.updated > 0 => eprintln!(
                                 "[core] update sweep refreshed {} instance(s) ({} skipped, {} failed, offline={})",
                                 summary.updated, summary.skipped, summary.failed, summary.offline_skipped
@@ -583,26 +714,6 @@ pub fn run() {
                         }
                     });
                 }
-                let purge_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Some(core_state) = purge_handle.try_state::<ManagedCoreContext>() {
-                            match core_state.lock() {
-                                Ok(ctx) => {
-                                    let svc =
-                                        agora_core::crash_service::CrashService::new(ctx.clone());
-                                    if let Err(e) = svc.purge_stale_telemetry() {
-                                        eprintln!("Failed to purge stale crash telemetry: {e}",);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Core context lock failed: {e}");
-                                }
-                            }
-                        }
-                    })
-                    .await;
-                });
                 // Start MCP server if enabled.
                 if let Some(core_state) = handle.try_state::<ManagedCoreContext>() {
                     match core_state.lock() {
@@ -652,4 +763,21 @@ pub fn run() {
         })
         .run(context)
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use agora_game_api::GameId;
+
+    /// Skyrim ships as an official plugin, so a build that registers it at
+    /// startup would be the old compiled package sneaking back in.
+    #[test]
+    fn the_shipped_registry_does_not_compile_in_skyrim() {
+        let registry = super::build_game_registry().build();
+        assert!(registry.game(&GameId::minecraft()).is_some());
+        assert!(
+            registry.game(&GameId::new("skyrim-se").unwrap()).is_none(),
+            "Skyrim must come from the official plugin, not the compiled registry"
+        );
+    }
 }

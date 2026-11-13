@@ -1,6 +1,6 @@
 //! Builds a shareable crash report.
 //!
-//! Agora diagnoses crashes locally (see `crash_investigator`). When the local
+//! Agora diagnoses crashes locally through the crash engine. When the local
 //! signals aren't enough, the user takes the evidence somewhere better — an AI
 //! assistant of their choosing, or the community Discord. This module assembles
 //! that evidence into one self-contained, redacted markdown document.
@@ -16,7 +16,8 @@ use serde::Serialize;
 pub struct CrashReportContext {
     pub instance_id: Option<String>,
     pub crash_log: Option<String>,
-    pub crash_signatures: Option<String>,
+    /// The rendered crash answer, shown after the log so a reader sees Agora's own conclusion.
+    pub answer: Option<String>,
     pub suspects: Option<String>,
 }
 
@@ -123,10 +124,10 @@ pub fn build_crash_report(
         ));
     }
 
-    if let Some(ref crash_signatures) = context.crash_signatures {
+    if let Some(ref answer) = context.answer {
         parts.push(format!(
-            "## Crash Signatures Matched\n\n{}",
-            crate::log_sanitizer::sanitize_log_lines(crash_signatures)
+            "## Agora's Crash Answer\n\n{}",
+            crate::log_sanitizer::sanitize_log_lines(answer)
         ));
     }
 
@@ -193,7 +194,7 @@ mod tests {
         CrashReportContext {
             instance_id: Some("inst-1".into()),
             crash_log: None,
-            crash_signatures: None,
+            answer: None,
             suspects: None,
         }
     }
@@ -222,7 +223,7 @@ mod tests {
         assert!(report.contains("examplemod.jar"));
         assert!(report.trim_end().ends_with("would help."));
         // Sections the context didn't supply are omitted, not left blank.
-        assert!(!report.contains("## Crash Signatures Matched"));
+        assert!(!report.contains("## Agora's Crash Answer"));
     }
 
     /// The report is read by people and models with no idea what Agora is, so

@@ -208,7 +208,7 @@ test.describe('Inline setting errors (B3)', () => {
     // Toggle launch mode to trigger a save that will fail
     const launchModeSection = page.locator('#settings-launching');
     // The checkbox reflects the current state; clicking should toggle and trigger save
-    await launchModeSection.getByRole('checkbox').click();
+    await launchModeSection.getByRole('switch').click();
 
     // The inline error should appear in the Launch Mode section
     await expect(

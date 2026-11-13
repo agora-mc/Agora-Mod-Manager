@@ -382,6 +382,11 @@ export interface InstalledMod {
   source_url?: string | null;
   version: string | null;
   sha256: string;
+  /**
+   * False when the source published no checksum, so Agora could not verify
+   * this file. Absent on records from before the field existed (those are true).
+   */
+  hash_verified?: boolean;
   installed_at: string;
   mod_jar_id?: string | null;
   enabled: boolean;
@@ -391,6 +396,10 @@ export interface InstalledMod {
   update_pinned?: boolean;
   /** True when Agora installed this only to satisfy another mod's dependency. */
   installed_as_dependency?: boolean;
+  /** The shared content store item this file was placed from. */
+  content_item_id?: string | null;
+  /** The SHA-256 of the stored object the file was placed from. */
+  object_sha256?: string | null;
 }
 
 export interface InstanceManifest {
@@ -451,6 +460,8 @@ export interface InstalledContentRow {
   loader_mod_id: string | null;
   size_bytes: number | null;
   file_present: boolean;
+  /** How the file compares with its manifest entry, or that Agora did not install it. */
+  file_state: 'ok' | 'missing' | 'modified' | 'unreadable' | 'untracked';
   resolved_path: string | null;
   author: string | null;
   categories: string[];
@@ -499,6 +510,15 @@ export interface LoaderVersionSummary {
 export interface DownloadSource {
   strategy: string;
   identifier: string;
+  /** Curator pins for exact release files of a github_release source. */
+  pins?: SourcePin[];
+}
+
+/** A curator's expected SHA-256 for one release file (`github_release` only). */
+export interface SourcePin {
+  tag: string;
+  asset: string;
+  sha256: string;
 }
 
 export interface RegistryItem {
@@ -509,7 +529,8 @@ export interface RegistryItem {
   /// prefer `downloadSourcesOf(item)` when the fallbacks matter.
   download_strategy: string;
   source_identifier: string;
-  sha256: string;
+  /** The manifest's sha256 when the entry states one; null otherwise. */
+  sha256: string | null;
   upvotes: number;
   downvotes: number;
   net_score: number;
@@ -700,6 +721,47 @@ export const listInstanceContent = (instanceId: string, contentType?: string) =>
   });
 export const enrichInstanceContent = (instanceId: string) =>
   invoke<InstalledContentMetadata[]>('enrich_instance_content', { instanceId });
+
+/** How Minecraft content files are placed: shared hard links, or an owned copy per instance. */
+export type ContentPlacementMode = 'link' | 'copy';
+
+export interface ContentConversionSkip {
+  path: string;
+  reason: 'missing' | 'changed' | 'unsupported' | 'moved_aside';
+  movedTo?: string;
+}
+
+export interface ContentConversionSummary {
+  filesConverted: number;
+  filesAlready: number;
+  /** Space freed when turning sharing on, or additionally used when turning it off. */
+  bytes: number;
+  skipped: ContentConversionSkip[];
+}
+
+export interface ContentConversionPreview {
+  instances: number;
+  summary: ContentConversionSummary;
+  warnings: string[];
+}
+
+export interface ContentConversionFailure {
+  instanceId: string;
+  message: string;
+}
+
+export interface ContentConversionReport {
+  instances: number;
+  summary: ContentConversionSummary;
+  failures: ContentConversionFailure[];
+  warnings: string[];
+}
+
+export const getContentSharing = () => invoke<ContentPlacementMode>('get_content_sharing');
+export const previewContentSharingConversion = (share: boolean) =>
+  invoke<ContentConversionPreview>('preview_content_sharing_conversion', { share });
+export const setContentSharing = (share: boolean, convert: boolean) =>
+  invoke<ContentConversionReport | null>('set_content_sharing', { share, convert });
 export const createInstance = (request: CreateInstanceRequest) =>
   invoke<InstanceRow>('create_instance', { request });
 export const deleteInstance = (instanceId: string) =>
@@ -1261,19 +1323,6 @@ export const getAuthStatus = () => invoke<boolean>('get_auth_status');
 export const getGithubProfile = () =>
   invoke<GithubProfile | null>('get_github_profile');
 
-export interface CrashReportInfo {
-  filename: string;
-  modified_at: string;
-  size_bytes: number;
-}
-
-export interface CrashTriageResult {
-  matched: boolean;
-  signature_name: string | null;
-  solution_markdown: string | null;
-  action_button_json: string | null;
-}
-
 export type EvidenceSourceKind =
   | 'CrashReport'
   | 'LatestLog'
@@ -1306,24 +1355,12 @@ export interface CrashInvestigation {
     any_stale: boolean;
     failure_category: 'CrashReport' | 'Oom' | 'JvmFatal' | 'NoEvidence';
   };
-  fingerprint: CrashFingerprint | null;
-  triage: CrashTriageResult;
   suspects: SuspectScore[];
   failure_category: 'CrashReport' | 'Oom' | 'JvmFatal' | 'NoEvidence';
 }
 
-export const checkInstanceCrash = (instanceId: string) =>
-  invoke<CrashReportInfo | null>('check_instance_crash', { instanceId });
-export const triageCrashReport = (instanceId: string, filename: string) =>
-  invoke<CrashTriageResult>('triage_crash_report', { instanceId, filename });
-export const listCrashReports = (instanceId: string) =>
-  invoke<CrashReportInfo[]>('list_crash_reports_cmd', { instanceId });
-export const readCrashLog = (instanceId: string, filename: string) =>
-  invoke<string>('read_crash_log_cmd', { instanceId, filename });
 export const investigateInstanceEvidence = (instanceId: string) =>
   invoke<CrashInvestigation>('investigate_instance_evidence', { instanceId });
-export const pickAndInvestigateCrashEvidence = (instanceId: string) =>
-  invoke<CrashInvestigation | null>('pick_and_investigate_crash_evidence', { instanceId });
 
 export interface ModVersionCandidate {
   version: string;
@@ -1366,6 +1403,9 @@ export const disableInstanceMod = (instanceId: string, filename: string) =>
   invoke<void>('disable_instance_mod', { instanceId, filename });
 export const enableInstanceMod = (instanceId: string, filename: string) =>
   invoke<void>('enable_instance_mod', { instanceId, filename });
+/** Add an item already in the shared content store to an instance, with no network. */
+export const minecraftAddStoredContent = (instanceId: string, itemId: string) =>
+  invoke<InstalledMod>('minecraft_add_stored_content', { instanceId, itemId });
 
 /** Choose which worlds a data pack goes to (`null` = all worlds) and sync now. */
 export const setDatapackWorlds = (instanceId: string, filename: string, worlds: string[] | null) =>
@@ -1657,13 +1697,17 @@ export interface AgoraPackEntry {
 }
 
 export type PackEntryStatus = 'installed' | 'failed' | 'needs_action';
-export type PackNeedsAction = 'enable_modrinth' | 'open_settings';
+export type PackNeedsAction = 'enable_modrinth' | 'open_settings' | 'confirm_hash';
 
 /** How one pack entry ended. Every entry gets exactly one. */
 export interface PackEntryOutcome {
   name: string;
   status: PackEntryStatus;
-  /** Installed only: the bytes matched the SHA-256 the pack pinned. */
+  /**
+   * Installed only: the bytes matched the SHA-256 the pack pinned. This is the
+   * pack vouching, not the source: when the source published no checksum the
+   * `reason` says the modpack's hash was the only check.
+   */
   verified_against_pack: boolean;
   /** Why it failed or what it needs; for an unverified install, the caveat. */
   reason: string | null;
@@ -1687,6 +1731,8 @@ export interface PackImportReport {
 export interface PackImportOutcome {
   instance_id: string;
   report: PackImportReport | null;
+  /** Non-fatal notes from the import itself. The import still succeeded. */
+  warnings: string[];
 }
 
 /** The instance block of an Agora pack file. */
@@ -1753,13 +1799,27 @@ export const importInstancePack = (
   reviewedSha256?: string | null,
   name?: string | null,
   skipUnfetchable = false,
+  installAnyway = false,
 ) =>
   invoke<PackImportOutcome>('import_instance_pack', {
     sourcePath,
     reviewedSha256: reviewedSha256 ?? null,
     name: name ?? null,
     skipUnfetchable,
+    installAnyway,
   });
+
+/** The code of the error a .mrpack import stops with when files fail the hashes the pack lists. */
+export const PACK_HASH_STOP_CODE = 'ERR_IMPORT_HASH_CONFIRMATION';
+
+/** The `code` of a Tauri error, when it has one. */
+export function errorCode(e: unknown): string | null {
+  if (e && typeof e === 'object') {
+    const code = (e as Record<string, unknown>).code;
+    if (typeof code === 'string') return code;
+  }
+  return null;
+}
 /** Drop the copy a .mrpack review staged (the review was cancelled). */
 export const discardPackReview = (sha256: string) =>
   invoke<void>('discard_pack_review', { sha256 });
@@ -1769,13 +1829,16 @@ export const planPackImport = (sourcePath: string) =>
 /**
  * Try needs-action entries again on the instance the import created.
  * `allowModrinthOnce` lets these entries use Modrinth without turning the
- * Modrinth setting on.
+ * Modrinth setting on. `installAnyway` installs the entries although they
+ * differ from the hash the modpack lists; only pass it for entries the user was
+ * shown a `confirm_hash` stop for. A hash the source published still applies.
  */
 export const retryPackImportEntries = (
   instanceId: string,
   entries: AgoraPackEntry[],
   allowModrinthOnce: boolean,
-) => invoke<PackImportReport>('retry_pack_import_entries', { instanceId, entries, allowModrinthOnce });
+  installAnyway: boolean,
+) => invoke<PackImportReport>('retry_pack_import_entries', { instanceId, entries, allowModrinthOnce, installAnyway });
 export const importModrinthPackByUrl = (downloadUrl: string, packIconUrl?: string | null) =>
   invoke<string>('import_modrinth_pack_by_url', {
     downloadUrl,
@@ -2070,11 +2133,6 @@ export const listModReviews = (itemId: string) =>
 
 // --- Crash Investigation (guided isolation) ---
 
-export interface CrashFingerprint {
-  exception_class: string;
-  top_frames: string[];
-}
-
 export interface SuspectScore {
   mod_id: string;
   filename: string;
@@ -2087,22 +2145,16 @@ export interface SuspectScore {
 
 export type SuggestedAction =
   | { kind: 'GuidedDisable'; next_suspect: SuspectScore }
-  | { kind: 'ConfidenceAutoDisable'; mod_id: string; filename: string }
   | { kind: 'NoSuspects' };
 
 export interface InvestigationResult {
-  fingerprint: CrashFingerprint | null;
-  signature_name: string | null;
   suspects: SuspectScore[];
   suggested_action: SuggestedAction;
   ruled_out: string[];
 }
 
-export const investigateCrash = (instanceId: string, filename?: string) =>
-  invoke<InvestigationResult>('investigate_crash', { instanceId, filename });
-
-export const investigateManual = (instanceId: string, logText: string) =>
-  invoke<InvestigationResult>('investigate_manual', { instanceId, logText });
+export const investigateCrash = (instanceId: string) =>
+  invoke<InvestigationResult>('investigate_crash', { instanceId });
 
 export const disableModForTest = (instanceId: string, filename: string) =>
   invoke<void>('disable_mod_for_test', { instanceId, filename });
@@ -2110,21 +2162,20 @@ export const disableModForTest = (instanceId: string, filename: string) =>
 export const enableModForTest = (instanceId: string, filename: string) =>
   invoke<void>('enable_mod_for_test', { instanceId, filename });
 
-export const confirmCrashFix = (fingerprint: CrashFingerprint, modId: string) =>
-  invoke<void>('confirm_crash_fix', { fingerprint, modId });
+/** Record the user's confirmed fix under the crash bucket, so a later diagnosis of the same
+ * bucket gets boost-only local-memory evidence. */
+export const confirmCrashFix = (bucket: string, ownerKey: string) =>
+  invoke<void>('confirm_crash_fix', { bucket, ownerKey });
 
-export const reportStillCrashing = (
-  instanceId: string,
-  fingerprint: CrashFingerprint,
-  ruledOutModId: string,
-  crashLogText: string,
-) =>
+export const reportStillCrashing = (instanceId: string, ruledOutOwnerKey: string) =>
   invoke<InvestigationResult>('report_still_crashing', {
     instanceId,
-    fingerprint,
-    ruledOutModId,
-    crashLogText,
+    ruledOutOwnerKey,
   });
+
+/** The file an engine suspect provides, so the experiment flow can disable it. */
+export const resolveCrashSuspectFile = (instanceId: string, ownerKey: string) =>
+  invoke<string>('resolve_crash_suspect_file', { instanceId, ownerKey });
 
 // --- Dependency Plans (PREVIEW) ---
 
@@ -2262,7 +2313,8 @@ export const regenerateMCPToken = () => invoke<McpTokenData>('regenerate_mcp_tok
 export interface CrashReportContext {
   instance_id: string | null;
   crash_log: string | null;
-  crash_signatures: string | null;
+  /** The engine answer, rendered as text. */
+  answer: string | null;
   suspects: string | null;
 }
 

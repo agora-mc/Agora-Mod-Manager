@@ -1,0 +1,1040 @@
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use agora_core::ctx::CoreContext;
+use agora_core::game_base::{
+    build_base, remove_base, BaseError, BaseMode, BuildOptions, BuildOutcome,
+};
+use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
+use agora_core::game_instance::{
+    create, delete, delete_permanently, delete_with_options, get, get_manifest,
+    prepare_launch_with, prepare_launch_with_discovery, record_launch, DeleteOptions,
+    GameInstanceManifest, InstanceError,
+};
+use agora_core::game_launch::LaunchError;
+use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
+use agora_core::game_user_files::Journal;
+use agora_core::process_identity;
+use agora_game_api::{
+    BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePath, InstallId, InstallKind,
+    LaunchRecipe, LaunchValue, RelPath, RuntimeIdentity, StoreId, StoreIdentifier,
+};
+use agora_plugin_api::host::GameReads;
+use tempfile::TempDir;
+
+fn make_test_definition() -> GameDefinition {
+    GameDefinition {
+        mo2_game_name: None,
+        session: Default::default(),
+        id: GameId::new("skyrim-se").unwrap(),
+        extends: None,
+        name: "Skyrim Special Edition".into(),
+        stores: vec![
+            StoreIdentifier {
+                store: StoreId::new("steam").unwrap(),
+                product: "489830".into(),
+            },
+            StoreIdentifier {
+                store: StoreId::new("microsoft-store").unwrap(),
+                product: "BethesdaSoftworks.SkyrimSE-PC".into(),
+            },
+        ],
+        version_sources: vec![],
+        deployment: DeploymentStrategy::VirtualFileSystem,
+        content_rules: vec![],
+        framework_ids: vec![],
+        tool_ids: vec![],
+        launch: Some(LaunchRecipe {
+            executable: GamePath::Runtime {
+                path: RelPath::new("Game.exe").unwrap(),
+            },
+            arguments: vec![LaunchValue::Literal {
+                value: "-test".into(),
+            }],
+            environment: Default::default(),
+            working_directory: GamePath::Runtime {
+                path: RelPath::default(),
+            },
+        }),
+        log_paths: vec![],
+        crash_paths: vec![],
+        user_files: vec![],
+        save_paths: vec![],
+        linked_archive_patterns: vec!["Data/*.bsa".into()],
+        declared_writes: vec![],
+        excluded_paths: vec![],
+        load_orders: Vec::new(),
+        runtime_files: Vec::new(),
+        save_location: Vec::new(),
+        launch_alternatives: Vec::new(),
+        content_layout: None,
+        copy_patterns: Vec::new(),
+    }
+}
+
+fn setup_fake_install(dir: &Path) {
+    std::fs::write(dir.join("Game.exe"), b"fake game binary contents").unwrap();
+    let data_dir = dir.join("Data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join("Skyrim.bsa"), b"BSA ARCHIVE DATA 1234567890").unwrap();
+}
+
+fn make_test_install(
+    install_dir: &Path,
+    store: &str,
+    product: &str,
+    readable: bool,
+    relocatable: bool,
+) -> IdentifiedInstall {
+    let store_id = StoreId::new(store).unwrap();
+    let runtime = RuntimeIdentity {
+        game: GameId::new("skyrim-se").unwrap(),
+        store: store_id.clone(),
+        version: "1.6.1170.0".into(),
+        build: None,
+    };
+    let detector = agora_core::game_discovery::volume::VolumeDetector::new();
+    let volume = detector.get_volume_info(install_dir);
+    let install_id = InstallId::new(format!("{store}:{product}")).unwrap();
+    let discovered = DiscoveredInstall {
+        store: store_id,
+        product: product.into(),
+        name: "Skyrim Special Edition".into(),
+        kind: InstallKind::BaseGame,
+        parent_product: None,
+        location: install_dir.to_path_buf(),
+        store_version: Some(runtime.version.clone()),
+        store_build: runtime.build.clone(),
+        executables: vec!["Game.exe".into()],
+        capabilities: InstallCapabilities {
+            executables_readable: readable,
+            accepts_new_files: true,
+            relocatable,
+        },
+        volume,
+    };
+    IdentifiedInstall {
+        game: runtime.game.clone(),
+        install_id,
+        discovered,
+        add_ons: vec![],
+        runtime: RuntimeResolution::Identified {
+            runtime,
+            source: "executable".into(),
+        },
+    }
+}
+
+#[test]
+fn two_instances_from_one_install_one_base_built_once() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+
+    // Instance 1
+    let rec1 = create(
+        &ctx,
+        &install,
+        &def,
+        "Playthrough 1",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    assert!(matches!(
+        rec1.build_outcome,
+        Some(BuildOutcome::Built { .. })
+    ));
+    let base_id1 = match &rec1.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        _ => panic!("expected pinned base"),
+    };
+
+    // Instance 2 from the same install
+    let rec2 = create(
+        &ctx,
+        &install,
+        &def,
+        "Playthrough 2",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    assert!(matches!(
+        rec2.build_outcome,
+        Some(BuildOutcome::Existing(_))
+    ));
+    let base_id2 = match &rec2.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        _ => panic!("expected pinned base"),
+    };
+
+    // Both pin the same base
+    assert_eq!(base_id1, base_id2);
+
+    // IDs are unique and valid
+    assert_ne!(rec1.instance_id, rec2.instance_id);
+    assert!(ctx.paths.instance_dir(&rec1.instance_id).is_ok());
+    assert!(ctx.paths.instance_dir(&rec2.instance_id).is_ok());
+
+    // Manifests round-trip correctly
+    let m1: GameInstanceManifest = get_manifest(&ctx, &rec1.instance_id).unwrap();
+    assert_eq!(m1.instance_id, rec1.instance_id);
+    assert_eq!(m1.name, "Playthrough 1");
+    assert_eq!(m1.manifest_version, 3);
+    assert_eq!(m1.base, rec1.base);
+
+    let m2: GameInstanceManifest = get_manifest(&ctx, &rec2.instance_id).unwrap();
+    assert_eq!(m2.instance_id, rec2.instance_id);
+    assert_eq!(m2.name, "Playthrough 2");
+    assert_eq!(m2.manifest_version, 3);
+    assert_eq!(m2.base, rec2.base);
+}
+
+#[test]
+fn unpinned_install_creates_unpinned_instance_with_reason_and_launch_never_verifies() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("ms_store_install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = make_test_definition();
+    let install = make_test_install(
+        &install_dir,
+        "microsoft-store",
+        "bethesda-softworks-skyrim-se-pc",
+        false, // executables not readable
+        true,
+    );
+
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Store Skyrim",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let reason_str = match &rec.base {
+        BaseReference::Unpinned { reason, .. } => reason.clone(),
+        _ => panic!("expected unpinned base"),
+    };
+    assert!(
+        reason_str.contains("executables are not readable"),
+        "reason should explain missing capability: {reason_str}"
+    );
+
+    // Launch resolves against the install folder and never verifies
+    let report = DiscoveryReport {
+        installs: vec![install.discovered.clone()],
+        warnings: vec![],
+    };
+    let prepared =
+        prepare_launch_with_discovery(&ctx, &rec.instance_id, &def, false, &|| report.clone())
+            .unwrap();
+
+    assert_eq!(prepared.resolved.program, install_dir.join("Game.exe"));
+    assert_eq!(prepared.resolved.cwd, install_dir);
+    assert!(prepared.warnings.is_empty());
+}
+
+#[test]
+fn remove_base_refuses_pinned_base_naming_instances_and_succeeds_after_both_deleted() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+
+    let rec1 = create(
+        &ctx,
+        &install,
+        &def,
+        "First",
+        Some("skyrim-first".into()),
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let rec2 = create(
+        &ctx,
+        &install,
+        &def,
+        "Second",
+        Some("skyrim-second".into()),
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let base_id = match &rec1.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        _ => panic!("expected pinned base"),
+    };
+
+    // remove_base refuses naming both instances
+    match remove_base(&ctx.paths, &base_id) {
+        Err(BaseError::InUse { instances }) => {
+            assert!(instances.contains(&rec1.instance_id));
+            assert!(instances.contains(&rec2.instance_id));
+        }
+        other => panic!("expected BaseError::InUse, got: {other:?}"),
+    }
+
+    // Delete first instance (for good, so the base is really unused)
+    let outcome1 = delete_permanently(&ctx, &rec1.instance_id).unwrap();
+    assert_eq!(outcome1.orphaned_base, None);
+
+    // remove_base still refuses naming the second instance
+    match remove_base(&ctx.paths, &base_id) {
+        Err(BaseError::InUse { instances }) => {
+            assert_eq!(instances, vec![rec2.instance_id.clone()]);
+        }
+        other => panic!("expected BaseError::InUse naming second, got: {other:?}"),
+    }
+
+    // Delete second instance
+    let outcome2 = delete_permanently(&ctx, &rec2.instance_id).unwrap();
+    assert_eq!(outcome2.orphaned_base, Some(base_id.clone()));
+
+    // Now remove_base succeeds!
+    assert!(remove_base(&ctx.paths, &base_id).is_ok());
+    assert!(!ctx.paths.base_manifest_path(&base_id).exists());
+}
+
+#[test]
+fn delete_refuses_id_that_only_exists_in_user_instances_and_leaves_folder_alone() {
+    let tmp = TempDir::new().unwrap();
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO user_instances (instance_id, name, minecraft_version, loader, loader_version)
+         VALUES ('mc-vanilla', 'Vanilla MC', '1.21', 'vanilla', '')",
+        [],
+    )
+    .unwrap();
+
+    let mc_dir = ctx.paths.instance_dir("mc-vanilla").unwrap();
+    std::fs::create_dir_all(&mc_dir).unwrap();
+    let marker_file = mc_dir.join("marker.txt");
+    std::fs::write(&marker_file, b"important minecraft data").unwrap();
+
+    // delete through game_instance should refuse
+    let err = delete(&ctx, "mc-vanilla").unwrap_err();
+    assert!(matches!(err, InstanceError::MinecraftInstance(_)));
+
+    // Folder and marker file remain intact
+    assert!(mc_dir.exists());
+    assert!(marker_file.exists());
+}
+
+#[test]
+fn deleting_an_instance_with_an_unreadable_base_record_needs_the_force_answer() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Broken base",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let BaseReference::Pinned { id: base_id, .. } = &rec.base else {
+        panic!("the instance is pinned");
+    };
+    let base_manifest_path = ctx.paths.base_manifest_path(base_id);
+    let base_record = std::fs::read(&base_manifest_path).unwrap();
+    let base: serde_json::Value = serde_json::from_slice(&base_record).unwrap();
+    let base_folder = PathBuf::from(base["location"].as_str().unwrap());
+    // The farm the instance deployed, which the unreadable record can no longer locate.
+    let deployment = base_folder
+        .parent()
+        .unwrap()
+        .join("deployments")
+        .join(&rec.instance_id);
+    std::fs::create_dir_all(deployment.join("game")).unwrap();
+    std::fs::write(deployment.join("game").join("save.txt"), b"the game's save").unwrap();
+    std::fs::write(deployment.join("deployment.json"), b"{}").unwrap();
+    std::fs::write(&base_manifest_path, b"not a base record").unwrap();
+
+    // Without the answer, the unreadable record blocks the delete and nothing moves.
+    let refused = delete(&ctx, &rec.instance_id).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            InstanceError::Deploy(agora_core::game_deploy::DeployError::UnreadableBaseManifest(_))
+        ),
+        "unexpected delete error: {refused:?}"
+    );
+    assert!(ctx.paths.instance_dir(&rec.instance_id).unwrap().exists());
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+    assert!(deployment.join("game").join("save.txt").exists());
+
+    let outcome = delete_with_options(
+        &ctx,
+        &rec.instance_id,
+        DeleteOptions {
+            force_unreadable_base: true,
+            recoverable: true,
+        },
+    )
+    .unwrap();
+
+    let left = outcome
+        .left_in_place
+        .expect("the folder it left in place is not named");
+    assert!(
+        !deployment.exists(),
+        "the farm is still reachable by the old id"
+    );
+    assert_eq!(
+        left.parent().and_then(|p| p.file_name()),
+        Some(std::ffi::OsStr::new("orphaned-deployments")),
+        "the kept farm is not in an Agora-owned orphaned folder: {}",
+        left.display()
+    );
+    assert!(
+        left.join("game").join("save.txt").exists(),
+        "a farm Agora could not prove was its own was deleted"
+    );
+    assert!(!ctx.paths.instance_dir(&rec.instance_id).unwrap().exists());
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_none());
+    assert!(base_folder.exists(), "the base folder was deleted");
+
+    // A new instance with the same id must not inherit the farm that was left behind.
+    std::fs::write(&base_manifest_path, &base_record).unwrap();
+    create(
+        &ctx,
+        &install,
+        &def,
+        "Again",
+        Some(rec.instance_id.clone()),
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("the id is free again");
+    assert!(
+        agora_core::game_deploy::deployment_dir(&ctx, &rec.instance_id)
+            .unwrap()
+            .is_none(),
+        "the new instance inherited the old farm"
+    );
+}
+
+#[test]
+fn delete_refuses_while_the_instances_session_is_starting_or_running() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Busy",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let journal_path = ctx.paths.user_files_journal_path("skyrim-se", "steam");
+    std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
+    let journal = |starting: bool| Journal {
+        game: GameId::new("skyrim-se").unwrap(),
+        store: StoreId::new("steam").unwrap(),
+        instance_id: rec.instance_id.clone(),
+        created_at: "2026-11-01T00:00:00Z".to_string(),
+        running_from: tmp.path().join("nothing-runs-here"),
+        processes: if starting {
+            Vec::new()
+        } else {
+            vec![process_identity::capture_self().unwrap()]
+        },
+        starting_launcher: if starting {
+            process_identity::capture_self()
+        } else {
+            None
+        },
+        files: Vec::new(),
+    };
+
+    std::fs::write(&journal_path, serde_json::to_vec(&journal(true)).unwrap()).unwrap();
+    let starting = delete(&ctx, &rec.instance_id).unwrap_err();
+    assert!(
+        matches!(starting, InstanceError::Running(_)),
+        "a launch that had swapped its files in was not running: {starting:?}"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+
+    std::fs::write(&journal_path, serde_json::to_vec(&journal(false)).unwrap()).unwrap();
+    let running = delete(&ctx, &rec.instance_id).unwrap_err();
+    assert!(
+        matches!(running, InstanceError::Running(_)),
+        "a recorded live process was not running: {running:?}"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+}
+
+#[test]
+fn delete_fails_fast_while_a_tool_run_holds_the_instance_lock() {
+    use std::time::{Duration, Instant};
+
+    use agora_core::lock_manager::LockResource;
+
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Busy tool",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let held = ctx
+        .lock_manager
+        .acquire(LockResource::Instance(rec.instance_id.clone()), "tool-run")
+        .unwrap();
+    let start = Instant::now();
+    let refused = delete(&ctx, &rec.instance_id).unwrap_err();
+    let waited = start.elapsed();
+    drop(held);
+
+    assert!(
+        refused.to_string().contains("a tool is running"),
+        "the delete did not say a tool is running: {refused}"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "the delete waited for the tool run's lock: {waited:?}"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+}
+
+#[test]
+fn a_forced_delete_fails_closed_when_the_base_roots_cannot_be_read() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Unreadable roots",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let BaseReference::Pinned { id: base_id, .. } = &rec.base else {
+        panic!("the instance is pinned");
+    };
+    let base_manifest_path = ctx.paths.base_manifest_path(base_id);
+    let base: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&base_manifest_path).unwrap()).unwrap();
+    let base_folder = PathBuf::from(base["location"].as_str().unwrap());
+    let deployment = base_folder
+        .parent()
+        .unwrap()
+        .join("deployments")
+        .join(&rec.instance_id);
+    std::fs::create_dir_all(deployment.join("game")).unwrap();
+    std::fs::write(deployment.join("game").join("save.txt"), b"the game's save").unwrap();
+    std::fs::write(&base_manifest_path, b"not a base record").unwrap();
+    std::fs::write(ctx.paths.base_roots_file(), b"{ not a list").unwrap();
+
+    let refused = delete_with_options(
+        &ctx,
+        &rec.instance_id,
+        DeleteOptions {
+            force_unreadable_base: true,
+            recoverable: true,
+        },
+    );
+
+    assert!(
+        refused.is_err(),
+        "a forced delete guessed where the base roots were"
+    );
+    assert!(get(&ctx, &rec.instance_id).unwrap().is_some());
+    assert!(deployment.join("game").join("save.txt").exists());
+}
+
+#[test]
+fn tampered_pinned_instance_launch_is_refused_naming_file_and_record_launch_sets_time() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Tamper Test",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let base_id = match &rec.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        _ => panic!("expected pinned base"),
+    };
+
+    let manifest_path = ctx.paths.base_manifest_path(&base_id);
+    let manifest_content = std::fs::read_to_string(&manifest_path).unwrap();
+    let manifest: agora_core::game_base::BaseManifest =
+        serde_json::from_str(&manifest_content).unwrap();
+
+    // Tamper with a file in the base
+    let base_file = manifest.location.join("Data/Skyrim.bsa");
+    std::fs::write(&base_file, b"corrupted bytes different length").unwrap();
+
+    // Launch should be refused naming the file
+    let err = prepare_falling_back(&ctx, &rec.instance_id, &def, false).unwrap_err();
+    match err {
+        InstanceError::LaunchError(LaunchError::BaseDamaged { problems }) => {
+            assert!(
+                problems.iter().any(|p| p.path == "Data/Skyrim.bsa"),
+                "problems should name the tampered file: {problems:?}"
+            );
+        }
+        other => panic!("expected BaseDamaged error, got {other:?}"),
+    }
+
+    // Launch anyway should succeed with warning
+    let prepared = prepare_falling_back(&ctx, &rec.instance_id, &def, true).unwrap();
+    assert!(!prepared.warnings.is_empty());
+
+    // Record launch sets last_launched_at
+    assert_eq!(rec.last_launched_at, None);
+    record_launch(&ctx, &rec.instance_id).unwrap();
+
+    let updated = get(&ctx, &rec.instance_id).unwrap().unwrap();
+    assert!(updated.last_launched_at.is_some());
+}
+
+/// `prepare_launch`, but allowed to step down to linked files: the test machine has no
+/// `agora_vfs.dll` beside the test executable, and these tests are about something else.
+fn prepare_falling_back(
+    ctx: &CoreContext,
+    id: &str,
+    def: &GameDefinition,
+    launch_anyway: bool,
+) -> Result<agora_core::game_launch::PreparedLaunch, InstanceError> {
+    agora_core::game_instance::prepare_launch_with(
+        ctx,
+        id,
+        def,
+        agora_core::game_instance::LaunchOptions {
+            launch_anyway,
+            on_vfs_failure: agora_core::game_instance::VfsFailure::FallBack,
+            ..Default::default()
+        },
+        &agora_core::game_discovery::discover_all,
+        &agora_core::game_launch::SystemLauncher,
+    )
+}
+
+fn fresh(tmp: &TempDir) -> (CoreContext, IdentifiedInstall, GameDefinition) {
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    (ctx, install, make_test_definition())
+}
+
+/// "Cannot tell which instances use this base" must keep the base, never
+/// read as "nothing uses it".
+#[test]
+fn an_unreadable_instance_row_keeps_its_base() {
+    let tmp = TempDir::new().unwrap();
+    let (ctx, install, def) = fresh(&tmp);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Keep",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let BaseReference::Pinned { id: base_id, .. } = rec.base else {
+        panic!("pinned")
+    };
+    let base_dir = rec.build_outcome.unwrap().manifest().location.clone();
+
+    let conn = rusqlite::Connection::open(ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "UPDATE game_instances SET base_json = 'not json' WHERE instance_id = ?1",
+        [&rec.instance_id],
+    )
+    .unwrap();
+    assert!(remove_base(&ctx.paths, &base_id).is_err());
+    assert!(
+        base_dir.exists(),
+        "a base whose users cannot be read is kept"
+    );
+
+    conn.execute("DROP TABLE game_instances", []).unwrap();
+    assert!(remove_base(&ctx.paths, &base_id).is_err());
+    assert!(base_dir.exists());
+}
+
+/// A taken or invalid --id is refused before a base is built.
+#[test]
+fn a_bad_chosen_id_is_refused_before_any_base_is_built() {
+    let tmp = TempDir::new().unwrap();
+    let (ctx, install, def) = fresh(&tmp);
+    let first = create(
+        &ctx,
+        &install,
+        &def,
+        "A",
+        Some("taken".into()),
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = match first.base {
+        BaseReference::Pinned { id, .. } => id,
+        _ => unreachable!(),
+    };
+    // With the only instance gone and its base removed, nothing exists to reuse.
+    delete(&ctx, "taken").unwrap();
+    remove_base(&ctx.paths, &base_id).unwrap();
+    let conn = rusqlite::Connection::open(ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO user_instances (instance_id, name, minecraft_version, loader, loader_version) VALUES ('taken', 'mc', '1.21', 'vanilla', '')",
+        [],
+    )
+    .unwrap();
+
+    for bad in ["taken", "../escape", ""] {
+        let built = std::sync::atomic::AtomicBool::new(false);
+        let result = create(
+            &ctx,
+            &install,
+            &def,
+            "B",
+            Some(bad.into()),
+            BaseMode::Linked,
+            &|_| built.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+        assert!(result.is_err(), "{bad:?} must be refused");
+        assert!(
+            !built.load(std::sync::atomic::Ordering::SeqCst),
+            "{bad:?} started a base build first"
+        );
+        assert!(!ctx.paths.base_manifest_path(&base_id).exists());
+    }
+}
+
+#[test]
+fn building_over_a_damaged_record_an_instance_is_pinned_to_is_refused_and_keeps_the_folder() {
+    // A damaged record is replaced by a new build, but not while an instance runs from that base.
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let def = make_test_definition();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Pinned",
+        Some("skyrim-pinned".into()),
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = match &rec.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        _ => panic!("expected pinned base"),
+    };
+    let manifest_path = ctx.paths.base_manifest_path(&base_id);
+    let folder = ctx.paths.bases_dir().join(&base_id);
+    assert!(folder.is_dir());
+    std::fs::write(&manifest_path, "{ not json").unwrap();
+
+    let error = build_base(
+        &ctx.paths,
+        &install,
+        &def,
+        BaseMode::Linked,
+        None,
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("damaged base"),
+        "a clear reason, not a raw IO error: {error}"
+    );
+    assert!(folder.is_dir(), "the base the instance runs from is kept");
+    assert_eq!(
+        std::fs::read_to_string(&manifest_path).unwrap(),
+        "{ not json",
+        "the damaged record is untouched"
+    );
+}
+
+fn a_definition_with_a_bad_recipe(deployment: DeploymentStrategy) -> GameDefinition {
+    let mut definition = make_test_definition();
+    definition.deployment = deployment;
+    definition.launch.as_mut().unwrap().environment.insert(
+        "LD_PRELOAD".into(),
+        LaunchValue::Literal {
+            value: "/tmp/evil.so".into(),
+        },
+    );
+    definition
+}
+
+#[test]
+fn an_unpinned_launch_checks_its_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = a_definition_with_a_bad_recipe(DeploymentStrategy::Redirect);
+    let install = make_test_install(&install_dir, "microsoft-store", "skyrim", false, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Unpinned",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let report = DiscoveryReport {
+        installs: vec![install.discovered.clone()],
+        warnings: vec![],
+    };
+    let error =
+        prepare_launch_with_discovery(&ctx, &rec.instance_id, &def, false, &|| report.clone())
+            .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
+}
+
+#[test]
+fn a_pinned_undeployed_launch_checks_its_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = a_definition_with_a_bad_recipe(DeploymentStrategy::Redirect);
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Pinned",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let report = DiscoveryReport {
+        installs: vec![install.discovered.clone()],
+        warnings: vec![],
+    };
+    let error = prepare_launch_with(
+        &ctx,
+        &rec.instance_id,
+        &def,
+        agora_core::game_instance::LaunchOptions {
+            launch_anyway: false,
+            // Linked files need no VFS, so the recipe check runs without one.
+            deployment: Some(agora_core::game_deploy::DeployMode::Links),
+            ..Default::default()
+        },
+        &|| report.clone(),
+        &agora_core::game_launch::SystemLauncher,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
+}
+
+#[test]
+fn a_deployed_launch_checks_its_recipe() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+
+    let def = a_definition_with_a_bad_recipe(DeploymentStrategy::VirtualFileSystem);
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Deployed",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+    let report = DiscoveryReport {
+        installs: vec![install.discovered.clone()],
+        warnings: vec![],
+    };
+    let error = prepare_launch_with(
+        &ctx,
+        &rec.instance_id,
+        &def,
+        agora_core::game_instance::LaunchOptions {
+            launch_anyway: false,
+            // Linked files need no VFS, so the recipe check runs without one.
+            deployment: Some(agora_core::game_deploy::DeployMode::Links),
+            ..Default::default()
+        },
+        &|| report.clone(),
+        &agora_core::game_launch::SystemLauncher,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("LD_PRELOAD"), "{error}");
+}
+
+#[test]
+fn instance_reads_include_base_and_content_before_deploy() {
+    let tmp = TempDir::new().unwrap();
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    setup_fake_install(&install_dir);
+    let mut def = make_test_definition();
+    def.deployment = DeploymentStrategy::Redirect;
+    let package = agora_game_api::PackageDefinition {
+        id: "test.pkg".into(),
+        version: semver::Version::new(0, 1, 0),
+        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+        parents: Vec::new(),
+        games: vec![def.clone()],
+        frameworks: Vec::new(),
+        tools: Vec::new(),
+        game_templates: Default::default(),
+        behaviours: None,
+    };
+    let mut builder = agora_core::game_registry::GameRegistry::builder();
+    builder
+        .add(
+            agora_core::game_registry::PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            Arc::new(agora_core::game_registry::DeclarativePackage(package)),
+        )
+        .unwrap();
+    let ctx =
+        CoreContext::for_testing(tmp.path().join("app_data")).with_games(Arc::new(builder.build()));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let install = make_test_install(&install_dir, "steam", "489830", true, true);
+    let rec = create(
+        &ctx,
+        &install,
+        &def,
+        "Undeployed",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .unwrap();
+
+    let content_dir = tmp.path().join("mod");
+    std::fs::create_dir_all(content_dir.join("mods")).unwrap();
+    std::fs::write(content_dir.join("mods/cool.txt"), b"cool").unwrap();
+    let add = agora_core::content_store::add_folder(&ctx, &content_dir, Some("Cool")).unwrap();
+    let item_id = match add {
+        agora_core::content_store::AddOutcome::Added { item, .. }
+        | agora_core::content_store::AddOutcome::Existing { item, .. } => item.item_id,
+    };
+    agora_core::game_deploy::add_content(&ctx, &rec.instance_id, &item_id, None, None).unwrap();
+
+    let reads = agora_core::game_script::instance_reads(&ctx, &rec.instance_id).unwrap();
+    assert_eq!(reads.read_bytes("Game.exe", 0, 4).unwrap(), b"fake");
+    assert_eq!(
+        reads.read_bytes("mods/cool.txt", 0, 4).unwrap(),
+        b"cool",
+        "content is in the view even though nothing was deployed"
+    );
+}

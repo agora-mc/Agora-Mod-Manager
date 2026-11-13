@@ -818,6 +818,85 @@ def _fetch_fabric(
     return entries
 
 
+def _quilt_provided_fabricloader(loader_version: str) -> str | None:
+    """Return the fabricloader version this Quilt release declares it provides.
+
+    Quilt's loader jar carries its own ``quilt.mod.json``, whose
+    ``quilt_loader.provides`` list names ``fabricloader`` at the version its
+    Fabric compatibility layer reports. That value changes between Quilt
+    releases, so it is read per version from the published Maven artifact
+
+    https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-loader/{version}/quilt-loader-{version}.jar
+
+    Returns None when the jar or the declaration cannot be read, or when the
+    declared value is a placeholder. Callers must leave the capability out in
+    that case rather than guessing a number.
+    """
+    source_url = (
+        "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-loader/"
+        f"{loader_version}/quilt-loader-{loader_version}.jar"
+    )
+    cache_name = re.sub(
+        r"[^a-zA-Z0-9._-]", "_", f"quilt-loader-{loader_version}.jar"
+    )
+    try:
+        jar_path = _download_to_cache(source_url, cache_name)
+    except urllib.error.URLError as exc:
+        logger.warning(
+            "Quilt %s: could not download its Maven jar for fabricloader: %s",
+            loader_version,
+            exc,
+        )
+        return None
+
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            if "quilt.mod.json" not in zf.namelist():
+                logger.warning(
+                    "Quilt %s: Maven jar has no quilt.mod.json; leaving fabricloader out",
+                    loader_version,
+                )
+                return None
+            metadata = json.loads(zf.read("quilt.mod.json").decode("utf-8"))
+    except (
+        zipfile.BadZipFile,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        logger.warning(
+            "Quilt %s: could not read quilt.mod.json for fabricloader: %s",
+            loader_version,
+            exc,
+        )
+        return None
+
+    loader = metadata.get("quilt_loader") if isinstance(metadata, dict) else None
+    provides = loader.get("provides") if isinstance(loader, dict) else None
+    if not isinstance(provides, list):
+        logger.warning(
+            "Quilt %s: quilt.mod.json declares no provides list; leaving fabricloader out",
+            loader_version,
+        )
+        return None
+    for entry in provides:
+        if not isinstance(entry, dict) or entry.get("id") != "fabricloader":
+            continue
+        version = entry.get("version")
+        if isinstance(version, str) and version.strip() and "${" not in version:
+            return version.strip()
+        logger.warning(
+            "Quilt %s: fabricloader declaration is not a concrete version; leaving it out",
+            loader_version,
+        )
+        return None
+    logger.warning(
+        "Quilt %s: quilt.mod.json does not provide fabricloader; leaving it out",
+        loader_version,
+    )
+    return None
+
+
 def _fetch_quilt(
     mc_version: str,
     per_mc_limit: int | None = None,
@@ -936,6 +1015,11 @@ def _fetch_quilt(
                 f"Quilt profile {mc_version}/{loader_version}: {exc}"
             ) from exc
 
+        provided_versions = {"quilt_loader": loader_version}
+        fabricloader = _quilt_provided_fabricloader(loader_version)
+        if fabricloader is not None:
+            provided_versions["fabricloader"] = fabricloader
+
         entries.append({
             "mc_version": mc_version,
             "loader_version": loader_version,
@@ -943,7 +1027,7 @@ def _fetch_quilt(
             "sha256": sha,
             "file_name": file_name,
             "file_type": "profile_json",
-            "provided_versions": {"quilt_loader": loader_version},
+            "provided_versions": provided_versions,
             "release_channel": _release_channel(loader_version),
         })
         logger.info(
@@ -1175,6 +1259,44 @@ def _is_repack(pinned: dict[str, Any], upstream: dict[str, Any]) -> bool:
     return content is not None and content == upstream.get("content_sha256")
 
 
+def _merge_provided_versions(
+    previous: dict[str, Any],
+    entry: dict[str, Any],
+    changed_fields: dict[str, Any],
+) -> None:
+    """Adopt newly declared capabilities without rewriting known ones.
+
+    A loader entry's ``provided_versions`` map grows as the generator learns to
+    read another capability from the same distribution (Quilt's ``fabricloader``,
+    for example). Adding a key is enrichment. Changing or dropping a key that
+    was already published means the upstream distribution now claims something
+    different, which must fail closed instead of silently rewriting a signed
+    entry.
+    """
+    before = previous.get("provided_versions")
+    after = entry.get("provided_versions")
+    if _enrichment_absent(previous, "provided_versions"):
+        if not _enrichment_absent(entry, "provided_versions"):
+            previous["provided_versions"] = after
+        return
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        if before != after:
+            changed_fields["provided_versions"] = {"before": before, "after": after}
+        return
+    if any(
+        capability not in after or after[capability] != version
+        for capability, version in before.items()
+    ):
+        changed_fields["provided_versions"] = {"before": before, "after": after}
+        return
+    merged = dict(before)
+    merged.update(
+        {capability: version for capability, version in after.items() if capability not in merged}
+    )
+    if merged != before:
+        previous["provided_versions"] = merged
+
+
 def _merge_entries(
     existing: list[dict[str, Any]],
     new_entries: list[dict[str, Any]],
@@ -1223,6 +1345,9 @@ def _merge_entries(
         # Enrichable fields: absent -> the new value is adopted (enrichment);
         # present -> any change is a mutation and must fail closed.
         for field in ENRICHABLE_ENTRY_FIELDS:
+            if field == "provided_versions":
+                _merge_provided_versions(previous, entry, changed_fields)
+                continue
             if _enrichment_absent(previous, field):
                 if not _enrichment_absent(entry, field):
                     previous[field] = entry[field]

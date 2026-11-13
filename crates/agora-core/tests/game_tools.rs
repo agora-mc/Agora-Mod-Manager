@@ -1,0 +1,7120 @@
+//! Tools and generated output (MASTER_SPEC §26.9): runs that promote or discard, generations,
+//! rollback, remove, diff, whiteouts, the order of generated layers, the input fingerprint, the
+//! staleness warnings and the refusals.
+//!
+//! A tool is a copy of `cmd.exe` named `Game.exe`. The one thing these tests do not do is inject the
+//! virtual file system: `StagingLauncher` starts the tool with its staging folder as its working
+//! folder, which is where the VFS puts a tool's writes, and a tool that deletes a file writes the
+//! whiteout marker the VFS would write. The VFS itself runs only in the `#[ignore]` real-injection
+//! tests at the end, which need `AGORA_VFS_DLL`.
+
+#![cfg(windows)]
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use agora_core::ctx::CoreContext;
+use agora_core::event_sink::CancellationToken;
+use agora_core::game_base::BaseMode;
+use agora_core::game_deploy::{
+    add_content, deploy, move_content, plan, set_content_enabled, set_deployment, DeployError,
+    DeployMode, DeploymentPlan, FileSource, PlannedFile,
+};
+use agora_core::game_discovery::{DiscoveredInstall, DiscoveryReport, InstallCapabilities};
+use agora_core::game_ini;
+use agora_core::game_instance::{
+    create, get_manifest, launch_with, prepare_launch_with, BeforeLaunchAnswer, BeforeLaunchChoice,
+    GameInstanceRecord, InstanceError, LaunchOptions, LaunchedInstance, VfsFailure,
+};
+use agora_core::game_launch::{LaunchError, LaunchedGame, Launcher, PreparedLaunch};
+use agora_core::game_load_order::{self, MoveTarget};
+use agora_core::game_plugins;
+use agora_core::game_registry::{
+    GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
+};
+use agora_core::game_tools::{
+    self, CaptureMethod, CaptureMode, OutputStatus, RunOutcome, ToolError, ToolOffer,
+};
+use agora_core::game_user_files::{record_process, swap_in};
+use agora_core::game_user_tools::{self, NewUserTool, EXCLUDED_EXE_NAMES, NAME_MAX_CHARS};
+use agora_core::process_identity;
+use agora_game_api::{
+    BaseReference, BeforeLaunch, BeforeLaunchMode, Condition, DeploymentStrategy, FailureMarker,
+    GameDefinition, GameId, GamePackage, GamePath, InputFingerprint, InstallId, InstallKind,
+    LaunchRecipe, LaunchValue, LayerSource, LoadOrderDefinition, LoadOrderFormat,
+    PackageDefinition, RelPath, RequiredMagic, RuntimeIdentity, StoreId, StoreIdentifier,
+    ToolDefinition, ToolId, ToolInput, ToolInputKind, ToolOutput, ToolScope, UserDataLocation,
+    UserFileMapping, UserFileStrategy,
+};
+use tempfile::TempDir;
+
+const GAME: &str = "test-game";
+
+struct TestPackage(PackageDefinition);
+
+impl GamePackage for TestPackage {
+    fn definition(&self) -> &PackageDefinition {
+        &self.0
+    }
+}
+
+/// The user-data folders are redirected by `AGORA_TEST_USER_DATA_ROOT`, a process-wide setting, so
+/// the tests that touch them run one at a time.
+static USER_DATA: Mutex<()> = Mutex::new(());
+
+struct UserData {
+    _lock: MutexGuard<'static, ()>,
+    _dir: TempDir,
+}
+
+impl UserData {
+    fn new() -> Self {
+        let lock = USER_DATA.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        std::env::set_var("AGORA_TEST_USER_DATA_ROOT", dir.path());
+        Self {
+            _lock: lock,
+            _dir: dir,
+        }
+    }
+}
+
+impl Drop for UserData {
+    fn drop(&mut self) {
+        std::env::remove_var("AGORA_TEST_USER_DATA_ROOT");
+    }
+}
+
+/// Starts a tool or a launch without the VFS. A tool's working folder is its staging folder, and
+/// `env` is added to what the process sees.
+struct StagingLauncher {
+    dll: Result<PathBuf, String>,
+    /// Whether the working folder moves to the staging folder (a tool run) or stays where the
+    /// recipe puts it (a game launch).
+    stage: bool,
+    env: Vec<(String, String)>,
+}
+
+impl StagingLauncher {
+    fn new() -> Self {
+        Self {
+            dll: Ok(PathBuf::from(r"C:\agora\agora_vfs.dll")),
+            stage: true,
+            env: Vec::new(),
+        }
+    }
+
+    /// For a game launch: the same launcher, without moving the working folder.
+    fn plain() -> Self {
+        Self {
+            stage: false,
+            ..Self::new()
+        }
+    }
+
+    fn with_env(mut self, key: &str, value: &str) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    fn without_vfs(reason: &str) -> Self {
+        Self {
+            dll: Err(reason.into()),
+            stage: true,
+            env: Vec::new(),
+        }
+    }
+}
+
+impl Launcher for StagingLauncher {
+    fn locate_vfs_dll(&self) -> Result<PathBuf, String> {
+        self.dll.clone()
+    }
+
+    fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        let mut plain = prepared.clone();
+        if let (true, Some(vfs)) = (self.stage, &prepared.vfs) {
+            plain.resolved.cwd = vfs.upper.clone();
+        }
+        plain.vfs = None;
+        for (key, value) in &self.env {
+            plain.resolved.env.insert(key.clone(), value.clone().into());
+        }
+        agora_core::game_launch::launch(&plain)
+    }
+
+    fn launch_capturing(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        let mut plain = prepared.clone();
+        if let (true, Some(vfs)) = (self.stage, &prepared.vfs) {
+            plain.resolved.cwd = vfs.upper.clone();
+        }
+        plain.vfs = None;
+        for (key, value) in &self.env {
+            plain.resolved.env.insert(key.clone(), value.clone().into());
+        }
+        agora_core::game_launch::launch_capturing(&plain)
+    }
+}
+
+fn literal_args(args: &[&str]) -> Vec<LaunchValue> {
+    args.iter()
+        .map(|a| LaunchValue::Literal {
+            value: a.to_string(),
+        })
+        .collect()
+}
+
+/// A tool that runs `args`, from the game's folder (its staging folder, under the fake launcher).
+fn tool(id: &str, name: &str, args: &[&str]) -> ToolDefinition {
+    ToolDefinition {
+        output: ToolOutput::GeneratedLayer,
+        output_arg: None,
+        output_patterns: Vec::new(),
+        id: ToolId::new(id).unwrap(),
+        game: GameId::new(GAME).unwrap(),
+        name: name.into(),
+        launch: LaunchRecipe {
+            executable: GamePath::Runtime {
+                path: RelPath::new("Game.exe").unwrap(),
+            },
+            arguments: literal_args(args),
+            environment: Default::default(),
+            working_directory: GamePath::Runtime {
+                path: RelPath::default(),
+            },
+        },
+        relevant_settings: Vec::new(),
+        after_tools: Vec::new(),
+        conflicts_with: Vec::new(),
+        uses_install_path: false,
+        required_outputs: Vec::new(),
+        failure_markers: Vec::new(),
+        required_magic: Vec::new(),
+        run_only: false,
+        executable_names: Vec::new(),
+        inputs: Vec::new(),
+        scope: Default::default(),
+        input_files: Vec::new(),
+        before_launch: None,
+    }
+}
+
+fn plugin_rule() -> LoadOrderDefinition {
+    LoadOrderDefinition {
+        id: "plugins".into(),
+        name: "Plugins".into(),
+        file: RelPath::new("user/Plugins.txt").unwrap(),
+        destination: Default::default(),
+        items: agora_game_api::LoadOrderItems {
+            folder: RelPath::new("Data").unwrap(),
+            patterns: vec!["*.esm".into(), "*.esl".into(), "*.esp".into()],
+            folders: false,
+        },
+        format: LoadOrderFormat::Lines {
+            active_prefix: "*".into(),
+            header: vec![
+                "# This file is used by Skyrim to keep track of your downloaded content.".into(),
+                "# Please do not modify this file.".into(),
+            ],
+        },
+        rules: agora_game_api::LoadOrderRules {
+            kind: "none".into(),
+            entry: None,
+            implicit: Vec::new(),
+            implicit_list_file: None,
+            sorter: None,
+        },
+        intro: None,
+        item_heading: None,
+    }
+}
+
+/// The test game. With `user_files` it keeps a plugin list and an INI in the user-data folders
+/// (a session can then run); with `plugins` it also has a plugin list.
+fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> GameDefinition {
+    let mut mappings = Vec::new();
+    if user_files {
+        mappings.push(
+            UserFileMapping::new(
+                GamePath::UserData {
+                    location: UserDataLocation::LocalAppData,
+                    path: RelPath::new("Test Game/Plugins.txt").unwrap(),
+                },
+                RelPath::new("user/Plugins.txt").unwrap(),
+                UserFileStrategy::JournaledSwap,
+            )
+            .with_stores(vec![StoreId::steam()]),
+        );
+        mappings.push(
+            UserFileMapping::new(
+                GamePath::UserData {
+                    location: UserDataLocation::Documents,
+                    path: RelPath::new("My Games/Test Game/Test.ini").unwrap(),
+                },
+                RelPath::new("user/Test.ini").unwrap(),
+                UserFileStrategy::JournaledSwap,
+            )
+            .with_stores(vec![StoreId::steam()]),
+        );
+    }
+    GameDefinition {
+        mo2_game_name: None,
+        session: Default::default(),
+        id: GameId::new(GAME).unwrap(),
+        extends: None,
+        name: "Test Game".into(),
+        stores: vec![StoreIdentifier {
+            store: StoreId::steam(),
+            product: "12345".into(),
+        }],
+        version_sources: vec![],
+        deployment: DeploymentStrategy::VirtualFileSystem,
+        content_rules: vec![],
+        framework_ids: vec![],
+        tool_ids: tools.iter().map(|t| t.id.clone()).collect(),
+        launch: Some(LaunchRecipe {
+            executable: GamePath::Runtime {
+                path: RelPath::new("Game.exe").unwrap(),
+            },
+            arguments: literal_args(&["/c", "exit", "0"]),
+            environment: Default::default(),
+            working_directory: GamePath::Runtime {
+                path: RelPath::default(),
+            },
+        }),
+        log_paths: vec![],
+        crash_paths: vec![],
+        user_files: mappings,
+        save_paths: vec![],
+        linked_archive_patterns: vec![],
+        declared_writes: vec![],
+        excluded_paths: vec![],
+        load_orders: if plugins {
+            vec![plugin_rule()]
+        } else {
+            Vec::new()
+        },
+        runtime_files: Vec::new(),
+        save_location: Vec::new(),
+        launch_alternatives: Vec::new(),
+        content_layout: None,
+        copy_patterns: Vec::new(),
+    }
+}
+
+fn registry(def: &GameDefinition, tools: Vec<ToolDefinition>) -> Arc<GameRegistry> {
+    let mut builder = GameRegistry::builder();
+    let pkg = PackageDefinition {
+        id: format!("test.{}", def.id),
+        version: semver::Version::new(0, 1, 0),
+        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+        parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
+        games: vec![def.clone()],
+        frameworks: vec![],
+        tools,
+    };
+    builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            Arc::new(TestPackage(pkg)),
+        )
+        .expect("register test package");
+    Arc::new(builder.build())
+}
+
+fn install_of(dir: &Path) -> IdentifiedInstall {
+    let store_id = StoreId::steam();
+    let runtime = RuntimeIdentity {
+        game: GameId::new(GAME).unwrap(),
+        store: store_id.clone(),
+        version: "1.0.0".into(),
+        build: None,
+    };
+    let volume = agora_core::game_discovery::volume::VolumeDetector::new().get_volume_info(dir);
+    let discovered = DiscoveredInstall {
+        store: store_id,
+        product: "12345".into(),
+        name: "Test Game".into(),
+        kind: InstallKind::BaseGame,
+        parent_product: None,
+        location: dir.to_path_buf(),
+        store_version: Some(runtime.version.clone()),
+        store_build: None,
+        executables: vec!["Game.exe".into()],
+        capabilities: InstallCapabilities {
+            executables_readable: true,
+            accepts_new_files: true,
+            relocatable: true,
+        },
+        volume,
+    };
+    IdentifiedInstall {
+        game: runtime.game.clone(),
+        install_id: InstallId::new("steam:12345").unwrap(),
+        discovered,
+        add_ons: vec![],
+        runtime: RuntimeResolution::Identified {
+            runtime,
+            source: "executable".into(),
+        },
+    }
+}
+
+struct Fixture {
+    _tmp: TempDir,
+    ctx: CoreContext,
+    def: GameDefinition,
+    inst: GameInstanceRecord,
+}
+
+fn fixture(tools: Vec<ToolDefinition>) -> Fixture {
+    fixture_with(tools, false, false)
+}
+
+fn fixture_with(tools: Vec<ToolDefinition>, user_files: bool, plugins: bool) -> Fixture {
+    fixture_with_exe(tools, user_files, plugins, r"C:\Windows\System32\cmd.exe")
+}
+
+/// A fixture whose `Game.exe` is a copy of `exe`: a 64-bit `cmd.exe` by default, or the 32-bit one.
+fn fixture_with_exe(
+    tools: Vec<ToolDefinition>,
+    user_files: bool,
+    plugins: bool,
+    exe: &str,
+) -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let def = definition(&tools, user_files, plugins);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(registry(&def, tools));
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(install_dir.join("Data")).unwrap();
+    std::fs::copy(exe, install_dir.join("Game.exe")).unwrap();
+    std::fs::write(install_dir.join("Data").join("Skyrim.bsa"), b"BSA DATA").unwrap();
+    std::fs::write(install_dir.join("base_file.txt"), b"initial base file").unwrap();
+    let install = install_of(&install_dir);
+    let inst = create(
+        &ctx,
+        &install,
+        &def,
+        "Tools",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("create instance");
+    Fixture {
+        _tmp: tmp,
+        ctx,
+        def,
+        inst,
+    }
+}
+
+fn planned<'a>(plan: &'a DeploymentPlan, path: &str) -> Option<&'a PlannedFile> {
+    plan.files.iter().find(|f| f.path.as_str() == path)
+}
+
+/// The names in a folder, sorted; empty when the folder does not exist.
+fn names(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    out.sort();
+    out
+}
+
+fn launch(
+    ctx: &CoreContext,
+    id: &str,
+    def: &GameDefinition,
+    launcher: &dyn Launcher,
+) -> Result<LaunchedInstance, InstanceError> {
+    launch_with(
+        ctx,
+        id,
+        def,
+        LaunchOptions {
+            launch_anyway: false,
+            plain: false,
+            deployment: None,
+            on_vfs_failure: VfsFailure::Ask,
+            before_launch: Default::default(),
+        },
+        &DiscoveryReport::default,
+        launcher,
+    )
+}
+
+impl Fixture {
+    fn id(&self) -> &str {
+        &self.inst.instance_id
+    }
+
+    fn instance_dir(&self) -> PathBuf {
+        self.ctx.paths.instance_dir(self.id()).unwrap()
+    }
+
+    fn writable_dir(&self) -> PathBuf {
+        self.instance_dir().join("writable")
+    }
+
+    fn generation_dir(&self, tool: &str, generation: &str) -> PathBuf {
+        game_tools::generation_dir(&self.instance_dir(), tool, generation).unwrap()
+    }
+
+    fn tool_dir(&self, tool: &str) -> PathBuf {
+        game_tools::tool_dir(&self.instance_dir(), tool)
+    }
+
+    /// A run with the default capture, `auto`.
+    fn run(&self, tool: &str, launcher: &dyn Launcher) -> Result<RunOutcome, ToolError> {
+        self.run_as(tool, launcher, CaptureMode::Auto)
+    }
+
+    fn run_as(
+        &self,
+        tool: &str,
+        launcher: &dyn Launcher,
+        capture: CaptureMode,
+    ) -> Result<RunOutcome, ToolError> {
+        game_tools::run(
+            &self.ctx,
+            self.id(),
+            &self.def,
+            &ToolId::new(tool).unwrap(),
+            capture,
+            // The costs are the user's to accept; a test that runs by swap has accepted them.
+            capture == CaptureMode::Swap,
+            launcher,
+            &CancellationToken::new(),
+        )
+    }
+
+    /// The game folder of this instance's deployment, where a link-captured run's writes land.
+    fn deployed_game_dir(&self) -> PathBuf {
+        let manifest = get_manifest(&self.ctx, self.id()).unwrap();
+        let BaseReference::Pinned { id: base_id, .. } = manifest.base else {
+            panic!("the fixture instance is pinned");
+        };
+        let base: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(self.ctx.paths.base_manifest_path(&base_id)).unwrap(),
+        )
+        .unwrap();
+        let location = PathBuf::from(base["location"].as_str().unwrap());
+        location
+            .parent()
+            .unwrap()
+            .join("deployments")
+            .join(self.id())
+            .join("game")
+    }
+
+    /// The bytes of a content item's file, as the content store holds them.
+    fn content_bytes(&self, item: &str, path: &str) -> Vec<u8> {
+        let item = agora_core::content_store::get_item(&self.ctx, item).unwrap();
+        let file = item
+            .files
+            .iter()
+            .find(|f| f.path.as_str() == path)
+            .unwrap_or_else(|| panic!("no file {path} in the item"));
+        std::fs::read(self.ctx.paths.content_object_path(&file.sha256)).unwrap()
+    }
+
+    /// A run that must promote.
+    fn run_ok(&self, tool: &str, launcher: &dyn Launcher) -> RunOutcome {
+        let outcome = self.run(tool, launcher).expect("run");
+        assert!(outcome.promoted, "{outcome:?}");
+        outcome
+    }
+
+    /// The tool's generated layer: its generation and inputs.
+    fn generated(&self, tool: &str) -> Option<(String, InputFingerprint)> {
+        get_manifest(&self.ctx, self.id())
+            .unwrap()
+            .layers
+            .layers()
+            .iter()
+            .find_map(|layer| match &layer.source {
+                LayerSource::Generated {
+                    tool: t,
+                    generation,
+                    inputs,
+                } if t.as_str() == tool => Some((generation.clone(), inputs.clone())),
+                _ => None,
+            })
+    }
+
+    /// The tools with a generated layer, in the order the stack has them.
+    fn generated_order(&self) -> Vec<String> {
+        get_manifest(&self.ctx, self.id())
+            .unwrap()
+            .layers
+            .layers()
+            .iter()
+            .filter_map(|layer| match &layer.source {
+                LayerSource::Generated { tool, .. } => Some(tool.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn plan(&self, mode: DeployMode) -> DeploymentPlan {
+        plan(&self.ctx, self.id(), &self.def, mode).unwrap()
+    }
+
+    /// Add a content item (a mod) to the instance, and return its id.
+    fn add_mod(&self, name: &str, files: &[(&str, &[u8])]) -> String {
+        let mod_dir = TempDir::new().unwrap();
+        for (rel, bytes) in files {
+            let path = mod_dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let outcome =
+            agora_core::content_store::add_folder(&self.ctx, mod_dir.path(), Some(name)).unwrap();
+        let item = outcome.item().item_id.clone();
+        add_content(&self.ctx, self.id(), &item, None, None).unwrap();
+        item
+    }
+}
+
+/// A tool that writes `tag <AGORA_TEST_TAG>` into `Data\mod.txt`. The space before `>` matters: cmd
+/// reads a digit joined to `>` as a handle number, so `echo 1>file` writes nothing. Under the fake
+/// launcher the staging folder starts empty, so the tool makes `Data` first; under the VFS `Data` is
+/// already there, so the real tests use [`tagged_in_place`].
+fn tagged(id: &str) -> ToolDefinition {
+    tool(
+        id,
+        "Nemesis",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "tag",
+            "%AGORA_TEST_TAG%",
+            ">",
+            r"Data\mod.txt",
+        ],
+    )
+}
+
+fn tagged_in_place(id: &str) -> ToolDefinition {
+    tool(
+        id,
+        "Nemesis",
+        &[
+            "/c",
+            "echo",
+            "tag",
+            "%AGORA_TEST_TAG%",
+            ">",
+            r"Data\mod.txt",
+        ],
+    )
+}
+
+/// A tool that writes `Data\nemesis.txt`, and exits 3 when `AGORA_TEST_FAIL` is set.
+fn writes_or_fails(id: &str) -> ToolDefinition {
+    tool(
+        id,
+        "Nemesis",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "made>",
+            r"Data\nemesis.txt",
+            "&",
+            "if",
+            "defined",
+            "AGORA_TEST_FAIL",
+            "exit",
+            "/b",
+            "3",
+        ],
+    )
+}
+
+#[test]
+fn a_successful_run_is_promoted_and_the_writable_layer_is_untouched() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    let out = f.run_ok("nemesis", &StagingLauncher::new());
+
+    assert_eq!(out.current.as_deref(), Some("1"));
+    assert_eq!(out.previous, None);
+    assert_eq!(out.written, vec!["Data/nemesis.txt".to_string()]);
+    assert_eq!(out.exit_code, Some(0));
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir("nemesis", "1").join("Data/nemesis.txt")).unwrap(),
+        // cmd writes the space before `>` too.
+        "made \r\n"
+    );
+    assert!(
+        names(&f.writable_dir()).is_empty(),
+        "the game's writable layer changed: {:?}",
+        names(&f.writable_dir())
+    );
+    assert!(
+        names(&f.tool_dir("nemesis"))
+            .iter()
+            .all(|n| !n.starts_with("staging-")),
+        "a staging folder was left behind"
+    );
+    let (generation, inputs) = f.generated("nemesis").expect("a generated layer");
+    assert_eq!(generation, "1");
+    assert!(matches!(inputs, InputFingerprint::Known(_)));
+}
+
+#[test]
+fn a_failing_run_is_discarded_and_the_previous_generation_stays_in_effect() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    f.run_ok("nemesis", &StagingLauncher::new());
+
+    let out = f
+        .run(
+            "nemesis",
+            &StagingLauncher::new().with_env("AGORA_TEST_FAIL", "1"),
+        )
+        .expect("a failed run is an outcome, not an error");
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(3));
+    assert!(!out.cancelled);
+    assert_eq!(out.current.as_deref(), Some("1"));
+    assert_eq!(out.previous, None);
+    let failed = out.failed_folder.expect("the discarded run is kept");
+    assert!(failed.is_dir(), "{}", failed.display());
+    assert!(failed.join("Data/nemesis.txt").is_file());
+    assert_eq!(f.generated("nemesis").unwrap().0, "1");
+    assert!(f.generation_dir("nemesis", "1").is_dir());
+}
+
+#[test]
+fn a_second_run_keeps_one_a_third_deletes_it() {
+    let f = fixture(vec![tagged("nemesis")]);
+
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+    );
+    let second = f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "2"),
+    );
+    assert_eq!(second.current.as_deref(), Some("2"));
+    assert_eq!(second.previous.as_deref(), Some("1"));
+    assert!(f.generation_dir("nemesis", "1").is_dir());
+    assert!(f.generation_dir("nemesis", "2").is_dir());
+
+    let third = f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "3"),
+    );
+    assert_eq!(third.current.as_deref(), Some("3"));
+    assert_eq!(third.previous.as_deref(), Some("2"));
+    assert!(
+        !f.generation_dir("nemesis", "1").exists(),
+        "generation 1 is kept"
+    );
+    assert!(f.generation_dir("nemesis", "2").is_dir());
+    assert!(f.generation_dir("nemesis", "3").is_dir());
+    assert_eq!(f.generated("nemesis").unwrap().0, "3");
+}
+
+#[test]
+fn rollback_swaps_the_current_and_previous_generations() {
+    let f = fixture(vec![tagged("nemesis")]);
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+    );
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "2"),
+    );
+
+    let state =
+        game_tools::rollback(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap();
+    assert_eq!(state.current.as_deref(), Some("1"));
+    assert_eq!(state.previous.as_deref(), Some("2"));
+    assert_eq!(f.generated("nemesis").unwrap().0, "1");
+    assert!(f.generation_dir("nemesis", "1").is_dir());
+    assert!(
+        f.generation_dir("nemesis", "2").is_dir(),
+        "nothing is deleted"
+    );
+
+    // Rolling back again swaps back.
+    let again =
+        game_tools::rollback(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap();
+    assert_eq!(again.current.as_deref(), Some("2"));
+    assert_eq!(again.previous.as_deref(), Some("1"));
+}
+
+#[test]
+fn rollback_needs_a_previous_generation() {
+    let f = fixture(vec![tagged("nemesis")]);
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+    );
+
+    let err =
+        game_tools::rollback(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap_err();
+    assert!(matches!(err, ToolError::NoPrevious(_)), "{err:?}");
+}
+
+#[test]
+fn rollback_to_a_generation_that_is_gone_changes_nothing() {
+    // Guard: the previous generation's folder is checked before the layer is touched.
+    let f = fixture(vec![tagged("nemesis")]);
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+    );
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "2"),
+    );
+    std::fs::remove_dir_all(f.generation_dir("nemesis", "1")).unwrap();
+
+    let err =
+        game_tools::rollback(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap_err();
+    assert!(matches!(err, ToolError::Other(_)), "{err:?}");
+    assert_eq!(
+        f.generated("nemesis").unwrap().0,
+        "2",
+        "the current generation is still in effect"
+    );
+}
+
+#[test]
+fn remove_drops_the_layer_and_every_generation_and_leaves_the_mods() {
+    let f = fixture(vec![tagged("nemesis")]);
+    f.add_mod("Mod", &[("Data/other.txt", b"mod")]);
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+    );
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "2"),
+    );
+
+    let mut removed =
+        game_tools::remove(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap();
+    removed.sort();
+    assert_eq!(removed, vec!["1".to_string(), "2".to_string()]);
+    assert!(f.generated("nemesis").is_none());
+    assert!(!f.tool_dir("nemesis").exists());
+    assert!(planned(&f.plan(DeployMode::Virtual), "Data/other.txt").is_some());
+
+    let err =
+        game_tools::remove(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap_err();
+    assert!(matches!(err, ToolError::NoOutput(_)), "{err:?}");
+}
+
+#[test]
+fn diff_lists_files_added_changed_and_removed_between_the_generations() {
+    // cmd's `if` takes the rest of the line with it, so the two branches are one `if ... else`.
+    let f = fixture(vec![tool(
+        "nemesis",
+        "Nemesis",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "tag",
+            "%AGORA_TEST_TAG%",
+            ">",
+            r"Data\a.txt",
+            "&",
+            "if",
+            "%AGORA_TEST_TAG%==1",
+            "(",
+            "echo",
+            "x>",
+            r"Data\gone.txt",
+            ")",
+            "else",
+            "(",
+            "echo",
+            "y>",
+            r"Data\new.txt",
+            ")",
+        ],
+    )]);
+    let tool_id = ToolId::new("nemesis").unwrap();
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+    );
+    let err = game_tools::diff(&f.ctx, f.id(), &tool_id).unwrap_err();
+    assert!(matches!(err, ToolError::NoPrevious(_)), "{err:?}");
+
+    f.run_ok(
+        "nemesis",
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "2"),
+    );
+    let report = game_tools::diff(&f.ctx, f.id(), &tool_id).unwrap();
+    assert_eq!(report.previous, "1");
+    assert_eq!(report.current, "2");
+    assert_eq!(report.added, vec!["Data/new.txt".to_string()]);
+    assert_eq!(report.changed, vec!["Data/a.txt".to_string()]);
+    assert_eq!(report.removed, vec!["Data/gone.txt".to_string()]);
+}
+
+#[test]
+fn a_tool_that_deletes_a_mods_file_hides_it_in_the_plan() {
+    let deleter = tool(
+        "deleter",
+        "Deleter",
+        &[
+            "/c",
+            "mkdir",
+            r".agvfs-wh\Data",
+            "&",
+            "type",
+            "nul",
+            ">",
+            r".agvfs-wh\Data\mod.txt.wh",
+        ],
+    );
+    let f = fixture(vec![deleter]);
+    f.add_mod("Mod", &[("Data/mod.txt", b"original")]);
+    assert!(planned(&f.plan(DeployMode::Virtual), "Data/mod.txt").is_some());
+
+    let out = f.run_ok("deleter", &StagingLauncher::new());
+    assert_eq!(out.deleted, vec!["Data/mod.txt".to_string()]);
+
+    for mode in [DeployMode::Virtual, DeployMode::Links, DeployMode::Copies] {
+        let p = f.plan(mode);
+        assert!(
+            planned(&p, "Data/mod.txt").is_none(),
+            "{mode}: the whiteout did not hide the mod's file"
+        );
+    }
+}
+
+#[test]
+fn a_tool_that_runs_after_another_sits_above_it() {
+    let mut alpha = tool(
+        "alpha",
+        "Alpha",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "alpha>",
+            r"Data\shared.txt",
+        ],
+    );
+    alpha.after_tools = vec![ToolId::new("beta").unwrap()];
+    let beta = tool(
+        "beta",
+        "Beta",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "beta>",
+            r"Data\shared.txt",
+        ],
+    );
+    let f = fixture(vec![alpha, beta]);
+
+    f.run_ok("alpha", &StagingLauncher::new());
+    f.run_ok("beta", &StagingLauncher::new());
+
+    assert_eq!(
+        f.generated_order(),
+        vec!["beta".to_string(), "alpha".to_string()]
+    );
+    let p = f.plan(DeployMode::Virtual);
+    let shared = planned(&p, "Data/shared.txt").expect("the shared file is planned");
+    assert!(
+        matches!(&shared.source, FileSource::Generated { tool, .. } if tool == "alpha"),
+        "alpha runs after beta, so its file wins: {:?}",
+        shared.source
+    );
+}
+
+#[test]
+fn the_fingerprint_changes_with_the_enabled_layers_and_their_order_and_is_stable_otherwise() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    let a = f.add_mod("A", &[("Data/a.txt", b"a")]);
+    let b = f.add_mod("B", &[("Data/b.txt", b"b")]);
+    let tool_def = f
+        .ctx
+        .games
+        .tool(&f.def.id, &ToolId::new("nemesis").unwrap())
+        .unwrap()
+        .clone();
+    let fingerprint = || game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &tool_def).unwrap();
+
+    let first = fingerprint();
+    assert_eq!(
+        first,
+        fingerprint(),
+        "the same inputs give the same fingerprint"
+    );
+
+    set_content_enabled(&f.ctx, f.id(), &a, false).unwrap();
+    let without_a = fingerprint();
+    assert_ne!(first, without_a, "disabling a layer changes it");
+    set_content_enabled(&f.ctx, f.id(), &a, true).unwrap();
+    assert_eq!(first, fingerprint(), "enabling it again restores it");
+
+    move_content(&f.ctx, f.id(), &b, 0).unwrap();
+    assert_ne!(first, fingerprint(), "the stack's order changes it");
+}
+
+#[test]
+fn the_fingerprint_changes_with_a_relevant_ini_value() {
+    let _user_data = UserData::new();
+    let mut settings_tool = writes_or_fails("nemesis");
+    settings_tool.relevant_settings = vec!["user/Test.ini:General:Gamma".into()];
+    let f = fixture_with(vec![settings_tool], true, false);
+    let tool_def = f
+        .ctx
+        .games
+        .tool(&f.def.id, &ToolId::new("nemesis").unwrap())
+        .unwrap()
+        .clone();
+    let fingerprint = || game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &tool_def).unwrap();
+
+    let first = fingerprint();
+    game_ini::set_value(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        "user/Test.ini",
+        "General",
+        "Gamma",
+        "2",
+    )
+    .unwrap();
+    let changed = fingerprint();
+    assert_ne!(first, changed, "a changed relevant setting changes it");
+    game_ini::set_value(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        "user/Test.ini",
+        "General",
+        "Gamma",
+        "2",
+    )
+    .unwrap();
+    assert_eq!(
+        changed,
+        fingerprint(),
+        "writing the same value again changes nothing"
+    );
+}
+
+#[test]
+fn the_fingerprint_changes_with_the_plugin_load_order() {
+    let _user_data = UserData::new();
+    let f = fixture_with(vec![writes_or_fails("nemesis")], true, true);
+    f.add_mod("Plugins", &[("Data/A.esp", b"A"), ("Data/B.esp", b"B")]);
+    deploy(&f.ctx, f.id(), &f.def, DeployMode::Virtual).unwrap();
+    let tool_def = f
+        .ctx
+        .games
+        .tool(&f.def.id, &ToolId::new("nemesis").unwrap())
+        .unwrap()
+        .clone();
+    let fingerprint = || game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &tool_def).unwrap();
+    let order = || -> Vec<String> {
+        game_load_order::order(&f.ctx, f.id(), &f.def)
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.active)
+            .map(|e| e.name.clone())
+            .collect()
+    };
+
+    let first = fingerprint();
+    let before = order();
+    game_load_order::move_plugin(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &before[0],
+        &MoveTarget::After(before[1].clone()),
+    )
+    .unwrap();
+    assert_ne!(before, order(), "the move changed the order");
+    assert_ne!(first, fingerprint(), "a changed plugin order changes it");
+}
+
+#[test]
+fn the_fingerprint_changes_when_the_second_list_changes() {
+    let _user_data = UserData::new();
+    let mut f = fixture_with(vec![writes_or_fails("nemesis")], true, true);
+    f.add_mod("Plugins", &[("Data/A.esp", b"A")]);
+    deploy(&f.ctx, f.id(), &f.def, DeployMode::Virtual).unwrap();
+
+    let mut second = plugin_rule();
+    second.id = "second".into();
+    second.name = "Second".into();
+    second.file = RelPath::new("user/Second.txt").unwrap();
+    f.def.load_orders.push(second);
+    f.def.user_files.push(
+        UserFileMapping::new(
+            GamePath::UserData {
+                location: UserDataLocation::LocalAppData,
+                path: RelPath::new("Test Game/Second.txt").unwrap(),
+            },
+            RelPath::new("user/Second.txt").unwrap(),
+            UserFileStrategy::JournaledSwap,
+        )
+        .with_stores(vec![StoreId::steam()]),
+    );
+
+    let tool_def = f
+        .ctx
+        .games
+        .tool(&f.def.id, &ToolId::new("nemesis").unwrap())
+        .unwrap()
+        .clone();
+    let fingerprint = || game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &tool_def).unwrap();
+
+    game_plugins::import_list_in(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        Some("second"),
+        &[("X.esp".into(), true)],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let first = fingerprint();
+    game_plugins::import_list_in(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        Some("second"),
+        &[("Y.esp".into(), true)],
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_ne!(first, fingerprint(), "the second list's change changes it");
+}
+
+#[test]
+fn a_stale_output_and_an_unknown_one_warn_and_never_refuse() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    let a = f.add_mod("A", &[("Data/a.txt", b"a")]);
+    f.run_ok("nemesis", &StagingLauncher::new());
+
+    // Current: no finding.
+    assert_eq!(
+        game_tools::list(&f.ctx, f.id(), &f.def).unwrap()[0].status,
+        Some(OutputStatus::Current)
+    );
+    assert!(game_tools::output_findings(&f.ctx, f.id(), &f.def)
+        .unwrap()
+        .is_empty());
+
+    // Stale once the enabled content changes.
+    set_content_enabled(&f.ctx, f.id(), &a, false).unwrap();
+    assert_eq!(
+        game_tools::list(&f.ctx, f.id(), &f.def).unwrap()[0].status,
+        Some(OutputStatus::Stale)
+    );
+    let findings = game_tools::output_findings(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].status, OutputStatus::Stale);
+    assert_eq!(
+        findings[0].message,
+        "Nemesis output is out of date: rebuild with `agora games instance tools run ".to_string()
+            + f.id()
+            + " nemesis`"
+    );
+    let launched = launch(&f.ctx, f.id(), &f.def, &StagingLauncher::plain())
+        .expect("a stale output does not refuse a launch");
+    assert_eq!(launched.prepared.generated_findings.len(), 1);
+    let mut child = launched.launched;
+    child.child.wait().unwrap();
+
+    // Unknown: the manifest says nobody recorded the inputs (an imported output).
+    set_content_enabled(&f.ctx, f.id(), &a, true).unwrap();
+    let path = f.instance_dir().join("instance_manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for layer in manifest["layers"].as_array_mut().unwrap() {
+        if layer["source"]["kind"] == "generated" {
+            layer["source"]["inputs"] = serde_json::json!({ "kind": "unknown" });
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+    assert_eq!(
+        game_tools::list(&f.ctx, f.id(), &f.def).unwrap()[0].status,
+        Some(OutputStatus::Unknown)
+    );
+    let findings = game_tools::output_findings(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].status, OutputStatus::Unknown);
+    assert!(
+        findings[0].message.contains("rebuild with"),
+        "{}",
+        findings[0].message
+    );
+    let launched = launch(&f.ctx, f.id(), &f.def, &StagingLauncher::plain())
+        .expect("an unknown output does not refuse a launch");
+    assert_eq!(launched.prepared.generated_findings.len(), 1);
+    let mut child = launched.launched;
+    child.child.wait().unwrap();
+
+    // Neither warning changed what the layer points at.
+    assert_eq!(f.generated("nemesis").unwrap().0, "1");
+}
+
+#[test]
+fn a_run_while_a_session_is_active_is_refused_and_leaves_nothing_behind() {
+    let _user_data = UserData::new();
+    let f = fixture_with(vec![writes_or_fails("nemesis")], true, false);
+    let running_from = f._tmp.path().join("running_from");
+    std::fs::create_dir_all(&running_from).unwrap();
+    swap_in(&f.ctx, f.id(), &f.def, &StoreId::steam(), &running_from).unwrap();
+    let live = process_identity::capture(std::process::id()).unwrap();
+    record_process(&f.ctx, &f.def.id, &StoreId::steam(), live).unwrap();
+
+    let err = f.run("nemesis", &StagingLauncher::new()).unwrap_err();
+    assert!(matches!(err, ToolError::SessionRunning(_)), "{err:?}");
+    assert!(f.generated("nemesis").is_none());
+    assert!(!f.tool_dir("nemesis").exists());
+}
+
+#[test]
+fn a_generated_layer_whose_folder_is_missing_is_an_error_not_an_empty_layer() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    f.run_ok("nemesis", &StagingLauncher::new());
+    std::fs::remove_dir_all(f.generation_dir("nemesis", "1")).unwrap();
+
+    let err = plan(&f.ctx, f.id(), &f.def, DeployMode::Virtual).unwrap_err();
+    match err {
+        DeployError::GeneratedLayerMissing {
+            tool, generation, ..
+        } => {
+            assert_eq!(tool, "nemesis");
+            assert_eq!(generation, "1");
+        }
+        other => panic!("expected GeneratedLayerMissing, got {other:?}"),
+    }
+    assert!(launch(&f.ctx, f.id(), &f.def, &StagingLauncher::plain()).is_err());
+}
+
+#[test]
+fn a_run_is_refused_before_anything_is_deployed_when_the_vfs_cannot_start() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    let err = f
+        .run_as(
+            "nemesis",
+            &StagingLauncher::without_vfs("agora_vfs.dll was not found"),
+            CaptureMode::Vfs,
+        )
+        .unwrap_err();
+    match err {
+        ToolError::VfsUnavailable { reason, next, .. } => {
+            assert!(reason.contains("agora_vfs.dll was not found"), "{reason}");
+            // The tool uses its own folder, so the next tier is link capture.
+            assert_eq!(next, Some(CaptureMode::Links));
+        }
+        other => panic!("expected VfsUnavailable, got {other:?}"),
+    }
+    assert!(f.generated("nemesis").is_none());
+    // The refusal counts as a failure, so the tool folder holds the count and nothing else.
+    assert_eq!(
+        names(&f.tool_dir("nemesis")),
+        vec!["failures.json".to_string()]
+    );
+}
+
+#[test]
+fn only_the_last_three_failed_runs_are_kept() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    for _ in 0..4 {
+        let out = f
+            .run(
+                "nemesis",
+                &StagingLauncher::new().with_env("AGORA_TEST_FAIL", "1"),
+            )
+            .unwrap();
+        assert!(!out.promoted);
+    }
+    let failed = names(&f.tool_dir("nemesis"))
+        .into_iter()
+        .filter(|n| n.starts_with("failed-"))
+        .count();
+    assert_eq!(failed, game_tools::FAILED_RUNS_KEPT);
+}
+
+#[test]
+fn an_undeclared_tool_is_refused() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    // xEdit is not declared by this fixture (Pandora is declared by the real package, not here).
+    let err = f.run("xedit", &StagingLauncher::new()).unwrap_err();
+    assert!(matches!(err, ToolError::UnknownTool { .. }), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Link capture (MASTER_SPEC §26.9): a run whose writes come from the link farm, compared with the
+// deployment record. These run without the VFS: `StagingLauncher` starts the tool in the game folder.
+// ---------------------------------------------------------------------------------------------
+
+/// The `whiteouts` of a tool's generated layer, as the layer stores them.
+fn whiteouts_of(f: &Fixture, tool: &str) -> Vec<String> {
+    get_manifest(&f.ctx, f.id())
+        .unwrap()
+        .layers
+        .layers()
+        .iter()
+        .find_map(|layer| match &layer.source {
+            LayerSource::Generated { tool: t, .. } if t.as_str() == tool => Some(
+                layer
+                    .whiteouts
+                    .iter()
+                    .map(|w| w.as_str().to_string())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Sets an environment variable for one test and removes it after.
+struct EnvVar(&'static str);
+
+impl EnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        std::env::set_var(key, value);
+        Self(key)
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
+/// The 32-bit DLL's path is read at every launch of a 32-bit program. The two tests that start one hold
+/// this lock, and each puts back the value it found, so one cannot see the other's path.
+static X86_DLL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets `AGORA_VFS_DLL_X86` for one test and puts back what was there before.
+struct X86Dll(Option<std::ffi::OsString>);
+
+impl X86Dll {
+    fn set(value: &str) -> Self {
+        let before = std::env::var_os("AGORA_VFS_DLL_X86");
+        std::env::set_var("AGORA_VFS_DLL_X86", value);
+        Self(before)
+    }
+}
+
+impl Drop for X86Dll {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(value) => std::env::set_var("AGORA_VFS_DLL_X86", value),
+            None => std::env::remove_var("AGORA_VFS_DLL_X86"),
+        }
+    }
+}
+
+#[test]
+fn a_link_capture_promotes_new_and_changed_files_and_a_whiteout_for_a_deletion() {
+    let maker = tool(
+        "maker",
+        "Maker",
+        &["/c", "echo", "one", ">", r"Data\gen.txt"],
+    );
+    let rewriter = tool(
+        "rewriter",
+        "Rewriter",
+        &[
+            "/c",
+            "echo",
+            "two",
+            ">",
+            r"Data\gen.txt",
+            "&",
+            "echo",
+            "fresh",
+            ">",
+            r"Data\new.txt",
+            "&",
+            "echo",
+            "value=2",
+            ">",
+            r"Data\Test.ini",
+            "&",
+            "del",
+            r"Data\mod.txt",
+        ],
+    );
+    let f = fixture(vec![maker, rewriter]);
+    let item = f.add_mod(
+        "Mod",
+        &[
+            ("Data/mod.txt", b"original"),
+            ("Data/Test.ini", b"value=1\r\n"),
+        ],
+    );
+    let mod_bytes = f.content_bytes(&item, "Data/mod.txt");
+    let launcher = StagingLauncher::new();
+
+    // The first tool makes a generated file: a copy in the farm, which the second tool rewrites.
+    let first = f.run_as("maker", &launcher, CaptureMode::Links).unwrap();
+    assert!(first.promoted, "{first:?}");
+    assert_eq!(first.capture, CaptureMethod::Links);
+    assert!(first.capture_reason.is_some());
+
+    let out = f.run_as("rewriter", &launcher, CaptureMode::Links).unwrap();
+    println!("link run outcome: {out:?}");
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.capture, CaptureMethod::Links);
+    assert_eq!(out.current.as_deref(), Some("1"));
+    assert_eq!(out.deleted, vec!["Data/mod.txt".to_string()]);
+    assert_eq!(
+        out.written,
+        vec![
+            "Data/Test.ini".to_string(),
+            "Data/gen.txt".to_string(),
+            "Data/new.txt".to_string()
+        ],
+        "the new file, the rewritten generated file and the rewritten ini are the output"
+    );
+
+    let gen = f.generation_dir("rewriter", "1");
+    assert_eq!(
+        std::fs::read_to_string(gen.join("Data/gen.txt"))
+            .unwrap()
+            .trim(),
+        "two"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gen.join("Data/new.txt"))
+            .unwrap()
+            .trim(),
+        "fresh"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gen.join("Data/Test.ini"))
+            .unwrap()
+            .trim(),
+        "value=2"
+    );
+    assert!(!gen.join("Data/mod.txt").exists());
+    assert_eq!(
+        whiteouts_of(&f, "rewriter"),
+        vec!["Data/mod.txt".to_string()]
+    );
+
+    // The writable layer is the game's: a tool run never changes it.
+    assert!(
+        names(&f.writable_dir()).is_empty(),
+        "{:?}",
+        names(&f.writable_dir())
+    );
+    // The first tool's output is what it was.
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir("maker", "1").join("Data/gen.txt"))
+            .unwrap()
+            .trim(),
+        "one"
+    );
+    // The deleted mod file's content object is untouched.
+    assert_eq!(f.content_bytes(&item, "Data/mod.txt"), mod_bytes);
+    // The farm the run used is taken away, so nothing it wrote is the game's.
+    assert!(!f.deployed_game_dir().exists());
+
+    // The next plan shows the new generation's bytes, and hides the deleted file.
+    let p = f.plan(DeployMode::Links);
+    assert!(planned(&p, "Data/mod.txt").is_none());
+    let source = |rel: &str| {
+        agora_core::game_deploy::visible_file_source(&f.ctx, f.id(), &f.def, DeployMode::Links, rel)
+            .unwrap()
+            .unwrap_or_else(|| panic!("no visible file {rel}"))
+    };
+    assert_eq!(
+        std::fs::read_to_string(source("Data/gen.txt"))
+            .unwrap()
+            .trim(),
+        "two"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source("Data/Test.ini"))
+            .unwrap()
+            .trim(),
+        "value=2"
+    );
+}
+
+#[test]
+fn a_link_capture_that_changes_a_linked_file_is_refused_and_discarded() {
+    let f = fixture(vec![tool(
+        "relinker",
+        "Relinker",
+        &[
+            "/c",
+            "del",
+            r"Data\mod.txt",
+            "&",
+            "echo",
+            "changed",
+            ">",
+            r"Data\mod.txt",
+        ],
+    )]);
+    let item = f.add_mod("Mod", &[("Data/mod.txt", b"original")]);
+    let before = f.content_bytes(&item, "Data/mod.txt");
+
+    let err = f
+        .run_as("relinker", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap_err();
+    match err {
+        ToolError::LinkedFileChanged {
+            tool,
+            paths,
+            failed_folder,
+        } => {
+            assert_eq!(tool, "relinker");
+            assert_eq!(paths, vec!["Data/mod.txt".to_string()]);
+            let failed = failed_folder.expect("the discarded run is kept");
+            assert!(failed.is_dir(), "{}", failed.display());
+        }
+        other => panic!("expected LinkedFileChanged, got {other:?}"),
+    }
+    assert!(f.generated("relinker").is_none());
+    assert_eq!(f.content_bytes(&item, "Data/mod.txt"), before);
+    assert!(names(&f.writable_dir()).is_empty());
+    assert!(!f.deployed_game_dir().exists());
+}
+
+#[test]
+fn a_write_through_a_linked_file_is_refused_and_the_run_is_not_promoted() {
+    let f = fixture(vec![tool(
+        "writer",
+        "Writer",
+        &["/c", "echo", "changed", ">", r"Data\mod.txt"],
+    )]);
+    let item = f.add_mod("Mod", &[("Data/mod.txt", b"original")]);
+    let before = f.content_bytes(&item, "Data/mod.txt");
+
+    // Whether the content store's ACL refuses the write (the tool fails) or lets it through (the
+    // change is caught), the run is discarded and the content object keeps its bytes.
+    match f.run_as("writer", &StagingLauncher::new(), CaptureMode::Links) {
+        Ok(out) => {
+            println!("write-through outcome: {out:?}");
+            assert!(!out.promoted, "{out:?}");
+        }
+        Err(ToolError::LinkedFileChanged { paths, .. }) => {
+            println!("write-through refused by the change check: {paths:?}");
+            assert_eq!(paths, vec!["Data/mod.txt".to_string()]);
+        }
+        Err(other) => panic!("{other:?}"),
+    }
+    assert!(f.generated("writer").is_none());
+    assert_eq!(f.content_bytes(&item, "Data/mod.txt"), before);
+    assert!(names(&f.writable_dir()).is_empty());
+}
+
+#[test]
+fn a_failing_link_run_is_discarded_and_the_farm_is_taken_away() {
+    // Writes a new file, then exits 3: the file is kept in the discarded run only.
+    let fails = tool(
+        "fails",
+        "Fails",
+        &[
+            "/c",
+            "echo",
+            "partial",
+            ">",
+            r"Data\partial.txt",
+            "&",
+            "exit",
+            "/b",
+            "3",
+        ],
+    );
+    let f = fixture(vec![writes_or_fails("nemesis"), fails]);
+    f.run_as("nemesis", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap();
+    assert_eq!(f.generated("nemesis").unwrap().0, "1");
+
+    let out = f
+        .run_as("fails", &StagingLauncher::new(), CaptureMode::Links)
+        .expect("a failed run is an outcome, not an error");
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(3));
+    assert_eq!(out.capture, CaptureMethod::Links);
+    assert_eq!(out.current, None);
+    let failed = out.failed_folder.expect("the discarded run is kept");
+    assert!(failed.join("Data/partial.txt").is_file());
+    assert!(f.generated("fails").is_none());
+    assert_eq!(f.generated("nemesis").unwrap().0, "1");
+    assert!(names(&f.writable_dir()).is_empty());
+    assert!(!f.deployed_game_dir().exists());
+    assert!(planned(&f.plan(DeployMode::Links), "Data/partial.txt").is_none());
+}
+
+#[test]
+fn auto_captures_under_the_vfs_when_the_vfs_starts_and_says_so() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    let out = f.run("nemesis", &StagingLauncher::new()).unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.capture, CaptureMethod::Vfs);
+    assert_eq!(out.capture_reason, None);
+}
+
+#[test]
+fn auto_on_a_virtual_instance_refuses_with_links_as_the_next_tier_and_runs_nothing() {
+    let _dll = EnvVar::set("AGORA_VFS_DLL", r"C:\agora-missing\agora_vfs.dll");
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    let err = f
+        .run_as(
+            "nemesis",
+            &agora_core::game_launch::SystemLauncher,
+            CaptureMode::Auto,
+        )
+        .unwrap_err();
+
+    match &err {
+        ToolError::VfsUnavailable { reason, next, .. } => {
+            assert!(reason.contains("AGORA_VFS_DLL points at"), "{reason}");
+            assert_eq!(*next, Some(CaptureMode::Links));
+        }
+        other => panic!("expected VfsUnavailable, got {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(
+        text.contains("Nothing was run") && text.contains("linked files"),
+        "{text}"
+    );
+    // Nothing was deployed, and no output was written: the user is asked before link capture runs.
+    assert!(!f.deployed_game_dir().exists());
+    assert!(f.generated("nemesis").is_none());
+    assert_eq!(
+        names(&f.tool_dir("nemesis")),
+        vec!["failures.json".to_string()]
+    );
+}
+
+#[test]
+fn auto_on_a_virtual_instance_refuses_a_real_install_tool_with_swap_as_the_next_tier() {
+    let f = fixture(vec![writes_real_data("nemesis")]);
+    let before = snapshot(&real_data(&f));
+
+    let err = f
+        .run_as(
+            "nemesis",
+            &StagingLauncher::without_vfs("agora_vfs.dll was not found"),
+            CaptureMode::Auto,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &err,
+            ToolError::VfsUnavailable {
+                next: Some(CaptureMode::Swap),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("copy of the instance's Data"),
+        "{err}"
+    );
+    assert!(!f.deployed_game_dir().exists());
+    assert!(!journal_file(&f).exists());
+    assert_eq!(
+        names(&f.tool_dir("nemesis")),
+        vec!["failures.json".to_string()]
+    );
+    assert_eq!(snapshot(&real_data(&f)), before);
+}
+
+#[test]
+fn auto_on_a_virtual_instance_runs_a_tool_that_uses_the_real_install_under_the_vfs() {
+    let mut tool = writes_or_fails("nemesis");
+    tool.uses_install_path = true;
+    let f = fixture(vec![tool]);
+
+    let out = f.run("nemesis", &StagingLauncher::new()).unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.capture, CaptureMethod::Vfs);
+    assert_eq!(out.capture_reason, None);
+}
+
+#[test]
+fn auto_on_a_linked_instance_captures_a_plain_tool_from_links_without_trying_the_vfs() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    set_deployment(&f.ctx, f.id(), Some(DeployMode::Links)).unwrap();
+
+    // A VFS that cannot start would refuse a virtual run. A linked instance must not even try one.
+    let out = f
+        .run(
+            "nemesis",
+            &StagingLauncher::without_vfs("agora_vfs.dll was not found"),
+        )
+        .expect("a linked instance runs by links");
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.capture, CaptureMethod::Links);
+    let reason = out.capture_reason.expect("the reason is given");
+    assert!(
+        reason.contains("set to linked files") && !reason.contains("could not start"),
+        "{reason}"
+    );
+    assert_eq!(out.written, vec!["Data/nemesis.txt".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir("nemesis", "1").join("Data/nemesis.txt"))
+            .unwrap()
+            .trim(),
+        "made"
+    );
+}
+
+/// A launcher whose VFS ends a program the tool started: it writes the line the DLL writes to its log
+/// during the run, then the tool fails. That is an injection failure.
+struct EndsAProgram;
+
+impl Launcher for EndsAProgram {
+    fn locate_vfs_dll(&self) -> Result<PathBuf, String> {
+        Ok(PathBuf::from(r"C:\agora\agora_vfs.dll"))
+    }
+
+    fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        if let Some(vfs) = &prepared.vfs {
+            std::fs::create_dir_all(vfs.log.parent().unwrap()).unwrap();
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&vfs.log)
+                .unwrap();
+            writeln!(
+                log,
+                "[4242] ending the process C:\\Games\\Tool\\helper.exe: anti-tamper refused the hook"
+            )
+            .unwrap();
+        }
+        StagingLauncher::new()
+            .with_env("AGORA_TEST_FAIL", "1")
+            .launch(prepared)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A tool that keeps failing (MASTER_SPEC §26.9, decision 3): the offers after two discarded runs.
+// ---------------------------------------------------------------------------------------------
+
+fn failing() -> StagingLauncher {
+    StagingLauncher::new().with_env("AGORA_TEST_FAIL", "1")
+}
+
+#[test]
+fn a_tool_discarded_twice_in_a_row_offers_the_full_copy_swap_and_applies_nothing() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    let first = f.run("nemesis", &failing()).unwrap();
+    assert!(!first.promoted);
+    assert!(first.offers.is_empty(), "{:?}", first.offers);
+
+    let second = f.run("nemesis", &failing()).unwrap();
+    assert!(!second.promoted);
+    match second.offers.as_slice() {
+        [ToolOffer::CopySwap { costs }] => assert!(costs.data_files >= 1, "{costs:?}"),
+        other => panic!("expected the copy swap offer, got {other:?}"),
+    }
+    // The offer changed nothing: no output, and the instance still has no deployment choice.
+    assert!(f.generated("nemesis").is_none());
+    assert_eq!(
+        get_manifest(&f.ctx, f.id()).unwrap().deployment,
+        None,
+        "an offer switched the instance"
+    );
+}
+
+#[test]
+fn a_promoted_run_resets_the_count_of_discarded_runs() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    f.run("nemesis", &failing()).unwrap();
+    f.run_ok("nemesis", &StagingLauncher::new());
+    let after_promotion = f.run("nemesis", &failing()).unwrap();
+    assert!(
+        after_promotion.offers.is_empty(),
+        "{:?}",
+        after_promotion.offers
+    );
+
+    let again = f.run("nemesis", &failing()).unwrap();
+    assert!(
+        matches!(again.offers.as_slice(), [ToolOffer::CopySwap { .. }]),
+        "{:?}",
+        again.offers
+    );
+}
+
+#[test]
+fn a_missing_or_corrupt_count_file_counts_as_none_and_never_blocks_a_run() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    // Missing: the first discarded run is only the first, and the run goes through.
+    let first = f
+        .run("nemesis", &failing())
+        .expect("a run with no count file");
+    assert!(!first.promoted && first.offers.is_empty(), "{first:?}");
+
+    // Corrupt: it reads as none, so the run is not blocked, and this discard is the first again.
+    std::fs::write(f.tool_dir("nemesis").join("failures.json"), b"{ not json").unwrap();
+    let corrupt = f
+        .run("nemesis", &failing())
+        .expect("a corrupt count file does not block a run");
+    assert!(
+        !corrupt.promoted && corrupt.offers.is_empty(),
+        "{corrupt:?}"
+    );
+
+    let next = f.run("nemesis", &failing()).unwrap();
+    assert!(
+        matches!(next.offers.as_slice(), [ToolOffer::CopySwap { .. }]),
+        "{:?}",
+        next.offers
+    );
+}
+
+#[test]
+fn a_failure_the_vfs_injected_into_offers_switching_to_links_for_a_tool_with_its_own_folder() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    let first = f.run("nemesis", &EndsAProgram).unwrap();
+    assert!(first.offers.is_empty(), "{:?}", first.offers);
+    let second = f.run("nemesis", &EndsAProgram).unwrap();
+
+    assert!(
+        second.offers.contains(&ToolOffer::SwitchToLinks),
+        "{:?}",
+        second.offers
+    );
+    assert!(
+        second
+            .offers
+            .iter()
+            .any(|offer| matches!(offer, ToolOffer::CopySwap { .. })),
+        "{:?}",
+        second.offers
+    );
+    // Asked about, never done.
+    assert_eq!(get_manifest(&f.ctx, f.id()).unwrap().deployment, None);
+}
+
+#[test]
+fn a_tool_that_works_on_the_real_install_never_offers_switching_to_links() {
+    let mut tool = writes_or_fails("nemesis");
+    tool.uses_install_path = true;
+    let f = fixture(vec![tool]);
+
+    f.run("nemesis", &EndsAProgram).unwrap();
+    let second = f.run("nemesis", &EndsAProgram).unwrap();
+
+    assert!(
+        !second.offers.contains(&ToolOffer::SwitchToLinks),
+        "{:?}",
+        second.offers
+    );
+    assert!(
+        second
+            .offers
+            .iter()
+            .any(|offer| matches!(offer, ToolOffer::CopySwap { .. })),
+        "{:?}",
+        second.offers
+    );
+}
+
+#[test]
+fn a_failure_without_injection_never_offers_switching_to_links() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    f.run("nemesis", &failing()).unwrap();
+    let second = f.run("nemesis", &failing()).unwrap();
+
+    assert!(
+        !second.offers.contains(&ToolOffer::SwitchToLinks),
+        "{:?}",
+        second.offers
+    );
+}
+
+#[test]
+fn two_failed_swaps_do_not_offer_the_swap_again() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_or_fails("nemesis")]);
+
+    f.run_as("nemesis", &failing(), CaptureMode::Swap).unwrap();
+    let second = f.run_as("nemesis", &failing(), CaptureMode::Swap).unwrap();
+
+    assert!(!second.promoted, "{second:?}");
+    assert!(second.offers.is_empty(), "{:?}", second.offers);
+}
+
+/// The offers of a refused virtual file system run.
+fn refusal_offers(err: &ToolError) -> Vec<ToolOffer> {
+    match err {
+        ToolError::VfsUnavailable { offers, .. } => offers.clone(),
+        other => panic!("expected VfsUnavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn two_refused_vfs_starts_offer_switching_to_links_on_the_second() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    let refuses = StagingLauncher::without_vfs("agora_vfs.dll was not found");
+
+    let first = f.run_as("nemesis", &refuses, CaptureMode::Vfs).unwrap_err();
+    assert!(refusal_offers(&first).is_empty(), "{first:?}");
+
+    let second = f.run_as("nemesis", &refuses, CaptureMode::Vfs).unwrap_err();
+    let offers = refusal_offers(&second);
+    assert!(offers.contains(&ToolOffer::SwitchToLinks), "{offers:?}");
+    assert!(
+        offers
+            .iter()
+            .any(|offer| matches!(offer, ToolOffer::CopySwap { .. })),
+        "{offers:?}"
+    );
+    // Asked about, never done: the instance keeps its deployment, and nothing ran.
+    assert_eq!(get_manifest(&f.ctx, f.id()).unwrap().deployment, None);
+    assert!(f.generated("nemesis").is_none());
+}
+
+#[test]
+fn two_refused_vfs_starts_never_offer_switching_to_links_for_a_real_install_tool() {
+    let mut tool = writes_or_fails("nemesis");
+    tool.uses_install_path = true;
+    let f = fixture(vec![tool]);
+    let refuses = StagingLauncher::without_vfs("agora_vfs.dll was not found");
+
+    f.run_as("nemesis", &refuses, CaptureMode::Auto)
+        .unwrap_err();
+    let second = f
+        .run_as("nemesis", &refuses, CaptureMode::Auto)
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &second,
+            ToolError::VfsUnavailable {
+                next: Some(CaptureMode::Swap),
+                ..
+            }
+        ),
+        "{second:?}"
+    );
+    let offers = refusal_offers(&second);
+    assert!(!offers.contains(&ToolOffer::SwitchToLinks), "{offers:?}");
+}
+
+#[test]
+fn a_promoted_run_after_a_refusal_resets_the_count() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    let refuses = StagingLauncher::without_vfs("agora_vfs.dll was not found");
+
+    f.run_as("nemesis", &refuses, CaptureMode::Vfs).unwrap_err();
+    let launcher = StagingLauncher::new();
+    let promoted = game_tools::run_after_vfs_refusal(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("nemesis").unwrap(),
+        CaptureMode::Links,
+        false,
+        "agora_vfs.dll was not found",
+        &launcher,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(promoted.promoted, "{promoted:?}");
+
+    // The count started again, so this refusal is the first of a new series, with no offer.
+    let again = f.run_as("nemesis", &refuses, CaptureMode::Vfs).unwrap_err();
+    assert!(refusal_offers(&again).is_empty(), "{again:?}");
+}
+
+#[test]
+fn a_run_by_a_tier_chosen_after_a_refusal_names_the_vfs_failure_in_its_reason() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    let refusal = "agora_vfs.dll was not found";
+    let err = f
+        .run_as(
+            "nemesis",
+            &StagingLauncher::without_vfs(refusal),
+            CaptureMode::Auto,
+        )
+        .unwrap_err();
+    let ToolError::VfsUnavailable { reason, .. } = &err else {
+        panic!("expected VfsUnavailable, got {err:?}");
+    };
+
+    let out = game_tools::run_after_vfs_refusal(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("nemesis").unwrap(),
+        CaptureMode::Links,
+        false,
+        reason,
+        &StagingLauncher::new(),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.capture, CaptureMethod::Links);
+    let why = out.capture_reason.expect("the fallback says why");
+    assert!(
+        why.contains("the virtual file system could not start (agora_vfs.dll was not found)")
+            && why.contains("link capture was chosen"),
+        "{why}"
+    );
+}
+
+#[test]
+fn a_swap_whose_costs_were_not_acknowledged_is_refused_by_core_and_touches_nothing() {
+    let _swap = SwapTest::same_volume();
+    let mut tool = writes_or_fails("nemesis");
+    tool.uses_install_path = true;
+    let f = swap_fixture(vec![tool]);
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    let entries_before = names(&install);
+    let tool_id = ToolId::new("nemesis").unwrap();
+
+    let direct = game_tools::run(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &tool_id,
+        CaptureMode::Swap,
+        false,
+        &StagingLauncher::new(),
+        &CancellationToken::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(direct, ToolError::SwapNotConfirmed), "{direct:?}");
+
+    // The tier chosen after a refusal is the same swap and is refused the same way.
+    let after_refusal = game_tools::run_after_vfs_refusal(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &tool_id,
+        CaptureMode::Swap,
+        false,
+        "agora_vfs.dll was not found",
+        &StagingLauncher::new(),
+        &CancellationToken::new(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(after_refusal, ToolError::SwapNotConfirmed),
+        "{after_refusal:?}"
+    );
+
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert_eq!(names(&install), entries_before);
+    assert!(!journal_file(&f).exists());
+    assert!(f.generated("nemesis").is_none(), "nothing was built");
+}
+
+#[test]
+fn the_acknowledgement_is_not_needed_by_the_other_captures() {
+    let f = fixture(vec![tagged("nemesis")]);
+    let out = game_tools::run(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("nemesis").unwrap(),
+        CaptureMode::Links,
+        false,
+        &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(out.promoted, "{out:?}");
+}
+
+#[test]
+fn a_swap_chosen_after_a_refusal_names_the_vfs_failure_in_its_reason() {
+    let _swap = SwapTest::same_volume();
+    let mut tool = writes_or_fails("nemesis");
+    tool.uses_install_path = true;
+    let f = swap_fixture(vec![tool]);
+
+    let out = game_tools::run_after_vfs_refusal(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("nemesis").unwrap(),
+        CaptureMode::Swap,
+        true,
+        "agora_vfs.dll was not found",
+        &StagingLauncher::new(),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    assert_eq!(out.capture, CaptureMethod::Swap);
+    let why = out.capture_reason.expect("the fallback says why");
+    assert!(
+        why.contains("the virtual file system could not start")
+            && why.contains("the full-copy swap was chosen"),
+        "{why}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Unchanged copies (MASTER_SPEC §26.9): a VFS run's staged files the game would already read
+// unchanged are dropped before the output is settled. These feed the staging folder directly.
+// ---------------------------------------------------------------------------------------------
+
+/// A staging folder for a tool, with `files` written into it.
+fn stage(f: &Fixture, tool: &str, files: &[(&str, &[u8])]) -> PathBuf {
+    let staging = f.tool_dir(tool).join("staging-test");
+    std::fs::create_dir_all(&staging).unwrap();
+    for (rel, bytes) in files {
+        let path = rel.split('/').fold(staging.clone(), |p, part| p.join(part));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    staging
+}
+
+/// Runs the drop on a staging folder, as a VFS run does, and returns how many files it dropped.
+fn drop_unchanged(f: &Fixture, tool: &str, staging: &Path) -> usize {
+    let tool_def = f
+        .ctx
+        .games
+        .tool(&f.def.id, &ToolId::new(tool).unwrap())
+        .unwrap()
+        .clone();
+    game_tools::drop_unchanged_outputs(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &tool_def,
+        &f.tool_dir(tool),
+        staging,
+        "test-run",
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_staged_file_identical_to_a_mods_file_is_dropped_and_counted() {
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod("Mod", &[("Data/meshes/a.hkx", b"same bytes")]);
+    let staging = stage(
+        &f,
+        "sweep",
+        &[
+            ("Data/meshes/a.hkx", b"same bytes"),
+            ("Data/keep.txt", b"new"),
+        ],
+    );
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 1);
+    assert!(!staging.join("Data/meshes/a.hkx").exists());
+    assert_eq!(
+        std::fs::read(staging.join("Data/keep.txt")).unwrap(),
+        b"new"
+    );
+}
+
+#[test]
+fn a_staged_file_that_differs_by_one_byte_at_the_same_size_is_kept() {
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod("Mod", &[("Data/meshes/a.hkx", b"same bytes")]);
+    let staging = stage(&f, "sweep", &[("Data/meshes/a.hkx", b"same bytez")]);
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 0);
+    assert_eq!(
+        std::fs::read(staging.join("Data/meshes/a.hkx")).unwrap(),
+        b"same bytez"
+    );
+}
+
+#[test]
+fn a_staged_file_equal_to_the_previous_generation_but_not_the_baseline_is_kept() {
+    let f = fixture(vec![tool(
+        "sweep",
+        "Sweep",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "made>",
+            r"Data\prev.txt",
+        ],
+    )]);
+    f.run_ok("sweep", &StagingLauncher::new());
+    let previous = std::fs::read(f.generation_dir("sweep", "1").join("Data/prev.txt")).unwrap();
+    // Nothing below the tool holds Data/prev.txt, so the baseline does not hold it either.
+    let staging = stage(&f, "sweep", &[("Data/prev.txt", &previous)]);
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 0);
+    assert!(staging.join("Data/prev.txt").is_file());
+}
+
+#[test]
+fn a_staged_file_absent_below_is_kept() {
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod("Mod", &[("Data/other.txt", b"mod")]);
+    let staging = stage(&f, "sweep", &[("Data/new.txt", b"fresh")]);
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 0);
+    assert!(staging.join("Data/new.txt").is_file());
+}
+
+#[test]
+fn a_whiteout_is_kept_and_stays_a_deletion() {
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod("Mod", &[("Data/mod.txt", b"original")]);
+    let staging = stage(&f, "sweep", &[]);
+    let marker = staging.join(".agvfs-wh").join("Data").join("mod.txt.wh");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"").unwrap();
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 0);
+    assert!(marker.is_file(), "the whiteout was removed");
+}
+
+#[test]
+fn folders_emptied_by_dropped_files_are_removed_and_the_others_stay() {
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod(
+        "Mod",
+        &[
+            ("Data/meshes/actors/a/b.hkx", b"anim"),
+            ("Data/meshes/c.hkx", b"mesh"),
+        ],
+    );
+    let staging = stage(
+        &f,
+        "sweep",
+        &[
+            ("Data/meshes/actors/a/b.hkx", b"anim"),
+            ("Data/meshes/keep.txt", b"kept"),
+        ],
+    );
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 1);
+    assert!(!staging.join("Data/meshes/actors").exists());
+    assert!(staging.join("Data/meshes/keep.txt").is_file());
+    assert!(staging.is_dir(), "the staging folder itself stays");
+
+    std::fs::remove_dir_all(&staging).unwrap();
+    let staging = stage(&f, "sweep", &[("Data/meshes/c.hkx", b"mesh")]);
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 1);
+    assert_eq!(names(&staging), Vec::<String>::new(), "nothing is left");
+    assert!(staging.is_dir());
+}
+
+#[test]
+fn a_required_output_equal_to_the_baseline_still_passes_and_is_not_output() {
+    let mut required = tagged("sweep");
+    required.required_outputs = vec!["Data/mod.txt".to_string()];
+    let f = fixture(vec![required]);
+    f.add_mod("Mod", &[("Data/mod.txt", b"tag 1 \r\n")]);
+
+    // The run writes the mod's own bytes, so the file is dropped, and the check still finds it: the
+    // game reads it from the mod.
+    let out = f
+        .run_as(
+            "sweep",
+            &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+            CaptureMode::Vfs,
+        )
+        .unwrap();
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.unchanged_dropped, 1, "{out:?}");
+    assert!(out.written.is_empty(), "{:?}", out.written);
+    assert!(names(&f.generation_dir("sweep", "1")).is_empty());
+}
+
+#[test]
+fn a_failure_marker_is_searched_only_in_files_the_run_changed() {
+    let mut marked = tagged("sweep");
+    marked.failure_markers = vec![FailureMarker {
+        file: RelPath::new("Data/mod.txt").unwrap(),
+        contains: "tag".into(),
+    }];
+    let f = fixture(vec![marked]);
+    f.add_mod("Mod", &[("Data/mod.txt", b"tag 1 \r\n")]);
+
+    // The same bytes as the mod: the file is dropped before the marker is searched, so the run passes.
+    let same = f
+        .run_as(
+            "sweep",
+            &StagingLauncher::new().with_env("AGORA_TEST_TAG", "1"),
+            CaptureMode::Vfs,
+        )
+        .unwrap();
+    assert!(same.promoted, "{same:?}");
+    assert_eq!(same.unchanged_dropped, 1);
+
+    // Changed bytes: the file is written, and the marker in it fails the run.
+    let changed = f
+        .run_as(
+            "sweep",
+            &StagingLauncher::new().with_env("AGORA_TEST_TAG", "2"),
+            CaptureMode::Vfs,
+        )
+        .unwrap();
+    assert!(!changed.promoted, "{changed:?}");
+    assert_eq!(changed.unchanged_dropped, 0);
+    assert_eq!(changed.written, vec!["Data/mod.txt".to_string()]);
+    assert!(changed.failure.is_some(), "{changed:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Real injection: the same tools under agora_vfs.dll. Run with
+//   cargo build -p agora-vfs
+//   AGORA_VFS_DLL=<worktree>\target\debug\agora_vfs.dll cargo test -p agora-core --test game_tools -- --ignored
+// ---------------------------------------------------------------------------------------------
+
+/// Injects the DLL, and sets `env` on the process it starts.
+struct RealLauncher {
+    dll: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+impl RealLauncher {
+    fn new(env: &[(&str, &str)]) -> Self {
+        Self {
+            dll: built_dll(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+}
+
+impl Launcher for RealLauncher {
+    fn locate_vfs_dll(&self) -> Result<PathBuf, String> {
+        Ok(self.dll.clone())
+    }
+
+    fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        let mut with_env = prepared.clone();
+        for (key, value) in &self.env {
+            with_env
+                .resolved
+                .env
+                .insert(key.clone(), value.clone().into());
+        }
+        agora_core::game_launch::launch(&with_env)
+    }
+}
+
+fn built_dll() -> PathBuf {
+    let dll = std::env::var_os("AGORA_VFS_DLL")
+        .map(PathBuf::from)
+        .expect("set AGORA_VFS_DLL to target/debug/agora_vfs.dll (cargo build -p agora-vfs)");
+    assert!(dll.is_file(), "{} does not exist", dll.display());
+    dll
+}
+
+#[test]
+#[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
+fn real_injection_a_tool_run_writes_into_staging_and_is_promoted() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+    let launcher = RealLauncher::new(&[]);
+
+    let out = f.run("nemesis", &launcher).expect("run under the VFS");
+    println!("run outcome: {out:?}");
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.written, vec!["Data/nemesis.txt".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir("nemesis", "1").join("Data/nemesis.txt")).unwrap(),
+        "made \r\n"
+    );
+    assert!(
+        names(&f.writable_dir()).is_empty(),
+        "the game's writable layer changed: {:?}",
+        names(&f.writable_dir())
+    );
+    assert!(names(&f.tool_dir("nemesis"))
+        .iter()
+        .all(|n| !n.starts_with("staging-")));
+}
+
+#[test]
+#[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
+fn real_injection_rollback_changes_the_bytes_the_game_reads() {
+    let f = fixture(vec![tagged_in_place("nemesis")]);
+    // The game reads Data\mod.txt through the stack and writes what it read into Data\seen.txt,
+    // which lands in the writable layer, so the test can read what the game saw.
+    let mut read_def = f.def.clone();
+    read_def.launch.as_mut().unwrap().arguments =
+        literal_args(&["/c", "type", r"Data\mod.txt", ">", r"Data\seen.txt"]);
+    let seen = f.writable_dir().join("Data").join("seen.txt");
+    // Read the game's copy of the file, after a launch that reads it through the stack.
+    let read_back = || std::fs::read_to_string(&seen).unwrap_or_default();
+
+    f.run_ok("nemesis", &RealLauncher::new(&[("AGORA_TEST_TAG", "1")]));
+    f.run_ok("nemesis", &RealLauncher::new(&[("AGORA_TEST_TAG", "2")]));
+    let launched = launch(&f.ctx, f.id(), &read_def, &RealLauncher::new(&[])).expect("launch");
+    let mut child = launched.launched;
+    assert!(child.child.wait().unwrap().success());
+    assert_eq!(
+        read_back().trim(),
+        "tag 2",
+        "generation 2 is what the game reads"
+    );
+
+    game_tools::rollback(&f.ctx, f.id(), &f.def, &ToolId::new("nemesis").unwrap()).unwrap();
+    let launched = launch(&f.ctx, f.id(), &read_def, &RealLauncher::new(&[])).expect("launch");
+    let mut child = launched.launched;
+    assert!(child.child.wait().unwrap().success());
+    assert_eq!(
+        read_back().trim(),
+        "tag 1",
+        "after rollback the game reads generation 1"
+    );
+}
+
+/// A tool that opens a mod's file for writing and writes nothing to it, then writes one new file. The VFS
+/// copies the mod's file up on the open, so the copy is staged; it is identical to the mod's file, so it
+/// is not output (MASTER_SPEC §26.9).
+#[test]
+#[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
+fn real_injection_a_file_opened_for_writing_and_not_changed_is_not_output() {
+    let opener = tool(
+        "opener",
+        "Opener",
+        &[
+            "/c",
+            "type",
+            "nul",
+            ">>",
+            r"Data\mod.txt",
+            "&",
+            "echo",
+            "new>",
+            r"Data\new.txt",
+        ],
+    );
+    let f = fixture(vec![opener]);
+    let item = f.add_mod("Mod", &[("Data/mod.txt", b"original")]);
+    let mod_bytes = f.content_bytes(&item, "Data/mod.txt");
+
+    let out = f.run_ok("opener", &RealLauncher::new(&[]));
+    println!("opener outcome: {out:?}");
+    assert_eq!(out.written, vec!["Data/new.txt".to_string()], "{out:?}");
+    assert_eq!(out.unchanged_dropped, 1, "{out:?}");
+    let generation = f.generation_dir("opener", "1");
+    assert_eq!(names(&generation), vec!["Data".to_string()]);
+    assert_eq!(names(&generation.join("Data")), vec!["new.txt".to_string()]);
+    assert_eq!(f.content_bytes(&item, "Data/mod.txt"), mod_bytes);
+}
+
+/// What a tool sees of a file the game deleted: the game's whiteout lives in its writable layer,
+/// which is a lower layer of the tool's run. Checked by the tool's own `if exist`.
+#[test]
+#[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
+fn real_injection_a_game_deletion_is_seen_by_a_tool_run() {
+    let probe = tool(
+        "probe",
+        "Probe",
+        &[
+            "/c",
+            "if",
+            "exist",
+            r"Data\mod.txt",
+            "(",
+            "echo",
+            "present",
+            ">",
+            r"Data\state.txt",
+            ")",
+            "else",
+            "(",
+            "echo",
+            "gone",
+            ">",
+            r"Data\state.txt",
+            ")",
+        ],
+    );
+    let f = fixture(vec![probe]);
+    f.add_mod("Mod", &[("Data/mod.txt", b"original")]);
+    let mut delete_def = f.def.clone();
+    delete_def.launch.as_mut().unwrap().arguments = literal_args(&["/c", "del", r"Data\mod.txt"]);
+    let launched = launch(&f.ctx, f.id(), &delete_def, &RealLauncher::new(&[])).expect("launch");
+    let mut child = launched.launched;
+    assert!(child.child.wait().unwrap().success());
+    assert!(
+        f.writable_dir().join(".agvfs-wh/Data/mod.txt.wh").is_file(),
+        "the game's deletion left no whiteout in its writable layer"
+    );
+
+    let out = f.run("probe", &RealLauncher::new(&[])).expect("probe run");
+    println!("probe outcome: {out:?}");
+    let state = std::fs::read_to_string(f.generation_dir("probe", "1").join("Data/state.txt"))
+        .unwrap_or_default();
+    assert_eq!(
+        state.trim(),
+        "gone",
+        "the tool still sees a file the game deleted"
+    );
+}
+
+#[test]
+#[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
+fn real_injection_a_tool_that_deletes_a_mods_file_hides_it() {
+    let deleter = tool("deleter", "Deleter", &["/c", "del", r"Data\mod.txt"]);
+    let f = fixture(vec![deleter]);
+    let item = f.add_mod("Mod", &[("Data/mod.txt", b"original")]);
+    let sha = agora_core::content_store::get_item(&f.ctx, &item)
+        .unwrap()
+        .files[0]
+        .sha256
+        .clone();
+
+    let out = f
+        .run("deleter", &RealLauncher::new(&[]))
+        .expect("run under the VFS");
+    println!("run outcome: {out:?}");
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.deleted, vec!["Data/mod.txt".to_string()]);
+    for mode in [DeployMode::Virtual, DeployMode::Links, DeployMode::Copies] {
+        assert!(planned(&f.plan(mode), "Data/mod.txt").is_none(), "{mode}");
+    }
+    assert_eq!(
+        std::fs::read(f.ctx.paths.content_object_path(&sha)).unwrap(),
+        b"original",
+        "the mod's stored file changed"
+    );
+}
+
+#[test]
+#[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
+fn real_injection_a_32_bit_tool_is_captured_from_links_under_auto_when_the_x86_dll_is_missing() {
+    // The game's own executable is the 32-bit cmd.exe. Without the 32-bit DLL it cannot run under the
+    // VFS, so Auto captures from links and says where the 32-bit files were looked for.
+    let _lock = X86_DLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _x86 = X86Dll::set(r"C:\agora-missing\x86\agora_vfs.dll");
+    let f = fixture_with_exe(
+        vec![tool("wow", "Wow", &["/c", "echo", "x", ">", "out.txt"])],
+        false,
+        false,
+        r"C:\Windows\SysWOW64\cmd.exe",
+    );
+    let launcher = RealLauncher::new(&[]);
+
+    // A virtual instance does not fall back by itself: the refusal names link capture as the next tier.
+    let err = f
+        .run_as("wow", &launcher, CaptureMode::Auto)
+        .expect_err("a 32-bit tool is refused under the VFS, and nothing runs");
+    let refusal = match &err {
+        ToolError::VfsUnavailable { reason, next, .. } => {
+            assert!(reason.contains("32-bit"), "{reason}");
+            assert_eq!(*next, Some(CaptureMode::Links));
+            reason.clone()
+        }
+        other => panic!("expected VfsUnavailable, got {other:?}"),
+    };
+    // The user's answer is link capture, which runs the tool, and its reason names what failed first.
+    let out = game_tools::run_after_vfs_refusal(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("wow").unwrap(),
+        CaptureMode::Links,
+        false,
+        &refusal,
+        &launcher,
+        &CancellationToken::new(),
+    )
+    .expect("a 32-bit tool runs by link capture once asked for");
+    println!("run outcome: {out:?}");
+    assert_eq!(out.capture, CaptureMethod::Links, "{out:?}");
+    let reason = out.capture_reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("32-bit program and the 32-bit VFS files were not found:")
+            && reason.contains(r"agora-missing"),
+        "{reason}"
+    );
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.written, vec!["out.txt".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir("wow", "1").join("out.txt"))
+            .unwrap()
+            .trim(),
+        "x"
+    );
+    assert!(names(&f.writable_dir()).is_empty());
+    assert!(!f.deployed_game_dir().exists());
+}
+
+/// A 32-bit tool runs under the VFS when the 32-bit files exist: the 32-bit probe is the tool, and its
+/// own write lands in the run's promoted generation. Needs `AGORA_VFS_DLL` and `AGORA_VFS_DLL_X86`.
+#[test]
+#[ignore = "injects agora_vfs.dll into a 32-bit tool: cargo build -p agora-vfs, cargo build -p agora-vfs --target i686-pc-windows-msvc, set AGORA_VFS_DLL and AGORA_VFS_DLL_X86"]
+fn real_injection_a_32_bit_tool_runs_under_the_vfs_and_its_write_is_promoted() {
+    let _lock = X86_DLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let x86_dll = std::env::var_os("AGORA_VFS_DLL_X86")
+        .map(PathBuf::from)
+        .expect("set AGORA_VFS_DLL_X86 to target/i686-pc-windows-msvc/debug/agora_vfs.dll");
+    assert!(x86_dll.is_file(), "{} does not exist", x86_dll.display());
+    let probe = x86_dll
+        .parent()
+        .expect("the 32-bit DLL's folder")
+        .join("agora-vfs-probe.exe");
+    assert!(probe.is_file(), "{} does not exist", probe.display());
+    // The probe's results go to a folder outside the view; it writes its files into the game's Data.
+    // The folder is a player input, not a declared literal: the player chose that path.
+    let out = std::env::temp_dir().join(format!("agora-tool32-out-{}", std::process::id()));
+    std::fs::create_dir_all(&out).unwrap();
+    let mut probe32 = tool("probe32", "Probe", &["--root", "."]);
+    let mut out_input = input("out", ToolInputKind::Folder, "--out");
+    out_input.required = true;
+    probe32.inputs = vec![out_input];
+    let f = fixture_with_exe(vec![probe32], false, false, probe.to_str().unwrap());
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("probe32").unwrap(),
+        "out",
+        out.to_str().unwrap(),
+    )
+    .unwrap();
+    let launcher = RealLauncher::new(&[]);
+
+    let run = f.run_as("probe32", &launcher, CaptureMode::Vfs);
+    let _ = std::fs::remove_dir_all(&out);
+    let run = run.expect("run the 32-bit tool under the VFS");
+    println!("run outcome: {run:?}");
+    assert_eq!(run.capture, CaptureMethod::Vfs, "{run:?}");
+    assert!(run.promoted, "{run:?}");
+    assert!(
+        run.written.iter().any(|w| w == "Data/created.txt"),
+        "{:?}",
+        run.written
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            f.generation_dir("probe32", "1")
+                .join("Data")
+                .join("created.txt")
+        )
+        .unwrap(),
+        "NEW"
+    );
+    assert!(names(&f.writable_dir()).is_empty());
+}
+
+#[test]
+#[ignore = "injects agora_vfs.dll: cargo build -p agora-vfs, then set AGORA_VFS_DLL"]
+fn real_injection_a_tool_that_writes_the_real_install_path_is_staged_and_the_install_is_unchanged()
+{
+    // The tool does not declare uses_install_path. Its install folder is an alias of the view, so
+    // its write to the real install's Data lands in this run's staging folder, and is promoted.
+    let f = fixture(vec![tool(
+        "alias-writer",
+        "Nemesis",
+        &[
+            "/c",
+            "echo",
+            "made",
+            ">",
+            r"%AGORA_REAL%\Data\from_alias.txt",
+        ],
+    )]);
+    let install = install_dir(&f);
+    let launcher = RealLauncher::new(&[("AGORA_REAL", install.to_str().unwrap())]);
+    let before = snapshot(&install);
+
+    let out = f
+        .run_as("alias-writer", &launcher, CaptureMode::Vfs)
+        .expect("run under the VFS");
+    println!("run outcome: {out:?}");
+    assert_eq!(out.capture, CaptureMethod::Vfs, "{out:?}");
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.written, vec!["Data/from_alias.txt".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(
+            f.generation_dir("alias-writer", "1")
+                .join("Data/from_alias.txt")
+        )
+        .unwrap()
+        .trim(),
+        "made"
+    );
+    assert_eq!(snapshot(&install), before, "the real install changed");
+    assert!(names(&f.writable_dir()).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The swap and the real install (MASTER_SPEC §26.9, slices 4c and 4e). Every test uses a fake install
+// in a temp folder. The swap runs its tool on a real copy of the instance's `Data`, kept between runs
+// on the same volume, or made for one run on another volume (seam).
+// ---------------------------------------------------------------------------
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use agora_core::game_deploy::source_path;
+use agora_core::game_tool_copy::{self, CopyKind};
+use agora_core::game_tool_swap::{self as swap, SpaceNeed, SwapError, SwapJournal, VolumeSeam};
+
+/// A tool that writes `Data\meshes\x.nif` in the real install, through `AGORA_REAL`.
+fn writes_real_data(id: &str) -> ToolDefinition {
+    swap_tool(
+        id,
+        "Nemesis",
+        &[
+            "/c",
+            "mkdir",
+            r"%AGORA_REAL%\Data\meshes",
+            "&",
+            "echo",
+            "nif",
+            ">",
+            r"%AGORA_REAL%\Data\meshes\x.nif",
+        ],
+    )
+}
+
+fn install_dir(f: &Fixture) -> PathBuf {
+    f._tmp.path().join("install")
+}
+
+fn real_data(f: &Fixture) -> PathBuf {
+    install_dir(f).join("Data")
+}
+
+fn journal_file(f: &Fixture) -> PathBuf {
+    f.ctx.paths.tool_swap_journal_path(GAME, "steam")
+}
+
+fn aside_named(f: &Fixture, name: &str) -> PathBuf {
+    install_dir(f).join(format!("{}{name}", swap::ASIDE_PREFIX))
+}
+
+/// Every entry under `root` with its bytes; folders are listed with a trailing `/`, links as
+/// `(link)`. A missing folder is empty. Used to prove the real folder came back unchanged.
+fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if swap::is_reparse_point(&path) {
+                out.insert(format!("{rel} (link)"), Vec::new());
+            } else if path.is_dir() {
+                out.insert(format!("{rel}/"), Vec::new());
+                walk(root, &path, out);
+            } else {
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    if root.is_dir() {
+        walk(root, root, &mut out);
+    }
+    out
+}
+
+/// The volume seam is process-wide, so every swap test takes this lock, sets the seam it needs, and
+/// clears it when it ends.
+static SWAP_SEAM: Mutex<()> = Mutex::new(());
+
+struct SwapTest {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl SwapTest {
+    fn with(seam: VolumeSeam) -> Self {
+        let lock = SWAP_SEAM.lock().unwrap_or_else(|e| e.into_inner());
+        swap::set_volume_seam(Some(seam));
+        Self { _lock: lock }
+    }
+
+    /// The copy is kept on the install's volume: the normal case.
+    fn same_volume() -> Self {
+        Self::with(VolumeSeam {
+            same_volume: Some(true),
+            free_bytes: None,
+        })
+    }
+
+    /// The copy is made for the run on the install's volume: the other-volume case, simulated.
+    fn different_volume() -> Self {
+        Self::with(VolumeSeam {
+            same_volume: Some(false),
+            free_bytes: None,
+        })
+    }
+}
+
+impl Drop for SwapTest {
+    fn drop(&mut self) {
+        swap::set_volume_seam(None);
+    }
+}
+
+/// A tool that works on the real install: the same as [`tool`], with `uses_install_path` set.
+fn swap_tool(id: &str, name: &str, args: &[&str]) -> ToolDefinition {
+    ToolDefinition {
+        output: ToolOutput::GeneratedLayer,
+        output_arg: None,
+        uses_install_path: true,
+        required_outputs: Vec::new(),
+        failure_markers: Vec::new(),
+        ..tool(id, name, args)
+    }
+}
+
+/// A tool that writes `Data\meshes\<name>` in the real install, through `AGORA_REAL`.
+fn writes_mesh(id: &str, name: &str) -> ToolDefinition {
+    let target = format!(r"%AGORA_REAL%\Data\meshes\{name}");
+    let args: Vec<&str> = vec![
+        "/c",
+        "mkdir",
+        r"%AGORA_REAL%\Data\meshes",
+        "&",
+        "echo",
+        "nif",
+        ">",
+        target.as_str(),
+    ];
+    swap_tool(id, "Nemesis", &args)
+}
+
+/// A tool that overwrites `Data\tweak.ini`, creates `Data\meshes\x.nif` and deletes `Data\delete_me.txt`.
+fn writes_and_deletes(id: &str) -> ToolDefinition {
+    let args: Vec<&str> = vec![
+        "/c",
+        "mkdir",
+        r"%AGORA_REAL%\Data\meshes",
+        "&",
+        "echo",
+        "nif",
+        ">",
+        r"%AGORA_REAL%\Data\meshes\x.nif",
+        "&",
+        "echo",
+        "changed",
+        ">",
+        r"%AGORA_REAL%\Data\tweak.ini",
+        "&",
+        "del",
+        r"%AGORA_REAL%\Data\delete_me.txt",
+    ];
+    swap_tool(id, "Nemesis", &args)
+}
+
+/// A tool that opens `Data\Skyrim.bsa` for writing and writes nothing to it.
+fn opens_for_writing_only(id: &str) -> ToolDefinition {
+    swap_tool(
+        id,
+        "Nemesis",
+        &["/c", "type", "nul", ">>", r"%AGORA_REAL%\Data\Skyrim.bsa"],
+    )
+}
+
+/// A tool that changes `Data` and then exits 3.
+fn writes_then_fails(id: &str) -> ToolDefinition {
+    swap_tool(
+        id,
+        "Nemesis",
+        &[
+            "/c",
+            "echo",
+            "bad",
+            ">",
+            r"%AGORA_REAL%\Data\bad.txt",
+            "&",
+            "echo",
+            "x",
+            ">",
+            r"%AGORA_REAL%\Data\tweak.ini",
+            "&",
+            "del",
+            r"%AGORA_REAL%\Data\delete_me.txt",
+            "&",
+            "exit",
+            "/b",
+            "3",
+        ],
+    )
+}
+
+/// A swap fixture: `Data` holds three files the tests keep, change and delete.
+fn swap_fixture(tools: Vec<ToolDefinition>) -> Fixture {
+    let tmp = TempDir::new().unwrap();
+    let def = definition(&tools, false, false);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(registry(&def, tools));
+    let install_dir = tmp.path().join("install");
+    std::fs::create_dir_all(install_dir.join("Data")).unwrap();
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", install_dir.join("Game.exe")).unwrap();
+    std::fs::write(install_dir.join("Data").join("Skyrim.bsa"), b"BSA DATA").unwrap();
+    std::fs::write(install_dir.join("Data").join("tweak.ini"), b"ini original").unwrap();
+    std::fs::write(install_dir.join("Data").join("delete_me.txt"), b"delete me").unwrap();
+    std::fs::write(install_dir.join("base_file.txt"), b"initial base file").unwrap();
+    let install = install_of(&install_dir);
+    let inst = create(
+        &ctx,
+        &install,
+        &def,
+        "Tools",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("create instance");
+    Fixture {
+        _tmp: tmp,
+        ctx,
+        def,
+        inst,
+    }
+}
+
+fn swap_launcher(f: &Fixture) -> StagingLauncher {
+    StagingLauncher::new().with_env("AGORA_REAL", install_dir(f).to_str().unwrap())
+}
+
+/// The swap folder of the instance: `<bases>\deployments\<instance>\swap`.
+fn swap_dir(f: &Fixture) -> PathBuf {
+    swap::swap_location(&f.ctx, f.id()).unwrap().swap_dir
+}
+
+/// The kept copy of the instance's `Data`.
+fn kept_copy(f: &Fixture) -> PathBuf {
+    swap_dir(f).join("Data")
+}
+
+/// The files the instance's plan puts under `Data`, as a swap's copy holds them.
+fn planned_files(f: &Fixture) -> Vec<PlannedFile> {
+    game_tool_copy::data_files(&f.ctx, f.id(), &f.def).unwrap()
+}
+
+/// The kept copy holds exactly the planned files, each with the bytes of its source, and no marker
+/// output. This is what a discarded run must leave behind, and what every finished run leaves.
+fn assert_copy_matches_plan(f: &Fixture) {
+    let copy = kept_copy(f);
+    let planned = planned_files(f);
+    let on_disk: BTreeSet<String> = snapshot(&copy)
+        .into_iter()
+        .filter(|(k, _)| !k.ends_with('/') && k.as_str() != game_tool_copy::MARKER_FILE)
+        .map(|(k, _)| k.to_ascii_lowercase())
+        .collect();
+    let wanted: BTreeSet<String> = planned
+        .iter()
+        .map(|p| p.path.as_str().to_ascii_lowercase())
+        .collect();
+    assert_eq!(
+        on_disk, wanted,
+        "the kept copy holds exactly the planned files"
+    );
+    for file in &planned {
+        let want = std::fs::read(source_path(&f.ctx, &file.source)).unwrap();
+        let got = std::fs::read(copy.join(file.path.as_str())).unwrap();
+        assert_eq!(got, want, "{} matches its source", file.path.as_str());
+    }
+}
+
+/// A journal for a swap a test sets up by hand, exactly as `run_by_swap` writes it.
+fn journal_of(f: &Fixture, run: &str, kind: CopyKind) -> SwapJournal {
+    let loc = swap::swap_location(&f.ctx, f.id()).unwrap();
+    SwapJournal {
+        version: swap::JOURNAL_VERSION,
+        game: GAME.into(),
+        store: "steam".into(),
+        instance_id: f.id().into(),
+        tool: "nemesis".into(),
+        run: run.into(),
+        started_unix_ms: 0,
+        install_dir: loc.install.clone(),
+        real_data: loc.install.join("Data"),
+        aside: loc.install.join(format!("{}{run}", swap::ASIDE_PREFIX)),
+        copy_kind: kind,
+        copy_dir: game_tool_copy::copy_dir_for(kind, &loc, run),
+        swap_dir: loc.swap_dir.clone(),
+    }
+}
+
+/// Simulates a crash in a kept-copy swap after `step` (MASTER_SPEC §26.9, the run's steps): 4 the real
+/// Data is renamed aside; 5 the copy is renamed into its place; 6 the tool has written into it; 7 the
+/// copy has been renamed back home. The journal is on disk.
+fn crash_after(f: &Fixture, step: u8, kind: CopyKind, run: &str) -> SwapJournal {
+    let journal = journal_of(f, run, kind);
+    swap::write_journal(&f.ctx, &journal).unwrap();
+    game_tool_copy::prepare(&f.ctx, &journal, &planned_files(f)).unwrap();
+    if step >= 4 {
+        std::fs::rename(&journal.real_data, &journal.aside).unwrap();
+    }
+    if step >= 5 {
+        std::fs::rename(&journal.copy_dir, &journal.real_data).unwrap();
+    }
+    if step >= 6 {
+        let data = &journal.real_data;
+        std::fs::write(data.join("tweak.ini"), b"tool wrote").unwrap();
+        std::fs::write(data.join("new.txt"), b"tool new").unwrap();
+        std::fs::remove_file(data.join("delete_me.txt")).unwrap();
+    }
+    if step >= 7 {
+        std::fs::rename(&journal.real_data, &journal.copy_dir).unwrap();
+    }
+    journal
+}
+
+#[test]
+fn a_swap_run_promotes_its_writes_and_the_real_data_is_byte_for_byte_unchanged() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    let planned = planned_files(&f).len();
+
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+
+    assert!(outcome.promoted, "{outcome:?}");
+    assert_eq!(outcome.capture, CaptureMethod::Swap);
+    assert_eq!(outcome.copied_layer, None);
+    assert!(outcome.written.contains(&"Data/meshes/x.nif".to_string()));
+    assert!(outcome.written.contains(&"Data/tweak.ini".to_string()));
+    assert_eq!(outcome.deleted, vec!["Data/delete_me.txt".to_string()]);
+    // The real Data is unchanged, and it is the real folder again: no copy, no aside, no journal.
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert!(!real_data(&f).join("meshes").join("x.nif").exists());
+    assert!(names(&install)
+        .iter()
+        .all(|n| !n.starts_with(swap::ASIDE_PREFIX)));
+    assert!(!journal_file(&f).exists());
+    // The output is the promoted generation.
+    let (generation, _) = f.generated("nemesis").expect("a generated layer");
+    let gen_dir = f.generation_dir("nemesis", &generation);
+    assert!(gen_dir.join("Data").join("meshes").join("x.nif").exists());
+    assert_eq!(
+        std::fs::read_to_string(gen_dir.join("Data").join("tweak.ini"))
+            .unwrap()
+            .trim(),
+        "changed"
+    );
+    // The kept copy now matches the plan, which has the new generation and not the deleted file.
+    assert_copy_matches_plan(&f);
+    let report = outcome.swap.expect("a swap report");
+    assert_eq!(report.copy, CopyKind::Kept);
+    assert_eq!(
+        report.copied_in_files, planned,
+        "the first run copies everything"
+    );
+}
+
+#[test]
+fn a_second_run_copies_only_what_changed() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![
+        writes_mesh("first", "x.nif"),
+        writes_mesh("second", "y.nif"),
+    ]);
+    let planned = planned_files(&f).len();
+
+    let first = f
+        .run_as("first", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+    assert!(first.promoted, "{first:?}");
+    let first_report = first.swap.expect("a swap report");
+    assert_eq!(first_report.copied_in_files, planned);
+    assert_eq!(first_report.captured_files, 1);
+    // The first run's own output joins the plan, so the copy takes that one file after the run.
+    assert_eq!(first_report.refreshed_files, 1);
+
+    let second = f
+        .run_as("second", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+    assert!(second.promoted, "{second:?}");
+    let second_report = second.swap.expect("a swap report");
+    assert_eq!(
+        second_report.copied_in_files, 0,
+        "nothing changed since the last run, so nothing is copied in"
+    );
+    assert_eq!(second_report.captured_files, 1);
+    assert_eq!(second_report.refreshed_files, 1);
+    assert_copy_matches_plan(&f);
+}
+
+#[test]
+fn a_tool_that_opens_a_file_for_writing_and_changes_nothing_produces_no_output() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![opens_for_writing_only("nemesis")]);
+    let before = snapshot(&real_data(&f));
+
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+
+    assert!(outcome.promoted, "{outcome:?}");
+    assert_eq!(outcome.exit_code, Some(0));
+    assert!(outcome.written.is_empty(), "{:?}", outcome.written);
+    assert!(outcome.deleted.is_empty(), "{:?}", outcome.deleted);
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert_copy_matches_plan(&f);
+}
+
+#[test]
+fn a_discarded_run_leaves_the_kept_copy_matching_the_plan_again() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_then_fails("nemesis")]);
+    let before = snapshot(&real_data(&f));
+
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+
+    assert!(!outcome.promoted, "{outcome:?}");
+    assert_eq!(outcome.exit_code, Some(3));
+    assert!(outcome.failed_folder.is_some());
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert!(!journal_file(&f).exists());
+    assert!(f.generated("nemesis").is_none());
+    // The run's edits did not survive into the copy.
+    assert!(!kept_copy(&f).join("bad.txt").exists());
+    assert_copy_matches_plan(&f);
+}
+
+#[test]
+fn on_another_volume_a_copy_is_made_for_the_run_and_deleted_after_it() {
+    let _swap = SwapTest::different_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    let planned = planned_files(&f).len();
+
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+
+    assert!(outcome.promoted, "{outcome:?}");
+    let report = outcome.swap.expect("a swap report");
+    assert_eq!(report.copy, CopyKind::PerRun);
+    assert_eq!(
+        report.copied_in_files, planned,
+        "every run copies everything in"
+    );
+    assert!(
+        !kept_copy(&f).exists(),
+        "no kept copy is made on another volume"
+    );
+    assert!(names(&install)
+        .iter()
+        .all(|n| !n.starts_with(swap::COPY_PREFIX) && !n.starts_with(swap::ASIDE_PREFIX)));
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert!(!journal_file(&f).exists());
+}
+
+#[test]
+fn a_swap_is_refused_before_anything_moves_when_the_copy_volume_lacks_space() {
+    let _swap = SwapTest::with(VolumeSeam {
+        same_volume: Some(true),
+        free_bytes: Some(1),
+    });
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let before = snapshot(&real_data(&f));
+
+    let result = f.run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap);
+
+    match result {
+        Err(ToolError::Swap(SwapError::Refused(message))) => {
+            assert!(message.contains("needs"), "{message}");
+            assert!(message.contains("only 1 bytes is free"), "{message}");
+        }
+        other => panic!("expected a refusal for space, got {other:?}"),
+    }
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert!(!journal_file(&f).exists());
+    assert!(!swap_dir(&f).exists());
+}
+
+#[test]
+fn a_swap_is_refused_while_a_program_runs_from_the_install() {
+    let f = fixture(vec![writes_real_data("nemesis")]);
+    let _swap = SwapTest::same_volume();
+    let install = install_dir(&f);
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", install.join("busy.exe")).unwrap();
+    let mut busy = Command::new(install.join("busy.exe"))
+        .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let before = snapshot(&real_data(&f));
+    let launcher = StagingLauncher::new().with_env("AGORA_REAL", install.to_str().unwrap());
+
+    let result = f.run_as("nemesis", &launcher, CaptureMode::Swap);
+    let _ = busy.kill();
+    let _ = busy.wait();
+
+    match result {
+        Err(ToolError::Swap(SwapError::Refused(message))) => {
+            assert!(message.contains("install folder"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert!(!swap::is_reparse_point(&real_data(&f)));
+    assert!(!journal_file(&f).exists());
+    assert!(!swap_dir(&f).exists());
+}
+
+#[test]
+fn a_swap_is_refused_when_the_real_data_is_already_a_link() {
+    let _swap = SwapTest::same_volume();
+    let f = fixture(vec![writes_real_data("nemesis")]);
+    let install = install_dir(&f);
+    let kept = install.join("Data.kept");
+    std::fs::rename(real_data(&f), &kept).unwrap();
+    junction::create(&kept, real_data(&f)).unwrap();
+    let launcher = StagingLauncher::new().with_env("AGORA_REAL", install.to_str().unwrap());
+
+    let result = f.run_as("nemesis", &launcher, CaptureMode::Swap);
+
+    match result {
+        Err(ToolError::Swap(SwapError::Refused(message))) => {
+            assert!(message.contains("already"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(swap::is_reparse_point(&real_data(&f)));
+    assert!(kept.is_dir());
+    assert!(!journal_file(&f).exists());
+}
+
+#[test]
+fn a_taken_aside_name_is_refused_before_anything_moves() {
+    let f = fixture(vec![writes_real_data("nemesis")]);
+    let install = install_dir(&f);
+    let aside = aside_named(&f, "taken");
+    std::fs::create_dir_all(&aside).unwrap();
+    std::fs::write(aside.join("keep.txt"), b"keep").unwrap();
+    let before = snapshot(&real_data(&f));
+    let space = SpaceNeed {
+        folder: install.clone(),
+        bytes: 0,
+    };
+
+    let result = swap::preflight(&install, &real_data(&f), &aside, &space);
+
+    match result {
+        Err(SwapError::Refused(message)) => {
+            assert!(message.contains("already exists"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert_eq!(std::fs::read(aside.join("keep.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn auto_refuses_a_real_install_tool_on_a_linked_instance_before_anything_is_deployed() {
+    let f = fixture(vec![writes_real_data("nemesis")]);
+    set_deployment(&f.ctx, f.id(), Some(DeployMode::Links)).unwrap();
+
+    let result = f.run_as("nemesis", &StagingLauncher::new(), CaptureMode::Auto);
+
+    assert!(
+        matches!(result, Err(ToolError::InstallPathNeedsSwap { .. })),
+        "{result:?}"
+    );
+    assert!(!f.deployed_game_dir().exists());
+    assert!(!journal_file(&f).exists());
+}
+
+#[test]
+fn a_crash_after_step_4_is_put_back_and_the_copy_is_discarded() {
+    crash_case(4, CopyKind::Kept);
+}
+
+#[test]
+fn a_crash_after_step_5_is_put_back_and_the_copy_is_discarded() {
+    crash_case(5, CopyKind::Kept);
+}
+
+#[test]
+fn a_crash_after_step_6_is_put_back_and_the_tools_writes_are_discarded() {
+    crash_case(6, CopyKind::Kept);
+}
+
+#[test]
+fn a_crash_after_step_7_is_put_back_and_the_copy_is_discarded() {
+    crash_case(7, CopyKind::Kept);
+}
+
+#[test]
+fn a_crash_on_another_volume_is_put_back_and_the_per_run_copy_is_deleted() {
+    crash_case_on_other_volume(6);
+}
+
+fn crash_case(step: u8, kind: CopyKind) {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    crash_after(&f, step, kind, "crash");
+
+    let restored = swap::recover_game(&f.ctx, &f.def).unwrap();
+
+    assert_eq!(restored.len(), 1, "step {step}");
+    assert_eq!(snapshot(&real_data(&f)), before, "step {step}");
+    assert!(!kept_copy(&f).exists(), "step {step}: the copy is deleted");
+    assert!(names(&install)
+        .iter()
+        .all(|n| !n.starts_with(swap::ASIDE_PREFIX)));
+    assert!(!journal_file(&f).exists());
+}
+
+fn crash_case_on_other_volume(step: u8) {
+    let _swap = SwapTest::different_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    crash_after(&f, step, CopyKind::PerRun, "crashpr");
+
+    let restored = swap::recover_game(&f.ctx, &f.def).unwrap();
+
+    assert_eq!(restored.len(), 1);
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert!(names(&install)
+        .iter()
+        .all(|n| !n.starts_with(swap::COPY_PREFIX) && !n.starts_with(swap::ASIDE_PREFIX)));
+    assert!(!journal_file(&f).exists());
+}
+
+#[test]
+fn a_crashed_swap_is_put_back_by_a_run_before_it_starts() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let before = snapshot(&real_data(&f));
+    crash_after(&f, 6, CopyKind::Kept, "crash");
+
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+
+    assert!(outcome.promoted, "{outcome:?}");
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert_copy_matches_plan(&f);
+}
+
+#[test]
+fn a_journal_whose_copy_points_at_a_victim_folder_stops_recovery_and_touches_nothing() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let victim = f._tmp.path().join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), b"keep").unwrap();
+    let mut journal = journal_of(&f, "tamper", CopyKind::Kept);
+    journal.copy_dir = victim.clone();
+    swap::write_journal(&f.ctx, &journal).unwrap();
+    std::fs::rename(real_data(&f), aside_named(&f, "tamper")).unwrap();
+
+    let result = swap::recover_game(&f.ctx, &f.def);
+
+    match result {
+        Err(SwapError::Stuck(message)) => {
+            assert!(message.contains("copy folder"), "{message}");
+        }
+        other => panic!("expected the recovery to stop, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(victim.join("keep.txt")).unwrap(), b"keep");
+    assert!(aside_named(&f, "tamper").is_dir());
+    assert!(!real_data(&f).exists());
+    assert!(journal_file(&f).exists());
+}
+
+#[test]
+fn a_copy_without_a_matching_marker_stops_recovery_before_anything_moves() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let journal = journal_of(&f, "stranger", CopyKind::Kept);
+    swap::write_journal(&f.ctx, &journal).unwrap();
+    std::fs::rename(real_data(&f), aside_named(&f, "stranger")).unwrap();
+    std::fs::create_dir_all(kept_copy(&f)).unwrap();
+    std::fs::write(kept_copy(&f).join("stranger.txt"), b"not ours").unwrap();
+
+    let result = swap::recover_game(&f.ctx, &f.def);
+
+    match result {
+        Err(SwapError::Stuck(message)) => {
+            assert!(message.contains("marker"), "{message}");
+        }
+        other => panic!("expected the recovery to stop, got {other:?}"),
+    }
+    assert!(!real_data(&f).exists(), "the real Data was not moved back");
+    assert!(aside_named(&f, "stranger").is_dir());
+    assert_eq!(
+        std::fs::read(kept_copy(&f).join("stranger.txt")).unwrap(),
+        b"not ours"
+    );
+    assert!(journal_file(&f).exists());
+}
+
+#[test]
+fn a_version_1_junction_journal_is_refused_by_name_and_nothing_is_changed() {
+    let f = fixture(vec![writes_real_data("nemesis")]);
+    let before = snapshot(&real_data(&f));
+    let path = journal_file(&f);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let old = serde_json::json!({
+        "version": 1,
+        "game": GAME,
+        "store": "steam",
+        "instance_id": f.id(),
+        "tool": "nemesis",
+        "run": "old",
+        "started_unix_ms": 0,
+        "install_dir": install_dir(&f),
+        "real_data": real_data(&f),
+        "aside": aside_named(&f, "old"),
+        "junction_target": f._tmp.path().join("farm"),
+        "deployment_game_dir": f._tmp.path().join("farm"),
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+
+    let result = swap::recover_game(&f.ctx, &f.def);
+
+    match result {
+        Err(SwapError::Stuck(message)) => {
+            assert!(message.contains("version 1"), "{message}");
+            assert!(message.contains("junction"), "{message}");
+        }
+        other => panic!("expected the recovery to stop, got {other:?}"),
+    }
+    assert_eq!(snapshot(&real_data(&f)), before);
+    assert!(path.exists());
+}
+
+#[test]
+fn remove_copy_refuses_a_folder_without_the_marker_and_removes_a_kept_copy() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    std::fs::create_dir_all(kept_copy(&f)).unwrap();
+    std::fs::write(kept_copy(&f).join("stranger.txt"), b"not ours").unwrap();
+
+    let refused = game_tool_copy::remove_kept_copy(&f.ctx, &f.def, f.id());
+
+    assert!(matches!(refused, Err(SwapError::Refused(_))), "{refused:?}");
+    assert!(kept_copy(&f).join("stranger.txt").exists());
+
+    std::fs::remove_dir_all(kept_copy(&f)).unwrap();
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+    assert!(outcome.promoted, "{outcome:?}");
+    assert!(kept_copy(&f).is_dir());
+
+    let removed = game_tool_copy::remove_kept_copy(&f.ctx, &f.def, f.id()).unwrap();
+
+    assert_eq!(removed, game_tool_copy::RemoveCopy::Removed);
+    assert!(!kept_copy(&f).exists());
+    assert_eq!(
+        game_tool_copy::remove_kept_copy(&f.ctx, &f.def, f.id()).unwrap(),
+        game_tool_copy::RemoveCopy::NothingToRemove
+    );
+}
+
+#[test]
+fn deleting_an_instance_removes_its_swap_folder() {
+    let _swap = SwapTest::same_volume();
+    let f = swap_fixture(vec![writes_and_deletes("nemesis")]);
+    let outcome = f
+        .run_as("nemesis", &swap_launcher(&f), CaptureMode::Swap)
+        .unwrap();
+    assert!(outcome.promoted, "{outcome:?}");
+    let folder = swap_dir(&f);
+    assert!(folder.exists());
+
+    agora_core::game_instance::delete(&f.ctx, f.id()).unwrap();
+
+    assert!(!folder.exists());
+}
+
+#[test]
+#[ignore = "runs the 32-bit cmd.exe from SysWOW64 on a fake install; run with --ignored"]
+fn real_a_32_bit_tool_run_by_swap_promotes_its_write() {
+    let _swap = SwapTest::same_volume();
+    let f = fixture_with_exe(
+        vec![writes_real_data("nemesis")],
+        false,
+        false,
+        r"C:\Windows\SysWOW64\cmd.exe",
+    );
+    let install = install_dir(&f);
+    let before = snapshot(&real_data(&f));
+    let launcher = StagingLauncher::new().with_env("AGORA_REAL", install.to_str().unwrap());
+
+    let outcome = f.run_as("nemesis", &launcher, CaptureMode::Swap).unwrap();
+
+    println!("{outcome:#?}");
+    assert!(outcome.promoted, "{outcome:?}");
+    assert!(outcome.written.contains(&"Data/meshes/x.nif".to_string()));
+    assert_eq!(snapshot(&real_data(&f)), before);
+}
+
+#[test]
+fn a_recovery_with_nothing_pending_changes_nothing() {
+    let f = fixture(vec![writes_real_data("nemesis")]);
+    let before = snapshot(&real_data(&f));
+
+    assert!(swap::recover_game(&f.ctx, &f.def).unwrap().is_empty());
+    assert!(swap::recover_all(&f.ctx).is_empty());
+    assert_eq!(snapshot(&real_data(&f)), before);
+}
+
+#[test]
+fn a_link_run_reports_what_the_tool_wrote_into_the_real_data_folder() {
+    // Under link capture the tool writes into the real install, which the farm comparison cannot see.
+    let f = fixture(vec![tool(
+        "nemesis",
+        "Nemesis",
+        &[
+            "/c",
+            "mkdir",
+            r"%AGORA_REAL%\Data\meshes",
+            "&",
+            "echo",
+            "nif",
+            ">",
+            r"%AGORA_REAL%\Data\meshes\from_links.nif",
+        ],
+    )]);
+    let install = install_dir(&f);
+    let launcher = StagingLauncher::new().with_env("AGORA_REAL", install.to_str().unwrap());
+
+    let outcome = f.run_as("nemesis", &launcher, CaptureMode::Links).unwrap();
+
+    assert_eq!(outcome.capture, CaptureMethod::Links);
+    assert!(
+        outcome
+            .install_changes
+            .created
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case("Data/meshes/from_links.nif")),
+        "{:?}",
+        outcome.install_changes
+    );
+    assert!(outcome.install_changes.unavailable.is_none());
+    assert!(real_data(&f).join("meshes").join("from_links.nif").exists());
+}
+
+#[test]
+fn the_outside_data_watch_reports_a_file_written_at_the_install_root() {
+    let f = fixture(vec![tool(
+        "nemesis",
+        "Nemesis",
+        &["/c", "echo", "root", ">", r"%AGORA_REAL%\root_out.txt"],
+    )]);
+    let install = install_dir(&f);
+    let launcher = StagingLauncher::new().with_env("AGORA_REAL", install.to_str().unwrap());
+
+    let outcome = f.run_as("nemesis", &launcher, CaptureMode::Links).unwrap();
+
+    assert!(
+        outcome
+            .install_changes
+            .created
+            .iter()
+            .any(|p| p == "root_out.txt"),
+        "{:?}",
+        outcome.install_changes
+    );
+    assert!(!outcome.install_changes.may_be_incomplete);
+}
+
+// ---------------------------------------------------------------------------
+// Output checks: a run that exits 0 is still discarded when it misses a required output or
+// writes a failure marker (MASTER_SPEC §26.9, slice 4d).
+// ---------------------------------------------------------------------------
+
+/// A tool named `id` that runs `args`, with the output checks it declares.
+fn checked(
+    id: &str,
+    args: &[&str],
+    required: &[&str],
+    markers: Vec<FailureMarker>,
+) -> ToolDefinition {
+    let mut t = tool(id, "Checked", args);
+    t.required_outputs = required.iter().map(|r| r.to_string()).collect();
+    t.failure_markers = markers;
+    t
+}
+
+/// A failure marker for `file`, which must contain `text`.
+fn marker(file: &str, text: &str) -> FailureMarker {
+    FailureMarker {
+        file: RelPath::new(file).unwrap(),
+        contains: text.into(),
+    }
+}
+
+#[test]
+fn a_run_that_exits_zero_but_deletes_a_required_output_is_discarded() {
+    let f = fixture(vec![checked(
+        "checked",
+        // cmd skips every `&`-chained command after a false `if`, so the conditional comes last.
+        &[
+            "/c",
+            "echo",
+            "made>",
+            r"Data\required.txt",
+            "&",
+            "if",
+            "defined",
+            "AGORA_TEST_DELETE",
+            "del",
+            r"Data\required.txt",
+        ],
+        &["Data/required.txt"],
+        Vec::new(),
+    )]);
+    let launcher = StagingLauncher::new();
+    let first = f.run_as("checked", &launcher, CaptureMode::Links).unwrap();
+    assert!(first.promoted, "{first:?}");
+    assert!(f
+        .generation_dir("checked", "1")
+        .join("Data/required.txt")
+        .is_file());
+
+    let out = f
+        .run_as(
+            "checked",
+            &launcher.with_env("AGORA_TEST_DELETE", "1"),
+            CaptureMode::Links,
+        )
+        .expect("a discarded run is an outcome, not an error");
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(0));
+    let reason = out.failure.clone().expect("the outcome says why");
+    assert!(
+        reason.contains("required output 'Data/required.txt'"),
+        "{reason}"
+    );
+    assert_eq!(out.current.as_deref(), Some("1"));
+    assert_eq!(f.generated("checked").unwrap().0, "1");
+    assert!(f.generation_dir("checked", "1").is_dir());
+    let failed = out.failed_folder.expect("the discarded run is kept");
+    assert!(failed.is_dir(), "{}", failed.display());
+}
+
+#[test]
+fn a_run_that_exits_zero_but_writes_a_failure_marker_is_discarded() {
+    let f = fixture(vec![checked(
+        "logger",
+        &["/c", "echo", "%AGORA_TEST_LOG%", ">", r"Data\PatchLog.txt"],
+        &[],
+        vec![marker("Data/PatchLog.txt", "Failed to generate behavior")],
+    )]);
+
+    let out = f
+        .run_as(
+            "logger",
+            &StagingLauncher::new().with_env("AGORA_TEST_LOG", "Failed to generate behavior"),
+            CaptureMode::Links,
+        )
+        .unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(0));
+    let reason = out.failure.clone().expect("the outcome says why");
+    assert!(reason.contains("Data/PatchLog.txt"), "{reason}");
+    assert!(reason.contains("Failed to generate behavior"), "{reason}");
+    assert!(f.generated("logger").is_none());
+    let failed = out.failed_folder.expect("the discarded run is kept");
+    assert!(failed.join("Data/PatchLog.txt").is_file());
+}
+
+#[test]
+fn a_run_that_keeps_its_required_outputs_and_writes_no_marker_is_promoted() {
+    let f = fixture(vec![checked(
+        "logger",
+        &[
+            "/c",
+            "echo",
+            "made>",
+            r"Data\required.txt",
+            "&",
+            "echo",
+            "%AGORA_TEST_LOG%",
+            ">",
+            r"Data\PatchLog.txt",
+        ],
+        &["Data/required.txt"],
+        vec![marker("Data/PatchLog.txt", "Failed to generate behavior")],
+    )]);
+
+    let out = f
+        .run_as(
+            "logger",
+            &StagingLauncher::new().with_env("AGORA_TEST_LOG", "all good"),
+            CaptureMode::Links,
+        )
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.failure, None);
+    assert_eq!(out.current.as_deref(), Some("1"));
+    let gen = f.generation_dir("logger", "1");
+    assert!(gen.join("Data/required.txt").is_file());
+    assert!(gen.join("Data/PatchLog.txt").is_file());
+}
+
+/// A tool shaped like the declared Pandora Behaviour Engine (MASTER_SPEC §26.9): it works on the real
+/// install, and its one required output is the master behaviour file. The fake is `cmd`, as for the others.
+fn pandora_shaped(args: &[&str]) -> ToolDefinition {
+    let mut t = checked(
+        "pandora",
+        args,
+        &["Data/meshes/actors/character/behaviors/0_master.hkx"],
+        Vec::new(),
+    );
+    t.name = "Pandora Behaviour Engine".into();
+    t.uses_install_path = true;
+    t
+}
+
+#[test]
+fn a_pandora_shaped_run_that_writes_its_behaviour_file_under_the_vfs_is_promoted() {
+    let f = fixture(vec![pandora_shaped(&[
+        "/c",
+        "mkdir",
+        r"Data\meshes\actors\character\behaviors",
+        "&",
+        "echo",
+        "made>",
+        r"Data\meshes\actors\character\behaviors\0_master.hkx",
+    ])]);
+
+    let out = f
+        .run_as("pandora", &StagingLauncher::new(), CaptureMode::Vfs)
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.capture, CaptureMethod::Vfs);
+    assert!(f
+        .generation_dir("pandora", "1")
+        .join("Data/meshes/actors/character/behaviors/0_master.hkx")
+        .is_file());
+}
+
+#[test]
+fn a_pandora_shaped_run_that_exits_zero_and_writes_nothing_is_discarded() {
+    // An empty run would replace the game's previous behaviour files with nothing, so it must not be promoted.
+    let f = fixture(vec![pandora_shaped(&["/c", "echo", "nothing to do"])]);
+
+    let out = f
+        .run_as("pandora", &StagingLauncher::new(), CaptureMode::Vfs)
+        .unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(0));
+    let reason = out.failure.clone().expect("the outcome says why");
+    assert!(
+        reason.contains("required output 'Data/meshes/actors/character/behaviors/0_master.hkx'"),
+        "{reason}"
+    );
+    assert!(f.generated("pandora").is_none());
+}
+
+/// The declared magic of Pandora's master behaviour file: a packed Havok file, little-endian.
+fn pandora_magic() -> Vec<RequiredMagic> {
+    vec![RequiredMagic {
+        file: RelPath::new("Data/meshes/actors/character/behaviors/0_master.hkx").unwrap(),
+        magic: "57e0e05710c0c010".into(),
+    }]
+}
+
+#[test]
+fn a_required_file_that_does_not_start_with_its_magic_is_discarded_and_named() {
+    // The XML fallback of the real Pandora writes `<?xml` where a packed Havok file belongs. It exits 0 and
+    // the file exists, so only the magic check can refuse it.
+    let mut t = pandora_shaped(&[
+        "/c",
+        "mkdir",
+        r"Data\meshes\actors\character\behaviors",
+        "&",
+        "echo",
+        "^<?xml version=1.0",
+        ">",
+        r"Data\meshes\actors\character\behaviors\0_master.hkx",
+    ]);
+    t.required_magic = pandora_magic();
+    let f = fixture(vec![t]);
+
+    let out = f
+        .run_as("pandora", &StagingLauncher::new(), CaptureMode::Vfs)
+        .unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(0));
+    let reason = out.failure.clone().expect("the outcome says why");
+    assert!(reason.contains("0_master.hkx"), "{reason}");
+    assert!(reason.contains("does not start with"), "{reason}");
+    assert!(f.generated("pandora").is_none());
+    assert!(out
+        .failed_folder
+        .expect("the discarded run is kept")
+        .is_dir());
+}
+
+#[test]
+fn a_required_file_that_starts_with_its_magic_is_promoted() {
+    let source_dir = TempDir::new().unwrap();
+    let source = source_dir.path().join("source.bin");
+    std::fs::write(
+        &source,
+        [0x57u8, 0xE0, 0xE0, 0x57, 0x10, 0xC0, 0xC0, 0x10, 0x00, 0x00],
+    )
+    .unwrap();
+    let mut t = pandora_shaped(&[
+        "/c",
+        "mkdir",
+        r"Data\meshes\actors\character\behaviors",
+        "&",
+        "copy",
+        "/b",
+        // No quotes: a quoted argument reaches cmd with backslash-quotes. The temp path has no spaces.
+        "%AGORA_TEST_SOURCE%",
+        r"Data\meshes\actors\character\behaviors\0_master.hkx",
+    ]);
+    t.required_magic = pandora_magic();
+    let f = fixture(vec![t]);
+
+    let out = f
+        .run_as(
+            "pandora",
+            &StagingLauncher::new().with_env("AGORA_TEST_SOURCE", &source.to_string_lossy()),
+            CaptureMode::Vfs,
+        )
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.failure, None);
+}
+
+#[test]
+fn a_magic_that_is_not_hex_discards_the_run_rather_than_matching_anything() {
+    let mut t = pandora_shaped(&[
+        "/c",
+        "mkdir",
+        r"Data\meshes\actors\character\behaviors",
+        "&",
+        "echo",
+        "made>",
+        r"Data\meshes\actors\character\behaviors\0_master.hkx",
+    ]);
+    t.required_magic = vec![RequiredMagic {
+        file: RelPath::new("Data/meshes/actors/character/behaviors/0_master.hkx").unwrap(),
+        magic: "5z".into(),
+    }];
+    let f = fixture(vec![t]);
+
+    let out = f
+        .run_as("pandora", &StagingLauncher::new(), CaptureMode::Vfs)
+        .unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    let reason = out.failure.expect("the outcome says why");
+    assert!(reason.contains("not valid hex"), "{reason}");
+}
+
+#[test]
+fn two_tools_that_declare_a_conflict_warn_only_when_both_have_enabled_output() {
+    // Two behaviour engines writing the same files: a warning, not a refusal (MASTER_SPEC §26.9).
+    let mut first = writes_or_fails("alpha");
+    first.conflicts_with = vec![ToolId::new("beta").unwrap()];
+    let f = fixture(vec![first, writes_or_fails("beta")]);
+    let conflicts = |f: &Fixture| -> Vec<(String, String)> {
+        game_tools::output_findings(&f.ctx, f.id(), &f.def)
+            .unwrap()
+            .into_iter()
+            .filter(|x| x.status == OutputStatus::Conflict)
+            .map(|x| (x.tool, x.message))
+            .collect()
+    };
+
+    f.run_ok("alpha", &StagingLauncher::new());
+    assert!(conflicts(&f).is_empty(), "{:?}", conflicts(&f));
+
+    f.run_ok("beta", &StagingLauncher::new());
+    let found = conflicts(&f);
+    let tools: Vec<&str> = found.iter().map(|(tool, _)| tool.as_str()).collect();
+    assert_eq!(tools.len(), 2, "{found:?}");
+    assert!(
+        tools.contains(&"alpha") && tools.contains(&"beta"),
+        "{found:?}"
+    );
+    assert!(found[0].1.contains("enable one of them"), "{found:?}");
+}
+
+#[test]
+fn a_failure_marker_is_searched_only_in_files_the_run_wrote() {
+    // The marker's text is in a mod's file that the run does not write, so the run is promoted.
+    let f = fixture(vec![checked(
+        "quiet",
+        &["/c", "echo", "fine", ">", r"Data\other.txt"],
+        &[],
+        vec![marker("Data/PatchLog.txt", "Failed to generate behavior")],
+    )]);
+    f.add_mod(
+        "Old log",
+        &[("Data/PatchLog.txt", b"Failed to generate behavior\r\n")],
+    );
+
+    let out = f
+        .run_as("quiet", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+}
+
+#[test]
+fn a_nonzero_exit_is_discarded_and_the_outcome_says_which_code() {
+    let f = fixture(vec![writes_or_fails("nemesis")]);
+
+    let out = f
+        .run_as(
+            "nemesis",
+            &StagingLauncher::new().with_env("AGORA_TEST_FAIL", "1"),
+            CaptureMode::Links,
+        )
+        .unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    let failure = out.failure.as_deref().expect("the outcome says why");
+    assert!(
+        failure.starts_with("the tool exited with code 3"),
+        "{failure}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A tool's own mod is copied for its run (MASTER_SPEC §26.9, slice 4d).
+// ---------------------------------------------------------------------------
+
+/// The bytes of the 64-bit `cmd.exe`, which a test puts in a mod as the tool's executable.
+fn cmd_exe() -> Vec<u8> {
+    std::fs::read(r"C:\Windows\System32\cmd.exe").unwrap()
+}
+
+/// `tool` with its executable at `exe`, a path under the runtime root.
+fn at_exe(mut tool: ToolDefinition, exe: &str) -> ToolDefinition {
+    tool.launch.executable = GamePath::Runtime {
+        path: RelPath::new(exe).unwrap(),
+    };
+    tool
+}
+
+/// The id of the layer a content item was added as.
+fn content_layer_id(f: &Fixture, item: &str) -> String {
+    get_manifest(&f.ctx, f.id())
+        .unwrap()
+        .layers
+        .layers()
+        .iter()
+        .find_map(|layer| match &layer.source {
+            LayerSource::Content { content } if content.as_str() == item => {
+                Some(layer.id.as_str().to_string())
+            }
+            _ => None,
+        })
+        .expect("the content item is a layer of the instance")
+}
+
+#[test]
+fn under_links_a_tool_overwrites_a_file_in_its_own_mod_and_the_mod_is_unchanged() {
+    let cmd = cmd_exe();
+    let f = fixture(vec![at_exe(
+        tool(
+            "owner",
+            "Owner",
+            &["/c", "echo", "changed", ">", r"Data\Tool\own.txt"],
+        ),
+        "Data/Tool/Tool.exe",
+    )]);
+    let item = f.add_mod(
+        "Owner mod",
+        &[
+            ("Data/Tool/Tool.exe", cmd.as_slice()),
+            ("Data/Tool/own.txt", b"original"),
+        ],
+    );
+    let layer = content_layer_id(&f, &item);
+    let before = f.content_bytes(&item, "Data/Tool/own.txt");
+
+    let out = f
+        .run_as("owner", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.copied_layer.as_deref(), Some(layer.as_str()));
+    assert!(
+        out.written.contains(&"Data/Tool/own.txt".to_string()),
+        "{:?}",
+        out.written
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir("owner", "1").join("Data/Tool/own.txt"))
+            .unwrap()
+            .trim(),
+        "changed"
+    );
+    assert_eq!(f.content_bytes(&item, "Data/Tool/own.txt"), before);
+    assert!(names(&f.writable_dir()).is_empty());
+    assert!(!f.deployed_game_dir().exists());
+}
+
+#[test]
+fn under_swap_a_tool_overwrites_a_file_in_its_own_mod_and_the_mod_and_real_data_are_unchanged() {
+    let cmd = cmd_exe();
+    let f = fixture(vec![at_exe(
+        swap_tool(
+            "owner",
+            "Owner",
+            &["/c", "echo", "changed", ">", r"Data\Tool\own.txt"],
+        ),
+        "Data/Tool/Tool.exe",
+    )]);
+    let item = f.add_mod(
+        "Owner mod",
+        &[
+            ("Data/Tool/Tool.exe", cmd.as_slice()),
+            ("Data/Tool/own.txt", b"original"),
+        ],
+    );
+    let before_mod = f.content_bytes(&item, "Data/Tool/own.txt");
+    let before_real = snapshot(&real_data(&f));
+
+    // Under a swap every file is a copy, so the tool's own mod is copied with the rest and no layer is
+    // copied separately (MASTER_SPEC §26.9, decision 9).
+    let _swap = SwapTest::same_volume();
+    let out = f
+        .run_as("owner", &StagingLauncher::new(), CaptureMode::Swap)
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.capture, CaptureMethod::Swap);
+    assert_eq!(out.copied_layer, None);
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir("owner", "1").join("Data/Tool/own.txt"))
+            .unwrap()
+            .trim(),
+        "changed"
+    );
+    assert_eq!(f.content_bytes(&item, "Data/Tool/own.txt"), before_mod);
+    assert_eq!(snapshot(&real_data(&f)), before_real);
+    assert!(!journal_file(&f).exists());
+}
+
+#[test]
+fn a_tool_that_overwrites_a_file_in_another_mod_is_still_refused_under_links() {
+    let cmd = cmd_exe();
+    let f = fixture(vec![at_exe(
+        tool(
+            "owner",
+            "Owner",
+            &["/c", "echo", "changed", ">", r"Data\Other\x.txt"],
+        ),
+        "Data/Tool/Tool.exe",
+    )]);
+    f.add_mod("Owner mod", &[("Data/Tool/Tool.exe", cmd.as_slice())]);
+    let other = f.add_mod("Other mod", &[("Data/Other/x.txt", b"keep")]);
+    let before = f.content_bytes(&other, "Data/Other/x.txt");
+
+    // Whether the content store's ACL refuses the write (the run is not promoted) or lets it through
+    // (the change check refuses it), the other mod's object keeps its bytes.
+    match f.run_as("owner", &StagingLauncher::new(), CaptureMode::Links) {
+        Ok(out) => assert!(!out.promoted, "{out:?}"),
+        Err(ToolError::LinkedFileChanged { paths, .. }) => {
+            assert_eq!(paths, vec!["Data/Other/x.txt".to_string()]);
+        }
+        Err(other) => panic!("{other:?}"),
+    }
+    assert!(f.generated("owner").is_none());
+    assert_eq!(f.content_bytes(&other, "Data/Other/x.txt"), before);
+}
+
+#[test]
+fn the_executable_is_copied_from_the_layer_that_wins_its_path() {
+    let cmd = cmd_exe();
+    let f = fixture(vec![at_exe(
+        tool(
+            "owner",
+            "Owner",
+            &["/c", "echo", "changed", ">", r"Data\Tool\own.txt"],
+        ),
+        "Data/Tool/Tool.exe",
+    )]);
+    let lower = f.add_mod(
+        "Lower",
+        &[
+            ("Data/Tool/Tool.exe", cmd.as_slice()),
+            ("Data/Tool/own.txt", b"lower"),
+        ],
+    );
+    // Added later, so it sits above the lower mod and wins the executable's path.
+    let upper = f.add_mod(
+        "Upper",
+        &[
+            ("Data/Tool/Tool.exe", cmd.as_slice()),
+            ("Data/Tool/own.txt", b"upper"),
+        ],
+    );
+    let winner = content_layer_id(&f, &upper);
+    let loser = content_layer_id(&f, &lower);
+    assert_eq!(
+        planned(&f.plan(DeployMode::Links), "Data/Tool/Tool.exe")
+            .unwrap()
+            .layer_id,
+        winner
+    );
+
+    let out = f
+        .run_as("owner", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.copied_layer.as_deref(), Some(winner.as_str()));
+    assert_ne!(out.copied_layer.as_deref(), Some(loser.as_str()));
+}
+
+#[test]
+fn under_the_vfs_no_content_layer_is_copied_for_a_run() {
+    // The VFS copies up on write, so the fake launcher's VFS route copies nothing for the tool's mod.
+    let cmd = cmd_exe();
+    let f = fixture(vec![at_exe(
+        writes_or_fails("nemesis"),
+        "Data/Tool/Tool.exe",
+    )]);
+    f.add_mod("Owner mod", &[("Data/Tool/Tool.exe", cmd.as_slice())]);
+
+    let out = f.run("nemesis", &StagingLauncher::new()).unwrap();
+
+    assert_eq!(out.capture, CaptureMethod::Vfs);
+    assert_eq!(out.copied_layer, None);
+}
+
+#[test]
+fn a_run_that_drops_a_required_output_from_the_game_is_discarded_even_though_it_exits_zero() {
+    // The shape of the real incident: generation 1 has the behaviour file; the next run exits 0 and
+    // writes only its logs. Promotion would leave the game without the file, so the run is discarded.
+    // cmd skips the `&`-chained commands after a false `if`, so the conditional comes last.
+    let f = fixture(vec![checked(
+        "behaviour",
+        &[
+            "/c",
+            "echo",
+            "%AGORA_TEST_LOG%",
+            ">",
+            r"Data\PatchLog.txt",
+            "&",
+            "if",
+            "not",
+            "defined",
+            "AGORA_TEST_LOGS_ONLY",
+            "echo",
+            "made>",
+            r"Data\0_master.hkx",
+        ],
+        &["Data/0_master.hkx"],
+        Vec::new(),
+    )]);
+    let first = f
+        .run_as(
+            "behaviour",
+            &StagingLauncher::new().with_env("AGORA_TEST_LOG", "all good"),
+            CaptureMode::Links,
+        )
+        .unwrap();
+    assert!(first.promoted, "{first:?}");
+    assert!(f
+        .generation_dir("behaviour", "1")
+        .join("Data/0_master.hkx")
+        .is_file());
+
+    let out = f
+        .run_as(
+            "behaviour",
+            &StagingLauncher::new()
+                .with_env("AGORA_TEST_LOG", "all good")
+                .with_env("AGORA_TEST_LOGS_ONLY", "1"),
+            CaptureMode::Links,
+        )
+        .unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(0));
+    let reason = out.failure.clone().expect("the outcome says why");
+    assert!(
+        reason.contains("required output 'Data/0_master.hkx'"),
+        "{reason}"
+    );
+    assert_eq!(f.generated("behaviour").unwrap().0, "1");
+    assert!(f
+        .generation_dir("behaviour", "1")
+        .join("Data/0_master.hkx")
+        .is_file());
+}
+
+#[test]
+fn a_required_output_a_content_mod_provides_passes_though_the_run_does_not_write_it() {
+    let f = fixture(vec![checked(
+        "logger",
+        &["/c", "echo", "log", ">", r"Data\log.txt"],
+        &["Data/mod_provided.txt"],
+        Vec::new(),
+    )]);
+    f.add_mod("Provider", &[("Data/mod_provided.txt", b"from the mod")]);
+
+    let out = f
+        .run_as("logger", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap();
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.failure, None);
+    assert_eq!(out.current.as_deref(), Some("1"));
+}
+
+#[test]
+fn a_run_that_deletes_a_required_output_a_mod_provided_is_discarded() {
+    let f = fixture(vec![checked(
+        "deleter",
+        &[
+            "/c",
+            "echo",
+            "log>",
+            r"Data\log.txt",
+            "&",
+            "del",
+            r"Data\mod_provided.txt",
+        ],
+        &["Data/mod_provided.txt"],
+        Vec::new(),
+    )]);
+    f.add_mod("Provider", &[("Data/mod_provided.txt", b"from the mod")]);
+
+    let out = f
+        .run_as("deleter", &StagingLauncher::new(), CaptureMode::Links)
+        .unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    let reason = out.failure.clone().expect("the outcome says why");
+    assert!(
+        reason.contains("required output 'Data/mod_provided.txt'"),
+        "{reason}"
+    );
+    assert!(f.generated("deleter").is_none());
+}
+
+/// The machine type in a PE file's header (`IMAGE_FILE_HEADER.Machine`), read without running it.
+fn pe_machine(path: &Path) -> std::io::Result<u16> {
+    use std::io::{Error, Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let mut dos = [0u8; 64];
+    file.read_exact(&mut dos)?;
+    if &dos[..2] != b"MZ" {
+        return Err(Error::other("not an MZ executable"));
+    }
+    let header_at = u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]);
+    file.seek(SeekFrom::Start(u64::from(header_at)))?;
+    let mut head = [0u8; 6];
+    file.read_exact(&mut head)?;
+    if &head[..4] != b"PE\0\0" {
+        return Err(Error::other("no PE signature"));
+    }
+    Ok(u16::from_le_bytes([head[4], head[5]]))
+}
+
+/// Read only: the real Nemesis 0.84 executable is a 32-bit program, so under the VFS it needs the
+/// 32-bit DLL, and the locator names the x86 folder beside the 64-bit DLL from `AGORA_VFS_DLL`. The
+/// executable is never run.
+#[test]
+#[ignore = "reads the PE headers of the real Nemesis exe and the DLLs (never runs them): set AGORA_VFS_DLL and AGORA_VFS_DLL_X86"]
+fn the_real_nemesis_exe_is_32_bit_and_the_locator_picks_the_x86_dll() {
+    const I386: u16 = 0x014c;
+    const AMD64: u16 = 0x8664;
+    // Another test in this file sets AGORA_VFS_DLL_X86 to a missing path while it runs.
+    let _lock = X86_DLL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = Path::new(
+        r"D:\Skyrim-MO2-Salvage\MO2\mods\090 - Nemesis Unlimited Behavior Engine 0.84\Nemesis_Engine\Nemesis Unlimited Behavior Engine.exe",
+    );
+    assert!(exe.is_file(), "{} does not exist", exe.display());
+    let machine = pe_machine(exe).expect("read the executable's PE header");
+    assert_eq!(
+        machine, I386,
+        "Nemesis should be 32-bit, got machine {machine:#x}"
+    );
+
+    let dll64 = PathBuf::from(
+        std::env::var_os("AGORA_VFS_DLL").expect("set AGORA_VFS_DLL to the 64-bit agora_vfs.dll"),
+    );
+    let x86 = agora_core::game_launch::locate_dll_x86(&dll64);
+    assert_eq!(
+        x86,
+        PathBuf::from(
+            std::env::var_os("AGORA_VFS_DLL_X86")
+                .expect("set AGORA_VFS_DLL_X86 to the 32-bit agora_vfs.dll")
+        ),
+        "the locator should pick the 32-bit DLL the environment names"
+    );
+    assert!(x86.is_file(), "{} does not exist", x86.display());
+    assert_eq!(
+        pe_machine(&x86).expect("read the 32-bit DLL's header"),
+        I386
+    );
+    assert_eq!(
+        pe_machine(&dll64).expect("read the 64-bit DLL's header"),
+        AMD64
+    );
+}
+
+fn write_user_tools(f: &Fixture, content: &[u8]) -> PathBuf {
+    let path = f.instance_dir().join("user_tools.json");
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+fn add_user_tool(
+    f: &Fixture,
+    name: &str,
+    exe: &str,
+) -> Result<agora_core::game_user_tools::UserTool, agora_core::game_user_tools::UserToolError> {
+    game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: name.to_string(),
+            exe: exe.to_string(),
+            args: Vec::new(),
+            output_is_mod: false,
+            output_folder: None,
+            keeps_output: false,
+        },
+    )
+}
+
+#[test]
+fn user_tool_edits_wait_for_the_instance_lock() {
+    use std::time::{Duration, Instant};
+
+    use agora_core::lock_manager::LockResource;
+
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let id = f.id().to_string();
+    let hold = |duration: Duration| {
+        let guard = f
+            .ctx
+            .lock_manager
+            .acquire(LockResource::Instance(id.clone()), "test")
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(duration);
+            drop(guard);
+        })
+    };
+
+    let released = hold(Duration::from_millis(700));
+    let start = Instant::now();
+    let tool = add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let add_wait = start.elapsed();
+    released.join().unwrap();
+    assert!(
+        add_wait >= Duration::from_millis(500),
+        "adding a user tool did not wait for the instance lock: {add_wait:?}"
+    );
+
+    let released = hold(Duration::from_millis(700));
+    let start = Instant::now();
+    game_user_tools::remove(&f.ctx, &id, &tool.id).unwrap();
+    let remove_wait = start.elapsed();
+    released.join().unwrap();
+    assert!(
+        remove_wait >= Duration::from_millis(500),
+        "removing a user tool did not wait for the instance lock: {remove_wait:?}"
+    );
+}
+
+#[test]
+fn user_tool_edits_fail_fast_while_a_tool_run_holds_the_instance_lock() {
+    use std::time::{Duration, Instant};
+
+    use agora_core::lock_manager::LockResource;
+
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let tool = add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let held = f
+        .ctx
+        .lock_manager
+        .acquire(LockResource::Instance(f.id().to_string()), "tool-run")
+        .unwrap();
+
+    let start = Instant::now();
+    let add_error = add_user_tool(&f, "Other", "Data/tools/My.exe").unwrap_err();
+    let remove_error = game_user_tools::remove(&f.ctx, f.id(), &tool.id).unwrap_err();
+    let waited = start.elapsed();
+    drop(held);
+
+    assert!(
+        add_error.to_string().contains("a tool is running"),
+        "adding a tool did not fail fast: {add_error}"
+    );
+    assert!(
+        remove_error.to_string().contains("a tool is running"),
+        "removing a tool did not fail fast: {remove_error}"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "user-tool edits waited for the tool run's lock: {waited:?}"
+    );
+}
+
+#[test]
+fn a_missing_user_tools_file_is_an_empty_list() {
+    let f = fixture(Vec::new());
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn listing_the_user_tools_of_an_unknown_instance_is_an_error() {
+    let f = fixture(Vec::new());
+    let error = game_user_tools::list(&f.ctx, "not-an-instance").expect_err("unknown instance");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InstanceNotFound(_)
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_malformed_or_wrong_version_or_unreadable_user_tools_file_is_an_error_and_add_leaves_it_alone()
+{
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for (label, bytes) in [
+        ("malformed", b"{\"version\":1,\"tools\":[".to_vec()),
+        ("wrong version", b"{\"version\":2,\"tools\":[]}".to_vec()),
+        ("unreadable", b"\xff\xfe\x00".to_vec()),
+    ] {
+        let path = write_user_tools(&f, &bytes);
+        assert!(
+            game_user_tools::list(&f.ctx, f.id()).is_err(),
+            "{label}: list must not read as no tools"
+        );
+        assert!(
+            add_user_tool(&f, "My Tool", "Data/tools/My.exe").is_err(),
+            "{label}: add must not overwrite the file"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "{label}: the file changed"
+        );
+    }
+}
+
+#[test]
+fn refused_executable_paths_are_named() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let refused = [
+        "",
+        "   ",
+        "C:/tools/My.exe",
+        "/tools/My.exe",
+        r"..\tools\My.exe",
+        "Data/../My.exe",
+        "Data/./My.exe",
+        "CON.exe",
+        "Data/tools/NUL.exe",
+        "Data/tools/My.exe.",
+        "Data/tools/My.exe ",
+        "Data/tools/My.txt",
+        "Data//tools/My.exe",
+        "Data/tools/My.exe:stream",
+    ];
+    for exe in refused {
+        let error =
+            add_user_tool(&f, "My Tool", exe).expect_err(&format!("{exe:?} must be refused"));
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidExe(_)
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+}
+
+#[test]
+fn an_exe_from_a_disabled_mod_is_refused() {
+    let f = fixture(Vec::new());
+    let enabled = f.add_mod("Enabled Tools", &[("Data/tools/On.exe", b"MZ")]);
+    let disabled = f.add_mod("Disabled Tools", &[("Data/tools/Off.exe", b"MZ")]);
+    assert_ne!(enabled, disabled);
+    set_content_enabled(&f.ctx, f.id(), &disabled, false).unwrap();
+    add_user_tool(&f, "On", "Data/tools/On.exe").unwrap();
+    let error = add_user_tool(&f, "Off", "Data/tools/Off.exe").expect_err("a disabled mod's exe");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidExe(_)
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn adding_the_same_exe_twice_is_refused() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "My Tool", r"Data\tools\My.exe").unwrap();
+    let first = game_user_tools::list(&f.ctx, f.id()).unwrap();
+    assert_eq!(
+        first[0].exe, "Data/tools/My.exe",
+        "forward slashes are stored"
+    );
+    let error = add_user_tool(&f, "My Tool again", "data/TOOLS/my.exe").expect_err("duplicate");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::Duplicate { .. }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_blank_name_or_one_longer_than_the_limit_is_refused() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for name in ["", "   "] {
+        let error = add_user_tool(&f, name, "Data/tools/My.exe").expect_err("blank");
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidName(_)
+            ),
+            "{error:?}"
+        );
+    }
+    let long = "a".repeat(NAME_MAX_CHARS + 1);
+    let error = add_user_tool(&f, &long, "Data/tools/My.exe").expect_err("too long");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidName(_)
+        ),
+        "{error:?}"
+    );
+    let exact = "a".repeat(NAME_MAX_CHARS);
+    add_user_tool(&f, &exact, "Data/tools/My.exe").unwrap();
+}
+
+#[test]
+fn removing_an_unknown_tool_id_is_an_error_and_removing_edits_only_the_list() {
+    let f = fixture(Vec::new());
+    let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let tool = add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let error = game_user_tools::remove(&f.ctx, f.id(), "not-a-tool").expect_err("unknown id");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::NotFound(_)
+        ),
+        "{error:?}"
+    );
+    game_user_tools::remove(&f.ctx, f.id(), &tool.id).unwrap();
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+    assert_eq!(
+        game_user_tools::find_candidates(&f.ctx, f.id(), &f.def)
+            .unwrap()
+            .into_iter()
+            .filter(|candidate| candidate.mod_id == item)
+            .count(),
+        1,
+        "the mod's files are untouched"
+    );
+}
+
+#[test]
+fn two_mods_shipping_the_same_exe_path_give_one_row_for_the_winner() {
+    let f = fixture(Vec::new());
+    f.add_mod("Lower", &[("Data/tools/Shared.exe", b"lower")]);
+    f.add_mod("Upper", &[("Data/tools/Shared.exe", b"upper")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let rows: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.exe.eq_ignore_ascii_case("Data/tools/Shared.exe"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{candidates:?}");
+    assert_eq!(
+        rows[0].mod_name, "Upper",
+        "the deployment's winner is the row"
+    );
+}
+
+#[test]
+fn a_known_tool_is_matched_by_the_file_name_of_its_executable() {
+    let mut known = tool("mytool", "My Tool", &[]);
+    known.launch.executable = GamePath::Runtime {
+        path: RelPath::new("Data/MyTool/My Tool.exe").unwrap(),
+    };
+    known.launch.working_directory = GamePath::Runtime {
+        path: RelPath::new("Data/MyTool").unwrap(),
+    };
+    let f = fixture(vec![known]);
+    f.add_mod("My Tool", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let row = candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .exe
+                .eq_ignore_ascii_case("Data/MyTool/My Tool.exe")
+        })
+        .unwrap_or_else(|| panic!("no row for the known tool: {candidates:?}"));
+    assert_eq!(row.known_tool_id.as_deref(), Some("mytool"));
+    assert_eq!(row.suggested_name, "My Tool");
+    assert_eq!(row.mod_name, "My Tool");
+}
+
+#[test]
+fn installer_executables_are_the_only_ones_left_out() {
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[
+            ("Data/tools/Keep.exe", b"MZ"),
+            ("Data/tools/uninstall.exe", b"MZ"),
+            ("Data/tools/Unins000.exe", b"MZ"),
+        ],
+    );
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let exes: Vec<&str> = candidates
+        .iter()
+        .map(|candidate| candidate.exe.as_str())
+        .collect();
+    assert_eq!(exes, vec!["Data/tools/Keep.exe"]);
+    assert_eq!(EXCLUDED_EXE_NAMES, &["uninstall.exe", "unins000.exe"]);
+}
+
+#[test]
+fn the_list_is_written_atomically_and_reads_back_with_its_arguments() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let tool = game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: "  My Tool  ".into(),
+            exe: "Data/tools/My.exe".into(),
+            args: vec!["-a".into(), "x".into()],
+            output_is_mod: false,
+            output_folder: None,
+            keeps_output: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(tool.name, "My Tool");
+    let file = f.instance_dir().join("user_tools.json");
+    let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(stored["version"], 1);
+    assert_eq!(stored["tools"][0]["args"][1], "x");
+}
+
+// ---- review/tools: hostile cases for the user's own tools (cross-review of d9202f0) ----
+
+fn mytool_known_at_a_nested_path() -> ToolDefinition {
+    let mut known = tool("mytool", "My Tool", &[]);
+    known.launch.executable = GamePath::Runtime {
+        path: RelPath::new("Data/MyTool/My Tool.exe").unwrap(),
+    };
+    known.launch.working_directory = GamePath::Runtime {
+        path: RelPath::new("Data/MyTool").unwrap(),
+    };
+    known
+}
+
+#[test]
+fn a_known_tools_exe_that_only_a_disabled_mod_ships_is_refused() {
+    let f = fixture(vec![mytool_known_at_a_nested_path()]);
+    let disabled = f.add_mod("My Tool", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    set_content_enabled(&f.ctx, f.id(), &disabled, false).unwrap();
+    let error = add_user_tool(&f, "My Tool", "Data/MyTool/My Tool.exe")
+        .expect_err("the only copy of the exe is in a disabled mod");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidExe(_)
+        ),
+        "{error:?}"
+    );
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn more_hostile_exe_spellings_are_refused_as_invalid_exe() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let refused = [
+        "C:x.exe",
+        "c:/Data/tools/My.exe",
+        r"\\server\share\My.exe",
+        "//server/share/My.exe",
+        "/Data/tools/My.exe",
+        r"..\..\evil.exe",
+        "./Data/tools/My.exe",
+        "Data/tools/prn.exe",
+        "Data/tools/COM1.exe",
+        "Data/tools/lpt9.EXE",
+        "Data/tools/My.exe..",
+        "Data/tools/My .exe ",
+        "Data/tools/My.exe\t",
+        "Data/tools/.exe",
+        "Data/tools/My.exe\u{0}",
+        " Data/tools/My.exe",
+        "Data/tools/",
+        "Data/tools/My.exe/",
+    ];
+    for exe in refused {
+        let error =
+            add_user_tool(&f, "My Tool", exe).expect_err(&format!("{exe:?} must be refused"));
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidExe(_)
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn an_exe_that_no_enabled_mod_provides_is_refused() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for exe in [
+        "Game.exe",
+        "Data/Skyrim.bsa",
+        "Data/tools/uninstall.exe",
+        "Data/tools/Unins000.exe",
+        "Data/tools/Missing.exe",
+    ] {
+        let error = add_user_tool(&f, "My Tool", exe).expect_err(exe);
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidExe(_)
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+}
+
+#[test]
+fn the_stored_exe_is_the_listed_path_whatever_the_spelling_of_the_input() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let tool = add_user_tool(&f, "My Tool", r"data\TOOLS\my.EXE").unwrap();
+    assert_eq!(tool.exe, "Data/tools/My.exe");
+    assert_eq!(
+        game_user_tools::list(&f.ctx, f.id()).unwrap()[0].exe,
+        "Data/tools/My.exe"
+    );
+}
+
+#[test]
+fn a_malformed_user_tools_file_in_every_shape_is_an_error_for_list_add_and_remove() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let shapes: [&[u8]; 11] = [
+        b"null",
+        b"",
+        b"  \n",
+        b"[]",
+        b"{}",
+        br#"{"version":1}"#,
+        br#"{"version":1,"tools":null}"#,
+        br#"{"version":"1","tools":[]}"#,
+        br#"{"version":-1,"tools":[]}"#,
+        br#"{"version":0,"tools":[]}"#,
+        br#"{"version":1,"tools":[{"id":"a","name":"x","args":[]}]}"#,
+    ];
+    for bytes in shapes {
+        let path = write_user_tools(&f, bytes);
+        let label = String::from_utf8_lossy(bytes).into_owned();
+        assert!(
+            game_user_tools::list(&f.ctx, f.id()).is_err(),
+            "{label}: list must not read as no tools"
+        );
+        assert!(
+            add_user_tool(&f, "My Tool", "Data/tools/My.exe").is_err(),
+            "{label}: add must refuse"
+        );
+        assert!(
+            game_user_tools::remove(&f.ctx, f.id(), "a").is_err(),
+            "{label}: remove must refuse"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "{label}: file changed"
+        );
+    }
+}
+
+#[test]
+fn a_user_tools_path_that_is_a_folder_is_an_error_and_add_leaves_it_alone() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let path = f.instance_dir().join("user_tools.json");
+    std::fs::create_dir_all(&path).unwrap();
+    assert!(game_user_tools::list(&f.ctx, f.id()).is_err());
+    assert!(add_user_tool(&f, "My Tool", "Data/tools/My.exe").is_err());
+    assert!(path.is_dir(), "add must not replace the folder");
+}
+
+#[test]
+fn a_mod_whose_record_cannot_be_read_is_an_error_not_no_candidates() {
+    let f = fixture(Vec::new());
+    let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    std::fs::write(f.ctx.paths.content_item_path(&item), b"{ not json").unwrap();
+    assert!(
+        game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).is_err(),
+        "an unreadable mod must not read as no candidates"
+    );
+    assert!(add_user_tool(&f, "My Tool", "Data/tools/My.exe").is_err());
+}
+
+#[test]
+fn a_name_with_a_control_character_is_refused() {
+    // Judgement call, not in the brief's list: a name with a line break or a bell would break the
+    // tab's layout. The brief is silent, so this test records the gap rather than a rule it states.
+    let names = [
+        "My\nTool",
+        "My\u{7}Tool",
+        "My\u{0}Tool",
+        "My\tTool",
+        "My\r\nTool",
+    ];
+    let f = fixture(Vec::new());
+    // One exe per name, so an accepted name cannot make a later one a duplicate.
+    let files: Vec<(String, Vec<u8>)> = (0..names.len())
+        .map(|i| (format!("Data/tools/T{i}.exe"), b"MZ".to_vec()))
+        .collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.as_slice()))
+        .collect();
+    f.add_mod("Tools", &refs);
+    let mut accepted = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        match add_user_tool(&f, name, &format!("Data/tools/T{i}.exe")) {
+            Err(agora_core::game_user_tools::UserToolError::InvalidName(_)) => {}
+            Err(other) => panic!("{name:?} gave {other:?}"),
+            Ok(_) => accepted.push(*name),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "control characters accepted in a name: {accepted:?}"
+    );
+}
+
+#[test]
+fn an_80_character_name_of_multibyte_letters_is_accepted_and_81_refused() {
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[("Data/tools/A.exe", b"MZ"), ("Data/tools/B.exe", b"MZ")],
+    );
+    let eighty = "é".repeat(80);
+    assert_eq!(eighty.len(), 160, "the test relies on multi-byte letters");
+    let tool = add_user_tool(&f, &eighty, "Data/tools/A.exe").expect("80 characters");
+    assert_eq!(tool.name, eighty);
+    let eighty_one = "漢".repeat(81);
+    let error = add_user_tool(&f, &eighty_one, "Data/tools/B.exe").expect_err("81 characters");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidName(_)
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn surrounding_whitespace_is_trimmed_before_the_length_is_counted() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/A.exe", b"MZ")]);
+    let padded = format!("   {}   ", "a".repeat(80));
+    let tool = add_user_tool(&f, &padded, "Data/tools/A.exe").expect("80 characters once trimmed");
+    assert_eq!(tool.name, "a".repeat(80));
+}
+
+#[test]
+fn remove_of_an_unknown_id_changes_nothing_and_creates_no_file() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let path = f.instance_dir().join("user_tools.json");
+    assert!(game_user_tools::remove(&f.ctx, f.id(), "x").is_err());
+    assert!(!path.exists(), "a refused remove must not create the list");
+    add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert!(game_user_tools::remove(&f.ctx, f.id(), "").is_err());
+    assert!(game_user_tools::remove(&f.ctx, f.id(), "NOT-THE-ID").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn no_temporary_file_is_left_beside_the_list_after_add_remove_or_a_refused_add() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let _ = add_user_tool(&f, "Again", "Data/tools/Missing.exe");
+    let tool = add_user_tool(&f, "Gone", "Data/tools/My.exe").err();
+    assert!(tool.is_some(), "a duplicate is refused");
+    let id = game_user_tools::list(&f.ctx, f.id()).unwrap()[0].id.clone();
+    game_user_tools::remove(&f.ctx, f.id(), &id).unwrap();
+    let leftovers: Vec<String> = names(&f.instance_dir())
+        .into_iter()
+        .filter(|name| name.contains("user_tools") && name != "user_tools.json")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn one_exe_path_in_two_mods_differing_only_in_case_is_one_row() {
+    let f = fixture(Vec::new());
+    f.add_mod("Lower", &[("Data/tools/Shared.exe", b"lower")]);
+    f.add_mod("Upper", &[("data/TOOLS/shared.exe", b"upper")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let rows: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.exe.eq_ignore_ascii_case("data/tools/shared.exe"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{candidates:?}");
+    assert_eq!(rows[0].mod_name, "Upper");
+}
+
+#[test]
+fn unicode_and_odd_file_names_are_found_suggested_and_added_as_listed() {
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[
+            ("Data/工具/ツール.exe", b"MZ"),
+            ("Data/tools/My Tool (x86).exe", b"MZ"),
+        ],
+    );
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let unicode = candidates
+        .iter()
+        .find(|c| c.exe == "Data/工具/ツール.exe")
+        .unwrap_or_else(|| panic!("no unicode row: {candidates:?}"));
+    assert_eq!(unicode.suggested_name, "ツール");
+    let odd = candidates
+        .iter()
+        .find(|c| c.exe == "Data/tools/My Tool (x86).exe")
+        .unwrap_or_else(|| panic!("no odd-name row: {candidates:?}"));
+    assert_eq!(odd.suggested_name, "My Tool (x86)");
+    let tool = add_user_tool(&f, "Tool", "Data/工具/ツール.exe").unwrap();
+    assert_eq!(tool.exe, "Data/工具/ツール.exe");
+}
+
+#[test]
+fn a_declared_tool_that_no_mod_provides_is_not_offered() {
+    let f = fixture(vec![mytool_known_at_a_nested_path()]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert!(candidates.is_empty(), "{candidates:?}");
+}
+
+#[test]
+fn an_empty_or_blank_exe_is_refused_as_invalid_exe() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for exe in ["", " ", "\t", "  \n  "] {
+        let error =
+            add_user_tool(&f, "My Tool", exe).expect_err(&format!("{exe:?} must be refused"));
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidExe(_)
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+/// Each refusal names the rule it broke. Several of these spellings are also not in the candidate
+/// list, so the bare variant cannot tell the validator from the fallback: the message can.
+#[test]
+fn a_refused_exe_is_refused_by_its_own_rule_not_only_by_being_unknown() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let cases: [(&str, &str); 16] = [
+        ("Data//tools/My.exe", "empty path segment"),
+        ("C:x.exe", "absolute path"),
+        ("c:/Data/tools/My.exe", "existing .exe file"),
+        (r"\\server\share\My.exe", "existing .exe file"),
+        ("/Data/tools/My.exe", "absolute path"),
+        (r"..\..\evil.exe", "leave the game folder"),
+        ("./Data/tools/My.exe", "leave the game folder"),
+        ("Data/../My.exe", "leave the game folder"),
+        ("Data/tools/prn.exe", "names a device"),
+        ("NUL.exe", "names a device"),
+        ("con.exe", "names a device"),
+        ("Data/tools/My.exe..", "dot or a space"),
+        ("Data/tools/My .exe ", "dot or a space"),
+        ("Data/tools/My.bat", "not an .exe"),
+        ("Data/tools/.exe", "not an .exe"),
+        ("Data/tools/My.exe/", "empty path segment"),
+    ];
+    let mut wrong = Vec::new();
+    for (exe, expected) in cases {
+        match add_user_tool(&f, "My Tool", exe) {
+            Err(agora_core::game_user_tools::UserToolError::InvalidExe(message))
+                if message.contains(expected) => {}
+            other => wrong.push(format!("{exe:?} expected '{expected}', got {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn a_blank_name_is_refused_as_invalid_name() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    for name in ["", " ", "\t", "\n", "\u{a0}", " \u{3000} "] {
+        let error = add_user_tool(&f, name, "Data/tools/My.exe")
+            .expect_err(&format!("{name:?} must be refused"));
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::InvalidName(_)
+            ),
+            "{name:?} gave {error:?}"
+        );
+    }
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn the_same_exe_by_other_case_or_separator_is_refused_as_a_duplicate() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "First", "Data/tools/My.exe").unwrap();
+    for exe in ["data/tools/my.exe", r"data\TOOLS\MY.EXE"] {
+        let error = add_user_tool(&f, "Second", exe).expect_err(exe);
+        assert!(
+            matches!(
+                error,
+                agora_core::game_user_tools::UserToolError::Duplicate { .. }
+            ),
+            "{exe:?} gave {error:?}"
+        );
+    }
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn an_exe_only_a_disabled_mod_ships_is_refused_and_one_an_enabled_mod_also_ships_is_accepted() {
+    let f = fixture(Vec::new());
+    let off = f.add_mod(
+        "Off",
+        &[
+            ("Data/tools/Off.exe", b"MZ"),
+            ("Data/tools/Both.exe", b"MZ"),
+        ],
+    );
+    f.add_mod("On", &[("Data/tools/Both.exe", b"MZ")]);
+    set_content_enabled(&f.ctx, f.id(), &off, false).unwrap();
+    let error = add_user_tool(&f, "Off", "Data/tools/Off.exe").expect_err("disabled mod");
+    assert!(
+        matches!(
+            error,
+            agora_core::game_user_tools::UserToolError::InvalidExe(_)
+        ),
+        "{error:?}"
+    );
+    add_user_tool(&f, "Both", "Data/tools/Both.exe").expect("an enabled mod also ships it");
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_user_tools_file_that_cannot_be_read_is_an_error_and_is_left_alone() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let path = f.instance_dir().join("user_tools.json");
+    let before = std::fs::read(&path).unwrap();
+    {
+        // share_mode(0): no one else may open the file while this handle is held.
+        let _locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let listed = game_user_tools::list(&f.ctx, f.id());
+        assert!(
+            matches!(
+                listed,
+                Err(agora_core::game_user_tools::UserToolError::Unreadable { .. })
+            ),
+            "list must not read as no tools: {listed:?}"
+        );
+        assert!(matches!(
+            add_user_tool(&f, "Other", "Data/tools/My.exe"),
+            Err(agora_core::game_user_tools::UserToolError::Unreadable { .. })
+        ));
+        assert!(game_user_tools::remove(&f.ctx, f.id(), "anything").is_err());
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn a_user_tools_file_that_is_not_utf8_is_an_error_and_is_left_alone() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    let bytes: &[u8] = &[b'{', 0xff, 0xfe, b'}'];
+    let path = write_user_tools(&f, bytes);
+    assert!(game_user_tools::list(&f.ctx, f.id()).is_err());
+    assert!(add_user_tool(&f, "My Tool", "Data/tools/My.exe").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn a_failed_replace_leaves_no_temp_file_and_the_list_as_it_was() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[("Data/tools/My.exe", b"MZ"), ("Data/tools/B.exe", b"MZ")],
+    );
+    add_user_tool(&f, "My Tool", "Data/tools/My.exe").unwrap();
+    let path = f.instance_dir().join("user_tools.json");
+    let before = std::fs::read(&path).unwrap();
+    {
+        // share_mode(FILE_SHARE_READ): the file can be read but not replaced, so the final rename
+        // of the atomic write fails after the temporary file has been written.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let error = add_user_tool(&f, "Second", "Data/tools/B.exe");
+        assert!(
+            matches!(
+                error,
+                Err(agora_core::game_user_tools::UserToolError::Io(_))
+            ),
+            "the replace must fail with an I/O error while the file is held: {error:?}"
+        );
+        let leftovers: Vec<String> = names(&f.instance_dir())
+            .into_iter()
+            .filter(|name| name.contains("user_tools") && name != "user_tools.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary file left behind: {leftovers:?}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "the list changed");
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+}
+
+#[test]
+fn an_exe_in_a_mod_that_is_later_disabled_is_no_longer_offered() {
+    let f = fixture(Vec::new());
+    let mod_id = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    assert_eq!(
+        game_user_tools::find_candidates(&f.ctx, f.id(), &f.def)
+            .unwrap()
+            .len(),
+        1
+    );
+    set_content_enabled(&f.ctx, f.id(), &mod_id, false).unwrap();
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert!(candidates.is_empty(), "{candidates:?}");
+}
+
+#[test]
+fn the_installers_are_never_offered_in_any_case_and_add_refuses_them() {
+    let f = fixture(Vec::new());
+    f.add_mod(
+        "Tools",
+        &[
+            ("Data/tools/Setup.exe", b"MZ"),
+            ("Data/tools/Uninstall.EXE", b"MZ"),
+            ("Data/tools/unins000.exe", b"MZ"),
+            ("Data/tools/Uninstall.exe.bak", b"MZ"),
+        ],
+    );
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let offered: Vec<&str> = candidates.iter().map(|c| c.exe.as_str()).collect();
+    assert_eq!(offered, vec!["Data/tools/Setup.exe"], "{candidates:?}");
+    for exe in ["Data/tools/Uninstall.EXE", "Data/tools/unins000.exe"] {
+        assert!(
+            add_user_tool(&f, "Installer", exe).is_err(),
+            "{exe} must be refused"
+        );
+    }
+    assert_eq!(EXCLUDED_EXE_NAMES, &["uninstall.exe", "unins000.exe"]);
+}
+
+#[test]
+fn a_path_held_by_two_mods_is_one_row_for_the_file_the_deployment_uses() {
+    let f = fixture(Vec::new());
+    let lower = f.add_mod("Lower", &[("Data/tools/Shared.exe", b"lower")]);
+    let upper = f.add_mod("Upper", &[("Data/tools/Shared.exe", b"upper")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let plan = plan(&f.ctx, f.id(), &f.def, DeployMode::Links).unwrap();
+    let deployed = planned(&plan, "Data/tools/Shared.exe").expect("the deployment has it");
+    let FileSource::Content { item_id, .. } = &deployed.source else {
+        panic!("not a content file: {:?}", deployed.source);
+    };
+    assert_eq!(&candidates[0].mod_id, item_id);
+    assert_eq!(item_id, &upper);
+    assert_ne!(item_id, &lower);
+}
+
+#[test]
+fn a_path_held_by_two_mods_in_different_non_ascii_case_is_one_row() {
+    // On NTFS "Ü" and "ü" name the same file, so the two mods collide on disk. One row is right.
+    let f = fixture(Vec::new());
+    let upper = f.add_mod("Upper", &[("Data/Ü/Tool.exe", b"upper")]);
+    let lower = f.add_mod("Lower", &[("data/ü/tool.exe", b"lower")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    // The later mod wins, as it does for an ASCII case pair.
+    assert_eq!(candidates[0].mod_id, lower);
+    let plan = plan(&f.ctx, f.id(), &f.def, DeployMode::Links).unwrap();
+    let deployed = planned(&plan, "data/ü/tool.exe").expect("the deployment has it");
+    let FileSource::Content { item_id, .. } = &deployed.source else {
+        panic!("not a content file: {:?}", deployed.source);
+    };
+    assert_eq!(item_id, &lower);
+    assert_ne!(item_id, &upper);
+}
+
+#[test]
+fn a_declared_tool_a_mod_ships_is_offered_with_its_id_and_name() {
+    let f = fixture(vec![mytool_known_at_a_nested_path()]);
+    f.add_mod("My Tool Pack", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    assert_eq!(candidates[0].known_tool_id.as_deref(), Some("mytool"));
+    assert_eq!(candidates[0].suggested_name, "My Tool");
+    assert_eq!(candidates[0].mod_name, "My Tool Pack");
+}
+
+#[test]
+fn a_program_in_the_instances_own_files_is_a_candidate_and_can_be_added() {
+    let f = fixture(Vec::new());
+    // The writable layer is the instance's own files; its overrides layer holds INI files only, by
+    // design, so an executable there is not part of the deployment.
+    for exe in ["Data/Made/Written.exe", "Data/Mine/Mine.exe"] {
+        let path = f.instance_dir().join("writable").join(exe);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"MZ").unwrap();
+    }
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let exes: Vec<&str> = candidates.iter().map(|c| c.exe.as_str()).collect();
+    assert_eq!(exes, ["Data/Made/Written.exe", "Data/Mine/Mine.exe"]);
+    for candidate in &candidates {
+        assert_eq!(
+            candidate.source,
+            game_user_tools::CandidateSource::InstanceFiles
+        );
+        assert_eq!(candidate.mod_id, "");
+    }
+    let added = game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: "Written".into(),
+            exe: "Data/Made/Written.exe".into(),
+            args: Vec::new(),
+            output_is_mod: false,
+            output_folder: None,
+            keeps_output: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(added.exe, "Data/Made/Written.exe");
+}
+
+#[test]
+fn the_games_own_programs_are_marked_and_a_mods_are_not() {
+    let f = fixture(Vec::new());
+    f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    // Game.exe is the game's launch program, here supplied by a mod as a script extender's is.
+    f.add_mod("Loader", &[("Game.exe", b"MZ")]);
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    let source_of = |exe: &str| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.exe == exe)
+            .map(|candidate| candidate.source)
+    };
+    assert_eq!(
+        source_of("Data/tools/My.exe"),
+        Some(game_user_tools::CandidateSource::Mod)
+    );
+    assert_eq!(
+        source_of("Game.exe"),
+        Some(game_user_tools::CandidateSource::Game)
+    );
+}
+
+#[test]
+fn a_mod_whose_record_is_missing_is_an_error_not_no_candidates() {
+    let f = fixture(Vec::new());
+    let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    std::fs::remove_file(f.ctx.paths.content_item_path(&item)).unwrap();
+    assert!(
+        game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).is_err(),
+        "a missing mod record must not read as no candidates"
+    );
+}
+
+#[test]
+fn a_staged_output_that_is_a_different_file_on_ntfs_is_never_dropped_as_unchanged() {
+    // NTFS keeps `i.txt` and `ı.txt` as two files (checked 2026-10-31). fold_path_case maps both to
+    // `I.TXT`, so the tool's own `ı.txt` is matched to the mod's `i.txt`, found equal, and deleted.
+    let f = fixture(vec![tool("sweep", "Sweep", &["/c", "echo", "x"])]);
+    f.add_mod("Mod", &[("Data/i.txt", b"same bytes")]);
+    let staging = stage(&f, "sweep", &[("Data/ı.txt", b"same bytes")]);
+
+    assert_eq!(drop_unchanged(&f, "sweep", &staging), 0);
+    assert_eq!(
+        std::fs::read(staging.join("Data/ı.txt")).unwrap(),
+        b"same bytes"
+    );
+}
+// ---- user tools run through the pipeline, and mod-output tools import their folder ----
+
+fn cmd_bytes() -> Vec<u8> {
+    std::fs::read(r"C:\Windows\System32\cmd.exe").unwrap()
+}
+
+fn add_user_tool_full(
+    f: &Fixture,
+    name: &str,
+    exe: &str,
+    args: &[&str],
+    output_is_mod: bool,
+    output_folder: Option<&str>,
+) -> game_user_tools::UserTool {
+    game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: name.to_string(),
+            exe: exe.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            output_is_mod,
+            output_folder: output_folder.map(|s| s.to_string()),
+            keeps_output: false,
+        },
+    )
+    .unwrap()
+}
+
+fn run_user_tool(
+    f: &Fixture,
+    id: &str,
+    launcher: &dyn Launcher,
+    move_aside: bool,
+) -> Result<RunOutcome, ToolError> {
+    game_tools::run_user_tool(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        id,
+        CaptureMode::Auto,
+        false,
+        move_aside,
+        launcher,
+        &CancellationToken::new(),
+    )
+}
+
+fn content_layer_item(f: &Fixture, layer_marker: &str) -> Option<String> {
+    get_manifest(&f.ctx, f.id())
+        .unwrap()
+        .layers
+        .layers()
+        .iter()
+        .find_map(|layer| match &layer.source {
+            LayerSource::Content { content } if layer.id.as_str().starts_with(layer_marker) => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+}
+
+fn item_names(f: &Fixture) -> Vec<String> {
+    agora_core::content_store::list_items(&f.ctx)
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| entry.readable().map(|item| item.name.clone()))
+        .collect()
+}
+
+#[test]
+fn a_user_tool_runs_through_the_pipeline_and_its_writes_become_its_generated_layer() {
+    let f = fixture(Vec::new());
+    f.add_mod("Runner", &[("Data/tools/Run.exe", &cmd_bytes())]);
+    let user = add_user_tool_full(
+        &f,
+        "Runner",
+        "Data/tools/Run.exe",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "user>",
+            r"Data\user.txt",
+        ],
+        false,
+        None,
+    );
+    let canonical = game_tools::user_tool_id(&user.id).unwrap().to_string();
+
+    let out = run_user_tool(&f, &user.id, &StagingLauncher::new(), false).expect("user tool run");
+
+    assert!(out.promoted, "{out:?}");
+    assert_eq!(out.tool, canonical);
+    assert_eq!(out.current.as_deref(), Some("1"));
+    assert_eq!(out.written, vec!["Data/user.txt".to_string()]);
+    assert_eq!(
+        f.generated(&canonical).map(|(generation, _)| generation),
+        Some("1".to_string())
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.generation_dir(&canonical, "1").join("Data/user.txt")).unwrap(),
+        "user\r\n"
+    );
+}
+
+#[test]
+fn a_user_tools_output_can_be_rolled_back() {
+    let f = fixture(Vec::new());
+    f.add_mod("Runner", &[("Data/tools/Run.exe", &cmd_bytes())]);
+    let user = add_user_tool_full(
+        &f,
+        "Runner",
+        "Data/tools/Run.exe",
+        &["/c", "mkdir", "Data", "&", "echo", "one>", r"Data\user.txt"],
+        false,
+        None,
+    );
+    let canonical = game_tools::user_tool_id(&user.id).unwrap();
+
+    run_user_tool(&f, &user.id, &StagingLauncher::new(), false).unwrap();
+    let second = run_user_tool(&f, &user.id, &StagingLauncher::new(), false).unwrap();
+    assert_eq!(second.current.as_deref(), Some("2"));
+
+    let state = game_tools::rollback(&f.ctx, f.id(), &f.def, &canonical).unwrap();
+    assert_eq!(state.current.as_deref(), Some("1"));
+    assert_eq!(state.previous.as_deref(), Some("2"));
+}
+
+#[test]
+fn a_stored_user_tool_id_can_never_take_a_declared_tools_place() {
+    let declared = tool("user-nemesis", "Nemesis", &["/c", "exit", "0"]);
+    let f = fixture(vec![declared]);
+    // A list written by hand names the id that would collide with the declared tool.
+    for (id, refused) in [
+        ("nemesis", true),
+        ("NEMESIS", true),
+        ("", true),
+        ("../x", true),
+        ("user-nemesis", false),
+    ] {
+        let json = format!(
+            r#"{{"version":1,"tools":[{{"id":"{id}","name":"Fake","exe":"Game.exe","args":[],"known_tool_id":null}}]}}"#
+        );
+        std::fs::write(f.instance_dir().join("user_tools.json"), json).unwrap();
+        let result = run_user_tool(&f, id, &StagingLauncher::new(), false);
+        assert!(
+            f.generated("user-nemesis").is_none(),
+            "{id:?}: the declared tool gained output"
+        );
+        if refused {
+            assert!(result.is_err(), "{id:?} ran: {result:?}");
+        }
+    }
+}
+
+#[test]
+fn removing_a_user_tool_keeps_its_generated_output() {
+    let f = fixture(Vec::new());
+    f.add_mod("Runner", &[("Data/tools/Run.exe", &cmd_bytes())]);
+    let user = add_user_tool_full(
+        &f,
+        "Runner",
+        "Data/tools/Run.exe",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "user>",
+            r"Data\user.txt",
+        ],
+        false,
+        None,
+    );
+    let canonical = game_tools::user_tool_id(&user.id).unwrap().to_string();
+    run_user_tool(&f, &user.id, &StagingLauncher::new(), false).unwrap();
+    assert!(f.generated(&canonical).is_some());
+
+    game_user_tools::remove(&f.ctx, f.id(), &user.id).unwrap();
+
+    assert!(
+        f.generated(&canonical).is_some(),
+        "removing a tool from the list must not delete output the user may still want"
+    );
+}
+
+struct ModTool {
+    _dir: TempDir,
+    exe: PathBuf,
+    folder: PathBuf,
+}
+
+fn mod_tool_fixture() -> (Fixture, ModTool) {
+    let f = fixture(Vec::new());
+    let dir = TempDir::new().unwrap();
+    let exe = dir.path().join("Tool.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_agora-tool-test-helper"), &exe).unwrap();
+    let folder = dir.path().join("Out");
+    (
+        f,
+        ModTool {
+            _dir: dir,
+            exe,
+            folder,
+        },
+    )
+}
+
+fn add_mod_tool(f: &Fixture, tool: &ModTool, _tag: &str) -> game_user_tools::UserTool {
+    add_user_tool_full(
+        f,
+        "My Tool",
+        &tool.exe.to_string_lossy(),
+        &["--write", "Out/x.txt", "--content-env", "AGORA_RUN"],
+        true,
+        Some("Out"),
+    )
+}
+
+#[test]
+fn a_mod_output_run_imports_one_item_and_a_second_run_adds_another() {
+    let (f, tool) = mod_tool_fixture();
+    let user = add_mod_tool(&f, &tool, "one");
+
+    let first = run_user_tool(
+        &f,
+        &user.id,
+        &StagingLauncher::plain().with_env("AGORA_RUN", "one"),
+        false,
+    )
+    .unwrap();
+    assert!(first.promoted, "{first:?}");
+    let first_item = first.current.clone().unwrap();
+    let layer = content_layer_item(&f, "tool-output:").expect("a mod-output layer");
+    assert_eq!(layer, first_item);
+    assert_eq!(item_names(&f).len(), 1);
+
+    let second = run_user_tool(
+        &f,
+        &user.id,
+        &StagingLauncher::plain().with_env("AGORA_RUN", "two"),
+        true,
+    )
+    .unwrap();
+    assert!(second.promoted, "{second:?}");
+    let second_item = second.current.clone().unwrap();
+    assert_ne!(first_item, second_item);
+    assert_eq!(
+        content_layer_item(&f, "tool-output:"),
+        Some(second_item.clone())
+    );
+    assert_eq!(item_names(&f).len(), 2, "the first item stays in the store");
+
+    game_tools::use_tool_output(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &game_tools::user_tool_id(&user.id).unwrap(),
+        &first_item,
+    )
+    .unwrap();
+    assert_eq!(
+        content_layer_item(&f, "tool-output:"),
+        Some(first_item.clone())
+    );
+}
+
+#[test]
+fn a_mod_output_run_that_fails_or_leaves_the_folder_empty_imports_nothing() {
+    let (f, tool) = mod_tool_fixture();
+
+    // Exit 0 and write nothing.
+    let empty = add_user_tool_full(
+        &f,
+        "Empty",
+        &tool.exe.to_string_lossy(),
+        &[],
+        true,
+        Some("Out"),
+    );
+    let out = run_user_tool(&f, &empty.id, &StagingLauncher::plain(), false).unwrap();
+    assert!(!out.promoted, "{out:?}");
+    assert!(
+        out.failure
+            .as_deref()
+            .unwrap_or_default()
+            .contains("output folder"),
+        "{out:?}"
+    );
+    assert!(content_layer_item(&f, "tool-output:").is_none());
+    assert!(item_names(&f).is_empty());
+    game_user_tools::remove(&f.ctx, f.id(), &empty.id).unwrap();
+
+    // Exit 1 after writing files.
+    std::fs::remove_dir_all(&tool.folder).ok();
+    let failed = add_user_tool_full(
+        &f,
+        "Failed",
+        &tool.exe.to_string_lossy(),
+        &["--write", "Out/x.txt", "--content", "x", "--exit", "1"],
+        true,
+        Some("Out"),
+    );
+    let out = run_user_tool(&f, &failed.id, &StagingLauncher::plain(), false).unwrap();
+    assert!(!out.promoted, "{out:?}");
+    assert!(content_layer_item(&f, "tool-output:").is_none());
+    assert!(item_names(&f).is_empty());
+    game_user_tools::remove(&f.ctx, f.id(), &failed.id).unwrap();
+
+    // A cancelled run.
+    std::fs::remove_dir_all(&tool.folder).ok();
+    let cancelled = add_user_tool_full(
+        &f,
+        "Cancelled",
+        &tool.exe.to_string_lossy(),
+        &[
+            "--write",
+            "Out/x.txt",
+            "--content",
+            "x",
+            "--sleep-ms",
+            "60000",
+        ],
+        true,
+        Some("Out"),
+    );
+    let token = CancellationToken::new();
+    token.cancel();
+    let out = game_tools::run_user_tool(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &cancelled.id,
+        CaptureMode::Auto,
+        false,
+        false,
+        &StagingLauncher::plain(),
+        &token,
+    )
+    .unwrap();
+    assert!(!out.promoted, "{out:?}");
+    assert!(content_layer_item(&f, "tool-output:").is_none());
+    assert!(item_names(&f).is_empty());
+}
+
+#[test]
+fn a_failed_run_keeps_the_tools_output_and_says_why() {
+    let (f, tool) = mod_tool_fixture();
+    let user = add_user_tool_full(
+        &f,
+        "Noisy",
+        &tool.exe.to_string_lossy(),
+        &[
+            "--stdout",
+            "built 12 parts",
+            "--stderr",
+            "the game folder is missing",
+            "--exit",
+            "9",
+        ],
+        true,
+        Some("Out"),
+    );
+
+    let out = run_user_tool(&f, &user.id, &StagingLauncher::plain(), false).unwrap();
+
+    assert!(!out.promoted, "{out:?}");
+    assert_eq!(out.exit_code, Some(9));
+    let failure = out.failure.as_deref().expect("the outcome says why");
+    assert!(failure.contains("the game folder is missing"), "{failure}");
+    assert!(failure.contains("built 12 parts"), "{failure}");
+    assert_eq!(out.stdout_tail.trim(), "built 12 parts");
+    assert_eq!(out.stderr_tail.trim(), "the game folder is missing");
+    let failed = out.failed_folder.expect("the discarded run is kept");
+    assert_eq!(
+        std::fs::read_to_string(failed.join("tool-stdout.txt"))
+            .unwrap()
+            .trim(),
+        "built 12 parts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(failed.join("tool-stderr.txt"))
+            .unwrap()
+            .trim(),
+        "the game folder is missing"
+    );
+}
+
+#[test]
+fn a_non_empty_output_folder_is_moved_aside_byte_for_byte_or_refused() {
+    let (f, tool) = mod_tool_fixture();
+    std::fs::create_dir_all(&tool.folder).unwrap();
+    std::fs::write(tool.folder.join("old.bin"), b"old bytes").unwrap();
+    let user = add_mod_tool(&f, &tool, "one");
+
+    let refused = run_user_tool(&f, &user.id, &StagingLauncher::plain(), false).unwrap_err();
+    assert!(
+        matches!(refused, ToolError::OutputFolderNotEmpty { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read(tool.folder.join("old.bin")).unwrap(),
+        b"old bytes"
+    );
+    assert!(item_names(&f).is_empty());
+
+    let out = run_user_tool(&f, &user.id, &StagingLauncher::plain(), true).unwrap();
+    assert!(out.promoted, "{out:?}");
+    let tool_id = game_tools::user_tool_id(&user.id).unwrap();
+    let aside_root = f
+        .instance_dir()
+        .join("tool-output-replaced")
+        .join(tool_id.as_str());
+    let moved: Vec<_> = std::fs::read_dir(&aside_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(
+        std::fs::read(moved[0].join("old.bin")).unwrap(),
+        b"old bytes"
+    );
+}
+
+#[test]
+fn a_move_aside_target_that_is_a_file_refuses_and_changes_nothing() {
+    let (f, tool) = mod_tool_fixture();
+    std::fs::create_dir_all(&tool.folder).unwrap();
+    std::fs::write(tool.folder.join("old.bin"), b"old bytes").unwrap();
+    let user = add_mod_tool(&f, &tool, "one");
+    let tool_id = game_tools::user_tool_id(&user.id).unwrap();
+    let replaced = f.instance_dir().join("tool-output-replaced");
+    std::fs::create_dir_all(&replaced).unwrap();
+    std::fs::write(replaced.join(tool_id.as_str()), b"not a folder").unwrap();
+
+    let error = run_user_tool(&f, &user.id, &StagingLauncher::plain(), true).unwrap_err();
+    assert!(error.to_string().contains("is a file"), "{error:?}");
+    assert_eq!(
+        std::fs::read(tool.folder.join("old.bin")).unwrap(),
+        b"old bytes"
+    );
+    assert!(item_names(&f).is_empty());
+}
+
+#[test]
+fn a_junction_in_a_mod_output_folder_is_refused_and_imports_nothing() {
+    let (f, tool) = mod_tool_fixture();
+    let outside = TempDir::new().unwrap();
+    let user = add_user_tool_full(
+        &f,
+        "Junction Tool",
+        &tool.exe.to_string_lossy(),
+        &[
+            "/c",
+            "mkdir",
+            "Out",
+            "&",
+            "mklink",
+            "/J",
+            r"Out\link",
+            "%AGORA_JUNCTION%",
+        ],
+        true,
+        Some("Out"),
+    );
+
+    let out = run_user_tool(
+        &f,
+        &user.id,
+        &StagingLauncher::plain().with_env("AGORA_JUNCTION", &outside.path().to_string_lossy()),
+        false,
+    )
+    .unwrap();
+    assert!(!out.promoted, "a junction must not be imported: {out:?}");
+    assert!(content_layer_item(&f, "tool-output:").is_none());
+    assert!(item_names(&f).is_empty());
+}
+
+#[test]
+fn a_user_tool_that_names_a_declared_tool_runs_as_that_tool() {
+    let f = fixture(vec![writes_or_fails("known")]);
+    let json = r#"{"version":1,"tools":[{"id":"mine","name":"Known","exe":"Game.exe","args":[],"known_tool_id":"known"}]}"#;
+    std::fs::write(f.instance_dir().join("user_tools.json"), json).unwrap();
+
+    let out = run_user_tool(&f, "mine", &StagingLauncher::new(), false).unwrap();
+
+    assert_eq!(out.tool, "known");
+    assert!(out.promoted, "{out:?}");
+    assert!(f.generated("known").is_some());
+    assert!(f.generated("user-mine").is_none());
+}
+
+#[test]
+fn an_absolute_user_exe_must_be_an_existing_exe_without_control_characters() {
+    let f = fixture(Vec::new());
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("Tool.exe");
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", &real).unwrap();
+    let text = dir.path().join("Tool.txt");
+    std::fs::write(&text, b"not a program").unwrap();
+
+    // The good absolute path is accepted.
+    add_user_tool_full(&f, "Good", &real.to_string_lossy(), &[], false, None);
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 1);
+
+    for exe in [
+        dir.path()
+            .join("missing.exe")
+            .to_string_lossy()
+            .into_owned(),
+        text.to_string_lossy().into_owned(),
+        format!("{}\u{0}", real.to_string_lossy()),
+    ] {
+        let result = game_user_tools::add(
+            &f.ctx,
+            f.id(),
+            NewUserTool {
+                name: "Bad".into(),
+                exe,
+                args: Vec::new(),
+                output_is_mod: false,
+                output_folder: None,
+                keeps_output: false,
+            },
+        );
+        assert!(result.is_err(), "an absolute bad exe was accepted");
+    }
+}
+
+// ---- tools that take their output folder as an argument, and PGPatcher's own setting ----
+
+/// A launcher that records the arguments and makes the output folder the run was given, then exits
+/// 0. Used to prove DynDOLOD and TexGen are passed their own per-run folder.
+struct OutputArgLauncher {
+    args: Mutex<Vec<std::ffi::OsString>>,
+    wrote: Mutex<bool>,
+}
+
+impl OutputArgLauncher {
+    fn new() -> Self {
+        Self {
+            args: Mutex::new(Vec::new()),
+            wrote: Mutex::new(false),
+        }
+    }
+
+    fn args(&self) -> Vec<String> {
+        self.args
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+impl Launcher for OutputArgLauncher {
+    fn locate_vfs_dll(&self) -> Result<PathBuf, String> {
+        Ok(PathBuf::from(r"C:\agora\agora_vfs.dll"))
+    }
+
+    fn launch(&self, prepared: &PreparedLaunch) -> Result<LaunchedGame, LaunchError> {
+        *self.args.lock().unwrap() = prepared.resolved.args.clone();
+        for arg in &prepared.resolved.args {
+            let text = arg.to_string_lossy();
+            if let Some(rest) = text.strip_prefix("-o:") {
+                let folder = PathBuf::from(rest.trim_matches('"'));
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("DynDOLOD.esp"), b"lod").unwrap();
+                *self.wrote.lock().unwrap() = true;
+            }
+        }
+        let mut plain = prepared.clone();
+        plain.vfs = None;
+        plain.resolved.args = vec![
+            std::ffi::OsString::from("/c"),
+            std::ffi::OsString::from("exit"),
+            std::ffi::OsString::from("0"),
+        ];
+        agora_core::game_launch::launch(&plain)
+    }
+}
+
+#[test]
+fn dyndolod_gets_its_own_output_folder_and_a_stale_folder_beside_it_is_untouched() {
+    let mut dyndolod = tool("dyndolod", "DynDOLOD", &[]);
+    dyndolod.output = ToolOutput::Mod {
+        folder: String::new(),
+        user_configured: false,
+    };
+    // https://dyndolod.info/Help/Command-Line-Argument
+    dyndolod.output_arg = Some("-o:\"{output}\"".to_string());
+    dyndolod.launch.arguments = vec![agora_game_api::LaunchValue::Literal {
+        value: "-sse".to_string(),
+    }];
+    let f = fixture(vec![dyndolod]);
+    deploy(&f.ctx, f.id(), &f.def, DeployMode::Virtual).unwrap();
+
+    let stale = f.deployed_game_dir().join("DynDOLOD_Output");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("old.esp"), b"old").unwrap();
+
+    let launcher = OutputArgLauncher::new();
+    let out = f.run_ok("dyndolod", &launcher);
+    assert!(out.promoted, "{out:?}");
+
+    let args = launcher.args();
+    assert!(args.iter().any(|arg| arg == "-sse"), "{args:?}");
+    let output_arg = args
+        .iter()
+        .find(|arg| arg.starts_with("-o:\""))
+        .unwrap_or_else(|| panic!("no -o: argument in {args:?}"));
+    let folder = PathBuf::from(output_arg.trim_start_matches("-o:").trim_matches('"'));
+    assert!(
+        folder.starts_with(f.instance_dir().join("tool-output").join("dyndolod")),
+        "the run's output is Agora's own folder, not next to the exe: {folder:?}"
+    );
+
+    assert_eq!(
+        f.content_bytes(&out.current.clone().unwrap(), "DynDOLOD.esp"),
+        b"lod"
+    );
+    assert_eq!(
+        std::fs::read(stale.join("old.esp")).unwrap(),
+        b"old",
+        "a folder another manager left next to the exe must not be touched"
+    );
+}
+
+#[test]
+fn a_pgpatcher_output_folder_inside_data_or_the_deployment_is_refused() {
+    let f = fixture(Vec::new());
+    let dir = TempDir::new().unwrap();
+    let exe = dir.path().join("PGPatcher.exe");
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).unwrap();
+    let exe_text = exe.to_string_lossy().into_owned();
+
+    let data_out = f._tmp.path().join("install").join("Data").join("PGOut");
+    std::fs::create_dir_all(&data_out).unwrap();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe_text,
+        &[],
+        true,
+        Some(&data_out.to_string_lossy()),
+    );
+    let refused = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), false).unwrap_err();
+    assert!(
+        refused.to_string().contains("inside the game"),
+        "a folder inside Data must be refused plainly: {refused:?}"
+    );
+
+    game_user_tools::remove(&f.ctx, f.id(), &tool.id).unwrap();
+    let deployment_out = f.deployed_game_dir().join("PGOut");
+    std::fs::create_dir_all(deployment_out.parent().unwrap()).unwrap();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe_text,
+        &[],
+        true,
+        Some(&deployment_out.to_string_lossy()),
+    );
+    let refused = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), false).unwrap_err();
+    assert!(
+        refused.to_string().contains("deployment"),
+        "a folder inside the deployment must be refused plainly: {refused:?}"
+    );
+}
+
+// ---- review probes for the tools-run change: each test below is a bug that fails on this branch ----
+
+/// A copy of `cmd.exe` named `PGPatcher.exe` in `<tmp>/tools`, outside the game.
+fn own_tool_exe() -> (TempDir, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let exe = dir.path().join("tools").join("PGPatcher.exe");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", &exe).unwrap();
+    (dir, exe)
+}
+
+/// A fixture whose game folder is `<tmp>/games/install`, so `<tmp>/games` holds the game. Returns
+/// the fixture and `<tmp>/games`.
+fn fixture_with_install_in_games() -> (Fixture, PathBuf) {
+    let tmp = TempDir::new().unwrap();
+    let def = definition(&[], false, false);
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(registry(&def, Vec::new()));
+    let games = tmp.path().join("games");
+    let install_dir = games.join("install");
+    std::fs::create_dir_all(install_dir.join("Data")).unwrap();
+    std::fs::copy(r"C:\Windows\System32\cmd.exe", install_dir.join("Game.exe")).unwrap();
+    std::fs::write(install_dir.join("Data").join("Skyrim.bsa"), b"BSA DATA").unwrap();
+    let inst = create(
+        &ctx,
+        &install_of(&install_dir),
+        &def,
+        "Tools",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("create instance");
+    (
+        Fixture {
+            _tmp: tmp,
+            ctx,
+            def,
+            inst,
+        },
+        games,
+    )
+}
+
+/// Bug: a PGPatcher output folder that CONTAINS the game passes validation, so move-aside moves the game.
+#[test]
+fn a_pgpatcher_output_folder_that_holds_the_game_is_refused_and_the_game_stays_put() {
+    let (f, games) = fixture_with_install_in_games();
+    let (_dir, exe) = own_tool_exe();
+    std::fs::write(games.join("old.bin"), b"old").unwrap();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &["/c", "exit", "0"],
+        true,
+        Some(&games.to_string_lossy()),
+    );
+
+    let _ = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+
+    assert!(
+        games.join("install").join("Game.exe").is_file(),
+        "the game was moved aside with the output folder that contains it"
+    );
+    assert!(games
+        .join("install")
+        .join("Data")
+        .join("Skyrim.bsa")
+        .is_file());
+}
+
+/// Bug: move-aside renames the tool's own folder before the run knows it can start.
+#[test]
+fn a_tool_whose_own_folder_is_its_output_folder_is_refused_before_anything_moves() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let tools_dir = exe.parent().unwrap().to_path_buf();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &["/c", "exit", "0"],
+        true,
+        Some(&tools_dir.to_string_lossy()),
+    );
+
+    let _ = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+
+    assert!(
+        exe.is_file(),
+        "the tool's own executable was moved aside with its output folder"
+    );
+}
+
+/// Bug: a `..` after a missing folder hides that the path lands in the game's Data folder.
+#[test]
+fn a_dot_dot_output_folder_that_reaches_the_game_through_a_missing_folder_is_refused() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let install = f._tmp.path().join("install");
+    let folder = f
+        ._tmp
+        .path()
+        .join("nope")
+        .join("..")
+        .join("install")
+        .join("Data")
+        .join("Out");
+    let out_text = folder.to_string_lossy().into_owned();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[
+            "/c",
+            "mkdir",
+            "%AGORA_OUT%",
+            "&",
+            "echo",
+            "x>",
+            r"%AGORA_OUT%\x.txt",
+        ],
+        true,
+        Some(&out_text),
+    );
+
+    let result = run_user_tool(
+        &f,
+        &tool.id,
+        &StagingLauncher::plain().with_env("AGORA_OUT", &out_text),
+        false,
+    );
+
+    assert!(
+        result.is_err(),
+        "an output folder inside the game was accepted: {result:?}"
+    );
+    assert!(
+        !install.join("Data").join("Out").exists(),
+        "the tool wrote into the game's Data folder"
+    );
+}
+
+/// Bug: a junction into the game's Data folder passes when the output folder does not exist yet.
+#[test]
+fn a_junction_to_the_game_data_folder_is_refused_when_the_output_folder_is_new() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let install = f._tmp.path().join("install");
+    let mods = f._tmp.path().join("mods");
+    std::fs::create_dir_all(&mods).unwrap();
+    let link = mods.join("link");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(install.join("Data"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "mklink /J failed");
+    let folder = link.join("Out");
+    let out_text = folder.to_string_lossy().into_owned();
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[
+            "/c",
+            "mkdir",
+            "%AGORA_OUT%",
+            "&",
+            "echo",
+            "x>",
+            r"%AGORA_OUT%\x.txt",
+        ],
+        true,
+        Some(&out_text),
+    );
+
+    let result = run_user_tool(
+        &f,
+        &tool.id,
+        &StagingLauncher::plain().with_env("AGORA_OUT", &out_text),
+        false,
+    );
+
+    assert!(
+        result.is_err(),
+        "a junction into the game's Data folder was accepted: {result:?}"
+    );
+    assert!(
+        !install.join("Data").join("Out").exists(),
+        "the tool wrote into the game's Data folder through the junction"
+    );
+}
+
+/// Bug: a user tool that names a declared mod tool drops the move-aside choice (run() has none).
+#[test]
+fn a_move_aside_choice_is_honoured_by_a_user_tool_that_names_a_declared_mod_tool() {
+    let mut pgpatcher = tool(
+        "pgpatcher",
+        "PGPatcher",
+        &[
+            "/c",
+            "mkdir",
+            "%AGORA_OUT%",
+            "&",
+            "echo",
+            "x>",
+            r"%AGORA_OUT%\x.txt",
+        ],
+    );
+    pgpatcher.output = ToolOutput::Mod {
+        folder: String::new(),
+        user_configured: true,
+    };
+    let f = fixture(vec![pgpatcher]);
+    let out = f._tmp.path().join("pg-out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("old.bin"), b"old").unwrap();
+    let out_text = out.to_string_lossy().into_owned();
+    let json = serde_json::json!({
+        "version": 1,
+        "tools": [{
+            "id": "mine",
+            "name": "PGPatcher",
+            "exe": "Game.exe",
+            "args": [],
+            "known_tool_id": "pgpatcher",
+            "output_is_mod": true,
+            "output_folder": out_text,
+        }]
+    })
+    .to_string();
+    std::fs::write(f.instance_dir().join("user_tools.json"), json).unwrap();
+
+    let result = run_user_tool(
+        &f,
+        "mine",
+        &StagingLauncher::plain().with_env("AGORA_OUT", &out_text),
+        true,
+    );
+
+    let outcome = result.expect("the person asked to move the old output aside");
+    assert!(outcome.promoted, "{outcome:?}");
+    assert!(!out.join("old.bin").exists());
+}
+
+/// Bug: the output is moved aside before the VFS start or launch, so a refused start still moves it.
+#[test]
+fn a_refused_start_moves_nothing_aside() {
+    let (f, tool) = mod_tool_fixture();
+    std::fs::create_dir_all(&tool.folder).unwrap();
+    std::fs::write(tool.folder.join("old.bin"), b"old bytes").unwrap();
+    let user = add_mod_tool(&f, &tool, "one");
+
+    let result = game_tools::run_user_tool(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &user.id,
+        CaptureMode::Vfs,
+        false,
+        true,
+        &StagingLauncher::without_vfs("no agora_vfs.dll in this test"),
+        &CancellationToken::new(),
+    );
+
+    assert!(
+        matches!(result, Err(ToolError::VfsUnavailable { .. })),
+        "{result:?}"
+    );
+    assert!(
+        tool.folder.join("old.bin").is_file(),
+        "the output was moved aside although the tool never ran"
+    );
+}
+
+/// A drive root contains the game, so it can never be an output folder.
+#[test]
+fn a_drive_root_as_the_output_folder_is_refused() {
+    use std::path::Component;
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let drive = f
+        ._tmp
+        .path()
+        .components()
+        .find_map(|component| match component {
+            Component::Prefix(prefix) => Some(prefix.as_os_str().to_os_string()),
+            _ => None,
+        })
+        .expect("the temp folder is on a drive");
+    let mut root = PathBuf::from(drive);
+    root.push(std::path::MAIN_SEPARATOR.to_string());
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[],
+        true,
+        Some(&root.to_string_lossy()),
+    );
+
+    let result = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+    assert!(result.is_err(), "a drive root was accepted: {result:?}");
+    assert!(f._tmp.path().join("install").join("Game.exe").is_file());
+}
+
+/// A verbatim (`\\?\`) spelling of the game path is the same folder and is refused.
+#[test]
+fn a_verbatim_unc_spelling_of_the_game_path_is_refused() {
+    let f = fixture(Vec::new());
+    let (_dir, exe) = own_tool_exe();
+    let install = f._tmp.path().join("install");
+    let verbatim = format!(r"\\?\{}", install.display());
+    let tool = add_user_tool_full(
+        &f,
+        "PGPatcher",
+        &exe.to_string_lossy(),
+        &[],
+        true,
+        Some(&verbatim),
+    );
+
+    let result = run_user_tool(&f, &tool.id, &StagingLauncher::plain(), true);
+    assert!(
+        result.is_err(),
+        "a verbatim spelling of the game folder was accepted: {result:?}"
+    );
+    assert!(install.join("Game.exe").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// Tools found in the instance's mods, and the list an import adds to (MASTER_SPEC §26.9).
+// ---------------------------------------------------------------------------
+
+/// A declared tool whose executable is at `exe`, which no base file provides.
+fn known_tool(id: &str, name: &str, exe: &str) -> ToolDefinition {
+    at_exe(tool(id, name, &[]), exe)
+}
+
+fn state_of(f: &Fixture, tool: &str) -> game_tools::ToolState {
+    game_tools::list(&f.ctx, f.id(), &f.def)
+        .unwrap()
+        .into_iter()
+        .find(|state| state.tool == tool)
+        .unwrap_or_else(|| panic!("no state for {tool}"))
+}
+
+fn presence(f: &Fixture) -> Vec<(String, bool)> {
+    game_user_tools::list_with_presence(&f.ctx, f.id(), &f.def)
+        .unwrap()
+        .into_iter()
+        .map(|(tool, present)| (tool.name, present))
+        .collect()
+}
+
+#[test]
+fn a_declared_tool_nobody_installed_is_not_present_and_a_mod_without_an_exe_adds_nothing() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    assert!(!state_of(&f, "mytool").is_present());
+
+    f.add_mod(
+        "Textures",
+        &[
+            ("Data/textures/a.dds", b"DDS"),
+            ("Data/MyTool/readme.txt", b"not the tool"),
+            ("Data/MyTool/My Tool.exe.bak", b"not the tool either"),
+        ],
+    );
+
+    let state = state_of(&f, "mytool");
+    assert_eq!(state.found, None);
+    assert!(!state.is_present());
+    assert!(game_user_tools::list(&f.ctx, f.id()).unwrap().is_empty());
+}
+
+#[test]
+fn installing_a_tools_mod_lists_the_tool_and_turning_the_mod_off_unlists_it() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    let item = f.add_mod("My Tool mod", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+
+    let state = state_of(&f, "mytool");
+    let found = state.found.clone().expect("the mod installs the tool");
+    assert_eq!(found.exe, "Data/MyTool/My Tool.exe");
+    assert_eq!(found.mod_id, item);
+    assert_eq!(found.mod_name, "My Tool mod");
+    assert!(found.at_declared_path);
+    assert!(state.is_present());
+
+    set_content_enabled(&f.ctx, f.id(), &item, false).unwrap();
+    assert!(
+        !state_of(&f, "mytool").is_present(),
+        "a mod that is off provides nothing"
+    );
+    set_content_enabled(&f.ctx, f.id(), &item, true).unwrap();
+    assert!(state_of(&f, "mytool").is_present());
+}
+
+#[test]
+fn a_tool_nested_deeper_and_in_another_case_is_still_found_where_it_is() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod(
+        "Packed one folder too deep",
+        &[("Data/Downloads/v2/MYTOOL/my tool.EXE", b"MZ")],
+    );
+
+    let found = state_of(&f, "mytool").found.expect("matched by file name");
+    assert_eq!(found.exe, "Data/Downloads/v2/MYTOOL/my tool.EXE");
+    assert!(!found.at_declared_path);
+}
+
+#[test]
+fn the_same_tool_in_two_mods_is_one_row_for_the_mod_that_wins_by_order() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod("Lower", &[("Data/MyTool/My Tool.exe", b"lower")]);
+    let upper = f.add_mod("Upper", &[("Data/Elsewhere/My Tool.exe", b"upper")]);
+
+    let states = game_tools::list(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(states.iter().filter(|s| s.tool == "mytool").count(), 1);
+    let found = state_of(&f, "mytool").found.unwrap();
+    assert_eq!(found.mod_name, "Upper");
+    assert_eq!(found.exe, "Data/Elsewhere/My Tool.exe");
+
+    // Move Upper below Lower: Lower now wins.
+    move_content(&f.ctx, f.id(), &upper, 0).unwrap();
+    let found = state_of(&f, "mytool").found.unwrap();
+    assert_eq!(found.mod_name, "Lower");
+    assert!(found.at_declared_path);
+}
+
+#[test]
+fn a_tool_with_output_stays_listed_when_its_mod_is_turned_off() {
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    let item = f.add_mod("My Tool mod", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    let output = TempDir::new().unwrap();
+    let file = output.path().join("out.txt");
+    std::fs::write(&file, b"built").unwrap();
+    game_tools::import_output(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("mytool").unwrap(),
+        &[("Data/out.txt".to_string(), file)],
+    )
+    .unwrap();
+
+    set_content_enabled(&f.ctx, f.id(), &item, false).unwrap();
+    let state = state_of(&f, "mytool");
+    assert_eq!(state.found, None, "the tool is not installed any more");
+    assert!(state.current.is_some());
+    assert!(state.is_present(), "its output is still there to manage");
+}
+
+#[test]
+fn a_tool_a_mod_ships_in_another_folder_runs_from_there() {
+    let cmd = cmd_exe();
+    let f = fixture(vec![at_exe(
+        tool(
+            "mytool",
+            "My Tool",
+            &["/c", "echo", "ran", ">", r"Data\ran.txt"],
+        ),
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod(
+        "Packed one folder too deep",
+        &[("Data/Extra/MyTool/MY TOOL.exe", cmd.as_slice())],
+    );
+
+    let out = f
+        .run_as("mytool", &StagingLauncher::new(), CaptureMode::Links)
+        .expect("the tool runs from where its mod put it");
+
+    assert!(out.promoted, "{out:?}");
+    assert!(
+        out.written.contains(&"Data/ran.txt".to_string()),
+        "{:?}",
+        out.written
+    );
+}
+
+#[test]
+fn a_user_added_tool_survives_its_mod_being_turned_off_and_says_it_is_missing() {
+    let f = fixture(Vec::new());
+    let item = f.add_mod("Tools", &[("Data/tools/My.exe", b"MZ")]);
+    add_user_tool(&f, "Mine", "Data/tools/My.exe").unwrap();
+    assert_eq!(presence(&f), vec![("Mine".to_string(), true)]);
+
+    set_content_enabled(&f.ctx, f.id(), &item, false).unwrap();
+    assert_eq!(presence(&f), vec![("Mine".to_string(), false)]);
+
+    // Another mod coming and going changes nothing for it.
+    let other = f.add_mod("Other", &[("Data/other.txt", b"x")]);
+    set_content_enabled(&f.ctx, f.id(), &other, false).unwrap();
+    set_content_enabled(&f.ctx, f.id(), &item, true).unwrap();
+    assert_eq!(presence(&f), vec![("Mine".to_string(), true)]);
+}
+
+#[test]
+fn an_import_adds_each_new_tool_once_and_refuses_paths_that_leave_the_game() {
+    use game_user_tools::ImportedTool;
+
+    let f = fixture(vec![known_tool(
+        "mytool",
+        "My Tool",
+        "Data/MyTool/My Tool.exe",
+    )]);
+    f.add_mod("My Tool mod", &[("Data/MyTool/My Tool.exe", b"MZ")]);
+    f.add_mod("Extras", &[("Data/Extras/Helper.exe", b"MZ")]);
+    let outside = TempDir::new().unwrap();
+    let external = outside.path().join("SSEEdit.exe");
+    std::fs::write(&external, b"MZ").unwrap();
+    let entry = |name: &str, exe: &str| NewUserTool {
+        name: name.into(),
+        exe: exe.into(),
+        args: vec!["-a".into()],
+        output_is_mod: false,
+        output_folder: None,
+        keeps_output: false,
+    };
+    let entries = || {
+        vec![
+            entry("My Tool", "Data/MyTool/My Tool.exe"),
+            entry("Helper", "data/extras/helper.exe"),
+            entry("Helper again", "Data/Extras/Helper.exe"),
+            entry("", &external.to_string_lossy()),
+            entry("Climber", "Data/../../Windows/System32/cmd.exe"),
+            entry("Gone", &outside.path().join("Gone.exe").to_string_lossy()),
+            entry("Off", "Data/NotHere/Off.exe"),
+        ]
+    };
+
+    let answers = game_user_tools::import_tools(&f.ctx, f.id(), entries()).unwrap();
+    assert!(
+        matches!(&answers[0], ImportedTool::AlreadyDetected { name } if name == "My Tool"),
+        "{answers:?}"
+    );
+    let ImportedTool::Added(helper) = &answers[1] else {
+        panic!("{answers:?}");
+    };
+    assert_eq!(
+        helper.exe, "Data/Extras/Helper.exe",
+        "the deployment's spelling"
+    );
+    assert_eq!(helper.args, vec!["-a".to_string()]);
+    assert!(
+        matches!(&answers[2], ImportedTool::AlreadyListed { .. }),
+        "{answers:?}"
+    );
+    let ImportedTool::Added(sseedit) = &answers[3] else {
+        panic!("{answers:?}");
+    };
+    assert_eq!(
+        sseedit.name, "SSEEdit",
+        "an empty name falls back to the file's stem"
+    );
+    for answer in &answers[4..] {
+        assert!(
+            matches!(answer, ImportedTool::Skipped { .. }),
+            "{answers:?}"
+        );
+    }
+    assert_eq!(game_user_tools::list(&f.ctx, f.id()).unwrap().len(), 2);
+
+    // Importing again adds nothing.
+    let again = game_user_tools::import_tools(&f.ctx, f.id(), entries()).unwrap();
+    assert!(
+        !again.iter().any(|a| matches!(a, ImportedTool::Added(_))),
+        "{again:?}"
+    );
+    let listed = game_user_tools::list(&f.ctx, f.id()).unwrap();
+    assert_eq!(listed.len(), 2);
+    // Nothing in the list leaves the game folder by a relative path.
+    assert!(listed.iter().all(|tool| !tool.exe.contains("..")));
+}
+
+#[test]
+fn an_import_with_nothing_to_add_writes_no_list() {
+    let f = fixture(Vec::new());
+    assert!(game_user_tools::import_tools(&f.ctx, f.id(), Vec::new())
+        .unwrap()
+        .is_empty());
+    assert!(!f.instance_dir().join("user_tools.json").exists());
+}
+
+#[test]
+fn a_run_only_tool_that_writes_nothing_simply_runs_and_makes_no_generation() {
+    let mut editor = tool("editor", "Editor", &["/c", "echo", "looked"]);
+    editor.run_only = true;
+    let f = fixture(vec![editor]);
+
+    let out = f.run_ok("editor", &StagingLauncher::new());
+
+    assert!(out.written.is_empty(), "{:?}", out.written);
+    assert_eq!(out.current, None);
+    assert_eq!(
+        f.generated("editor"),
+        None,
+        "no generated layer for a run that wrote nothing"
+    );
+    assert!(names(&f.tool_dir("editor"))
+        .iter()
+        .all(|name| name.parse::<u64>().is_err()));
+}
+
+#[test]
+fn a_run_only_tool_that_writes_keeps_what_it_wrote() {
+    let mut editor = tool(
+        "editor",
+        "Editor",
+        &[
+            "/c",
+            "mkdir",
+            "Data",
+            "&",
+            "echo",
+            "patch",
+            ">",
+            r"Data\Patch.esp",
+        ],
+    );
+    editor.run_only = true;
+    let f = fixture(vec![editor]);
+
+    let out = f.run_ok("editor", &StagingLauncher::new());
+
+    assert!(
+        out.written.contains(&"Data/Patch.esp".to_string()),
+        "{:?}",
+        out.written
+    );
+    assert_eq!(out.current.as_deref(), Some("1"));
+    assert!(f.generated("editor").is_some(), "an edit is never lost");
+}
+
+#[test]
+fn a_declared_tool_is_found_by_another_name_its_executable_goes_by() {
+    let mut editor = known_tool("sseedit", "SSEEdit", "Data/SSEEdit/SSEEdit.exe");
+    editor.executable_names = vec!["SSEEdit64.exe".into()];
+    let f = fixture(vec![editor]);
+    f.add_mod("xEdit", &[("Data/Tools/xEdit/sseedit64.EXE", b"MZ")]);
+
+    let found = state_of(&f, "sseedit")
+        .found
+        .expect("found by its 64-bit name");
+    assert_eq!(found.exe, "Data/Tools/xEdit/sseedit64.EXE");
+    // The candidate list recognises it too.
+    let candidates = game_user_tools::find_candidates(&f.ctx, f.id(), &f.def).unwrap();
+    assert_eq!(candidates[0].known_tool_id.as_deref(), Some("sseedit"));
+}
+
+#[test]
+fn a_user_tool_is_run_only_unless_it_keeps_output_or_writes_a_mod() {
+    let f = fixture(Vec::new());
+    let user = |keeps_output: bool, output_is_mod: bool| game_user_tools::UserTool {
+        id: "abc".into(),
+        name: "Mine".into(),
+        exe: "Data/tools/My.exe".into(),
+        args: Vec::new(),
+        known_tool_id: None,
+        output_is_mod,
+        output_folder: output_is_mod.then(|| "Out".to_string()),
+        keeps_output,
+    };
+    assert!(
+        game_tools::user_tool_definition(&f.def, &user(false, false))
+            .unwrap()
+            .run_only
+    );
+    assert!(
+        !game_tools::user_tool_definition(&f.def, &user(true, false))
+            .unwrap()
+            .run_only
+    );
+    assert!(
+        !game_tools::user_tool_definition(&f.def, &user(false, true))
+            .unwrap()
+            .run_only
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tool inputs, item scope and before-launch tools (MASTER_SPEC §30.12)
+// ---------------------------------------------------------------------------
+
+fn input(id: &str, kind: ToolInputKind, arg: &str) -> ToolInput {
+    ToolInput {
+        id: id.into(),
+        label: format!("{id} label"),
+        kind,
+        required: false,
+        default: None,
+        choices: Vec::new(),
+        arg: Some(arg.into()),
+    }
+}
+
+fn prepare_with(
+    f: &Fixture,
+    before: BeforeLaunchChoice,
+    launcher: &dyn Launcher,
+) -> Result<agora_core::game_launch::PreparedLaunch, InstanceError> {
+    prepare_launch_with(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        LaunchOptions {
+            launch_anyway: false,
+            plain: false,
+            deployment: None,
+            on_vfs_failure: VfsFailure::Ask,
+            before_launch: before,
+        },
+        &DiscoveryReport::default,
+        launcher,
+    )
+}
+
+fn item_named(f: &Fixture, name: &str, mount: Option<&str>, files: &[(&str, &[u8])]) -> String {
+    let dir = TempDir::new().unwrap();
+    for (rel, bytes) in files {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let outcome = agora_core::content_store::add_folder(&f.ctx, dir.path(), Some(name)).unwrap();
+    let id = outcome.item().item_id.clone();
+    add_content(&f.ctx, f.id(), &id, mount, None).unwrap();
+    id
+}
+
+#[test]
+fn a_required_input_unfilled_refuses_with_its_name() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    let mut required = input("profile", ToolInputKind::Text, "--profile");
+    required.required = true;
+    t.inputs = vec![required];
+    let error = game_tools::tool_input_arguments(&t, &Default::default(), None).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("profile label"), "{text}");
+    assert!(text.contains("profile"), "{text}");
+}
+
+#[test]
+fn a_choice_outside_the_list_is_refused() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    let mut choice = input("mode", ToolInputKind::Choice, "--mode");
+    choice.choices = vec!["fast".into(), "slow".into()];
+    t.inputs = vec![choice];
+    let f = fixture(vec![t.clone()]);
+    let error = game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("nemesis").unwrap(),
+        "mode",
+        "sideways",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("fast"), "{error}");
+    let mut stored = std::collections::BTreeMap::new();
+    stored.insert("mode".to_string(), "sideways".to_string());
+    assert!(game_tools::tool_input_arguments(&t, &stored, None).is_err());
+}
+
+#[test]
+fn input_files_ignores_other_content_changes() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    t.input_files = vec!["mods/A/*".into()];
+    let f = fixture(vec![t.clone()]);
+    item_named(&f, "A", Some("mods/A"), &[("a.txt", b"a")]);
+    let before = game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &t).unwrap();
+    item_named(&f, "B", Some("mods/B"), &[("b.txt", b"b")]);
+    let after = game_tools::input_fingerprint(&f.ctx, f.id(), &f.def, &t).unwrap();
+    assert_eq!(
+        before, after,
+        "an unrelated content change moved the fingerprint"
+    );
+}
+
+#[test]
+fn an_item_scoped_tool_gets_only_that_item() {
+    let mut t = tool("nemesis", "Nemesis", &["/c", "exit", "0"]);
+    t.scope = ToolScope::Item;
+    let mut target = input("target", ToolInputKind::Text, "--target");
+    target.default = Some("{item}".into());
+    t.inputs = vec![target];
+    let f = fixture(vec![t.clone()]);
+    let a = item_named(&f, "A", Some("mods/A"), &[("a.txt", b"a")]);
+    let b = item_named(&f, "B", Some("mods/B"), &[("b.txt", b"b")]);
+    let first = game_tools::input_fingerprint_for_item(&f.ctx, f.id(), &t, &a).unwrap();
+    let other = game_tools::input_fingerprint_for_item(&f.ctx, f.id(), &t, &b).unwrap();
+    assert_ne!(first, other);
+    // Another item arriving does not change this item's fingerprint.
+    item_named(&f, "C", Some("mods/C"), &[("c.txt", b"c")]);
+    assert_eq!(
+        first,
+        game_tools::input_fingerprint_for_item(&f.ctx, f.id(), &t, &a).unwrap()
+    );
+    let path = game_tools::item_view_path(&f.ctx, f.id(), &a).unwrap();
+    assert_eq!(path.as_deref(), Some("mods/A"));
+    let args = game_tools::tool_input_arguments(&t, &Default::default(), path.as_deref()).unwrap();
+    assert_eq!(
+        args,
+        vec![
+            std::ffi::OsString::from("--target"),
+            std::ffi::OsString::from("mods/A")
+        ]
+    );
+    assert!(game_tools::tool_input_arguments(&t, &Default::default(), None).is_err());
+}
+
+#[test]
+fn a_folder_input_with_an_absolute_path_runs() {
+    let mut t = writes_or_fails("folder-in");
+    let mut folder = input("out", ToolInputKind::Folder, "--out");
+    folder.required = true;
+    t.inputs = vec![folder];
+    let f = fixture(vec![t]);
+    let out = TempDir::new().unwrap();
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("folder-in").unwrap(),
+        "out",
+        out.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let run = f.run_ok("folder-in", &StagingLauncher::new());
+    assert!(run.written.iter().any(|path| path == "Data/nemesis.txt"));
+}
+
+#[test]
+fn a_user_tool_with_a_relative_exe_may_pass_an_absolute_argument() {
+    let f = fixture(Vec::new());
+    let cmd = std::fs::read(r"C:\Windows\System32\cmd.exe").unwrap();
+    f.add_mod("Tools", &[("Data/tools/My.exe", &cmd)]);
+    let out = TempDir::new().unwrap();
+    let user = game_user_tools::add(
+        &f.ctx,
+        f.id(),
+        NewUserTool {
+            name: "Absolute argument".into(),
+            exe: "Data/tools/My.exe".into(),
+            args: vec![
+                "/c".into(),
+                "exit".into(),
+                "0".into(),
+                "--out".into(),
+                out.path().to_string_lossy().into_owned(),
+            ],
+            output_is_mod: false,
+            output_folder: None,
+            keeps_output: false,
+        },
+    )
+    .unwrap();
+    let run = run_user_tool(&f, &user.id, &StagingLauncher::new(), false)
+        .expect("the player's absolute argument must not be refused");
+    assert!(run.promoted, "{run:?}");
+}
+
+#[test]
+fn an_item_scoped_tool_with_an_absolute_item_path_runs() {
+    let mut t = writes_or_fails("item-abs");
+    t.scope = ToolScope::Item;
+    let mut target = input("target", ToolInputKind::Text, "--target");
+    target.default = Some("{item}".into());
+    let mut out = input("out", ToolInputKind::Folder, "--out");
+    out.required = true;
+    t.inputs = vec![target, out];
+    let f = fixture(vec![t]);
+    let item = item_named(&f, "A", Some("mods/A"), &[("a.txt", b"a")]);
+    let folder = TempDir::new().unwrap();
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("item-abs").unwrap(),
+        "out",
+        folder.path().to_str().unwrap(),
+    )
+    .unwrap();
+    let run = game_tools::run_for_item(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("item-abs").unwrap(),
+        &item,
+        CaptureMode::Auto,
+        false,
+        &StagingLauncher::new(),
+        &CancellationToken::new(),
+    )
+    .expect("the item's path and the player's absolute folder must run");
+    assert!(run.promoted, "{run:?}");
+}
+
+#[test]
+fn a_declared_literal_outside_the_view_is_still_refused() {
+    let t = tool(
+        "declared-abs",
+        "Declared",
+        &["/c", "exit", "0", r"C:\Users\someone\outside.txt"],
+    );
+    let f = fixture(vec![t]);
+    let error = f.run("declared-abs", &StagingLauncher::new()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ToolError::Launch(agora_core::game_launch::LaunchError::UnsafeRecipe { .. })
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_declared_literal_cannot_hide_inside_a_player_input_default() {
+    let mut t = tool("default-abs", "Default", &["/c", "exit", "0"]);
+    let mut folder = input("out", ToolInputKind::Folder, "--out");
+    folder.default = Some(r"C:\Users\someone\outside".into());
+    t.inputs = vec![folder];
+    let f = fixture(vec![t]);
+    let error = f.run("default-abs", &StagingLauncher::new()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ToolError::Launch(agora_core::game_launch::LaunchError::UnsafeRecipe { .. })
+        ),
+        "a package's default is a declared literal: {error}"
+    );
+
+    // Once the player has set the value, it is theirs and is not judged.
+    let chosen = TempDir::new().unwrap();
+    game_tools::set_tool_input(
+        &f.ctx,
+        f.id(),
+        &f.def,
+        &ToolId::new("default-abs").unwrap(),
+        "out",
+        chosen.path().to_str().unwrap(),
+    )
+    .unwrap();
+    f.run_ok("default-abs", &StagingLauncher::new());
+}
+
+fn before_launch_tool(id: &str, mode: BeforeLaunchMode) -> ToolDefinition {
+    let mut t = writes_or_fails(id);
+    t.before_launch = Some(BeforeLaunch { mode, when: None });
+    t
+}
+
+fn needs_of(f: &Fixture) -> Vec<game_tools::BeforeLaunchNeed> {
+    let facts = agora_core::game_conditions::InstanceFacts::for_instance(&f.ctx, f.id(), &f.def);
+    game_tools::before_launch_needs(&f.ctx, f.id(), &f.def, &facts, &mut Vec::new()).unwrap()
+}
+
+#[test]
+fn a_stale_before_launch_tool_stops_launch_with_the_outcome() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    let error = prepare_with(&f, BeforeLaunchChoice::Ask, &StagingLauncher::new()).unwrap_err();
+    match error {
+        InstanceError::BeforeLaunchNeeded { tools, .. } => {
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].tool, "nemesis");
+            assert_eq!(tools[0].mode, BeforeLaunchMode::Run);
+        }
+        other => panic!("expected the needs outcome, got {other}"),
+    }
+}
+
+#[test]
+fn a_fresh_one_does_not() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    f.run_ok("nemesis", &StagingLauncher::new());
+    assert!(needs_of(&f).is_empty());
+    prepare_with(&f, BeforeLaunchChoice::Ask, &StagingLauncher::new())
+        .expect("a fresh tool does not stop the launch");
+}
+
+#[test]
+fn when_false_does_not() {
+    let mut t = writes_or_fails("nemesis");
+    t.before_launch = Some(BeforeLaunch {
+        mode: BeforeLaunchMode::Run,
+        when: Some(Condition::Present(RelPath::new("not-there.txt").unwrap())),
+    });
+    let f = fixture(vec![t]);
+    assert!(needs_of(&f).is_empty());
+    prepare_with(&f, BeforeLaunchChoice::Ask, &StagingLauncher::new())
+        .expect("a false when does not need the tool");
+}
+
+#[test]
+fn launch_anyway_launches_and_records_it() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    let prepared = prepare_with(
+        &f,
+        BeforeLaunchChoice::Answers(
+            [("nemesis".to_string(), BeforeLaunchAnswer::LaunchAnyway)]
+                .into_iter()
+                .collect(),
+        ),
+        &StagingLauncher::new(),
+    )
+    .expect("launch anyway still prepares the launch");
+    assert!(prepared.deploy_outcome.is_some());
+    let log = std::fs::read_to_string(
+        agora_core::game_instance::launch_log_path(&f.ctx, f.id()).unwrap(),
+    )
+    .unwrap();
+    assert!(log.contains("launch anyway"), "{log}");
+}
+
+#[test]
+fn a_failed_run_stops_and_can_still_launch_anyway() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    let failing = StagingLauncher::new().with_env("AGORA_TEST_FAIL", "1");
+    let error = prepare_with(&f, BeforeLaunchChoice::Run, &failing).unwrap_err();
+    assert!(
+        matches!(error, InstanceError::BeforeLaunchFailed { .. }),
+        "expected the failed-run outcome, got {error}"
+    );
+    prepare_with(&f, BeforeLaunchChoice::Skip, &StagingLauncher::new())
+        .expect("launch anyway still works after a failed run");
+}
+
+#[test]
+fn a_run_mode_tool_that_runs_makes_the_next_launch_fresh() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Run)]);
+    prepare_with(&f, BeforeLaunchChoice::Run, &StagingLauncher::new())
+        .expect("the run-mode tool runs and the launch goes on");
+    assert!(needs_of(&f).is_empty(), "the output should be current now");
+}
+
+#[test]
+fn ask_mode_never_runs_unasked() {
+    let f = fixture(vec![before_launch_tool("nemesis", BeforeLaunchMode::Ask)]);
+    prepare_with(&f, BeforeLaunchChoice::Run, &StagingLauncher::new())
+        .expect("the launch goes on without running the ask-mode tool");
+    assert!(
+        f.generated("nemesis").is_none(),
+        "an ask-mode tool ran without being asked"
+    );
+    let log = std::fs::read_to_string(
+        agora_core::game_instance::launch_log_path(&f.ctx, f.id()).unwrap(),
+    )
+    .unwrap();
+    assert!(log.contains("chose to launch anyway"), "{log}");
+}

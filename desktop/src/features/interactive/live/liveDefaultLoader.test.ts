@@ -117,8 +117,6 @@ const investigation: CrashInvestigation = {
     any_stale: false,
     failure_category: 'NoEvidence',
   },
-  fingerprint: null,
-  triage: { matched: false, signature_name: null, solution_markdown: null, action_button_json: null },
   suspects: [],
   failure_category: 'NoEvidence',
 };

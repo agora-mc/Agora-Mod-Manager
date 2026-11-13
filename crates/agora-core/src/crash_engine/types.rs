@@ -1,0 +1,115 @@
+//! The input and output shapes around the pure engine.
+
+use agora_game_api::crash::{CrashPack, Fact, Owner, ParserOutput, Ref, Role, SourceAttribution};
+
+/// Who contributed a pack. The host stamps this; a pack can never claim another plugin's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginIdentity {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+}
+
+impl PluginIdentity {
+    /// The attribution of a parser that this plugin contributes.
+    pub fn parser_source(&self, parser_id: &str) -> SourceAttribution {
+        SourceAttribution {
+            plugin_id: self.id.clone(),
+            plugin_name: self.name.clone(),
+            plugin_version: self.version.clone(),
+            rule_id: None,
+            rule_version: None,
+            parser_id: Some(parser_id.to_string()),
+        }
+    }
+}
+
+/// One plugin's crash pack.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackInput {
+    pub plugin: PluginIdentity,
+    pub pack: CrashPack,
+}
+
+/// What one parser made of one artifact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedArtifact {
+    pub plugin: PluginIdentity,
+    pub parser_id: String,
+    /// The artifact's name, for evidence lines.
+    pub artifact: String,
+    /// The crash source that found it. `None` for a swept or pasted artifact.
+    pub source: Option<String>,
+    pub output: ParserOutput,
+}
+
+/// What the resolver knows about a ref. Attribution is a later slice; tests use a fake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub owner: Owner,
+    pub role: Option<Role>,
+}
+
+/// Answers "who owns this ref, and what role has it".
+pub trait RefResolver {
+    fn resolve(&self, reference: &Ref) -> Resolved;
+
+    /// The game-relative files an installed item provides, for checking whether removing it is
+    /// safe for a save. `None` means this resolver cannot list the instance, so nothing is claimed.
+    fn item_files(&self, _content_key: &str) -> Option<Vec<String>> {
+        None
+    }
+}
+
+/// One inspector call. `plugin_id` is the plugin whose rule asked: inspector ids are local to a
+/// plugin, so an inspector is found in that plugin's pack and nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectionRequest<'a> {
+    pub plugin_id: &'a str,
+    pub inspector: &'a str,
+    pub target: &'a Ref,
+}
+
+/// What an inspector returned. `Missing` and `Failed` mean the inspector did not look, so they
+/// take the rule's `on_unknown` effects and are never treated as a pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inspection {
+    Pass,
+    Fail,
+    Unknown,
+    Missing,
+    Failed(String),
+}
+
+/// An inspection's result with what it wants the answer to show: its own detail, and any facts it
+/// found (such as the versions a file declares).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InspectionOutcome {
+    pub result: Inspection,
+    pub detail: Option<String>,
+    pub facts: Vec<Fact>,
+}
+
+impl InspectionOutcome {
+    pub fn new(result: Inspection) -> Self {
+        Self {
+            result,
+            detail: None,
+            facts: Vec::new(),
+        }
+    }
+}
+
+impl From<Inspection> for InspectionOutcome {
+    fn from(result: Inspection) -> Self {
+        Self::new(result)
+    }
+}
+
+/// The deeper check a rule can ask for.
+pub trait Inspector {
+    fn inspect(&self, request: &InspectionRequest<'_>) -> InspectionOutcome;
+}
+
+/// Facts only the engine knows, such as the session verdict. They are always covered when present.
+pub type EngineFacts = Vec<Fact>;

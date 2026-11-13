@@ -3,6 +3,10 @@ import { GITHUB_REPO_URL, DISCORD_URL, SPONSORS_URL } from '@/lib/site';
 
 const PILLARS = [
   {
+    title: 'Built for more than one game',
+    body: 'Minecraft is included as the default, other games come as plugins. Official game plugins are built and maintained by the Agora team, but Agora also supports community plugins for other games. Install official game plugins from the "More games" card on Home or in Settings > Game support.',
+  },
+  {
     title: 'Customizable to you',
     body: 'Theme every corner of Agora — fonts, colors, density, corners, motion, and more. If it does not feel like yours, keep tuning until it does.',
   },
@@ -57,7 +61,7 @@ export default function AboutPage() {
           The Agora Difference
         </h1>
         <p className="mx-auto mt-3 max-w-xl text-lg text-ink-muted">
-          A different kind of Minecraft mod platform.
+          A different kind of mod manager. Minecraft is included as the default, other games come as plugins.
         </p>
       </header>
 
@@ -65,14 +69,14 @@ export default function AboutPage() {
         <p className="text-lg font-medium leading-7">
           Agora is a bespoke boutique, not a warehouse. Every entry in the catalog is curated,
           tailored, and made accessible for you — a hand-picked selection of the best Minecraft
-          has to offer, free of ads, tracking, and bloat.
+          mods today, free of ads, tracking, and bloat.
         </p>
       </section>
 
       <section className="panel space-y-4">
         <h2 className="rule-gold text-xl font-semibold text-ink">Why "Agora"?</h2>
         <p className="leading-7 text-gray-700 dark:text-gray-300">
-          The name "Agora" comes from the ancient Greek word for a public gathering place. Just as the Agora was the heart of social and political life in ancient Athens, Agora is designed to be a central hub for the Minecraft modding community.
+          The name "Agora" comes from the ancient Greek word for a public gathering place. Just as the Agora was the heart of social and political life in ancient Athens, Agora is designed to be a central hub for the modding community.
         </p>
       </section>
 
@@ -133,7 +137,7 @@ export default function AboutPage() {
         <div className="panel-inset border-pink-700/60 bg-[linear-gradient(135deg,rgba(184,69,106,0.16),rgba(29,47,71,0.86)_55%)] p-5">
           <h3 className="font-semibold text-pink-800 dark:text-pink-200">Support Agora’s future</h3>
           <p className="mt-1 text-sm leading-6 text-pink-700 dark:text-pink-300">
-            Agora is built and maintained by a solo developer who cares deeply about the Minecraft community. If Agora saves you time, helps you discover great mods, or just makes modding more fun — please consider sponsoring. Your donation keeps Agora free, ad-free, and improving, and it helps fund awesome new projects down the road. Every contribution, big or small, means a lot — thank you!
+            Agora is built and maintained by a solo developer who cares deeply about the modding community. If Agora saves you time, helps you discover great mods, or just makes modding more fun — please consider sponsoring. Your donation keeps Agora free, ad-free, and improving, and it helps fund awesome new projects down the road. Every contribution, big or small, means a lot — thank you!
           </p>
           <a
             href={SPONSORS_URL}

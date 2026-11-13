@@ -5,6 +5,7 @@ import {
   INITIAL_TOUR_STATE,
   TOUR_STEPS,
   tourReducer,
+  visibleTourSteps,
   watchedAnchors,
   type TourState,
   type TourStep,
@@ -206,6 +207,35 @@ describe('advance helpers', () => {
     const anchorless: TourStep = { id: 'a', title: '', body: '', advance: { kind: 'click' } };
     expect(advanceSatisfiedBy(anchorless.advance, { type: 'dom-click', anchors: ['nav-home'] }, anchorless))
       .toBe(false);
+  });
+});
+
+describe('visibleTourSteps', () => {
+  const conditional: TourStep[] = [
+    { id: 'always', title: '', body: '', advance: { kind: 'next' } },
+    { id: 'only-with-games', title: '', body: '', when: 'multipleGames', advance: { kind: 'next' } },
+  ];
+
+  it('keeps the conditional step when its situation holds', () => {
+    expect(visibleTourSteps(conditional, { multipleGames: true }).map((step) => step.id))
+      .toEqual(['always', 'only-with-games']);
+  });
+
+  it('drops the conditional step when its situation does not hold', () => {
+    expect(visibleTourSteps(conditional, { multipleGames: false }).map((step) => step.id))
+      .toEqual(['always']);
+  });
+
+  it('always keeps a step that declares no condition', () => {
+    const unconditioned = conditional[0];
+    expect(visibleTourSteps([unconditioned], { multipleGames: false })).toEqual([unconditioned]);
+  });
+
+  it('removes the switcher step from the shipped script when only one game is installed', () => {
+    const ids = visibleTourSteps(TOUR_STEPS, { multipleGames: false }).map((step) => step.id);
+    expect(ids).not.toContain('game-switcher');
+    // The rest of the tour is unchanged: one step fewer, same order.
+    expect(ids).toEqual(TOUR_STEPS.filter((step) => step.id !== 'game-switcher').map((step) => step.id));
   });
 });
 

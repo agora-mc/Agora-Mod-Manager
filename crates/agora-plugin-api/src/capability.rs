@@ -60,6 +60,21 @@ pub enum Capability {
     /// installs is labelled with the provider it came from.
     #[serde(rename = "content:provide")]
     ContentProvide,
+    /// Define games: their stores, versions, folders and how to launch them.
+    #[serde(rename = "game:define")]
+    GameDefine,
+    /// Add to Agora's crash diagnosis: where crash evidence appears, parsers that read that
+    /// evidence and nothing else, and rules that name suspects. Every finding names the plugin.
+    #[serde(rename = "crash:contribute")]
+    CrashContribute,
+    /// Read files from an instance's merged view by game path (MASTER_SPEC §30.12). The script
+    /// never sees a real filesystem path.
+    #[serde(rename = "game:read")]
+    GameRead,
+    /// Write files into the plugin's own generated layer for an instance (MASTER_SPEC §30.12).
+    /// A script cannot write to the game, a save, or another layer.
+    #[serde(rename = "game:write")]
+    GameWrite,
 }
 
 impl Capability {
@@ -74,6 +89,10 @@ impl Capability {
         Capability::DiagnosticsPublish,
         Capability::Network,
         Capability::ContentProvide,
+        Capability::GameDefine,
+        Capability::CrashContribute,
+        Capability::GameRead,
+        Capability::GameWrite,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -87,6 +106,10 @@ impl Capability {
             Capability::DiagnosticsPublish => "diagnostics:publish",
             Capability::Network => "network",
             Capability::ContentProvide => "content:provide",
+            Capability::GameDefine => "game:define",
+            Capability::CrashContribute => "crash:contribute",
+            Capability::GameRead => "game:read",
+            Capability::GameWrite => "game:write",
         }
     }
 
@@ -98,7 +121,10 @@ impl Capability {
     pub fn is_mutating(self) -> bool {
         matches!(
             self,
-            Capability::InstanceWrite | Capability::ContentWrite | Capability::LaunchPrepare
+            Capability::InstanceWrite
+                | Capability::ContentWrite
+                | Capability::LaunchPrepare
+                | Capability::GameWrite
         )
     }
 
@@ -116,6 +142,19 @@ impl Capability {
             Capability::Network => "Reach the internet, subject to your network settings",
             Capability::ContentProvide => {
                 "Offer content in Browse; Agora verifies and installs anything you choose"
+            }
+            Capability::GameDefine => {
+                "Define games: their stores, versions, folders and how to launch them"
+            }
+            Capability::CrashContribute => {
+                "Read your games' crash logs and add its own opinion to crash diagnoses"
+            }
+            Capability::GameRead => {
+                "Read the files in your game instances, including their mods and settings."
+            }
+            Capability::GameWrite => {
+                "Add files to your game instances. These can include programs and mods that run \
+                 when you play, so only allow this for plugins you trust."
             }
         }
     }

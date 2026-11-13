@@ -41,11 +41,11 @@ export interface GuideOverview {
 /** Orientation shown at the top of the app's Home page and the website's docs home. */
 export const GUIDE_OVERVIEW: GuideOverview = {
   title: 'What Agora manages',
-  body: 'Agora looks after the files and settings around modded Minecraft: instances, mods, packs, Java runtimes, snapshots, compatibility checks, and recovery. By default, the official Minecraft launcher still runs the game and handles your Microsoft account.',
+  body: 'Agora looks after the files and settings around your modded games: instances, mods, packs, Java runtimes, snapshots, compatibility checks, and recovery. Minecraft is included as the default, other games come as plugins, starting with Skyrim Special Edition. For Minecraft, the official launcher still runs the game by default and handles your Microsoft account, but you can sign in through Agora and launch directly if you adjust the corresponding setting.',
   terms: [
     {
       term: 'Instance',
-      definition: 'An isolated Minecraft setup with its own version, loader, mods, and settings.',
+      definition: 'An isolated game setup with its own version, loader, mods, and settings.',
     },
     {
       term: 'Mod loader',
@@ -78,7 +78,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
     description: 'Set up Agora, understand what it does, and reach your first playable instance.',
     keywords: ['onboarding', 'setup', 'registry', 'java', 'first launch'],
     basic: {
-      summary: 'Agora helps you discover, organize, and recover modded Minecraft installations. It calls each separate installation an instance and keeps risky changes contained to that instance.',
+      summary: 'Agora helps you discover, organize, and recover modded game installations. Minecraft is built in, and other games come as add-ons; the walkthrough here uses Minecraft. Agora calls each separate installation an instance and keeps risky changes contained to that instance.',
       outcomes: [
         'Complete the first-run setup without needing prior modding knowledge.',
         'Understand the difference between Agora, Minecraft, and the official launcher.',
@@ -260,7 +260,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Use the sidebar',
-          body: 'Home is the dashboard, Browse is the catalog, My Instances is your library, Community Governance explains how voting and reviews work, Help & Guide is this learning center, and Settings controls Agora itself.',
+          body: 'Home is the dashboard, Browse is the catalog, Library is everything you have installed or added (with descriptions saved on disk), My Instances holds your profiles, Community Governance explains how voting and reviews work, Help & Guide is this learning center, and Settings controls Agora itself.',
           steps: [
             'Select an item to move to that area.',
             'Use the arrow button at the sidebar edge to collapse or expand it.',
@@ -504,12 +504,12 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           callout: {
             tone: 'tip',
             title: 'You can always go back',
-            text: 'Agora saves a restore point right before it installs. If you do not like the result, select Roll Back on the result screen, or restore it later from the instance\'s Snapshots tab.',
+            text: 'Agora saves a restore point right before it installs. If you do not like the result, select Roll Back on the result screen, or restore it later from Snapshots, under Backups & Versions.',
           },
         },
         {
           title: 'Remove safely',
-          body: 'We recommend removing mods with Remove on the Mods tab rather than deleting the file yourself. That way Agora can tell you if another mod needs it, and you can undo the removal later.',
+          body: 'We recommend removing mods with Remove on the Mods page under Content rather than deleting the file yourself. That way Agora can tell you if another mod needs it, and you can undo the removal later.',
           callout: {
             tone: 'warning',
             title: 'Dependents may stop loading',
@@ -518,7 +518,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Check for updates',
-          body: 'On My Instances, select Edit on the instance, open its Mods tab, and select Check for updates. Resource Packs, Shaders and Data Packs have the same button. Update one item from its row, or use Update All to review every update in that tab at once.',
+          body: 'On My Instances, select Edit on the instance, open Content, choose Mods, and select Check for updates. Resource Packs, Shaders and Data Packs are the other Content pages and have the same button. Update one item from its row, or use Update All to review every update on that page at once.',
           bullets: [
             'A locked instance cannot be updated until you unlock it.',
             'A newer version of one mod can still clash with your others, so it is worth launching once after updating.',
@@ -597,7 +597,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Use the content tabs',
-          body: 'Open My Instances, select Edit, then choose Mods, Resource Packs, Shaders, or Data Packs. Each list shows the installed file and available actions for that content type.',
+          body: 'Open My Instances, select Edit, then open Content and choose Mods, Resource Packs, Shaders, or Data Packs. Each list shows the installed file and available actions for that content type.',
           bullets: [
             'View Details returns to the project page when Agora can resolve the source.',
             'Disable keeps a mod file available but prevents it from loading.',
@@ -626,6 +626,20 @@ export const GUIDE_TOPICS: GuideTopic[] = [
             tone: 'warning',
             title: 'Manual files have fewer guarantees',
             text: 'Agora knows less about a file you add yourself, so it cannot warn you as much. We suggest taking a snapshot first, and only adding files from sources you trust.',
+          },
+        },
+        {
+          title: 'One copy of each mod',
+          body: 'Agora keeps one copy of each mod and shares it between the instances that use it. The files in an instance\'s mods, resource packs, shaders and data packs folders point at that shared copy, which is protected so a change in one instance cannot break another.',
+          bullets: [
+            'Deleting or renaming a mod file in File Explorer works.',
+            'Replacing a mod file with a newer one of the same name, or a tool editing a mod file, can fail with "Access denied". Update it in Agora instead, or delete the old file first.',
+            'Configs, saves and screenshots are ordinary files you can edit freely.',
+          ],
+          callout: {
+            tone: 'note',
+            title: 'Prefer separate copies?',
+            text: 'Turn off "Share mod files between instances" in Settings, and new installs get their own copy in each instance. It uses more disk space.',
           },
         },
         {
@@ -701,6 +715,73 @@ export const GUIDE_TOPICS: GuideTopic[] = [
     },
   },
   {
+    id: 'downloads',
+    title: 'Mods you download in your browser',
+    shortTitle: 'New downloads',
+    category: 'Manage',
+    description: 'Let Agora notice mod archives in your Downloads folder and add them to your Library.',
+    keywords: ['downloads', 'nexus manual download', 'watch folder', 'new downloads', 'manual mod'],
+    basic: {
+      summary: 'Many mod sites still use a browser download instead of a button inside the launcher. Agora can watch one folder, recognise the mod archives in it by what is inside, and list them in your Library. Nothing is imported until you add it.',
+      outcomes: [
+        'Turn on download watching and choose the folder.',
+        'Add a recognised archive to your Library.',
+        'Ignore a file and stop Agora offering it.',
+      ],
+      sections: [
+        {
+          title: 'Turn it on',
+          body: 'Open Settings, Storage, and turn on "Notice mod downloads". Agora watches your Downloads folder unless you choose another one with Change folder. Watching happens only while Agora is running.',
+          bullets: [
+            'It is off by default, so Agora never asks about files you did not ask it to watch.',
+            'Only common mod archives (.zip, .7z, .rar, .jar, .mrpack) for a game you have turned on are offered.',
+            'Files already in the folder when you turn it on are not offered. Neither are browser partial downloads.',
+          ],
+        },
+        {
+          title: 'Add or ignore',
+          body: 'Open Library and look for New downloads. Each row says the file name, its size, the game and kind Agora recognised, and why. Add to library stores it through that game\'s normal flow. Ignore remembers the file by its contents so it is not offered again.',
+          bullets: [
+            'A file Agora already has is marked "Already in your library" and is not offered again.',
+            'An archive with a FOMOD installer opens the same questions Agora asks during an install.',
+            'The downloaded file is never moved, changed or deleted. Add to library copies it into Agora\'s store.',
+          ],
+          callout: {
+            tone: 'note',
+            title: 'File names are not trusted',
+            text: 'Agora decides what a file is by its contents, because download names are not standardized. A name that looks like a Nexus download adds a label only; it never changes what Agora thinks the file is.',
+          },
+        },
+        {
+          title: 'A quiet notification',
+          body: 'Agora can show one short message per batch of new downloads. Turn that off in the same Settings card if you would rather just check the Library badge. There are no dialog boxes for individual files.',
+        },
+      ],
+    },
+    advanced: {
+      summary: 'See what the CLI would offer, and what Agora does and does not read.',
+      outcomes: [
+        'Check a folder without importing anything.',
+        'Understand the limits of recognition.',
+      ],
+      sections: [
+        {
+          title: 'Scan from the CLI',
+          body: 'agora downloads scan --folder <path> makes one classification pass and prints each recognised file, its game, its kind and the reason. Add --json for machine output. It never imports, moves or changes a file.',
+        },
+        {
+          title: 'What recognition means',
+          body: 'For Minecraft, a jar carrying loader metadata (Fabric, Quilt, Forge or NeoForge) is a mod; a pack.mcmeta archive with assets/ or data/ is a resource or data pack; a shaders/ folder makes a shader pack; and an .mrpack with its pack index is a modpack. Other games use the content layout their own package declares, such as a fomod/ folder or the extensions and folders a game calls its data.',
+          callout: {
+            tone: 'warning',
+            title: 'Recognition is not a safety check',
+            text: 'A recognised archive is still an unverified file from the internet. Add only what you meant to download, and prefer sources you trust.',
+          },
+        },
+      ],
+    },
+  },
+  {
     id: 'launching',
     title: 'Launching Minecraft and health checks',
     shortTitle: 'Launch & health',
@@ -757,7 +838,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           callout: {
             tone: 'tip',
             title: 'Changing the loader version yourself',
-            text: 'You can change the loader version any time with the Change loader version button next to the loader name in the instance editor. When an install needs a different loader version, the review screen offers the same choice, or lets you skip the mods that do not fit.',
+            text: 'You can change the loader version any time by clicking the loader name beside the instance title in the instance editor. Its tooltip also says Change loader version. When an install needs a different loader version, the review screen offers the same choice, or lets you skip the mods that do not fit.',
           },
         },
         {
@@ -790,6 +871,127 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         {
           title: 'Getting useful logs',
           body: 'With direct launch, the Console tab shows the game\'s log. Filter it to All, Warnings+, or Errors, or switch to Raw to see every line as written, then copy what you need. The first error is usually the most useful. The last few lines are often just the game shutting down because of it. If there is a crash report too, include it.',
+        },
+      ],
+    },
+  },
+  {
+    id: 'other-games',
+    title: 'Playing other games',
+    shortTitle: 'Other games',
+    category: 'Play',
+    description: 'Add support for a game like Skyrim Special Edition, make an instance, add mods, sort the load order, and know where to look when something goes wrong.',
+    keywords: ['skyrim', 'other games', 'game support', 'more games', 'base', 'load order', 'plugins', 'fomod', 'dyndolod', 'pgpatcher', 'tools', 'mod organizer'],
+    basic: {
+      summary: 'Agora can also look after mods for games other than Minecraft. Skyrim Special Edition is the first. Each game has its own instances, so one setup never disturbs another.',
+      outcomes: [
+        'Add a game and make sure Agora has found it.',
+        'Make an instance and put mods in it.',
+        'Sort the load order and launch.',
+      ],
+      sections: [
+        {
+          title: 'Add a game',
+          body: 'Other games arrive as small add-ons that you install once. Your Minecraft instances are not affected. The add-ons on the More games card are official, which means Agora\'s signed catalog vouches for them; a plugin you install yourself can add a game too, but it is community-made and gets no special access. Some game add-ons build on a shared one, as Skyrim\'s builds on the Creation Engine base: installing Skyrim installs that base too, and the install prompt lists it.',
+          steps: [
+            'On Home, find the "More games" card and press Install next to the game. The same card is in Settings > Game support, which helps if you dismissed it on Home.',
+            'If Agora shows what the add-on wants to do, read it first, and approve it only if you are happy with it.',
+            'Restart Agora when it asks (Restart now).',
+            'Once Agora has found a copy of the game on this computer (Steam, GOG, Epic Games Store or Microsoft Store), a game switcher appears at the top of the sidebar. Choose the game there to open its Instances and Library pages. Its installs, bases and recovery are in Settings, under the game\'s name.',
+          ],
+          callout: {
+            tone: 'tip',
+            title: 'If Agora did not find your game',
+            text: 'Use Add game folder in Settings > Game support and pick the folder the game is installed in. After you install or move the game later, Rescan on the game\'s Installs page in Settings looks again.',
+          },
+        },
+        {
+          title: 'Instances and bases',
+          body: 'An instance is a separate setup of the game, with its own mods and load order, so a heavily modded game can sit beside a lightly modded one. Instances of the same game share a base: a pinned copy of the game\'s files that Agora builds the first time you need it and reuses after that.',
+          steps: [
+            'Open the game and choose Instances > New instance.',
+            'Name it, and pick the install to build from if you have more than one, such as a Steam copy and a GOG copy.',
+            'Choose a base. A Linked base shares most files with your install, so it takes little extra space, but a change to a linked file also changes the install. A Copied base takes about the size of the game again, and changes to it never reach the install. We suggest Linked base, unless you plan to change the game files by hand.',
+            'Leave How it will run on Automatic unless you have a reason. You can change it later on the instance\'s Overview.',
+            'Choose Create and wait while the base is built.',
+          ],
+          callout: {
+            tone: 'note',
+            title: 'Your game install',
+            text: 'Agora starts the game from the instance\'s own folder and does not write into your game\'s files. The exceptions are the Linked base above and the full-copy swap some tools can use, which renames the game\'s Data folder for the length of a run and puts it back. Agora shows that option\'s cost before you agree to it.',
+          },
+        },
+        {
+          title: 'Add mods',
+          body: 'Mods go into your library first and then into an instance, so the same mod can be used by several instances.',
+          steps: [
+            'On Library, Curated items lists mods Agora has checked for this game. Choose the instance under Install into, then Preview or Install. The list can be empty for a game until the catalog has entries for it.',
+            'For your own downloads, use Add an archive… (zip, 7z or RAR) or Add a folder… under Your stored mods.',
+            'Open an instance, go to its Content tab, choose an item under Add from your library, and press Add to instance.',
+            'If an archive has an installer (a FOMOD), Agora asks the installer\'s questions first and adds what you chose.',
+          ],
+          bullets: [
+            'Turn off, Turn on and Remove change one item without touching the others.',
+            'When two items change the same file, the one that loads later wins. Move up and Move down change that, and each button says whether it makes the item load later or earlier.',
+            'A mod the catalog cannot download for you shows a Get from button naming its host, such as Get from nexusmods.com. It opens a dialog: choose Open page to open the mod\'s page in your browser, download the file there with the page\'s own button, then choose it with Choose file…. Agora copies it into your library and never changes the original, and that mod shows Updates unknown because Agora cannot check its page for new versions.',
+            'A mod that needs a framework such as SKSE or Address Library stops and names it. Use the Get button to open the framework\'s entry and install it first, or choose Install anyway knowing the mod probably will not work without it. The framework has to be in the instance as mod content; a copy left in the game folder is not detected.',
+            'Turn on Notice mod downloads in Settings and Agora lists a file you download in your browser under Library > New downloads, ready to add.',
+          ],
+          callout: {
+            tone: 'note',
+            title: 'Mods from Nexus Mods',
+            text: 'Most Skyrim mods are on Nexus Mods. Download them in your browser with the "Manual download" button, then use Add an archive…. Agora does not sign in to Nexus Mods or CurseForge: it does not register with platforms whose terms would bind how Agora works, so their "Mod Manager Download" buttons do not open in Agora.',
+          },
+        },
+        {
+          title: 'Load order and launching',
+          body: 'The game reads its plugins in an order, and a plugin\'s masters must load above it. The instance\'s Plugins tab lists them and flags Problems with the load order, including the sorter\'s own notes. Sort… puts them in the order the list\'s sorter recommends. When the instance has a loader such as SKSE, Launch starts the game through it.',
+          steps: [
+            'Open the instance\'s Plugins tab and press Sort….',
+            'If the sorter has nothing saved yet, its note says to update the masterlist first; the Plugins tab has a button for it. Without it, Sort only puts each plugin below its masters.',
+            'Read the preview. Nothing is written until you choose Apply, and locked or always-loaded plugins stay where they are.',
+            'On Overview, read the Launch checks, then press Launch. Each finding says what is wrong, why it matters and what to do. While the game runs, the same button reads Stop and ends the session.',
+          ],
+        },
+      ],
+    },
+    advanced: {
+      summary: 'Tools that build files for the game, importing a Mod Organizer 2 setup, and where to look when a launch or a tool run goes wrong.',
+      outcomes: [
+        'Run a tool such as DynDOLOD or PGPatcher and keep its output manageable.',
+        'Bring a Mod Organizer 2 setup into Agora.',
+        'Find the page that explains a problem.',
+      ],
+      sections: [
+        {
+          title: 'Tools that build files for the game',
+          body: 'Some mods need a tool run after you change your setup, such as DynDOLOD or PGPatcher. The instance\'s Tools tab lists them. Each card shows a badge (Up to date, Out of date, Rebuild to be sure or Not built yet) and a button that reads Build, Rebuild or Run again.',
+          bullets: [
+            'How to capture the output decides how the tool\'s files are collected while it runs. We recommend Let Agora choose: it asks before using anything slower.',
+            'For tools whose result is a mod, including DynDOLOD, PGPatcher and tools you add yourself with an output folder, Agora keeps the output as a mod in the instance. Use an earlier output switches back to an older run.',
+            'Where a tool offers them, Show changes, Roll back and Remove output let you compare, undo or remove the last run.',
+            'Scan for programs looks through the instance\'s enabled mods and its own files and lets you pick which programs to add, and Add a tool lets you point at any .exe.',
+          ],
+          callout: {
+            tone: 'tip',
+            title: 'Rebuild after changing mods',
+            text: 'When a mod, the load order or a setting changes, a tool\'s badge turns to Out of date. Rebuild it so the game reads output that matches your setup.',
+          },
+        },
+        {
+          title: 'Bring a Mod Organizer 2 setup',
+          body: 'On the game\'s Instances page, Import instances lists the Mod Organizer 2 setups on this computer. Choose a setup and a profile, use Preview the import to see what will happen, then confirm with Import profile. It becomes a new instance, and your Mod Organizer 2 setup is only read, not changed.',
+        },
+        {
+          title: 'When something goes wrong',
+          body: 'Start with the page closest to the problem.',
+          bullets: [
+            'Overview > Launch checks says what stopped a launch, and Check again re-runs them. Launch anyway under Advanced options skips them, but the game may then crash, so we suggest it only when you know why a check is wrong.',
+            'The Plugins tab lists Problems with the load order, including anything the sorter\'s masterlist says.',
+            'If Agora cannot tell where an item\'s files go, a dialog names the top-level entries it found and the item is not added. Check that you downloaded the main file rather than a patch or a nested archive, then add it again.',
+            'If Agora was closed while a tool ran, the Tools tab says A tool swap was interrupted and offers Put the Data folder back. Do that before you launch.',
+            'Settings > (your game) > Recovery lists game files that are still swapped and offers Put the files back.',
+          ],
         },
       ],
     },
@@ -835,7 +1037,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Recover instead of investigate',
-          body: 'If you need to play immediately, restore the last setup that launched fine (Last Known Good) from Home or the Snapshots tab. To undo Crash Doctor\'s test changes, choose Undo and close.',
+          body: 'If you need to play immediately, restore the last setup that launched fine (Last Known Good) from Home or Snapshots, under Backups & Versions. To undo Crash Doctor\'s test changes, choose Undo and close.',
           callout: {
             tone: 'tip',
             title: 'Keep the crash report',
@@ -902,7 +1104,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Create a loadout profile',
-          body: 'Open Loadout Profiles, give the profile a name, and save it. It remembers which mods, resource packs, shader packs, data packs and worlds are switched on or off right now. Applying it later switches everything back to match.',
+          body: 'Open Backups & Versions, choose Loadout Profiles, give the profile a name, and save it. It remembers which mods, resource packs, shader packs, data packs and worlds are switched on or off right now. Applying it later switches everything back to match.',
           bullets: [
             'If you have added a mod since saving the profile, Agora asks whether to keep it on or switch it off when you apply.',
             'After adding or removing mods, use Update from setup on the profile to save the instance as it is now. Agora shows you what will change first.',
@@ -967,7 +1169,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Import a pack',
-          body: 'On My Instances, click Import pack file at the top and pick a .mrpack or an Agora pack file. (In an instance\'s editor, the "Import pack as new instance" button at the top does the same, and the Other launchers & files tab has "Select File & Import" for a .mrpack or Prism .zip.) Either kind of pack opens a review before anything is created: the new instance\'s name, every file with where it comes from (a Modrinth or other download, or a copy inside the pack), what is left out, and anything that would stop the import.',
+          body: 'On My Instances, click Import pack file at the top and pick a .mrpack or an Agora pack file. (In an instance\'s editor, the "Import pack as new instance" item in the More menu does the same, and the Import & Export page has "Select File & Import" for a .mrpack or Prism .zip.) Either kind of pack opens a review before anything is created: the new instance\'s name, every file with where it comes from (a Modrinth or other download, or a copy inside the pack), what is left out, and anything that would stop the import.',
           steps: [
             'Choose a pack file from someone you trust.',
             'In the review, check the instance name. If one with that name already exists, Agora suggests a numbered copy such as "Name (2)"; edit it if you like. The existing instance is never overwritten.',
@@ -1099,7 +1301,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Use a different Java for one instance',
-          body: 'Settings decides which Java Agora uses everywhere. To use a different one for a single instance, pick it on that instance\'s Java & Args tab. When you are done testing, clear it again so Agora goes back to choosing a suitable Java for you.',
+          body: 'Settings decides which Java Agora uses everywhere. To use a different one for a single instance, pick it under Java & Logs, on the Java & Args page. When you are done testing, clear it again so Agora goes back to choosing a suitable Java for you.',
         },
         {
           title: 'Trying the performance options',
@@ -1521,6 +1723,10 @@ export const GUIDE_TOPICS: GuideTopic[] = [
           },
         },
         {
+          title: 'Mods are stored once',
+          body: 'An instance\'s mods, resource packs, shaders and data packs point at one shared copy, so the same mod in ten instances takes the space of one. File Explorer does not know this and shows each instance at its full size.',
+        },
+        {
           title: 'Put an instance on your desktop',
           body: 'Instance integration can create a desktop shortcut. Opening it brings up Agora on that instance, ready for you to press Play. If Agora is already open, it uses that window rather than opening a second one.',
         },
@@ -1674,7 +1880,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
       sections: [
         {
           title: 'Export the report',
-          body: 'Open Crash Doctor for the affected instance and choose Copy crash report. The report is assembled on your machine and placed on your clipboard. It contains the crash log, any matched crash signatures, the ranked suspect mods, and the instance\'s installed mod list — the same evidence Agora used for its own diagnosis.',
+          body: 'Open Crash Doctor for the affected instance and choose Copy crash report. The report is assembled on your machine and placed on your clipboard. It contains the crash log, any matched crash signatures, the ranked suspect mods, and the instance\'s installed mod list — the same evidence Agora used for its own diagnosis. Community signatures come from the signed catalog and can cover any supported game, not only Minecraft.',
         },
         {
           title: 'Know what is shared',

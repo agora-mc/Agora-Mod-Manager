@@ -12,7 +12,11 @@ Covers: validate_sha256, _get_registry_repo, _load_poll_blacklist,
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import contextlib
+import hashlib
+import io
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -673,9 +677,14 @@ class TestRegexDosProtection(unittest.TestCase):
             CREATE TABLE IF NOT EXISTS crash_signatures (
                 id TEXT PRIMARY KEY,
                 name TEXT,
+                games_json TEXT NOT NULL,
                 regex_pattern TEXT,
-                solution_markdown TEXT,
-                action_button_json TEXT
+                level TEXT,
+                cause TEXT,
+                text TEXT,
+                action_kind TEXT,
+                action_content_key TEXT,
+                action_label TEXT
             )
         """)
 
@@ -687,16 +696,21 @@ class TestRegexDosProtection(unittest.TestCase):
     def tearDown(self):
         self._conn.close()
 
+    def _signature(self, **overrides):
+        sig = {
+            "id": "example_signature",
+            "name": "Example Crash",
+            "games": ["minecraft"],
+            "regex_pattern": r"java\.lang\.ExampleException",
+            "text": "An example thing failed.",
+        }
+        sig.update(overrides)
+        return sig
+
     def test_long_pattern_rejected(self):
         """A pattern >256 characters is rejected."""
         long_pattern = "a" * 257
-        sig = {
-            "id": "long_test",
-            "name": "Long Pattern",
-            "regex_pattern": long_pattern,
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="long_test", regex_pattern=long_pattern)
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 1)
         # Should not have been inserted.
@@ -707,13 +721,12 @@ class TestRegexDosProtection(unittest.TestCase):
 
     def test_valid_pattern_accepted(self):
         """A normal short pattern is accepted and inserted."""
-        sig = {
-            "id": "nullptr_test",
-            "name": "Null Pointer",
-            "regex_pattern": r"java\.lang\.NullPointerException",
-            "solution_markdown": "Check for nulls.",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(
+            id="nullptr_test",
+            name="Null Pointer",
+            regex_pattern=r"java\.lang\.NullPointerException",
+            text="A null pointer was the failure.",
+        )
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 0)
         row = self._conn.execute(
@@ -726,32 +739,123 @@ class TestRegexDosProtection(unittest.TestCase):
 
     def test_invalid_regex_rejected(self):
         """An invalid regex pattern is rejected."""
-        sig = {
-            "id": "bad_regex",
-            "name": "Bad Regex",
-            "regex_pattern": "[invalid(regex",
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="bad_regex", regex_pattern="[invalid(regex")
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 1)
 
     def test_exact_256_pattern_accepted(self):
         """A pattern exactly 256 characters is accepted (boundary)."""
         pattern_256 = "a" * 256
-        sig = {
-            "id": "boundary_test",
-            "name": "Boundary",
-            "regex_pattern": pattern_256,
-            "solution_markdown": "",
-            "action_button_json": "[]",
-        }
+        sig = self._signature(id="boundary_test", regex_pattern=pattern_256)
         _compile.insert_crash_signature(self._conn, sig, self._rejected)
         self.assertEqual(self._rejected[0], 0)
         row = self._conn.execute(
             "SELECT id FROM crash_signatures WHERE id = ?", ("boundary_test",)
         ).fetchone()
         self.assertIsNotNone(row)
+
+
+class TestCrashSignatureFormat(unittest.TestCase):
+    """V2 signature validation: the app converts every row into a crash rule."""
+
+    def _create_schema(self, conn):
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS crash_signatures (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                games_json TEXT NOT NULL,
+                regex_pattern TEXT,
+                level TEXT,
+                cause TEXT,
+                text TEXT,
+                action_kind TEXT,
+                action_content_key TEXT,
+                action_label TEXT
+            )
+        """)
+
+    def setUp(self):
+        self._conn = _compile.sqlite3.connect(":memory:")
+        self._create_schema(self._conn)
+        self._rejected: list[int] = [0]
+
+    def tearDown(self):
+        self._conn.close()
+
+    def _signature(self, **overrides):
+        sig = {
+            "id": "example_signature",
+            "name": "Example Crash",
+            "games": ["skyrim-se"],
+            "regex_pattern": r"Unhandled exception",
+            "text": "An example thing failed.",
+        }
+        sig.update(overrides)
+        return sig
+
+    def test_defaults_are_possible_and_other(self):
+        _compile.insert_crash_signature(self._conn, self._signature(), self._rejected)
+        self.assertEqual(self._rejected[0], 0)
+        row = self._conn.execute(
+            "SELECT games_json, level, cause, action_kind FROM crash_signatures"
+        ).fetchone()
+        self.assertEqual(row, ('["skyrim-se"]', "possible", "other", None))
+
+    def test_missing_games_is_rejected(self):
+        sig = self._signature()
+        del sig["games"]
+        _compile.insert_crash_signature(self._conn, sig, self._rejected)
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_empty_games_is_rejected(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(games=[]), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_level_must_be_possible_or_likely(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(level="very_likely"), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_unknown_cause_is_rejected(self):
+        _compile.insert_crash_signature(
+            self._conn, self._signature(cause="banana"), self._rejected
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_install_action_needs_a_content_key(self):
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(action={"kind": "install_content"}),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 1)
+
+    def test_action_is_stored(self):
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(
+                level="likely",
+                cause="missing_requirement",
+                action={
+                    "kind": "install_content",
+                    "content_key": "example-api",
+                    "label": "Install Example API",
+                },
+            ),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 0)
+        row = self._conn.execute(
+            "SELECT level, cause, action_kind, action_content_key, action_label "
+            "FROM crash_signatures"
+        ).fetchone()
+        self.assertEqual(
+            row,
+            ("likely", "missing_requirement", "install_content", "example-api", "Install Example API"),
+        )
 
 
 
@@ -1462,6 +1566,808 @@ class TestLoadKnownConflicts(unittest.TestCase):
         self.assertEqual(rows[0][4], "maven")
 
 
+# ---------------------------------------------------------------------------
+# Catalog entries for other games (MASTER_SPEC §26.8, REGISTRY_CURATION_REFERENCE)
+# ---------------------------------------------------------------------------
+
+# A stand-in for a game package. The real Skyrim package declares no frameworks
+# yet, so the fixture declares SKSE to exercise a satisfiable requirement.
+FIXTURE_PACKAGE = {
+    "id": "agora.test-creation",
+    "games": [
+        {
+            "id": "skyrim-se",
+            "stores": [{"store": "steam", "product": "1"}, {"store": "gog", "product": "2"}],
+            "framework_ids": [],
+        }
+    ],
+    "frameworks": [
+        {"id": "skse", "game": "skyrim-se", "name": "SKSE", "version": "2.2.6"},
+    ],
+}
+
+
+def _skyrim_github_entry(item_id="crash-logger"):
+    return {
+        "id": item_id,
+        "name": "CrashLogger",
+        "content_type": "mod",
+        "author": "Example",
+        "license": "MIT",
+        "game": "skyrim-se",
+        "download_strategy": "github_release",
+        "source_identifier": "example-author/crash-logger",
+        "sha256": "a" * 64,
+        "game_compatibility": [
+            {
+                "stores": ["steam", "gog"],
+                "game_versions": ["1.6.1170.*", "1.6.1179.0"],
+                "requires": [{"framework": "skse", "min_version": "2.2.6"}],
+                "asset": "CrashLogger-*.7z",
+            }
+        ],
+        "curator_note": "Logs crashes.",
+        "base_categories": ["tools"],
+    }
+
+
+def _skyrim_direct_entry(item_id="skyrim-archive-mod", url="https://example.com/files/Mod-1.0.zip"):
+    return {
+        "id": item_id,
+        "name": "Archive Mod",
+        "content_type": "mod",
+        "author": "Example",
+        "license": "LicenseRef-Proprietary",
+        "game": "skyrim-se",
+        "download_strategy": "direct_hash",
+        "source_identifier": url,
+        "sha256": "b" * 64,
+        "game_compatibility": [{"stores": ["steam"], "game_versions": ["1.6.1170.0"]}],
+        "curator_note": "",
+        "base_categories": ["content"],
+    }
+
+
+def _skyrim_manual_entry(
+    item_id="address-library",
+    url="https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+):
+    return {
+        "id": item_id,
+        "name": "Address Library for SKSE Plugins",
+        "content_type": "mod",
+        "author": "meh321",
+        "license": "MIT",
+        "game": "skyrim-se",
+        "download_strategy": "manual_link",
+        "source_identifier": url,
+        "game_compatibility": [
+            {
+                "stores": ["steam", "gog"],
+                "game_versions": ["1.6.*"],
+                "requires": [{"framework": "skse", "min_version": "2.2.6"}],
+                "asset": "*-32444-*.zip",
+                "download_hint": "Main file: Address Library for SKSE Plugins",
+            }
+        ],
+    }
+
+
+def _minecraft_direct_entry(item_id="minecraft-pinned-mod"):
+    return {
+        "id": item_id,
+        "name": "Pinned Mod",
+        "content_type": "mod",
+        "author": "Example",
+        "license": "LicenseRef-Proprietary",
+        "download_strategy": "direct_hash",
+        "source_identifier": "https://example.com/files/pinned-1.0.0.jar",
+        "sha256": "c" * 64,
+        "compatible_versions": [
+            {"mc_version": "1.21", "loader": "fabric", "mod_version": "1.0.0"},
+        ],
+        "curator_note": "",
+        "base_categories": ["content"],
+    }
+
+
+class OtherGameDeclarationTests(unittest.TestCase):
+    """What the game packages declare, read from their JSON."""
+
+    def test_real_packages_declare_skyrim_and_the_tracer_games(self):
+        declared = _compile.load_game_declarations()
+        self.assertEqual(declared["skyrim-se"].stores, frozenset({"steam", "gog"}))
+        self.assertEqual(declared["valheim"].stores, frozenset({"steam"}))
+        self.assertEqual(declared["witcher-3"].stores, frozenset({"gog"}))
+        self.assertNotIn("minecraft", declared)
+
+    def test_minecraft_cannot_be_declared_by_a_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / "package.json"
+            package.write_text(json.dumps({"games": [{"id": "minecraft", "stores": []}]}), encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                _compile.load_game_declarations([package])
+        self.assertIn("minecraft", str(caught.exception.code))
+
+    def test_a_game_declared_twice_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "a.json", Path(tmp) / "b.json"
+            game = {"games": [{"id": "skyrim-se", "stores": []}]}
+            first.write_text(json.dumps(game), encoding="utf-8")
+            second.write_text(json.dumps(game), encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                _compile.load_game_declarations([first, second])
+        self.assertIn("skyrim-se", str(caught.exception.code))
+
+
+class OtherGameEntryTests(unittest.TestCase):
+    """Entries for other games compile through the real pipeline. Every rule they
+    break is refused, and the refusal names the file and the field."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = self.tmp / "registry"
+        self.registry.mkdir()
+        self.package = self.tmp / "package.json"
+        self.package.write_text(json.dumps(FIXTURE_PACKAGE), encoding="utf-8")
+        patches = [
+            mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
+            mock.patch.object(_compile, "game_package_paths", lambda: [self.package]),
+            mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_modrinth_versions", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_version_changelogs", lambda items: []),
+            mock.patch.object(_compile, "_load_github_token", lambda: None),
+            mock.patch.object(
+                _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def reset_registry(self):
+        shutil.rmtree(self.registry)
+        self.registry.mkdir()
+
+    def write(self, rel, data):
+        path = self.registry / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def skyrim_entry_at(self, data, rel=None):
+        return self.write(rel or f"games/skyrim-se/mods/{data['id']}.json", data)
+
+    def compile(self):
+        out = self.tmp / "out" / "registry.db"
+        _compile.compile_registry(out, skip_sign=True, no_governance_write=True, governance_mode_str="off")
+        return out
+
+    def _rows_of(self, out, table):
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        try:
+            return {row["id"]: dict(row) for row in conn.execute(f"SELECT * FROM {table}")}
+        finally:
+            conn.close()
+
+    def game_rows(self, out):
+        """Entries for other games, from game_catalog_items."""
+        return self._rows_of(out, "game_catalog_items")
+
+    def minecraft_rows(self, out):
+        """Minecraft entries, from registry_items."""
+        return self._rows_of(out, "registry_items")
+
+    def assertRefused(self, *needles):
+        """The compile must exit. The refusal, whether raised with its message or
+        logged first (the Minecraft URL checks log then exit 1), must name each needle."""
+        logged = []
+        handler = logging.Handler(level=logging.ERROR)
+        handler.emit = lambda record: logged.append(record.getMessage())
+        compiler_logger = logging.getLogger("compiler")
+        compiler_logger.addHandler(handler)
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                self.compile()
+        finally:
+            compiler_logger.removeHandler(handler)
+        message = " ".join([str(caught.exception.code), *logged])
+        for needle in needles:
+            self.assertIn(needle, message)
+        return message
+
+    # -- valid entries -------------------------------------------------------
+
+    def test_valid_github_and_direct_hash_entries_compile(self):
+        self.skyrim_entry_at(_skyrim_github_entry())
+        self.skyrim_entry_at(_skyrim_direct_entry())
+        out = self.compile()
+        rows = self.game_rows(out)
+
+        github = rows["crash-logger"]
+        self.assertEqual(github["game"], "skyrim-se")
+        self.assertEqual(github["download_strategy"], "github_release")
+        self.assertEqual(github["status"], "active")
+        self.assertEqual(github["license_id"], "MIT")
+        compat = json.loads(github["game_compatibility_json"])
+        self.assertEqual(compat[0]["asset"], "CrashLogger-*.7z")
+        self.assertEqual(compat[0]["requires"], [{"framework": "skse", "min_version": "2.2.6"}])
+        self.assertEqual(
+            json.loads(github["download_sources_json"]),
+            [{"strategy": "github_release", "identifier": "example-author/crash-logger"}],
+        )
+
+        direct = rows["skyrim-archive-mod"]
+        self.assertEqual(direct["game"], "skyrim-se")
+        self.assertEqual(direct["download_strategy"], "direct_hash")
+        self.assertNotIn("asset", json.loads(direct["game_compatibility_json"])[0])
+
+    def test_other_game_entries_stay_out_of_registry_items(self):
+        self.skyrim_entry_at(_skyrim_github_entry())
+        out = self.compile()
+        self.assertNotIn("crash-logger", self.minecraft_rows(out))
+        conn = sqlite3.connect(str(out))
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(registry_items)")}
+        finally:
+            conn.close()
+        self.assertNotIn("game", columns)
+        self.assertNotIn("game_compatibility_json", columns)
+
+    def test_archive_names_are_accepted_for_direct_hash(self):
+        for index, name in enumerate(("Mod-1.0.7z", "Mod-1.0.zip", "Mod-1.0.rar")):
+            self.skyrim_entry_at(
+                _skyrim_direct_entry(item_id=f"archive-{index}", url=f"https://example.com/files/{name}")
+            )
+        rows = self.game_rows(self.compile())
+        self.assertEqual({"archive-0", "archive-1", "archive-2"}, set(rows))
+
+    def test_minecraft_entry_may_name_its_game(self):
+        entry = _minecraft_direct_entry()
+        entry["game"] = "minecraft"
+        self.write("mods/minecraft-pinned-mod.json", entry)
+        out = self.compile()
+        self.assertIn("minecraft-pinned-mod", self.minecraft_rows(out))
+        self.assertNotIn("minecraft-pinned-mod", self.game_rows(out))
+
+    def test_compiled_schema_version_is_the_compiler_constant(self):
+        self.skyrim_entry_at(_skyrim_github_entry())
+        conn = sqlite3.connect(str(self.compile()))
+        try:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(version, _compile.SCHEMA_VERSION)
+        # Schema 10: crash_signatures changed shape (format v2), and that is a
+        # table older clients read, so the version moves with it.
+        self.assertEqual(_compile.SCHEMA_VERSION, 10)
+
+    # -- folder and game ----------------------------------------------------
+
+    def test_an_entry_whose_game_disagrees_with_its_folder_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game"] = "valheim"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", '"game" must be', "skyrim-se")
+
+    def test_a_folder_for_an_undeclared_game_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game"] = "not-a-game"
+        self.write("games/not-a-game/mods/crash-logger.json", entry)
+        self.assertRefused("crash-logger.json", "not-a-game")
+
+    def test_an_other_game_entry_outside_the_games_folder_is_refused(self):
+        self.write("mods/crash-logger.json", _skyrim_github_entry())
+        self.assertRefused("crash-logger.json", '"game" is', "registry/games/skyrim-se")
+
+    def test_a_minecraft_folder_entry_may_not_carry_game_compatibility(self):
+        entry = _minecraft_direct_entry()
+        entry["game_compatibility"] = [{"stores": ["steam"], "game_versions": ["1.0"]}]
+        self.write("mods/minecraft-pinned-mod.json", entry)
+        self.assertRefused("minecraft-pinned-mod.json", '"game_compatibility"')
+
+    def test_an_other_game_packs_folder_is_refused(self):
+        self.write("games/skyrim-se/packs/crash-logger.json", _skyrim_github_entry())
+        self.assertRefused("packs", "only mods entries")
+
+    # -- compatibility ------------------------------------------------------
+
+    def test_unknown_store_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["stores"] = ["epic"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "game_compatibility[0].stores", "'epic'")
+
+    def test_unknown_framework_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["requires"] = [{"framework": "nvse", "min_version": "1.0"}]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "requires", "'nvse'")
+
+    def test_empty_arrays_are_refused(self):
+        cases = {
+            "game_compatibility": lambda e: e.update(game_compatibility=[]),
+            "stores": lambda e: e["game_compatibility"][0].update(stores=[]),
+            "game_versions": lambda e: e["game_compatibility"][0].update(game_versions=[]),
+        }
+        for field_name, break_entry in cases.items():
+            with self.subTest(field=field_name):
+                self.reset_registry()
+                entry = _skyrim_github_entry()
+                break_entry(entry)
+                self.skyrim_entry_at(entry)
+                self.assertRefused("crash-logger.json", field_name)
+
+    def test_non_numeric_min_version_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["requires"] = [{"framework": "skse", "min_version": "2.2.6b"}]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "min_version", "'2.2.6b'")
+
+    def test_game_version_globs_must_cover_whole_components(self):
+        for bad in ("1.6.11*", "1.6.1170.0-1", "1.6.1170.x", ""):
+            with self.subTest(version=bad):
+                self.reset_registry()
+                entry = _skyrim_github_entry()
+                entry["game_compatibility"][0]["game_versions"] = [bad]
+                self.skyrim_entry_at(entry)
+                self.assertRefused("crash-logger.json", "game_versions")
+
+    def test_a_github_entry_needs_an_asset(self):
+        entry = _skyrim_github_entry()
+        del entry["game_compatibility"][0]["asset"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "game_compatibility[0].asset", "required")
+
+    def test_a_direct_hash_entry_may_not_name_an_asset(self):
+        entry = _skyrim_direct_entry()
+        entry["game_compatibility"][0]["asset"] = "Mod-*.zip"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("skyrim-archive-mod.json", "game_compatibility[0].asset", "only for github_release")
+
+    def test_unknown_compatibility_keys_are_refused(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["game_version"] = ["1.6.1170.0"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "game_version")
+
+    # -- Minecraft-only fields and strategies ---------------------------------
+
+    def test_minecraft_only_fields_are_refused_on_other_game_entries(self):
+        extras = {
+            "compatible_versions": [{"mc_version": "1.21", "loader": "fabric", "mod_version": "1.0"}],
+            "mod_dependencies": {"required": ["fabric-api"]},
+            "package_signatures": ["com.example.mod"],
+            "mod_jar_aliases": ["example"],
+            "modrinth_id": "AAAAAAAA",
+        }
+        for field_name, value in extras.items():
+            with self.subTest(field=field_name):
+                self.reset_registry()
+                entry = _skyrim_github_entry()
+                entry[field_name] = value
+                self.skyrim_entry_at(entry)
+                self.assertRefused("crash-logger.json", f'"{field_name}"')
+
+    def test_modrinth_strategy_is_refused_for_another_game(self):
+        entry = _skyrim_github_entry()
+        entry["download_strategy"] = "modrinth_id"
+        entry["source_identifier"] = "AAAAAAAA"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "'modrinth_id'", "github_release or direct_hash")
+
+    def test_a_github_identifier_must_be_owner_and_repo(self):
+        entry = _skyrim_github_entry()
+        entry["source_identifier"] = "just-a-name"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "owner/repo")
+
+    def test_a_direct_hash_url_must_be_https(self):
+        self.skyrim_entry_at(_skyrim_direct_entry(url="http://example.com/files/Mod-1.0.zip"))
+        self.assertRefused("skyrim-archive-mod.json", "https://")
+
+    def test_sha256_is_required_on_other_game_entries(self):
+        entry = _skyrim_github_entry()
+        entry["sha256"] = "not-a-hash"
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "sha256")
+
+    # -- download hashes and pins ----------------------------------------------
+
+    def test_a_github_entry_for_another_game_compiles_without_sha256(self):
+        entry = _skyrim_github_entry()
+        del entry["sha256"]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        self.assertIsNone(self.game_rows(out)["crash-logger"]["sha256"])
+
+    def test_a_direct_hash_entry_for_another_game_still_requires_sha256(self):
+        entry = _skyrim_direct_entry()
+        del entry["sha256"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("skyrim-archive-mod.json", "sha256", "required")
+
+    def test_a_valid_pin_on_another_game_entry_compiles_and_is_stored(self):
+        entry = _skyrim_github_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "github_release",
+                "identifier": "example-author/crash-logger",
+                "pins": [{"tag": "v1.0", "asset": "CrashLogger-1.0.7z", "sha256": "D" * 64}],
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["crash-logger"]["download_sources_json"])
+        self.assertEqual(
+            sources[0]["pins"],
+            [{"tag": "v1.0", "asset": "CrashLogger-1.0.7z", "sha256": "d" * 64}],
+        )
+
+    def test_a_malformed_pin_on_another_game_entry_is_refused(self):
+        entry = _skyrim_github_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "github_release",
+                "identifier": "example-author/crash-logger",
+                "pins": [{"tag": "v1.0", "asset": "CrashLogger-1.0.7z", "sha256": "short"}],
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("crash-logger.json", "pins[0].sha256", "64 hex")
+
+    # -- identity -----------------------------------------------------------
+
+    def test_an_id_used_by_two_games_is_refused_naming_both_files(self):
+        self.write("mods/shared-id.json", _minecraft_direct_entry("shared-id"))
+        self.skyrim_entry_at(_skyrim_github_entry("shared-id"))
+        message = self.assertRefused("Duplicate catalog id 'shared-id'", "shared-id.json")
+        self.assertEqual(message.count("shared-id.json"), 2)
+
+
+class ManualLinkEntryTests(OtherGameEntryTests):
+    """Entries whose file the player downloads themselves. Minecraft keeps its
+    own strategies, so a manual_link page is for another game only."""
+
+    def test_a_valid_manual_link_entry_compiles_and_keeps_its_page_and_hint(self):
+        self.skyrim_entry_at(_skyrim_manual_entry())
+        out = self.compile()
+        row = self.game_rows(out)["address-library"]
+        self.assertEqual(row["download_strategy"], "manual_link")
+        self.assertEqual(
+            row["source_identifier"],
+            "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+        )
+        self.assertIsNone(row["sha256"])
+        compat = json.loads(row["game_compatibility_json"])
+        self.assertEqual(compat[0]["asset"], "*-32444-*.zip")
+        self.assertEqual(
+            compat[0]["download_hint"], "Main file: Address Library for SKSE Plugins"
+        )
+        self.assertEqual(
+            json.loads(row["download_sources_json"]),
+            [
+                {
+                    "strategy": "manual_link",
+                    "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+                }
+            ],
+        )
+
+    def test_a_manual_link_url_must_be_https_and_the_refusal_names_the_field(self):
+        entry = _skyrim_manual_entry(url="http://www.nexusmods.com/skyrimspecialedition/mods/32444")
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "source_identifier", "http://")
+
+    def test_a_manual_link_entry_needs_an_asset(self):
+        entry = _skyrim_manual_entry()
+        del entry["game_compatibility"][0]["asset"]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "game_compatibility[0].asset", "required")
+
+    def test_a_manual_link_entry_may_carry_pins_without_a_release_tag(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+                "pins": [{"asset": "Address Library-32444-1.0-1700000000.zip", "sha256": "E" * 64}],
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual(
+            sources[0]["pins"],
+            [{"asset": "Address Library-32444-1.0-1700000000.zip", "sha256": "e" * 64}],
+        )
+
+    def test_a_manual_link_may_only_be_the_last_fallback(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            },
+            {"strategy": "github_release", "identifier": "example/address-library"},
+        ]
+        self.skyrim_entry_at(entry)
+        self.assertRefused("address-library.json", "download_sources[0]", "last fallback")
+
+    def test_a_manual_link_alone_is_the_entrys_only_source(self):
+        entry = _skyrim_manual_entry()
+        entry["download_sources"] = [
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            }
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual([source["strategy"] for source in sources], ["manual_link"])
+
+    def test_a_manual_link_fallback_after_a_github_source_compiles(self):
+        entry = _skyrim_manual_entry()
+        entry["download_strategy"] = "github_release"
+        entry["source_identifier"] = "example/address-library"
+        entry["download_sources"] = [
+            {"strategy": "github_release", "identifier": "example/address-library"},
+            {
+                "strategy": "manual_link",
+                "identifier": "https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+            },
+        ]
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        sources = json.loads(self.game_rows(out)["address-library"]["download_sources_json"])
+        self.assertEqual([source["strategy"] for source in sources], ["github_release", "manual_link"])
+
+    def test_minecraft_cannot_use_manual_link(self):
+        entry = _minecraft_direct_entry("manual-in-minecraft")
+        entry["download_strategy"] = "manual_link"
+        entry["source_identifier"] = "https://example.com/files/mod-page"
+        del entry["sha256"]
+        self.write("mods/manual-in-minecraft.json", entry)
+        self.assertRefused("manual-in-minecraft.json", "manual_link")
+
+    def test_a_download_hint_must_be_one_short_line(self):
+        for bad in ("", "line one\nline two", "x" * 201):
+            with self.subTest(hint=bad):
+                self.reset_registry()
+                entry = _skyrim_manual_entry()
+                entry["game_compatibility"][0]["download_hint"] = bad
+                self.skyrim_entry_at(entry)
+                self.assertRefused("address-library.json", "download_hint")
+
+    def test_provides_framework_is_stored_and_must_be_declared(self):
+        entry = _skyrim_manual_entry()
+        entry["provides_framework"] = "skse"
+        self.skyrim_entry_at(entry)
+        out = self.compile()
+        self.assertEqual(self.game_rows(out)["address-library"]["provides_framework"], "skse")
+
+        self.reset_registry()
+        bad = _skyrim_manual_entry("bad-provider")
+        bad["provides_framework"] = "nvse"
+        self.skyrim_entry_at(bad)
+        self.assertRefused("bad-provider.json", "provides_framework", "'nvse'")
+
+
+class RealSkyrimPackageEntryTests(unittest.TestCase):
+    """The brief's SKSE example compiles against the real Skyrim package, which
+    declares SKSE (MASTER_SPEC §26.8). Nothing here patches the game packages."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = self.tmp / "registry"
+        self.registry.mkdir()
+        patches = [
+            mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
+            mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_modrinth_versions", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_version_changelogs", lambda items: []),
+            mock.patch.object(_compile, "_load_github_token", lambda: None),
+            mock.patch.object(
+                _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write_entry(self, data):
+        path = self.registry / "games" / "skyrim-se" / "mods" / f"{data['id']}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def compile_rows(self):
+        out = self.tmp / "out" / "registry.db"
+        _compile.compile_registry(out, skip_sign=True, no_governance_write=True, governance_mode_str="off")
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        try:
+            return {row["id"]: dict(row) for row in conn.execute("SELECT * FROM game_catalog_items")}
+        finally:
+            conn.close()
+
+    def test_the_real_package_declares_skse(self):
+        declared = _compile.load_game_declarations()
+        self.assertIn("skse", declared["skyrim-se"].frameworks)
+
+    def test_the_brief_example_compiles_against_the_real_package(self):
+        self.write_entry(_skyrim_github_entry())
+        rows = self.compile_rows()
+        compat = json.loads(rows["crash-logger"]["game_compatibility_json"])
+        self.assertEqual(compat[0]["requires"], [{"framework": "skse", "min_version": "2.2.6"}])
+        self.assertEqual(compat[0]["stores"], ["steam", "gog"])
+
+    def test_an_undeclared_framework_is_still_refused_against_the_real_package(self):
+        entry = _skyrim_github_entry()
+        entry["game_compatibility"][0]["requires"] = [{"framework": "nvse", "min_version": "1.0"}]
+        self.write_entry(entry)
+        with self.assertRaises(SystemExit) as caught:
+            self.compile_rows()
+        self.assertIn("'nvse'", str(caught.exception.code))
+
+
+class DownloadHashPolicyTests(unittest.TestCase):
+    """The manifest sha256 is required only where a pinned source needs it, and
+    curator pins validate. Covers Minecraft entries; other games are in
+    OtherGameEntryTests."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.manifest = self.tmp / "item.json"
+        self.manifest.write_text("{}", encoding="utf-8")
+        patch = mock.patch.object(
+            _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        _compile.create_tables(self.conn)
+
+    def _github_item(self, **overrides):
+        item = {
+            "id": "xaeros-minimap",
+            "name": "Xaero's Minimap",
+            "content_type": "mod",
+            "download_strategy": "github_release",
+            "source_identifier": "owner/repo",
+            "compatible_versions": [
+                {"mc_version": "1.21", "loader": "fabric", "mod_version": "1.2.0"},
+            ],
+        }
+        item.update(overrides)
+        return item
+
+    def _insert(self, item):
+        _compile.insert_registry_item(self.conn, item, self.manifest)
+        return self.conn.execute(
+            "SELECT sha256, download_sources_json FROM registry_items WHERE id = ?",
+            (item["id"],),
+        ).fetchone()
+
+    def test_a_github_release_entry_compiles_without_sha256(self):
+        sha256, _ = self._insert(self._github_item())
+        self.assertIsNone(sha256)
+
+    def test_a_modrinth_entry_compiles_without_sha256(self):
+        item = self._github_item(download_strategy="modrinth_id", source_identifier="AANobbMI")
+        sha256, _ = self._insert(item)
+        self.assertIsNone(sha256)
+
+    def test_a_github_entry_that_states_a_sha256_keeps_it(self):
+        sha256, _ = self._insert(self._github_item(sha256="a" * 64))
+        self.assertEqual(sha256, "a" * 64)
+
+    def test_a_malformed_sha256_is_refused_even_though_it_is_optional(self):
+        with self.assertRaises(SystemExit):
+            self._insert(self._github_item(sha256="not-a-hash"))
+
+    def test_direct_hash_still_requires_sha256(self):
+        item = _minecraft_direct_entry("direct-no-hash")
+        del item["sha256"]
+        with self.assertRaises(SystemExit):
+            self._insert(item)
+
+    def test_a_pinned_fallback_source_requires_sha256_even_on_a_github_primary(self):
+        item = self._github_item(
+            download_sources=[
+                {"strategy": "github_release", "identifier": "owner/repo"},
+                {"strategy": "direct_hash", "identifier": "https://example.com/files/mod-1.2.0.jar"},
+            ],
+        )
+        with self.assertRaises(SystemExit):
+            self._insert(item)
+        item["sha256"] = "b" * 64
+        sha256, _ = self._insert(item)
+        self.assertEqual(sha256, "b" * 64)
+
+    def test_a_valid_pin_is_kept_in_download_sources(self):
+        pin = {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "C" * 64}
+        item = self._github_item(
+            download_sources=[{"strategy": "github_release", "identifier": "owner/repo", "pins": [pin]}],
+        )
+        _, sources_json = self._insert(item)
+        sources = json.loads(sources_json)
+        self.assertEqual(
+            sources[0]["pins"],
+            [{"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "c" * 64}],
+            "pins are stored in canonical (lowercase) form",
+        )
+
+    def test_a_source_without_pins_stores_no_pins_key(self):
+        _, sources_json = self._insert(self._github_item())
+        self.assertNotIn("pins", json.loads(sources_json)[0])
+
+    def test_malformed_pins_are_refused(self):
+        good = {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "c" * 64}
+        bad_pins = {
+            "empty tag": {**good, "tag": " "},
+            "empty asset": {**good, "asset": ""},
+            "asset with a path": {**good, "asset": "dir/xaeros.jar"},
+            "short sha256": {**good, "sha256": "c" * 63},
+            "non-hex sha256": {**good, "sha256": "z" * 64},
+            "unknown key": {**good, "size": 10},
+            "missing sha256": {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar"},
+        }
+        for label, pin in bad_pins.items():
+            with self.subTest(pin=label):
+                item = self._github_item(
+                    download_sources=[
+                        {"strategy": "github_release", "identifier": "owner/repo", "pins": [pin]},
+                    ],
+                )
+                with self.assertRaises(SystemExit):
+                    self._insert(item)
+
+    def test_a_pin_repeated_for_the_same_release_file_is_refused(self):
+        pin = {"tag": "v1.2.0", "asset": "xaeros-1.2.0.jar", "sha256": "c" * 64}
+        item = self._github_item(
+            download_sources=[
+                {"strategy": "github_release", "identifier": "owner/repo", "pins": [pin, dict(pin)]},
+            ],
+        )
+        with self.assertRaises(SystemExit):
+            self._insert(item)
+
+    def test_pins_are_only_for_github_release_sources(self):
+        item = _minecraft_direct_entry("direct-with-pin")
+        del item["sha256"]
+        item["download_sources"] = [
+            {
+                "strategy": "direct_hash",
+                "identifier": "https://example.com/files/pinned-1.0.0.jar",
+                "pins": [{"tag": "v1", "asset": "pinned-1.0.0.jar", "sha256": "c" * 64}],
+            },
+        ]
+        with self.assertRaises(SystemExit):
+            normalize_download_sources_for_test(item)
+
+    def test_the_live_manifests_that_state_a_sha256_still_normalize(self):
+        registry = Path(_compile.REGISTRY_DIR) / "mods"
+        manifests = sorted(registry.glob("*.json"))
+        self.assertTrue(manifests, "the live registry has mod manifests")
+        for path in manifests:
+            with self.subTest(manifest=path.name):
+                item = json.loads(path.read_text(encoding="utf-8"))
+                if item.get("archived") or item.get("status") == "archived":
+                    continue
+                sources = _compile.normalize_download_sources(item)
+                _compile.require_manifest_sha256(item["id"], sources, item.get("sha256"))
+
+
+def normalize_download_sources_for_test(item):
+    return _compile.normalize_download_sources(item)
+
+
 class TestNormalizeCuratorWarning(unittest.TestCase):
     """Tests for normalize_curator_warning.
 
@@ -1511,6 +2417,328 @@ class TestNormalizeCuratorWarning(unittest.TestCase):
             _compile.normalize_curator_warning({"curator_warning": raw}),
             "a" * _compile.CURATOR_WARNING_MAX_CHARS,
         )
+
+
+class OfficialPluginTests(unittest.TestCase):
+    """registry/official-plugins/<id>.json compiles into the official_plugins table, and every
+    malformed entry stops the compile with a message naming the file and the field."""
+
+    EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "official-plugins" / "acme.fixture.json"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.registry = self.tmp / "registry"
+        self.registry.mkdir()
+        patches = [
+            mock.patch.object(_compile, "REGISTRY_DIR", self.registry),
+            mock.patch.object(_compile, "_hydrate_modrinth_metadata", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_modrinth_versions", lambda items: None),
+            mock.patch.object(_compile, "_hydrate_version_changelogs", lambda items: []),
+            mock.patch.object(_compile, "_load_github_token", lambda: None),
+            mock.patch.object(
+                _compile, "manifest_date_added", lambda path: "2026-01-01T00:00:00+00:00"
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def entry(self):
+        return json.loads(self.EXAMPLE.read_text(encoding="utf-8"))
+
+    def write(self, data, name=None):
+        path = self.registry / "official-plugins" / (name or f"{data['id']}.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def compile(self, official_fetcher=None):
+        out = self.tmp / "out" / "registry.db"
+        _compile.compile_registry(
+            out,
+            skip_sign=True,
+            no_governance_write=True,
+            governance_mode_str="off",
+            official_fetcher=official_fetcher,
+        )
+        return out
+
+    def rows(self, out):
+        conn = sqlite3.connect(str(out))
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM official_plugins ORDER BY version")]
+        finally:
+            conn.close()
+
+    def assertRefused(self, *needles):
+        with self.assertRaises(SystemExit) as caught:
+            self.compile()
+        message = str(caught.exception.code)
+        for needle in needles:
+            self.assertIn(needle, message)
+
+    def test_the_example_entry_compiles_to_a_current_and_a_previous_row(self):
+        self.write(self.entry())
+        rows = self.rows(self.compile())
+        self.assertEqual([r["version"] for r in rows], ["1.0.0", "1.1.0"])
+        by_version = {r["version"]: r for r in rows}
+        self.assertEqual(by_version["1.1.0"]["channel"], "current")
+        self.assertEqual(by_version["1.0.0"]["channel"], "previous")
+        current = by_version["1.1.0"]
+        self.assertEqual(current["plugin_id"], "acme.fixture")
+        self.assertEqual(current["name"], "Acme Fixture")
+        self.assertEqual(json.loads(current["game_ids_json"]), ["fixture-game"])
+        self.assertEqual(current["package_url"], "https://plugins.example.org/acme.fixture-1.1.0.zip")
+        self.assertEqual(current["package_sha256"], "1" * 64)
+        self.assertEqual(current["package_tree_sha256"], "3" * 64)
+        self.assertEqual(by_version["1.0.0"]["package_tree_sha256"], "4" * 64)
+        self.assertEqual(current["package_size"], 4096)
+        self.assertEqual(current["min_agora_version"], "0.1.0")
+
+    def test_an_official_package_must_match_its_pinned_bytes(self):
+        payload = b"acme fixture package"
+        digest = hashlib.sha256(payload).hexdigest()
+        data = self.entry()
+        del data["previous"]
+        data["current"]["sha256"] = digest
+        data["current"]["size"] = len(payload)
+        self.write(data)
+
+        # A fetcher that serves the pinned bytes lets the entry through.
+        rows = self.rows(self.compile(official_fetcher=lambda url: payload))
+        self.assertEqual(rows[0]["package_sha256"], digest)
+
+        with self.assertRaises(SystemExit) as caught:
+            self.compile(official_fetcher=lambda url: payload.upper())
+        self.assertIn("current.sha256", str(caught.exception.code))
+
+        data["current"]["size"] = len(payload) + 1
+        self.write(data)
+        with self.assertRaises(SystemExit) as caught:
+            self.compile(official_fetcher=lambda url: payload)
+        self.assertIn("current.size", str(caught.exception.code))
+
+    def test_a_missing_official_package_leaves_the_entry_out_with_a_warning(self):
+        payload = b"acme fixture package"
+        data = self.entry()
+        del data["previous"]
+        data["current"]["sha256"] = hashlib.sha256(payload).hexdigest()
+        data["current"]["size"] = len(payload)
+        self.write(data)
+
+        def missing(url):
+            raise OSError("404")
+
+        with self.assertLogs(_compile.logger, level="WARNING") as logs:
+            rows = self.rows(self.compile(official_fetcher=missing))
+        self.assertEqual(rows, [])
+        self.assertIn("left out of the catalog", "\n".join(logs.output))
+
+        # In Actions the same message is a workflow annotation, so the run shows it as a warning.
+        printed = io.StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), contextlib.redirect_stdout(printed):
+            self.compile(official_fetcher=missing)
+        self.assertIn("::warning::", printed.getvalue())
+        self.assertIn("left out of the catalog", printed.getvalue())
+
+    def test_an_additive_table_does_not_hide_the_schema_version(self):
+        self.write(self.entry())
+        out = self.compile()
+        conn = sqlite3.connect(str(out))
+        try:
+            version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            conn.close()
+        self.assertEqual(version, _compile.SCHEMA_VERSION)
+        # Everything an older client reads is still there; the new table is purely additive.
+        self.assertIn("registry_items", tables)
+        self.assertIn("game_catalog_items", tables)
+        self.assertIn("official_plugins", tables)
+
+    def test_no_official_plugins_folder_compiles_to_an_empty_table(self):
+        self.assertEqual(self.rows(self.compile()), [])
+
+    def test_previous_is_optional(self):
+        data = self.entry()
+        del data["previous"]
+        self.write(data)
+        self.assertEqual([r["channel"] for r in self.rows(self.compile())], ["current"])
+
+    def test_a_non_https_url_is_refused(self):
+        for bad in [
+            "http://plugins.example.org/a.zip",
+            "ftp://plugins.example.org/a.zip",
+            "https://user:pw@plugins.example.org/a.zip",
+            "https://plugins.example.org:8443/a.zip",
+            "plugins.example.org/a.zip",
+            "https://",
+            "https://plugins.example.org/a b.zip",
+            "",
+        ]:
+            with self.subTest(url=bad):
+                data = self.entry()
+                data["current"]["package_url"] = bad
+                self.write(data)
+                self.assertRefused("current.package_url", "acme.fixture.json")
+
+    def test_a_malformed_hash_is_refused(self):
+        for bad in ["", "abc", "1" * 63, "1" * 65, "G" * 64, "A" * 64, None, 5]:
+            with self.subTest(sha256=bad):
+                data = self.entry()
+                data["previous"]["sha256"] = bad
+                self.write(data)
+                self.assertRefused("previous.sha256")
+
+    def test_a_missing_or_malformed_tree_digest_is_refused(self):
+        for bad in ["", "abc", "3" * 63, "3" * 65, "G" * 64, "A" * 64, None, 5]:
+            with self.subTest(tree_sha256=bad):
+                data = self.entry()
+                data["current"]["tree_sha256"] = bad
+                self.write(data)
+                self.assertRefused("current.tree_sha256")
+        data = self.entry()
+        del data["previous"]["tree_sha256"]
+        self.write(data)
+        self.assertRefused("missing", "tree_sha256")
+
+    def test_a_bad_size_is_refused(self):
+        for bad in [0, -1, 64 * 1024 * 1024 + 1, 1.5, "10", True, None]:
+            with self.subTest(size=bad):
+                data = self.entry()
+                data["current"]["size"] = bad
+                self.write(data)
+                self.assertRefused("current.size")
+
+    def test_ids_must_be_lowercase_publisher_dot_plugin_and_match_the_file(self):
+        for bad in ["", "acme", "Acme.Fixture", "acme.fixture ", "../x.y", "acme..fixture", "-a.b", "a.b-"]:
+            with self.subTest(id=bad):
+                data = self.entry()
+                data["id"] = bad
+                self.write(data, name="acme.fixture.json")
+                self.assertRefused("id must be")
+        data = self.entry()
+        data["id"] = "acme.other"
+        self.write(data, name="acme.fixture.json")
+        self.assertRefused("file name must be the plugin id")
+
+    def test_versions_must_be_semver_and_previous_must_differ(self):
+        data = self.entry()
+        data["current"]["version"] = "latest"
+        self.write(data)
+        self.assertRefused("current.version")
+        data = self.entry()
+        data["previous"]["version"] = data["current"]["version"]
+        self.write(data)
+        self.assertRefused("previous must be a different version")
+        data = self.entry()
+        data["min_agora_version"] = "newest"
+        self.write(data)
+        self.assertRefused("min_agora_version")
+
+    def test_unknown_missing_and_stray_fields_are_refused(self):
+        data = self.entry()
+        data["official"] = True
+        self.write(data)
+        self.assertRefused("unknown field", "official")
+        data = self.entry()
+        del data["current"]["size"]
+        self.write(data)
+        self.assertRefused("missing", "size")
+        self.write(self.entry())
+        (self.registry / "official-plugins" / "notes.txt").write_text("x", encoding="utf-8")
+        self.assertRefused("official-plugins/<plugin-id>.json")
+
+    def test_a_malformed_file_is_refused_not_skipped(self):
+        path = self.registry / "official-plugins" / "acme.fixture.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{ not json", encoding="utf-8")
+        self.assertRefused("acme.fixture.json", "cannot read")
+
+    def test_archived_entries_are_skipped_like_everywhere_else(self):
+        data = self.entry()
+        path = self.registry / "official-plugins" / "archived" / "acme.fixture.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.rows(self.compile()), [])
+
+
+class OfficialPluginDigestTests(unittest.TestCase):
+    """scripts/official_plugin_digest.py computes the tree digest the signed entry pins. The app
+    computes it too (official.rs), so a shared vector keeps the two in step."""
+
+    # The same two files, hashed by tree_digest and zip_tree_digest in
+    # crates/agora-core/src/plugins/official.rs (test `the_tree_digest_matches_the_python_script`).
+    GOLDEN = "edf96c2334a03f422f09963524f136c27b969682ebead88f3d40865741d830a8"
+
+    def setUp(self):
+        scripts = str(Path(__file__).resolve().parent.parent / "scripts")
+        sys.path.insert(0, scripts)
+        self.addCleanup(sys.path.remove, scripts)
+        import official_plugin_digest
+
+        self.digest = official_plugin_digest
+
+    def make_zip(self, entries):
+        import io
+        import zipfile
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, data in entries:
+                archive.writestr(name, data)
+        return buffer.getvalue()
+
+    def test_the_shared_vector(self):
+        files = {"agora-plugin.json": b"{}", "games/package.json": b"[]"}
+        self.assertEqual(self.digest.tree_digest(files), self.GOLDEN)
+
+    def test_a_zip_and_a_folder_of_the_same_files_agree(self):
+        data = self.make_zip([("agora-plugin.json", b"{}"), ("games/package.json", b"[]")])
+        self.assertEqual(self.digest.tree_digest(self.digest.files_of_zip(data)), self.GOLDEN)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "games").mkdir()
+            (root / "agora-plugin.json").write_bytes(b"{}")
+            (root / "games" / "package.json").write_bytes(b"[]")
+            self.assertEqual(self.digest.describe(root)["tree_sha256"], self.GOLDEN)
+
+    def test_backslash_and_dot_segments_unpack_to_the_same_path(self):
+        data = self.make_zip([("./agora-plugin.json", b"{}"), ("games\\package.json", b"[]")])
+        self.assertEqual(self.digest.tree_digest(self.digest.files_of_zip(data)), self.GOLDEN)
+
+    def test_any_change_moves_the_digest(self):
+        base = {"a.json": b"1", "d/b.json": b"2"}
+        digest = self.digest.tree_digest(base)
+        self.assertNotEqual(digest, self.digest.tree_digest({**base, "a.json": b"3"}))
+        self.assertNotEqual(digest, self.digest.tree_digest({**base, "c.json": b""}))
+        self.assertNotEqual(
+            digest, self.digest.tree_digest({"a.json": b"1", "e/b.json": b"2"})
+        )
+
+    def test_a_later_duplicate_entry_wins_as_unpacking_does(self):
+        data = self.make_zip([("a.json", b"old"), ("a.json", b"new")])
+        self.assertEqual(self.digest.files_of_zip(data), {"a.json": b"new"})
+
+    def test_hostile_entry_names_are_refused(self):
+        for bad in ["../x", "a/../../x", "/etc/passwd", "C:/x", "a/b:c", ""]:
+            with self.subTest(name=bad):
+                with self.assertRaises(SystemExit):
+                    self.digest.files_of_zip(self.make_zip([(bad, b"x")]))
+
+    def test_describe_reports_the_zip_hash_and_size(self):
+        import hashlib
+
+        data = self.make_zip([("agora-plugin.json", b"{}"), ("games/package.json", b"[]")])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "p.zip"
+            path.write_bytes(data)
+            described = self.digest.describe(path)
+        self.assertEqual(described["sha256"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(described["size"], len(data))
+        self.assertEqual(described["tree_sha256"], self.GOLDEN)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,10 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// Standard manifest filename inside a package or development folder.
 pub const MANIFEST_FILENAME: &str = "agora-plugin.json";
 
+/// Longest a `withoutCode` sentence may be. It is read at the install prompt
+/// and has to stay one glanceable line of plain text.
+pub const WITHOUT_CODE_MAX_LEN: usize = 240;
+
 // ---------------------------------------------------------------------------
 // Plugin identity
 // ---------------------------------------------------------------------------
@@ -235,6 +239,11 @@ pub struct PluginManifest {
     /// a purely declarative plugin such as a theme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
+    /// One plain-text sentence naming what this plugin cannot do when its code
+    /// is not allowed to run. Shown at the install prompt beside the choice to
+    /// install without running code. Only meaningful with an `entrypoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub without_code: Option<String>,
     #[serde(default)]
     pub activation: Vec<ActivationEvent>,
     #[serde(default)]
@@ -402,6 +411,30 @@ impl PluginManifest {
                 )));
             }
         }
+        if let Some(without_code) = &self.without_code {
+            if self.entrypoint.is_none() {
+                return Err(PluginError::invalid_manifest(
+                    "`withoutCode` says what a plugin cannot do without its code, but this \
+                     plugin declares no `entrypoint` and runs none",
+                ));
+            }
+            if without_code.trim().is_empty() {
+                return Err(PluginError::invalid_manifest(
+                    "`withoutCode` must say what the plugin cannot do without its code",
+                ));
+            }
+            let length = without_code.chars().count();
+            if length > WITHOUT_CODE_MAX_LEN {
+                return Err(PluginError::invalid_manifest(format!(
+                    "`withoutCode` is {length} characters; the limit is {WITHOUT_CODE_MAX_LEN}"
+                )));
+            }
+            if without_code.chars().any(char::is_control) {
+                return Err(PluginError::invalid_manifest(
+                    "`withoutCode` must be plain text without control characters",
+                ));
+            }
+        }
         if let Some(source) = &self.source {
             if !source.starts_with("https://") {
                 return Err(PluginError::invalid_manifest(format!(
@@ -552,6 +585,8 @@ impl PluginManifest {
         }
 
         self.validate_providers()?;
+        self.validate_game_packages()?;
+        self.validate_crash_packs()?;
 
         for check in &self.contributions.launch_checks {
             if check.timeout_ms == 0 {
@@ -560,6 +595,40 @@ impl PluginManifest {
                     check.id
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_game_packages(&self) -> PluginResult<()> {
+        let has_game_define = self
+            .capabilities
+            .required
+            .iter()
+            .any(|n| n == "game:define");
+        if !self.contributions.game_packages.is_empty() && !has_game_define {
+            return Err(PluginError::invalid_manifest(
+                "`gamePackages` requires the `game:define` capability under `capabilities.required`",
+            ));
+        }
+        for pkg in &self.contributions.game_packages {
+            validate_package_path("game package path", &pkg.path)?;
+        }
+        Ok(())
+    }
+
+    fn validate_crash_packs(&self) -> PluginResult<()> {
+        let has_capability = self
+            .capabilities
+            .required
+            .iter()
+            .any(|n| n == "crash:contribute");
+        if !self.contributions.crash_packs.is_empty() && !has_capability {
+            return Err(PluginError::invalid_manifest(
+                "`crashPacks` requires the `crash:contribute` capability under `capabilities.required`",
+            ));
+        }
+        for pack in &self.contributions.crash_packs {
+            validate_package_path("crash pack path", &pack.path)?;
         }
         Ok(())
     }
@@ -830,6 +899,58 @@ mod tests {
     }
 
     #[test]
+    fn a_without_code_sentence_is_optional_and_kept_verbatim() {
+        let mut json = minimal_json();
+        json["withoutCode"] = serde_json::json!("Sorting will not work.");
+        let manifest = parse(json).unwrap();
+        assert_eq!(
+            manifest.without_code.as_deref(),
+            Some("Sorting will not work.")
+        );
+    }
+
+    #[test]
+    fn rejects_a_without_code_sentence_that_is_too_long() {
+        let mut json = minimal_json();
+        json["withoutCode"] = serde_json::json!("x".repeat(WITHOUT_CODE_MAX_LEN + 1));
+        let err = parse(json).unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidManifest);
+        assert!(err.message.contains("withoutCode"), "{}", err.message);
+        assert!(err.message.contains("240"), "{}", err.message);
+    }
+
+    #[test]
+    fn rejects_a_without_code_sentence_with_control_characters() {
+        for bad in ["line one\nline two", "tab\there", "nul\0here"] {
+            let mut json = minimal_json();
+            json["withoutCode"] = serde_json::json!(bad);
+            let err = parse(json).unwrap_err();
+            assert_eq!(err.code, PluginErrorCode::InvalidManifest, "{bad:?}");
+            assert!(
+                err.message.contains("withoutCode"),
+                "{bad:?}: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("control characters"),
+                "{bad:?}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_without_code_sentence_without_an_entrypoint() {
+        let mut json = minimal_json();
+        json.as_object_mut().unwrap().remove("entrypoint");
+        json["withoutCode"] = serde_json::json!("Sorting will not work.");
+        let err = parse(json).unwrap_err();
+        assert_eq!(err.code, PluginErrorCode::InvalidManifest);
+        assert!(err.message.contains("withoutCode"), "{}", err.message);
+        assert!(err.message.contains("entrypoint"), "{}", err.message);
+    }
+
+    #[test]
     fn rejects_a_non_https_source_url() {
         let mut json = minimal_json();
         json["source"] = serde_json::json!("http://example.com/plugin");
@@ -937,6 +1058,115 @@ mod tests {
     fn an_unrecognised_activation_event_names_what_was_expected() {
         let err = ActivationEvent::parse("whenever").unwrap_err();
         assert!(err.message.contains("onStartup"), "{}", err.message);
+    }
+
+    #[test]
+    fn crash_packs_require_their_capability_and_stay_in_the_package() {
+        let mut value = minimal_json();
+        value["contributions"] = serde_json::json!({
+            "crashPacks": [{ "path": "crash/pack.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("crash:contribute"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        value["capabilities"] = serde_json::json!({ "required": ["crash:contribute"] });
+        PluginManifest::parse(&value.to_string()).unwrap();
+
+        value["contributions"]["crashPacks"][0]["path"] = serde_json::json!("../outside.json");
+        assert!(PluginManifest::parse(&value.to_string()).is_err());
+    }
+
+    #[test]
+    fn game_packages_requires_game_define_capability() {
+        let mut value = minimal_json();
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "games/package.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("game:define"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        value["capabilities"] = serde_json::json!({
+            "required": ["game:define"]
+        });
+        assert!(PluginManifest::parse(&value.to_string()).is_ok());
+    }
+
+    #[test]
+    fn game_packages_rejects_escaping_or_absolute_paths() {
+        let mut value = minimal_json();
+        value["capabilities"] = serde_json::json!({
+            "required": ["game:define"]
+        });
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "../games/package.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("climbs out of the package"),
+            "{}",
+            error.message
+        );
+
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "/games/package.json" }]
+        });
+        let error = PluginManifest::parse(&value.to_string()).unwrap_err();
+        assert!(
+            error.message.contains("must be relative"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn game_packages_is_declarative_only_without_entrypoint() {
+        let mut value = minimal_json();
+        value.as_object_mut().unwrap().remove("entrypoint");
+        value["capabilities"] = serde_json::json!({
+            "required": ["game:define"]
+        });
+        value["contributions"] = serde_json::json!({
+            "gamePackages": [{ "path": "games/package.json" }]
+        });
+        let manifest = PluginManifest::parse(&value.to_string()).unwrap();
+        assert!(manifest.is_declarative_only());
+    }
+
+    #[test]
+    fn tracer_manifests_parse_successfully() {
+        let tracers_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/tracers");
+        let entries = std::fs::read_dir(&tracers_dir).expect("read tracers dir");
+        let mut count = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let manifest_path = path.join("agora-plugin.json");
+                let content = std::fs::read_to_string(&manifest_path)
+                    .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+                let manifest = PluginManifest::parse(&content)
+                    .unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest_path.display()));
+                assert!(manifest
+                    .capabilities
+                    .required
+                    .iter()
+                    .any(|c| c == "game:define"));
+                assert!(!manifest.contributions.game_packages.is_empty());
+                count += 1;
+            }
+        }
+        assert!(
+            count >= 4,
+            "expected at least 4 tracer plugins, found {count}"
+        );
     }
 }
 
