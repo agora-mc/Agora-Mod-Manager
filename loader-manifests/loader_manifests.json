@@ -39330,6 +39330,23 @@
           "lowcodefml": "12.0.12"
         },
         "release_channel": "stable"
+      },
+      {
+        "mc_version": "26.3",
+        "loader_version": "26.3.0.103",
+        "source_url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.3.0.103/neoforge-26.3.0.103-installer.jar",
+        "sha256": "d8a92e17cf12b5739a2518b11afd47eeec0e636a6e63f94b6400c5dbd3603e48",
+        "file_name": "neoforge-26.3.0.103-installer.jar",
+        "file_type": "installer_jar",
+        "version_json_sha256": "d86e85c2e8cb86c0671003cf44774bbb5d0c5248fadf7eece464868b45b36b9b",
+        "content_sha256": "139b75d1f441afe88d0c1e43ea40428b6770f15e079dfcbcaaea24fb88497802",
+        "installer_spec": 1,
+        "provided_versions": {
+          "neoforge": "26.3.0.103",
+          "javafml": "12.0.12",
+          "lowcodefml": "12.0.12"
+        },
+        "release_channel": "stable"
       }
     ],
     "forge": [
@@ -52729,6 +52746,23 @@
         "installer_spec": 1,
         "provided_versions": {
           "forge": "66.1.5",
+          "javafml": "66",
+          "lowcodefml": "66"
+        },
+        "release_channel": "stable"
+      },
+      {
+        "mc_version": "26.3",
+        "loader_version": "66.1.8",
+        "source_url": "https://maven.minecraftforge.net/net/minecraftforge/forge/26.3-66.1.8/forge-26.3-66.1.8-installer.jar",
+        "sha256": "a3b613a0e1ed8eb5e3df405affd2cc09a578e899beb7db932703f1175bf163e2",
+        "file_name": "forge-26.3-66.1.8-installer.jar",
+        "file_type": "installer_jar",
+        "version_json_sha256": "28aaee3af748359c027317509746a47d93438bdb023e8b68cf2b10067f4ab310",
+        "content_sha256": "6cf1c31d01c4344a324916f7b55259d7cfcd93359dc74320426b0d327fbe95df",
+        "installer_spec": 1,
+        "provided_versions": {
+          "forge": "66.1.8",
           "javafml": "66",
           "lowcodefml": "66"
         },
