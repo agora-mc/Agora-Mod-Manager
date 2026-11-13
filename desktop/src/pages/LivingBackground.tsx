@@ -9,12 +9,91 @@
  * It only appears in the sidebar while the living background is enabled.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Mountain, Music, Volume2, CloudRain, CloudSnow, Sun, ZoomIn, ZoomOut, Sparkles, Rainbow, Maximize2, ChevronRight, Lock, LockOpen, RotateCcw } from 'lucide-react';
 import { MUSIC_TRACK_CHOICES, INSTRUMENT_CHOICES } from '../features/ambience/engine/audio/trackChoices';
 import { useAmbience } from '../features/ambience/AmbienceProvider';
 import { Switch } from '../components/ui/switch';
 import { PageHero } from '../components/PageHero';
+import { useController } from '../features/controller/ControllerProvider';
+import { useControllerLayer } from '../features/controller/useControllerLayer';
+import type { ControllerIntent } from '../features/controller/intents';
+import { readGamepadAnalog } from '../lib/useGamepad';
+import { reloadPage } from '../lib/reloadPage';
+
+/** Stick deflection below this is drift, not intent. */
+const STICK_DEADZONE = 0.16;
+/** Cursor and pan speed at full deflection, in px per second. */
+const CURSOR_SPEED = 620;
+const PAN_SPEED = 520;
+
+/** Deadzone, then a gentle curve so small movements stay precise. */
+function shapeAxis(v: number): number {
+  const m = Math.abs(v);
+  if (m < STICK_DEADZONE) return 0;
+  const k = (m - STICK_DEADZONE) / (1 - STICK_DEADZONE);
+  return Math.sign(v) * k * (0.35 + 0.65 * k);
+}
+
+// Fifth tick of the old range (0.5 + 4×0.1) is now BOTH the minimum and the
+// default: below this the world was scaled so far down that the extra terrain
+// generated to cover the viewport was mostly wasted, and the props got tiny.
+const MIN_ZOOM = 0.9;
+const DEFAULT_ZOOM = MIN_ZOOM;
+
+/**
+ * The zoom slider, shared by the control panel and the floating copy that
+ * takes over its job when the panel is folded away. `action` lets the floating
+ * copy carry the scene reset too, since the panel (and its own reset) is gone.
+ */
+function ZoomControl({ zoom, onChange, readoutTestId, action }: {
+  zoom: number;
+  onChange: (z: number) => void;
+  readoutTestId: string;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="space-y-1 text-sm">
+      <div className="flex items-center gap-2">
+        <span className="inline-flex items-center gap-2 font-medium">
+          <Mountain className="h-4 w-4" aria-hidden="true" />
+          Zoom
+          <span className="text-xs font-normal text-muted-foreground" data-testid={readoutTestId}>{zoom.toFixed(1)}×</span>
+        </span>
+        {action && <div className="ml-auto">{action}</div>}
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => onChange(zoom - 0.1)}
+          aria-label="Zoom out"
+          className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
+        >
+          <ZoomOut className="h-4 w-4" aria-hidden="true" />
+        </button>
+        <input
+          type="range"
+          aria-label="Zoom"
+          min={MIN_ZOOM}
+          max="2"
+          step="0.1"
+          value={zoom}
+          onChange={(e) => onChange(Number(e.target.value))}
+          className="w-full accent-primary"
+        />
+        <button
+          type="button"
+          onClick={() => onChange(zoom + 0.1)}
+          aria-label="Zoom in"
+          className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
+        >
+          <ZoomIn className="h-4 w-4" aria-hidden="true" />
+        </button>
+      </div>
+      <span className="block text-xs text-muted-foreground">(click and drag to move the view)</span>
+    </div>
+  );
+}
 
 /**
  * "Leave this alone" for one of the world's own clocks. Pressed, the day stops
@@ -66,15 +145,16 @@ export function LivingBackground() {
     setMusicAuto,
     shuffleMusic,
     setBuddy,
+    moveCursorBy,
+    panBy,
+    clickAtCursor,
+    dropCarried,
+    setCursorVisible,
     ready,
   } = useAmbience();
+  const { connected: padConnected } = useController();
 
   const [time, setTime] = useState(0.3);
-  // Fifth tick of the old range (0.5 + 4×0.1) is now BOTH the minimum and the
-  // default: below this the world was scaled so far down that the extra terrain
-  // generated to cover the viewport was mostly wasted, and the props got tiny.
-  const MIN_ZOOM = 0.9;
-  const DEFAULT_ZOOM = MIN_ZOOM;
   const [zoom, setZoomValue] = useState(DEFAULT_ZOOM);
   const [buddy, setBuddyValue] = useState(true);
   const [weather, setWeatherValue] = useState<'clear' | 'rain' | 'snow'>('clear');
@@ -187,21 +267,73 @@ export function LivingBackground() {
     setZoom(clamped);
   };
   /**
-   * Put the scene back the way it starts: default zoom, both clocks free-running,
-   * the standard background visible, the companion on. The time and weather
-   * themselves are left alone (they keep cycling once unlocked).
+   * Start the scene over by reloading the app window: the world is rebuilt from
+   * scratch and the view, the clocks and the rainbow all go back to how they
+   * open. Saved settings (sound, music, the hidden background) are kept, and
+   * the app comes back on this page.
    */
-  const resetScene = () => {
-    setZoomValue(DEFAULT_ZOOM);
-    setZoom(DEFAULT_ZOOM);
-    setTodLockedValue(false);
-    setTodLocked(false);
-    setWeatherLockedValue(false);
-    setWeatherLocked(false);
-    setClearBackground(false);
-    setBuddyValue(true);
-    setBuddy(true);
-  };
+  const resetScene = () => reloadPage();
+  /**
+   * Controller play. With the controls folded away, a pad drives the world
+   * itself: the left stick (or D-pad) moves a cursor, the right stick looks
+   * around a zoomed view, and the face buttons poke and put down. With the
+   * panel open the pad goes back to moving between its controls as usual.
+   */
+  const worldPlay = !panelOpen && padConnected;
+  const pageRef = useRef<HTMLDivElement>(null);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  useControllerLayer({
+    active: worldPlay,
+    rootRef: pageRef,
+    // Only the bindings below are taken; the menu button still reaches the app.
+    transparent: true,
+    onIntent: (intent: ControllerIntent) => {
+      switch (intent.type) {
+        case 'accept': clickAtCursor(); return true;
+        case 'secondary': dropCarried(); return true;
+        // Back puts down what is being carried first, then brings the controls back.
+        case 'cancel': if (!dropCarried()) setPanelOpen(true); return true;
+        case 'page': changeZoom(zoomRef.current + (intent.direction === 'next' ? 0.1 : -0.1)); return true;
+        // The sticks are read every frame below, so their coarse repeats are spent here.
+        case 'navigate': case 'scroll': return true;
+        default: return false;
+      }
+    },
+  });
+  useEffect(() => {
+    if (!worldPlay) return undefined;
+    setCursorVisible(true);
+    let frame = 0;
+    let last = performance.now();
+    let zoomHold = 0.14;
+    const tick = (now: number) => {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const pad = readGamepadAnalog();
+      if (pad) {
+        const lx = shapeAxis(pad.lx), ly = shapeAxis(pad.ly);
+        if (lx || ly) moveCursorBy(lx * CURSOR_SPEED * dt, ly * CURSOR_SPEED * dt);
+        const rx = shapeAxis(pad.rx), ry = shapeAxis(pad.ry);
+        // pushing the stick right looks right, so the world slides left
+        if (rx || ry) panBy(-rx * PAN_SPEED * dt, -ry * PAN_SPEED * dt);
+        // triggers zoom while held, a step at a time
+        if (Math.abs(pad.triggers) > 0.5) {
+          zoomHold += dt;
+          if (zoomHold >= 0.14) { zoomHold = 0; changeZoom(zoomRef.current + Math.sign(pad.triggers) * 0.1); }
+        } else zoomHold = 0.14;
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(frame);
+      setCursorVisible(false);
+    };
+    // changeZoom reads the zoom through a ref, so it is safe to leave out.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [worldPlay, moveCursorBy, panBy, setCursorVisible]);
+
   const toggleBuddy = () => {
     const next = !buddy;
     setBuddyValue(next);
@@ -209,7 +341,7 @@ export function LivingBackground() {
   };
 
   return (
-    <div className="space-y-6" data-testid="living-background-page">
+    <div ref={pageRef} className="space-y-6" data-testid="living-background-page">
       {/* Collapsed, the page gets out of the way entirely — no title, no
           description, no panel chrome — because the whole point of this screen is
           to look at the world. Only the reopen button stays. */}
@@ -231,6 +363,38 @@ export function LivingBackground() {
           <ChevronRight className="h-4 w-4" aria-hidden="true" />
           Show controls
         </button>
+      )}
+      {!panelOpen && (
+        <div
+          className="fixed right-6 top-6 z-40 w-72 max-w-[calc(100vw-3rem)] rounded-2xl border border-border bg-card/85 p-3 shadow-lg backdrop-blur-md"
+          aria-label="Living background zoom"
+          data-testid="living-bg-zoom-float"
+        >
+          <ZoomControl
+            zoom={zoom}
+            onChange={changeZoom}
+            readoutTestId="living-bg-zoom-float-readout"
+            action={(
+              <button
+                type="button"
+                onClick={resetScene}
+                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted px-3 py-1 text-xs font-semibold text-foreground hover:bg-muted/70"
+                data-testid="living-bg-zoom-float-reset"
+              >
+                <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                Reload Scene
+              </button>
+            )}
+          />
+        </div>
+      )}
+      {worldPlay && (
+        <p
+          className="w-fit rounded-full border border-primary/30 bg-background/80 px-4 py-1.5 text-xs text-muted-foreground shadow-lg backdrop-blur-md"
+          data-testid="living-bg-pad-hint"
+        >
+          Left stick moves the pointer · A pokes · X puts down · Right stick looks around · Bumpers or triggers zoom · B brings the controls back
+        </p>
       )}
 
       {/* The control panel — the same set as the prototype's top control bar,
@@ -258,6 +422,11 @@ export function LivingBackground() {
               Open Full Living Background
             </button>
           </div>
+          {padConnected && (
+            <p className="mb-3 text-xs text-muted-foreground" data-testid="living-bg-pad-tip">
+              Playing with a controller? Open the full view and the left stick becomes a pointer you can poke the world with.
+            </p>
+          )}
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
               Locks stop the world changing the time of day or the weather on its own; unlocked, both keep cycling.
@@ -269,7 +438,7 @@ export function LivingBackground() {
               data-testid="living-bg-reset"
             >
               <RotateCcw className="h-3 w-3" aria-hidden="true" />
-              Reset scene
+              Reload Scene
             </button>
           </div>
           <div id="living-bg-panel-body" className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -380,41 +549,7 @@ export function LivingBackground() {
               </div>
             </div>
 
-            <div className="space-y-1 text-sm">
-              <span className="inline-flex items-center gap-2 font-medium">
-                <Mountain className="h-4 w-4" aria-hidden="true" />
-                Zoom
-                <span className="text-xs font-normal text-muted-foreground" data-testid="living-bg-zoom-readout">{zoom.toFixed(1)}×</span>
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => changeZoom(zoom - 0.1)}
-                  aria-label="Zoom out"
-                  className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
-                >
-                  <ZoomOut className="h-4 w-4" aria-hidden="true" />
-                </button>
-                <input
-                  type="range"
-                  aria-label="Zoom"
-                  min={MIN_ZOOM}
-                  max="2"
-                  step="0.1"
-                  value={zoom}
-                  onChange={(e) => changeZoom(Number(e.target.value))}
-                  className="w-full accent-primary"
-                />
-                <button
-                  type="button"
-                  onClick={() => changeZoom(zoom + 0.1)}
-                  aria-label="Zoom in"
-                  className="rounded-lg border border-input bg-muted p-1.5 text-foreground hover:bg-muted"
-                >
-                  <ZoomIn className="h-4 w-4" aria-hidden="true" />
-                </button>
-              </div>
-            </div>
+            <ZoomControl zoom={zoom} onChange={changeZoom} readoutTestId="living-bg-zoom-readout" />
 
             <div className="flex items-center gap-3 text-sm">
               <Switch

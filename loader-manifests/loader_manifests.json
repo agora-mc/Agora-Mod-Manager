@@ -36714,6 +36714,23 @@
         "release_channel": "stable"
       },
       {
+        "mc_version": "1.21.1",
+        "loader_version": "21.1.266",
+        "source_url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.266/neoforge-21.1.266-installer.jar",
+        "sha256": "4f312ec39ff935c661f4053ef398056a8f946057b04be1c1eebf0518a18b2ba2",
+        "file_name": "neoforge-21.1.266-installer.jar",
+        "file_type": "installer_jar",
+        "version_json_sha256": "c23d422fdea6cc39766abaff7dedbad9e5ab9bbbfc102489d1480b64d4a42a85",
+        "content_sha256": "906c41fb6d68ebae94fe559c68524b6ed883f7925dd441c29f7c03f3a508c869",
+        "installer_spec": 1,
+        "provided_versions": {
+          "neoforge": "21.1.266",
+          "javafml": "4.0.45",
+          "lowcodefml": "4.0.45"
+        },
+        "release_channel": "stable"
+      },
+      {
         "mc_version": "1.21.2",
         "loader_version": "21.2.0-beta",
         "source_url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.2.0-beta/neoforge-21.2.0-beta-installer.jar",
@@ -39292,6 +39309,23 @@
         "installer_spec": 1,
         "provided_versions": {
           "neoforge": "26.3.0.101",
+          "javafml": "12.0.12",
+          "lowcodefml": "12.0.12"
+        },
+        "release_channel": "stable"
+      },
+      {
+        "mc_version": "26.3",
+        "loader_version": "26.3.0.102",
+        "source_url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.3.0.102/neoforge-26.3.0.102-installer.jar",
+        "sha256": "e26e42b0414da4f68840835b4d637928b971a01852b32b6424747290f84e9f1c",
+        "file_name": "neoforge-26.3.0.102-installer.jar",
+        "file_type": "installer_jar",
+        "version_json_sha256": "11b9182178251dde2cdaeb188e00687ce41b0d477c63c038871a39d5d74287a7",
+        "content_sha256": "ff4d2b9ba4ef3b7a67a703dc3178640cc6f1a533ba54f00a0c50a02841b9488e",
+        "installer_spec": 1,
+        "provided_versions": {
+          "neoforge": "26.3.0.102",
           "javafml": "12.0.12",
           "lowcodefml": "12.0.12"
         },

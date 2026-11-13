@@ -57,6 +57,17 @@ export interface AmbienceContextValue {
   readView: () => { zoom: number; tx: number; ty: number } | null;
   setZoom: (z: number) => void;
   setBuddy: (on: boolean) => void;
+  /**
+   * Drive the world without a mouse (a controller on the Living Background
+   * page): move an on-screen cursor, look around a zoomed view, poke what is
+   * under the cursor, put down what is being carried.
+   */
+  moveCursorBy: (dx: number, dy: number) => void;
+  panBy: (dx: number, dy: number) => void;
+  clickAtCursor: () => void;
+  /** Returns false when nothing was being carried. */
+  dropCarried: () => boolean;
+  setCursorVisible: (on: boolean) => void;
   /** Rainbow: put one up now, or take it down. */
   setRainbow: (on: boolean) => void;
   /** Whether a player-pinned rainbow is currently up (the page's checkbox mirrors this). */
@@ -217,7 +228,7 @@ export function AmbienceProvider({ children }: { children: ReactNode }) {
     setMusicVolume: (v) => persist({ musicVolume: v }),
     soundVolume: settings?.soundVolume ?? 0.5,
     setSoundVolume: (v) => persist({ soundVolume: v }),
-    musicOn: (settings?.musicOn !== false) && effectiveProfile === 'full',
+    musicOn: settings?.musicOn === true && effectiveProfile === 'full',
     setMusicOn: (on) => persist({ musicOn: on }),
     clearBackground: effectiveProfile !== 'off' && (settings?.clearBackground ?? false),
     setClearBackground: (on) => persist({ clearBackground: on }),
@@ -232,6 +243,11 @@ export function AmbienceProvider({ children }: { children: ReactNode }) {
     readView: () => (engine ? engine.getView() : null),
     setZoom: (z) => engine?.setZoom(z),
     setBuddy: (on) => engine?.setBuddy(on),
+    moveCursorBy: (dx, dy) => engine?.moveCursorBy(dx, dy),
+    panBy: (dx, dy) => engine?.panBy(dx, dy),
+    clickAtCursor: () => engine?.clickAtCursor(),
+    dropCarried: () => engine?.dropCarried() ?? false,
+    setCursorVisible: (on) => engine?.setCursorVisible(on),
     setRainbow: (on) => engine?.setRainbow(on),
     isRainbowPinned: () => engine?.isRainbowPinned() ?? false,
     setTrack: (id) => engine?.setTrack(id),
@@ -243,7 +259,7 @@ export function AmbienceProvider({ children }: { children: ReactNode }) {
   }), [effectiveProfile, settings, journal, lastEvent, persist, engine, reducedMotion]);
 
   // Music rides along with the full profile (optional in calm).
-  const musicOn = (settings?.musicOn !== false) && effectiveProfile === 'full';
+  const musicOn = settings?.musicOn === true && effectiveProfile === 'full';
 
   return (
     <AmbienceContext.Provider value={value}>

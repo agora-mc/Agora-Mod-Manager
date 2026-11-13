@@ -194,11 +194,13 @@ describe('terrain (port fidelity)', () => {
     const cases: Array<[number, number, number]> = [
       [0, 16, 696.48],
       [50, 16, 660.48],
-      [200, 16, 636.48],
+      // x=200 is inside the pond: the hill that used to stand in the middle of
+      // the basin is cut down to the waterline before the bowl is dug.
+      [200, 16, 708.48],
       [555, 16, 660.48],
       [1000, 16, 648.48],
       [1100, 16, 624.48],
-      [300, 14, 720.48],
+      [300, 14, 732.48],
       [900, 14, 696.48],
       [77, 12, 648.48],
       [500, 12, 648.48],
@@ -271,8 +273,12 @@ describe('terrain (port fidelity)', () => {
 
   it('water sits inside the carved basin, not on a fixed ellipse (F9)', () => {
     const ws = waterSpan(t.state);
-    expect(ws.x0).toBe(246);
-    expect(ws.x1).toBe(318);
+    expect(ws.x0).toBe(174);
+    expect(ws.x1).toBe(366);
+    // ...and it is ONE body of water: no dry column between its two ends
+    for (let x = ws.x0; x <= ws.x1; x += 12) {
+      expect(groundYWorld(t.state, x + 6, 2)).toBeGreaterThan(t.state.WATER_LEVEL);
+    }
     // every submerged column is below the water level
     const b = t.state.BASIN!;
     const r3 = t.state.R3!;
@@ -587,17 +593,10 @@ describe('the pond answers clicks in the water', () => {
     return cols;
   }
 
-  /** The hover highlight's rectangle for a prop. */
+  /** The hover highlight's rectangle for a prop: the brackets trace this box. */
   function glowRect(t: TestWorld, obj: Prop): { y: number; h: number } {
-    let rect: { y: number; h: number } | null = null;
-    const ctx = {
-      save() {}, restore() {},
-      strokeRect(_x: number, y: number, _w: number, h: number) { rect = { y, h }; },
-      strokeStyle: '', lineWidth: 0, shadowBlur: 0, shadowColor: '',
-    } as unknown as CanvasRenderingContext2D;
-    t.world.drawHoverGlow(ctx, { kind: 'prop', obj });
-    if (!rect) throw new Error('the highlight drew nothing');
-    return rect;
+    const box = t.world.boxOf({ kind: 'prop', obj });
+    return { y: box.y, h: box.h };
   }
 
   it('reaches down into the water instead of floating above it', () => {

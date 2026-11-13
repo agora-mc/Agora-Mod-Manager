@@ -22,7 +22,9 @@ const DEFAULTS = {
   // up past today's fixed SFX level: at 0.5 the engine's 1× multiplier keeps
   // the current loudness, at 1 it plays twice as loud.
   soundVolume: 0.5,
-  musicOn: true,
+  // Off until somebody asks for it: an app that starts playing music on its
+  // own is a surprise, however nice the music. Onboarding offers it.
+  musicOn: false,
   clearBackground: false,
 };
 
@@ -85,9 +87,21 @@ export async function loadAmbienceSettings(): Promise<AmbienceSettings> {
     musicVolume: Math.max(0, Math.min(1, typeof musicVolume === 'number' ? musicVolume : DEFAULTS.musicVolume)),
     sound: sound === true,
     soundVolume: Math.max(0, Math.min(1, typeof soundVolume === 'number' ? soundVolume : DEFAULTS.soundVolume)),
-    musicOn: musicOn !== false,
+    musicOn: musicOn === true,
     clearBackground: clearBackground === true,
   };
+}
+
+/**
+ * The music switch on its own, for the one screen that sets it before the
+ * ambience provider exists (onboarding runs outside it).
+ */
+export function loadAmbienceMusicOn(): Promise<boolean> {
+  return read<boolean>(AMBIENCE_MUSIC_ON_KEY, DEFAULTS.musicOn).then((v) => v === true);
+}
+
+export function saveAmbienceMusicOn(on: boolean): Promise<void> {
+  return write(AMBIENCE_MUSIC_ON_KEY, on);
 }
 
 export async function saveAmbienceSettings(s: AmbienceSettings): Promise<void> {

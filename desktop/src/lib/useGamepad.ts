@@ -42,6 +42,40 @@ function connectedGamepads(): Gamepad[] {
   }
 }
 
+/** Raw analog state of the first connected pad, for surfaces that steer continuously. */
+export interface GamepadAnalog {
+  /** Left stick, with the D-pad folded in as full deflection. -1..1 each. */
+  lx: number;
+  ly: number;
+  /** Right stick. -1..1 each. */
+  rx: number;
+  ry: number;
+  /** Right trigger minus left trigger. -1..1. */
+  triggers: number;
+}
+
+/**
+ * Sample the sticks and triggers right now.
+ *
+ * Intents are deliberately coarse: a direction, debounced and repeated like a
+ * key. That is right for moving focus and wrong for steering a cursor, which
+ * needs the stick's actual deflection every frame. The few surfaces that
+ * steer poll this themselves while they are on screen. Null without a pad.
+ */
+export function readGamepadAnalog(): GamepadAnalog | null {
+  const gamepad = connectedGamepads()[0];
+  if (!gamepad) return null;
+  const dx = (pressed(gamepad, 15) ? 1 : 0) - (pressed(gamepad, 14) ? 1 : 0);
+  const dy = (pressed(gamepad, 13) ? 1 : 0) - (pressed(gamepad, 12) ? 1 : 0);
+  return {
+    lx: dx || (gamepad.axes[0] ?? 0),
+    ly: dy || (gamepad.axes[1] ?? 0),
+    rx: gamepad.axes[2] ?? 0,
+    ry: gamepad.axes[3] ?? 0,
+    triggers: (gamepad.buttons[7]?.value ?? 0) - (gamepad.buttons[6]?.value ?? 0),
+  };
+}
+
 function pressed(gamepad: Gamepad, index: number): boolean {
   return gamepad.buttons[index]?.pressed === true;
 }

@@ -44,6 +44,7 @@ import { pinnedMotion } from '../components/presentation-capabilities';
 import { motionAfterPinEnds, rememberMotionBeforePin, takeMotionBeforePin } from '../components/motion-before-pin';
 import { useConfirm } from '@/components/ui/confirm';
 import { Check } from 'lucide-react';
+import { loadAmbienceMusicOn, saveAmbienceMusicOn } from '../features/ambience/ambienceSettings';
 
 /**
  * Every step's Back/Continue row. Sticky inside the card's scroll area: at
@@ -353,6 +354,19 @@ function AppearanceStep({
   // key (mirrors Settings → Appearance → Interaction mode), so it is
   // read/written directly rather than folded into the theme blob.
   const [interaction, setInteraction] = useState<InteractionPreference>(() => loadPreference());
+  // Background music is off unless it is asked for here (or later in Settings).
+  // Onboarding sits outside the living background, so this writes the stored
+  // setting directly and the music picks it up once setup is finished.
+  const [music, setMusic] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void loadAmbienceMusicOn().then((on) => { if (!cancelled) setMusic(on); });
+    return () => { cancelled = true; };
+  }, []);
+  const applyMusic = (on: boolean) => {
+    setMusic(on);
+    void saveAmbienceMusicOn(on);
+  };
   const applyInteraction = (value: InteractionPreference) => {
     setInteraction(value);
     savePreference(value);
@@ -467,6 +481,15 @@ function AppearanceStep({
             applied. You can change this any time in Settings → Appearance.
           </span>
         </label>
+      </div>
+
+      <div className="mt-4">
+        <ServiceToggle
+          title="Background music"
+          description="Quiet music to go with the living background. It stays off unless you switch it on here, and it starts playing once setup is finished. You can pick the piece, change the volume, or turn it off any time in Settings → Appearance."
+          checked={music}
+          onChange={applyMusic}
+        />
       </div>
 
       {/* Sticky: this step exists to enlarge the text, and at large scales

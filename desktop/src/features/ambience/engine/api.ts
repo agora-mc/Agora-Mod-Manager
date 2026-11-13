@@ -28,7 +28,8 @@ export interface GameApi {
   fleeState: (e: Entity, mul?: number) => void;
   boltState: (e: Entity) => void;
   exitToward: (e: Entity, tx: number) => void;
-  dropGroundItem: (itemId: string, x: number) => void;
+  /** Drop an item; `from` is the animal or prop it falls from, which decides its layer and height. */
+  dropGroundItem: (itemId: string, x: number, from?: Entity | Prop) => void;
   playVoice: (v: VoiceDef | null | undefined) => void;
   findEgg: (id: string) => void;
   shakeProp: (p: Prop) => void;

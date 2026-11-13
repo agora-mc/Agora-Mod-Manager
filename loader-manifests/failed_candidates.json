@@ -62,12 +62,6 @@
       "last_failed": "2026-10-20T06:26:07Z",
       "status": "retired"
     },
-    "forge/1.19/1.19-41.0.112": {
-      "strikes": 1,
-      "first_failed": "2026-11-09T08:26:50Z",
-      "last_failed": "2026-11-09T08:26:50Z",
-      "status": "failing"
-    },
     "forge/1.2.3/1.2.3-1.4.0.55": {
       "strikes": 3,
       "first_failed": "2026-10-19T21:08:49Z",
