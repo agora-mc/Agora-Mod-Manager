@@ -35,9 +35,11 @@ pub fn names_a_crash(
     if all.is_empty() {
         return false;
     }
+    // Captured launch output is collected by Agora, never a paste: no snippet fallback.
     let files = [CrashFile {
         name: file_name.to_string(),
         bytes: text.as_bytes().to_vec(),
+        origin: super::CrashFileOrigin::Collected,
     }];
     let host = NoHost;
     match analyze(&AnalyzeInput {

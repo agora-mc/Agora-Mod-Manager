@@ -801,15 +801,36 @@ impl ParserReads for ReadsForBuiltIn<'_> {
 // Detection
 // ---------------------------------------------------------------------------
 
-/// Choose the parsers whose `detect` accepts this artifact.
+/// Choose the parsers whose `detect` accepts this artifact as a whole file.
 ///
-/// An empty detect means "only a source's `format` selects me", so it never
-/// matches here. A parser whose `detect` is malformed is reported, not ignored:
-/// the pack should have been linted, and a silent skip would hide the mistake.
+/// A `snippet` parser is not included: it may read only pasted text, and the analyzer asks for it
+/// separately with [`detect_parsers_with_snippets`]. An empty detect means "only a source's
+/// `format` selects me", so it never matches here. A parser whose `detect` is malformed is
+/// reported, not ignored: the pack should have been linted, and a silent skip would hide the
+/// mistake.
 pub fn detect_parsers<'a>(
     pack: &'a CrashPack,
     name: &str,
     head: &[u8],
+) -> Result<Vec<&'a ParserDecl>, ParserFailure> {
+    detect_parsers_for(pack, name, head, false)
+}
+
+/// Like [`detect_parsers`], with the `snippet` parsers too. The analyzer uses this to find a
+/// fragment fallback for pasted text that no primary parser claimed.
+pub fn detect_parsers_with_snippets<'a>(
+    pack: &'a CrashPack,
+    name: &str,
+    head: &[u8],
+) -> Result<Vec<&'a ParserDecl>, ParserFailure> {
+    detect_parsers_for(pack, name, head, true)
+}
+
+fn detect_parsers_for<'a>(
+    pack: &'a CrashPack,
+    name: &str,
+    head: &[u8],
+    include_snippets: bool,
 ) -> Result<Vec<&'a ParserDecl>, ParserFailure> {
     let head = &head[..head.len().min(DETECT_HEAD_BYTES)];
     // Patterns see `\n` line ends whatever the file used: in this regex dialect `$` never matches
@@ -818,6 +839,9 @@ pub fn detect_parsers<'a>(
     let mut matched = Vec::new();
     for parser in &pack.parsers {
         if parser.detect.is_empty() {
+            continue;
+        }
+        if !include_snippets && parser.reads.is_snippet() {
             continue;
         }
         if detect_matches(&parser.detect, name, head, &text).map_err(|error| ParserFailure {

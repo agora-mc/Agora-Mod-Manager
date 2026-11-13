@@ -7,6 +7,7 @@
 pub mod bases;
 pub mod catalog;
 pub mod content;
+pub mod crash_answers;
 pub mod discovery;
 pub mod dto;
 pub mod error;

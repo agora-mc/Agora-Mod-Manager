@@ -216,6 +216,16 @@ impl EvidenceStore {
         self.root.join(session_id)
     }
 
+    /// The stored file for one artifact, when the ids are safe and the file is still there. A
+    /// caller may show it to the user; it never reaches a parser this way.
+    pub fn artifact_path(&self, session_id: &str, artifact_id: &str) -> Option<PathBuf> {
+        if !is_safe_component(session_id) || !is_safe_component(artifact_id) {
+            return None;
+        }
+        let path = self.session_dir(session_id).join(artifact_id);
+        path.is_file().then_some(path)
+    }
+
     /// Copy everything bound to the session into its own folder, content addressed. A source file
     /// that is locked or gone is a problem on the result; a failure writing Agora's own store is an
     /// error, because then nothing was kept at all.

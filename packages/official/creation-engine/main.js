@@ -428,6 +428,34 @@ function crashFindSection(sections, name) {
   return undefined;
 }
 
+/// A section that spans a pasted fragment, for a whole-file reader whose header the user did not
+/// paste (`MODULES`, `PLUGINS`). `start` is -1 so the reader's `start + 1` is the first line.
+function crashFragmentSection(name, count) {
+  const section = { name, start: -1, end: count };
+  const map = {};
+  map[name] = section;
+  return { headers: [section], map };
+}
+
+/// A MODULES row without its header: `SomeMod.dll 0x7FF700000000`.
+function crashIsSimpleModuleLine(line) {
+  return /^[\t ]*[A-Za-z0-9_.\-]+\.(?:dll|exe)[\t ]+0x[0-9A-Fa-f]+[\t ]*$/.test(line);
+}
+
+/// A PLUGINS row without its header: `[ 1]     Example.esp`.
+function crashIsPluginListLine(line) {
+  return /^[\t ]*\[\s*(?:FE:)?[0-9A-Fa-f]+\s*\][\t ]+[^\r\n]+\.(?:esp|esm|esl)[\t ]*$/i.test(line);
+}
+
+/// An SKSE plugin list row without its header: `ExampleMod.dll v1.0.0`. A module row carries an
+/// address and is read by the module reader instead.
+function crashIsScriptExtenderLine(line) {
+  return (
+    /^[\t ]*[A-Za-z0-9_.\-]+\.dll(?:[\t ]+v?[0-9][0-9A-Za-z.\-]*)?[\t ]*$/.test(line) &&
+    !/0x[0-9A-Fa-f]+/.test(line)
+  );
+}
+
 function crashScalar(value) {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
@@ -1246,8 +1274,16 @@ function crashCallStackSection(sections) {
 function crashParseCallStack(state, limits, sections, lines, game, logType) {
   const section = crashCallStackSection(sections);
   if (!section) return false;
+  crashParseFrameLines(state, limits, lines, section.start + 1, section.end, game, logType);
+  return true;
+}
+
+/// Read every call-stack frame line between `start` and `end`. The whole-file parser calls it over
+/// its call-stack section; a pasted fragment calls it over every line, because the frames are the
+/// same shape without the header.
+function crashParseFrameLines(state, limits, lines, start, end, game, logType) {
   const scheme = crashSymbolScheme(game);
-  for (let index = section.start + 1; index < section.end; index += 1) {
+  for (let index = start; index < end; index += 1) {
     const line = lines[index];
     const match = line.match(/^\s*\[\s*(\d+)\s*\]\s*(?:\[([PS])\])?\s*0x([0-9A-Fa-f]+)\s+(\S+?)\+([0-9A-Fa-f]+)\s*(.*)$/);
     if (!match) continue;
@@ -1304,7 +1340,7 @@ function crashParseCallStack(state, limits, sections, lines, game, logType) {
         functionName = symbol;
       }
       // Source and instruction lines follow the frame, indented.
-      for (let next = index + 1; next < section.end; next += 1) {
+      for (let next = index + 1; next < end; next += 1) {
         const text = lines[next];
         if (/^\s*\[\s*\d+\s*\]\s+0x[0-9A-Fa-f]+/.test(text)) break;
         if (text.trim() === "") break;
@@ -1768,6 +1804,134 @@ export async function parseCrashLogger(request) {
 /// Trainwreck crash logs, versions 1.2 through 1.4.
 export async function parseTrainwreck(request) {
   return crashParseCreationEngine(request, "trainwreck");
+}
+
+// ---------------------------------------------------------------------------
+// A pasted fragment
+//
+// People paste a stack trace, the top of a crash report, or a few lines of a
+// log. The whole-file parsers above need the logger's header; this reads the
+// same line shapes without it, and reuses their line handling so the two never
+// drift. It is declared `reads: "snippet"`, so it runs only on text the user
+// pasted and no whole-file parser claimed.
+// ---------------------------------------------------------------------------
+
+function crashParseFragment(request) {
+  const read = crashReadAllLines(request);
+  if (read.error) throw new Error(read.error);
+  const lines = read.lines;
+  if (lines.length === 0) {
+    return {
+      contract: CRASH_CONTRACT,
+      producer: { format: "crash_logger" },
+      facts: [],
+      notes: [{ kind: "wrong_format", message: "the pasted text is empty" }],
+    };
+  }
+
+  const logType = lines.some((line) => /^\s*trainwreck\s+v/i.test(line)) ? "trainwreck" : "crash_logger";
+  const exception = lines.find((line) => /^\s*Unhandled exception\b/.test(line)) || "";
+  const edition = /SkyrimVR\.exe/i.test(exception) ? "VR" : /SkyrimSE\.exe/i.test(exception) ? "SSE" : undefined;
+  const game = {
+    name: "Skyrim",
+    edition,
+    version: undefined,
+    vr: edition === "VR",
+    executable: edition ? (edition === "VR" ? "SkyrimVR.exe" : "SkyrimSE.exe") : undefined,
+  };
+
+  const limits = request.limits;
+  const state = { facts: [], kinds: {}, budgetSpent: false, refsTruncated: false };
+  const sections = crashSections(lines);
+
+  crashParseException(state, limits, sections, lines, game, logType);
+  crashParseFrameLines(state, limits, lines, 0, lines.length, game, logType);
+  // A module list or plugin list pasted without its header. The whole-file readers only need the
+  // line shape, so give them a section that spans the fragment, and hand the plugin reader only
+  // the lines it claims so the rest of the fragment is not called an unreadable plugin list.
+  if (lines.some(crashIsSimpleModuleLine)) {
+    crashParseModules(state, limits, crashFragmentSection("MODULES", lines.length), lines, logType);
+  }
+  if (lines.some(crashIsPluginListLine)) {
+    const pluginLines = lines.map((line) => (crashIsPluginListLine(line) ? line : ""));
+    crashParseLoadOrder(
+      state,
+      limits,
+      crashFragmentSection("PLUGINS", pluginLines.length),
+      pluginLines,
+      logType,
+    );
+  }
+  if (lines.some(crashIsScriptExtenderLine)) {
+    const name = logType === "crash_logger" ? "SKSE PLUGINS" : "SCRIPT EXTENDER PLUGINS";
+    const pluginLines = lines.map((line) => (crashIsScriptExtenderLine(line) ? line : ""));
+    crashParseScriptExtender(
+      state,
+      limits,
+      crashFragmentSection(name, pluginLines.length),
+      pluginLines,
+      logType,
+    );
+  }
+
+  // File / Modified by lines from a register or stack object whose header was not pasted. The
+  // object reader turns a plugin and its chain into the same facts a whole log would give.
+  const root = {
+    place: "fragment",
+    value: "",
+    type: "",
+    depth: 0,
+    fields: {},
+    children: [],
+    line: 0,
+    endLine: lines.length - 1,
+  };
+  for (let index = 0; index < lines.length; index += 1) {
+    const field = crashField(lines[index]);
+    if (!field) continue;
+    if (field.label === "File" || field.label === "Modified by") {
+      crashAddField(root, field.label, field.value);
+    }
+  }
+  if (Object.keys(root.fields).length > 0) {
+    crashEmitObject(state, limits, root, "fragment", true);
+  }
+
+  const notes = [];
+  if (read.cut) notes.push({ kind: "truncated", message: "a line was longer than the read limit and was cut" });
+  if (read.gap) notes.push({ kind: "truncated", message: "the kept head and tail are not adjacent" });
+  if (read.budget || state.budgetSpent) notes.push({ kind: "budget_spent", message: "the parser reached its fact or line budget" });
+
+  const exceptionFacts = state.facts.filter(
+    (fact) => fact.kind === "core.exception" && Number(fact.attrs.depth || 0) === 0,
+  );
+  const frames = state.facts
+    .filter((fact) => fact.kind === "core.frame")
+    .map((fact) => ({
+      symbol: fact.attrs.symbol,
+      symbol_scheme: fact.attrs.symbol_scheme,
+      symbol_offset: fact.attrs.symbol_offset,
+    }));
+  const bucket = crashBuildBucket(
+    exceptionFacts.length > 0 ? { class: exceptionFacts[0].attrs.class } : undefined,
+    frames,
+    game,
+    logType,
+  );
+
+  return {
+    contract: CRASH_CONTRACT,
+    producer: { format: logType },
+    facts: state.facts,
+    bucket,
+    coverage: [],
+    notes,
+  };
+}
+
+/// A pasted Crash Logger or Trainwreck fragment.
+export async function parseFragment(request) {
+  return crashParseFragment(request);
 }
 
 // ---------------------------------------------------------------------------

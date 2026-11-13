@@ -77,6 +77,22 @@
           "(?m)^# Agora captured Java output"
         ]
       }
+    },
+    {
+      "id": "snippet",
+      "entry": { "built_in": { "name": "snippet" } },
+      "reads": "snippet",
+      "detect": {
+        "any": [
+          "(?m)^\\s*(?:Caused by: |Suppressed: )?[A-Za-z_$][A-Za-z0-9_$.]*\\.[A-Za-z0-9_$]+(?:Exception|Error|Throwable)\\b",
+          "(?m)^Exception in thread\\s+\"[^\"]*\"\\s+\\S*(?:Exception|Error|Throwable)\\b",
+          "(?m)^\\s*at\\s+[A-Za-z_$][A-Za-z0-9_$.]*\\(",
+          "(?im)(?:Mixin (?:apply|prepare)|was loaded too early|InvalidInjectionException|ClassMetadataNotFoundException)",
+          "(?im)(?:duplicate (?:asm )?classes found on classpath|ModResolutionException|incompatible mod set|missing or unsupported mandatory dependencies)",
+          "(?m)^\\s*-\\s*Mod '[^']*' \\([^)]*\\) .* requires .*, which is (?:missing|disabled|incompatible)!",
+          "(?m)OutOfMemoryError"
+        ]
+      }
     }
   ],
   "ref_maps": [

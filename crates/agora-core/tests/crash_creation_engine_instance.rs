@@ -182,10 +182,10 @@ fn with_instance_notes(
     );
     let output = analyze(&AnalyzeInput {
         packs: std::slice::from_ref(&running.pack),
-        files: &[CrashFile {
-            name: "crash-2026-01-01-12-00-00.log".into(),
-            bytes: log().into_bytes(),
-        }],
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
         runtime_version: Some(RUNNING),
         host: &running.host,
         built_in: &[],
@@ -204,10 +204,10 @@ fn with_instance_notes(
 fn loose(running: &Running) -> AnalyzeOutput {
     let output = analyze(&AnalyzeInput {
         packs: std::slice::from_ref(&running.pack),
-        files: &[CrashFile {
-            name: "crash-2026-01-01-12-00-00.log".into(),
-            bytes: log().into_bytes(),
-        }],
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
         runtime_version: Some(RUNNING),
         host: &running.host,
         built_in: &[],
@@ -323,10 +323,10 @@ fn a_loose_file_never_carries_a_save_risk_label() {
     let running = start();
     let output = analyze(&AnalyzeInput {
         packs: std::slice::from_ref(&running.pack),
-        files: &[CrashFile {
-            name: "crash-2026-01-01-12-00-00.log".into(),
-            bytes: log().into_bytes(),
-        }],
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
         runtime_version: Some(RUNNING),
         host: &running.host,
         built_in: &[],
@@ -423,10 +423,10 @@ fn the_inspector_only_runs_for_the_instance_game() {
     );
     let output = analyze(&AnalyzeInput {
         packs: std::slice::from_ref(&running.pack),
-        files: &[CrashFile {
-            name: "crash-2026-01-01-12-00-00.log".into(),
-            bytes: log().into_bytes(),
-        }],
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
         runtime_version: Some(RUNNING),
         host: &running.host,
         built_in: &[],
@@ -477,10 +477,10 @@ fn a_ref_that_is_not_in_the_instance_is_not_inspected() {
     );
     let output = analyze(&AnalyzeInput {
         packs: std::slice::from_ref(&running.pack),
-        files: &[CrashFile {
-            name: "crash-2026-01-01-12-00-00.log".into(),
-            bytes: log().into_bytes(),
-        }],
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            log().into_bytes(),
+        )],
         runtime_version: Some(RUNNING),
         host: &running.host,
         built_in: &[],

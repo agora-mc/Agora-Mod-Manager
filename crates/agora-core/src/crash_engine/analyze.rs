@@ -10,6 +10,7 @@
 //! "could not check", naming the plugin; none is ever read as "nothing found".
 
 use super::attribution::{LooseResolver, Resolver};
+use super::history::{CrashHistory, RecordedCrash};
 use super::instance_view::{resolve_crash_instance, ExtraInstanceProvider};
 use super::{
     answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusProfile, EvaluateInput,
@@ -17,19 +18,21 @@ use super::{
     PluginIdentity, RefResolver,
 };
 use crate::crash_packs::{
-    artifact_handle, detect_parsers, load_built_in_packs, parser_request, run_parser_with_builtin,
-    LoadedCrashPack, MemoryArtifact, ParserFailureKind, BUILT_IN_PLUGIN_ID,
+    artifact_handle, detect_parsers_with_snippets, load_built_in_packs, parser_request,
+    run_parser_with_builtin, LoadedCrashPack, MemoryArtifact, ParserFailureKind,
+    BUILT_IN_PLUGIN_ID,
 };
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
 use crate::game_script::instance_reads;
 use agora_game_api::crash::{
     Artifact, AttrValue, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, Fact,
-    GameHandle, MatchedBy, ParserDecl, ParserLimits, Privacy, Reads, RefMap, Retained, RoleRule,
-    Scalar, SessionVerdict, DETECT_HEAD_BYTES,
+    GameHandle, Level, MatchedBy, ParserDecl, ParserLimits, Privacy, Reads, RefMap, Retained,
+    RoleRule, Scalar, SessionVerdict, TrustNote, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The artifact id a parser is given. A parser sees a name and an id, never a path.
@@ -39,11 +42,66 @@ const ARTIFACT_ID: &str = "artifact";
 /// instance, Agora cannot say which game the file came from, so every installed pack may try.
 const UNKNOWN_GAME: &str = "unknown";
 
+/// The wording a snippet answer carries, unchanged wherever it is shown. Agora says why the
+/// answer is weaker rather than hiding the cap.
+pub const SNIPPET_TRUST_NOTE: &str = "Agora is reading a pasted snippet, not a whole log, so this \
+answer is less certain. Paste or pick the whole crash log for the best result.";
+
+/// Where the bytes the analyser is holding came from. Only [`Pasted`](CrashFileOrigin::Pasted)
+/// text may fall back to a pack's `snippet` parsers: a file Agora found or the user picked must be
+/// recognised as a whole file, or the answer says there was nothing to read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrashFileOrigin {
+    /// The user pasted a fragment into Agora.
+    Pasted,
+    /// The user picked a file.
+    #[default]
+    File,
+    /// Agora's evidence sweep found the file.
+    Collected,
+}
+
 /// One file the user supplied. Core sees bytes and a name, never a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrashFile {
     pub name: String,
     pub bytes: Vec<u8>,
+    pub origin: CrashFileOrigin,
+}
+
+impl CrashFile {
+    /// A file the user picked: a whole file, never eligible for a snippet parser.
+    pub fn new(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: bytes.into(),
+            origin: CrashFileOrigin::File,
+        }
+    }
+
+    /// Text the user pasted. Only this origin may use a pack's `snippet` parsers.
+    pub fn pasted(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: bytes.into(),
+            origin: CrashFileOrigin::Pasted,
+        }
+    }
+
+    /// A file Agora's evidence sweep found.
+    pub fn collected(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: bytes.into(),
+            origin: CrashFileOrigin::Collected,
+        }
+    }
+
+    /// The same file with another origin.
+    pub fn with_origin(mut self, origin: CrashFileOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
 }
 
 /// What an analysis did not have to build for itself: the instance behind the crash.
@@ -111,6 +169,10 @@ pub struct AnalyzedFile {
     /// `extra` readers that ran alongside the primary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_by_extra: Vec<FileReader>,
+    /// A `snippet` parser read this pasted text, so the answer carries the snippet trust note and
+    /// its cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snippet: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -156,6 +218,17 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
     analyze_with_facts(input, &[], &[])
 }
 
+/// The earlier crashes an analysis compares this one with. Supplied by the caller, which owns the
+/// store; the engine only counts them.
+pub struct CrashHistoryInput<'a> {
+    /// Earlier crashes for this instance, newest or oldest first. Never includes this crash.
+    pub prior: &'a [RecordedCrash],
+    /// How many sessions have run since a bucket first appeared, by [`RecordedCrash::bucket_key`].
+    pub sessions_since_first: &'a BTreeMap<String, u64>,
+    /// When the setup this crash ran began, in Unix milliseconds, when known.
+    pub setup_since_unix_ms: Option<i64>,
+}
+
 /// [`analyze`] with facts only a live session can supply: `core.session` and `core.change`.
 /// `changes` are the same differences those facts describe, used for the boost signals and for
 /// the finding shown when nothing else is named. A loose file passes neither.
@@ -163,6 +236,18 @@ pub fn analyze_with_facts(
     input: &AnalyzeInput<'_>,
     extra_facts: &[Fact],
     changes: &[crate::session_ledger::ManifestChange],
+) -> LauncherResult<AnalyzeOutput> {
+    analyze_with_history(input, extra_facts, changes, None)
+}
+
+/// [`analyze_with_facts`] plus the pattern across earlier crashes, which becomes the engine's
+/// `core.history` facts, a boost-only `HistoryRepeat` signal and a finding when a named suspect
+/// recurs at different places. `None` is a crash with no history behind it.
+pub fn analyze_with_history(
+    input: &AnalyzeInput<'_>,
+    extra_facts: &[Fact],
+    changes: &[crate::session_ledger::ManifestChange],
+    history: Option<&CrashHistoryInput<'_>>,
 ) -> LauncherResult<AnalyzeOutput> {
     let mut packs: Vec<&LoadedCrashPack> = input.packs.iter().collect();
     packs.sort_by(|a, b| {
@@ -181,6 +266,9 @@ pub fn analyze_with_facts(
     let mut parsed: Vec<ParsedArtifact> = Vec::new();
     let mut reports: Vec<AnalyzedFile> = Vec::with_capacity(input.files.len());
     let mut failures: Vec<(String, FileParserFailure)> = Vec::new();
+    // The snippet parser that stood in for a whole-file reader, if one did. Its source names the
+    // trust note, and its presence caps the answer at "possible".
+    let mut snippet_source: Option<agora_game_api::crash::SourceAttribution> = None;
 
     for file in input.files {
         let mut report = AnalyzedFile {
@@ -188,6 +276,7 @@ pub fn analyze_with_facts(
             read_by: None,
             also_recognised_by: Vec::new(),
             read_by_extra: Vec::new(),
+            snippet: false,
             reason: None,
             failures: Vec::new(),
         };
@@ -240,7 +329,7 @@ pub fn analyze_with_facts(
             } else {
                 None
             };
-            match detect_parsers(&pack.pack, &file.name, head) {
+            match detect_parsers_with_snippets(&pack.pack, &file.name, head) {
                 Ok(parsers) => {
                     for parser in parsers {
                         claimed.push(Claim {
@@ -274,6 +363,9 @@ pub fn analyze_with_facts(
         let primary = claimed
             .iter()
             .position(|claim| claim.parser.reads == Reads::Primary);
+        // A primary that detected this text speaks for it, even if it later fails: a fragment
+        // fallback must never stand in for a parser that said it could not check the file.
+        let primary_claimed = primary.is_some();
         if let Some(index) = primary {
             report.read_by = Some(claimed[index].reader.clone());
         }
@@ -287,7 +379,7 @@ pub fn analyze_with_facts(
                     report.also_recognised_by.push(claim.reader.clone());
                 }
                 Reads::Extra => to_run.push((false, claim)),
-                Reads::Primary => {}
+                Reads::Primary | Reads::Snippet => {}
             }
         }
 
@@ -338,6 +430,57 @@ pub fn analyze_with_facts(
             }
         }
 
+        // A fragment the user pasted, which no primary parser claimed, may be read by a pack's
+        // snippet parsers. Never for a file the user picked or Agora collected: those must be
+        // recognised as whole files, or the answer says there was nothing to read.
+        if !primary_claimed && file.origin == CrashFileOrigin::Pasted {
+            for claim in claimed
+                .iter()
+                .filter(|claim| claim.parser.reads == Reads::Snippet)
+            {
+                let attempt = run_parser_with_builtin(
+                    input.host,
+                    &claim.pack.plugin_id,
+                    claim.parser,
+                    &request,
+                    reads.clone(),
+                    claim.built_in,
+                );
+                match &attempt.outcome {
+                    crate::crash_packs::ParserDispatch::Parsed(output) => {
+                        read_any = true;
+                        parsed.push(ParsedArtifact {
+                            plugin: identity(claim.pack),
+                            parser_id: attempt.parser_id.clone(),
+                            artifact: file.name.clone(),
+                            source: None,
+                            output: output.clone(),
+                        });
+                        if report.read_by.is_none() {
+                            report.read_by = Some(claim.reader.clone());
+                        }
+                        report.snippet = true;
+                        snippet_source.get_or_insert_with(|| {
+                            identity(claim.pack).parser_source(&claim.parser.id)
+                        });
+                    }
+                    crate::crash_packs::ParserDispatch::WrongFormat(_) => {}
+                    crate::crash_packs::ParserDispatch::Failed(failure) => {
+                        let reported = FileParserFailure {
+                            plugin_id: claim.pack.plugin_id.clone(),
+                            plugin_name: plugin_name(claim.pack),
+                            plugin_version: claim.pack.plugin_version.clone(),
+                            parser_id: attempt.parser_id.clone(),
+                            kind: failure.kind,
+                            message: failure.message.clone(),
+                        };
+                        report.failures.push(reported.clone());
+                        failures.push((file.name.clone(), reported));
+                    }
+                }
+            }
+        }
+
         if !read_any {
             report.read_by = None;
             report.read_by_extra.clear();
@@ -349,6 +492,13 @@ pub fn analyze_with_facts(
         }
         reports.push(report);
     }
+
+    // The pattern across earlier crashes is a count over what was already stored. The identity of
+    // this crash is what its parsers said (or the place they named), so a caller need not decide
+    // that before parsing.
+    let history_summary: Option<CrashHistory> =
+        history.map(|history| super::history::summarize_recorded(history.prior));
+    let current_bucket = history.and_then(|_| super::history::current_bucket(&parsed));
 
     // With an instance, the game is known and only its packs, plus those for every game, take part.
     // A loose file names no game, so it stands for the games of the packs that read it: another
@@ -413,6 +563,14 @@ pub fn analyze_with_facts(
         span: None,
     }];
     engine_facts.extend(extra_facts.iter().cloned());
+    if let Some(history) = history {
+        engine_facts.extend(super::history::engine_facts(
+            history.prior,
+            current_bucket.as_deref(),
+            history.sessions_since_first,
+            history.setup_since_unix_ms,
+        ));
+    }
     let loose_resolver = LooseResolver::from_packs(packs.iter().map(|pack| &pack.pack), &parsed);
     let resolver: &dyn RefResolver = match &input.instance {
         Some(instance) => instance.resolver,
@@ -435,6 +593,21 @@ pub fn analyze_with_facts(
     evaluated
         .signals
         .extend(super::change::change_signals(changes));
+    // A pasted snippet is not a whole log. Say so, and never let the answer read stronger than
+    // "possible", whatever the rules found.
+    if let Some(source) = snippet_source {
+        evaluated.trust_notes.push(TrustNote {
+            text: super::english(SNIPPET_TRUST_NOTE),
+            source,
+        });
+        evaluated.level_cap = super::lower_cap(evaluated.level_cap, Level::Possible);
+    }
+    // A suspect from earlier crashes is the same kind of lead: boost-only, never an accusation.
+    if let Some(summary) = &history_summary {
+        evaluated
+            .signals
+            .extend(super::history::repeat_signals(summary));
+    }
     let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
     let scored = consensus(
         &ConsensusInput {
@@ -444,6 +617,12 @@ pub fn analyze_with_facts(
         },
         &ConsensusProfile::default(),
     );
+    // The finding is for a suspect consensus actually named, so a recurrence can never invent one.
+    if let Some(summary) = &history_summary {
+        evaluated
+            .findings
+            .extend(super::history::repeat_findings(summary, &scored.candidates));
+    }
     let mut crash_answer = answer(&AnswerInput {
         verdict: SessionVerdict::Crashed {
             how: MatchedBy::Supplied,
@@ -576,6 +755,7 @@ pub fn analyze_pasted_text(ctx: &Ctx, input: &TextAnalysis<'_>) -> LauncherResul
     let files = [CrashFile {
         name: input.file_name.to_string(),
         bytes: input.text.as_bytes().to_vec(),
+        origin: CrashFileOrigin::Pasted,
     }];
     let Some((instance_id, provider)) = input.instance else {
         return analyze(&AnalyzeInput {

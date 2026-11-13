@@ -29,7 +29,8 @@ use crate::crash_engine::evidence::{
     SourceSpec, EVIDENCE_STORE_DIR,
 };
 use crate::crash_engine::{
-    analyze_with_facts, AnalyzeInput, AnalyzedFile, CrashFile, InstanceAnalysis, InstanceInspector,
+    analyze_with_history, history::RecordedCrash, AnalyzeInput, AnalyzedFile, CrashFile,
+    InstanceAnalysis, InstanceInspector,
 };
 use crate::crash_packs::{load_built_in_packs, LoadedCrashPack};
 use crate::ctx::Ctx;
@@ -44,6 +45,14 @@ pub enum StoredAnswer {
     Analyzed {
         answer: Box<CrashAnswer>,
         files: Vec<AnalyzedFile>,
+        /// What changed since the last session that ended normally, when one exists. Stored so the
+        /// answer screen can list it later; absent in answers written before this was kept.
+        #[serde(default)]
+        changes: Vec<ManifestChange>,
+        /// What this crash contributes to the pattern across crashes. Older answers stored before
+        /// this field existed have none, and are still read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<RecordedCrash>,
     },
     /// Nothing was readable for this session. That is not a clean bill of health.
     NothingToRead { why: String },
@@ -96,6 +105,33 @@ pub fn answer_for_session(
     row.map(decode_answer).transpose()
 }
 
+/// Every stored answer for an instance, newest session first. The newest is the card the overview
+/// shows; the rest are the instance's earlier crashes. A session with no row in `launch_history`
+/// (only possible for an answer written by hand) is ordered by when it was stored.
+pub fn answers_for_instance(
+    conn: &Connection,
+    instance_id: &str,
+) -> anyhow::Result<Vec<SessionAnswer>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.session_id, a.instance_id, a.created_at, a.answer_json
+           FROM session_answers a
+           LEFT JOIN launch_history h ON h.session_id = a.session_id
+          WHERE a.instance_id = ?1
+          ORDER BY COALESCE(h.ended_at, h.started_at, a.created_at) DESC, a.session_id DESC",
+    )?;
+    let rows = stmt
+        .query_map([instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter().map(decode_answer).collect()
+}
+
 /// The newest stored answer for an instance.
 pub fn latest_answer(
     conn: &Connection,
@@ -111,27 +147,6 @@ pub fn latest_answer(
         )
         .optional()?;
     row.map(decode_answer).transpose()
-}
-
-/// Every stored answer for an instance, newest first. This is a list of what Agora diagnosed,
-/// not a list of log files.
-pub fn answers_for_instance(
-    conn: &Connection,
-    instance_id: &str,
-) -> anyhow::Result<Vec<SessionAnswer>> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id, instance_id, created_at, answer_json
-           FROM session_answers WHERE instance_id = ?1
-           ORDER BY created_at DESC, session_id DESC",
-    )?;
-    let rows = stmt.query_map([instance_id], |row| {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-    })?;
-    let mut answers = Vec::new();
-    for row in rows {
-        answers.push(decode_answer(row?)?);
-    }
-    Ok(answers)
 }
 
 fn decode_answer(
@@ -366,7 +381,46 @@ fn diagnose_record(
 
     let changes = previous_changes(conn, record)?;
     let engine_facts = session_engine_facts(record, &changes);
-    let output = analyze_with_facts(
+
+    // The same crash's own files may sit in a source folder, so leave them out of the history
+    // comparison by their content hash.
+    let exclude_hashes: Vec<String> = files
+        .iter()
+        .map(|file| crate::crash_history::content_hash(&file.bytes))
+        .collect();
+    let setup_hash = record.manifest.as_ref().map(|manifest| manifest.hash());
+    let limits = crate::crash_history::LogSweepLimits::default();
+    let (prepared, history_error) = match crate::crash_history::prepare(
+        ctx,
+        conn,
+        crate::crash_history::HistorySetup {
+            instance_id: &record.instance_id,
+            game_id: &game_id,
+            runtime_version: runtime_version.as_deref(),
+            packs: &packs,
+            built_in: live.built_in,
+            host: live.host,
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &could_not_check,
+            setup: setup_hash
+                .as_deref()
+                .map(|hash| (hash, record.started_at.as_str())),
+            exclude_hashes: &exclude_hashes,
+        },
+        limits,
+        true,
+    ) {
+        Ok(prepared) => (Some(prepared), None),
+        // A history failure must not erase this crash's diagnosis. It is stated as something
+        // Agora could not check, never as "no earlier crashes".
+        Err(why) => (None, Some(why)),
+    };
+    let history_input = prepared
+        .as_ref()
+        .map(crate::crash_history::PreparedHistory::input);
+
+    let mut output = analyze_with_history(
         &AnalyzeInput {
             packs: &packs,
             files: &files,
@@ -377,13 +431,50 @@ fn diagnose_record(
         },
         &engine_facts,
         &changes,
+        history_input.as_ref(),
     )
     .map_err(|error| format!("the crash analysis failed: {error}"))?;
+
+    if let Some(note) = prepared
+        .as_ref()
+        .and_then(|prepared| prepared.skipped_note(limits))
+    {
+        push_history_note(&mut output, note);
+    }
+    if let Some(why) = history_error {
+        push_history_note(
+            &mut output,
+            format!("the older crash logs could not be read: {why}"),
+        );
+    }
+
+    let at_unix_ms = record_window(record)
+        .ok()
+        .map(|window| crate::crash_engine::evidence::unix_ms(window.started));
+    let recorded = RecordedCrash {
+        record: output.record.clone(),
+        bucket: crate::crash_engine::history::parsed_bucket(&output.parsed),
+        at_unix_ms,
+    };
 
     Ok(StoredAnswer::Analyzed {
         answer: Box::new(output.answer),
         files: output.files,
+        changes,
+        record: Some(recorded),
     })
+}
+
+fn push_history_note(output: &mut crate::crash_engine::AnalyzeOutput, note: String) {
+    output
+        .answer
+        .could_not_check
+        .push(agora_game_api::crash::CouldNotCheck {
+            reason: agora_game_api::crash::CouldNotCheckReason::NotRetained,
+            subject: "older crash logs".to_string(),
+            detail: Some(note),
+            source: None,
+        });
 }
 
 fn record_window(record: &SessionRecord) -> Result<SessionWindow, String> {
@@ -458,6 +549,8 @@ fn readable_files(copied: &CopiedSession) -> Vec<CrashFile> {
         files.push(CrashFile {
             name: (*name).to_string(),
             bytes,
+            // Agora found it: a whole file, never read by a snippet parser.
+            origin: crate::crash_engine::CrashFileOrigin::Collected,
         });
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));

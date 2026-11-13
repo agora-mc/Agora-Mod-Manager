@@ -7819,7 +7819,7 @@ fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn reveal_in_explorer(path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn reveal_in_explorer(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let path_str = path.to_string_lossy().to_string();

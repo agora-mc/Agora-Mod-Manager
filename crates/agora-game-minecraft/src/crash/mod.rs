@@ -10,6 +10,7 @@ mod crash_report;
 mod hs_err;
 mod latest_log;
 mod shared;
+mod snippet;
 
 use agora_core::crash_engine::gate;
 use agora_core::crash_live::{
@@ -21,6 +22,7 @@ pub use captured::CapturedOutputParser;
 pub use crash_report::CrashReportParser;
 pub use hs_err::HsErrParser;
 pub use latest_log::LatestLogParser;
+pub use snippet::SnippetParser;
 
 /// Diagnose a finished Minecraft session with the same packs and engine the rest of Agora uses,
 /// through the shared instance router's Minecraft branch. The caller supplies the host; every
@@ -94,6 +96,7 @@ pub fn built_in_packs() -> Vec<BuiltInPack> {
                 Box::new(captured::CapturedOutputParser),
             ),
             ("hs_err".to_string(), Box::new(hs_err::HsErrParser)),
+            ("snippet".to_string(), Box::new(snippet::SnippetParser)),
         ],
     }]
 }

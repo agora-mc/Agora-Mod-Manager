@@ -1,8 +1,10 @@
 //! Storing, reading back and trimming the crash answer attached to a session. No game runs.
 
 use agora_core::crash_live::{
-    answer_for_session, latest_answer, store_answer, SessionAnswer, StoredAnswer,
+    answer_for_session, answers_for_instance, latest_answer, store_answer, SessionAnswer,
+    StoredAnswer,
 };
+use agora_core::session_ledger::{ChangeKind, ManifestChange};
 use agora_game_api::crash::{CrashAnswer, Level, NextStepKind, SessionVerdict};
 use rusqlite::Connection;
 
@@ -43,6 +45,8 @@ fn answer(session: &str, instance: &str, created: &str, headline: &str) -> Sessi
                 cause: None,
             }),
             files: Vec::new(),
+            changes: Vec::new(),
+            record: None,
         },
     }
 }
@@ -139,4 +143,62 @@ fn deleting_an_instance_deletes_its_answers() {
         .query_row("SELECT COUNT(*) FROM session_answers", [], |row| row.get(0))
         .unwrap();
     assert_eq!(answers, 0);
+}
+
+#[test]
+fn answers_for_instance_are_newest_session_first() {
+    let conn = db();
+    insert_session(&conn, "old", "inst", "2026-01-01T00:00:00Z");
+    conn.execute(
+        "UPDATE launch_history SET ended_at = '2026-01-01T00:10:00Z' WHERE session_id = 'old'",
+        [],
+    )
+    .unwrap();
+    insert_session(&conn, "new", "inst", "2026-01-01T01:00:00Z");
+    conn.execute(
+        "UPDATE launch_history SET ended_at = '2026-01-01T01:10:00Z' WHERE session_id = 'new'",
+        [],
+    )
+    .unwrap();
+    // Stored in the other order, so the query's ordering is what the test proves.
+    store_answer(&conn, &answer("new", "inst", "2026-01-01T01:01:00Z", "new")).unwrap();
+    store_answer(&conn, &answer("old", "inst", "2026-01-01T00:01:00Z", "old")).unwrap();
+
+    let answers = answers_for_instance(&conn, "inst").unwrap();
+    let ids: Vec<&str> = answers
+        .iter()
+        .map(|answer| answer.session_id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["new", "old"]);
+    assert!(answers_for_instance(&conn, "another").unwrap().is_empty());
+}
+
+#[test]
+fn the_change_summary_survives_a_round_trip() {
+    let conn = db();
+    insert_session(&conn, "s1", "inst", "2026-01-01T00:00:00Z");
+    let mut stored = answer("s1", "inst", "2026-01-01T00:01:00Z", "x");
+    stored.answer = StoredAnswer::Analyzed {
+        answer: match stored.answer {
+            StoredAnswer::Analyzed { answer, .. } => answer,
+            _ => unreachable!(),
+        },
+        files: Vec::new(),
+        changes: vec![ManifestChange {
+            kind: ChangeKind::Updated,
+            key: Some("acme.sky".to_string()),
+            from_version: Some("1.0".to_string()),
+            to_version: Some("2.0".to_string()),
+        }],
+        record: None,
+    };
+    store_answer(&conn, &stored).unwrap();
+
+    let found = answer_for_session(&conn, "s1").unwrap().unwrap();
+    let StoredAnswer::Analyzed { changes, .. } = found.answer else {
+        panic!("the answer should still be analyzed")
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].key.as_deref(), Some("acme.sky"));
+    assert_eq!(changes[0].to_version.as_deref(), Some("2.0"));
 }

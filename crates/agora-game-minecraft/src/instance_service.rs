@@ -3849,6 +3849,9 @@ $#
             let mut reviewed: Vec<&str> = vec![
                 "crash_events",
                 "crash_survivals",
+                // One compact record per older crash log, keyed by content hash. It belongs to the
+                // instance, so it is captured, deleted and restored with it.
+                "crash_log_results",
                 // Other games' instances. Ids are unique across games, so a Minecraft delete finds
                 // no row here; the generic capture still carries one if it ever did.
                 "game_instances",

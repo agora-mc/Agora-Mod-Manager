@@ -220,7 +220,7 @@ fn a_live_session_reads_the_captured_launch_output_when_no_report_was_written() 
         .unwrap()
         .expect("an answer is stored");
     match stored.answer {
-        agora_core::crash_live::StoredAnswer::Analyzed { answer, files } => {
+        agora_core::crash_live::StoredAnswer::Analyzed { answer, files, .. } => {
             assert!(
                 files
                     .iter()

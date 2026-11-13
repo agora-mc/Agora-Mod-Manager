@@ -17,6 +17,7 @@ mod store;
 mod sweep;
 
 pub use source::*;
+pub(crate) use source::{folder_below_trusted_root, marker_present};
 pub use store::*;
 pub use sweep::*;
 

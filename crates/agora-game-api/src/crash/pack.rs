@@ -189,12 +189,22 @@ pub enum Reads {
     Primary,
     /// Reads alongside the primary. Every extra runs, so it must stay in its own namespace.
     Extra,
+    /// Reads a fragment the user pasted, when no primary parser claimed it. It never runs on a
+    /// file Agora found or the user picked, and its facts are ordinary facts, so the pack's rules
+    /// work on them. Its `detect` must be non-empty: a fragment still needs a shape to recognise.
+    Snippet,
 }
 
 impl Reads {
-    /// Whether a parser may emit `core.*` facts.
+    /// Whether a parser may emit `core.*` facts. A snippet parser can, because it stands in for
+    /// the primary reader of the text it reads.
     pub fn may_emit_core(self) -> bool {
-        self == Self::Primary
+        matches!(self, Self::Primary | Self::Snippet)
+    }
+
+    /// Whether this parser only reads text the user pasted.
+    pub fn is_snippet(self) -> bool {
+        self == Self::Snippet
     }
 }
 

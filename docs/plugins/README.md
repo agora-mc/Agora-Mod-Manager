@@ -230,6 +230,15 @@ recognised by" and are not run. Every `extra` runs alongside the primary, and it
 in a namespace of its own, never `core.*`; an output that tries is refused as "could not check" so
 the same core fact is never counted twice.
 
+A third value, `"snippet"`, reads a fragment the user pasted: a stack trace, the top of a crash
+report, a few lines of a log. A snippet parser runs only when the text's origin is `pasted`, no
+primary parser claimed it, and its own `detect` matched. It never runs on a file Agora's sweep
+found or the user picked, so a whole file must be recognised by its whole-file parser or the answer
+says there was nothing to read. Its `detect` is required and may be looser than a whole-file
+parser's (an exception line, a frame shape). Its facts are ordinary facts, so the pack's rules work
+on them; a rule that needs a section a fragment cannot have comes out "could not check". When one
+reads the text, the answer carries a trust note naming the parser and is capped at `possible`.
+
 A source's `format` names a parser. A plain id is local to the plugin. A declared dependency's
 parser is written `"<plugin id>:<parser id>"` (for example `"acme.base:shared"`): the plugin must be
 in the pack plugin's `dependencies`, the linter refuses it otherwise, and the engine runs that
@@ -277,6 +286,18 @@ The cross-crash summary counts a **crash place** from the contract's facts, neve
 own names: either a `core.exception` with a `module` ref and an `offset` attribute, or the first
 `core.frame` with its module or class ref and its `rva`, `symbol`, `address` or `symbol_offset`.
 Two crashes at the same place are treated as the same bug repeating.
+
+A pack's `sources` are also what Agora reads when it sweeps older crash logs. For an instance,
+every file the applicable packs' `sources` name is listed newest first, and a bounded number are
+analysed once each; only a small per-log record is kept, keyed by the file's content hash, so the
+same log is never analysed twice and the log's bytes are never copied. A plugin that declares
+another source (a mod's own log folder, say) is swept with no change to Agora. The scan is bounded,
+and when older logs are left for a later sweep the answer says so instead of treating them as
+absent. The count across crashes then reaches rules as the engine's `core.history` facts
+(`same_bucket_count`, `sessions_since_first`, `predates_last_change`), raises a recurring suspect
+with the boost-only `history_repeat` family, and adds one finding when a named suspect appeared in
+several crashes at different places. Framework and hook-framework owners are listed as always
+running and are never raised by that count.
 
 ### The runtime
 
