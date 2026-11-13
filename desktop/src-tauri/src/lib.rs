@@ -1,6 +1,5 @@
 pub mod auth;
 pub mod commands;
-pub mod crash_diagnostics;
 pub mod crash_export;
 pub mod dependency_ops;
 pub mod downloads;
@@ -352,16 +351,12 @@ pub fn run() {
             commands::github_logout,
             commands::get_auth_status,
             commands::get_github_profile,
-            commands::check_instance_crash,
             games::crash_answers::get_crash_answer,
             games::crash_answers::list_crash_answers,
             games::crash_answers::analyze_crash_text,
             games::crash_answers::analyze_crash_file,
             games::crash_answers::read_crash_artifact,
             games::crash_answers::reveal_crash_artifact,
-            commands::triage_crash_report,
-            commands::list_crash_reports_cmd,
-            commands::read_crash_log_cmd,
             commands::investigate_instance_evidence,
             commands::list_mod_versions,
             commands::list_mod_versions_load_more,
@@ -719,26 +714,6 @@ pub fn run() {
                         }
                     });
                 }
-                let purge_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Some(core_state) = purge_handle.try_state::<ManagedCoreContext>() {
-                            match core_state.lock() {
-                                Ok(ctx) => {
-                                    let svc =
-                                        agora_core::crash_service::CrashService::new(ctx.clone());
-                                    if let Err(e) = svc.purge_stale_telemetry() {
-                                        eprintln!("Failed to purge stale crash telemetry: {e}",);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Core context lock failed: {e}");
-                                }
-                            }
-                        }
-                    })
-                    .await;
-                });
                 // Start MCP server if enabled.
                 if let Some(core_state) = handle.try_state::<ManagedCoreContext>() {
                     match core_state.lock() {

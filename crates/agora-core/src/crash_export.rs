@@ -1,6 +1,6 @@
 //! Builds a shareable crash report.
 //!
-//! Agora diagnoses crashes locally (see `crash_investigator`). When the local
+//! Agora diagnoses crashes locally through the crash engine. When the local
 //! signals aren't enough, the user takes the evidence somewhere better — an AI
 //! assistant of their choosing, or the community Discord. This module assembles
 //! that evidence into one self-contained, redacted markdown document.

@@ -259,9 +259,6 @@ pub struct DependencyDecl {
 }
 
 /// Jar dependency metadata extracted from a mod JAR file.
-///
-/// Renamed from `JarMetadata` to avoid collision with
-/// `crate::crash_diagnostics::JarMetadata` in the same crate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JarDeps {
     pub java_packages: Vec<String>,

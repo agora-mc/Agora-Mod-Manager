@@ -144,7 +144,7 @@
   - **Acceptance:** New user sees welcome → toggles → can skip OAuth → lands on Home with registry loaded.
 
 - [x] **Crash diagnostics** (§9, Phase 4)
-  - **Short:** Pre-launch interceptor, regex signature matching, GitHub issue duplicate search, preview-before-submit, manual log viewer. Implemented in `desktop/src-tauri/src/crash_diagnostics.rs` (`check_for_crash`, `triage_crash`, `list_crash_reports`, `read_crash_log`).
+  - **Short:** Pre-launch interceptor, crash log analysis, GitHub issue duplicate search, preview-before-submit, manual log viewer. Implemented by the crash engine (`crash analyze`, stored session answers) and the shared `CrashAnswerView`; the old regex-signature diagnoser (`crash_diagnostics.rs`) was deleted when Minecraft moved fully to the engine (MASTER_SPEC §30.11).
   - **Detail:** (a) Pre-launch interceptor reads `last_launched_at` (already fixed to update before spawn); if the previous launch crashed, show crash prompt. (b) Add Rust `regex` crate; read `crash_signatures` table; match against latest crash log. (c) Search GitHub issues for known duplicate patterns. (d) Show preview of what will be submitted before creating a GitHub issue. (e) Manual log viewer panel for browsing `crash-reports/`. (f) Local crash telemetry already has `record_co_crash()` + retention purge; wire it into the crash detection flow.
   - **Spec:** §9, Phase 4
   - **Acceptance:** A simulated crash matches a regex signature, shows the fix hint, and the user can preview + submit a GitHub issue.

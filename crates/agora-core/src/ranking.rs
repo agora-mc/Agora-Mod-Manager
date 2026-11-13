@@ -102,9 +102,8 @@ pub struct RankingInput {
 
 /// A scored item plus the reasoning behind it.
 ///
-/// The breakdown mirrors `crash_service::compute_mod_score`'s explainability
-/// pattern: every component that moved the number is recorded, so a surprising
-/// ordering can be explained without re-deriving the math by hand.
+/// Every component that moved the number is recorded, so a surprising ordering
+/// can be explained without re-deriving the math by hand.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScoreBreakdown {

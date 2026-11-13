@@ -20,7 +20,6 @@ pub mod connectivity;
 pub mod content_fomod;
 pub mod content_store;
 pub mod content_thunderstore;
-pub mod crash_diagnostics;
 pub mod crash_engine;
 pub mod crash_evidence;
 pub mod crash_export;

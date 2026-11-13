@@ -1,5 +1,4 @@
 use crate::auth::{DeviceFlowResponse, GithubProfile};
-use crate::crash_diagnostics::{self, CrashReportInfo, CrashTriageResult};
 use crate::crash_export;
 use crate::dependency_ops;
 use crate::error::{LauncherError, LauncherResult};
@@ -2076,60 +2075,6 @@ pub async fn get_github_profile(app: tauri::AppHandle) -> LauncherResult<Option<
         }
         Err(_) => Ok(None),
     }
-}
-
-/// Check whether a fresh crash report appeared after the instance's last launch.
-#[tauri::command]
-pub async fn check_instance_crash(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    instance_id: String,
-) -> LauncherResult<Option<CrashReportInfo>> {
-    tokio::task::spawn_blocking(move || crash_diagnostics::check_for_crash(&app, &instance_id))
-        .await
-        .map_err(|_| LauncherError::LocalStateFailed)?
-}
-
-/// Triage a crash log against curated signatures from the registry.
-#[tauri::command]
-pub async fn triage_crash_report(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    instance_id: String,
-    filename: String,
-) -> LauncherResult<CrashTriageResult> {
-    tokio::task::spawn_blocking(move || {
-        crash_diagnostics::triage_crash(&app, &instance_id, &filename)
-    })
-    .await
-    .map_err(|_| LauncherError::LocalStateFailed)?
-}
-
-/// List all crash report files for an instance.
-#[tauri::command]
-pub async fn list_crash_reports_cmd(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    instance_id: String,
-) -> LauncherResult<Vec<CrashReportInfo>> {
-    tokio::task::spawn_blocking(move || crash_diagnostics::list_crash_reports(&app, &instance_id))
-        .await
-        .map_err(|_| LauncherError::LocalStateFailed)?
-}
-
-/// Read the content of a specific crash report file.
-#[tauri::command]
-pub async fn read_crash_log_cmd(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    instance_id: String,
-    filename: String,
-) -> LauncherResult<String> {
-    tokio::task::spawn_blocking(move || {
-        crash_diagnostics::read_crash_log(&app, &instance_id, &filename)
-    })
-    .await
-    .map_err(|_| LauncherError::LocalStateFailed)?
 }
 
 /// Collect the instance's recent crash evidence and the engine answer's ranked suspects for the

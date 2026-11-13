@@ -276,7 +276,7 @@ MCP client (e.g., Claude Desktop)
                              │    LaunchService,     │
                              │    InstallService,    │
                              │    health, registry,  │
-                             │    crash_diagnostics  │
+                             │    crash engine       │
                              └──────────────────────┘
 ```
 

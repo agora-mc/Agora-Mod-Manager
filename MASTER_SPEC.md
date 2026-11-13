@@ -5007,6 +5007,8 @@ A plugin contributes **crash packs**: JSON files listed under `contributions.cra
 
 **Actions on rules** *(built)*. A rule may offer buttons, from a closed set the screen knows how to perform: `install_content` (with a `content_key`), `open_console`, `open_jvm_settings`, `open_crash_log`, `review_mods`. A rule supplies an optional label; the action becomes an `ActionOffer` on the answer with its source, alongside repairs. A pack never decides behaviour: it can only ask for an existing action. The linter refuses `install_content` without a key, a key on another kind, and certainty wording in a label. This carries the buttons the old diagnoser returned without teaching core a game.
 
+**The old diagnoser is gone** *(built)*. Minecraft is fully on the engine: crash diagnosis, the test-it flow, export, Home's crash alert, the CLI and the MCP tools all read the stored engine answer. `crash_diagnostics.rs` and the scoring, fingerprint, triage and telemetry half of `crash_service.rs` were deleted; `crash_service` keeps only the enable and disable operations the experiment flow uses. A fix the user confirms is kept per crash bucket as boost-only local-confirmation evidence, so it can raise a suspect but never create one.
+
 *Deferred until a game needs them:* derivers, scanners, bisect edges, rule macros, scoring profiles. The `agora-game-api` dependency list widens to `serde_json` and `regex` for this.
 
 ### 30.12 The platform contract
