@@ -10,10 +10,12 @@
 mod analyze;
 mod answer;
 pub mod attribution;
+pub mod change;
 mod consensus;
 mod evaluate;
 pub mod history;
 mod inspector;
+pub mod instance_view;
 pub mod parsers;
 mod profile;
 pub mod save_risk;

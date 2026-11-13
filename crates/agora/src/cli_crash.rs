@@ -6,7 +6,7 @@
 //! instance's deployed view so refs attribute to mods and an inspector can open one file; it
 //! changes no game file, only Agora's own metadata caches.
 
-use agora_core::crash_engine::attribution::{from_instance, InstanceView, Resolver};
+use agora_core::crash_engine::attribution::Resolver;
 use agora_core::crash_engine::history::{summarize, CrashHistory, HistoryOwner};
 use agora_core::crash_engine::{
     analyze, owner_name, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
@@ -25,6 +25,30 @@ use agora_plugin_host::QuickJsHost;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// The packs and script host a live session analysis runs with, loaded the same way `crash
+/// analyze` loads them: every installed plugin's packs, the packs compiled into Agora, and the
+/// script host activated for any that need one.
+pub struct LivePacks {
+    pub packs: Vec<LoadedCrashPack>,
+    pub built_in: Vec<agora_game_api::crash::BuiltInPack>,
+    pub host: Arc<dyn ScriptHost>,
+}
+
+pub fn load_live_packs(ctx: &agora_core::ctx::Ctx) -> anyhow::Result<LivePacks> {
+    let host: Arc<dyn ScriptHost> = Arc::new(QuickJsHost::new());
+    let installed = agora_core::crash_live::load_installed_packs(ctx, host.clone())?;
+    for problem in &installed.problems {
+        eprintln!("Warning: {problem}");
+    }
+    // The built-in packs are linter-checked by the live path itself, so they are passed raw.
+    let built_in = agora_game_minecraft::crash::built_in_packs();
+    Ok(LivePacks {
+        packs: installed.packs,
+        built_in,
+        host,
+    })
+}
 
 pub struct AnalyzeArgs {
     pub files: Vec<PathBuf>,
@@ -104,7 +128,8 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
     let mut instance_notes: Vec<CouldNotCheck> = Vec::new();
     let mut effective_version = args.game_version.clone();
     if let Some(instance_id) = args.instance.as_deref() {
-        let (game_id, view, runtime_version, notes) = resolve_instance(ctx, instance_id)?;
+        let resolved = resolve_instance(ctx, instance_id)?;
+        let game_id = resolved.game_id.clone();
         // Only the instance's game and the packs for every game may say how a ref is attributed.
         let game_packs: Vec<&LoadedCrashPack> = packs
             .iter()
@@ -120,14 +145,14 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
             .iter()
             .flat_map(|pack| pack.pack.roles.iter().cloned())
             .collect();
-        instance_resolver = Some(Resolver::new(view, ref_maps, roles));
+        instance_resolver = Some(Resolver::new(resolved.view, ref_maps, roles));
         instance_scope = Some(Arc::new(instance_reads(ctx, instance_id).map_err(
             |error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"),
         )?));
         if effective_version.is_none() {
-            effective_version = runtime_version;
+            effective_version = resolved.runtime_version;
         }
-        instance_notes = notes;
+        instance_notes = resolved.could_not_check;
         instance_game_id = Some(game_id);
     }
     let instance_inspector = match (&instance_resolver, &instance_scope) {
@@ -228,44 +253,44 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
     Ok(())
 }
 
-/// The view behind `--instance`: a game instance as before, or a Minecraft instance when the id
-/// belongs to that separate instance system. The game package builds the Minecraft view, so no
-/// game's names or file layout reach this adapter or core.
+/// The view behind `--instance`, through the one router the live path uses too. Core reads a
+/// generic game instance; the Minecraft package supplies the branch for its own instance system,
+/// so no game's names or file layout reach this adapter or core.
 fn resolve_instance(
     ctx: &agora_core::ctx::Ctx,
     instance_id: &str,
-) -> anyhow::Result<(String, InstanceView, Option<String>, Vec<CouldNotCheck>)> {
-    match agora_core::game_instance::get_manifest(ctx, instance_id) {
-        Ok(manifest) => {
-            let view = from_instance(ctx, instance_id).map_err(|error| {
-                anyhow::anyhow!("Could not read instance '{instance_id}': {error}")
-            })?;
-            Ok((
-                manifest.game.as_str().to_string(),
-                view,
-                manifest
-                    .runtime_identity
-                    .as_ref()
-                    .map(|runtime| runtime.version.clone()),
-                Vec::new(),
-            ))
-        }
-        Err(generic_error) => {
-            match agora_game_minecraft::installed_content::crash_instance_view(ctx, instance_id) {
-                Ok(Some(found)) => Ok((
-                    found.game_id,
-                    found.view,
-                    found.runtime_version,
-                    found.could_not_check,
-                )),
-                Ok(None) => Err(anyhow::anyhow!(
-                    "Unknown instance '{instance_id}': {generic_error}"
-                )),
-                Err(error) => Err(anyhow::anyhow!(
-                    "Could not read instance '{instance_id}': {error}"
-                )),
-            }
-        }
+) -> anyhow::Result<agora_core::crash_engine::instance_view::ResolvedCrashInstance> {
+    Ok(
+        agora_core::crash_engine::instance_view::resolve_crash_instance(
+            ctx,
+            instance_id,
+            Some(&MinecraftInstances),
+        )?,
+    )
+}
+
+/// The Minecraft instance system, supplied to the shared router from this adapter. Core cannot
+/// name a game, so this small branch lives where the game package is already known.
+struct MinecraftInstances;
+
+impl agora_core::crash_engine::instance_view::ExtraInstanceProvider for MinecraftInstances {
+    fn resolve(
+        &self,
+        ctx: &agora_core::ctx::Ctx,
+        instance_id: &str,
+    ) -> agora_core::error::LauncherResult<
+        Option<agora_core::crash_engine::instance_view::ResolvedCrashInstance>,
+    > {
+        Ok(
+            agora_game_minecraft::installed_content::crash_instance_view(ctx, instance_id)?.map(
+                |found| agora_core::crash_engine::instance_view::ResolvedCrashInstance {
+                    game_id: found.game_id,
+                    runtime_version: found.runtime_version,
+                    view: found.view,
+                    could_not_check: found.could_not_check,
+                },
+            ),
+        )
     }
 }
 
@@ -396,7 +421,37 @@ fn print_text(output: &AnalyzeOutput) {
         print_files(output);
         return;
     }
-    let answer = &output.answer;
+    print_answer(&output.answer, &output.files);
+}
+
+/// Print a stored answer (the read-back path for `crash last` / `crash show`).
+pub fn print_stored(
+    stored: &agora_core::crash_live::SessionAnswer,
+    json: bool,
+) -> anyhow::Result<()> {
+    use agora_core::crash_live::StoredAnswer;
+    if json {
+        println!("{}", serde_json::to_string_pretty(stored)?);
+        return Ok(());
+    }
+    match &stored.answer {
+        StoredAnswer::Analyzed { answer, files } => print_answer(answer, files),
+        StoredAnswer::NothingToRead { why } => {
+            println!("Agora has no crash evidence to diagnose for this session.");
+            println!("{why}");
+        }
+        StoredAnswer::CouldNotAnalyze { why } => {
+            println!("Agora could not analyze this session.");
+            println!("{why}");
+        }
+    }
+    Ok(())
+}
+
+fn print_answer(
+    answer: &agora_game_api::crash::CrashAnswer,
+    files: &[agora_core::crash_engine::AnalyzedFile],
+) {
     println!("{}", english(&answer.headline));
     println!("How sure: {}", answer.level.label());
     if let Some(cause) = answer.cause {
@@ -474,7 +529,7 @@ fn print_text(output: &AnalyzeOutput) {
         }
     }
 
-    print_files(output);
+    print_file_list(files);
 }
 
 fn print_each_text(outputs: &[AnalyzeOutput]) {
@@ -582,11 +637,15 @@ fn save_risk_words(label: SaveRiskLabel) -> &'static str {
 }
 
 fn print_files(output: &AnalyzeOutput) {
-    if output.files.is_empty() {
+    print_file_list(&output.files);
+}
+
+fn print_file_list(files: &[agora_core::crash_engine::AnalyzedFile]) {
+    if files.is_empty() {
         return;
     }
     println!("Files:");
-    for file in &output.files {
+    for file in files {
         match (&file.read_by, file.read_by_extra.first()) {
             (Some(reader), _) => println!("  {}: read by {}", file.name, reader.plugin_name),
             (None, Some(reader)) => {

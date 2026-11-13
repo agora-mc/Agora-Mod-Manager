@@ -232,6 +232,17 @@ pub fn prune_history(conn: &Connection, instance_id: &str) -> anyhow::Result<usi
             )",
         params![instance_id],
     )?;
+    // An answer lives exactly as long as its session row. This is the one retention limit both
+    // share: the history row and the answer are trimmed together, never one without the other.
+    conn.execute(
+        "DELETE FROM session_answers
+          WHERE instance_id = ?1
+            AND session_id NOT IN (
+                SELECT session_id FROM launch_history
+                 WHERE instance_id = ?1 AND session_id IS NOT NULL
+            )",
+        params![instance_id],
+    )?;
     Ok(removed)
 }
 

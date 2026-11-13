@@ -301,6 +301,26 @@ fn a_loader_that_exits_first_does_not_decide_the_verdict() {
     assert!(report.game_runtime_ms.is_some());
 }
 
+/// A game that starts and ends between two watcher polls must still keep its exit code. The
+/// loader does its work and exits at once, and nothing holds the game open: the watch is started
+/// exactly as the launch path starts it, so there is no test-only pause to hide the race.
+#[test]
+#[cfg(windows)]
+fn a_game_that_ends_between_two_polls_keeps_its_exit_code() {
+    let rig = Rig::new(&["loader", "game"]);
+    let mut loader_args = args(&["spawn"]);
+    loader_args.push(rig.exe("game").display().to_string());
+    loader_args.extend(args(&["exit", "0"]));
+    let launched = start(&rig.exe("loader"), &loader_args);
+    let report = watch(rig.dir.path(), &["game"], launched).join().unwrap();
+    assert_eq!(
+        code_of(&report),
+        0,
+        "the game's own exit code was lost: {:?}",
+        report.exit
+    );
+}
+
 #[test]
 #[cfg(windows)]
 fn a_game_that_crashes_after_its_loader_exited_zero_is_a_crash() {

@@ -1043,6 +1043,33 @@ fn spawn_exit_watch(
                 );
             }
         }
+        // The session is recorded. Diagnose it now, before a logger can rotate its evidence away.
+        // Every failure is stored as a "could not analyze" answer, never raised to the page.
+        if let Some(session) = session_id.as_deref() {
+            let host: Arc<dyn agora_plugin_api::host::ScriptHost> =
+                Arc::new(agora_plugin_host::QuickJsHost::new());
+            match agora_core::crash_live::load_installed_packs(&ctx, host.clone()) {
+                Ok(installed) => {
+                    let built_in = agora_game_minecraft::crash::built_in_packs();
+                    let _ = agora_core::crash_live::diagnose_session(
+                        &ctx,
+                        session,
+                        agora_core::crash_live::LivePacks {
+                            packs: &installed.packs,
+                            built_in: &built_in,
+                            host: host.as_ref(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    let _ = agora_core::crash_live::record_could_not_analyze(
+                        &ctx,
+                        session,
+                        format!("the crash packs could not be loaded: {error}"),
+                    );
+                }
+            }
+        }
         // The same end a stop runs: put the player's files back and add this session to the
         // instance's play time.
         let restore_error = match ctx.games.game(&game_id) {

@@ -489,6 +489,333 @@ fn a_stop_during_the_run_is_recorded_as_stopped() {
     }
 }
 
+// -- live crash diagnosis ------------------------------------------------------------------
+
+fn live_pack() -> agora_game_api::crash::BuiltInPack {
+    agora_game_api::crash::BuiltInPack {
+            file: "test/crash/pack.json".to_string(),
+            json: serde_json::json!({
+                "contract": 1,
+                "games": ["test-game"],
+                "sources": [{
+                    "id": "crash_log",
+                    "where": { "root": "instance", "path": "logs" },
+                    "match": { "glob": "crash-*.txt" },
+                    "format": "probe",
+                    "bind": [{ "time": { "before_s": 3600, "after_s": 3600 } }],
+                    "role": "primary"
+                }],
+                "parsers": [{
+                    "id": "probe",
+                    "detect": { "all": ["(?m)^ERRORS$"] },
+                    "entry": { "generic": { "name": "text_sections", "config": {
+                        "producer": { "format": "probe_log" },
+                        "sections": [{
+                            "id": "errors",
+                            "header": "^ERRORS$",
+                            "kind": "core.exception",
+                            "lines": [{
+                                "pattern": "^(?P<category>\\w+) (?P<module>\\S+)$",
+                                "attrs": { "category": "category" },
+                                "refs": [{ "kind": "module", "value": "module", "strength": "exec" }]
+                            }]
+                        }]
+                    } } }
+                }],
+                "rules": [{
+                    "id": "something_faulted",
+                    "version": 1,
+                    "when": { "fact": { "kind": "core.exception", "ref": { "kind": "module" } } },
+                    "effects": [{ "context": { "text": { "en": "The log names a module at the fault." } } }],
+                    "text": { "headline": { "en": "The log names a module at the fault." } }
+                }]
+            })
+            .to_string(),
+            parsers: Vec::new(),
+        }
+}
+
+fn write_log(f: &Fixture) {
+    let dir = f.ctx.paths.instance_dir(&f.record.instance_id).unwrap();
+    let logs = dir.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("crash-1.txt"),
+        "ERRORS\naccess_violation Example.dll\n",
+    )
+    .unwrap();
+}
+
+fn manifest(items: &[&str]) -> agora_core::session_ledger::LaunchManifest {
+    agora_core::session_ledger::LaunchManifest {
+        plan_fingerprint: None,
+        items: items
+            .iter()
+            .enumerate()
+            .map(|(order, key)| agora_core::session_ledger::ManifestItem {
+                key: (*key).to_string(),
+                version: Some("1.0".to_string()),
+                hash: Some(format!("hash-{key}")),
+                enabled: true,
+                order: order as u32,
+                unreadable: None,
+            })
+            .collect(),
+        load_orders_hash: Some("load".to_string()),
+        runtime: "test:1.0".to_string(),
+        settings_hash: Some("settings".to_string()),
+        unreadable: Vec::new(),
+    }
+}
+
+fn start_session(f: &Fixture, started: &str, items: &[&str]) -> String {
+    session_ledger::begin(
+        &ledger(f),
+        &f.record.instance_id,
+        started,
+        &manifest(items),
+        session_ledger::Owner { pid: 1, started: 7 },
+    )
+    .unwrap()
+}
+
+fn end_session(f: &Fixture, id: &str, ended: &str, code: u32) {
+    session_ledger::finish(
+        &ledger(f),
+        id,
+        &session_ledger::SessionFinish {
+            ended_at: ended.to_string(),
+            duration_ms: 60_000,
+            exit: session_ledger::ExitObservation::Code {
+                pid: 4242,
+                image: "Game.exe".to_string(),
+                code,
+            },
+            game_runtime_ms: Some(60_000),
+            normal_exit_codes: vec![0],
+            artifact: None,
+            froze: false,
+        },
+    )
+    .unwrap();
+}
+
+fn now_minus(seconds: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(seconds)).to_rfc3339()
+}
+
+fn diagnose(f: &Fixture, session: &str) -> Option<agora_core::crash_live::SessionAnswer> {
+    let host = agora_plugin_host::QuickJsHost::new();
+    let packs: Vec<agora_core::crash_packs::LoadedCrashPack> = Vec::new();
+    let built_in = [live_pack()];
+    agora_core::crash_live::diagnose_session(
+        &f.ctx,
+        session,
+        agora_core::crash_live::LivePacks {
+            packs: &packs,
+            built_in: &built_in,
+            host: &host,
+        },
+    )
+}
+
+fn stored(f: &Fixture, session: &str) -> agora_core::crash_live::SessionAnswer {
+    agora_core::crash_live::answer_for_session(&ledger(f), session)
+        .unwrap()
+        .expect("an answer is stored")
+}
+
+fn headlines(answer: &agora_core::crash_live::StoredAnswer) -> Vec<String> {
+    match answer {
+        agora_core::crash_live::StoredAnswer::Analyzed { answer, .. } => answer
+            .findings
+            .iter()
+            .filter_map(|finding| finding.headline.get("en").cloned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[test]
+fn a_crash_with_logs_is_analyzed_and_its_answer_is_stored() {
+    let f = fixture(1);
+    write_log(&f);
+    let started = now_minus(30);
+    let id = start_session(&f, &started, &["mod-a"]);
+    end_session(&f, &id, &now_minus(1), 0xC000_0005);
+
+    let answer = diagnose(&f, &id).expect("the crash is diagnosed");
+    assert!(matches!(
+        answer.answer,
+        agora_core::crash_live::StoredAnswer::Analyzed { .. }
+    ));
+    let stored = stored(&f, &id);
+    assert!(
+        headlines(&stored.answer)
+            .iter()
+            .any(|line| line.contains("The log names a module")),
+        "{:?}",
+        stored.answer
+    );
+}
+
+#[test]
+fn a_crash_with_no_logs_says_so_and_stores_that() {
+    let f = fixture(1);
+    let id = start_session(&f, &now_minus(30), &["mod-a"]);
+    end_session(&f, &id, &now_minus(1), 0xC000_0005);
+
+    let answer = diagnose(&f, &id).expect("the crash is recorded");
+    assert!(matches!(
+        answer.answer,
+        agora_core::crash_live::StoredAnswer::NothingToRead { .. }
+    ));
+    match stored(&f, &id).answer {
+        agora_core::crash_live::StoredAnswer::NothingToRead { why } => {
+            assert!(why.contains("No crash log"), "{why}");
+        }
+        other => panic!("expected nothing-to-read, got {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_log_locked_before_the_copy_is_reported_as_unreadable_not_as_no_log() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let f = fixture(1);
+    write_log(&f);
+    let log = f
+        .ctx
+        .paths
+        .instance_dir(&f.record.instance_id)
+        .unwrap()
+        .join("logs")
+        .join("crash-1.txt");
+    let _lock = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&log)
+        .unwrap();
+    let id = start_session(&f, &now_minus(30), &["mod-a"]);
+    end_session(&f, &id, &now_minus(1), 0xC000_0005);
+
+    let answer = diagnose(&f, &id).expect("the crash is recorded");
+    match answer.answer {
+        agora_core::crash_live::StoredAnswer::NothingToRead { why } => {
+            assert!(why.contains("could not be copied"), "{why}");
+        }
+        other => panic!("expected nothing-to-read, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_normal_exit_stores_no_answer_at_all() {
+    let f = fixture(1);
+    let id = start_session(&f, &now_minus(30), &["mod-a"]);
+    end_session(&f, &id, &now_minus(1), 0);
+
+    assert!(diagnose(&f, &id).is_none());
+    assert!(agora_core::crash_live::answer_for_session(&ledger(&f), &id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn two_crashes_back_to_back_each_get_their_own_answer() {
+    let f = fixture(1);
+    write_log(&f);
+    let first = start_session(&f, &now_minus(120), &["mod-a"]);
+    end_session(&f, &first, &now_minus(90), 0xC000_0005);
+    let second = start_session(&f, &now_minus(60), &["mod-a"]);
+    end_session(&f, &second, &now_minus(30), 0xC000_0005);
+
+    diagnose(&f, &first).expect("the first crash is diagnosed");
+    diagnose(&f, &second).expect("the second crash is diagnosed");
+
+    let first = stored(&f, &first);
+    let second = stored(&f, &second);
+    assert_ne!(first.session_id, second.session_id);
+    assert!(!firstheads_empty(&first));
+    assert!(!firstheads_empty(&second));
+}
+
+fn firstheads_empty(answer: &agora_core::crash_live::SessionAnswer) -> bool {
+    match &answer.answer {
+        agora_core::crash_live::StoredAnswer::Analyzed { answer, .. } => answer.findings.is_empty(),
+        _ => true,
+    }
+}
+
+#[test]
+fn with_no_previous_good_session_agora_invents_no_change() {
+    let f = fixture(1);
+    write_log(&f);
+    let id = start_session(&f, &now_minus(30), &["mod-a"]);
+    end_session(&f, &id, &now_minus(1), 0xC000_0005);
+
+    diagnose(&f, &id).expect("the crash is diagnosed");
+    let lines = headlines(&stored(&f, &id).answer);
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.contains("This started after")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_change_since_the_last_good_session_is_listed_when_nobody_is_named() {
+    let f = fixture(1);
+    write_log(&f);
+    let good = start_session(&f, &now_minus(180), &["mod-a"]);
+    end_session(&f, &good, &now_minus(120), 0);
+    let id = start_session(&f, &now_minus(60), &["mod-a", "mod-b"]);
+    end_session(&f, &id, &now_minus(1), 0xC000_0005);
+
+    diagnose(&f, &id).expect("the crash is diagnosed");
+    let lines = headlines(&stored(&f, &id).answer);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("This started after you changed") && line.contains("mod-b")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn an_analysis_that_cannot_run_is_stored_as_could_not_analyze() {
+    let f = fixture(1);
+    // A session whose instance has no manifest: the analysis cannot even read the instance.
+    let id = session_ledger::begin(
+        &ledger(&f),
+        "missing-instance",
+        &now_minus(30),
+        &manifest(&["mod-a"]),
+        session_ledger::Owner { pid: 1, started: 7 },
+    )
+    .unwrap();
+    end_session(&f, &id, &now_minus(1), 0xC000_0005);
+
+    let answer = diagnose(&f, &id).expect("the failure is recorded");
+    match answer.answer {
+        agora_core::crash_live::StoredAnswer::CouldNotAnalyze { why } => {
+            assert!(why.contains("instance"), "{why}");
+        }
+        other => panic!("expected could-not-analyze, got {other:?}"),
+    }
+    // The crash still exists as a recorded session, independent of the analysis.
+    assert_eq!(
+        session_ledger::get(&ledger(&f), &id)
+            .unwrap()
+            .unwrap()
+            .verdict,
+        Some(SessionVerdict::Crashed {
+            how: agora_core::session_ledger::MatchedBy::ExitStatus
+        })
+    );
+}
+
 #[test]
 fn a_session_left_open_when_agora_closed_ends_unknown_at_the_next_launch() {
     let f = fixture(1);
