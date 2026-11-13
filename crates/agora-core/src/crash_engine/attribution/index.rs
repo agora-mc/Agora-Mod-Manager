@@ -130,29 +130,37 @@ impl FileIndex {
         }
     }
 
-    /// The layer positions whose item declares a value in `index` matching `value`.
-    pub(crate) fn items(&self, index: &str, value: &str, matching: NameMatch) -> Vec<usize> {
+    /// The layer positions whose item declares a value in `index` matching `value`, each with how
+    /// much of `value` the declared entry covered. For `prefix_dot` that length is the depth of the
+    /// package: the longer the match, the more specific the entry.
+    pub(crate) fn items(
+        &self,
+        index: &str,
+        value: &str,
+        matching: NameMatch,
+    ) -> Vec<(usize, usize)> {
         match matching {
             NameMatch::Exact => self
                 .index_exact
                 .get(&join_index(index, value))
-                .cloned()
+                .map(|positions| positions.iter().map(|&at| (at, value.len())).collect())
                 .unwrap_or_default(),
             NameMatch::Casefold => self
                 .index_folded
                 .get(&join_index(index, &fold_path_case(value)))
-                .cloned()
+                .map(|positions| positions.iter().map(|&at| (at, value.len())).collect())
                 .unwrap_or_default(),
             NameMatch::PrefixDot => {
-                let mut positions = Vec::new();
+                let mut found = Vec::new();
                 let mut end = Some(value.len());
                 while let Some(at) = end {
-                    if let Some(found) = self.index_exact.get(&join_index(index, &value[..at])) {
-                        positions.extend(found.iter().copied());
+                    if let Some(positions) = self.index_exact.get(&join_index(index, &value[..at]))
+                    {
+                        found.extend(positions.iter().map(|&position| (position, at)));
                     }
                     end = value[..at].rfind('.');
                 }
-                positions
+                found
             }
             NameMatch::Segment => Vec::new(),
         }

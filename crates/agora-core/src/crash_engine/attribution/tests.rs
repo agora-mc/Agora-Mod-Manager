@@ -584,6 +584,62 @@ fn an_index_lookup_finds_the_item_that_declares_the_name() {
 }
 
 #[test]
+fn the_deepest_declared_package_wins_even_when_an_earlier_install_is_broader() {
+    // The broad package is installed later, so load order alone would pick it. The class belongs
+    // to the deeper package, though, and that is the layer that shipped it.
+    let view = InstanceView::new(vec![
+        layer("mod-deep", true, item("mod-deep"), &["mods/deep.jar"])
+            .with_index("java_package", vec!["com.example.painting".to_string()]),
+        layer("mod-broad", true, item("mod-broad"), &["mods/broad.jar"])
+            .with_index("java_package", vec!["com.example".to_string()]),
+    ]);
+    let resolver = resolver(
+        view,
+        vec![index_map("class", "java_package", NameMatch::PrefixDot)],
+        Vec::new(),
+    );
+    let answer = resolver.attribute(&reference("class", "com.example.painting.ExampleBrush"));
+    assert_eq!(answer.owner, owner("mod-deep"));
+}
+
+#[test]
+fn a_package_two_enabled_items_share_is_ambiguous_not_guessed() {
+    let view = InstanceView::new(vec![
+        layer("mod-a", true, item("mod-a"), &["mods/a.jar"])
+            .with_index("java_package", vec!["com.example.painting".to_string()]),
+        layer("mod-b", true, item("mod-b"), &["mods/b.jar"])
+            .with_index("java_package", vec!["com.example.painting".to_string()]),
+    ]);
+    let resolver = resolver(
+        view,
+        vec![index_map("class", "java_package", NameMatch::PrefixDot)],
+        Vec::new(),
+    );
+    let answer = resolver.attribute(&reference("class", "com.example.painting.ExampleBrush"));
+    assert_eq!(answer.owner, Owner::Unknown);
+    let reason = answer.reason.expect("ambiguity is reported");
+    assert!(reason.contains("ambiguous"), "{reason}");
+    assert!(reason.contains("com.example.painting"), "{reason}");
+}
+
+#[test]
+fn a_package_shared_with_a_turned_off_item_is_not_ambiguous() {
+    let view = InstanceView::new(vec![
+        layer("mod-a", true, item("mod-a"), &["mods/a.jar"])
+            .with_index("java_package", vec!["com.example.painting".to_string()]),
+        layer("mod-b", false, item("mod-b"), &["mods/b.jar"])
+            .with_index("java_package", vec!["com.example.painting".to_string()]),
+    ]);
+    let resolver = resolver(
+        view,
+        vec![index_map("class", "java_package", NameMatch::PrefixDot)],
+        Vec::new(),
+    );
+    let answer = resolver.attribute(&reference("class", "com.example.painting.ExampleBrush"));
+    assert_eq!(answer.owner, owner("mod-a"));
+}
+
+#[test]
 fn the_worked_skyrim_example_resolves_as_expected() {
     let pack: CrashPack = serde_json::from_str(include_str!(
         "../../../../agora-game-api/tests/crash_examples/skyrim.pack.json"

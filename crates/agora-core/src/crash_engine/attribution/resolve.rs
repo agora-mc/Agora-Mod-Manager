@@ -279,12 +279,54 @@ impl Resolver {
         let Some(normalized) = normalize_index_value(value) else {
             return unknown("the ref has an empty value");
         };
-        let positions = self.view.index().items(index, &normalized, matching);
-        if positions.is_empty() {
+        let matched = self.view.index().items(index, &normalized, matching);
+        if matched.is_empty() {
             return self.not_in_instance(role, value);
         }
+
+        // A package index names the folder a class lives in. The most specific entry wins, because
+        // a class belongs to its deepest declared package, not to every parent of it. When two
+        // enabled items declare that same package, nothing in the instance says which one shipped
+        // the class, so the answer is ambiguous rather than a guess.
+        if matching == NameMatch::PrefixDot {
+            let deepest = matched
+                .iter()
+                .map(|&(_, depth)| depth)
+                .max()
+                .expect("there was at least one match");
+            let mut positions: Vec<usize> = matched
+                .into_iter()
+                .filter(|&(_, depth)| depth == deepest)
+                .map(|(position, _)| position)
+                .collect();
+            positions.sort_unstable();
+            positions.dedup();
+            let enabled: Vec<usize> = positions
+                .iter()
+                .copied()
+                .filter(|&position| self.view.layers()[position].enabled)
+                .collect();
+            if enabled.len() > 1 {
+                return unknown(format!(
+                    "ambiguous: {} enabled layers declare the package '{}'",
+                    enabled.len(),
+                    &normalized[..deepest]
+                ));
+            }
+            let candidates: Vec<Candidate> = positions
+                .into_iter()
+                .map(|position| Candidate {
+                    position,
+                    pattern_index: 0,
+                    group: index.to_string(),
+                    via: index.to_string(),
+                })
+                .collect();
+            return self.choose(candidates, role, value);
+        }
+
+        let positions = matched.into_iter().map(|(position, _)| position);
         let candidates: Vec<Candidate> = positions
-            .into_iter()
             .map(|position| Candidate {
                 position,
                 pattern_index: 0,

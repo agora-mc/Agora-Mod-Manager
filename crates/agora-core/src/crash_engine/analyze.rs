@@ -52,6 +52,10 @@ pub struct InstanceAnalysis<'a> {
     pub resolver: &'a dyn RefResolver,
     /// The deeper checks this instance's packs can make.
     pub inspector: &'a dyn Inspector,
+    /// What the instance itself could not supply, such as installed items whose metadata is
+    /// missing. These reach the answer's "could not check", so a gap is never read as a clean
+    /// result.
+    pub could_not_check: &'a [CouldNotCheck],
 }
 
 /// Everything one crash analysis needs.
@@ -395,6 +399,12 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         candidates,
         place,
     };
+
+    if let Some(instance) = input.instance {
+        crash_answer
+            .could_not_check
+            .extend(instance.could_not_check.iter().cloned());
+    }
 
     for (file, failure) in &failures {
         crash_answer.could_not_check.push(CouldNotCheck {
