@@ -1695,6 +1695,43 @@ fn crash_analyze_of_a_file_nobody_reads_states_no_diagnosis() {
 }
 
 #[test]
+fn crash_analyze_paste_reads_stdin_as_a_snippet_and_says_so() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let mut cmd = agora_command(&data_dir, &["--json", "crash", "analyze", "--paste"]);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn agora crash analyze --paste");
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(b"Caused by: java.lang.OutOfMemoryError: Java heap space\n")
+        .expect("write the pasted fragment");
+    let output = child
+        .wait_with_output()
+        .expect("wait for crash analyze --paste");
+    assert!(output.status.success(), "{output:?}");
+
+    let json = assert_json_stdout(&output);
+    assert_eq!(json["files"][0]["snippet"], true, "{json:#}");
+    assert_eq!(
+        json["files"][0]["read_by"]["parser_id"], "snippet",
+        "{json:#}"
+    );
+    let notes = json["answer"]["trust_notes"]
+        .as_array()
+        .expect("trust notes");
+    assert!(
+        notes.iter().any(|note| note["text"]["en"]
+            .as_str()
+            .is_some_and(|text| text == agora_core::crash_engine::SNIPPET_TRUST_NOTE)),
+        "{json:#}"
+    );
+    assert_eq!(json["answer"]["level"], "not_sure", "{json:#}");
+}
+
+#[test]
 fn crash_analyze_each_judges_three_logs_and_summarizes_the_pattern() {
     let (tmp, data_dir) = temp_data_dir();
     let (plugin, logs) = write_each_crash_fixtures(tmp.path());

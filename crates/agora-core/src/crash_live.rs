@@ -431,6 +431,8 @@ fn readable_files(copied: &CopiedSession) -> Vec<CrashFile> {
         files.push(CrashFile {
             name: (*name).to_string(),
             bytes,
+            // Agora found it: a whole file, never read by a snippet parser.
+            origin: crate::crash_engine::CrashFileOrigin::Collected,
         });
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));

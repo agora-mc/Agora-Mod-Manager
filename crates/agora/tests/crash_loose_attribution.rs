@@ -52,10 +52,10 @@ fn analyze_text(text: &str) -> AnalyzeOutput {
     let host = QuickJsHost::new();
     analyze(&AnalyzeInput {
         packs: &packs,
-        files: &[CrashFile {
-            name: "pasted-crash.txt".to_string(),
-            bytes: text.as_bytes().to_vec(),
-        }],
+        files: &[CrashFile::new(
+            "pasted-crash.txt".to_string(),
+            text.as_bytes().to_vec(),
+        )],
         runtime_version: None,
         host: &host,
         built_in: &built_in,

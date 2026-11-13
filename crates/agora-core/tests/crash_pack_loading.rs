@@ -207,6 +207,65 @@ fn a_lint_problem_names_the_file_and_the_rule() {
 }
 
 #[test]
+fn a_snippet_parser_needs_a_detect() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "crash/pack.json",
+        r#"{
+          "contract": 1,
+          "parsers": [{
+            "id": "fragment",
+            "entry": { "script": { "export": "parseFragment" } },
+            "reads": "snippet"
+          }]
+        }"#,
+    );
+    let manifest = manifest(&["crash/pack.json"]);
+    let report = load_plugin_packs("acme.skyrim", dir.path(), &manifest);
+    assert!(report.packs.is_empty());
+    assert_eq!(report.problems[0].code, "badparser");
+    assert!(
+        report.problems[0].message.contains("needs a `detect`"),
+        "{}",
+        report.problems[0].message
+    );
+}
+
+#[test]
+fn a_source_cannot_select_a_snippet_parser() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "crash/pack.json",
+        r#"{
+          "contract": 1,
+          "sources": [{
+            "id": "logs",
+            "where": { "root": "instance", "path": "logs" },
+            "match": { "glob": "*.log" },
+            "format": "fragment"
+          }],
+          "parsers": [{
+            "id": "fragment",
+            "entry": { "script": { "export": "parseFragment" } },
+            "reads": "snippet",
+            "detect": { "all": ["(?m)^Unhandled exception "] }
+          }]
+        }"#,
+    );
+    let manifest = manifest(&["crash/pack.json"]);
+    let report = load_plugin_packs("acme.skyrim", dir.path(), &manifest);
+    assert!(report.packs.is_empty());
+    assert_eq!(report.problems[0].code, "badsource");
+    assert!(
+        report.problems[0].message.contains("pasted text"),
+        "{}",
+        report.problems[0].message
+    );
+}
+
+#[test]
 fn two_packs_with_one_broken_keeps_the_good_one() {
     let dir = tempfile::tempdir().unwrap();
     write(

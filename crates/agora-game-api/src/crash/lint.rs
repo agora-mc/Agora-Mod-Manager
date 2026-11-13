@@ -144,9 +144,37 @@ pub fn lint_pack(pack: &CrashPack) -> Vec<LintProblem> {
     }
     for source in &pack.sources {
         lint_source(source, &mut out);
+        // A source names an artifact Agora found or the user picked, never pasted text. A snippet
+        // parser may read only pasted text, so a source must not select one.
+        if let Some(format) = source
+            .format
+            .as_deref()
+            .filter(|format| !format.contains(':'))
+        {
+            if pack
+                .parsers
+                .iter()
+                .any(|parser| parser.id == format && parser.reads.is_snippet())
+            {
+                out.push(problem(
+                    LintCode::BadSource,
+                    &format!("source `{}`", source.id),
+                    "`format` names a `snippet` parser, which reads only pasted text; a source is \
+                     a file Agora found or the user picked",
+                ));
+            }
+        }
     }
     for parser in &pack.parsers {
         let at = format!("parser `{}`", parser.id);
+        if parser.reads.is_snippet() && parser.detect.is_empty() {
+            out.push(problem(
+                LintCode::BadParser,
+                &at,
+                "a `snippet` parser needs a `detect`: it runs only on pasted text, and a fragment \
+                 still needs a shape (an exception line, a frame) to recognise",
+            ));
+        }
         for regex in parser.detect.all.iter().chain(&parser.detect.any) {
             check_regex(regex, &at, &mut out);
         }
