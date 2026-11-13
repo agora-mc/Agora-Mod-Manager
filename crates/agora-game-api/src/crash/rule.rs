@@ -135,8 +135,10 @@ pub enum Condition {
     Fact(FactQuery),
     /// How many facts fit.
     Count(CountQuery),
-    /// The escape hatch: a regex over `core.log_line` text. Prefer a fact. The linter refuses one
-    /// with no `section` or `source` unless another condition also has to hold.
+    /// The escape hatch: a regex over text. By default it reads the `core.log_line` facts a
+    /// parser emitted. With [`TextMatch::whole_file`] it reads the whole artifact instead. Prefer
+    /// a fact. The linter refuses one with no `section` or `source` unless another condition also
+    /// has to hold; a whole-file match always counts as unbounded.
     Text(TextMatch),
 }
 
@@ -206,12 +208,20 @@ pub struct CountQuery {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextMatch {
-    /// Only lines the parser placed in this section.
+    /// Only lines the parser placed in this section. Ignored with `whole_file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
-    /// Only lines from artifacts of this crash source.
+    /// Only lines from artifacts of this crash source. With `whole_file`, only artifacts from
+    /// that source are searched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Search the whole text of each artifact the engine read, not only the `core.log_line`
+    /// facts a parser chose to emit. A match's evidence is the line it appears on, with that
+    /// line's number. This is never a bounded match, even with `source`, so another condition
+    /// must anchor the rule. With no artifact text the condition is unknown ("could not check"),
+    /// never silently false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub whole_file: bool,
     pub regex: String,
     /// Named capture to ref kind: `(?P<m>...)` binds `m`, and an entry here makes it a ref that can
     /// be a suspect.

@@ -2,9 +2,9 @@
 //! failure it catches, so a broken scorer fails a test rather than quietly naming the wrong mod.
 
 use agora_core::crash_engine::{
-    answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusOutput, ConsensusProfile,
-    EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionOutcome, InspectionRequest,
-    Inspector, PackInput, ParsedArtifact, PluginIdentity,
+    answer, consensus, evaluate, AnswerInput, ArtifactText, ConsensusInput, ConsensusOutput,
+    ConsensusProfile, EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionOutcome,
+    InspectionRequest, Inspector, PackInput, ParsedArtifact, PluginIdentity,
 };
 use agora_game_api::crash::{
     certainty_claim, AttrValue, Cause, Coverage, CoverageState, CrashPack, Fact, Level, MatchedBy,
@@ -220,6 +220,7 @@ fn run(
     let evaluated = evaluate(&EvaluateInput {
         packs,
         parsed,
+        texts: &[],
         engine_facts,
         runtime_version: runtime,
         resolver,
@@ -2568,6 +2569,7 @@ fn a_change_since_the_last_good_launch_only_boosts_and_never_accuses_alone() {
     let none = evaluate(&EvaluateInput {
         packs: &[],
         parsed: &[],
+        texts: &[],
         engine_facts: &EngineFacts::new(),
         runtime_version: None,
         resolver: &resolver,
@@ -2735,4 +2737,62 @@ fn a_rule_that_does_not_fire_offers_no_actions() {
         &consensus,
     );
     assert!(answer.actions.is_empty());
+}
+
+#[test]
+fn a_whole_file_match_respects_its_source_and_reports_the_line() {
+    let rule = json!({
+        "id": "whole_file",
+        "version": 1,
+        "when": {
+            "text": {
+                "whole_file": true,
+                "source": "crash_report",
+                "regex": "the widget fell over"
+            }
+        },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "The widget fell over." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with("p", "reader", "some_log", Vec::new(), Vec::new());
+    let resolver = FakeResolver::new();
+    let inspector = FixedInspector(Inspection::Missing);
+    let other_source = [ArtifactText {
+        artifact: "crash.log".to_string(),
+        source: Some("latest_log".to_string()),
+        text: "the widget fell over\n".to_string(),
+    }];
+    let evaluated = evaluate(&EvaluateInput {
+        packs: &packs,
+        parsed: std::slice::from_ref(&parsed),
+        texts: &other_source,
+        engine_facts: &EngineFacts::new(),
+        runtime_version: None,
+        resolver: &resolver,
+        inspector: &inspector,
+    });
+    // A source that no artifact has is a clean no, not "could not check": there was text to read.
+    assert!(evaluated.findings.is_empty());
+    assert!(evaluated.could_not_check.is_empty());
+
+    let texts = [ArtifactText {
+        artifact: "crash.log".to_string(),
+        source: Some("crash_report".to_string()),
+        text: "first line\nthe widget fell over\n".to_string(),
+    }];
+    let evaluated = evaluate(&EvaluateInput {
+        packs: &packs,
+        parsed: std::slice::from_ref(&parsed),
+        texts: &texts,
+        engine_facts: &EngineFacts::new(),
+        runtime_version: None,
+        resolver: &resolver,
+        inspector: &inspector,
+    });
+    assert_eq!(evaluated.findings.len(), 1);
+    let evidence = &evaluated.findings[0].evidence;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    assert_eq!(evidence[0].span.line_start, Some(2));
+    assert_eq!(evidence[0].quote.as_deref(), Some("the widget fell over"));
 }

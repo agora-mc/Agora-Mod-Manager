@@ -325,6 +325,13 @@ fn an_unbounded_text_match_alone_is_refused() {
         ] } }),
     );
     refused_with(&two_of_three, LintCode::Unanchored);
+
+    // A whole-file match is unbounded even when it names a source, so it needs an anchor too.
+    let whole_file = with(
+        &["when"],
+        json!({ "text": { "whole_file": true, "source": "crash_report", "regex": "something" } }),
+    );
+    refused_with(&whole_file, LintCode::Unanchored);
 }
 
 fn signal_free(json: String) -> String {

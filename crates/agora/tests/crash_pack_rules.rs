@@ -166,6 +166,7 @@ fn evaluate_one(output: ParserOutput) -> EvaluateOutput {
     evaluate(&EvaluateInput {
         packs: &packs,
         parsed: std::slice::from_ref(&parsed),
+        texts: &[],
         engine_facts: &EngineFacts::new(),
         runtime_version: Some("1.20.1"),
         resolver: &MapResolver,

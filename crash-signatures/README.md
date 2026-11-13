@@ -27,7 +27,7 @@ fields in the signed `registry.db`; the launcher turns every valid row into a ru
 | `id` | yes | Slug matching the filename. Lower-case letters, digits, `.`, `_`, `-`. |
 | `name` | yes | Display name. |
 | `games` | yes | Non-empty list of game ids the signature applies to (for example `minecraft`, `skyrim-se`). |
-| `regex_pattern` | yes | Rust regex over crash log lines. At most 256 characters; no look-around or backreferences. |
+| `regex_pattern` | yes | Rust regex over the whole crash artifact. At most 256 characters; no look-around or backreferences. |
 | `level` | no | `possible` (default) or `likely`. Agora never claims certainty. |
 | `cause` | no | One of `mod`, `version_mismatch`, `missing_requirement`, `file`, `setting`, `save`, `memory`, `driver`, `game_install`, `other` (default). |
 | `text` | yes | Plain-text headline. No Markdown and no HTML; the launcher shows it as text. |

@@ -244,6 +244,13 @@ parser is written `"<plugin id>:<parser id>"` (for example `"acme.base:shared"`)
 in the pack plugin's `dependencies`, the linter refuses it otherwise, and the engine runs that
 plugin's parser through the same contract and read scope.
 
+A rule may also use the `text` condition as an escape hatch. By default it searches the
+`core.log_line` facts a parser chose to emit. Setting `"whole_file": true` searches the whole text
+of every artifact the engine read instead, up to the same per-read byte limit the parsers use, with
+the matching line and its line number as evidence; `source` still narrows it to that crash source.
+A whole-file match is always unbounded, so it needs another condition to anchor it. When there is no
+artifact text the condition is "could not check", never a clean no.
+
 A `finding` effect may state its `cause`: one of `mod`, `version_mismatch`, `missing_requirement`,
 `file`, `setting`, `save`, `memory`, `driver`, `game_install` or `other`. A root-cause finding about
 a mod defaults to `mod`, and a finding that accuses nobody defaults to `other`. The kind reaches the

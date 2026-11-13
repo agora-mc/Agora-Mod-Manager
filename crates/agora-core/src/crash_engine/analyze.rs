@@ -13,9 +13,9 @@ use super::attribution::{LooseResolver, Resolver};
 use super::history::{CrashHistory, RecordedCrash};
 use super::instance_view::{resolve_crash_instance, ExtraInstanceProvider};
 use super::{
-    answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusProfile, EvaluateInput,
-    Inspection, InspectionOutcome, InspectionRequest, Inspector, InstanceInspector, ParsedArtifact,
-    PluginIdentity, RefResolver,
+    answer, consensus, evaluate, AnswerInput, ArtifactText, ConsensusInput, ConsensusProfile,
+    EvaluateInput, Inspection, InspectionOutcome, InspectionRequest, Inspector, InstanceInspector,
+    ParsedArtifact, PluginIdentity, RefResolver,
 };
 use crate::crash_packs::{
     artifact_handle, detect_parsers_with_snippets, load_built_in_packs, parser_request,
@@ -267,6 +267,7 @@ pub fn analyze_with_history(
         .map(|instance| instance.game_id)
         .unwrap_or(UNKNOWN_GAME);
     let mut parsed: Vec<ParsedArtifact> = Vec::new();
+    let mut texts: Vec<ArtifactText> = Vec::new();
     let mut reports: Vec<AnalyzedFile> = Vec::with_capacity(input.files.len());
     let mut failures: Vec<(String, FileParserFailure)> = Vec::new();
     // The snippet parser that stood in for a whole-file reader, if one did. Its source names the
@@ -492,6 +493,16 @@ pub fn analyze_with_history(
             } else {
                 "no parser could read this file; see the failures".to_string()
             });
+        } else {
+            // A whole-file text rule searches exactly what a parser could see. Cap it at the same
+            // per-read byte limit the parsers use, and never include a file nothing read.
+            let cap = limits.max_read_bytes as usize;
+            let text = String::from_utf8_lossy(&file.bytes[..file.bytes.len().min(cap)]);
+            texts.push(ArtifactText {
+                artifact: file.name.clone(),
+                source: None,
+                text: text.into_owned(),
+            });
         }
         reports.push(report);
     }
@@ -587,6 +598,7 @@ pub fn analyze_with_history(
     let mut evaluated = evaluate(&EvaluateInput {
         packs: &pack_inputs,
         parsed: &parsed,
+        texts: &texts,
         engine_facts: &engine_facts,
         runtime_version: input.runtime_version,
         resolver,

@@ -181,6 +181,7 @@ fn crash_a_plugin_rule_sees_a_built_in_parsers_fact_and_names_the_plugin() {
     let evaluated = evaluate(&EvaluateInput {
         packs: &packs,
         parsed: std::slice::from_ref(&parsed),
+        texts: &[],
         engine_facts: &EngineFacts::new(),
         runtime_version: Some("1.0"),
         resolver: &NoResolver,
@@ -277,6 +278,7 @@ fn crash_a_built_in_packs_rule_produces_an_answer_with_agora_as_its_source() {
     let evaluated = evaluate(&EvaluateInput {
         packs: &packs,
         parsed: std::slice::from_ref(&parsed),
+        texts: &[],
         engine_facts: &EngineFacts::new(),
         runtime_version: Some("1.0"),
         resolver: &NoResolver,

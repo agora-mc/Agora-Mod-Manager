@@ -1177,10 +1177,10 @@ fn anchor(condition: &Condition) -> Anchor {
             _ => Anchor::None,
         },
         Condition::Text(text) => {
-            if text.section.is_some() || text.source.is_some() {
-                Anchor::BoundedText
-            } else {
+            if text.whole_file || (text.section.is_none() && text.source.is_none()) {
                 Anchor::UnboundedText
+            } else {
+                Anchor::BoundedText
             }
         }
     }

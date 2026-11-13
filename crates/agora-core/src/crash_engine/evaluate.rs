@@ -7,7 +7,7 @@ use agora_game_api::crash::{
     CountQuery, Coverage, CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding,
     InspectResult, InspectionRecord, Level, LocalText, MatchOps, NextStepKind, ParseNoteKind, Ref,
     RepairOffer, RepairRequest, ResolvedRepair, Role, Rule, RuleText, Scalar, Scope, Signal,
-    SourceAttribution, Strength, TextMatch, TrustNote, Truth,
+    SourceAttribution, SourceSpan, Strength, TextMatch, TrustNote, Truth,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,10 +15,22 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct EvaluateInput<'a> {
     pub packs: &'a [PackInput],
     pub parsed: &'a [ParsedArtifact],
+    /// The text of each artifact a parser read, capped by the caller, for `whole_file` matches.
+    /// Only an artifact that was actually parsed is here.
+    pub texts: &'a [ArtifactText],
     pub engine_facts: &'a EngineFacts,
     pub runtime_version: Option<&'a str>,
     pub resolver: &'a dyn RefResolver,
     pub inspector: &'a dyn Inspector,
+}
+
+/// One artifact's text, as the engine already holds it for parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactText {
+    pub artifact: String,
+    /// The crash source that found the file. `None` for a swept or pasted artifact.
+    pub source: Option<String>,
+    pub text: String,
 }
 
 /// What the rules said. Consensus and the answer take it from here.
@@ -170,14 +182,16 @@ enum CoverageClass {
     Unknown(CouldNotCheckReason),
 }
 
-struct View {
+struct View<'a> {
     facts: Vec<FactEntry>,
     coverage: Vec<Coverage>,
+    texts: Vec<&'a ArtifactText>,
 }
 
-impl View {
+impl<'a> View<'a> {
     fn build(
-        parsed: &[&ParsedArtifact],
+        parsed: &[&'a ParsedArtifact],
+        texts: &'a [ArtifactText],
         engine_facts: &[Fact],
         include_engine: bool,
         resolver: &dyn RefResolver,
@@ -200,6 +214,16 @@ impl View {
             }
             coverage.extend(artifact.output.coverage.iter().cloned());
         }
+        // A producer-gated rule sees only the artifacts its producer read; keep its whole-file
+        // search to those artifacts too, never another format's text.
+        let readable: BTreeSet<&str> = parsed
+            .iter()
+            .map(|artifact| artifact.artifact.as_str())
+            .collect();
+        let texts = texts
+            .iter()
+            .filter(|text| readable.contains(text.artifact.as_str()))
+            .collect();
         if include_engine {
             for fact in engine_facts {
                 facts.push(FactEntry {
@@ -215,10 +239,14 @@ impl View {
         annotate_frames(&mut facts, resolver);
         // Each key serialises a fact, so compute it once per fact, not once per comparison.
         facts.sort_by_cached_key(FactEntry::sort_key);
-        Self { facts, coverage }
+        Self {
+            facts,
+            coverage,
+            texts,
+        }
     }
 
-    fn facts_of_kind<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a FactEntry> {
+    fn facts_of_kind<'b>(&'b self, kind: &'b str) -> impl Iterator<Item = &'b FactEntry> {
         self.facts
             .iter()
             .filter(move |entry| entry.fact.kind == kind)
@@ -933,6 +961,9 @@ fn count_truth(query: &CountQuery, known: u32, unknown: u32) -> Truth {
 }
 
 fn eval_text(text: &TextMatch, view: &View, limit: usize, bindings: &Bindings) -> EvalResult {
+    if text.whole_file {
+        return eval_whole_file(text, view, limit, bindings);
+    }
     let lines: Vec<&FactEntry> = view.facts_of_kind("core.log_line").collect();
     if lines.is_empty() {
         return match view.coverage_of("core.log_line") {
@@ -1048,6 +1079,132 @@ fn eval_text(text: &TextMatch, view: &View, limit: usize, bindings: &Bindings) -
         branches.push(Branch::initial(bindings.clone()).with_truth(Truth::False));
     }
     EvalResult { branches, overflow }
+}
+
+/// A `whole_file` text match: search each artifact's text with the same linear-time regex, and
+/// report the line the match is on as evidence. With no artifact text the answer is unknown, never
+/// a clean no: nothing was there to search.
+fn eval_whole_file(text: &TextMatch, view: &View, limit: usize, bindings: &Bindings) -> EvalResult {
+    if view.texts.is_empty() {
+        return EvalResult {
+            branches: vec![Branch {
+                truth: Truth::Unknown,
+                bindings: bindings.clone(),
+                evidence: Vec::new(),
+                unknown: vec![UnknownNote {
+                    subject: "artifact text".to_string(),
+                    reason: CouldNotCheckReason::NotCovered,
+                }],
+            }],
+            overflow: false,
+        };
+    }
+    let regex = match regex::Regex::new(&text.regex) {
+        Ok(regex) => regex,
+        Err(_) => {
+            return EvalResult {
+                branches: vec![Branch {
+                    truth: Truth::Unknown,
+                    bindings: bindings.clone(),
+                    evidence: Vec::new(),
+                    unknown: vec![UnknownNote {
+                        subject: "artifact text".to_string(),
+                        reason: CouldNotCheckReason::CodeFailed,
+                    }],
+                }],
+                overflow: false,
+            };
+        }
+    };
+    let mut branches = Vec::new();
+    let mut overflow = false;
+    'texts: for artifact in &view.texts {
+        if let Some(source) = &text.source {
+            if artifact.source.as_deref() != Some(source.as_str()) {
+                continue;
+            }
+        }
+        for captures in regex.captures_iter(&artifact.text) {
+            let Some(whole) = captures.get(0) else {
+                continue;
+            };
+            let evidence = evidence_at(artifact, whole.start());
+            let mut next = bindings.clone();
+            let mut ok = true;
+            for name in regex.capture_names().flatten() {
+                let Some(found) = captures.name(name) else {
+                    continue;
+                };
+                let value = found.as_str().to_string();
+                match text.refs.get(name) {
+                    Some(kind) => {
+                        let bound = BoundRef {
+                            reference: Ref {
+                                kind: kind.clone(),
+                                value,
+                                strength: Strength::Mention,
+                            },
+                            parser: None,
+                            evidence: Some(evidence.clone()),
+                        };
+                        if !bind_ref(&mut next, name, bound) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        if !bind_value(&mut next, name, Scalar::Text(value)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok {
+                branches.push(Branch {
+                    truth: Truth::True,
+                    bindings: next,
+                    evidence: vec![evidence],
+                    unknown: Vec::new(),
+                });
+                if branches.len() > limit {
+                    overflow = true;
+                    branches.truncate(limit);
+                    break 'texts;
+                }
+            }
+        }
+    }
+    if branches.is_empty() {
+        branches.push(Branch::initial(bindings.clone()).with_truth(Truth::False));
+    }
+    EvalResult { branches, overflow }
+}
+
+/// The evidence for a whole-file match: the line it starts on, numbered from 1 in that artifact.
+fn evidence_at(artifact: &ArtifactText, offset: usize) -> EvidenceLine {
+    let start = artifact.text[..offset]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let end = artifact.text[offset..]
+        .find('\n')
+        .map_or(artifact.text.len(), |newline| offset + newline);
+    let line = artifact.text[start..end].trim_end_matches('\r');
+    let line_number = artifact.text[..offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u64
+        + 1;
+    EvidenceLine {
+        artifact: artifact.artifact.clone(),
+        span: SourceSpan {
+            artifact: Some(artifact.artifact.clone()),
+            section: None,
+            line_start: Some(line_number),
+            line_end: Some(line_number),
+        },
+        quote: Some(line.to_string()),
+    }
 }
 
 fn bind_value(bindings: &mut Bindings, name: &str, value: Scalar) -> bool {
@@ -1346,7 +1503,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
 
     // Most rules see every parsed artifact plus the engine's facts, so they share one view.
     let all: Vec<&ParsedArtifact> = input.parsed.iter().collect();
-    let shared = View::build(&all, input.engine_facts, true, input.resolver);
+    let shared = View::build(&all, input.texts, input.engine_facts, true, input.resolver);
     let mut products: Vec<RuleProducts> = Vec::new();
     for (plugin, rule) in rules {
         let Some(product) = evaluate_rule(input, plugin, rule, &shared) else {
@@ -1587,7 +1744,13 @@ fn evaluate_rule(
     let view = if producer.is_none() {
         shared
     } else {
-        gated = View::build(&allowed, input.engine_facts, false, input.resolver);
+        gated = View::build(
+            &allowed,
+            input.texts,
+            input.engine_facts,
+            false,
+            input.resolver,
+        );
         &gated
     };
     let limit = rule.branch_limit();

@@ -250,6 +250,7 @@ impl CommunitySignature {
             game_condition,
             Condition::Text(TextMatch {
                 regex: self.regex_pattern.clone(),
+                whole_file: true,
                 ..TextMatch::default()
             }),
         ]);

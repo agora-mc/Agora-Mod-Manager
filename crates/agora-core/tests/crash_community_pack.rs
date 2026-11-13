@@ -2,15 +2,16 @@
 //! them. Every log line here is invented for these tests.
 
 use agora_core::crash_engine::{
-    evaluate, EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionOutcome,
-    InspectionRequest, Inspector, PackInput, ParsedArtifact, PluginIdentity, RefResolver, Resolved,
+    evaluate, ArtifactText, EngineFacts, EvaluateInput, EvaluateOutput, Inspection,
+    InspectionOutcome, InspectionRequest, Inspector, PackInput, ParsedArtifact, PluginIdentity,
+    RefResolver, Resolved,
 };
 use agora_core::crash_packs::{
     parse_community_signature_json, COMMUNITY_PACK_PLUGIN_ID, COMMUNITY_PACK_PLUGIN_NAME,
 };
 use agora_game_api::crash::{
-    lint_rule, AttrValue, Coverage, CoverageState, CrashPack, Fact, ParserOutput, Producer, Rule,
-    Scalar, CRASH_CONTRACT_VERSION,
+    lint_rule, AttrValue, CouldNotCheckReason, Coverage, CoverageState, CrashPack, Fact,
+    ParserOutput, Producer, Rule, Scalar, CRASH_CONTRACT_VERSION,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -115,6 +116,11 @@ fn instance_facts(game: &str) -> EngineFacts {
 
 fn evaluate_for_game(rule: Rule, game: &str) -> EvaluateOutput {
     let parsed = parsed_log_line();
+    let texts = [ArtifactText {
+        artifact: "invented-crash.log".to_string(),
+        source: None,
+        text: "Unhandled exception while loading the example thing\n".to_string(),
+    }];
     let facts = instance_facts(game);
     let packs = [PackInput {
         plugin: PluginIdentity {
@@ -127,6 +133,7 @@ fn evaluate_for_game(rule: Rule, game: &str) -> EvaluateOutput {
     evaluate(&EvaluateInput {
         packs: &packs,
         parsed: std::slice::from_ref(&parsed),
+        texts: &texts,
         engine_facts: &facts,
         runtime_version: None,
         resolver: &NoResolver,
@@ -180,6 +187,36 @@ fn a_minecraft_signature_fires_on_minecraft_and_not_on_skyrim() {
 
     let skyrim = evaluate_for_game(rule_from_json(MINECRAFT_SIGNATURE), "skyrim-se");
     assert!(skyrim.findings.is_empty(), "{:?}", skyrim.findings);
+}
+
+#[test]
+fn a_whole_file_rule_with_no_artifacts_is_could_not_check() {
+    let rule = rule_from_json(SKYRIM_SIGNATURE);
+    let facts = instance_facts("skyrim-se");
+    let packs = [PackInput {
+        plugin: PluginIdentity {
+            id: COMMUNITY_PACK_PLUGIN_ID.to_string(),
+            name: COMMUNITY_PACK_PLUGIN_NAME.to_string(),
+            version: String::new(),
+        },
+        pack: pack(rule),
+    }];
+    let output = evaluate(&EvaluateInput {
+        packs: &packs,
+        parsed: &[],
+        texts: &[],
+        engine_facts: &facts,
+        runtime_version: None,
+        resolver: &NoResolver,
+        inspector: &NoInspector,
+    });
+    assert!(output.findings.is_empty());
+    assert_eq!(output.could_not_check.len(), 1);
+    assert_eq!(output.could_not_check[0].subject, "artifact text");
+    assert_eq!(
+        output.could_not_check[0].reason,
+        CouldNotCheckReason::NotCovered
+    );
 }
 
 #[test]

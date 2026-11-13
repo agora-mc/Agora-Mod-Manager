@@ -579,10 +579,11 @@ Compiler-generated; do not edit manually. Appended to on every compile.
 ## 7. Crash signatures (`crash-signatures/<id>.json`)
 
 Not under `registry/` — these live at the repo root in `crash-signatures/`. Each file is a
-**format v2** signature: a regex over log lines, the games it applies to, a plain-text headline, and
-an optional action. The compiler stores each one as a row in `crash_signatures`; the launcher reads
-that table from the signed `registry.db` and turns every valid row into a rule in its community
-crash pack, so a signature works for **any game**, not only Minecraft.
+**format v2** signature: a regex over the whole crash artifact, the games it applies to, a
+plain-text headline, and an optional action. The compiler stores each one as a row in
+`crash_signatures`; the launcher reads that table from the signed `registry.db` and turns every
+valid row into a rule in its community crash pack, so a signature works for **any game**, not only
+Minecraft.
 
 ### Example
 
