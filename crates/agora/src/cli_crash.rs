@@ -28,6 +28,8 @@ use std::sync::Arc;
 
 pub struct AnalyzeArgs {
     pub files: Vec<PathBuf>,
+    /// Read text from stdin as a pasted fragment, so a pack's `snippet` parsers may read it.
+    pub paste: bool,
     /// Analyze each file as its own crash, then summarize the pattern across them.
     pub each: bool,
     pub instance: Option<String>,
@@ -83,7 +85,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         anyhow::bail!("No crash pack loaded, so Agora cannot read crash files.");
     }
 
-    let mut crash_files = Vec::with_capacity(args.files.len());
+    let mut crash_files = Vec::with_capacity(args.files.len() + usize::from(args.paste));
     for path in &args.files {
         let bytes = std::fs::read(path)
             .map_err(|error| anyhow::anyhow!("Could not read {}: {error}", path.display()))?;
@@ -92,7 +94,17 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
             .and_then(|name| name.to_str())
             .unwrap_or("crash file")
             .to_string();
-        crash_files.push(CrashFile { name, bytes });
+        // A file the user named on the command line is a whole file, never a pasted fragment.
+        crash_files.push(CrashFile::new(name, bytes));
+    }
+    if args.paste {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("Could not read the pasted text: {error}"))?;
+        // Only this origin may fall back to a snippet parser.
+        crash_files.push(CrashFile::pasted("pasted text", bytes));
     }
 
     // With an instance the game is known, so only its packs take part, refs resolve to the mods
@@ -403,6 +415,13 @@ fn print_text(output: &AnalyzeOutput) {
         println!("Likely cause: {}", cause.label());
     }
 
+    if !answer.trust_notes.is_empty() {
+        println!("Notes:");
+        for note in &answer.trust_notes {
+            println!("  - {}", english(&note.text));
+        }
+    }
+
     if !answer.candidates.is_empty() {
         println!("Suspects:");
         for candidate in &answer.candidates {
@@ -487,6 +506,9 @@ fn print_each_text(outputs: &[AnalyzeOutput]) {
         }
         let answer = &output.answer;
         println!("  {}", english(&answer.headline));
+        for note in &answer.trust_notes {
+            println!("  Note: {}", english(&note.text));
+        }
         if !answer.candidates.is_empty() {
             println!("  Suspects:");
             for candidate in answer.candidates.iter().take(3) {
@@ -588,7 +610,14 @@ fn print_files(output: &AnalyzeOutput) {
     println!("Files:");
     for file in &output.files {
         match (&file.read_by, file.read_by_extra.first()) {
-            (Some(reader), _) => println!("  {}: read by {}", file.name, reader.plugin_name),
+            (Some(reader), _) => {
+                let how = if file.snippet { "a pasted snippet" } else { "" };
+                if how.is_empty() {
+                    println!("  {}: read by {}", file.name, reader.plugin_name);
+                } else {
+                    println!("  {}: read by {} as {how}", file.name, reader.plugin_name);
+                }
+            }
             (None, Some(reader)) => {
                 println!(
                     "  {}: no primary reader; read alongside by {}",

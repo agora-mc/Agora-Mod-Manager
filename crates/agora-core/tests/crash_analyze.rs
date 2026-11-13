@@ -173,10 +173,7 @@ fn idle_host() -> QuickJsHost {
 }
 
 fn file(name: &str, text: &str) -> CrashFile {
-    CrashFile {
-        name: name.to_string(),
-        bytes: text.as_bytes().to_vec(),
-    }
+    CrashFile::new(name.to_string(), text.as_bytes().to_vec())
 }
 
 fn english(answer: &CrashAnswer) -> &str {
@@ -257,10 +254,7 @@ fn an_empty_file_and_an_unrecognised_file_name_nobody_and_say_so() {
     let output = analyze(&AnalyzeInput {
         packs: &[pack],
         files: &[
-            CrashFile {
-                name: "empty.txt".into(),
-                bytes: Vec::new(),
-            },
+            CrashFile::new("empty.txt", Vec::new()),
             file("wrong.txt", "not a crash log at all\n"),
         ],
         runtime_version: None,
@@ -454,10 +448,7 @@ fn a_file_over_the_read_limits_is_refused_and_said() {
     let too_big = ParserLimits::DEFAULT.max_total_read_bytes as usize + 1;
     let output = analyze(&AnalyzeInput {
         packs: &[pack],
-        files: &[CrashFile {
-            name: "huge.txt".into(),
-            bytes: vec![b'x'; too_big],
-        }],
+        files: &[CrashFile::new("huge.txt", vec![b'x'; too_big])],
         runtime_version: None,
         host: &host,
         built_in: &[],

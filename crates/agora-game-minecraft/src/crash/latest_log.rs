@@ -550,7 +550,7 @@ impl BuiltInParser for LatestLogParser {
     }
 }
 
-fn parse_fatal_exception(
+pub(crate) fn parse_fatal_exception(
     lines: &[String],
     first: Option<&(usize, String)>,
 ) -> (Vec<Fact>, Vec<BucketPart>) {
@@ -672,7 +672,7 @@ fn frame_fact(line: &str, index: u32, line_no: usize) -> Option<Fact> {
     Some(fact("core.frame", attrs, refs, line_no, "fatal"))
 }
 
-fn strip_log_prefix(line: &str) -> &str {
+pub(crate) fn strip_log_prefix(line: &str) -> &str {
     let mut rest = line;
     for _ in 0..3 {
         if !rest.starts_with('[') {
@@ -686,7 +686,7 @@ fn strip_log_prefix(line: &str) -> &str {
     rest
 }
 
-fn exception_line(line: &str) -> Option<(bool, String, Option<String>)> {
+pub(crate) fn exception_line(line: &str) -> Option<(bool, String, Option<String>)> {
     let (caused, rest) = match line.strip_prefix("Caused by: ") {
         Some(rest) => (true, rest),
         None => {
@@ -745,7 +745,7 @@ fn loader_universal_jar(file: &str) -> Option<(String, String)> {
     Some((id.to_string(), version.to_string()))
 }
 
-fn fabric_dependency(line: &str) -> Option<(String, String, String, String)> {
+pub(crate) fn fabric_dependency(line: &str) -> Option<(String, String, String, String)> {
     let rest = line.trim_start().strip_prefix('-')?.trim_start();
     let rest = rest.strip_prefix("Mod '")?;
     let (_, rest) = rest.split_once("' (")?;
@@ -801,7 +801,7 @@ fn target_id(target: &str) -> String {
         .to_string()
 }
 
-fn forge_dependency(line: &str) -> Option<(String, String, String, String)> {
+pub(crate) fn forge_dependency(line: &str) -> Option<(String, String, String, String)> {
     let rest = line.split("Mod ID: '").nth(1)?;
     let (id, rest) = rest.split_once("', Requested by: '")?;
     let (by, rest) = rest.split_once("', Expected range: '")?;
@@ -820,7 +820,7 @@ fn forge_dependency(line: &str) -> Option<(String, String, String, String)> {
     ))
 }
 
-fn duplicate_mod(line: &str) -> Option<String> {
+pub(crate) fn duplicate_mod(line: &str) -> Option<String> {
     if let Some(rest) = line.split("Found a duplicate mod ").nth(1) {
         let id = rest.split_whitespace().next()?.trim();
         if is_mod_id(id) {
@@ -845,7 +845,7 @@ fn duplicate_mod(line: &str) -> Option<String> {
 }
 
 /// `Found conflicting mods: <a> conflicts with <b>`.
-fn mod_conflict(line: &str) -> Option<(String, String)> {
+pub(crate) fn mod_conflict(line: &str) -> Option<(String, String)> {
     let rest = line.split("Found conflicting mods: ").nth(1)?;
     let (first, rest) = rest.split_once(" conflicts with ")?;
     let second = rest.trim().trim_end_matches('.').trim();
@@ -907,7 +907,7 @@ fn world_mod(line: &str) -> Option<WorldMod> {
     })
 }
 
-fn loader_problem(line: &str) -> Option<&'static str> {
+pub(crate) fn loader_problem(line: &str) -> Option<&'static str> {
     let lower = line.to_ascii_lowercase();
     if lower.contains("modresolutionexception") || lower.contains("incompatible mod set") {
         return Some("resolution");
@@ -929,7 +929,7 @@ fn loader_problem(line: &str) -> Option<&'static str> {
     None
 }
 
-fn looks_like_mod_error(line: &str) -> bool {
+pub(crate) fn looks_like_mod_error(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("mod loading error")
         || lower.contains("failed to load mod")
@@ -937,7 +937,7 @@ fn looks_like_mod_error(line: &str) -> bool {
         || lower.contains("error loading mod")
 }
 
-fn looks_like_config_error(line: &str) -> bool {
+pub(crate) fn looks_like_config_error(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("failed to load config")
         || lower.contains("could not load config")
@@ -945,7 +945,7 @@ fn looks_like_config_error(line: &str) -> bool {
         || lower.contains("malformed config")
 }
 
-fn looks_like_world_error(line: &str) -> bool {
+pub(crate) fn looks_like_world_error(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("failed to load chunk")
         || lower.contains("exception loading chunk")

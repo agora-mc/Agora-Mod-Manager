@@ -111,10 +111,7 @@ fn object_in(place: &str, file: &str) -> [String; 4] {
 fn run_files(running: &Running, files: &[(&str, &str)]) -> AnalyzeOutput {
     let crash_files: Vec<CrashFile> = files
         .iter()
-        .map(|(name, text)| CrashFile {
-            name: (*name).into(),
-            bytes: text.as_bytes().to_vec(),
-        })
+        .map(|(name, text)| CrashFile::new(*name, text.as_bytes().to_vec()))
         .collect();
     let output = analyze(&AnalyzeInput {
         packs: std::slice::from_ref(&running.pack),

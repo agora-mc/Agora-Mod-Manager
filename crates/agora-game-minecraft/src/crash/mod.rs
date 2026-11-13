@@ -9,12 +9,14 @@ mod crash_report;
 mod hs_err;
 mod latest_log;
 mod shared;
+mod snippet;
 
 use agora_game_api::crash::BuiltInPack;
 
 pub use crash_report::CrashReportParser;
 pub use hs_err::HsErrParser;
 pub use latest_log::LatestLogParser;
+pub use snippet::SnippetParser;
 
 /// Every crash pack this game package ships, with the parsers its JSON names.
 ///
@@ -35,6 +37,7 @@ pub fn built_in_packs() -> Vec<BuiltInPack> {
                 Box::new(latest_log::LatestLogParser),
             ),
             ("hs_err".to_string(), Box::new(hs_err::HsErrParser)),
+            ("snippet".to_string(), Box::new(snippet::SnippetParser)),
         ],
     }]
 }

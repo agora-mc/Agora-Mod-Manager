@@ -1794,9 +1794,13 @@ enum CrashCmd {
     },
     /// Diagnose crash files against an instance, or on their own when none is named.
     Analyze {
-        /// The crash file to read. May be repeated.
-        #[arg(required = true)]
+        /// The crash file to read. May be repeated. Not needed with --paste.
+        #[arg(required_unless_present = "paste")]
         files: Vec<PathBuf>,
+        /// Read the crash text from stdin as a pasted fragment. A pack's snippet parsers may read
+        /// it, and the answer says the text was a snippet.
+        #[arg(long)]
+        paste: bool,
         /// Analyze each file as its own crash, then summarize the pattern across them.
         #[arg(long)]
         each: bool,
@@ -4748,6 +4752,7 @@ async fn run_crash_command(
         }
         CrashCmd::Analyze {
             files,
+            paste,
             each,
             instance,
             plugin_dirs,
@@ -4759,6 +4764,7 @@ async fn run_crash_command(
                 ctx,
                 cli_crash::AnalyzeArgs {
                     files,
+                    paste,
                     each,
                     instance,
                     plugin_dirs,
@@ -13217,6 +13223,7 @@ mod tests {
                 action:
                     super::CrashCmd::Analyze {
                         files,
+                        paste,
                         each,
                         instance,
                         plugin_dirs,
@@ -13226,6 +13233,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(files.len(), 2);
+                assert!(!paste);
                 assert!(!each);
                 assert_eq!(instance, None);
                 assert_eq!(plugin_dirs.len(), 1);
@@ -13267,6 +13275,21 @@ mod tests {
             } => {
                 assert!(each);
                 assert_eq!(files.len(), 2);
+            }
+            _ => panic!("expected crash analyze"),
+        }
+    }
+
+    #[test]
+    fn crash_analyze_paste_reads_stdin_without_files() {
+        let cli = Cli::try_parse_from(["agora", "crash", "analyze", "--paste"])
+            .expect("--paste alone is enough");
+        match cli.command {
+            Commands::Crash {
+                action: super::CrashCmd::Analyze { files, paste, .. },
+            } => {
+                assert!(paste);
+                assert!(files.is_empty());
             }
             _ => panic!("expected crash analyze"),
         }

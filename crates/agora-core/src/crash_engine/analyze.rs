@@ -16,14 +16,14 @@ use super::{
     RefResolver,
 };
 use crate::crash_packs::{
-    artifact_handle, detect_parsers, parser_request, run_parser_with_builtin, LoadedCrashPack,
-    MemoryArtifact, ParserFailureKind, BUILT_IN_PLUGIN_ID,
+    artifact_handle, detect_parsers_with_snippets, parser_request, run_parser_with_builtin,
+    LoadedCrashPack, MemoryArtifact, ParserFailureKind, BUILT_IN_PLUGIN_ID,
 };
 use crate::error::{LauncherError, LauncherResult};
 use agora_game_api::crash::{
     Artifact, AttrValue, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, Fact,
-    GameHandle, MatchedBy, ParserDecl, ParserLimits, Privacy, Reads, Retained, Scalar,
-    SessionVerdict, DETECT_HEAD_BYTES,
+    GameHandle, Level, MatchedBy, ParserDecl, ParserLimits, Privacy, Reads, Retained, Scalar,
+    SessionVerdict, TrustNote, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use serde::{Deserialize, Serialize};
@@ -36,11 +36,66 @@ const ARTIFACT_ID: &str = "artifact";
 /// instance, Agora cannot say which game the file came from, so every installed pack may try.
 const UNKNOWN_GAME: &str = "unknown";
 
+/// The wording a snippet answer carries, unchanged wherever it is shown. Agora says why the
+/// answer is weaker rather than hiding the cap.
+pub const SNIPPET_TRUST_NOTE: &str = "Agora is reading a pasted snippet, not a whole log, so this \
+answer is less certain. Paste or pick the whole crash log for the best result.";
+
+/// Where the bytes the analyser is holding came from. Only [`Pasted`](CrashFileOrigin::Pasted)
+/// text may fall back to a pack's `snippet` parsers: a file Agora found or the user picked must be
+/// recognised as a whole file, or the answer says there was nothing to read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrashFileOrigin {
+    /// The user pasted a fragment into Agora.
+    Pasted,
+    /// The user picked a file.
+    #[default]
+    File,
+    /// Agora's evidence sweep found the file.
+    Collected,
+}
+
 /// One file the user supplied. Core sees bytes and a name, never a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrashFile {
     pub name: String,
     pub bytes: Vec<u8>,
+    pub origin: CrashFileOrigin,
+}
+
+impl CrashFile {
+    /// A file the user picked: a whole file, never eligible for a snippet parser.
+    pub fn new(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: bytes.into(),
+            origin: CrashFileOrigin::File,
+        }
+    }
+
+    /// Text the user pasted. Only this origin may use a pack's `snippet` parsers.
+    pub fn pasted(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: bytes.into(),
+            origin: CrashFileOrigin::Pasted,
+        }
+    }
+
+    /// A file Agora's evidence sweep found.
+    pub fn collected(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            bytes: bytes.into(),
+            origin: CrashFileOrigin::Collected,
+        }
+    }
+
+    /// The same file with another origin.
+    pub fn with_origin(mut self, origin: CrashFileOrigin) -> Self {
+        self.origin = origin;
+        self
+    }
 }
 
 /// What an analysis did not have to build for itself: the instance behind the crash.
@@ -108,6 +163,10 @@ pub struct AnalyzedFile {
     /// `extra` readers that ran alongside the primary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_by_extra: Vec<FileReader>,
+    /// A `snippet` parser read this pasted text, so the answer carries the snippet trust note and
+    /// its cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub snippet: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -168,6 +227,9 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
     let mut parsed: Vec<ParsedArtifact> = Vec::new();
     let mut reports: Vec<AnalyzedFile> = Vec::with_capacity(input.files.len());
     let mut failures: Vec<(String, FileParserFailure)> = Vec::new();
+    // The snippet parser that stood in for a whole-file reader, if one did. Its source names the
+    // trust note, and its presence caps the answer at "possible".
+    let mut snippet_source: Option<agora_game_api::crash::SourceAttribution> = None;
 
     for file in input.files {
         let mut report = AnalyzedFile {
@@ -175,6 +237,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             read_by: None,
             also_recognised_by: Vec::new(),
             read_by_extra: Vec::new(),
+            snippet: false,
             reason: None,
             failures: Vec::new(),
         };
@@ -227,7 +290,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             } else {
                 None
             };
-            match detect_parsers(&pack.pack, &file.name, head) {
+            match detect_parsers_with_snippets(&pack.pack, &file.name, head) {
                 Ok(parsers) => {
                     for parser in parsers {
                         claimed.push(Claim {
@@ -261,6 +324,9 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         let primary = claimed
             .iter()
             .position(|claim| claim.parser.reads == Reads::Primary);
+        // A primary that detected this text speaks for it, even if it later fails: a fragment
+        // fallback must never stand in for a parser that said it could not check the file.
+        let primary_claimed = primary.is_some();
         if let Some(index) = primary {
             report.read_by = Some(claimed[index].reader.clone());
         }
@@ -274,7 +340,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
                     report.also_recognised_by.push(claim.reader.clone());
                 }
                 Reads::Extra => to_run.push((false, claim)),
-                Reads::Primary => {}
+                Reads::Primary | Reads::Snippet => {}
             }
         }
 
@@ -321,6 +387,57 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
                     };
                     report.failures.push(reported.clone());
                     failures.push((file.name.clone(), reported));
+                }
+            }
+        }
+
+        // A fragment the user pasted, which no primary parser claimed, may be read by a pack's
+        // snippet parsers. Never for a file the user picked or Agora collected: those must be
+        // recognised as whole files, or the answer says there was nothing to read.
+        if !primary_claimed && file.origin == CrashFileOrigin::Pasted {
+            for claim in claimed
+                .iter()
+                .filter(|claim| claim.parser.reads == Reads::Snippet)
+            {
+                let attempt = run_parser_with_builtin(
+                    input.host,
+                    &claim.pack.plugin_id,
+                    claim.parser,
+                    &request,
+                    reads.clone(),
+                    claim.built_in,
+                );
+                match &attempt.outcome {
+                    crate::crash_packs::ParserDispatch::Parsed(output) => {
+                        read_any = true;
+                        parsed.push(ParsedArtifact {
+                            plugin: identity(claim.pack),
+                            parser_id: attempt.parser_id.clone(),
+                            artifact: file.name.clone(),
+                            source: None,
+                            output: output.clone(),
+                        });
+                        if report.read_by.is_none() {
+                            report.read_by = Some(claim.reader.clone());
+                        }
+                        report.snippet = true;
+                        snippet_source.get_or_insert_with(|| {
+                            identity(claim.pack).parser_source(&claim.parser.id)
+                        });
+                    }
+                    crate::crash_packs::ParserDispatch::WrongFormat(_) => {}
+                    crate::crash_packs::ParserDispatch::Failed(failure) => {
+                        let reported = FileParserFailure {
+                            plugin_id: claim.pack.plugin_id.clone(),
+                            plugin_name: plugin_name(claim.pack),
+                            plugin_version: claim.pack.plugin_version.clone(),
+                            parser_id: attempt.parser_id.clone(),
+                            kind: failure.kind,
+                            message: failure.message.clone(),
+                        };
+                        report.failures.push(reported.clone());
+                        failures.push((file.name.clone(), reported));
+                    }
                 }
             }
         }
@@ -409,7 +526,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         Some(instance) => instance.inspector,
         None => &no_inspector,
     };
-    let evaluated = evaluate(&EvaluateInput {
+    let mut evaluated = evaluate(&EvaluateInput {
         packs: &pack_inputs,
         parsed: &parsed,
         engine_facts: &engine_facts,
@@ -417,6 +534,15 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         resolver,
         inspector,
     });
+    // A pasted snippet is not a whole log. Say so, and never let the answer read stronger than
+    // "possible", whatever the rules found.
+    if let Some(source) = snippet_source {
+        evaluated.trust_notes.push(TrustNote {
+            text: super::english(SNIPPET_TRUST_NOTE),
+            source,
+        });
+        evaluated.level_cap = super::lower_cap(evaluated.level_cap, Level::Possible);
+    }
     let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
     let scored = consensus(
         &ConsensusInput {

@@ -120,6 +120,26 @@
       }
     },
     {
+      "id": "fragment",
+      "entry": {
+        "script": {
+          "export": "parseFragment"
+        }
+      },
+      "reads": "snippet",
+      "detect": {
+        "any": [
+          "(?m)^\\s*Unhandled exception\\b",
+          "(?m)^\\s*\\[\\s*\\d+\\s*\\]\\s*(?:\\[[PS]\\])?\\s*0x[0-9A-Fa-f]+\\s+\\S+\\+[0-9A-Fa-f]+",
+          "(?m)^[\\t ]*[A-Za-z0-9_.\\-]+\\.(?:dll|exe)[\\t ]+0x[0-9A-Fa-f]+[\\t ]*$",
+          "(?m)^[\\t ]*[A-Za-z0-9_.\\-]+\\.dll(?:[\\t ]+v?[0-9][0-9A-Za-z.\\-]*)?[\\t ]*$",
+          "(?m)^[\\t ]*\\[\\s*(?:FE:)?[0-9A-Fa-f]+\\s*\\][\\t ]+[^\\r\\n]+\\.(?:esp|esm|esl)[\\t ]*$",
+          "(?m)^[\\t ]*(?:File|Modified by):\\s*.*(?:\\.(?:esp|esm|esl|dll|nif|dds|hkx|pex|bsa|ba2)\\b|[\\\\/])",
+          "(?m)^\\s*(?:Access Violation|In-Page Error):\\s*Tried to\\s+(?:read|write|execute)\\s+memory at\\s+0x[0-9A-Fa-f]+"
+        ]
+      }
+    },
+    {
       "id": "skse_log",
       "entry": {
         "script": {
@@ -2615,6 +2635,72 @@
       },
       "next_step": "confirm_experiment",
       "reference": "Phostwood js/diagnoses.js:55, 580 (GPL-3, idea)"
+    },
+    {
+      "id": "pasted_fragment_names_plugin",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": "fragment"
+          },
+          "ref": {
+            "kind": "plugin",
+            "strength": "object",
+            "bind": "p"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "object_reference",
+            "candidate": {
+              "owner_of": "p"
+            },
+            "weight": 5
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The pasted fragment names the plugin {owner:p} in a File line."
+        }
+      }
+    },
+    {
+      "id": "pasted_fragment_names_file",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.object",
+          "where": {
+            "place": "fragment"
+          },
+          "ref": {
+            "kind": "file",
+            "strength": "object",
+            "bind": "f"
+          }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "object_reference",
+            "candidate": {
+              "owner_of": "f"
+            },
+            "weight": 4
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The pasted fragment names the file {owner:f}."
+        }
+      }
     }
   ]
 }

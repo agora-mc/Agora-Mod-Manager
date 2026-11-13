@@ -230,6 +230,15 @@ recognised by" and are not run. Every `extra` runs alongside the primary, and it
 in a namespace of its own, never `core.*`; an output that tries is refused as "could not check" so
 the same core fact is never counted twice.
 
+A third value, `"snippet"`, reads a fragment the user pasted: a stack trace, the top of a crash
+report, a few lines of a log. A snippet parser runs only when the text's origin is `pasted`, no
+primary parser claimed it, and its own `detect` matched. It never runs on a file Agora's sweep
+found or the user picked, so a whole file must be recognised by its whole-file parser or the answer
+says there was nothing to read. Its `detect` is required and may be looser than a whole-file
+parser's (an exception line, a frame shape). Its facts are ordinary facts, so the pack's rules work
+on them; a rule that needs a section a fragment cannot have comes out "could not check". When one
+reads the text, the answer carries a trust note naming the parser and is capped at `possible`.
+
 A source's `format` names a parser. A plain id is local to the plugin. A declared dependency's
 parser is written `"<plugin id>:<parser id>"` (for example `"acme.base:shared"`): the plugin must be
 in the pack plugin's `dependencies`, the linter refuses it otherwise, and the engine runs that
