@@ -503,8 +503,14 @@ function BrowseContent({
   // is not tagged fabric.
   const [modLoader, setLoader] = useState<string | null>(null);
   const loader = loaderFilterApplies(contentType) ? modLoader : null;
-  const [query, setQuery] = useState(() => takeBrowseSearchRequest() ?? '');
-  useEffect(() => onBrowseSearchRequest(setQuery), []);
+  const [query, setQuery] = useState('');
+  // Take a parked "search for this" request after mounting, not in the state initializer:
+  // React's dev mode runs initializers twice, and the second run would find it already taken.
+  useEffect(() => {
+    const parked = takeBrowseSearchRequest();
+    if (parked !== null) setQuery(parked);
+    return onBrowseSearchRequest(setQuery);
+  }, []);
   const debouncedQuery = useDebounce(query, 250);
   const [layout, setLayout] = useState<'list' | 'grid'>(() => {
     try {

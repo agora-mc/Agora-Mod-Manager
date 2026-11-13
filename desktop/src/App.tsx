@@ -1330,7 +1330,8 @@ function AppContent() {
               requestEditorTab('console');
               navigateToInstanceDetail(id);
             }}
-            onOpenBrowse={() => {
+            onOpenBrowse={(query) => {
+              if (query) requestBrowseSearch(query);
               setCrashInvestigation(null);
               navigateToTab('browse');
             }}

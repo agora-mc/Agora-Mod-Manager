@@ -64,7 +64,8 @@ interface CrashInvestigatorProps {
   onOpenContent?: () => void;
   onOpenJvmSettings?: () => void;
   onOpenConsole?: () => void;
-  onOpenBrowse?: () => void;
+  /** Open Browse, searching for `query` when one is given. */
+  onOpenBrowse?: (query?: string) => void;
 }
 
 type Origin = 'session' | 'pasted' | 'file';
@@ -827,7 +828,7 @@ export function CrashInvestigator({
           return;
         }
         onClose();
-        onOpenBrowse();
+        onOpenBrowse(offer.action.content_key ?? undefined);
         return;
       default:
         setNotice('Agora does not know how to do that yet.');

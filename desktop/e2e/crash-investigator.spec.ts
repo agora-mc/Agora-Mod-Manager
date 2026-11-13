@@ -182,7 +182,10 @@ async function installMock(page: Page) {
         trust_notes: [],
         next: { kind: 'confirm_experiment', keys: ['mods/example.jar:abc'] },
         repairs: [],
-        actions: [{ action: { kind: 'open_crash_log' }, source: sourceFromScript() }],
+        actions: [
+          { action: { kind: 'open_crash_log' }, source: sourceFromScript() },
+          { action: { kind: 'install_content', content_key: 'fabric-api', label: { en: 'Install Fabric API' } }, source: sourceFromScript() },
+        ],
         artifacts: [{ id: 'log-1', name: 'crash-2026-11-12-21-14.log', size: 48_320, privacy: 'personal', retained: { kind: 'whole' } }],
       };
     }
@@ -280,6 +283,12 @@ test.describe('CrashInvestigator', () => {
     await page.getByRole('button', { name: 'Open crash log' }).click();
     const args = await lastArgs(page);
     expect(args.reveal_crash_artifact).toMatchObject({ sessionId: 'session-42', artifactId: 'log-1' });
+  });
+
+  test('an install action opens Browse searching for the missing item', async ({ page }) => {
+    await openDoctor(page);
+    await page.getByRole('button', { name: 'Install Fabric API' }).click();
+    await expect(page.getByPlaceholder('Search mods, packs, and more…')).toHaveValue('fabric-api');
   });
 
   test('Test without it disables the top installable suspect, never a framework', async ({ page }) => {
