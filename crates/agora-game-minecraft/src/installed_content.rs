@@ -2,11 +2,16 @@
 
 use agora_core::{
     content_store::place::same_file,
+    crash_engine::attribution::{InstanceView, LayerOwner, LayerView},
+    ctx::Ctx,
+    error::{LauncherError, LauncherResult},
     helpers::{content_subdir, hash_file_sha256},
     models::{InstalledMod, InstanceManifest},
     registry::{RegistryItem, RegistryService},
 };
+use agora_game_api::crash::{CouldNotCheck, CouldNotCheckReason};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
@@ -695,12 +700,147 @@ fn curation_status(status: &str) -> CurationStatus {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The crash engine's view of an instance
+// ---------------------------------------------------------------------------
+
+/// A Minecraft instance as the crash engine reads it: every installed mod as a layer, plus what
+/// the instance itself could not tell attribution.
+pub struct CrashInstance {
+    /// The game the instance runs, so the caller can pick the packs that apply.
+    pub game_id: String,
+    /// The game version the instance runs, when the manifest names one.
+    pub runtime_version: Option<String>,
+    pub view: InstanceView,
+    /// Gaps the answer shows instead of reading them as a clean result.
+    pub could_not_check: Vec<CouldNotCheck>,
+}
+
+/// Build the attribution view for a Minecraft instance, or `None` when `instance_id` is not one.
+///
+/// Every manifest mod becomes one layer, enabled or not, providing `mods/<filename>` and indexed
+/// by its loader ids and Java packages. Missing package metadata is filled from the jars on disk
+/// first, so a class can be traced to the mod that ships it; anything still missing is reported
+/// once as a count rather than silently left out of the view.
+pub fn crash_instance_view(ctx: &Ctx, instance_id: &str) -> LauncherResult<Option<CrashInstance>> {
+    let Some(detail) =
+        crate::instance_service::InstanceService::new(ctx.clone()).get(instance_id)?
+    else {
+        return Ok(None);
+    };
+    let Some(mut manifest) = detail.manifest else {
+        return Err(LauncherError::Generic {
+            code: "ERR_INSTANCE_MANIFEST_MISSING".into(),
+            message: format!(
+                "Instance '{instance_id}' has no instance manifest, so its installed mods cannot be listed."
+            ),
+        });
+    };
+    let instance_dir = ctx.paths.instance_dir(instance_id)?;
+    // The manifest caches what a jar declares, and older instances may not have it. Reading the
+    // jars is the existing way to fill it; the parse is cached on disk, so a warm instance is a
+    // stat per file.
+    crate::dependency_service::refresh_installed_jar_metadata(&instance_dir, &mut manifest.mods)?;
+
+    let display_names = registry_display_names(ctx, &manifest);
+    let (layers, mods_without_packages) = layers_for(&manifest, &display_names);
+    let could_not_check = (mods_without_packages > 0)
+        .then(|| no_packages_note(mods_without_packages))
+        .into_iter()
+        .collect();
+    Ok(Some(CrashInstance {
+        game_id: agora_game_api::GameId::minecraft().as_str().to_string(),
+        runtime_version: Some(manifest.minecraft_version.clone()),
+        view: InstanceView::new(layers),
+        could_not_check,
+    }))
+}
+
+/// One note for every mod whose packages could not be read, so a class from it is never silently
+/// missing from attribution.
+fn no_packages_note(count: usize) -> CouldNotCheck {
+    CouldNotCheck {
+        reason: CouldNotCheckReason::InstanceIncomplete,
+        subject: format!(
+            "{count} installed {}",
+            if count == 1 { "mod" } else { "mods" }
+        ),
+        detail: Some(
+            "no Java package is recorded for them, so a class they ship cannot be attributed to them"
+                .to_string(),
+        ),
+        source: None,
+    }
+}
+
+/// The name the instance view shows for each entry: the catalog's name when it has one, else the
+/// file's own name, matching [`list_installed_content`].
+fn registry_display_names(ctx: &Ctx, manifest: &InstanceManifest) -> HashMap<String, String> {
+    let ids: Vec<String> = manifest
+        .mods
+        .iter()
+        .filter_map(|entry| entry.registry_id.clone())
+        .collect();
+    let items = RegistryService::new(ctx.clone())
+        .get_items_by_ids(&ids)
+        .unwrap_or_default();
+    manifest
+        .mods
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .registry_id
+                .as_ref()
+                .and_then(|id| items.get(id))
+                .map(|item| item.name.clone())
+                .unwrap_or_else(|| filename_display_name(&entry.filename));
+            (content_key(entry), name)
+        })
+        .collect()
+}
+
+fn layers_for(
+    manifest: &InstanceManifest,
+    display_names: &HashMap<String, String>,
+) -> (Vec<LayerView>, usize) {
+    let mut layers = Vec::with_capacity(manifest.mods.len());
+    let mut without_packages = 0;
+    for entry in &manifest.mods {
+        if entry.java_packages.is_empty() {
+            without_packages += 1;
+        }
+        let key = content_key(entry);
+        let name = display_names
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| filename_display_name(&entry.filename));
+        let mut layer = LayerView::new(
+            format!("mod:{}", entry.filename),
+            entry.enabled,
+            LayerOwner::Item { key, name },
+            vec![format!("mods/{}", entry.filename)],
+        );
+        let mut mod_ids = Vec::new();
+        if let Some(id) = &entry.mod_jar_id {
+            mod_ids.push(id.clone());
+        }
+        mod_ids.extend(entry.provided_mod_ids.iter().cloned());
+        if !mod_ids.is_empty() {
+            layer = layer.with_index("mod_id", mod_ids);
+        }
+        if !entry.java_packages.is_empty() {
+            layer = layer.with_index("java_package", entry.java_packages.clone());
+        }
+        layers.push(layer);
+    }
+    (layers, without_packages)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agora_core::{
         content_store::{add_file, place_object_at, PlacementMode},
-        ctx::Ctx,
         models::CURRENT_MANIFEST_VERSION,
     };
     use sha2::{Digest, Sha256};
@@ -1039,5 +1179,72 @@ mod tests {
         assert_eq!(second[0].file_state, FileState::Ok);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_crash_view_makes_one_layer_per_installed_mod() {
+        let mut package_mod = manifest_entry("example-brush.jar", "mod", true);
+        package_mod.java_packages = vec!["com.example.painting".to_string()];
+        package_mod.mod_jar_id = Some("examplebrush".to_string());
+        package_mod.provided_mod_ids = vec!["examplebrushalias".to_string()];
+        let mut disabled = manifest_entry("example-disabled.jar", "mod", false);
+        disabled.java_packages = vec!["com.example.other".to_string()];
+        let manifest = manifest_with(vec![package_mod, disabled]);
+
+        let (layers, without_packages) = layers_for(&manifest, &HashMap::new());
+
+        assert_eq!(without_packages, 0);
+        assert_eq!(layers.len(), 2, "a turned-off mod still keeps its layer");
+        assert_eq!(layers[0].files, ["mods/example-brush.jar"]);
+        assert!(layers[0].enabled);
+        assert_eq!(layers[1].files, ["mods/example-disabled.jar"]);
+        assert!(!layers[1].enabled);
+        match &layers[0].owner {
+            LayerOwner::Item { key, name } => {
+                assert_eq!(key, &content_key(&manifest.mods[0]));
+                assert_eq!(name, "example-brush");
+            }
+            other => panic!("expected an item owner, got {other:?}"),
+        }
+        assert_eq!(
+            layers[0].indexes["mod_id"],
+            ["examplebrush", "examplebrushalias"]
+        );
+        assert_eq!(layers[0].indexes["java_package"], ["com.example.painting"]);
+    }
+
+    #[test]
+    fn a_catalog_name_replaces_the_file_name_in_the_view() {
+        let mut entry = manifest_entry("example-brush.jar", "mod", true);
+        entry.registry_id = Some("acme.example-brush".to_string());
+        let manifest = manifest_with(vec![entry.clone()]);
+        let mut names = HashMap::new();
+        names.insert(content_key(&entry), "Example Brush".to_string());
+
+        let (layers, _) = layers_for(&manifest, &names);
+
+        match &layers[0].owner {
+            LayerOwner::Item { name, .. } => assert_eq!(name, "Example Brush"),
+            other => panic!("expected an item owner, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mods_without_packages_are_reported_once_with_their_count() {
+        let manifest = manifest_with(vec![
+            manifest_entry("known.jar", "mod", true),
+            manifest_entry("unknown.jar", "mod", true),
+        ]);
+        let (_, without_packages) = layers_for(&manifest, &HashMap::new());
+        assert_eq!(without_packages, 2);
+
+        let note = no_packages_note(without_packages);
+        assert_eq!(note.reason, CouldNotCheckReason::InstanceIncomplete);
+        assert_eq!(note.subject, "2 installed mods");
+        assert!(note
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no Java package is recorded"));
     }
 }

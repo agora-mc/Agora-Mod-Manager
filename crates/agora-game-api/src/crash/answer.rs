@@ -225,6 +225,9 @@ pub enum CouldNotCheckReason {
     NotRetained,
     /// A rule hit [`MAX_RULE_BRANCHES`](super::MAX_RULE_BRANCHES).
     TooManyMatches,
+    /// The instance could not supply it: its listing or the metadata attribution needs was
+    /// incomplete.
+    InstanceIncomplete,
 }
 
 /// What to do next, with what it needs.

@@ -11,7 +11,10 @@ use agora_core::crash_engine::{
     analyze, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis, InstanceInspector,
 };
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
-use agora_game_api::crash::{Family, GameHandle, InspectResult, Level, Owner, SaveRiskLabel};
+use agora_game_api::crash::{
+    CouldNotCheck, CouldNotCheckReason, Family, GameHandle, InspectResult, Level, Owner,
+    SaveRiskLabel,
+};
 use agora_plugin_api::host::{
     ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
 };
@@ -153,6 +156,14 @@ fn view() -> InstanceView {
 }
 
 fn with_instance(running: &Running, bytes: Vec<u8>) -> AnalyzeOutput {
+    with_instance_notes(running, bytes, &[])
+}
+
+fn with_instance_notes(
+    running: &Running,
+    bytes: Vec<u8>,
+    could_not_check: &[CouldNotCheck],
+) -> AnalyzeOutput {
     let resolver = Resolver::new(
         view(),
         running.pack.pack.ref_maps.clone(),
@@ -182,6 +193,7 @@ fn with_instance(running: &Running, bytes: Vec<u8>) -> AnalyzeOutput {
             game_id: GAME,
             resolver: &resolver,
             inspector: &inspector,
+            could_not_check,
         }),
     })
     .unwrap();
@@ -267,6 +279,27 @@ fn an_instance_names_a_listed_dll_that_declares_another_game_version() {
         .as_deref()
         .unwrap_or("")
         .contains("built for another game version"));
+}
+
+#[test]
+fn what_an_instance_could_not_supply_reaches_could_not_check() {
+    let running = start();
+    let note = CouldNotCheck {
+        reason: CouldNotCheckReason::InstanceIncomplete,
+        subject: "2 installed items".to_string(),
+        detail: Some("no class prefix is recorded for them".to_string()),
+        source: None,
+    };
+    let output = with_instance_notes(
+        &running,
+        dll(&VersionData::default()),
+        std::slice::from_ref(&note),
+    );
+    assert!(
+        output.answer.could_not_check.contains(&note),
+        "{:#?}",
+        output.answer.could_not_check
+    );
 }
 
 #[test]
@@ -401,6 +434,7 @@ fn the_inspector_only_runs_for_the_instance_game() {
             game_id: "another-game",
             resolver: &resolver,
             inspector: &inspector,
+            could_not_check: &[],
         }),
     })
     .unwrap();
@@ -454,6 +488,7 @@ fn a_ref_that_is_not_in_the_instance_is_not_inspected() {
             game_id: GAME,
             resolver: &resolver,
             inspector: &inspector,
+            could_not_check: &[],
         }),
     })
     .unwrap();

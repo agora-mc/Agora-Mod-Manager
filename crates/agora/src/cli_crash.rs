@@ -4,9 +4,9 @@
 //! packs of installed plugins plus any `--plugin-dir` development folder, starts the script host a
 //! script parser or inspector needs, and prints the answer. With `--instance` it also reads that
 //! instance's deployed view so refs attribute to mods and an inspector can open one file; it
-//! changes nothing.
+//! changes no game file, only Agora's own metadata caches.
 
-use agora_core::crash_engine::attribution::{from_instance, Resolver};
+use agora_core::crash_engine::attribution::{from_instance, InstanceView, Resolver};
 use agora_core::crash_engine::history::{summarize, CrashHistory, HistoryOwner};
 use agora_core::crash_engine::{
     analyze, owner_name, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
@@ -16,7 +16,8 @@ use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
 use agora_core::game_script::instance_reads;
 use agora_core::plugins::PluginService;
 use agora_game_api::crash::{
-    CodeEntry, CouldNotCheckReason, GameHandle, LocalText, RefMap, RoleRule, SaveRiskLabel,
+    CodeEntry, CouldNotCheck, CouldNotCheckReason, GameHandle, LocalText, RefMap, RoleRule,
+    SaveRiskLabel,
 };
 use agora_plugin_api::host::{ActivationRequest, GameReads, ScriptHost};
 use agora_plugin_api::manifest::PluginId;
@@ -100,13 +101,10 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
     let mut instance_game_id: Option<String> = None;
     let mut instance_resolver: Option<Resolver> = None;
     let mut instance_scope: Option<Arc<dyn GameReads>> = None;
+    let mut instance_notes: Vec<CouldNotCheck> = Vec::new();
     let mut effective_version = args.game_version.clone();
     if let Some(instance_id) = args.instance.as_deref() {
-        let manifest = agora_core::game_instance::get_manifest(ctx, instance_id)
-            .map_err(|error| anyhow::anyhow!("Unknown instance '{instance_id}': {error}"))?;
-        let game_id = manifest.game.as_str().to_string();
-        let view = from_instance(ctx, instance_id)
-            .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
+        let (game_id, view, runtime_version, notes) = resolve_instance(ctx, instance_id)?;
         // Only the instance's game and the packs for every game may say how a ref is attributed.
         let game_packs: Vec<&LoadedCrashPack> = packs
             .iter()
@@ -127,11 +125,9 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
             |error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"),
         )?));
         if effective_version.is_none() {
-            effective_version = manifest
-                .runtime_identity
-                .as_ref()
-                .map(|runtime| runtime.version.clone());
+            effective_version = runtime_version;
         }
+        instance_notes = notes;
         instance_game_id = Some(game_id);
     }
     let instance_inspector = match (&instance_resolver, &instance_scope) {
@@ -156,6 +152,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
             game_id,
             resolver,
             inspector,
+            could_not_check: &instance_notes,
         }),
         _ => None,
     };
@@ -229,6 +226,47 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         anyhow::bail!("No crash file could be read.");
     }
     Ok(())
+}
+
+/// The view behind `--instance`: a game instance as before, or a Minecraft instance when the id
+/// belongs to that separate instance system. The game package builds the Minecraft view, so no
+/// game's names or file layout reach this adapter or core.
+fn resolve_instance(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+) -> anyhow::Result<(String, InstanceView, Option<String>, Vec<CouldNotCheck>)> {
+    match agora_core::game_instance::get_manifest(ctx, instance_id) {
+        Ok(manifest) => {
+            let view = from_instance(ctx, instance_id).map_err(|error| {
+                anyhow::anyhow!("Could not read instance '{instance_id}': {error}")
+            })?;
+            Ok((
+                manifest.game.as_str().to_string(),
+                view,
+                manifest
+                    .runtime_identity
+                    .as_ref()
+                    .map(|runtime| runtime.version.clone()),
+                Vec::new(),
+            ))
+        }
+        Err(generic_error) => {
+            match agora_game_minecraft::installed_content::crash_instance_view(ctx, instance_id) {
+                Ok(Some(found)) => Ok((
+                    found.game_id,
+                    found.view,
+                    found.runtime_version,
+                    found.could_not_check,
+                )),
+                Ok(None) => Err(anyhow::anyhow!(
+                    "Unknown instance '{instance_id}': {generic_error}"
+                )),
+                Err(error) => Err(anyhow::anyhow!(
+                    "Could not read instance '{instance_id}': {error}"
+                )),
+            }
+        }
+    }
 }
 
 /// What each parser found, for `--json --facts`.
@@ -577,5 +615,6 @@ fn reason_words(reason: CouldNotCheckReason) -> &'static str {
         CouldNotCheckReason::InspectorMissing => "no inspector is installed",
         CouldNotCheckReason::NotRetained => "Agora did not keep these bytes",
         CouldNotCheckReason::TooManyMatches => "the rule matched too many times",
+        CouldNotCheckReason::InstanceIncomplete => "the instance could not supply it",
     }
 }

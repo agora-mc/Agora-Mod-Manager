@@ -1535,6 +1535,136 @@ fn crash_analyze_names_the_module_a_loose_file_names_itself() {
     );
 }
 
+/// Add one invented mod to an existing Minecraft instance, so attribution has a layer to find.
+fn add_invented_mod(
+    data_dir: &Path,
+    instance_id: &str,
+    filename: &str,
+    java_packages: &[&str],
+    mod_id: Option<&str>,
+) {
+    let dir = data_dir.join("instances").join(instance_id);
+    std::fs::create_dir_all(dir.join("mods")).unwrap();
+    std::fs::write(dir.join("mods").join(filename), b"not a real jar").unwrap();
+    let path = dir.join("instance_manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["mods"]
+        .as_array_mut()
+        .expect("the vanilla fixture has a mods array")
+        .push(serde_json::json!({
+            "filename": filename,
+            "source": "manual",
+            "version": null,
+            "sha256": "0".repeat(64),
+            "installed_at": "2024-01-01T00:00:00Z",
+            "java_packages": java_packages,
+            "modrinth_id": null,
+            "registry_id": null,
+            "mod_jar_id": mod_id,
+            "provided_mod_ids": [],
+            "enabled": true,
+            "content_type": "mod",
+            "depends_on": [],
+            "optional_deps": [],
+            "incompatible_deps": [],
+            "source_url": null,
+        }));
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
+fn candidate_names(parsed: &serde_json::Value) -> Vec<String> {
+    parsed["answer"]["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| candidate["owner"]["name"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn crash_analyze_with_a_minecraft_instance_names_the_installed_mod() {
+    let (tmp, data_dir) = temp_data_dir();
+    run_agora(&data_dir, &["paths"]);
+    create_vanilla_instance(&data_dir, "mc-crash", "1.21");
+    add_invented_mod(
+        &data_dir,
+        "mc-crash",
+        "example-brush.jar",
+        &["com.example.painting"],
+        Some("examplebrush"),
+    );
+    // A second mod with no package metadata: attribution must say so once, not hide it.
+    add_invented_mod(&data_dir, "mc-crash", "example-unknown.jar", &[], None);
+    let report = tmp.path().join("invented-crash.txt");
+    std::fs::write(
+        &report,
+        "---- Minecraft Crash Report ----\n\
+// An invented crash, for this test only.\n\
+\n\
+Time: 2026-01-02 03:04:05\n\
+Description: Rendering an example brush\n\
+\n\
+java.lang.IllegalStateException: the example brush could not draw\n\
+\tat com.example.painting.ExampleBrush.draw(ExampleBrush.java:12)\n\
+\tat net.minecraft.class_123.method_456(class_123.java:10)\n\
+\n\
+-- System Details --\n\
+Details:\n\
+\tMinecraft Version: 1.21\n",
+    )
+    .unwrap();
+
+    let with_instance = run_agora_json(
+        &data_dir,
+        &[
+            "crash",
+            "analyze",
+            report.to_str().unwrap(),
+            "--instance",
+            "mc-crash",
+        ],
+    );
+    assert!(
+        with_instance.status.success(),
+        "{}",
+        String::from_utf8_lossy(&with_instance.stderr)
+    );
+    let parsed = assert_json_stdout(&with_instance);
+    assert!(
+        candidate_names(&parsed).contains(&"example-brush".to_string()),
+        "{:#?}",
+        parsed["answer"]["candidates"]
+    );
+    assert!(
+        !candidate_names(&parsed).contains(&"com.example.painting.ExampleBrush".to_string()),
+        "the instance replaces the loose class name"
+    );
+    assert!(
+        parsed["answer"]["could_not_check"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|note| note["subject"] == "1 installed mod"),
+        "{:#?}",
+        parsed["answer"]["could_not_check"]
+    );
+
+    let loose = run_agora_json(&data_dir, &["crash", "analyze", report.to_str().unwrap()]);
+    assert!(
+        loose.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loose.stderr)
+    );
+    let loose = assert_json_stdout(&loose);
+    assert!(
+        candidate_names(&loose).contains(&"com.example.painting.ExampleBrush".to_string()),
+        "{:#?}",
+        loose["answer"]["candidates"]
+    );
+}
+
 #[test]
 fn crash_analyze_names_a_file_it_cannot_open() {
     // Agora's own packs always load, so with no plugin installed the run reaches the files.
