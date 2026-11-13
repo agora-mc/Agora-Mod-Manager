@@ -29,8 +29,8 @@ use crate::crash_engine::evidence::{
     SourceSpec, EVIDENCE_STORE_DIR,
 };
 use crate::crash_engine::{
-    analyze_with_history, history::RecordedCrash, AnalyzeInput, AnalyzedFile, CrashFile,
-    InstanceAnalysis, InstanceInspector,
+    analyze_with_history, history::LocalConfirmation, history::RecordedCrash, AnalyzeInput,
+    AnalyzedFile, CrashFile, InstanceAnalysis, InstanceInspector,
 };
 use crate::crash_packs::{load_built_in_packs, LoadedCrashPack};
 use crate::ctx::Ctx;
@@ -158,6 +158,26 @@ fn decode_answer(
         created_at,
         answer: serde_json::from_str(&json)?,
     })
+}
+
+/// The answer's candidates in the old test-it flow's shape, in rank order. Only an installed item
+/// the engine may test is included; a framework or hook framework never becomes a suspect, and an
+/// item the instance view cannot list carries its display name in place of a file.
+pub fn suspects_for_test(
+    answer: &CrashAnswer,
+    view: Option<&crate::crash_engine::attribution::InstanceView>,
+) -> Vec<crate::crash_service::SuspectScore> {
+    crate::crash_engine::suspects::installable_candidates(answer, view)
+        .into_iter()
+        .map(|candidate| crate::crash_service::SuspectScore {
+            mod_id: candidate.owner_key,
+            filename: candidate.file.unwrap_or(candidate.name),
+            total_score: f64::from(candidate.score),
+            breakdown: serde_json::json!({ "level": candidate.level }),
+            is_dependent_of: None,
+            under_review: false,
+        })
+        .collect()
 }
 
 /// The packs and host a live analysis runs with. The caller loads the packs (the plugin service
@@ -416,9 +436,10 @@ fn diagnose_record(
         // Agora could not check, never as "no earlier crashes".
         Err(why) => (None, Some(why)),
     };
+    let confirmations = local_confirmations(conn);
     let history_input = prepared
         .as_ref()
-        .map(crate::crash_history::PreparedHistory::input);
+        .map(|prepared| prepared.input(&confirmations));
 
     let mut output = analyze_with_history(
         &AnalyzeInput {
@@ -463,6 +484,20 @@ fn diagnose_record(
         changes,
         record: Some(recorded),
     })
+}
+
+/// Every fix the user confirmed on this PC. A failure is not raised: the current crash's diagnosis
+/// must not be lost because the optional local memory could not be read.
+fn local_confirmations(conn: &Connection) -> Vec<LocalConfirmation> {
+    crate::db::all_confirmed_attributions(conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(bucket, owner_key, count)| LocalConfirmation {
+            bucket,
+            owner_key,
+            count: count.clamp(0, u32::MAX as i64) as u32,
+        })
+        .collect()
 }
 
 fn push_history_note(output: &mut crate::crash_engine::AnalyzeOutput, note: String) {

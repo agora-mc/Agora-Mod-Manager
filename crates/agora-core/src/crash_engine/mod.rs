@@ -20,6 +20,7 @@ pub mod instance_view;
 pub mod parsers;
 mod profile;
 pub mod save_risk;
+pub mod suspects;
 mod types;
 
 pub mod evidence;

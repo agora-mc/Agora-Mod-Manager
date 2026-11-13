@@ -241,6 +241,7 @@ fn candidate(owner: Owner) -> Candidate {
         level: Level::Possible,
         score: 1,
         cause: Cause::Mod,
+        role: None,
         families: vec![Family::Execution],
         sources: Vec::new(),
         also_provided_by: Vec::new(),

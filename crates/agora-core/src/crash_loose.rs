@@ -31,6 +31,8 @@ pub enum SuppliedAnswer {
     Analyzed {
         answer: Box<agora_game_api::crash::CrashAnswer>,
         files: Vec<AnalyzedFile>,
+        /// The crash's stable bucket, when its parsers gave one. A confirmed fix is keyed by it.
+        bucket: Option<String>,
     },
     /// Nothing was readable in what the user supplied. That is not a clean bill of health.
     NothingToRead { why: String },
@@ -149,9 +151,11 @@ pub fn analyze_supplied(ctx: &Ctx, input: SuppliedAnalysis<'_>) -> LauncherResul
             why: nothing_read_reason(&output),
         });
     }
+    let bucket = crate::crash_engine::history::current_bucket(&output.parsed);
     Ok(SuppliedAnswer::Analyzed {
         answer: Box::new(output.answer),
         files: output.files,
+        bucket,
     })
 }
 

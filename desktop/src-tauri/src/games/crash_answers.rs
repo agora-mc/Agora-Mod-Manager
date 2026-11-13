@@ -85,6 +85,9 @@ pub struct CrashAnswerDetail {
     pub status: AnswerStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answer: Option<agora_game_api::crash::CrashAnswer>,
+    /// The crash bucket a confirmed fix is recorded under, when the answer kept one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<AnalyzedFile>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -100,6 +103,9 @@ pub struct SuppliedCrashAnswer {
     pub status: AnswerStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answer: Option<agora_game_api::crash::CrashAnswer>,
+    /// The crash bucket a confirmed fix is recorded under, when the parsers gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<AnalyzedFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,15 +301,21 @@ fn supplied(
     )
     .map_err(GamesError::from)?;
     Ok(match answer {
-        SuppliedAnswer::Analyzed { answer, files } => SuppliedCrashAnswer {
+        SuppliedAnswer::Analyzed {
+            answer,
+            files,
+            bucket,
+        } => SuppliedCrashAnswer {
             status: AnswerStatus::Analyzed,
             answer: Some(*answer),
+            bucket,
             files,
             reason: None,
         },
         SuppliedAnswer::NothingToRead { why } => SuppliedCrashAnswer {
             status: AnswerStatus::NothingToRead,
             answer: None,
+            bucket: None,
             files: Vec::new(),
             reason: Some(why),
         },
@@ -377,7 +389,7 @@ fn detail(
             answer,
             files,
             changes,
-            ..
+            record,
         } => CrashAnswerDetail {
             session_id: stored.session_id,
             instance_id: stored.instance_id,
@@ -386,6 +398,7 @@ fn detail(
             created_at: stored.created_at,
             status: AnswerStatus::Analyzed,
             answer: Some(*answer),
+            bucket: record.and_then(|record| record.bucket_key()),
             files,
             changes,
             reason: None,
@@ -398,6 +411,7 @@ fn detail(
             created_at: stored.created_at,
             status: AnswerStatus::NothingToRead,
             answer: None,
+            bucket: None,
             files: Vec::new(),
             changes: Vec::new(),
             reason: Some(why),
@@ -410,6 +424,7 @@ fn detail(
             created_at: stored.created_at,
             status: AnswerStatus::CouldNotAnalyze,
             answer: None,
+            bucket: None,
             files: Vec::new(),
             changes: Vec::new(),
             reason: Some(why),

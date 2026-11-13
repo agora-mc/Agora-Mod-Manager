@@ -367,7 +367,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
     };
 
     if args.each {
-        let history_input = prepared.as_ref().map(PreparedHistory::input);
+        let history_input = prepared.as_ref().map(|prepared| prepared.input(&[]));
         let mut outputs = Vec::with_capacity(crash_files.len());
         for file in &crash_files {
             outputs.push(analyze_with_history(
@@ -425,7 +425,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         return Ok(());
     }
 
-    let history_input = prepared.as_ref().map(PreparedHistory::input);
+    let history_input = prepared.as_ref().map(|prepared| prepared.input(&[]));
     let mut output = analyze_with_history(
         &AnalyzeInput {
             packs: &packs,

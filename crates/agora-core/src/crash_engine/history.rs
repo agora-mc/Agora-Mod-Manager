@@ -23,6 +23,18 @@ use super::{owner_key, owner_name, ParsedArtifact};
 /// pack's rules.
 pub const RECURRING_SUSPECT_RULE: &str = "core.recurring_suspect";
 
+/// The rule id Agora's own local confirmation history names.
+pub const LOCAL_CONFIRMATION_RULE: &str = "core.local_confirmation";
+
+/// A fix the user confirmed on this PC for one crash bucket. It is boost-only: it may raise a
+/// suspect another family already named and never creates one (MASTER_SPEC §30.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalConfirmation {
+    pub bucket: String,
+    pub owner_key: String,
+    pub count: u32,
+}
+
 /// A place a crash happened: the faulting module and offset, or the top frame's identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrashPlace {
@@ -428,6 +440,31 @@ fn history_source() -> SourceAttribution {
     }
 }
 
+/// The boost a confirmed fix on this PC gives its suspect. It is boost-only by family, so it can
+/// never create a candidate on its own.
+pub fn local_confirmation_signal(owner: Owner, count: u32) -> Signal {
+    Signal {
+        family: Family::LocalConfirmation,
+        candidate: owner,
+        weight: 1 + count.min(3),
+        source: confirmation_source(),
+        evidence: Vec::new(),
+        cause: None,
+    }
+}
+
+fn confirmation_source() -> SourceAttribution {
+    let identity = crate::crash_packs::built_in_identity();
+    SourceAttribution {
+        plugin_id: identity.id,
+        plugin_name: identity.name,
+        plugin_version: identity.version,
+        rule_id: Some(LOCAL_CONFIRMATION_RULE.to_string()),
+        rule_version: Some(1),
+        parser_id: None,
+    }
+}
+
 /// Boost signals for suspects that came up in more than one earlier crash. The family is
 /// boost-only, so consensus lets this raise a suspect another family named and never creates one.
 /// Framework and hook-framework owners are absent here: the summary lists them apart because they
@@ -678,11 +715,35 @@ mod tests {
             level: Level::Possible,
             score: 12,
             cause: agora_game_api::crash::Cause::Mod,
+            role: None,
             families: Vec::new(),
             sources: Vec::new(),
             also_provided_by: Vec::new(),
             save_risk: None,
         };
         assert!(repeat_findings(&same_place, std::slice::from_ref(&candidate)).is_empty());
+    }
+    #[test]
+    fn a_confirmed_fix_is_boost_only_and_never_creates_a_candidate() {
+        use crate::crash_engine::consensus::{consensus, ConsensusInput};
+        use crate::crash_engine::ConsensusProfile;
+
+        let signal = local_confirmation_signal(item("one"), 2);
+        assert_eq!(signal.family, Family::LocalConfirmation);
+        assert!(Family::LocalConfirmation.is_boost_only());
+
+        let roles = BTreeMap::new();
+        let out = consensus(
+            &ConsensusInput {
+                signals: std::slice::from_ref(&signal),
+                roles: &roles,
+                level_caps: &[],
+            },
+            &ConsensusProfile::default(),
+        );
+        assert!(
+            out.candidates.is_empty(),
+            "memory alone must never accuse a mod"
+        );
     }
 }

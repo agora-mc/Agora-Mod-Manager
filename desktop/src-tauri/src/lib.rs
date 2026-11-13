@@ -2,7 +2,6 @@ pub mod auth;
 pub mod commands;
 pub mod crash_diagnostics;
 pub mod crash_export;
-pub mod crash_investigator;
 pub mod dependency_ops;
 pub mod downloads;
 pub mod games;
@@ -364,7 +363,6 @@ pub fn run() {
             commands::list_crash_reports_cmd,
             commands::read_crash_log_cmd,
             commands::investigate_instance_evidence,
-            commands::pick_and_investigate_crash_evidence,
             commands::list_mod_versions,
             commands::list_mod_versions_load_more,
             commands::check_mod_compat,
@@ -407,7 +405,7 @@ pub fn run() {
             commands::preview_content_sharing_conversion,
             commands::set_content_sharing,
             commands::investigate_crash,
-            commands::investigate_manual,
+            commands::resolve_crash_suspect_file,
             commands::disable_mod_for_test,
             commands::enable_mod_for_test,
             commands::disable_instance_mod,

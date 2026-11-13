@@ -1,7 +1,6 @@
 use crate::auth::{DeviceFlowResponse, GithubProfile};
 use crate::crash_diagnostics::{self, CrashReportInfo, CrashTriageResult};
 use crate::crash_export;
-use crate::crash_investigator;
 use crate::dependency_ops;
 use crate::error::{LauncherError, LauncherResult};
 use crate::governance::{
@@ -539,7 +538,6 @@ pub async fn launch_instance(
         )
         .await;
         // The delegated game has ended; only a clean end counts as a survival.
-        record_clean_survival(&app_for_monitor, &id_for_monitor, &outcome);
         if let Some(session) = ledger {
             let duration_ms =
                 i64::try_from(ledger_started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -1111,7 +1109,6 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
         use tauri::Emitter;
 
         // The direct game process has ended; only a clean end counts as a survival.
-        record_clean_survival(&self.app, &self.instance_id, &result.outcome);
 
         // Close out the local history row, then trim. Best-effort: a lost row
         // is a lost row, not a failed launch.
@@ -2135,7 +2132,9 @@ pub async fn read_crash_log_cmd(
     .map_err(|_| LauncherError::LocalStateFailed)?
 }
 
-/// Collect and investigate the most useful recent evidence for an instance.
+/// Collect the instance's recent crash evidence and the engine answer's ranked suspects for the
+/// interactive crash board. The diagnosis itself comes from the stored session answer; this command
+/// adds nothing of its own.
 #[tauri::command]
 pub async fn investigate_instance_evidence(
     app: tauri::AppHandle,
@@ -2143,36 +2142,20 @@ pub async fn investigate_instance_evidence(
 ) -> LauncherResult<agora_core::crash_service::CrashInvestigation> {
     let ctx = crate::core_context(&app)?;
     tokio::task::spawn_blocking(move || {
-        agora_core::crash_service::CrashService::new(ctx).investigate_evidence(&instance_id, &[])
-    })
-    .await
-    .map_err(|_| LauncherError::LocalStateFailed)?
-}
-
-/// Pick additional diagnostic files and investigate them without returning
-/// their filesystem paths to the webview.
-#[tauri::command]
-pub async fn pick_and_investigate_crash_evidence(
-    app: tauri::AppHandle,
-    instance_id: String,
-) -> LauncherResult<Option<agora_core::crash_service::CrashInvestigation>> {
-    let picked = rfd::AsyncFileDialog::new()
-        .set_title("Add crash evidence")
-        .add_filter("Diagnostic text", &["log", "txt", "json", "md"])
-        .pick_files()
-        .await;
-    let Some(files) = picked else {
-        return Ok(None);
-    };
-    let paths = files
-        .into_iter()
-        .map(|file| file.path().to_path_buf())
-        .collect::<Vec<_>>();
-    let ctx = crate::core_context(&app)?;
-    tokio::task::spawn_blocking(move || {
-        agora_core::crash_service::CrashService::new(ctx)
-            .investigate_evidence(&instance_id, &paths)
-            .map(Some)
+        let instance_dir = ctx.paths.instance_dir(&instance_id)?;
+        let evidence =
+            agora_core::crash_evidence::CrashEvidenceService::new().collect(&instance_dir, &[]);
+        let answer = latest_analyzed_answer(&ctx, &instance_id)?;
+        let view = crash_instance_view(&ctx, &instance_id)?;
+        let suspects = answer
+            .as_ref()
+            .map(|answer| agora_core::crash_live::suspects_for_test(answer, view.as_ref()))
+            .unwrap_or_default();
+        Ok(agora_core::crash_service::CrashInvestigation {
+            failure_category: evidence.failure_category.clone(),
+            evidence,
+            suspects,
+        })
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
@@ -3222,143 +3205,39 @@ fn load_manifest<R: tauri::Runtime>(
     agora_core::helpers::read_manifest(&manifest_path)
 }
 
-/// Mod ids that were installed during a launch, for survival telemetry.
-fn manifest_mod_ids(manifest: &InstanceManifest) -> Vec<String> {
-    manifest
-        .mods
-        .iter()
-        .map(|entry| {
-            entry
-                .registry_id
-                .clone()
-                .unwrap_or_else(|| entry.filename.clone())
-        })
-        .collect()
-}
-
-/// Record a survival only after the launch ended cleanly. Called at the two
-/// places that already observe the end of a Minecraft launch.
-fn record_clean_survival<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    instance_id: &str,
-    outcome: &agora_core::lkg::LaunchOutcome,
-) {
-    if *outcome != agora_core::lkg::LaunchOutcome::Success {
-        return;
-    }
-    let Ok(manifest) = load_manifest(app, instance_id) else {
-        return;
-    };
-    let mod_ids = manifest_mod_ids(&manifest);
-    if mod_ids.is_empty() {
-        return;
-    }
-    let _ = crash_investigator::record_survival_if_clean(app, instance_id, &mod_ids, outcome);
-}
-
-/// Investigate a crash for an instance using the auto-detected or provided
-/// crash log filename. Runs the full guided-isolation pipeline.
+/// Suspects for the test-it flow, from the engine answer stored for the instance's newest crash.
+/// The stored answer is the diagnosis; this command only turns its candidates into the shape the
+/// experiment flow uses. A framework, a hook framework or anything that is not an installed item
+/// is never among them.
 #[tauri::command]
 pub async fn investigate_crash(
     app: tauri::AppHandle,
     _state: tauri::State<'_, LauncherState>,
     instance_id: String,
-    filename: Option<String>,
-) -> LauncherResult<crash_investigator::InvestigationResult> {
+) -> LauncherResult<agora_core::crash_service::InvestigationResult> {
     tokio::task::spawn_blocking(move || {
-        // Determine the crash log filename.
-        let filename = match filename {
-            Some(f) => f,
-            None => {
-                let report = crash_diagnostics::check_for_crash(&app, &instance_id)
-                    .map_err(|_| LauncherError::LocalStateFailed)?;
-                report
-                    .ok_or_else(|| LauncherError::Generic {
-                        code: "ERR_NO_CRASH_LOG".to_string(),
-                        message: "No crash log detected for this instance.".to_string(),
-                    })?
-                    .filename
-            }
-        };
-
-        // Read the crash log text.
-        let crash_text =
-            crash_diagnostics::read_crash_log(&app, &instance_id, &filename).map_err(|_| {
-                LauncherError::Generic {
-                    code: "ERR_CRASH_LOG_READ".to_string(),
-                    message: "Could not read the crash log file.".to_string(),
-                }
-            })?;
-
-        // Load the instance manifest for installed mods.
-        let manifest = load_manifest(&app, &instance_id)?;
-
-        // Run the investigation pipeline.
-        let fingerprint = match crash_investigator::parse_crash_log(&crash_text) {
-            Some(fp) => fp,
-            None => {
-                // Can't parse â€” return empty investigation.
-                return Ok(crash_investigator::InvestigationResult {
-                    fingerprint: None,
-                    signature_name: None,
-                    suspects: Vec::new(),
-                    suggested_action: crash_investigator::SuggestedAction::NoSuspects,
-                    ruled_out: Vec::new(),
-                });
-            }
-        };
-
         let ctx = crate::core_context(&app)?;
-        let result = crash_investigator::continue_investigation(
-            &ctx,
-            &fingerprint,
-            &manifest.mods,
-            &crash_text,
-        )?;
-        // Per A5 (2026-07-05 audit): feed the investigation result back into the
-        // local crash telemetry (local_crash_telemetry) so the Crash Matrix signal
-        // B/C data populates for future diagnostics. Skip if no suspects to avoid noise.
-        if !result.suspects.is_empty() {
-            let _ = crash_investigator::record_crash_event(
-                &app,
-                &instance_id,
-                &fingerprint,
-                &result.suspects,
-                None, // signature_name -- callers pass curated-regex match separately when known
-            );
-        }
-        Ok(result)
-    })
-    .await
-    .map_err(|_| LauncherError::LocalStateFailed)?
-}
-
-/// Investigate a crash using a manually-provided crash log text.
-#[tauri::command]
-pub async fn investigate_manual(
-    app: tauri::AppHandle,
-    _state: tauri::State<'_, LauncherState>,
-    instance_id: String,
-    log_text: String,
-) -> LauncherResult<crash_investigator::InvestigationResult> {
-    tokio::task::spawn_blocking(move || {
-        let manifest = load_manifest(&app, &instance_id)?;
-
-        let fingerprint = match crash_investigator::parse_crash_log(&log_text) {
-            Some(fp) => fp,
-            None => {
-                return Ok(crash_investigator::InvestigationResult {
-                    fingerprint: None,
-                    signature_name: None,
-                    suspects: Vec::new(),
-                    suggested_action: crash_investigator::SuggestedAction::NoSuspects,
-                    ruled_out: Vec::new(),
-                });
-            }
+        let some_answer = latest_analyzed_answer(&ctx, &instance_id)?;
+        let Some(answer) = some_answer else {
+            return Ok(agora_core::crash_service::InvestigationResult {
+                suspects: Vec::new(),
+                suggested_action: agora_core::crash_service::SuggestedAction::NoSuspects,
+                ruled_out: Vec::new(),
+            });
         };
-
-        let ctx = crate::core_context(&app)?;
-        crash_investigator::continue_investigation(&ctx, &fingerprint, &manifest.mods, &log_text)
+        let view = crash_instance_view(&ctx, &instance_id)?;
+        let suspects = agora_core::crash_live::suspects_for_test(&answer, view.as_ref());
+        let suggested_action = suspects.first().map_or(
+            agora_core::crash_service::SuggestedAction::NoSuspects,
+            |next| agora_core::crash_service::SuggestedAction::GuidedDisable {
+                next_suspect: next.clone(),
+            },
+        );
+        Ok(agora_core::crash_service::InvestigationResult {
+            suspects,
+            suggested_action,
+            ruled_out: Vec::new(),
+        })
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
@@ -3398,51 +3277,146 @@ pub async fn enable_mod_for_test(
     .map_err(|_| LauncherError::LocalStateFailed)?
 }
 
-/// Confirm that a mod was the cause of a crash (for telemetry).
+/// Confirm that a mod was the cause of a crash. The record is keyed by the crash bucket and the
+/// engine's owner key, so a later diagnosis of the same bucket gets a boost-only local-memory clue.
 #[tauri::command]
 pub async fn confirm_crash_fix(
     app: tauri::AppHandle,
     _state: tauri::State<'_, LauncherState>,
-    fingerprint: crash_investigator::CrashFingerprint,
-    mod_id: String,
+    bucket: String,
+    owner_key: String,
 ) -> LauncherResult<()> {
     tokio::task::spawn_blocking(move || {
-        crash_investigator::confirm_attribution(&app, &fingerprint, &mod_id)
+        let ctx = crate::core_context(&app)?;
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).map_err(
+            |error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            },
+        )?;
+        agora_core::db::increment_confirmation(&conn, &bucket, &owner_key).map_err(|error| {
+            LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            }
+        })
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
 }
 
-/// Report that the crash persists after disabling the top suspect.
-/// Rules out the mod and re-runs the investigation to find the next suspect.
+/// Report that the crash persists after disabling a suspect. The newest stored answer already
+/// ranks what remains; the ruled-out candidate is filtered out so the next experiment is about a
+/// different item.
 #[tauri::command]
 pub async fn report_still_crashing(
     app: tauri::AppHandle,
     _state: tauri::State<'_, LauncherState>,
     instance_id: String,
-    fingerprint: crash_investigator::CrashFingerprint,
-    ruled_out_mod_id: String,
-    crash_log_text: String,
-) -> LauncherResult<crash_investigator::InvestigationResult> {
+    ruled_out_owner_key: String,
+) -> LauncherResult<agora_core::crash_service::InvestigationResult> {
     tokio::task::spawn_blocking(move || {
-        // Rule out the mod.
-        crash_investigator::rule_out(&app, &fingerprint, &ruled_out_mod_id)
-            .map_err(|_| LauncherError::LocalStateFailed)?;
-
         let ctx = crate::core_context(&app)?;
-
-        // Reload the manifest and re-investigate.
-        let manifest = load_manifest(&app, &instance_id)?;
-
-        crash_investigator::continue_investigation(
-            &ctx,
-            &fingerprint,
-            &manifest.mods,
-            &crash_log_text,
-        )
+        let some_answer = latest_analyzed_answer(&ctx, &instance_id)?;
+        let Some(answer) = some_answer else {
+            return Ok(agora_core::crash_service::InvestigationResult {
+                suspects: Vec::new(),
+                suggested_action: agora_core::crash_service::SuggestedAction::NoSuspects,
+                ruled_out: vec![ruled_out_owner_key],
+            });
+        };
+        let view = crash_instance_view(&ctx, &instance_id)?;
+        let mut suspects = agora_core::crash_live::suspects_for_test(&answer, view.as_ref());
+        suspects.retain(|suspect| suspect.mod_id != ruled_out_owner_key);
+        let suggested_action = suspects.first().map_or(
+            agora_core::crash_service::SuggestedAction::NoSuspects,
+            |next| agora_core::crash_service::SuggestedAction::GuidedDisable {
+                next_suspect: next.clone(),
+            },
+        );
+        Ok(agora_core::crash_service::InvestigationResult {
+            suspects,
+            suggested_action,
+            ruled_out: vec![ruled_out_owner_key],
+        })
     })
     .await
     .map_err(|_| LauncherError::LocalStateFailed)?
+}
+
+/// The file an engine candidate provides, so the experiment flow can disable it. The owner key
+/// must be one the answer named; a key the view cannot list is an error, never a silent no-op.
+#[tauri::command]
+pub async fn resolve_crash_suspect_file(
+    app: tauri::AppHandle,
+    _state: tauri::State<'_, LauncherState>,
+    instance_id: String,
+    owner_key: String,
+) -> LauncherResult<String> {
+    tokio::task::spawn_blocking(move || {
+        let ctx = crate::core_context(&app)?;
+        let view =
+            crash_instance_view(&ctx, &instance_id)?.ok_or_else(|| LauncherError::Generic {
+                code: "ERR_CRASH_INSTANCE_VIEW".into(),
+                message: format!("Instance '{instance_id}' could not be read."),
+            })?;
+        let content_key =
+            owner_key
+                .strip_prefix("item:")
+                .ok_or_else(|| LauncherError::Generic {
+                    code: "ERR_CRASH_SUSPECT_NOT_ITEM".into(),
+                    message: "That suspect is not an installed item, so it cannot be turned off."
+                        .to_string(),
+                })?;
+        let file = view
+            .item_files(content_key)
+            .and_then(|files| files.into_iter().next())
+            .and_then(|path| path.rsplit(['/', '\\']).next().map(str::to_string))
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| LauncherError::Generic {
+                code: "ERR_CRASH_SUSPECT_NO_FILE".into(),
+                message: "Agora could not find the file for that suspect in this instance."
+                    .to_string(),
+            })?;
+        Ok(file)
+    })
+    .await
+    .map_err(|_| LauncherError::LocalStateFailed)?
+}
+
+fn latest_analyzed_answer(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+) -> LauncherResult<Option<agora_game_api::crash::CrashAnswer>> {
+    let conn =
+        agora_core::db::local_state_connection(&ctx.paths.local_state_db()).map_err(|error| {
+            LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            }
+        })?;
+    let stored = agora_core::crash_live::latest_answer(&conn, instance_id).map_err(|error| {
+        LauncherError::Generic {
+            code: "ERR_CRASH_ANSWER".into(),
+            message: error.to_string(),
+        }
+    })?;
+    Ok(stored.and_then(|stored| match stored.answer {
+        agora_core::crash_live::StoredAnswer::Analyzed { answer, .. } => Some(*answer),
+        _ => None,
+    }))
+}
+
+fn crash_instance_view(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+) -> LauncherResult<Option<agora_core::crash_engine::attribution::InstanceView>> {
+    let resolved = agora_core::crash_engine::instance_view::resolve_crash_instance(
+        ctx,
+        instance_id,
+        Some(&agora_game_minecraft::installed_content::MinecraftInstanceProvider),
+    )?;
+    Ok(Some(resolved.view))
 }
 
 /// Read the whole installed-content dependency graph for an instance.
@@ -3789,13 +3763,13 @@ pub async fn export_crash_report(
     _state: tauri::State<'_, LauncherState>,
     instance_id: Option<String>,
     crash_log: Option<String>,
-    crash_signatures: Option<String>,
+    answer: Option<String>,
     suspects: Option<String>,
 ) -> LauncherResult<String> {
     let context = crash_export::CrashReportContext {
         instance_id,
         crash_log,
-        crash_signatures,
+        answer,
         suspects,
     };
     Ok(crash_export::build_crash_report(&app, &context))

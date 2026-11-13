@@ -252,6 +252,10 @@ pub struct Candidate {
     /// The cause of the strongest clue that states one; `mod` when no clue does.
     #[serde(default = "default_candidate_cause")]
     pub cause: Cause,
+    /// What part this owner plays in the game, when the pack's roles say. A framework or hook
+    /// framework is never auto-disabled, so the test-it flow needs this beside the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<crate::crash::Role>,
     pub families: Vec<Family>,
     /// Everyone whose rules contributed, so a noisy plugin can be spotted.
     pub sources: Vec<SourceAttribution>,

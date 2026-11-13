@@ -227,6 +227,9 @@ pub struct CrashHistoryInput<'a> {
     pub sessions_since_first: &'a BTreeMap<String, u64>,
     /// When the setup this crash ran began, in Unix milliseconds, when known.
     pub setup_since_unix_ms: Option<i64>,
+    /// Every fix the user confirmed on this PC, with the crash bucket it belongs to. Only the ones
+    /// matching this crash's bucket become boost-only signals.
+    pub local_confirmations: &'a [crate::crash_engine::history::LocalConfirmation],
 }
 
 /// [`analyze`] with facts only a live session can supply: `core.session` and `core.change`.
@@ -607,6 +610,31 @@ pub fn analyze_with_history(
         evaluated
             .signals
             .extend(super::history::repeat_signals(summary));
+    }
+    // A past fix on this PC only raises a suspect the current crash already named. The owner comes
+    // from the signals themselves, so a confirmation can never introduce a candidate.
+    if let (Some(history), Some(bucket)) = (history, current_bucket.as_deref()) {
+        for confirmed in history
+            .local_confirmations
+            .iter()
+            .filter(|confirmation| confirmation.bucket == bucket)
+        {
+            if let Some(owner) = evaluated
+                .signals
+                .iter()
+                .find(|signal| {
+                    super::suspects::public_owner_key(&signal.candidate) == confirmed.owner_key
+                })
+                .map(|signal| signal.candidate.clone())
+            {
+                evaluated
+                    .signals
+                    .push(super::history::local_confirmation_signal(
+                        owner,
+                        confirmed.count,
+                    ));
+            }
+        }
     }
     let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
     let scored = consensus(

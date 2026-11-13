@@ -88,7 +88,7 @@ fn empty_input_is_an_explicit_nothing_to_read() {
 #[test]
 fn supplied_text_runs_the_pipeline_and_names_what_it_named_itself() {
     let answer = analyze("== FAULTS ==\nmodule ExampleMod.dll failed\n");
-    let SuppliedAnswer::Analyzed { answer, files } = answer else {
+    let SuppliedAnswer::Analyzed { answer, files, .. } = answer else {
         panic!("a readable log should produce an answer");
     };
     assert_eq!(answer.candidates.len(), 1);

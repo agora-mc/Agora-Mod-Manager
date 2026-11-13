@@ -601,7 +601,6 @@ impl CrashService {
 #[serde(tag = "kind")]
 pub enum SuggestedAction {
     GuidedDisable { next_suspect: SuspectScore },
-    ConfidenceAutoDisable { mod_id: String, filename: String },
     NoSuspects,
 }
 
@@ -612,8 +611,6 @@ pub enum SuggestedAction {
 /// The complete result of a crash investigation step.
 #[derive(Debug, Clone, Serialize)]
 pub struct InvestigationResult {
-    pub fingerprint: Option<CrashFingerprint>,
-    pub signature_name: Option<String>,
     pub suspects: Vec<SuspectScore>,
     pub suggested_action: SuggestedAction,
     pub ruled_out: Vec<String>,
@@ -623,174 +620,13 @@ pub struct InvestigationResult {
 // CrashInvestigation — unified read-only investigation result
 // ---------------------------------------------------------------------------
 
-/// Combined result of a full crash investigation: evidence, triage,
-/// fingerprint, and ranked suspects (zero-score suspects filtered out).
+/// What the interactive crash board reads: the evidence Agora collected and the engine answer's
+/// ranked suspects, in the shape the experiment flow uses.
 #[derive(Debug, Clone, Serialize)]
 pub struct CrashInvestigation {
     pub evidence: crate::crash_evidence::CollectedEvidence,
-    pub fingerprint: Option<CrashFingerprint>,
-    pub triage: crate::crash_diagnostics::CrashTriageResult,
     pub suspects: Vec<SuspectScore>,
     pub failure_category: crate::crash_evidence::FailureCategory,
-}
-
-impl CrashService {
-    /// Unified read-only investigation: collect local evidence, run triage,
-    /// extract fingerprint, rank suspects, and filter zero-score results.
-    ///
-    /// This is the single entry point for GUI, CLI, and MCP diagnostics.
-    /// It does NOT mutate state (no disable, no telemetry).
-    ///
-    /// `explicit_files` are user-chosen absolute paths to include as
-    /// additional evidence (resolved and extension-validated by the
-    /// collector).
-    pub fn investigate_evidence(
-        &self,
-        instance_id: &str,
-        explicit_files: &[std::path::PathBuf],
-    ) -> LauncherResult<CrashInvestigation> {
-        let sanitized = validate_instance_id(instance_id)?;
-
-        // 1. Collect local evidence
-        let instance_dir = match self.ctx.paths.instance_dir(&sanitized) {
-            Ok(d) => d,
-            Err(_) => {
-                return Ok(CrashInvestigation {
-                    evidence: crate::crash_evidence::CollectedEvidence {
-                        sources: vec![],
-                        primary_index: 0,
-                        aggregate_bytes: 0,
-                        any_truncated: false,
-                        any_stale: false,
-                        failure_category: crate::crash_evidence::FailureCategory::NoEvidence,
-                    },
-                    fingerprint: None,
-                    triage: crate::crash_diagnostics::CrashTriageResult::no_match(),
-                    suspects: vec![],
-                    failure_category: crate::crash_evidence::FailureCategory::NoEvidence,
-                })
-            }
-        };
-
-        let launch_started_at = crate::db::local_state_connection(&self.ctx.paths.local_state_db())
-            .ok()
-            .and_then(|conn| crate::db::get_instance(&conn, &sanitized).ok().flatten())
-            .and_then(|row| row.last_launched_at)
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
-            .and_then(|value| {
-                let seconds = value.timestamp();
-                (seconds >= 0).then(|| {
-                    std::time::SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_secs(seconds as u64)
-                        + std::time::Duration::from_nanos(value.timestamp_subsec_nanos() as u64)
-                })
-            });
-        let evidence_svc = crate::crash_evidence::CrashEvidenceService::new();
-        let evidence = evidence_svc.collect_since(&instance_dir, explicit_files, launch_started_at);
-
-        // 2. Analyze the coherent evidence set together. Source boundaries are
-        // retained so evidence excerpts remain understandable.
-        let combined_text = evidence
-            .sources
-            .iter()
-            .map(|source| format!("\n===== {} =====\n{}", source.meta.basename, source.text))
-            .collect::<String>();
-
-        // 3. Run curated triage
-        let conn_opt = if self.ctx.paths.registry_db().exists() {
-            crate::db::registry_connection(&self.ctx.paths.registry_db()).ok()
-        } else {
-            None
-        };
-        let mut triage =
-            crate::crash_diagnostics::triage_with_db(&combined_text, conn_opt.as_ref());
-        // A named missing class is more specific than "no match", but a curated
-        // signature that matched is left alone.
-        let mut throwers: Vec<String> = Vec::new();
-        if !triage.matched {
-            if let Some(finding) = self.missing_class_finding(&sanitized, &combined_text) {
-                triage = finding.triage;
-                throwers = finding.throwers;
-            }
-        }
-
-        // 4. Extract fingerprint
-        let fingerprint = crate::crash_service::parse_crash_log(&combined_text);
-
-        // 5. Score suspects (requires manifest)
-        let suspects = if let Some(ref _fp) = fingerprint {
-            match self.load_instance_manifest(&sanitized) {
-                Ok(Some(manifest)) => {
-                    crate::crash_service::score_suspects(&self.ctx, &combined_text, &manifest.mods)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|s| s.total_score > 0.0 && !throwers.contains(&s.filename))
-                        .collect()
-                }
-                _ => vec![],
-            }
-        } else {
-            vec![]
-        };
-
-        Ok(CrashInvestigation {
-            failure_category: evidence.failure_category.clone(),
-            evidence,
-            fingerprint,
-            triage,
-            suspects,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// continue_investigation — full investigation pipeline
-// ---------------------------------------------------------------------------
-
-/// Run the full investigation pipeline: score suspects, fetch ruled-out mods,
-/// filter them out, pick the top remaining, and build an `InvestigationResult`.
-pub fn continue_investigation(
-    ctx: &Ctx,
-    fingerprint: &CrashFingerprint,
-    installed: &[crate::models::InstalledMod],
-    crash_text: &str,
-) -> LauncherResult<InvestigationResult> {
-    let crash_svc = CrashService::new(ctx.clone());
-
-    // Score suspects.
-    let mut suspects = score_suspects(ctx, crash_text, installed)?;
-
-    // Fetch ruled-out mods for this fingerprint.
-    let ruled_out = crash_svc
-        .get_ruled_out_mods(&fingerprint.fingerprint_str())
-        .unwrap_or_default();
-
-    // Filter out ruled-out mods, and mods with no evidence at all. A score of
-    // zero means "installed", not "suspicious"; suggesting a disable on that
-    // would just name the alphabetically first mod.
-    let ruled_out_set: std::collections::HashSet<String> = ruled_out.iter().cloned().collect();
-    suspects.retain(|s| s.total_score > 0.0 && !ruled_out_set.contains(&s.mod_id));
-
-    // Build the ruled_out list for the result (sorted for determinism).
-    let mut ruled_out_sorted = ruled_out.clone();
-    ruled_out_sorted.sort();
-
-    // Determine suggested action.
-    let suggested_action = if suspects.is_empty() {
-        SuggestedAction::NoSuspects
-    } else {
-        SuggestedAction::GuidedDisable {
-            next_suspect: suspects[0].clone(),
-        }
-    };
-
-    Ok(InvestigationResult {
-        fingerprint: Some(fingerprint.clone()),
-        signature_name: None,
-        suspects,
-        suggested_action,
-        ruled_out: ruled_out_sorted,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2515,51 +2351,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_investigation_suspects_leave_out_the_thrower() {
-        let (ctx, _tmp) = setup_ctx();
-        create_instance(&ctx, "inst", &["iris.jar"]);
-        let mut manifest = read_manifest(&ctx, "inst");
-        manifest.mods[0].java_packages = vec![IRIS_PACKAGE.to_string()];
-        manifest.mods.push(mod_with_packages(
-            "fabric-api.jar",
-            true,
-            &[FABRIC_KEYBINDING_PACKAGE],
-        ));
-        std::fs::write(
-            ctx.paths.instance_manifest("inst").unwrap(),
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
-        let reports = ctx
-            .paths
-            .instance_dir("inst")
-            .unwrap()
-            .join("crash-reports");
-        std::fs::create_dir_all(&reports).unwrap();
-        std::fs::write(reports.join("crash.txt"), missing_fabric_class_log()).unwrap();
-
-        let investigation = CrashService::new(ctx.clone())
-            .investigate_evidence("inst", &[])
-            .unwrap();
-        assert_eq!(
-            investigation.triage.signature_name.as_deref(),
-            Some("Required Mod Not Running")
-        );
-        assert!(
-            investigation
-                .suspects
-                .iter()
-                .all(|s| s.filename != "iris.jar"),
-            "thrower still listed as suspect: {:?}",
-            investigation
-                .suspects
-                .iter()
-                .map(|s| &s.filename)
-                .collect::<Vec<_>>()
-        );
-    }
-
     // ------------------------------------------------------------------
     // Scoring tests (moved from desktop crash_investigator)
     // ------------------------------------------------------------------
@@ -2996,8 +2787,6 @@ Caused by: java.lang.NullPointerException
     #[test]
     fn test_investigation_result_serialization() {
         let result = InvestigationResult {
-            fingerprint: None,
-            signature_name: None,
             suspects: vec![],
             suggested_action: SuggestedAction::NoSuspects,
             ruled_out: vec!["mod-a".into()],
@@ -3238,38 +3027,6 @@ java.lang.NullPointerException: Cannot invoke "java.util.List.forEach(java.util.
         svc.record_crash_event("test-instance", &fp, &two_real, None)
             .unwrap();
         assert_eq!(svc.get_pair_crash_count("real-a", "real-b").unwrap(), 1);
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn test_d7_no_evidence_means_no_suggestion() {
-        let (ctx, tmp) = setup_ctx();
-        create_instance(&ctx, "no-evidence", &["alpha.jar", "beta.jar"]);
-        let manifest = read_manifest(&ctx, "no-evidence");
-        let fp = CrashFingerprint {
-            exception_class: "java.lang.NullPointerException".into(),
-            top_frames: vec![],
-        };
-        let crash_text =
-            "java.lang.NullPointerException:\n\tat com.unrelated.Thing.tick(Thing.java:1)\n";
-
-        let result = continue_investigation(&ctx, &fp, &manifest.mods, crash_text).unwrap();
-        assert!(
-            matches!(result.suggested_action, SuggestedAction::NoSuspects),
-            "no mod scored above zero, so there must be no suggestion"
-        );
-        assert!(
-            result.suspects.iter().all(|s| s.total_score > 0.0),
-            "zero-score mods must not be presented as suspects"
-        );
-
-        let empty = continue_investigation(&ctx, &fp, &[], crash_text).unwrap();
-        assert!(matches!(
-            empty.suggested_action,
-            SuggestedAction::NoSuspects
-        ));
-        assert!(empty.suspects.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

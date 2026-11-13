@@ -1981,6 +1981,23 @@ pub fn get_confirmed_attribution(
     Ok(out)
 }
 
+/// Every confirmed attribution on this PC, as `(bucket or fingerprint, mod id, confirm count)`.
+/// The crash engine reads this to add its boost-only local-confirmation evidence; an engine bucket
+/// and an older fingerprint simply never collide.
+pub fn all_confirmed_attributions(conn: &Connection) -> anyhow::Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT fingerprint, mod_id, confirm_count FROM crash_attribution ORDER BY fingerprint, mod_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Upsert a confirmed attribution: insert with confirm_count=1 or increment + update last_confirmed_at.
 pub fn increment_confirmation(
     conn: &Connection,

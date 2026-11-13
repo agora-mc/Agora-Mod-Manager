@@ -148,12 +148,17 @@ pub struct PreparedHistory {
 }
 
 impl PreparedHistory {
-    /// The input the evaluator takes. It borrows this value, so keep it alive for the analysis.
-    pub fn input(&self) -> CrashHistoryInput<'_> {
+    /// The input the evaluator takes. It borrows this value and the confirmations, so keep both
+    /// alive for the analysis.
+    pub fn input<'a>(
+        &'a self,
+        local_confirmations: &'a [crate::crash_engine::history::LocalConfirmation],
+    ) -> CrashHistoryInput<'a> {
         CrashHistoryInput {
             prior: &self.prior,
             sessions_since_first: &self.sessions_since_first,
             setup_since_unix_ms: self.setup_since_unix_ms,
+            local_confirmations,
         }
     }
 

@@ -5,8 +5,10 @@ use std::path::Path;
 
 use agora_core::crash_engine::attribution::{InstanceView, LayerOwner, LayerView, Resolver};
 use agora_core::crash_engine::history::{
-    summarize_recorded, CrashPlace, HistorySuspect, RecordedCrash,
+    current_bucket, summarize_recorded, CrashPlace, HistorySuspect, LocalConfirmation,
+    RecordedCrash,
 };
+use agora_core::crash_engine::suspects::public_owner_key;
 use agora_core::crash_engine::{
     analyze, analyze_with_history, AnalyzeInput, CrashFile, CrashHistoryInput, Inspection,
     InspectionOutcome, InspectionRequest, Inspector, InstanceAnalysis,
@@ -384,6 +386,7 @@ fn a_recurring_suspect_boosts_the_answer_and_gets_one_counting_finding() {
             prior: &prior,
             sessions_since_first: &sessions,
             setup_since_unix_ms: None,
+            local_confirmations: &[],
         }),
     )
     .unwrap();
@@ -434,4 +437,135 @@ fn a_framework_owner_is_never_boosted_by_history() {
     assert_eq!(summary.suspects.len(), 0);
     assert_eq!(summary.always_running.len(), 1);
     assert!(agora_core::crash_engine::history::repeat_signals(&summary).is_empty());
+}
+
+#[test]
+fn a_confirmed_fix_boosts_the_same_bucket_and_never_invents_a_suspect() {
+    let fixture = Fixture::new();
+    let file = CrashFile::new("current.txt", log_bytes("1000"));
+    let instance = InstanceAnalysis {
+        game_id: GAME,
+        resolver: &fixture.resolver,
+        inspector: &fixture.inspector,
+        could_not_check: &[],
+    };
+    let baseline = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&fixture.pack),
+        files: std::slice::from_ref(&file),
+        runtime_version: Some("1.0"),
+        host: &fixture.host,
+        built_in: &[],
+        instance: Some(instance),
+    })
+    .unwrap();
+    let bucket = current_bucket(&baseline.parsed).expect("the invented log has a bucket");
+    let owner_key = public_owner_key(&baseline.answer.candidates[0].owner);
+    let sessions = std::collections::BTreeMap::new();
+
+    let confirmed = [LocalConfirmation {
+        bucket: bucket.clone(),
+        owner_key: owner_key.clone(),
+        count: 1,
+    }];
+    let boosted = analyze_with_history(
+        &AnalyzeInput {
+            packs: std::slice::from_ref(&fixture.pack),
+            files: std::slice::from_ref(&file),
+            runtime_version: Some("1.0"),
+            host: &fixture.host,
+            built_in: &[],
+            instance: Some(InstanceAnalysis {
+                game_id: GAME,
+                resolver: &fixture.resolver,
+                inspector: &fixture.inspector,
+                could_not_check: &[],
+            }),
+        },
+        &[],
+        &[],
+        Some(&CrashHistoryInput {
+            prior: &[],
+            sessions_since_first: &sessions,
+            setup_since_unix_ms: None,
+            local_confirmations: &confirmed,
+        }),
+    )
+    .unwrap();
+    assert!(
+        boosted.answer.candidates[0].score > baseline.answer.candidates[0].score,
+        "a confirmed fix is a boost"
+    );
+
+    let other_bucket = [LocalConfirmation {
+        bucket: "another crash".to_string(),
+        owner_key: owner_key.clone(),
+        count: 5,
+    }];
+    let unchanged = analyze_with_history(
+        &AnalyzeInput {
+            packs: std::slice::from_ref(&fixture.pack),
+            files: std::slice::from_ref(&file),
+            runtime_version: Some("1.0"),
+            host: &fixture.host,
+            built_in: &[],
+            instance: Some(InstanceAnalysis {
+                game_id: GAME,
+                resolver: &fixture.resolver,
+                inspector: &fixture.inspector,
+                could_not_check: &[],
+            }),
+        },
+        &[],
+        &[],
+        Some(&CrashHistoryInput {
+            prior: &[],
+            sessions_since_first: &sessions,
+            setup_since_unix_ms: None,
+            local_confirmations: &other_bucket,
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        unchanged.answer.candidates[0].score, baseline.answer.candidates[0].score,
+        "a confirmation for another crash bucket must not touch this one"
+    );
+
+    let never_named = [LocalConfirmation {
+        bucket,
+        owner_key: "item:something-not-in-this-crash".to_string(),
+        count: 3,
+    }];
+    let no_new_suspect = analyze_with_history(
+        &AnalyzeInput {
+            packs: std::slice::from_ref(&fixture.pack),
+            files: std::slice::from_ref(&file),
+            runtime_version: Some("1.0"),
+            host: &fixture.host,
+            built_in: &[],
+            instance: Some(InstanceAnalysis {
+                game_id: GAME,
+                resolver: &fixture.resolver,
+                inspector: &fixture.inspector,
+                could_not_check: &[],
+            }),
+        },
+        &[],
+        &[],
+        Some(&CrashHistoryInput {
+            prior: &[],
+            sessions_since_first: &sessions,
+            setup_since_unix_ms: None,
+            local_confirmations: &never_named,
+        }),
+    )
+    .unwrap();
+    assert!(
+        no_new_suspect
+            .answer
+            .candidates
+            .iter()
+            .all(|candidate| public_owner_key(&candidate.owner)
+                != "item:something-not-in-this-crash"),
+        "memory alone must never create a candidate"
+    );
 }
