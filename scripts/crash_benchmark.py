@@ -36,8 +36,86 @@ from pathlib import Path
 from typing import Any, Iterable
 
 EXTENSIONS = (".dll", ".esp", ".esm", ".esl", ".jar", ".pex")
-GROUP_DIMENSIONS = ("game", "log_type", "difficulty", "culprit_in_log")
+GROUP_DIMENSIONS = ("game", "log_type", "difficulty", "culprit_in_log", "culprit_kind")
 SEGMENT_SPLIT = re.compile(r" and | with |[&,()/;]")
+
+# The closed set of cause kinds the crash contract teaches. A key row's `culprit_kind` is mapped
+# onto this set so the benchmark can grade what kind of cause a tool found, not only its name.
+CAUSE_KINDS = (
+    "mod",
+    "version_mismatch",
+    "missing_requirement",
+    "file",
+    "setting",
+    "save",
+    "memory",
+    "driver",
+    "game_install",
+    "other",
+)
+
+CAUSE_SYNONYMS = {
+    "mod": "mod",
+    "mods": "mod",
+    "mod_conflict": "mod",
+    "mod_loading": "mod",
+    "version": "version_mismatch",
+    "version_mismatch": "version_mismatch",
+    "wrong_version": "version_mismatch",
+    "outdated": "version_mismatch",
+    "incompatible": "version_mismatch",
+    "game_version": "version_mismatch",
+    "loader_version": "version_mismatch",
+    "missing": "missing_requirement",
+    "missing_dependency": "missing_requirement",
+    "missing_requirement": "missing_requirement",
+    "missing_master": "missing_requirement",
+    "missing_mod": "missing_requirement",
+    "dependency": "missing_requirement",
+    "file": "file",
+    "asset": "file",
+    "mesh": "file",
+    "texture": "file",
+    "corrupt_file": "file",
+    "setting": "setting",
+    "settings": "setting",
+    "config": "setting",
+    "configuration": "setting",
+    "load_order": "setting",
+    "save": "save",
+    "world": "save",
+    "corrupt_save": "save",
+    "memory": "memory",
+    "oom": "memory",
+    "out_of_memory": "memory",
+    "ram": "memory",
+    "driver": "driver",
+    "graphics_driver": "driver",
+    "gpu": "driver",
+    "game_install": "game_install",
+    "game": "game_install",
+    "game_files": "game_install",
+    "install": "game_install",
+    "vanilla": "game_install",
+    "other": "other",
+    "none": "other",
+    "unknown": "other",
+}
+
+
+def cause_kind(value: Any) -> str | None:
+    """Map a key's `culprit_kind` (or a prediction's `cause`) onto the closed cause set.
+
+    A missing or blank kind has no opinion and returns `None`. Anything not in the closed set or
+    the synonym table is `other`: the set has that open door on purpose.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().casefold().replace("-", "_").replace(" ", "_")
+    if text in CAUSE_KINDS:
+        return text
+    return CAUSE_SYNONYMS.get(text, "other")
+
 
 
 class BenchmarkError(Exception):
@@ -417,6 +495,8 @@ def _empty_metrics() -> dict[str, int]:
         "loose_wrong": 0,
         "missing": 0,
         "errors": 0,
+        "cause_rows": 0,
+        "cause_hits": 0,
     }
 
 
@@ -477,6 +557,11 @@ def _validate_predictions(rows: Iterable[dict[str, Any]], where: str) -> dict[st
         if not isinstance(abstained, bool):
             raise BenchmarkError(
                 f"prediction {row_id!r}: 'abstained' must be a boolean"
+            )
+        cause = row.get("cause")
+        if cause is not None and cause not in CAUSE_KINDS:
+            raise BenchmarkError(
+                f"prediction {row_id!r}: 'cause' must be one of {', '.join(CAUSE_KINDS)}"
             )
         suspects = row.get("suspects")
         if not isinstance(suspects, list):
@@ -550,6 +635,15 @@ def _score(
         metrics = _empty_metrics()
         metrics["rows"] = 1
 
+        key_cause = cause_kind(row.get("culprit_kind"))
+        predicted_cause = (
+            cause_kind(prediction.get("cause")) if prediction is not None else None
+        )
+        if key_cause is not None:
+            metrics["cause_rows"] = 1
+            if predicted_cause == key_cause:
+                metrics["cause_hits"] = 1
+
         top1_hit = False
         top3_hit = False
         top1_loose = False
@@ -613,6 +707,8 @@ def _score(
                     "loose_top1_hit": top1_loose,
                     "loose_top3_hit": top3_loose,
                     "matched_by": matched_by,
+                    "cause": predicted_cause,
+                    "key_cause": key_cause,
                     "groups": {
                         dimension: _group_value(row, dimension)
                         for dimension in GROUP_DIMENSIONS
@@ -696,6 +792,7 @@ def _metrics_cells(metrics: dict[str, int]) -> list[Any]:
         metrics["loose_wrong"],
         metrics["missing"],
         metrics["errors"],
+        f"{metrics['cause_hits']}/{metrics['cause_rows']}",
     ]
 
 
@@ -710,6 +807,7 @@ METRIC_HEADERS = [
     "loose wrong",
     "missing",
     "errors",
+    "cause",
 ]
 
 
@@ -731,6 +829,8 @@ def format_score(result: dict[str, Any], detail: bool) -> str:
                 row["loose_top1_hit"],
                 row["loose_top3_hit"],
                 row["matched_by"] or "-",
+                row["cause"] or "-",
+                row["key_cause"] or "-",
             ]
             for row in result["rows"]
         ]
@@ -745,6 +845,8 @@ def format_score(result: dict[str, Any], detail: bool) -> str:
                     "loose top-1",
                     "loose top-3",
                     "matched by",
+                    "cause",
+                    "key cause",
                 ],
                 detail_rows,
             )
@@ -900,6 +1002,9 @@ def _prediction_from_run(
         "abstained": not suspects,
         "read_by": read_by,
     }
+    cause = cause_kind(answer.get("cause"))
+    if cause is not None:
+        row["cause"] = cause
     if skipped_unnamed:
         row["skipped_unnamed"] = skipped_unnamed
     if file_reason and not suspects:

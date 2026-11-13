@@ -4,7 +4,7 @@
 //! file.
 
 use agora_core::crash_engine::{analyze, AnalyzeInput, CrashFile, RefResolver};
-use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack, ParserFailureKind};
+use agora_core::crash_packs::{LoadedCrashPack, ParserFailureKind};
 use agora_game_api::crash::{CrashAnswer, Level, MatchedBy, Owner, ParserLimits, SessionVerdict};
 use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
 use agora_plugin_api::manifest::PluginId;
@@ -96,6 +96,25 @@ fn plugin_folder(
     pack: &str,
     script: Option<&str>,
 ) -> (TempDir, LoadedCrashPack) {
+    plugin_folder_with(id, name, pack, script, false)
+}
+
+fn official_plugin_folder(
+    id: &str,
+    name: &str,
+    pack: &str,
+    script: Option<&str>,
+) -> (TempDir, LoadedCrashPack) {
+    plugin_folder_with(id, name, pack, script, true)
+}
+
+fn plugin_folder_with(
+    id: &str,
+    name: &str,
+    pack: &str,
+    script: Option<&str>,
+    official: bool,
+) -> (TempDir, LoadedCrashPack) {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "crash/pack.json", pack);
     write(
@@ -107,7 +126,7 @@ fn plugin_folder(
         write(dir.path(), "index.js", script);
     }
     let manifest = agora_core::plugins::install::read_folder_manifest(dir.path()).unwrap();
-    let report = load_plugin_packs(id, dir.path(), &manifest);
+    let report = agora_core::crash_packs::load_plugin_packs_as(id, dir.path(), &manifest, official);
     assert!(report.is_clean(), "{:#?}", report.problems);
     assert_eq!(report.packs.len(), 1);
     (dir, report.packs[0].clone())
@@ -715,4 +734,193 @@ fn a_fact_about_something_else_is_not_a_match_even_when_its_attribute_is_unknown
         "{:#?}",
         wanted.answer.could_not_check
     );
+}
+
+fn two_reader_pack(extra_kind: &str) -> String {
+    serde_json::json!({
+        "contract": 1,
+        "parsers": [
+            {
+                "id": "main",
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "sections": [{
+                        "id": "faults",
+                        "header": HEADER,
+                        "lines": [{
+                            "pattern": "^module (?P<module>[A-Za-z0-9_.-]+) failed$",
+                            "kind": "acme.fault",
+                            "refs": [{ "kind": "module", "value": "module" }]
+                        }]
+                    }]
+                } } },
+                "detect": { "all": ["(?m)^== FAULTS ==$"] }
+            },
+            {
+                "id": "aside",
+                "reads": "extra",
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "sections": [{
+                        "id": "faults",
+                        "header": HEADER,
+                        "lines": [{
+                            "pattern": "^module (?P<module>[A-Za-z0-9_.-]+) failed$",
+                            "kind": extra_kind,
+                            "attrs": { "text": "module" }
+                        }]
+                    }]
+                } } },
+                "detect": { "all": ["(?m)^== FAULTS ==$"] }
+            }
+        ]
+    })
+    .to_string()
+}
+
+#[test]
+fn one_primary_reads_a_file_and_every_extra_reads_alongside_it() {
+    let (_dir, pack) = plugin_folder(
+        "acme.harbor",
+        "Acme Harbor crash rules",
+        &two_reader_pack("aside.note"),
+        None,
+    );
+    let host = idle_host();
+    let output = analyze(&AnalyzeInput {
+        packs: &[pack],
+        files: &[file(
+            "friend-crash.txt",
+            "== FAULTS ==\nmodule ExampleMod.dll failed\n",
+        )],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+
+    let report = &output.files[0];
+    assert_eq!(report.read_by.as_ref().unwrap().parser_id, "main");
+    assert_eq!(report.read_by_extra.len(), 1);
+    assert_eq!(report.read_by_extra[0].parser_id, "aside");
+    assert!(report.also_recognised_by.is_empty());
+    assert_eq!(output.parsed.len(), 2, "the primary and the extra both ran");
+    assert!(output.parsed.iter().any(|parsed| {
+        parsed.parser_id == "aside"
+            && parsed
+                .output
+                .facts
+                .iter()
+                .any(|fact| fact.kind == "aside.note")
+    }));
+}
+
+#[test]
+fn when_two_primaries_claim_a_file_one_plugin_name_orders_them_and_the_other_is_listed() {
+    let (_alpha_dir, alpha) = plugin_folder(
+        "acme.alpha",
+        "Alpha rules",
+        &generic_pack("", &fault_rule("alpha_fault")),
+        None,
+    );
+    let (_beta_dir, beta) = plugin_folder(
+        "acme.beta",
+        "Beta rules",
+        &generic_pack("", &fault_rule("beta_fault")),
+        None,
+    );
+    let host = idle_host();
+    let output = analyze(&AnalyzeInput {
+        packs: &[beta, alpha],
+        files: &[file(
+            "friend-crash.txt",
+            "== FAULTS ==\nmodule ExampleMod.dll failed\n",
+        )],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+
+    let report = &output.files[0];
+    assert_eq!(report.read_by.as_ref().unwrap().plugin_id, "acme.alpha");
+    assert_eq!(report.also_recognised_by.len(), 1);
+    assert_eq!(report.also_recognised_by[0].plugin_id, "acme.beta");
+    assert_eq!(output.parsed.len(), 1, "a second primary is not run");
+}
+
+#[test]
+fn an_extra_that_emits_a_core_fact_is_refused_at_run_time() {
+    let (_dir, pack) = plugin_folder(
+        "acme.harbor",
+        "Acme Harbor crash rules",
+        &two_reader_pack("core.log_line"),
+        None,
+    );
+    let host = idle_host();
+    let output = analyze(&AnalyzeInput {
+        packs: &[pack],
+        files: &[file(
+            "friend-crash.txt",
+            "== FAULTS ==\nmodule ExampleMod.dll failed\n",
+        )],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+
+    let report = &output.files[0];
+    assert!(report.read_by_extra.is_empty());
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|failure| failure.parser_id == "aside" && failure.message.contains("core.*")),
+        "{:#?}",
+        report.failures
+    );
+    assert_eq!(
+        output
+            .parsed
+            .iter()
+            .filter(|parsed| parsed.parser_id == "aside")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn a_verified_official_plugin_reads_before_a_community_one_whatever_its_id() {
+    let (_community_dir, community) = plugin_folder(
+        "acme.zeta",
+        "Zeta rules",
+        &generic_pack("", &fault_rule("zeta_fault")),
+        None,
+    );
+    let (_official_dir, official) = official_plugin_folder(
+        "acme.alpha",
+        "Alpha rules",
+        &generic_pack("", &fault_rule("alpha_fault")),
+        None,
+    );
+    let host = idle_host();
+    let output = analyze(&AnalyzeInput {
+        packs: &[community, official],
+        files: &[file(
+            "friend-crash.txt",
+            "== FAULTS ==\nmodule ExampleMod.dll failed\n",
+        )],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+
+    let report = &output.files[0];
+    assert_eq!(report.read_by.as_ref().unwrap().plugin_id, "acme.alpha");
+    assert_eq!(report.also_recognised_by.len(), 1);
+    assert_eq!(report.also_recognised_by[0].plugin_id, "acme.zeta");
 }

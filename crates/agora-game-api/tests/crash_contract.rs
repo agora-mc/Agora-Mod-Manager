@@ -1004,3 +1004,106 @@ fn verdict_json_is_what_the_ledger_has_stored() {
         r#"{"kind":"unavailable","reason":"no job"}"#
     );
 }
+
+#[test]
+fn an_unknown_finding_cause_is_refused() {
+    let json = r#"{
+      "contract": 1,
+      "rules": [{
+        "id": "r",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "finding": {
+          "scope": "root_cause",
+          "level": "likely",
+          "cause": "banana",
+          "candidate": { "owner_of": "m" },
+          "family": "known_signature",
+          "weight": 5
+        } }],
+        "text": { "headline": { "en": "Something happened." } }
+      }]
+    }"#;
+    assert!(
+        lint_pack_json(json).is_err(),
+        "an unknown cause is not a kind"
+    );
+}
+
+#[test]
+fn a_non_mod_cause_naming_a_candidate_needs_an_explanation() {
+    let rule = |why: &str| {
+        format!(
+            r#"{{
+              "contract": 1,
+              "rules": [{{
+                "id": "r",
+                "version": 1,
+                "when": {{ "fact": {{ "kind": "core.frame", "ref": {{ "kind": "module", "bind": "m" }} }} }},
+                "effects": [{{ "finding": {{
+                  "scope": "root_cause",
+                  "level": "likely",
+                  "cause": "save",
+                  "candidate": {{ "owner_of": "m" }},
+                  "family": "known_signature",
+                  "weight": 5
+                }} }}],
+                "text": {{ "headline": {{ "en": "Something happened." }}{why} }}
+              }}]
+            }}"#
+        )
+    };
+    let bare = lint_pack_json(&rule("")).expect_err("no explanation is refused");
+    assert!(
+        bare.iter()
+            .any(|problem| problem.code == LintCode::BadEffect
+                && problem.message.contains("why_not_sure")),
+        "{bare:#?}"
+    );
+    assert!(
+        lint_pack_json(&rule(r#", "why_not_sure": { "en": "The log names a file it was reading, not the code that failed." }"#))
+            .is_ok(),
+        "an explanation lets the rule name a candidate"
+    );
+}
+
+#[test]
+fn an_extra_reader_may_not_emit_core_facts() {
+    let output = ParserOutput {
+        contract: CRASH_CONTRACT_VERSION,
+        producer: Producer {
+            format: "extra".to_string(),
+            version: None,
+        },
+        facts: vec![Fact {
+            kind: "core.frame".to_string(),
+            attrs: [("index".to_string(), AttrValue::Scalar(Scalar::Number(0.0)))]
+                .into_iter()
+                .collect(),
+            refs: Vec::new(),
+            span: None,
+        }],
+        bucket: Vec::new(),
+        coverage: Vec::new(),
+        notes: Vec::new(),
+    };
+    assert!(validate_extra_output(&output, &ParserLimits::DEFAULT)
+        .iter()
+        .any(|problem| problem.code == LintCode::BadOutput && problem.message.contains("core.*")));
+}
+
+#[test]
+fn a_parser_reads_as_primary_unless_it_says_extra() {
+    let pack = lint_pack_json(
+        r#"{
+          "contract": 1,
+          "parsers": [
+            { "id": "main", "entry": { "script": { "export": "parseMain" } } },
+            { "id": "aside", "reads": "extra", "entry": { "script": { "export": "parseAside" } } }
+          ]
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(pack.parsers[0].reads, Reads::Primary);
+    assert_eq!(pack.parsers[1].reads, Reads::Extra);
+}

@@ -7,7 +7,7 @@ use agora_core::crash_engine::{
     Inspector, PackInput, ParsedArtifact, PluginIdentity,
 };
 use agora_game_api::crash::{
-    certainty_claim, AttrValue, Coverage, CoverageState, CrashPack, Fact, Level, MatchedBy,
+    certainty_claim, AttrValue, Cause, Coverage, CoverageState, CrashPack, Fact, Level, MatchedBy,
     NextStepKind, Owner, ParserOutput, Producer, Ref, Role, Rule, Scalar, Scope, SessionVerdict,
     Strength, CRASH_CONTRACT_VERSION,
 };
@@ -2278,4 +2278,98 @@ fn equal_frame_indexes_across_artifacts_are_order_independent() {
         serde_json::to_string(&first).expect("serialize"),
         serde_json::to_string(&second).expect("serialize")
     );
+}
+
+#[test]
+fn a_root_cause_finding_about_a_mod_defaults_to_the_mod_cause() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![root_cause_rule(
+            "names_the_mod",
+            "known_signature",
+            10,
+            "likely",
+        )],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+
+    let finding = evaluated
+        .findings
+        .iter()
+        .find(|finding| finding.candidate.is_some())
+        .expect("a root-cause finding");
+    assert_eq!(finding.cause, Cause::Mod);
+
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(answer.cause, Some(Cause::Mod));
+}
+
+#[test]
+fn a_non_mod_cause_reaches_the_answer_when_nobody_is_named() {
+    let rule = json!({
+        "id": "out_of_memory",
+        "version": 1,
+        "when": { "fact": { "kind": "core.exception", "where": { "category": "oom" } } },
+        "effects": [{
+            "finding": {
+                "scope": "environment",
+                "level": "likely",
+                "cause": "memory"
+            }
+        }],
+        "text": {
+            "headline": { "en": "The game ran out of memory." },
+            "why_not_sure": { "en": "A mod can cause the memory use, but the log does not say which." }
+        }
+    });
+    let exception = Fact {
+        kind: "core.exception".to_string(),
+        attrs: [("category".to_string(), text_attr("oom"))]
+            .into_iter()
+            .collect(),
+        refs: Vec::new(),
+        span: None,
+    };
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with("p", "parser", "test", vec![exception], Vec::new());
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &FakeResolver::new(),
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Supplied,
+        },
+        &evaluated,
+        &consensus,
+    );
+
+    assert!(answer.candidates.is_empty());
+    assert_eq!(answer.cause, Some(Cause::Memory));
+    assert_eq!(answer.findings[0].cause, Cause::Memory);
 }

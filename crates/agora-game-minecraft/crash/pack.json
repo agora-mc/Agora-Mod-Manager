@@ -154,7 +154,7 @@
           "bind": { "needed_by": "needed_by", "requirement": "requirement" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "missing_requirement" } }],
       "text": {
         "headline": {
           "en": "A mod that is installed needs {owner:missing} ({requirement}), and it is not installed. Installing it, or removing the mod that needs it, is a likely next step."
@@ -181,7 +181,7 @@
           "bind": { "needed_by": "needed_by" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "missing_requirement" } }],
       "text": {
         "headline": {
           "en": "A mod that is installed needs Fabric API, and it is not installed. Installing Fabric API is a likely next step."
@@ -203,7 +203,7 @@
           "bind": { "requirement": "requirement", "needed_by": "needed_by" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "A mod needs {owner:bad} ({requirement}), but a different version is installed. Getting the version the loader asks for is a likely next step."
@@ -230,7 +230,7 @@
           "bind": { "requirement": "requirement" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "A mod asks for a different game version ({requirement}) than the one that is running. A build of that mod for this game version is a likely next step."
@@ -257,7 +257,7 @@
           "bind": { "requirement": "requirement" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "A mod asks for a different version of the mod loader ({requirement}). Updating the loader may help."
@@ -277,7 +277,7 @@
           "where": { "category": "oom" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "memory" } }],
       "text": {
         "headline": {
           "en": "Java ran out of memory. Giving the instance more memory may help, or a mod may be holding on to more than it should."
@@ -302,7 +302,7 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "missing_requirement" } }],
       "text": {
         "headline": {
           "en": "A class the game needed was not found: {message}. A mod that provides it may be missing, disabled, or for another game version."
@@ -328,6 +328,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "likely",
             "candidate": { "owner_of": "owner" },
@@ -437,6 +438,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "possible",
             "candidate": { "owner_of": "mod" },
@@ -468,6 +470,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "likely",
             "candidate": { "owner_of": "dup" },
@@ -497,7 +500,7 @@
           "where": { "kind": { "in": ["resolution", "missing_dependency"] } }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "missing_requirement" } }],
       "text": {
         "headline": {
           "en": "The mod loader could not resolve the installed mod set. A dependency may be missing, or two mods may declare requirements that cannot both be met."
@@ -518,7 +521,7 @@
           "where": { "kind": "incompatible" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "The loader found mods it cannot run together or with this game version. Checking that each mod is built for this loader and game version is a likely next step."
@@ -539,7 +542,7 @@
           "where": { "kind": "duplicate_classpath" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "other" } }],
       "text": {
         "headline": {
           "en": "The game started with two copies of the same library on its classpath, which the loader refuses to run with. This is usually a launcher problem: updating Agora and launching again is a likely next step."
@@ -560,7 +563,7 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "mechanism", "level": "possible", "cause": "mod" } }],
       "text": {
         "headline": {
           "en": "A mod failed to load: {message}. Its own log or the loader's error usually names the file and the reason."
@@ -596,7 +599,7 @@
           }
         ]
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "setting" } }],
       "text": {
         "headline": {
           "en": "A configuration file could not be read: {message}. Moving it aside so the game can write a fresh one is a possible next step."
@@ -617,7 +620,7 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "save" } }],
       "text": {
         "headline": {
           "en": "The log suggests the world data could not be read: {message}. Restoring a backup of the world is a possible next step."
@@ -657,7 +660,7 @@
           }
         ]
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "game_install" } }],
       "text": {
         "headline": {
           "en": "This game version needs Java 17 or newer, and the log reports an older Java. Installing a newer Java is a likely next step."
@@ -699,7 +702,7 @@
           }
         ]
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "game_install" } }],
       "text": {
         "headline": {
           "en": "This game version needs Java 16 or newer, and the log reports an older Java. Installing a newer Java is a likely next step."
@@ -719,7 +722,7 @@
           "where": { "java_bits": 32 }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "game_install" } }],
       "text": {
         "headline": {
           "en": "The game is running on a 32-bit Java. It cannot use much memory and often fails with larger mod sets; installing 64-bit Java is a likely next step."
@@ -791,6 +794,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "likely",
             "candidate": { "owner_of": "mod" },
@@ -819,7 +823,7 @@
           "bind": { "required_java": "required_java", "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "A class was compiled for Java {required_java} or newer, and the game is running an older Java ({message}). Installing that Java, or using a build of the mod for the selected Java, is a likely next step."
@@ -850,7 +854,7 @@
           }
         ]
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "game_install" } }],
       "text": {
         "headline": {
           "en": "The selected Java is newer than this old game or loader can work with ({message}). Selecting the Java version the game expects is a likely next step."
@@ -871,7 +875,7 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "game_install" } }],
       "text": {
         "headline": {
           "en": "A native library the game needs is missing or blocked ({message}). Reinstalling the game files, or allowing the file in antivirus, is a likely next step."
@@ -892,7 +896,7 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "memory" } }],
       "text": {
         "headline": {
           "en": "Java could not start with the memory it was given ({message}). Using 64-bit Java, lowering the maximum heap, or freeing memory on the machine is a likely next step."
@@ -913,7 +917,7 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "driver" } }],
       "text": {
         "headline": {
           "en": "The game could not create a working graphics context ({message}). Updating or reinstalling the graphics driver, and closing overlays, is a likely next step."
@@ -973,7 +977,7 @@
           }
         ]
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "driver" } }],
       "text": {
         "headline": {
           "en": "The native fault is inside a graphics library ({symbol}). Updating or reinstalling the graphics driver is a likely next step, not a mod."
@@ -1003,7 +1007,7 @@
           }
         ]
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "other" } }],
       "text": {
         "headline": {
           "en": "The mod set uses more block, item or entity ids than this game version allows. Removing some content mods, or moving to a version without that limit, is a possible next step."
@@ -1028,6 +1032,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "possible",
             "candidate": { "owner_of": "owner" },
@@ -1065,7 +1070,7 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "Code expected a method or field this game version does not have ({message}). That usually means a mod or loader component is built for another game, loader or Java version."
@@ -1085,7 +1090,7 @@
           "bind": { "object_kind": "kind", "type": "type" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "save" } }],
       "text": {
         "headline": {
           "en": "The game crashed while ticking a {object_kind} of type {type}. Restoring a world backup, or testing a new world, is a possible next step."
@@ -1113,7 +1118,7 @@
           }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "save" } }],
       "text": {
         "headline": {
           "en": "The game crashed while ticking a {object_kind} of type {type} at {x}, {y}, {z}. Back the world up first, then remove or replace that object, or test a new world."
@@ -1137,6 +1142,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "possible",
             "candidate": { "owner_of": "owner" },
@@ -1164,7 +1170,7 @@
           "bind": { "first": "first", "second": "second" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "The loader says {first} conflicts with {second}. Using versions of both that are built for this game and loader version, or choosing one, is a possible next step."
@@ -1185,7 +1191,7 @@
           "ref": { "kind": "mod_id", "bind": "mod" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "missing_requirement" } }],
       "text": {
         "headline": {
           "en": "This world was saved with {owner:mod}, which is not installed now. Installing the mod again, or restoring a world backup, is a possible next step."
@@ -1207,7 +1213,7 @@
           "bind": { "expected": "expected", "current": "current" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "possible" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "possible", "cause": "version_mismatch" } }],
       "text": {
         "headline": {
           "en": "This world was saved with {owner:mod} {expected}, and {current} is installed now. Installing the saved version, or restoring a world backup, is a possible next step."
@@ -1233,6 +1239,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "file",
             "scope": "root_cause",
             "level": "likely",
             "candidate": { "owner_of": "file" },

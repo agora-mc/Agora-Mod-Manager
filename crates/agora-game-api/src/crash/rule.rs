@@ -18,7 +18,7 @@
 //! The effects fire once per surviving branch. Text may say `{name}` for a bound value and
 //! `{owner:name}` for the display name of whatever provides a ref.
 
-use super::{Family, Level, Role, Scalar, Scope, Strength};
+use super::{Cause, Family, Level, Role, Scalar, Scope, Strength};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
@@ -288,6 +288,10 @@ pub enum Effect {
     Finding {
         scope: Scope,
         level: Level,
+        /// What kind of cause this is. Absent: a root-cause finding about a mod is `mod`, and a
+        /// finding that accuses nobody is `other`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         candidate: Option<OwnerOf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

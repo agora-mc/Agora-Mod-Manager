@@ -124,6 +124,8 @@ fn pack(export: &str, accepts: &[&str]) -> LoadedCrashPack {
         plugin_id: PLUGIN.to_string(),
         plugin_name: "Acme Inspector".to_string(),
         plugin_version: "1.0.0".to_string(),
+        dependencies: Vec::new(),
+        official: false,
         file: "crash/pack.json".to_string(),
         pack: CrashPack {
             contract: 1,

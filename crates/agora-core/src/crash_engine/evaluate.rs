@@ -3,8 +3,8 @@
 
 use super::*;
 use agora_game_api::crash::{
-    AttrMatch, AttrValue, Condition, CouldNotCheck, CouldNotCheckReason, CountQuery, Coverage,
-    CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding, InspectResult,
+    AttrMatch, AttrValue, Cause, Condition, CouldNotCheck, CouldNotCheckReason, CountQuery,
+    Coverage, CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding, InspectResult,
     InspectionRecord, Level, LocalText, MatchOps, NextStepKind, ParseNoteKind, Ref, RepairOffer,
     RepairRequest, ResolvedRepair, Role, Rule, RuleText, Scalar, Scope, Signal, SourceAttribution,
     Strength, TextMatch, TrustNote, Truth,
@@ -1819,6 +1819,18 @@ fn overflow_note(plugin: &PluginIdentity, rule: &Rule) -> CouldNotCheck {
     }
 }
 
+/// The kind a finding has when the pack states none: a root cause about a mod is `mod`, everything
+/// else is `other`. A root cause about the game or a generated file is not a mod's fault.
+fn default_cause(scope: Scope, owner: Option<&Owner>) -> Cause {
+    if scope == Scope::RootCause
+        && matches!(owner, Some(Owner::Item { .. } | Owner::Framework { .. }))
+    {
+        Cause::Mod
+    } else {
+        Cause::Other
+    }
+}
+
 fn culprit_owner(owner: &Owner, role: Option<Role>) -> bool {
     if matches!(role, Some(Role::System | Role::Platform)) {
         return false;
@@ -1884,6 +1896,7 @@ fn apply_effects(
             Effect::Finding {
                 scope,
                 level,
+                cause,
                 candidate,
                 family,
                 weight,
@@ -1939,6 +1952,7 @@ fn apply_effects(
                 product.findings.push(Finding {
                     scope: effective_scope,
                     level: *level,
+                    cause: cause.unwrap_or_else(|| default_cause(effective_scope, owner.as_ref())),
                     candidate: owner.clone(),
                     headline: rendered.headline,
                     why_not_sure: rendered.why_not_sure,
@@ -1984,6 +1998,7 @@ fn apply_effects(
                 product.findings.push(Finding {
                     scope: Scope::Environment,
                     level: Level::NotSure,
+                    cause: Cause::Other,
                     candidate: None,
                     headline: rendered.headline,
                     why_not_sure: None,

@@ -843,6 +843,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "memory",
             "scope": "environment",
             "level": "likely"
           }
@@ -880,6 +881,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "missing_requirement",
             "scope": "environment",
             "level": "possible"
           }
@@ -926,6 +928,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "file",
             "scope": "environment",
             "level": "likely"
           }
@@ -1012,6 +1015,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "missing_requirement",
             "scope": "environment",
             "level": "likely"
           }
@@ -1058,6 +1062,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -1095,6 +1100,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "driver",
             "scope": "environment",
             "level": "possible"
           }
@@ -1142,6 +1148,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "other",
             "scope": "environment",
             "level": "possible"
           }
@@ -1332,6 +1339,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -1385,6 +1393,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -1493,6 +1502,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "version_mismatch",
             "scope": "environment",
             "level": "possible"
           }
@@ -1573,6 +1583,7 @@
         "on_fail": [
           {
             "finding": {
+              "cause": "version_mismatch",
               "scope": "root_cause",
               "level": "likely",
               "candidate": {
@@ -1642,6 +1653,7 @@
         "on_fail": [
           {
             "finding": {
+              "cause": "version_mismatch",
               "scope": "root_cause",
               "level": "likely",
               "candidate": {
@@ -1727,6 +1739,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "driver",
             "scope": "environment",
             "level": "possible"
           }
@@ -1767,6 +1780,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "version_mismatch",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -1807,6 +1821,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "missing_requirement",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -1847,6 +1862,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "version_mismatch",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -1892,6 +1908,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "version_mismatch",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -1932,6 +1949,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "version_mismatch",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -1972,6 +1990,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "missing_requirement",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -2019,6 +2038,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "root_cause",
             "level": "possible",
             "candidate": {
@@ -2151,6 +2171,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "file",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2181,6 +2202,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "other",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2211,6 +2233,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "other",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2241,6 +2264,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "driver",
             "scope": "environment",
             "level": "possible"
           }
@@ -2271,6 +2295,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "other",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2303,6 +2328,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "driver",
             "scope": "environment",
             "level": "possible"
           }
@@ -2335,6 +2361,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "mod",
             "scope": "environment",
             "level": "possible"
           }
@@ -2367,6 +2394,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "save",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2433,6 +2461,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "save",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2468,6 +2497,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "save",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2501,6 +2531,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "save",
             "scope": "mechanism",
             "level": "possible"
           }
@@ -2568,6 +2599,7 @@
       "effects": [
         {
           "finding": {
+            "cause": "missing_requirement",
             "scope": "environment",
             "level": "possible"
           }

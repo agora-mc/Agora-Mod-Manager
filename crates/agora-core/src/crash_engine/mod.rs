@@ -134,9 +134,10 @@ pub(crate) fn clean_findings(
             .unwrap_or_default();
         let evidence: Vec<String> = finding.evidence.iter().map(evidence_key).collect();
         format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             scope_rank(finding.scope),
             finding.level.label(),
+            finding.cause.label(),
             candidate,
             candidate_name,
             headline,

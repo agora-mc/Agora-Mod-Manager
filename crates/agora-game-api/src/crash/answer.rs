@@ -29,6 +29,53 @@ impl Level {
     }
 }
 
+/// What kind of cause a finding describes. Closed, so a screen can show each kind well; `other`
+/// is the open door. A cause can be a mod, but it need not name one: "your page file is too small"
+/// is a complete answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cause {
+    /// A mod, by name.
+    Mod,
+    /// A mod or plugin built for another game version.
+    VersionMismatch,
+    /// Something a mod or the game needs is not installed.
+    MissingRequirement,
+    /// One file, such as a mesh, texture or data file.
+    File,
+    /// A setting or configuration.
+    Setting,
+    /// The save or world.
+    Save,
+    /// Memory: out of memory, or too little.
+    Memory,
+    /// A graphics driver or injector.
+    Driver,
+    /// The game installation itself.
+    GameInstall,
+    /// Anything else, in the pack's words.
+    #[default]
+    Other,
+}
+
+impl Cause {
+    /// The words the UI and the CLI use for this kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mod => "mod",
+            Self::VersionMismatch => "version mismatch",
+            Self::MissingRequirement => "missing requirement",
+            Self::File => "file",
+            Self::Setting => "setting",
+            Self::Save => "save",
+            Self::Memory => "memory",
+            Self::Driver => "driver",
+            Self::GameInstall => "game install",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// What a statement is about. A mechanism ("read a bad pointer") never fills the "who did it" slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +201,10 @@ pub struct Signal {
 pub struct Finding {
     pub scope: Scope,
     pub level: Level,
+    /// What kind of cause this is. A root-cause finding about a mod defaults to `mod`; a finding
+    /// that accuses nobody defaults to `other` unless the pack says otherwise.
+    #[serde(default)]
+    pub cause: Cause,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate: Option<Owner>,
     pub headline: LocalText,
@@ -336,6 +387,10 @@ pub struct CrashAnswer {
     pub verdict: SessionVerdict,
     pub headline: LocalText,
     pub level: Level,
+    /// The kind of cause of the top answer, when there is one to state. It is the top suspect's
+    /// cause, or the strongest non-mod finding's cause when nobody is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Cause>,
     /// Ranked, strongest first. Empty when Agora isn't naming anyone.
     pub candidates: Vec<Candidate>,
     pub findings: Vec<Finding>,
