@@ -530,33 +530,178 @@ pub(crate) fn is_mod_id(value: &str) -> bool {
         })
 }
 
-/// A mixin failure block names the config and, sometimes, the mod that owns it.
-pub(crate) fn crash_mixin_line(line: &str, line_no: usize) -> Option<Fact> {
-    let rest = line.split("Mixin [").nth(1)?;
-    let (inside, _) = rest.split_once(']')?;
-    let (config_and_class, named) = match inside.split_once(" from mod ") {
-        Some((config, id)) => (config, Some(id.trim().to_string())),
-        None => (inside, None),
-    };
-    let config = config_and_class.split(':').next()?.trim();
-    if config.is_empty() {
+/// A mixin failure: the config it named, the class it tried to change, and the mod that owns it.
+pub(crate) struct MixinFailure {
+    pub config: String,
+    pub target: Option<String>,
+    pub owner: Option<String>,
+}
+
+/// A line from any loader's mixin failure shapes. The mod's own config and its target are kept as
+/// separate refs so a pack can map either to a mod, and the config's owner ranks first.
+pub(crate) fn mixin_failure_line(line: &str) -> Option<MixinFailure> {
+    let lower = line.to_ascii_lowercase();
+    let is_failure = lower.contains("mixin apply")
+        || lower.contains("mixin prepare")
+        || lower.contains("mixin [")
+        || lower.contains("failed injection")
+        || lower.contains("injection failure")
+        || lower.contains("was loaded too early")
+        || (lower.contains(" from mod ")
+            && (lower.contains(".mixins.json") || lower.contains(".mixin.json"))
+            && lower.contains("failed"));
+    if !is_failure {
         return None;
     }
-    let owner = named
-        .filter(|id| is_mod_id(id))
-        .or_else(|| config_mod_id(config));
-    Some(fact(
-        "minecraft.mixin_failure",
-        vec![
-            ("severity", text("critical")),
-            ("config", text(config.to_string())),
-        ],
-        owner
-            .map(|id| vec![reference("mod_id", id, Strength::Mention)])
-            .unwrap_or_default(),
+    let config = mixin_config_token(line)?;
+    let target = mixin_target_token(line);
+    if lower.contains("was loaded too early") {
+        // "Target already loaded" is worth naming only when a second mod is named too. A platform
+        // target means the line names one mod, and blaming it there is a guess.
+        let target = target.as_deref()?;
+        if is_platform_or_framework_class(target) {
+            return None;
+        }
+    }
+    let owner = named_mixin_owner(line).or_else(|| config_mod_id(&config));
+    Some(MixinFailure {
+        config,
+        target,
+        owner,
+    })
+}
+
+/// A mixin failure fact. The owner (when one is named) comes first, then the config, then the
+/// target class, so a pack can bind any of them.
+pub(crate) fn mixin_failure_fact(
+    failure: MixinFailure,
+    line_no: usize,
+    owner_strength: Strength,
+) -> Fact {
+    let mut attrs = vec![
+        ("severity", text("critical")),
+        ("config", text(failure.config.clone())),
+    ];
+    if let Some(target) = &failure.target {
+        attrs.push(("target", text(target.clone())));
+    }
+    let mut refs = Vec::new();
+    if let Some(owner) = &failure.owner {
+        refs.push(reference("mod_id", owner.clone(), owner_strength));
+    }
+    refs.push(reference(
+        "mixin_config",
+        mixin_config_value(&failure.config),
+        Strength::Mention,
+    ));
+    if let Some(target) = &failure.target {
+        if looks_like_class(target) {
+            refs.push(reference("class", target.clone(), Strength::Mention));
+        }
+    }
+    fact("minecraft.mixin_failure", attrs, refs, line_no, "mixin")
+}
+
+/// A mixin failure block names the config and, sometimes, the mod that owns it.
+pub(crate) fn crash_mixin_line(line: &str, line_no: usize) -> Option<Fact> {
+    Some(mixin_failure_fact(
+        mixin_failure_line(line)?,
         line_no,
-        "mixin",
+        Strength::Mention,
     ))
+}
+
+/// The first token on the line that looks like a mixin config (`a.mixins.json`, `a-common.mixins.json`,
+/// `mixins.a.json`), without its `:MixinClass` suffix.
+fn mixin_config_token(line: &str) -> Option<String> {
+    line.split_whitespace().find_map(|raw| {
+        let token = raw.trim_matches(|character: char| {
+            matches!(
+                character,
+                '[' | ']' | '(' | ')' | ',' | ';' | '\'' | '"' | '<' | '>'
+            )
+        });
+        let base = token.split(':').next().unwrap_or(token);
+        is_mixin_config(base).then(|| base.to_string())
+    })
+}
+
+fn is_mixin_config(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower.ends_with(".mixins.json")
+        || lower.ends_with(".mixin.json")
+        || (lower.starts_with("mixins.") && lower.ends_with(".json"))
+        || (lower.starts_with("mixin.") && lower.ends_with(".json"))
+}
+
+/// The class a failure names as its target, from either `target <class>` or `-> <class>:`.
+fn mixin_target_token(line: &str) -> Option<String> {
+    let raw = if let Some(rest) = line.split(" target ").nth(1) {
+        rest.split_whitespace().next()?
+    } else {
+        line.split(" -> ").nth(1)?.split(':').next()?.trim()
+    };
+    let target = raw.trim_matches(|character: char| {
+        matches!(character, '[' | ']' | '(' | ')' | ',' | ';' | '\'' | '"')
+    });
+    (!target.is_empty() && looks_like_class(target)).then(|| target.to_string())
+}
+
+fn named_mixin_owner(line: &str) -> Option<String> {
+    let inside_brackets = line
+        .split("Mixin [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .and_then(|inside| inside.split(" from mod ").nth(1));
+    let candidate = inside_brackets
+        .or_else(|| line.split(" from mod ").nth(1))
+        .or_else(|| line.split("Mixin apply for mod ").nth(1))
+        .or_else(|| line.split("Mixin prepare for mod ").nth(1))?;
+    let id = candidate
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, ',' | ']' | ')' | ';')
+        })
+        .next()?
+        .trim();
+    is_mod_id(id).then(|| id.to_string())
+}
+
+fn looks_like_class(value: &str) -> bool {
+    value.contains('.') || value.contains('/')
+}
+
+fn is_platform_or_framework_class(value: &str) -> bool {
+    let value = value.replace('/', ".");
+    [
+        "java.",
+        "javax.",
+        "jdk.",
+        "sun.",
+        "net.minecraft.",
+        "net.fabricmc.",
+        "net.minecraftforge.",
+        "net.neoforged.",
+        "com.mojang.",
+        "com.google.",
+        "org.apache.",
+        "org.spongepowered.",
+        "org.objectweb.",
+        "org.slf4j.",
+        "io.netty.",
+        "it.unimi.",
+        "com.llamalad7.",
+        "kotlin.",
+        "scala.",
+        "org.lwjgl.",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
+/// A config's stem with the separators a mod id may use turned into dots, so the pack's `segment`
+/// matcher sees `examplemod` in `examplemod-common.mixins.json`.
+fn mixin_config_value(config: &str) -> String {
+    config.replace(['-', '_'], ".")
 }
 
 /// The config's leading token is usually the mod id; skip the generic prefixes a loader writes.
@@ -573,6 +718,227 @@ fn config_mod_id(config: &str) -> Option<String> {
             None
         }
     })
+}
+
+/// Classes an exception's message names, when that is the only place a mod appears. Only shapes
+/// specific enough to mean something are read: a mixin error whose message is a class, and a
+/// missing-member error, where the message names the class that expected the member.
+pub(crate) fn named_message_classes(exception_class: &str, message: &str) -> Vec<String> {
+    if exception_class.ends_with("ClassMetadataNotFoundException") {
+        return class_tokens(message);
+    }
+    if exception_class.ends_with("AbstractMethodError") {
+        if let Some(rest) = message.split("of abstract class ").nth(1) {
+            let class = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or(rest)
+                .trim_end_matches('.');
+            if looks_like_class(class) {
+                return vec![class.to_string()];
+            }
+        }
+    }
+    if exception_class.ends_with("NoSuchMethodError")
+        || exception_class.ends_with("NoSuchFieldError")
+        || exception_class.ends_with("IllegalAccessError")
+    {
+        return class_tokens(message);
+    }
+    if exception_class.ends_with("NullPointerException") {
+        return quoted_class_paths(message);
+    }
+    Vec::new()
+}
+
+/// Class paths the JVM quotes in a null-pointer message, such as the owner of a null field. The
+/// last part is the member, not the class, so it is dropped.
+fn quoted_class_paths(message: &str) -> Vec<String> {
+    let mut classes = Vec::new();
+    for piece in message.split('"') {
+        let token = piece.trim().trim_end_matches('.');
+        let token = token.split('(').next().unwrap_or(token).trim();
+        if !token.contains('.')
+            || !token
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_lowercase())
+        {
+            continue;
+        }
+        let Some((class, _member)) = token.rsplit_once('.') else {
+            continue;
+        };
+        if class.split('.').count() >= 3 && !is_platform_or_framework_class(class) {
+            let class = class.to_string();
+            if !classes.contains(&class) {
+                classes.push(class);
+            }
+        }
+    }
+    classes
+}
+
+fn fact_text<'a>(fact: &'a Fact, attr: &str) -> Option<&'a str> {
+    match fact.attrs.get(attr) {
+        Some(AttrValue::Scalar(Scalar::Text(text))) => Some(text),
+        _ => None,
+    }
+}
+
+fn class_tokens(message: &str) -> Vec<String> {
+    let mut classes = Vec::new();
+    for raw in message.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '$'))
+    }) {
+        let token = raw.trim_matches(|character: char| matches!(character, '.' | '$'));
+        let segments = token.split('.').count();
+        let starts_lower = token
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_lowercase());
+        if segments >= 3 && starts_lower && !is_platform_or_framework_class(token) {
+            let class = token.to_string();
+            if !classes.contains(&class) {
+                classes.push(class);
+            }
+        }
+    }
+    classes
+}
+
+/// A Forge 1.7-1.12 `LoaderException` that fails because one mod's class is missing from another's
+/// package. The loader names the mod that failed and the missing class; this turns that into the
+/// same dependency fact an explicit "missing mods" line would produce.
+pub(crate) fn loader_dependency_problem(facts: &[Fact]) -> Option<Fact> {
+    let exception = |fact: &Fact| {
+        fact.kind == "core.exception"
+            && fact_text(fact, "class").is_some_and(|class| class.ends_with("LoaderException"))
+    };
+    let loader = facts.iter().find(|fact| {
+        exception(fact)
+            && fact_text(fact, "message")
+                .is_some_and(|message| message.contains("NoClassDefFoundError"))
+    })?;
+    let needed_class = fact_text(loader, "message")
+        .and_then(|message| message.split("NoClassDefFoundError:").nth(1))
+        .and_then(descriptor_class)?;
+    let missing = facts
+        .iter()
+        .filter(|fact| {
+            fact.kind == "core.exception"
+                && fact_text(fact, "class")
+                    .is_some_and(|class| class.ends_with("ClassNotFoundException"))
+        })
+        .max_by(|a, b| depth(a).total_cmp(&depth(b)))?;
+    let missing_class = fact_text(missing, "message")?;
+    let missing_id = package_mod_id(missing_class)?;
+    let needed_by = package_mod_id(&needed_class)?;
+    if missing_id == needed_by {
+        return None;
+    }
+    let line = loader
+        .span
+        .as_ref()
+        .and_then(|span| span.line_start)
+        .unwrap_or(0) as usize;
+    Some(fact(
+        "core.dependency_problem",
+        vec![
+            ("state", text("absent")),
+            ("requirement", text("any version")),
+            ("needed_by", text(needed_by.clone())),
+        ],
+        vec![
+            reference("mod_id", missing_id, Strength::Mention),
+            reference("needed_by", needed_by, Strength::Mention),
+        ],
+        line,
+        "fatal",
+    ))
+}
+
+fn descriptor_class(message: &str) -> Option<String> {
+    let descriptor = message.split_whitespace().next()?.trim();
+    let descriptor = descriptor.strip_prefix('L')?.trim_end_matches(';');
+    let class = descriptor.replace('/', ".");
+    looks_like_class(&class).then_some(class)
+}
+
+fn package_mod_id(class: &str) -> Option<String> {
+    let first = class.split('.').next()?.trim();
+    let reserved = matches!(
+        first.to_ascii_lowercase().as_str(),
+        "net" | "com" | "org" | "java" | "javax" | "jdk" | "sun" | "io" | "me" | "cpw" | "lwjgl"
+    );
+    (is_mod_id(first) && !reserved).then(|| first.to_string())
+}
+
+fn depth(fact: &Fact) -> f64 {
+    match fact.attrs.get("depth") {
+        Some(AttrValue::Scalar(Scalar::Number(depth))) => *depth,
+        _ => 0.0,
+    }
+}
+
+/// A fatal JSON error that names a mod's data namespace. Only the fatal exception chain reaches
+/// here, so an unrelated warning earlier in a long log cannot accuse a mod.
+pub(crate) fn data_error_fact(
+    exception_class: &str,
+    message: &str,
+    line: usize,
+    section: &str,
+) -> Option<Fact> {
+    let json = exception_class.ends_with("JsonSyntaxException")
+        || exception_class.ends_with("JsonParseException")
+        || exception_class.ends_with("MalformedJsonException");
+    if !json {
+        return None;
+    }
+    let namespace = data_namespace(message)?;
+    Some(fact(
+        "minecraft.data_error",
+        vec![
+            ("namespace", text(namespace.clone())),
+            ("message", text(message.to_string())),
+        ],
+        vec![reference("mod_id", namespace, Strength::Mention)],
+        line,
+        section,
+    ))
+}
+
+fn data_namespace(message: &str) -> Option<String> {
+    if let Some(rest) = message.split("data/").nth(1) {
+        if let Some(namespace) = rest.split('/').next() {
+            if is_data_namespace(namespace) {
+                return Some(namespace.to_string());
+            }
+        }
+    }
+    for token in message.split_whitespace() {
+        let token = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '\'' | '"' | ',' | ';' | '(' | ')' | '[' | ']' | '.'
+            )
+        });
+        let Some((namespace, rest)) = token.split_once(':') else {
+            continue;
+        };
+        if rest.contains('/') && is_data_namespace(namespace) {
+            return Some(namespace.to_string());
+        }
+    }
+    None
+}
+
+fn is_data_namespace(namespace: &str) -> bool {
+    is_mod_id(namespace)
+        && !matches!(
+            namespace.to_ascii_lowercase().as_str(),
+            "minecraft" | "forge" | "neoforge"
+        )
 }
 
 fn is_numeric_or_hex(text: &str) -> bool {
