@@ -1,10 +1,10 @@
 //! The game's `latest.log`: the loader's own account of what it refused to load.
 
 use super::shared::{
-    collect_lines, data_error_fact, fact, file_problem, frame_symbol_and_class, is_mod_id,
-    jar_from_frame, java_exception_category, jvm_problem, loader_dependency_problem, looked_for,
-    mixin_failure_fact, mixin_failure_line, mod_crash_from_message, mod_crash_line,
-    named_message_classes, notes_for, number, reference, source_location, text,
+    collect_lines, data_error_fact, fabric_dependency, fact, file_problem, frame_symbol_and_class,
+    is_mod_id, jar_from_frame, java_exception_category, jvm_problem, loader_dependency_problem,
+    loader_problem, looked_for, mixin_failure_fact, mixin_failure_line, mod_crash_from_message,
+    mod_crash_line, named_message_classes, notes_for, number, reference, source_location, text,
 };
 use agora_game_api::crash::{
     BucketPart, BuiltInParser, BuiltInParserError, Coverage, CoverageState, Fact, ParserOutput,
@@ -745,62 +745,6 @@ fn loader_universal_jar(file: &str) -> Option<(String, String)> {
     Some((id.to_string(), version.to_string()))
 }
 
-fn fabric_dependency(line: &str) -> Option<(String, String, String, String)> {
-    let rest = line.trim_start().strip_prefix('-')?.trim_start();
-    let rest = rest.strip_prefix("Mod '")?;
-    let (_, rest) = rest.split_once("' (")?;
-    let (required_by, rest) = rest.split_once(')')?;
-    let rest = rest.trim_start();
-    let pos = rest.find(" requires ")?;
-    let need = rest[pos + " requires ".len()..].trim();
-
-    let (need, state) = if let Some((need, after)) = need.split_once(", which is ") {
-        let state = if after.starts_with("missing") {
-            "absent"
-        } else if after.starts_with("disabled") {
-            "disabled"
-        } else if after.starts_with("incompatible") {
-            "incompatible"
-        } else {
-            return None;
-        };
-        (need, state)
-    } else if need.contains(", but only the wrong version is present") {
-        (need.split(", but only").next()?, "wrong_version")
-    } else {
-        return None;
-    };
-
-    let (requirement, target) = match need.split_once(" of ") {
-        Some((requirement, target)) => (requirement.trim(), target.trim()),
-        None => ("any version", need.trim()),
-    };
-    let missing = target_id(target);
-    if missing.is_empty() {
-        return None;
-    }
-    Some((
-        state.to_string(),
-        required_by.trim().to_string(),
-        missing,
-        requirement.to_string(),
-    ))
-}
-
-fn target_id(target: &str) -> String {
-    if let Some((_, id)) = target.rsplit_once(" (") {
-        if let Some(id) = id.strip_suffix(')') {
-            return id.trim().to_string();
-        }
-    }
-    target
-        .trim_matches(|c: char| c == '\'' || c == '"' || c == '.' || c == ',')
-        .split_whitespace()
-        .last()
-        .unwrap_or("")
-        .to_string()
-}
-
 fn forge_dependency(line: &str) -> Option<(String, String, String, String)> {
     let rest = line.split("Mod ID: '").nth(1)?;
     let (id, rest) = rest.split_once("', Requested by: '")?;
@@ -905,28 +849,6 @@ fn world_mod(line: &str) -> Option<WorldMod> {
         expected: Some(expected.trim().to_string()),
         current: Some(current.to_string()),
     })
-}
-
-fn loader_problem(line: &str) -> Option<&'static str> {
-    let lower = line.to_ascii_lowercase();
-    if lower.contains("modresolutionexception") || lower.contains("incompatible mod set") {
-        return Some("resolution");
-    }
-    if lower.contains("incompatible mods found") {
-        return Some("incompatible");
-    }
-    if lower.contains("duplicate asm classes found on classpath")
-        || lower.contains("duplicate classes found on classpath")
-    {
-        return Some("duplicate_classpath");
-    }
-    if lower.starts_with("missing or unsupported mandatory dependencies") {
-        return Some("missing_dependency");
-    }
-    if lower.contains("maximum id range exceeded") {
-        return Some("id_limit");
-    }
-    None
 }
 
 fn looks_like_mod_error(line: &str) -> bool {

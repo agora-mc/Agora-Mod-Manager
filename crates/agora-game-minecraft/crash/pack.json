@@ -364,7 +364,8 @@
           "signal": {
             "family": "known_signature",
             "candidate": { "owner_of": "config_owner" },
-            "weight": 11
+            "weight": 11,
+            "cause": "mod"
           }
         }
       ],
@@ -390,7 +391,8 @@
           "signal": {
             "family": "execution",
             "candidate": { "owner_of": "target_class" },
-            "weight": 4
+            "weight": 4,
+            "cause": "mod"
           }
         }
       ],
@@ -415,7 +417,8 @@
           "signal": {
             "family": "known_signature",
             "candidate": { "owner_of": "named_class" },
-            "weight": 6
+            "weight": 6,
+            "cause": "mod"
           }
         }
       ],
@@ -493,7 +496,6 @@
     {
       "id": "mod_resolution_failed",
       "version": 1,
-      "scope": { "producer": { "format": "minecraft_latest_log" } },
       "when": {
         "fact": {
           "kind": "minecraft.loader_problem",
@@ -514,7 +516,6 @@
     {
       "id": "incompatible_mods",
       "version": 1,
-      "scope": { "producer": { "format": "minecraft_latest_log" } },
       "when": {
         "fact": {
           "kind": "minecraft.loader_problem",

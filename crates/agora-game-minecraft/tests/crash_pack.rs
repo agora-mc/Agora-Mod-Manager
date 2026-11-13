@@ -452,6 +452,59 @@ java.lang.IllegalStateException: decorated frames\n\
     }
 
     #[test]
+    fn a_crash_report_reads_the_fabric_unmet_dependency_listing() {
+        let output = run_ok(
+            "crash_report",
+            &fixture("crash_fabric_missing_dependency.txt"),
+        );
+        let first = find(
+            &output,
+            "core.dependency_problem",
+            "needed_by",
+            "examplemod",
+        )
+        .expect("a problem");
+        assert_eq!(text_of(first, "state"), "absent");
+        assert_eq!(text_of(first, "requirement"), "any version");
+        assert!(first
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mod_id" && reference.value == "examplelib"));
+        let second = find(
+            &output,
+            "core.dependency_problem",
+            "needed_by",
+            "exampletools",
+        )
+        .expect("a problem");
+        assert_eq!(text_of(second, "requirement"), "version 2.0.0 or later");
+        assert!(second
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mod_id" && reference.value == "examplelib"));
+        assert_eq!(
+            output
+                .facts
+                .iter()
+                .filter(|fact| fact.kind == "core.dependency_problem")
+                .count(),
+            2,
+            "the install suggestion is not a dependency of its own"
+        );
+        assert!(find(&output, "minecraft.loader_problem", "kind", "resolution").is_some());
+        assert_eq!(
+            coverage_state(&output, "minecraft.loader_problem"),
+            CoverageState::Checked
+        );
+    }
+
+    #[test]
+    fn a_crash_report_reads_a_loader_incompatible_failure() {
+        let output = run_ok("crash_report", &fixture("crash_fabric_incompatible.txt"));
+        assert!(find(&output, "minecraft.loader_problem", "kind", "incompatible").is_some());
+    }
+
+    #[test]
     fn a_mixin_failure_names_the_config_target_and_mod() {
         let output = run_ok("latest_log", &fixture("latest_mixin.log"));
         let failure = output

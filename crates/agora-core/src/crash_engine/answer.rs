@@ -119,30 +119,9 @@ fn top_cause(
     findings: &[Finding],
 ) -> Option<Cause> {
     if let Some(top) = candidates.first() {
-        let key = owner_key(&top.owner);
-        let best = findings
-            .iter()
-            .filter(|finding| {
-                finding
-                    .candidate
-                    .as_ref()
-                    .is_some_and(|owner| owner_key(owner) == key)
-            })
-            .max_by_key(|finding| {
-                (
-                    finding.level,
-                    std::cmp::Reverse(scope_rank(finding.scope)),
-                    std::cmp::Reverse(finding.cause),
-                )
-            });
-        // A root-cause finding about a mod defaults to `mod`; anything else stays its own kind.
-        return Some(best.map(|finding| finding.cause).unwrap_or_else(|| {
-            if matches!(top.owner, Owner::Item { .. } | Owner::Framework { .. }) {
-                Cause::Mod
-            } else {
-                Cause::Other
-            }
-        }));
+        // The top candidate's cause already comes from its strongest clue that states one (and
+        // a root-cause finding feeds a clue), so the answer follows the top candidate.
+        return Some(top.cause);
     }
     // Nobody is named. A finding that states a non-mod cause is the whole answer, so the strongest
     // specific kind wins over `other`, which is the open door.

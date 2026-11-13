@@ -181,6 +181,16 @@ fn signal_rule(id: &str, family: &str, weight: u32) -> Value {
     })
 }
 
+fn signal_rule_with_cause(id: &str, family: &str, weight: u32, module: &str, cause: &str) -> Value {
+    json!({
+        "id": id,
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "value": module, "bind": "m" } } },
+        "effects": [{ "signal": { "family": family, "candidate": { "owner_of": "m" }, "weight": weight, "cause": cause } }],
+        "text": { "headline": { "en": "A clue." } }
+    })
+}
+
 fn root_cause_rule(id: &str, family: &str, weight: u32, level: &str) -> Value {
     json!({
         "id": id,
@@ -497,6 +507,174 @@ fn boost_signals_alone_give_no_candidate() {
     assert_eq!(evaluated.signals.len(), 1);
     assert!(consensus.candidates.is_empty());
     assert!(consensus.abstained);
+}
+
+#[test]
+fn a_candidate_cause_comes_from_its_strongest_signal_that_states_one() {
+    let resolver = FakeResolver::new()
+        .with("module", "modA.dll", item("mod-a", "Mod A"), None)
+        .with("module", "modB.dll", item("mod-b", "Mod B"), None);
+    // The heavier clue states no cause; the lighter one says why. The lighter one still decides
+    // the candidate's cause, because only it has an opinion.
+    let packs = vec![pack(
+        "p",
+        vec![
+            signal_rule_for_sort("heavy", "execution", 12, "modA.dll", None),
+            signal_rule_for_sort(
+                "why",
+                "known_signature",
+                4,
+                "modA.dll",
+                Some("version_mismatch"),
+            ),
+            signal_rule_for_sort("silent", "execution", 12, "modB.dll", None),
+        ],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll"), frame(1, "modB.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.candidates[0].cause, Cause::VersionMismatch);
+    assert_eq!(consensus.candidates[1].cause, Cause::Mod);
+}
+
+#[test]
+fn a_cause_tie_prefers_a_specific_kind_over_mod() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![
+            signal_rule_for_sort("says_mod", "execution", 8, "modA.dll", Some("mod")),
+            signal_rule_for_sort("says_file", "object_reference", 8, "modA.dll", Some("file")),
+        ],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (_, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.candidates[0].cause, Cause::File);
+}
+
+#[test]
+fn a_root_cause_finding_shares_its_cause_with_the_clue_it_feeds() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let rule = json!({
+        "id": "built_for_another_version",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{
+            "finding": {
+                "scope": "root_cause",
+                "level": "likely",
+                "cause": "version_mismatch",
+                "candidate": { "owner_of": "m" },
+                "family": "verified_asset",
+                "weight": 16
+            }
+        }],
+        "text": { "headline": { "en": "{owner:m} was built for another version." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(
+        evaluated.signals[0].cause,
+        Some(Cause::VersionMismatch),
+        "a finding's clue keeps its cause"
+    );
+    assert_eq!(consensus.candidates[0].cause, Cause::VersionMismatch);
+}
+
+#[test]
+fn the_answer_cause_follows_the_top_candidate() {
+    let resolver = FakeResolver::new()
+        .with("module", "modA.dll", item("mod-a", "Mod A"), None)
+        .with("module", "modB.dll", item("mod-b", "Mod B"), None);
+    let packs = vec![pack(
+        "p",
+        vec![
+            signal_rule_for_sort(
+                "top",
+                "known_signature",
+                14,
+                "modA.dll",
+                Some("version_mismatch"),
+            ),
+            signal_rule_for_sort("second", "execution", 6, "modB.dll", Some("memory")),
+        ],
+    )];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll"), frame(1, "modB.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Pid,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(top_key(&consensus.candidates).as_deref(), Some("mod-a"));
+    assert_eq!(answer.cause, Some(Cause::VersionMismatch));
+}
+
+fn signal_rule_for_sort(
+    id: &str,
+    family: &str,
+    weight: u32,
+    module: &str,
+    cause: Option<&str>,
+) -> Value {
+    match cause {
+        Some(cause) => signal_rule_with_cause(id, family, weight, module, cause),
+        None => signal_rule_for(id, family, weight, module),
+    }
 }
 
 #[test]

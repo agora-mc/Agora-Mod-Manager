@@ -1,0 +1,11 @@
+---- Minecraft Crash Report ----
+// An invented crash for these tests.
+
+Description: There was a severe problem during mod loading
+
+java.lang.RuntimeException: Incompatible mods found!
+	at example.loader.Loader.check(Loader.java:1)
+
+A detailed walkthrough of the error:
+-- System Details --
+	Minecraft Version: 1.20.1

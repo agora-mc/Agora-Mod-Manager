@@ -1,15 +1,17 @@
 //! The `---- Minecraft Crash Report ----` file, whichever loader wrote it.
 
 use super::shared::{
-    absent, checked, collect_lines, crash_mixin_line, data_error_fact, fact, file_problem,
-    frame_symbol_and_class, is_mod_id, jar_from_frame, java_exception_category, jvm_problem,
-    loader_dependency_problem, looked_for, mod_crash_from_message, mod_crash_line,
-    named_message_classes, not_applicable, notes_for, number, reference, source_location, text,
+    absent, checked, collect_lines, crash_mixin_line, data_error_fact, fabric_dependency, fact,
+    file_problem, frame_symbol_and_class, is_mod_id, jar_from_frame, java_exception_category,
+    jvm_problem, loader_dependency_problem, loader_problem, looked_for, mod_crash_from_message,
+    mod_crash_line, named_message_classes, not_applicable, notes_for, number, reference,
+    source_location, text,
 };
 use agora_game_api::crash::{
     BucketPart, BuiltInParser, BuiltInParserError, Fact, ParserOutput, ParserReads, ParserRequest,
     Producer, Strength, CRASH_CONTRACT_VERSION,
 };
+use std::collections::BTreeSet;
 
 pub struct CrashReportParser;
 
@@ -40,6 +42,7 @@ impl BuiltInParser for CrashReportParser {
         let mut facts: Vec<Fact> = Vec::new();
         let mut frames: Vec<(usize, usize)> = Vec::new();
         let mut bucket = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
 
         let mut section: Option<String> = None;
         let mut walkthrough = false;
@@ -72,6 +75,57 @@ impl BuiltInParser for CrashReportParser {
 
         for (offset, line) in collected.lines.iter().enumerate().skip(start + 1) {
             let line_no = offset + 1;
+
+            // A loader resolution failure writes the same unmet-dependency listing into a crash
+            // report that it writes into `latest.log`. Read it here so the same rules fire.
+            if let Some((state, required_by, missing, requirement)) = fabric_dependency(line) {
+                let key = format!("dep\0{required_by}\0{missing}\0{requirement}\0{state}");
+                if seen.insert(key) {
+                    if state == "incompatible" {
+                        facts.push(fact(
+                            "minecraft.loader_problem",
+                            vec![
+                                ("kind", text("incompatible")),
+                                ("message", text(line.trim().to_string())),
+                            ],
+                            vec![reference("mod_id", missing, Strength::Mention)],
+                            line_no,
+                            "loader",
+                        ));
+                    } else {
+                        facts.push(fact(
+                            "core.dependency_problem",
+                            vec![
+                                ("requirement", text(requirement)),
+                                ("state", text(state)),
+                                ("needed_by", text(required_by.clone())),
+                            ],
+                            vec![
+                                reference("mod_id", missing, Strength::Mention),
+                                reference("needed_by", required_by, Strength::Mention),
+                            ],
+                            line_no,
+                            "loader",
+                        ));
+                    }
+                }
+            }
+            if let Some(kind) = loader_problem(line) {
+                let key = format!("problem\0{kind}\0{}", line.trim());
+                if seen.insert(key) {
+                    let mut attrs = vec![("kind", text(kind))];
+                    if !line.trim().is_empty() {
+                        attrs.push(("message", text(line.trim().to_string())));
+                    }
+                    facts.push(fact(
+                        "minecraft.loader_problem",
+                        attrs,
+                        Vec::new(),
+                        line_no,
+                        "loader",
+                    ));
+                }
+            }
 
             if let Some(name) = section_header(line) {
                 if let Some(object) = ticking.take() {
@@ -452,7 +506,7 @@ impl BuiltInParser for CrashReportParser {
             not_applicable("core.log_line"),
             checked("core.dependency_problem"),
             not_applicable("core.module"),
-            not_applicable("minecraft.loader_problem"),
+            checked("minecraft.loader_problem"),
             not_applicable("minecraft.mod_conflict"),
             not_applicable("minecraft.world_mod"),
         ];

@@ -1870,6 +1870,7 @@ fn apply_effects(
                 family,
                 candidate,
                 weight,
+                cause,
             } => {
                 if let Some((owner, parser, role)) =
                     resolve_owner(&candidate.owner_of, branch, input.resolver)
@@ -1888,6 +1889,7 @@ fn apply_effects(
                         family: *family,
                         candidate: owner,
                         weight: *weight,
+                        cause: *cause,
                         source,
                         evidence: clean_evidence(branch.evidence.clone()),
                     });
@@ -1949,10 +1951,12 @@ fn apply_effects(
                         product.roles.insert(owner_key(owner), role);
                     }
                 }
+                let finding_cause =
+                    cause.unwrap_or_else(|| default_cause(effective_scope, owner.as_ref()));
                 product.findings.push(Finding {
                     scope: effective_scope,
                     level: *level,
-                    cause: cause.unwrap_or_else(|| default_cause(effective_scope, owner.as_ref())),
+                    cause: finding_cause,
                     candidate: owner.clone(),
                     headline: rendered.headline,
                     why_not_sure: rendered.why_not_sure,
@@ -1965,6 +1969,7 @@ fn apply_effects(
                             family: *family,
                             candidate: owner,
                             weight: *weight,
+                            cause: Some(finding_cause),
                             source,
                             evidence: clean_evidence(branch.evidence.clone()),
                         });
@@ -2133,10 +2138,11 @@ fn bucket_predates_change(facts: &[Fact]) -> bool {
 fn signal_key(signal: &Signal) -> String {
     let evidence: Vec<String> = signal.evidence.iter().map(evidence_key).collect();
     format!(
-        "{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}",
         signal.family as u8,
         owner_key(&signal.candidate),
         signal.weight,
+        signal.cause.map(|cause| cause as u8).unwrap_or(u8::MAX),
         source_key(&signal.source),
         evidence.join("\u{1f}")
     )

@@ -949,6 +949,89 @@ fn is_numeric_or_hex(text: &str) -> bool {
     !hex.is_empty() && hex.chars().all(|character| character.is_ascii_hexdigit())
 }
 
+/// One Fabric/Quilt unmet-dependency line: `Mod 'Name' (id) version requires ... of
+/// other, which is missing!`. It returns (state, required_by, missing, requirement), the same
+/// shape whether the line came from `latest.log` or a crash report's unmet listing.
+pub(crate) fn fabric_dependency(line: &str) -> Option<(String, String, String, String)> {
+    let rest = line.trim_start().strip_prefix('-')?.trim_start();
+    let rest = rest.strip_prefix("Mod '")?;
+    let (_, rest) = rest.split_once("' (")?;
+    let (required_by, rest) = rest.split_once(')')?;
+    let rest = rest.trim_start();
+    let pos = rest.find(" requires ")?;
+    let need = rest[pos + " requires ".len()..].trim();
+
+    let (need, state) = if let Some((need, after)) = need.split_once(", which is ") {
+        let state = if after.starts_with("missing") {
+            "absent"
+        } else if after.starts_with("disabled") {
+            "disabled"
+        } else if after.starts_with("incompatible") {
+            "incompatible"
+        } else {
+            return None;
+        };
+        (need, state)
+    } else if need.contains(", but only the wrong version is present") {
+        (need.split(", but only").next()?, "wrong_version")
+    } else {
+        return None;
+    };
+
+    let (requirement, target) = match need.split_once(" of ") {
+        Some((requirement, target)) => (requirement.trim(), target.trim()),
+        None => ("any version", need.trim()),
+    };
+    let missing = target_id(target);
+    if missing.is_empty() {
+        return None;
+    }
+    Some((
+        state.to_string(),
+        required_by.trim().to_string(),
+        missing,
+        requirement.to_string(),
+    ))
+}
+
+fn target_id(target: &str) -> String {
+    if let Some((_, id)) = target.rsplit_once(" (") {
+        if let Some(id) = id.strip_suffix(')') {
+            return id.trim().to_string();
+        }
+    }
+    target
+        .trim_matches(|c: char| c == '\'' || c == '"' || c == '.' || c == ',')
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A loader failure that stopped the game from resolving its mod set. Both a log and a crash
+/// report carry these messages, so both readers use this.
+pub(crate) fn loader_problem(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("modresolutionexception") || lower.contains("incompatible mod set") {
+        return Some("resolution");
+    }
+    if lower.contains("incompatible mods found") {
+        return Some("incompatible");
+    }
+    if lower.contains("duplicate asm classes found on classpath")
+        || lower.contains("duplicate classes found on classpath")
+    {
+        return Some("duplicate_classpath");
+    }
+    if lower.starts_with("missing or unsupported mandatory dependencies") {
+        return Some("missing_dependency");
+    }
+    if lower.contains("maximum id range exceeded") {
+        return Some("id_limit");
+    }
+    None
+}
+
 /// The jar or module a Forge/NeoForge frame annotation names: `~[some.jar%123!/:?]`.
 pub(crate) fn jar_from_frame(line: &str) -> Option<String> {
     let start = line.find("~[")? + 2;

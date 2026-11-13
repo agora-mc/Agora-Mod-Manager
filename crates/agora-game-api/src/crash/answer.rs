@@ -191,6 +191,9 @@ pub struct Signal {
     pub family: Family,
     pub candidate: Owner,
     pub weight: u32,
+    /// What kind of cause this clue points at, when the rule states one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Cause>,
     pub source: SourceAttribution,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceLine>,
@@ -228,12 +231,19 @@ pub enum SaveRiskLabel {
     Unknown,
 }
 
+fn default_candidate_cause() -> Cause {
+    Cause::Mod
+}
+
 /// A suspect after consensus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
     pub owner: Owner,
     pub level: Level,
     pub score: u32,
+    /// The cause of the strongest clue that states one; `mod` when no clue does.
+    #[serde(default = "default_candidate_cause")]
+    pub cause: Cause,
     pub families: Vec<Family>,
     /// Everyone whose rules contributed, so a noisy plugin can be spotted.
     pub sources: Vec<SourceAttribution>,
@@ -388,7 +398,8 @@ pub struct CrashAnswer {
     pub headline: LocalText,
     pub level: Level,
     /// The kind of cause of the top answer, when there is one to state. It is the top suspect's
-    /// cause, or the strongest non-mod finding's cause when nobody is named.
+    /// cause (from the strongest clue that states one), or the strongest non-mod finding's cause
+    /// when nobody is named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<Cause>,
     /// Ranked, strongest first. Empty when Agora isn't naming anyone.

@@ -743,7 +743,8 @@
             "candidate": {
               "owner_of": "p"
             },
-            "weight": 6
+            "weight": 6,
+            "cause": "mod"
           }
         }
       ],
@@ -781,7 +782,8 @@
             "candidate": {
               "owner_of": "p"
             },
-            "weight": 3
+            "weight": 3,
+            "cause": "mod"
           }
         }
       ],
@@ -816,7 +818,8 @@
             "candidate": {
               "owner_of": "f"
             },
-            "weight": 5
+            "weight": 5,
+            "cause": "file"
           }
         }
       ],
@@ -1226,7 +1229,8 @@
             "candidate": {
               "owner_of": "d"
             },
-            "weight": 6
+            "weight": 6,
+            "cause": "mod"
           }
         }
       ],
@@ -1306,7 +1310,8 @@
             "candidate": {
               "owner_of": "d"
             },
-            "weight": 6
+            "weight": 6,
+            "cause": "version_mismatch"
           }
         }
       ],
@@ -1599,7 +1604,8 @@
               "candidate": {
                 "owner_of": "d"
               },
-              "weight": 8
+              "weight": 8,
+              "cause": "version_mismatch"
             }
           }
         ]
@@ -1669,7 +1675,8 @@
               "candidate": {
                 "owner_of": "d"
               },
-              "weight": 8
+              "weight": 8,
+              "cause": "version_mismatch"
             }
           }
         ]
