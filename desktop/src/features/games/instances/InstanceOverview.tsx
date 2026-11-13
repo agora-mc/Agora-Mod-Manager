@@ -15,10 +15,13 @@ import {
   orderFindings,
 } from './instanceText';
 import { useInstanceSession } from './instanceSession';
+import type { GameInstancePage } from '@/lib/useDestination';
+import { CrashAnswerOverview } from './CrashAnswerPanel';
 
 interface InstanceOverviewTabProps {
   gameId: string;
   instanceId: string;
+  onNavigatePage?: (page: GameInstancePage) => void;
 }
 
 /** `checked 2 min ago`, for the last answer the page is showing while it checks again. */
@@ -36,7 +39,7 @@ function checkedAgo(at: number | null, now: number): string | null {
  * across the whole width below them, where long ids have the room to wrap. Launch itself is in the header every page shares. The last checks show at once and are
  * refreshed in the background.
  */
-export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
+export function InstanceOverviewTab({ instanceId, onNavigatePage }: InstanceOverviewTabProps) {
   const session = useInstanceSession();
   const { page, busy } = session;
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -56,6 +59,13 @@ export function InstanceOverviewTab(_props: InstanceOverviewTabProps) {
 
   return (
     <div className="@container">
+      <div className="mb-6">
+        <CrashAnswerOverview
+          instanceId={instanceId}
+          onNavigatePage={onNavigatePage}
+          onRunAgain={() => void session.launch()}
+        />
+      </div>
       <section className="grid items-start gap-6 @2xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]" data-testid="instance-overview">
         <section aria-labelledby="checks-heading" className="space-y-4 rounded-xl border border-border bg-card p-5">
           <div className="flex flex-wrap items-center justify-between gap-2">

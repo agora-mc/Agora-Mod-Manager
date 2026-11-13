@@ -44,6 +44,10 @@ pub enum StoredAnswer {
     Analyzed {
         answer: Box<CrashAnswer>,
         files: Vec<AnalyzedFile>,
+        /// What changed since the last session that ended normally, when one exists. Stored so the
+        /// answer screen can list it later; absent in answers written before this was kept.
+        #[serde(default)]
+        changes: Vec<ManifestChange>,
     },
     /// Nothing was readable for this session. That is not a clean bill of health.
     NothingToRead { why: String },
@@ -94,6 +98,33 @@ pub fn answer_for_session(
         )
         .optional()?;
     row.map(decode_answer).transpose()
+}
+
+/// Every stored answer for an instance, newest session first. The newest is the card the overview
+/// shows; the rest are the instance's earlier crashes. A session with no row in `launch_history`
+/// (only possible for an answer written by hand) is ordered by when it was stored.
+pub fn answers_for_instance(
+    conn: &Connection,
+    instance_id: &str,
+) -> anyhow::Result<Vec<SessionAnswer>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.session_id, a.instance_id, a.created_at, a.answer_json
+           FROM session_answers a
+           LEFT JOIN launch_history h ON h.session_id = a.session_id
+          WHERE a.instance_id = ?1
+          ORDER BY COALESCE(h.ended_at, h.started_at, a.created_at) DESC, a.session_id DESC",
+    )?;
+    let rows = stmt
+        .query_map([instance_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter().map(decode_answer).collect()
 }
 
 /// The newest stored answer for an instance.
@@ -356,6 +387,7 @@ fn diagnose_record(
     Ok(StoredAnswer::Analyzed {
         answer: Box::new(output.answer),
         files: output.files,
+        changes,
     })
 }
 

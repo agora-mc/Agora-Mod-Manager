@@ -25,6 +25,7 @@ pub mod crash_engine;
 pub mod crash_evidence;
 pub mod crash_export;
 pub mod crash_live;
+pub mod crash_loose;
 pub mod crash_packs;
 pub mod crash_service;
 pub mod ctx;

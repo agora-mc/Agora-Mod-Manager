@@ -37,7 +37,13 @@ export function GameInstancePage({ gameId, instanceId, page, onNavigatePage, onB
         </div>
         <InstanceHero onShowChecks={() => onNavigatePage('overview')} />
         <InstanceTabBar tabs={tabs} active={page} onSelect={onNavigatePage} />
-        {page === 'overview' && <InstanceOverviewTab gameId={gameId} instanceId={instanceId} />}
+        {page === 'overview' && (
+          <InstanceOverviewTab
+            gameId={gameId}
+            instanceId={instanceId}
+            onNavigatePage={onNavigatePage}
+          />
+        )}
         {page === 'content' && <InstanceContentTab gameId={gameId} instanceId={instanceId} />}
         {page === 'plugins' && <InstancePluginsTab gameId={gameId} instanceId={instanceId} />}
         {page === 'ini-saves' && <InstanceIniSavesTab gameId={gameId} instanceId={instanceId} />}

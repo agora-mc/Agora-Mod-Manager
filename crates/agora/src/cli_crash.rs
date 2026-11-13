@@ -447,7 +447,7 @@ pub fn print_stored(
         return Ok(());
     }
     match &stored.answer {
-        StoredAnswer::Analyzed { answer, files } => print_answer(answer, files),
+        StoredAnswer::Analyzed { answer, files, .. } => print_answer(answer, files),
         StoredAnswer::NothingToRead { why } => {
             println!("Agora has no crash evidence to diagnose for this session.");
             println!("{why}");

@@ -1540,3 +1540,20 @@ fn retention_records_a_locked_session_and_keeps_going() {
         .any(|skip| skip.path.starts_with(&locked_folder)));
     assert!(locked_folder.join("log.txt").exists());
 }
+
+#[test]
+fn artifact_path_only_answers_for_a_safe_id_and_a_file_that_is_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = EvidenceStore::new(tmp.path().join("store"));
+    let session = store.session_dir("session-1");
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::write(session.join("log-1"), b"crash").unwrap();
+
+    assert_eq!(
+        store.artifact_path("session-1", "log-1"),
+        Some(session.join("log-1"))
+    );
+    assert_eq!(store.artifact_path("session-1", "missing"), None);
+    assert_eq!(store.artifact_path("../session-1", "log-1"), None);
+    assert_eq!(store.artifact_path("session-1", "../log-1"), None);
+}
