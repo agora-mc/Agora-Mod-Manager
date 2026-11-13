@@ -202,7 +202,12 @@ pub fn load_installed_packs(
 
     let service = crate::plugins::PluginService::headless(ctx.clone(), host);
     service.reload()?;
-    let report = service.crash_packs();
+    let mut report = service.crash_packs();
+    // The signed catalog's community signatures ride along wherever installed packs are loaded.
+    // They add rules, never parsers, so they need no script host of their own.
+    let community = crate::crash_packs::load_community_pack_from_registry(ctx.paths.root());
+    report.packs.extend(community.packs);
+    report.problems.extend(community.problems);
     let script_ids: Vec<String> = report
         .packs
         .iter()

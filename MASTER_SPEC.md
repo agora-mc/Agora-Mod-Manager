@@ -268,7 +268,7 @@ If present, the launcher uses this data to populate `compatible_versions_json` i
   "id": "fabric-api-missing",
   "name": "Missing Fabric API",
   "games": ["minecraft"],
-  "regex_pattern": "requires \\\\{fabric @",
+  "regex_pattern": "requires \\{fabric @",
   "level": "likely",
   "cause": "missing_requirement",
   "text": "A mod you installed requires Fabric API, but it is missing from your mod folder.",

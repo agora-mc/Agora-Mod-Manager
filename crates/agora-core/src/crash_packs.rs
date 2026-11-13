@@ -15,15 +15,19 @@
 
 use crate::error::LauncherResult;
 use agora_game_api::crash::{
-    lint_pack_json, validate_extra_output, validate_inspector_output, validate_parser_output,
-    ArtifactHandle, BuiltInPack, CodeEntry, CoverageState, CrashPack, Detect, GameHandle,
-    InspectorDecl, InspectorOutput, LinesReply, ParseNoteKind, ParserDecl, ParserLimits,
-    ParserOutput, ParserReadError, ParserReads, ParserRequest, ReadRefusal, ReadRefused,
+    lint_pack_json, lint_rule, validate_extra_output, validate_inspector_output,
+    validate_parser_output, ActionKind, ActionRequest, ArtifactHandle, AttrMatch, BuiltInPack,
+    Cause, CodeEntry, Condition, CoverageState, CrashPack, Detect, Effect, FactQuery, GameHandle,
+    InspectorDecl, InspectorOutput, Level, LinesReply, LocalText, MatchOps, ParseNoteKind,
+    ParserDecl, ParserLimits, ParserOutput, ParserReadError, ParserReads, ParserRequest,
+    ReadRefusal, ReadRefused, Rule, RuleScope, RuleText, Scalar, Scope, TextMatch,
     CRASH_CONTRACT_VERSION, DETECT_HEAD_BYTES,
 };
+use agora_game_api::GameId;
 use agora_plugin_api::host::{ScriptHost, ScriptReadError, ScriptReads};
 use agora_plugin_api::manifest::{validate_package_path, PluginManifest};
 use regex::Regex;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -95,6 +99,453 @@ pub fn built_in_identity() -> crate::crash_engine::PluginIdentity {
         id: BUILT_IN_PLUGIN_ID.to_string(),
         name: "Agora".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Community signatures (the signed catalog's crash_signatures table)
+// ---------------------------------------------------------------------------
+
+/// The identity every community signature names. The id is namespaced so it can never collide
+/// with a plugin id, and the name is what a finding shows after "from".
+pub const COMMUNITY_PACK_PLUGIN_ID: &str = "agora.community";
+pub const COMMUNITY_PACK_PLUGIN_NAME: &str = "Agora community catalog";
+/// The file a community pack reports, so a problem points at where the row came from.
+pub const COMMUNITY_PACK_FILE: &str = "registry.db (crash_signatures)";
+
+/// One community crash signature, format v2. It is data the engine turns into a rule; it never
+/// names a suspect and has no parser of its own.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommunitySignature {
+    pub id: String,
+    pub name: String,
+    /// The game ids this signature applies to. Required and non-empty.
+    pub games: Vec<String>,
+    pub regex_pattern: String,
+    #[serde(default)]
+    pub level: Option<Level>,
+    #[serde(default)]
+    pub cause: Option<Cause>,
+    /// The finding's headline, in plain text.
+    pub text: String,
+    #[serde(default)]
+    pub action: Option<CommunityAction>,
+}
+
+/// An optional button a signature offers, from the UI's closed set.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommunityAction {
+    pub kind: ActionKind,
+    #[serde(default)]
+    pub content_key: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Parse one v2 signature file. The caller still runs [`CommunitySignature::to_rule`] and
+/// [`lint_rule`], so shape and rule checks are the same for a file and a catalog row.
+pub fn parse_community_signature_json(json: &str) -> Result<CommunitySignature, String> {
+    serde_json::from_str(json).map_err(|error| error.to_string())
+}
+
+impl CommunitySignature {
+    /// Turn this signature into one rule. It applies only to the games it names, produces one
+    /// finding that accuses nobody, and offers its action. The caller lints the result.
+    pub fn to_rule(&self) -> Result<Rule, Vec<String>> {
+        let mut errors = Vec::new();
+        if self.games.is_empty() {
+            errors.push("`games` is a non-empty list of game ids".to_string());
+        }
+        for game in &self.games {
+            if let Err(error) = GameId::new(game.clone()) {
+                errors.push(format!("game id `{game}`: {error}"));
+            }
+        }
+        let level = match self.level.unwrap_or(Level::Possible) {
+            Level::Possible => Level::Possible,
+            Level::Likely => Level::Likely,
+            other => {
+                errors.push(format!(
+                    "`level` is `possible` or `likely`; got `{}`",
+                    match other {
+                        Level::NotSure => "not_sure",
+                        Level::VeryLikely => "very_likely",
+                        Level::Possible | Level::Likely => unreachable!(),
+                    }
+                ));
+                Level::Possible
+            }
+        };
+        if self.regex_pattern.trim().is_empty() {
+            errors.push("`regex_pattern` is a non-empty string".to_string());
+        }
+        if self.text.trim().is_empty() {
+            errors.push("`text` is a non-empty plain-text headline".to_string());
+        }
+        let mut actions = Vec::new();
+        if let Some(action) = &self.action {
+            match action.kind {
+                ActionKind::InstallContent => {
+                    if action
+                        .content_key
+                        .as_deref()
+                        .is_none_or(|key| key.trim().is_empty())
+                    {
+                        errors.push(
+                            "`action.content_key` is required for `install_content`".to_string(),
+                        );
+                    }
+                }
+                _ if action.content_key.is_some() => {
+                    errors.push("only `install_content` uses `action.content_key`".to_string());
+                }
+                _ => {}
+            }
+            if action
+                .label
+                .as_deref()
+                .is_some_and(|label| label.trim().is_empty())
+            {
+                errors.push("`action.label` is a non-empty string when present".to_string());
+            }
+            actions.push(ActionRequest {
+                kind: action.kind,
+                content_key: action.content_key.clone(),
+                label: action
+                    .label
+                    .as_ref()
+                    .map(|label| LocalText::from([("en".to_string(), label.clone())])),
+            });
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let game_condition = Condition::Fact(FactQuery {
+            kind: "core.instance".to_string(),
+            filter: BTreeMap::from([(
+                "game".to_string(),
+                AttrMatch::Test(MatchOps {
+                    any_of: Some(self.games.iter().cloned().map(Scalar::Text).collect()),
+                    ..MatchOps::default()
+                }),
+            )]),
+            reference: None,
+            bind: BTreeMap::new(),
+        });
+        // The text match is only allowed to stand on its own when the game is known, so the
+        // game condition is the anchor the linter asks for.
+        let when = Condition::All(vec![
+            game_condition,
+            Condition::Text(TextMatch {
+                regex: self.regex_pattern.clone(),
+                ..TextMatch::default()
+            }),
+        ]);
+
+        Ok(Rule {
+            id: self.id.clone(),
+            version: 1,
+            scope: RuleScope::default(),
+            when,
+            verify: None,
+            effects: vec![Effect::Finding {
+                scope: Scope::Mechanism,
+                level,
+                cause: Some(self.cause.unwrap_or(Cause::Other)),
+                candidate: None,
+                family: None,
+                weight: None,
+                text: None,
+            }],
+            text: RuleText {
+                headline: LocalText::from([("en".to_string(), self.text.clone())]),
+                why_not_sure: None,
+            },
+            supersedes: Vec::new(),
+            repairs: Vec::new(),
+            actions,
+            next_step: None,
+            fixtures: Vec::new(),
+            reference: Some(format!("crash-signatures/{}.json", self.id)),
+            max_branches: None,
+        })
+    }
+}
+
+/// Read the community signatures from an already-open, verified `registry.db` and make one loaded
+/// pack from the rows that convert and lint clean.
+///
+/// A missing table means the catalog predates community signatures (or has none), so the pack is
+/// simply absent. A row that fails is reported with its id and never stops the others.
+pub fn load_community_pack(conn: &Connection) -> CrashPackReport {
+    let mut report = CrashPackReport::default();
+    let table: Option<String> = match conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'crash_signatures'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+    {
+        Ok(table) => table,
+        Err(error) => {
+            report.problems.push(PackProblem::new(
+                COMMUNITY_PACK_PLUGIN_ID,
+                COMMUNITY_PACK_FILE,
+                "",
+                "unreadable",
+                format!("could not read the catalog's tables: {error}"),
+            ));
+            return report;
+        }
+    };
+    if table.is_none() {
+        return report;
+    }
+
+    let mut statement = match conn.prepare(
+        "SELECT id, name, games_json, regex_pattern, level, cause, text,
+                action_kind, action_content_key, action_label
+           FROM crash_signatures
+          ORDER BY id",
+    ) {
+        Ok(statement) => statement,
+        Err(error) => {
+            report.problems.push(PackProblem::new(
+                COMMUNITY_PACK_PLUGIN_ID,
+                COMMUNITY_PACK_FILE,
+                "",
+                "schema",
+                format!(
+                    "the catalog's crash_signatures table has no signature format v2 columns; \
+                     update the catalog: {error}"
+                ),
+            ));
+            return report;
+        }
+    };
+
+    let rows = match statement.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let games: String = row.get(2)?;
+        let regex_pattern: String = row.get(3)?;
+        let level: Option<String> = row.get(4)?;
+        let cause: Option<String> = row.get(5)?;
+        let text: String = row.get(6)?;
+        let action_kind: Option<String> = row.get(7)?;
+        let action_content_key: Option<String> = row.get(8)?;
+        let action_label: Option<String> = row.get(9)?;
+        Ok((
+            id,
+            name,
+            games,
+            regex_pattern,
+            level,
+            cause,
+            text,
+            action_kind,
+            action_content_key,
+            action_label,
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(error) => {
+            report.problems.push(PackProblem::new(
+                COMMUNITY_PACK_PLUGIN_ID,
+                COMMUNITY_PACK_FILE,
+                "",
+                "unreadable",
+                format!("could not read the catalog's crash signatures: {error}"),
+            ));
+            return report;
+        }
+    };
+
+    let mut rules = Vec::new();
+    for row in rows {
+        let row = match row {
+            Ok(row) => row,
+            Err(error) => {
+                report.problems.push(PackProblem::new(
+                    COMMUNITY_PACK_PLUGIN_ID,
+                    COMMUNITY_PACK_FILE,
+                    "",
+                    "unreadable",
+                    format!("could not read one crash signature row: {error}"),
+                ));
+                continue;
+            }
+        };
+        let (id, signature) = match community_signature_from_row(row) {
+            Ok(pair) => pair,
+            Err((id, message)) => {
+                report.problems.push(PackProblem::new(
+                    COMMUNITY_PACK_PLUGIN_ID,
+                    COMMUNITY_PACK_FILE,
+                    format!("signature `{id}`"),
+                    "signature",
+                    format!("could not check this signature: {message}"),
+                ));
+                continue;
+            }
+        };
+        let rule = match signature.to_rule() {
+            Ok(rule) => rule,
+            Err(errors) => {
+                report.problems.push(PackProblem::new(
+                    COMMUNITY_PACK_PLUGIN_ID,
+                    COMMUNITY_PACK_FILE,
+                    format!("signature `{id}`"),
+                    "signature",
+                    format!("could not check this signature: {}", errors.join("; ")),
+                ));
+                continue;
+            }
+        };
+        let problems = lint_rule(&rule);
+        if !problems.is_empty() {
+            let message = problems
+                .iter()
+                .map(|problem| problem.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            report.problems.push(PackProblem::new(
+                COMMUNITY_PACK_PLUGIN_ID,
+                COMMUNITY_PACK_FILE,
+                format!("signature `{id}`"),
+                "lint",
+                format!("could not check this signature: {message}"),
+            ));
+            continue;
+        }
+        rules.push(rule);
+    }
+
+    if !rules.is_empty() {
+        report.packs.push(LoadedCrashPack {
+            plugin_id: COMMUNITY_PACK_PLUGIN_ID.to_string(),
+            plugin_name: COMMUNITY_PACK_PLUGIN_NAME.to_string(),
+            plugin_version: String::new(),
+            dependencies: Vec::new(),
+            official: false,
+            file: COMMUNITY_PACK_FILE.to_string(),
+            pack: CrashPack {
+                contract: CRASH_CONTRACT_VERSION,
+                // Each rule carries its own game gate, so the pack itself applies to every game.
+                games: Vec::new(),
+                sources: Vec::new(),
+                parsers: Vec::new(),
+                inspectors: Vec::new(),
+                ref_maps: Vec::new(),
+                roles: Vec::new(),
+                save_risk: None,
+                rules,
+            },
+        });
+    }
+
+    report
+}
+
+type SignatureRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Turn one stored row back into a v2 signature. A malformed cell is a problem with that row's
+/// id, never a panic or a silently dropped row.
+fn community_signature_from_row(
+    (
+        id,
+        name,
+        games,
+        regex_pattern,
+        level,
+        cause,
+        text,
+        action_kind,
+        action_content_key,
+        action_label,
+    ): SignatureRow,
+) -> Result<(String, CommunitySignature), (String, String)> {
+    let bad = |message: String| (id.clone(), message);
+    let games: Vec<String> = serde_json::from_str(&games).map_err(|error| {
+        bad(format!(
+            "`games_json` is not a JSON array of game ids: {error}"
+        ))
+    })?;
+    let action = match action_kind {
+        None => None,
+        Some(kind) => {
+            let kind: ActionKind = serde_json::from_value(serde_json::Value::String(kind))
+                .map_err(|error| bad(format!("`action_kind`: {error}")))?;
+            Some(CommunityAction {
+                kind,
+                content_key: action_content_key,
+                label: action_label,
+            })
+        }
+    };
+    let level = match level {
+        None => None,
+        Some(level) => Some(
+            serde_json::from_value::<Level>(serde_json::Value::String(level))
+                .map_err(|error| bad(format!("`level`: {error}")))?,
+        ),
+    };
+    let cause = match cause {
+        None => None,
+        Some(cause) => Some(
+            serde_json::from_value::<Cause>(serde_json::Value::String(cause))
+                .map_err(|error| bad(format!("`cause`: {error}")))?,
+        ),
+    };
+    Ok((
+        id.clone(),
+        CommunitySignature {
+            id,
+            name,
+            games,
+            regex_pattern,
+            level,
+            cause,
+            text,
+            action,
+        },
+    ))
+}
+
+/// Load the community pack from the cached, verified catalog. A missing or unsigned catalog is
+/// absent rather than an error, because the catalog has its own update path; anything else is a
+/// reported problem.
+pub fn load_community_pack_from_registry(app_data_dir: &Path) -> CrashPackReport {
+    match crate::registry_sync::open_verified_registry(app_data_dir) {
+        Ok(registry) => load_community_pack(registry.connection()),
+        Err(crate::error::LauncherError::RegistryMissing)
+        | Err(crate::error::LauncherError::RegistrySignatureInvalid) => CrashPackReport::default(),
+        Err(error) => {
+            let mut report = CrashPackReport::default();
+            report.problems.push(PackProblem::new(
+                COMMUNITY_PACK_PLUGIN_ID,
+                COMMUNITY_PACK_FILE,
+                "",
+                "unreadable",
+                format!("could not open the signed catalog: {error}"),
+            ));
+            report
+        }
     }
 }
 
@@ -1637,5 +2088,159 @@ mod tests {
         assert!(detect_parsers(&pack, "x.txt", b"---- Banner ----\rmore\n")
             .unwrap()
             .is_empty());
+    }
+
+    fn community_table(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE crash_signatures (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                games_json TEXT NOT NULL,
+                regex_pattern TEXT,
+                level TEXT,
+                cause TEXT,
+                text TEXT,
+                action_kind TEXT,
+                action_content_key TEXT,
+                action_label TEXT
+            );",
+        )
+        .unwrap();
+    }
+
+    fn insert_signature(conn: &Connection, id: &str, games_json: &str, pattern: &str) {
+        conn.execute(
+            "INSERT INTO crash_signatures
+                (id, name, games_json, regex_pattern, level, cause, text,
+                 action_kind, action_content_key, action_label)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, NULL, NULL, NULL)",
+            rusqlite::params![id, id, games_json, pattern, format!("{id} happened.")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_catalog_without_the_table_has_no_community_pack() {
+        let conn = Connection::open_in_memory().unwrap();
+        let report = load_community_pack(&conn);
+        assert!(report.packs.is_empty());
+        assert!(report.is_clean(), "{:#?}", report.problems);
+    }
+
+    #[test]
+    fn a_valid_row_becomes_one_rule_that_names_no_suspect() {
+        let conn = Connection::open_in_memory().unwrap();
+        community_table(&conn);
+        insert_signature(
+            &conn,
+            "example_signature",
+            r#"["skyrim-se"]"#,
+            "Unhandled exception",
+        );
+        conn.execute(
+            "UPDATE crash_signatures SET level = 'likely', cause = 'memory',
+                action_kind = 'open_jvm_settings', action_label = 'Open JVM Settings'",
+            [],
+        )
+        .unwrap();
+
+        let report = load_community_pack(&conn);
+        assert!(report.is_clean(), "{:#?}", report.problems);
+        assert_eq!(report.packs.len(), 1);
+        let pack = &report.packs[0];
+        assert_eq!(pack.plugin_id, COMMUNITY_PACK_PLUGIN_ID);
+        assert_eq!(pack.plugin_name, COMMUNITY_PACK_PLUGIN_NAME);
+        assert_eq!(pack.pack.rules.len(), 1);
+        let rule = &pack.pack.rules[0];
+        assert_eq!(rule.id, "example_signature");
+        assert_eq!(rule.actions.len(), 1);
+        assert_eq!(rule.actions[0].kind, ActionKind::OpenJvmSettings);
+        match &rule.effects[0] {
+            Effect::Finding {
+                scope,
+                level,
+                cause,
+                candidate,
+                ..
+            } => {
+                assert_eq!(*scope, Scope::Mechanism);
+                assert_eq!(*level, Level::Likely);
+                assert_eq!(*cause, Some(Cause::Memory));
+                assert!(candidate.is_none());
+            }
+            other => panic!("expected a finding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_row_is_reported_with_its_id_and_never_hides_a_good_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        community_table(&conn);
+        insert_signature(&conn, "bad_games", "[]", "Anything");
+        insert_signature(&conn, "bad_regex", r#"["minecraft"]"#, "[not a regex");
+        insert_signature(&conn, "good_one", r#"["minecraft"]"#, "A real line");
+        let report = load_community_pack(&conn);
+        assert_eq!(report.packs.len(), 1);
+        assert_eq!(report.packs[0].pack.rules.len(), 1);
+        assert_eq!(report.packs[0].pack.rules[0].id, "good_one");
+        let at: Vec<&str> = report
+            .problems
+            .iter()
+            .map(|problem| problem.at.as_str())
+            .collect();
+        assert!(at.contains(&"signature `bad_games`"), "{at:?}");
+        assert!(at.contains(&"signature `bad_regex`"), "{at:?}");
+        for problem in &report.problems {
+            assert!(problem.message.contains("could not check"), "{problem}");
+        }
+    }
+
+    #[test]
+    fn a_level_other_than_possible_or_likely_is_refused() {
+        let signature = CommunitySignature {
+            id: "too_sure".to_string(),
+            name: "Too Sure".to_string(),
+            games: vec!["minecraft".to_string()],
+            regex_pattern: "Anything".to_string(),
+            level: Some(Level::VeryLikely),
+            cause: None,
+            text: "Something happened.".to_string(),
+            action: None,
+        };
+        let errors = signature.to_rule().unwrap_err();
+        assert!(
+            errors.iter().any(|error| error.contains("`level`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_games_cell_is_a_problem_for_that_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        community_table(&conn);
+        insert_signature(&conn, "broken_games", "not json", "Anything");
+        let report = load_community_pack(&conn);
+        assert!(report.packs.is_empty());
+        assert_eq!(report.problems.len(), 1);
+        assert_eq!(report.problems[0].at, "signature `broken_games`");
+        assert!(report.problems[0].message.contains("games_json"));
+    }
+
+    #[test]
+    fn a_signature_json_file_and_a_catalog_row_take_the_same_path() {
+        let json = r#"{
+          "id": "example_signature",
+          "name": "Example",
+          "games": ["skyrim-se"],
+          "regex_pattern": "Unhandled exception",
+          "level": "likely",
+          "cause": "memory",
+          "text": "The game ran out of memory.",
+          "action": { "kind": "open_jvm_settings", "label": "Open JVM Settings" }
+        }"#;
+        let signature = parse_community_signature_json(json).unwrap();
+        let rule = signature.to_rule().unwrap();
+        assert!(lint_rule(&rule).is_empty());
+        assert_eq!(rule.id, "example_signature");
     }
 }

@@ -591,7 +591,7 @@ crash pack, so a signature works for **any game**, not only Minecraft.
   "id": "fabric-api-missing",
   "name": "Missing Fabric API",
   "games": ["minecraft"],
-  "regex_pattern": "requires \\\\{fabric @",
+  "regex_pattern": "requires \\{fabric @",
   "level": "likely",
   "cause": "missing_requirement",
   "text": "A mod you installed requires Fabric API, but it is missing from your mod folder.",
