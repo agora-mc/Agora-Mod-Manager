@@ -15,11 +15,11 @@
 
 use crate::error::LauncherResult;
 use agora_game_api::crash::{
-    lint_pack_json, validate_inspector_output, validate_parser_output, ArtifactHandle, BuiltInPack,
-    CodeEntry, CoverageState, CrashPack, Detect, GameHandle, InspectorDecl, InspectorOutput,
-    LinesReply, ParseNoteKind, ParserDecl, ParserLimits, ParserOutput, ParserReadError,
-    ParserReads, ParserRequest, ReadRefusal, ReadRefused, CRASH_CONTRACT_VERSION,
-    DETECT_HEAD_BYTES,
+    lint_pack_json, validate_extra_output, validate_inspector_output, validate_parser_output,
+    ArtifactHandle, BuiltInPack, CodeEntry, CoverageState, CrashPack, Detect, GameHandle,
+    InspectorDecl, InspectorOutput, LinesReply, ParseNoteKind, ParserDecl, ParserLimits,
+    ParserOutput, ParserReadError, ParserReads, ParserRequest, ReadRefusal, ReadRefused,
+    CRASH_CONTRACT_VERSION, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReadError, ScriptReads};
 use agora_plugin_api::manifest::{validate_package_path, PluginManifest};
@@ -85,6 +85,10 @@ impl std::fmt::Display for PackProblem {
 /// The source a built-in pack's findings name: Agora itself, not a plugin.
 pub const BUILT_IN_PLUGIN_ID: &str = "agora";
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Who findings from a built-in pack name, with this Agora build's version.
 pub fn built_in_identity() -> crate::crash_engine::PluginIdentity {
     crate::crash_engine::PluginIdentity {
@@ -105,6 +109,14 @@ pub struct LoadedCrashPack {
     pub plugin_name: String,
     #[serde(default)]
     pub plugin_version: String,
+    /// The plugin ids this pack's plugin declares as dependencies. A source may name a parser from
+    /// one of them as `"<plugin id>:<parser id>"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
+    /// This copy is verified as an official package. It only decides which primary reads a file
+    /// when more than one claims it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub official: bool,
     pub file: String,
     pub pack: CrashPack,
 }
@@ -135,13 +147,20 @@ pub struct PluginPackSource<'a> {
     pub plugin_id: &'a str,
     pub root: &'a Path,
     pub manifest: &'a PluginManifest,
+    /// This copy is verified as an official package.
+    pub official: bool,
 }
 
 /// Load packs from several plugins. One plugin's failure never stops another's.
 pub fn load_for_plugins(sources: &[PluginPackSource<'_>]) -> CrashPackReport {
     let mut report = CrashPackReport::default();
     for source in sources {
-        let one = load_plugin_packs(source.plugin_id, source.root, source.manifest);
+        let one = load_plugin_packs_as(
+            source.plugin_id,
+            source.root,
+            source.manifest,
+            source.official,
+        );
         report.packs.extend(one.packs);
         report.problems.extend(one.problems);
     }
@@ -157,6 +176,18 @@ pub fn load_plugin_packs(
     plugin_id: &str,
     root: &Path,
     manifest: &PluginManifest,
+) -> CrashPackReport {
+    load_plugin_packs_as(plugin_id, root, manifest, false)
+}
+
+/// Like [`load_plugin_packs`], with whether this copy is verified as an official package. That
+/// flag only orders two primaries that claim the same file, and it defaults to false for a
+/// development folder.
+pub fn load_plugin_packs_as(
+    plugin_id: &str,
+    root: &Path,
+    manifest: &PluginManifest,
+    official: bool,
 ) -> CrashPackReport {
     let mut report = CrashPackReport::default();
     if manifest.contributions.crash_packs.is_empty() {
@@ -262,12 +293,20 @@ pub fn load_plugin_packs(
 
         match lint_pack_json(&text) {
             Ok(pack) => {
-                let config_problems = parser_config_problems(plugin_id, &relative, &pack, false);
+                let dependencies: Vec<String> = manifest
+                    .dependencies
+                    .keys()
+                    .map(|id| id.as_str().to_string())
+                    .collect();
+                let config_problems =
+                    parser_config_problems(plugin_id, &relative, &pack, false, &dependencies);
                 if config_problems.is_empty() {
                     report.packs.push(LoadedCrashPack {
                         plugin_id: plugin_id.to_string(),
                         plugin_name: manifest.name.clone(),
                         plugin_version: manifest.version.to_string(),
+                        dependencies: dependencies.clone(),
+                        official,
                         file: relative,
                         pack,
                     });
@@ -300,7 +339,7 @@ pub fn load_built_in_packs(packs: &[BuiltInPack]) -> CrashPackReport {
         match lint_pack_json(&built_in.json) {
             Ok(pack) => {
                 let mut problems =
-                    parser_config_problems(BUILT_IN_PLUGIN_ID, &built_in.file, &pack, true);
+                    parser_config_problems(BUILT_IN_PLUGIN_ID, &built_in.file, &pack, true, &[]);
                 for parser in &pack.parsers {
                     if let CodeEntry::BuiltIn { name } = &parser.entry {
                         if !built_in
@@ -324,6 +363,8 @@ pub fn load_built_in_packs(packs: &[BuiltInPack]) -> CrashPackReport {
                         plugin_id: identity.id,
                         plugin_name: identity.name,
                         plugin_version: identity.version,
+                        dependencies: Vec::new(),
+                        official: false,
                         file: built_in.file.clone(),
                         pack,
                     });
@@ -354,8 +395,37 @@ fn parser_config_problems(
     file: &str,
     pack: &CrashPack,
     allow_built_in: bool,
+    dependencies: &[String],
 ) -> Vec<PackProblem> {
     let mut problems = Vec::new();
+    for source in &pack.sources {
+        let Some(format) = &source.format else {
+            continue;
+        };
+        if let Some((from_plugin, parser_id)) = format.split_once(':') {
+            if from_plugin != plugin_id && !dependencies.iter().any(|id| id == from_plugin) {
+                problems.push(PackProblem::new(
+                    plugin_id,
+                    file,
+                    format!("source `{}`", source.id),
+                    "parser_dependency",
+                    format!(
+                        "`{format}` names a parser from `{from_plugin}`, which is not in this \
+                         plugin's `dependencies`; add it there, or use a parser from this plugin"
+                    ),
+                ));
+            }
+            if parser_id.is_empty() || from_plugin.is_empty() {
+                problems.push(PackProblem::new(
+                    plugin_id,
+                    file,
+                    format!("source `{}`", source.id),
+                    "parser_dependency",
+                    "a parser reference is `\"<plugin id>:<parser id>\"`, with both parts present",
+                ));
+            }
+        }
+    }
     for parser in &pack.parsers {
         match &parser.entry {
             CodeEntry::Generic { name, config } => {
@@ -382,6 +452,52 @@ fn parser_config_problems(
         }
     }
     problems
+}
+
+/// A parser reference that resolved: the pack that owns the parser and the parser itself.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedParserRef<'a> {
+    pub pack: &'a LoadedCrashPack,
+    pub parser: &'a ParserDecl,
+}
+
+/// Resolve a source's `format` against the loaded packs. A plain id is local to `owner`; a
+/// `"<plugin id>:<parser id>"` reference must name a plugin in `owner`'s declared dependencies.
+pub fn resolve_parser_ref<'a>(
+    packs: &'a [LoadedCrashPack],
+    owner: &'a LoadedCrashPack,
+    format: &str,
+) -> Result<ResolvedParserRef<'a>, String> {
+    let (plugin_id, parser_id) = match format.split_once(':') {
+        Some((plugin_id, parser_id)) => (plugin_id, parser_id),
+        None => (owner.plugin_id.as_str(), format),
+    };
+    if plugin_id.is_empty() || parser_id.is_empty() {
+        return Err(format!(
+            "`{format}` is not a parser reference; it is `\"<parser id>\"` or `\"<plugin id>:<parser id>\"`"
+        ));
+    }
+    let pack = if plugin_id == owner.plugin_id {
+        owner
+    } else {
+        if !owner.dependencies.iter().any(|id| id == plugin_id) {
+            return Err(format!(
+                "`{format}` names a parser from `{plugin_id}`, which is not a declared dependency of `{}`",
+                owner.plugin_id
+            ));
+        }
+        packs
+            .iter()
+            .find(|pack| pack.plugin_id == plugin_id)
+            .ok_or_else(|| format!("no loaded pack belongs to `{plugin_id}`"))?
+    };
+    let parser = pack
+        .pack
+        .parsers
+        .iter()
+        .find(|parser| parser.id == parser_id)
+        .ok_or_else(|| format!("`{plugin_id}` has no parser `{parser_id}`"))?;
+    Ok(ResolvedParserRef { pack, parser })
 }
 
 /// Validate a development folder's packs. Used by `agora plugin validate`.
@@ -988,6 +1104,22 @@ pub fn parse_artifact_with_builtin(
     }
 }
 
+/// Run one parser the caller already chose, through the same host, limits and validator a detected
+/// parser gets. Used when the engine picks one primary and every extra for a file itself.
+pub fn run_parser_with_builtin(
+    host: &dyn ScriptHost,
+    plugin_id: &str,
+    parser: &ParserDecl,
+    request: &ParserRequest,
+    reads: Arc<dyn ScriptReads>,
+    built_in: Option<&BuiltInPack>,
+) -> ParserAttempt {
+    ParserAttempt {
+        parser_id: parser.id.clone(),
+        outcome: run_one(host, plugin_id, parser, request, reads, built_in),
+    }
+}
+
 fn run_one(
     host: &dyn ScriptHost,
     plugin_id: &str,
@@ -1191,7 +1323,11 @@ fn run_one(
         ));
     }
 
-    let problems = validate_parser_output(&output, &request.limits);
+    let problems = if parser.reads.may_emit_core() {
+        validate_parser_output(&output, &request.limits)
+    } else {
+        validate_extra_output(&output, &request.limits)
+    };
     if !problems.is_empty() {
         let message = problems
             .iter()

@@ -166,12 +166,36 @@ pub struct ChildPolicy {
 pub struct ParserDecl {
     pub id: String,
     pub entry: CodeEntry,
+    /// Whether this parser is the one that speaks for the file, or reads alongside another. One
+    /// primary per file is chosen; every extra runs and may emit only facts in a namespace of its
+    /// own, never `core.*`.
+    #[serde(default)]
+    pub reads: Reads,
     /// How to recognise its artifacts. Empty means only a source's `format` selects it.
     #[serde(default, skip_serializing_if = "Detect::is_empty")]
     pub detect: Detect,
     /// Asks for less than the defaults. The host keeps the lower of this and its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<ParserLimits>,
+}
+
+/// How a parser takes part when more than one recognises the same file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reads {
+    /// Speaks for the file. When several primaries claim it, one is chosen (built-in, then
+    /// official, then by plugin id) and the rest are reported as "also recognised by".
+    #[default]
+    Primary,
+    /// Reads alongside the primary. Every extra runs, so it must stay in its own namespace.
+    Extra,
+}
+
+impl Reads {
+    /// Whether a parser may emit `core.*` facts.
+    pub fn may_emit_core(self) -> bool {
+        self == Self::Primary
+    }
 }
 
 /// What runs. The engine calls all of them through the same request and output shapes

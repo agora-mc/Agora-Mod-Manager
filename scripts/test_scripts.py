@@ -3440,14 +3440,23 @@ class TestCrashBenchmark(unittest.TestCase):
                     ids.add(json.loads(line)["id"])
         return ids
 
-    def _prediction(self, row_id: str, *suspects: str, abstained: bool = False) -> dict[str, Any]:
-        return {
+    def _prediction(
+        self,
+        row_id: str,
+        *suspects: str,
+        abstained: bool = False,
+        cause: str | None = None,
+    ) -> dict[str, Any]:
+        row = {
             "id": row_id,
             "suspects": [
                 {"name": suspect, "confidence": None} for suspect in suspects
             ],
             "abstained": abstained,
         }
+        if cause is not None:
+            row["cause"] = cause
+        return row
 
     def test_empty_predictions_are_an_error_not_a_perfect_score(self):
         key = self._write_jsonl("key.jsonl", [self._key_row("a")])
@@ -3826,6 +3835,76 @@ class TestCrashBenchmark(unittest.TestCase):
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+    def test_a_non_mod_cause_counts_when_nobody_is_named(self):
+        key_row = self._key_row("a")
+        key_row["culprit_kind"] = "setting"
+        key_row["culprit"] = "a setting"
+        key = self._write_jsonl("key.jsonl", [key_row])
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [self._prediction("a", abstained=True, cause="setting")],
+        )
+
+        result = cb.score(key, predictions)
+
+        overall = result["overall"]
+        self.assertEqual(overall["abstained"], 1)
+        self.assertEqual(overall["cause_rows"], 1)
+        self.assertEqual(overall["cause_hits"], 1)
+
+    def test_score_counts_the_cause_kind_per_group(self):
+        mod_row = self._key_row("a")
+        version_row = self._key_row("b")
+        version_row["culprit_kind"] = "version_mismatch"
+        other_row = self._key_row("c")
+        other_row["culprit_kind"] = "save"
+        key = self._write_jsonl("key.jsonl", [mod_row, version_row, other_row])
+        predictions = self._write_jsonl(
+            "predictions.jsonl",
+            [
+                self._prediction("a", "Mod.jar", cause="mod"),
+                self._prediction("b", abstained=True, cause="version_mismatch"),
+                self._prediction("c", abstained=True, cause="other"),
+            ],
+        )
+
+        result = cb.score(key, predictions)
+
+        overall = result["overall"]
+        self.assertEqual(overall["cause_rows"], 3)
+        self.assertEqual(overall["cause_hits"], 2)
+        self.assertEqual(
+            result["by"]["game"]["minecraft"]["cause_hits"], 2
+        )
+
+    def test_key_cause_kinds_map_onto_the_closed_set(self):
+        self.assertEqual(cb.cause_kind("version_mismatch"), "version_mismatch")
+        self.assertEqual(cb.cause_kind("Out Of Memory"), "memory")
+        self.assertEqual(cb.cause_kind("missing_dependency"), "missing_requirement")
+        self.assertEqual(cb.cause_kind("something-new"), "other")
+        self.assertIsNone(cb.cause_kind(None))
+        self.assertIsNone(cb.cause_kind("  "))
+
+    def test_an_unknown_prediction_cause_is_an_error(self):
+        key = self._write_jsonl("key.jsonl", [self._key_row("a")])
+        predictions = self._write_jsonl(
+            "predictions.jsonl", [self._prediction("a", "Mod", cause="made-up")]
+        )
+
+        with self.assertRaises(cb.BenchmarkError):
+            cb.score(key, predictions)
+
+    def test_predict_records_the_answer_cause(self):
+        script = self._analyzer(
+            "import json\n"
+            "print(json.dumps({'answer': {'cause': 'memory', 'candidates': []}, "
+            "'files': []}))\n"
+        )
+
+        _, out = self._predict(["a"], script, corpus_name="cause")
+
+        self.assertEqual(self._rows(out)[0]["cause"], "memory")
 
     def test_predict_reads_candidates_and_skips_unnamed_owners(self):
         script = self._analyzer(

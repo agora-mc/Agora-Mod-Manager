@@ -3,7 +3,7 @@
 
 use super::*;
 use agora_game_api::crash::{
-    CrashAnswer, Finding, Level, LocalText, NextStep, NextStepKind, Scope, SessionVerdict,
+    Cause, CrashAnswer, Finding, Level, LocalText, NextStep, NextStepKind, Scope, SessionVerdict,
     CRASH_CONTRACT_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,6 +76,11 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         findings.retain(|finding| finding.candidate.is_none());
     }
     let findings = clean_findings(findings);
+    let cause = if not_a_crash {
+        None
+    } else {
+        top_cause(&candidates, &findings)
+    };
 
     let headline = headline(
         input.verdict,
@@ -97,6 +102,7 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         verdict: input.verdict,
         headline,
         level,
+        cause,
         candidates,
         findings,
         inspections: input.evaluated.inspections.clone(),
@@ -106,6 +112,56 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         repairs,
         artifacts: Vec::new(),
     }
+}
+
+fn top_cause(
+    candidates: &[agora_game_api::crash::Candidate],
+    findings: &[Finding],
+) -> Option<Cause> {
+    if let Some(top) = candidates.first() {
+        let key = owner_key(&top.owner);
+        let best = findings
+            .iter()
+            .filter(|finding| {
+                finding
+                    .candidate
+                    .as_ref()
+                    .is_some_and(|owner| owner_key(owner) == key)
+            })
+            .max_by_key(|finding| {
+                (
+                    finding.level,
+                    std::cmp::Reverse(scope_rank(finding.scope)),
+                    std::cmp::Reverse(finding.cause),
+                )
+            });
+        // A root-cause finding about a mod defaults to `mod`; anything else stays its own kind.
+        return Some(best.map(|finding| finding.cause).unwrap_or_else(|| {
+            if matches!(top.owner, Owner::Item { .. } | Owner::Framework { .. }) {
+                Cause::Mod
+            } else {
+                Cause::Other
+            }
+        }));
+    }
+    // Nobody is named. A finding that states a non-mod cause is the whole answer, so the strongest
+    // specific kind wins over `other`, which is the open door.
+    findings
+        .iter()
+        .filter(|finding| finding.cause != Cause::Other)
+        .max_by_key(|finding| {
+            (
+                finding.level,
+                std::cmp::Reverse(scope_rank(finding.scope)),
+                std::cmp::Reverse(finding.cause),
+            )
+        })
+        .or_else(|| {
+            findings
+                .iter()
+                .max_by_key(|finding| (finding.level, std::cmp::Reverse(scope_rank(finding.scope))))
+        })
+        .map(|finding| finding.cause)
 }
 
 fn headline(

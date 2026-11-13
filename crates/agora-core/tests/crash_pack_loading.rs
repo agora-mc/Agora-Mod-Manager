@@ -2,11 +2,15 @@
 //! good one.
 
 use agora_core::crash_packs::{
-    load_for_plugins, load_plugin_packs, validate_plugin_folder, PluginPackSource,
+    artifact_handle, load_for_plugins, load_plugin_packs, parser_request, resolve_parser_ref,
+    run_parser_with_builtin, validate_plugin_folder, MemoryArtifact, PluginPackSource,
 };
+use agora_game_api::crash::{GameHandle, ParserLimits, CRASH_CONTRACT_VERSION};
 use agora_plugin_api::contributions::CrashPackContribution;
 use agora_plugin_api::manifest::PluginManifest;
+use agora_plugin_host::QuickJsHost;
 use std::path::Path;
+use std::sync::Arc;
 
 fn manifest(packs: &[&str]) -> PluginManifest {
     PluginManifest::parse(
@@ -239,11 +243,13 @@ fn one_broken_plugin_does_not_stop_another() {
             plugin_id: "acme.skyrim",
             root: good.path(),
             manifest: &good_manifest,
+            official: false,
         },
         PluginPackSource {
             plugin_id: "acme.cyberpunk",
             root: bad.path(),
             manifest: &bad_manifest,
+            official: false,
         },
     ]);
     assert_eq!(report.packs.len(), 1);
@@ -278,4 +284,133 @@ fn validate_plugin_folder_reads_the_manifest_and_the_packs() {
     let report = validate_plugin_folder(dir.path()).unwrap();
     assert!(report.is_clean(), "{:#?}", report.problems);
     assert_eq!(report.packs.len(), 1);
+}
+
+fn manifest_full(id: &str, dependencies: serde_json::Value) -> PluginManifest {
+    PluginManifest::parse(
+        &serde_json::json!({
+            "manifest": 1,
+            "id": id,
+            "name": format!("{id} crash rules"),
+            "version": "1.0.0",
+            "license": "MIT",
+            "apiRange": ">=0.1, <0.2",
+            "dependencies": dependencies,
+            "capabilities": { "required": ["crash:contribute"] },
+            "contributions": { "crashPacks": [{ "path": "crash/pack.json" }] }
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+const SHARED_PACK: &str = r#"{
+  "contract": 1,
+  "parsers": [{
+    "id": "shared",
+    "entry": { "generic": { "name": "text_sections", "config": {
+      "sections": [{
+        "id": "faults",
+        "header": "^== FAULTS ==$",
+        "lines": [{
+          "pattern": "^module (?P<module>[A-Za-z0-9_.-]+) failed$",
+          "kind": "acme.fault",
+          "refs": [{ "kind": "module", "value": "module" }]
+        }]
+      }]
+    } } },
+    "detect": { "all": ["(?m)^== FAULTS ==$"] }
+  }]
+}"#;
+
+const USES_SHARED: &str = r#"{
+  "contract": 1,
+  "sources": [{
+    "id": "logs",
+    "where": { "root": "instance", "path": "logs" },
+    "match": { "glob": "*.log" },
+    "format": "acme.base:shared"
+  }]
+}"#;
+
+#[test]
+fn a_source_may_name_a_parser_from_a_declared_dependency_and_it_resolves_and_runs() {
+    let base = tempfile::tempdir().unwrap();
+    write(base.path(), "crash/pack.json", SHARED_PACK);
+    let app = tempfile::tempdir().unwrap();
+    write(app.path(), "crash/pack.json", USES_SHARED);
+
+    let base_manifest = manifest_full("acme.base", serde_json::json!({}));
+    let app_manifest = manifest_full(
+        "acme.app",
+        serde_json::json!({ "acme.base": ">=1.0, <2.0" }),
+    );
+    let report = load_for_plugins(&[
+        PluginPackSource {
+            plugin_id: "acme.base",
+            root: base.path(),
+            manifest: &base_manifest,
+            official: false,
+        },
+        PluginPackSource {
+            plugin_id: "acme.app",
+            root: app.path(),
+            manifest: &app_manifest,
+            official: false,
+        },
+    ]);
+    assert!(report.is_clean(), "{:#?}", report.problems);
+    assert_eq!(report.packs.len(), 2);
+
+    let owner = report
+        .packs
+        .iter()
+        .find(|pack| pack.plugin_id == "acme.app")
+        .unwrap();
+    assert_eq!(owner.dependencies, vec!["acme.base".to_string()]);
+    let resolved = resolve_parser_ref(&report.packs, owner, "acme.base:shared").unwrap();
+    assert_eq!(resolved.pack.plugin_id, "acme.base");
+    assert_eq!(resolved.parser.id, "shared");
+
+    // It does more than resolve: the dependency's parser reads the file through the same contract.
+    let limits = ParserLimits::DEFAULT;
+    let mut reads = MemoryArtifact::new(limits);
+    reads.insert("artifact", "== FAULTS ==\nmodule ExampleMod.dll failed\n");
+    let request = parser_request(
+        "shared",
+        artifact_handle("artifact", "friend-crash.txt", 37, Vec::new()),
+        GameHandle {
+            id: "acme.game".to_string(),
+            runtime_version: None,
+        },
+        limits,
+    );
+    let attempt = run_parser_with_builtin(
+        &QuickJsHost::new(),
+        resolved.pack.plugin_id.as_str(),
+        resolved.parser,
+        &request,
+        Arc::new(reads),
+        None,
+    );
+    match attempt.outcome {
+        agora_core::crash_packs::ParserDispatch::Parsed(output) => {
+            assert_eq!(output.contract, CRASH_CONTRACT_VERSION);
+            assert!(output.facts.iter().any(|fact| fact.kind == "acme.fault"));
+        }
+        other => panic!("the dependency's parser did not run: {other:?}"),
+    }
+}
+
+#[test]
+fn a_source_naming_a_parser_from_a_plugin_it_does_not_depend_on_is_refused() {
+    let app = tempfile::tempdir().unwrap();
+    write(app.path(), "crash/pack.json", USES_SHARED);
+    let app_manifest = manifest_full("acme.app", serde_json::json!({}));
+    let report = load_plugin_packs("acme.app", app.path(), &app_manifest);
+
+    assert!(report.packs.is_empty());
+    assert_eq!(report.problems.len(), 1);
+    assert_eq!(report.problems[0].code, "parser_dependency");
+    assert!(report.problems[0].message.contains("acme.base"));
 }

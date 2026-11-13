@@ -223,6 +223,26 @@ to nothing.
 A kind may have more than one ref map. They are tried in order, and a later one is used when an
 earlier one finds nothing. Every finding still names the plugin that made it.
 
+A parser declares how it takes part when several recognise the same file. `reads` is `"primary"`
+(the default) or `"extra"`. One primary speaks for a file: when several claim it, the choice is the
+built-in pack first, then an official plugin, then plugin id; the others are listed as "also
+recognised by" and are not run. Every `extra` runs alongside the primary, and it may emit only facts
+in a namespace of its own, never `core.*`; an output that tries is refused as "could not check" so
+the same core fact is never counted twice.
+
+A source's `format` names a parser. A plain id is local to the plugin. A declared dependency's
+parser is written `"<plugin id>:<parser id>"` (for example `"acme.base:shared"`): the plugin must be
+in the pack plugin's `dependencies`, the linter refuses it otherwise, and the engine runs that
+plugin's parser through the same contract and read scope.
+
+A `finding` effect may state its `cause`: one of `mod`, `version_mismatch`, `missing_requirement`,
+`file`, `setting`, `save`, `memory`, `driver`, `game_install` or `other`. A root-cause finding about
+a mod defaults to `mod`, and a finding that accuses nobody defaults to `other`. The kind reaches the
+answer, its findings and the top answer's `cause`, so a screen can group findings by it. A cause
+other than `mod`, `version_mismatch` or `file` may still name a candidate (a refused plugin whose
+dependency is missing, say), but only with its own `why_not_sure` explanation; without one the
+linter refuses it, because that cause rarely singles out one mod.
+
 An `inspector` opens one file a rule's `verify` points at and reports `pass`, `fail` or `unknown`.
 It gets the same request and read scope as a parser, with the target file as its artifact, so it
 still never sees a path. `accepts` lists the file names it will open (case-insensitive `*` and

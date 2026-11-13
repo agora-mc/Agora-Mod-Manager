@@ -16,14 +16,14 @@ use super::{
     RefResolver,
 };
 use crate::crash_packs::{
-    artifact_handle, parse_artifact_with_builtin, parser_request, LoadedCrashPack, MemoryArtifact,
-    ParserFailureKind, BUILT_IN_PLUGIN_ID,
+    artifact_handle, detect_parsers, parser_request, run_parser_with_builtin, LoadedCrashPack,
+    MemoryArtifact, ParserFailureKind, BUILT_IN_PLUGIN_ID,
 };
 use crate::error::{LauncherError, LauncherResult};
 use agora_game_api::crash::{
     Artifact, AttrValue, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, Fact,
-    GameHandle, MatchedBy, ParserLimits, Privacy, Retained, Scalar, SessionVerdict,
-    DETECT_HEAD_BYTES,
+    GameHandle, MatchedBy, ParserDecl, ParserLimits, Privacy, Reads, Retained, Scalar,
+    SessionVerdict, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,13 @@ pub struct AnalyzedFile {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_by: Option<FileReader>,
+    /// Primary readers that would also have claimed this file. They were not run: one primary
+    /// speaks for a file, so its facts are never counted twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_recognised_by: Vec<FileReader>,
+    /// `extra` readers that ran alongside the primary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_by_extra: Vec<FileReader>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -120,9 +127,9 @@ pub struct AnalyzeOutput {
 }
 
 impl AnalyzeOutput {
-    /// Whether at least one file was read by a parser.
+    /// Whether at least one parser read a file.
     pub fn read_any(&self) -> bool {
-        self.files.iter().any(|file| file.read_by.is_some())
+        !self.parsed.is_empty()
     }
 }
 
@@ -146,8 +153,9 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
 
     let mut packs: Vec<&LoadedCrashPack> = input.packs.iter().collect();
     packs.sort_by(|a, b| {
-        a.plugin_id
-            .cmp(&b.plugin_id)
+        pack_rank(a)
+            .cmp(&pack_rank(b))
+            .then_with(|| a.plugin_id.cmp(&b.plugin_id))
             .then_with(|| a.file.cmp(&b.file))
     });
 
@@ -165,6 +173,8 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         let mut report = AnalyzedFile {
             name: file.name.clone(),
             read_by: None,
+            also_recognised_by: Vec::new(),
+            read_by_extra: Vec::new(),
             reason: None,
             failures: Vec::new(),
         };
@@ -199,6 +209,15 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             limits,
         );
 
+        // Who claims this file? Detection reads only the first bytes. One primary speaks for the
+        // file: built-in first, then official, then by plugin id. Every extra runs alongside it.
+        struct Claim<'a> {
+            pack: &'a LoadedCrashPack,
+            parser: &'a ParserDecl,
+            built_in: Option<&'a BuiltInPack>,
+            reader: FileReader,
+        }
+        let mut claimed: Vec<Claim<'_>> = Vec::new();
         for pack in &packs {
             let built_in = if pack.plugin_id == BUILT_IN_PLUGIN_ID {
                 input
@@ -208,54 +227,107 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             } else {
                 None
             };
-            let outcome = parse_artifact_with_builtin(
-                input.host,
-                &pack.plugin_id,
-                &pack.pack,
-                &request,
-                reads.clone(),
-                None,
-                head,
-                built_in,
-            );
-            for attempt in &outcome.attempts {
-                match &attempt.outcome {
-                    crate::crash_packs::ParserDispatch::Parsed(output) => {
-                        // The first parser that read it is the one the answer speaks from; a
-                        // second reader of the same file would double its facts.
-                        if report.read_by.is_none() {
-                            report.read_by = Some(FileReader {
+            match detect_parsers(&pack.pack, &file.name, head) {
+                Ok(parsers) => {
+                    for parser in parsers {
+                        claimed.push(Claim {
+                            pack,
+                            parser,
+                            built_in,
+                            reader: FileReader {
                                 plugin_id: pack.plugin_id.clone(),
                                 plugin_name: plugin_name(pack),
-                                parser_id: attempt.parser_id.clone(),
-                            });
-                            parsed.push(ParsedArtifact {
-                                plugin: identity(pack),
-                                parser_id: attempt.parser_id.clone(),
-                                artifact: file.name.clone(),
-                                source: None,
-                                output: output.clone(),
-                            });
-                        }
+                                parser_id: parser.id.clone(),
+                            },
+                        });
                     }
-                    crate::crash_packs::ParserDispatch::WrongFormat(_) => {}
-                    crate::crash_packs::ParserDispatch::Failed(failure) => {
-                        let reported = FileParserFailure {
-                            plugin_id: pack.plugin_id.clone(),
-                            plugin_name: plugin_name(pack),
-                            plugin_version: pack.plugin_version.clone(),
-                            parser_id: attempt.parser_id.clone(),
-                            kind: failure.kind,
-                            message: failure.message.clone(),
-                        };
-                        report.failures.push(reported.clone());
-                        failures.push((file.name.clone(), reported));
-                    }
+                }
+                Err(mut failure) => {
+                    failure.plugin_id = pack.plugin_id.clone();
+                    let reported = FileParserFailure {
+                        plugin_id: pack.plugin_id.clone(),
+                        plugin_name: plugin_name(pack),
+                        plugin_version: pack.plugin_version.clone(),
+                        parser_id: failure.parser_id.clone(),
+                        kind: failure.kind,
+                        message: failure.message.clone(),
+                    };
+                    report.failures.push(reported.clone());
+                    failures.push((file.name.clone(), reported));
                 }
             }
         }
 
-        if report.read_by.is_none() {
+        let primary = claimed
+            .iter()
+            .position(|claim| claim.parser.reads == Reads::Primary);
+        if let Some(index) = primary {
+            report.read_by = Some(claimed[index].reader.clone());
+        }
+        let mut to_run: Vec<(bool, &Claim<'_>)> = Vec::new();
+        if let Some(index) = primary {
+            to_run.push((true, &claimed[index]));
+        }
+        for (index, claim) in claimed.iter().enumerate() {
+            match claim.parser.reads {
+                Reads::Primary if Some(index) != primary => {
+                    report.also_recognised_by.push(claim.reader.clone());
+                }
+                Reads::Extra => to_run.push((false, claim)),
+                Reads::Primary => {}
+            }
+        }
+
+        let mut read_any = false;
+        for (is_primary, claim) in to_run {
+            let attempt = run_parser_with_builtin(
+                input.host,
+                &claim.pack.plugin_id,
+                claim.parser,
+                &request,
+                reads.clone(),
+                claim.built_in,
+            );
+            match &attempt.outcome {
+                crate::crash_packs::ParserDispatch::Parsed(output) => {
+                    read_any = true;
+                    parsed.push(ParsedArtifact {
+                        plugin: identity(claim.pack),
+                        parser_id: attempt.parser_id.clone(),
+                        artifact: file.name.clone(),
+                        source: None,
+                        output: output.clone(),
+                    });
+                    if !is_primary {
+                        report.read_by_extra.push(claim.reader.clone());
+                    }
+                }
+                crate::crash_packs::ParserDispatch::WrongFormat(_) => {
+                    if is_primary {
+                        report.read_by = None;
+                    }
+                }
+                crate::crash_packs::ParserDispatch::Failed(failure) => {
+                    if is_primary {
+                        report.read_by = None;
+                    }
+                    let reported = FileParserFailure {
+                        plugin_id: claim.pack.plugin_id.clone(),
+                        plugin_name: plugin_name(claim.pack),
+                        plugin_version: claim.pack.plugin_version.clone(),
+                        parser_id: attempt.parser_id.clone(),
+                        kind: failure.kind,
+                        message: failure.message.clone(),
+                    };
+                    report.failures.push(reported.clone());
+                    failures.push((file.name.clone(), reported));
+                }
+            }
+        }
+
+        if !read_any {
+            report.read_by = None;
+            report.read_by_extra.clear();
             report.reason = Some(if report.failures.is_empty() {
                 "no installed crash pack recognised this file".to_string()
             } else {
@@ -279,7 +351,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         None => {
             let read_games: std::collections::BTreeSet<&str> = reports
                 .iter()
-                .filter_map(|report| report.read_by.as_ref())
+                .flat_map(|report| report.read_by.iter().chain(report.read_by_extra.iter()))
                 .flat_map(|reader| {
                     packs
                         .iter()
@@ -395,7 +467,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             .map(|file| file.name.as_str())
             .collect::<Vec<_>>()
             .join(", "),
-        readable: reports.iter().any(|report| report.read_by.is_some()),
+        readable: !parsed.is_empty(),
         candidates,
         place,
     };
@@ -456,6 +528,18 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         parsed,
         record,
     })
+}
+
+/// Which primary speaks for a file when several recognise it: a built-in pack, then a verified
+/// official plugin, then anyone else by plugin id.
+fn pack_rank(pack: &LoadedCrashPack) -> u8 {
+    if pack.plugin_id == BUILT_IN_PLUGIN_ID {
+        0
+    } else if pack.official {
+        1
+    } else {
+        2
+    }
 }
 
 fn identity(pack: &LoadedCrashPack) -> PluginIdentity {

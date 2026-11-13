@@ -319,6 +319,20 @@ fn lint_source(source: &CrashSource, out: &mut Vec<LintProblem>) {
     if source.matching.glob.trim().is_empty() {
         out.push(problem(LintCode::BadSource, &at, "`match.glob` is empty"));
     }
+    if let Some(format) = &source.format {
+        let invalid = match format.split_once(':') {
+            Some((plugin_id, parser_id)) => !is_valid_id(plugin_id) || !is_valid_id(parser_id),
+            None => !is_valid_id(format),
+        };
+        if invalid {
+            out.push(problem(
+                LintCode::BadSource,
+                &at,
+                "`format` is a parser id, or `\"<plugin id>:<parser id>\"` for a parser from a \
+                 declared dependency",
+            ));
+        }
+    }
     if source.unit == ArtifactUnit::File && !source.children.is_empty() {
         out.push(problem(
             LintCode::BadSource,
@@ -427,6 +441,7 @@ pub fn lint_rule(rule: &Rule) -> Vec<LintProblem> {
     for effect in &effects {
         lint.effect(effect, &bound);
     }
+    lint.finding_causes(rule);
 
     lint.text(&rule.text, &bound);
     for repair in &rule.repairs {
@@ -799,6 +814,49 @@ impl RuleLint {
         }
     }
 
+    /// A cause that rarely singles out one mod still names one. That can be right (a plugin
+    /// refused for a missing dependency), but it needs its own explanation, or it reads as blame.
+    fn finding_causes(&mut self, rule: &Rule) {
+        let verify_effects = rule.verify.iter().flat_map(|verify| {
+            verify
+                .on_pass
+                .iter()
+                .chain(&verify.on_fail)
+                .chain(&verify.on_unknown)
+        });
+        for effect in rule.effects.iter().chain(verify_effects) {
+            let Effect::Finding {
+                candidate: Some(_),
+                cause: Some(cause),
+                text,
+                ..
+            } = effect
+            else {
+                continue;
+            };
+            if matches!(cause, Cause::Mod | Cause::VersionMismatch | Cause::File) {
+                continue;
+            }
+            let why = text
+                .as_ref()
+                .and_then(|text| text.why_not_sure.as_ref())
+                .or(rule.text.why_not_sure.as_ref());
+            let has_reason =
+                why.is_some_and(|why| why.get("en").is_some_and(|words| !words.trim().is_empty()));
+            if !has_reason {
+                self.push(
+                    LintCode::BadEffect,
+                    format!(
+                        "a `{}` finding names a candidate, so it needs `why_not_sure`: `{}` rarely \
+                         singles out one mod, and the user must see why this one is named",
+                        cause.label(),
+                        cause.label()
+                    ),
+                );
+            }
+        }
+    }
+
     fn effect(&mut self, effect: &Effect, bound: &Bound) {
         match effect {
             Effect::Signal {
@@ -1060,6 +1118,24 @@ fn anchor(condition: &Condition) -> Anchor {
             }
         }
     }
+}
+
+/// Everything wrong with what an `extra` parser returned. It is a parser output plus one rule: it
+/// may emit only facts in a namespace of its own, never `core.*`, so two readers cannot both count
+/// the same core fact.
+pub fn validate_extra_output(output: &ParserOutput, limits: &ParserLimits) -> Vec<LintProblem> {
+    let mut out = validate_parser_output(output, limits);
+    for (index, fact) in output.facts.iter().enumerate() {
+        if fact.kind.starts_with("core.") {
+            out.push(problem(
+                LintCode::BadOutput,
+                &format!("fact {index} `{}`", fact.kind),
+                "an `extra` reader may not emit `core.*` facts; a core fact belongs to the primary \
+                 reader, and counting it twice would double its weight",
+            ));
+        }
+    }
+    out
 }
 
 /// Everything wrong with what a parser returned. The output is untrusted, so the host calls this on

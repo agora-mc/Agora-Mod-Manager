@@ -1128,7 +1128,26 @@ impl PluginService {
     /// that is disabled or cannot run contributes nothing, because its rules
     /// must not speak for a game it is not part of.
     pub fn crash_packs(&self) -> crate::crash_packs::CrashPackReport {
-        let installed: Vec<(String, PathBuf, PluginManifest)> = self
+        // Which copies are verified official decides only which primary reads a file. A catalog
+        // that cannot be read leaves them community, which is the safe, quieter answer.
+        let official: BTreeMap<String, bool> = self
+            .inner
+            .conn()
+            .and_then(|conn| {
+                super::official::verify_installed(
+                    &conn,
+                    self.inner.ctx.paths.root(),
+                    &self.inner.registry_trust,
+                )
+            })
+            .map(|statuses| {
+                statuses
+                    .into_iter()
+                    .map(|(id, status)| (id, status.is_official()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let installed: Vec<(String, PathBuf, PluginManifest, bool)> = self
             .inner
             .resolution
             .read()
@@ -1140,6 +1159,7 @@ impl PluginService {
                             plugin.id().as_str().to_string(),
                             plugin.record.install_dir.clone(),
                             plugin.record.manifest.clone(),
+                            official.get(plugin.id().as_str()).copied().unwrap_or(false),
                         )
                     })
                     .collect()
@@ -1148,10 +1168,11 @@ impl PluginService {
         let sources: Vec<crate::crash_packs::PluginPackSource<'_>> = installed
             .iter()
             .map(
-                |(plugin_id, root, manifest)| crate::crash_packs::PluginPackSource {
+                |(plugin_id, root, manifest, official)| crate::crash_packs::PluginPackSource {
                     plugin_id,
                     root,
                     manifest,
+                    official: *official,
                 },
             )
             .collect();

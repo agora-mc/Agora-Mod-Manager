@@ -399,6 +399,9 @@ fn print_text(output: &AnalyzeOutput) {
     let answer = &output.answer;
     println!("{}", english(&answer.headline));
     println!("How sure: {}", answer.level.label());
+    if let Some(cause) = answer.cause {
+        println!("Likely cause: {}", cause.label());
+    }
 
     if !answer.candidates.is_empty() {
         println!("Suspects:");
@@ -411,7 +414,9 @@ fn print_text(output: &AnalyzeOutput) {
         println!("Findings:");
         for finding in &answer.findings {
             println!(
-                "  - {} (from {})",
+                "  - {} {}: {} (from {})",
+                level_word(finding.level),
+                cause_words(finding.cause),
                 english(&finding.headline),
                 finding.source.plugin_name
             );
@@ -582,14 +587,54 @@ fn print_files(output: &AnalyzeOutput) {
     }
     println!("Files:");
     for file in &output.files {
-        match (&file.read_by, &file.reason) {
+        match (&file.read_by, file.read_by_extra.first()) {
             (Some(reader), _) => println!("  {}: read by {}", file.name, reader.plugin_name),
-            (None, Some(reason)) => println!("  {}: {reason}", file.name),
+            (None, Some(reader)) => {
+                println!(
+                    "  {}: no primary reader; read alongside by {}",
+                    file.name, reader.plugin_name
+                );
+            }
             (None, None) => println!(
-                "  {}: not recognised by any installed crash pack",
-                file.name
+                "  {}: {}",
+                file.name,
+                file.reason
+                    .as_deref()
+                    .unwrap_or("not recognised by any installed crash pack")
             ),
         }
+        for reader in &file.also_recognised_by {
+            println!(
+                "    also recognised by {}/{} (not run; one primary reads a file)",
+                reader.plugin_name, reader.parser_id
+            );
+        }
+    }
+}
+
+fn level_word(level: agora_game_api::crash::Level) -> &'static str {
+    match level {
+        agora_game_api::crash::Level::NotSure => "Not sure",
+        agora_game_api::crash::Level::Possible => "Possible",
+        agora_game_api::crash::Level::Likely => "Likely",
+        agora_game_api::crash::Level::VeryLikely => "Very likely",
+    }
+}
+
+/// How a finding's cause reads in a sentence: "Likely a setting: ...".
+fn cause_words(cause: agora_game_api::crash::Cause) -> &'static str {
+    use agora_game_api::crash::Cause;
+    match cause {
+        Cause::Mod => "a mod",
+        Cause::VersionMismatch => "a version mismatch",
+        Cause::MissingRequirement => "a missing requirement",
+        Cause::File => "a file",
+        Cause::Setting => "a setting",
+        Cause::Save => "a save",
+        Cause::Memory => "a memory problem",
+        Cause::Driver => "a driver problem",
+        Cause::GameInstall => "a game install problem",
+        Cause::Other => "another cause",
     }
 }
 
