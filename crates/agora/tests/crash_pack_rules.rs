@@ -2,8 +2,9 @@
 //! quiet on a case close to it. The parsers' own outputs are tested in the game package.
 
 use agora_core::crash_engine::{
-    evaluate, EngineFacts, EvaluateInput, EvaluateOutput, Inspection, InspectionOutcome,
-    InspectionRequest, Inspector, PackInput, ParsedArtifact, RefResolver, Resolved,
+    consensus, evaluate, ConsensusInput, ConsensusProfile, EngineFacts, EvaluateInput,
+    EvaluateOutput, Inspection, InspectionOutcome, InspectionRequest, Inspector, PackInput,
+    ParsedArtifact, RefResolver, Resolved,
 };
 use agora_core::crash_packs::{built_in_identity, load_built_in_packs, BUILT_IN_PLUGIN_ID};
 use agora_game_api::crash::{
@@ -24,6 +25,12 @@ impl RefResolver for MapResolver {
             };
         }
         if reference.kind == "class" {
+            if reference.value.contains(".target.") {
+                return Resolved {
+                    owner: item("targetmod"),
+                    role: None,
+                };
+            }
             if reference.value.starts_with("com.example") {
                 return Resolved {
                     owner: item("examplemod"),
@@ -40,6 +47,17 @@ impl RefResolver for MapResolver {
         if reference.kind == "module" {
             return Resolved {
                 owner: item("examplegfx"),
+                role: None,
+            };
+        }
+        if matches!(reference.kind.as_str(), "mixin_config" | "named_class") {
+            let key = if reference.value.contains(".target.") {
+                "targetmod"
+            } else {
+                "examplemod"
+            };
+            return Resolved {
+                owner: item(key),
                 role: None,
             };
         }
@@ -153,6 +171,19 @@ fn evaluate_one(output: ParserOutput) -> EvaluateOutput {
         resolver: &MapResolver,
         inspector: &NoInspector,
     })
+}
+
+fn candidates(evaluated: &EvaluateOutput) -> Vec<agora_game_api::crash::Candidate> {
+    let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
+    consensus(
+        &ConsensusInput {
+            signals: &evaluated.signals,
+            roles: &evaluated.roles,
+            level_caps: &level_caps,
+        },
+        &ConsensusProfile::default(),
+    )
+    .candidates
 }
 
 fn fired(evaluated: &EvaluateOutput, rule: &str) -> bool {
@@ -808,6 +839,101 @@ mod crash {
         assert!(signalled(&evaluated, "module_on_stack"));
         assert!(evaluated.signals.iter().any(
             |signal| matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplegfx")
+        ));
+    }
+
+    #[test]
+    fn a_mixin_config_owner_ranks_before_the_target_class_owner() {
+        let mut config = reference("mixin_config", "examplemod.mixins.json");
+        config.strength = agora_game_api::crash::Strength::Mention;
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.mixin_failure",
+                &[
+                    ("severity", text("critical")),
+                    ("config", text("examplemod.mixins.json")),
+                    ("target", text("com.target.mod.TargetScreen")),
+                ],
+                vec![
+                    reference("mod_id", "examplemod"),
+                    config,
+                    reference("class", "com.target.mod.TargetScreen"),
+                ],
+            )],
+        ));
+        assert!(signalled(&evaluated, "mixin_config_owner"));
+        assert!(signalled(&evaluated, "mixin_target_owner"));
+        let keys: Vec<String> = candidates(&evaluated)
+            .iter()
+            .filter_map(|candidate| match &candidate.owner {
+                Owner::Item { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.first().map(String::as_str), Some("examplemod"));
+        assert!(keys.iter().any(|key| key == "targetmod"));
+    }
+
+    #[test]
+    fn a_mixin_warning_creates_no_suspect() {
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.mixin_failure",
+                &[
+                    ("severity", text("warning")),
+                    ("config", text("examplemod.mixins.json")),
+                ],
+                vec![reference("mixin_config", "examplemod.mixins.json")],
+            )],
+        ));
+        assert!(!signalled(&evaluated, "mixin_config_owner"));
+        assert!(candidates(&evaluated).is_empty());
+    }
+
+    #[test]
+    fn a_class_named_in_an_exception_message_becomes_a_suspect() {
+        let mut named = reference("named_class", "com.example.mod.HiddenConfig");
+        named.strength = agora_game_api::crash::Strength::Mention;
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "core.exception",
+                &[
+                    (
+                        "class",
+                        text("org.example.mixin.ClassMetadataNotFoundException"),
+                    ),
+                    ("category", text("managed")),
+                    ("message", text("com.example.mod.HiddenConfig")),
+                    ("depth", number(0.0)),
+                ],
+                vec![named],
+            )],
+        ));
+        assert!(signalled(&evaluated, "exception_names_mod_class"));
+        assert!(evaluated.signals.iter().any(
+            |signal| matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplemod")
+        ));
+    }
+
+    #[test]
+    fn a_data_error_in_a_mods_namespace_names_that_mod() {
+        let evaluated = evaluate_one(output(
+            "minecraft_crash_report",
+            vec![fact(
+                "minecraft.data_error",
+                &[
+                    ("namespace", text("examplemod")),
+                    ("message", text("data/examplemod/recipes/thing.json")),
+                ],
+                vec![reference("mod_id", "examplemod")],
+            )],
+        ));
+        assert!(fired(&evaluated, "data_error_names_mod"));
+        assert!(candidates(&evaluated).iter().any(
+            |candidate| matches!(&candidate.owner, Owner::Item { key, .. } if key == "examplemod")
         ));
     }
 }

@@ -1,9 +1,10 @@
 //! The game's `latest.log`: the loader's own account of what it refused to load.
 
 use super::shared::{
-    collect_lines, fact, file_problem, frame_symbol_and_class, is_mod_id, jar_from_frame,
-    java_exception_category, jvm_problem, looked_for, mod_crash_from_message, mod_crash_line,
-    notes_for, number, reference, source_location, text,
+    collect_lines, data_error_fact, fact, file_problem, frame_symbol_and_class, is_mod_id,
+    jar_from_frame, java_exception_category, jvm_problem, loader_dependency_problem, looked_for,
+    mixin_failure_fact, mixin_failure_line, mod_crash_from_message, mod_crash_line,
+    named_message_classes, notes_for, number, reference, source_location, text,
 };
 use agora_game_api::crash::{
     BucketPart, BuiltInParser, BuiltInParserError, Coverage, CoverageState, Fact, ParserOutput,
@@ -37,6 +38,12 @@ impl BuiltInParser for LatestLogParser {
         let mut os: Option<String> = None;
         let mut fatal_line: Option<(usize, String)> = None;
         let mut mod_crash_order = 0u32;
+        // A crash report the game wrote into its own log is the account that matters; the lines
+        // before it can contain unrelated errors.
+        let embedded_report = collected
+            .lines
+            .iter()
+            .position(|line| line.contains("---- Minecraft Crash Report ----"));
 
         for (offset, line) in collected.lines.iter().enumerate() {
             let line_no = offset + 1;
@@ -136,9 +143,12 @@ impl BuiltInParser for LatestLogParser {
                             vec![
                                 ("requirement", text(requirement)),
                                 ("state", text(state)),
-                                ("needed_by", text(required_by)),
+                                ("needed_by", text(required_by.clone())),
                             ],
-                            vec![reference("mod_id", missing, Strength::Mention)],
+                            vec![
+                                reference("mod_id", missing, Strength::Mention),
+                                reference("needed_by", required_by, Strength::Mention),
+                            ],
                             line_no,
                             "loader",
                         ));
@@ -154,34 +164,27 @@ impl BuiltInParser for LatestLogParser {
                         vec![
                             ("requirement", text(requirement)),
                             ("state", text(state)),
-                            ("needed_by", text(required_by)),
+                            ("needed_by", text(required_by.clone())),
                         ],
-                        vec![reference("mod_id", missing, Strength::Mention)],
+                        vec![
+                            reference("mod_id", missing, Strength::Mention),
+                            reference("needed_by", required_by, Strength::Mention),
+                        ],
                         line_no,
                         "loader",
                     ));
                 }
             }
 
-            if let Some((mod_id, config, target)) = mixin_failure(trimmed) {
+            if let Some(failure) = mixin_failure_line(trimmed) {
                 let key = format!(
-                    "mixin\0{}\0{config}\0{target}",
-                    mod_id.as_deref().unwrap_or("")
+                    "mixin\0{}\0{}\0{}",
+                    failure.owner.as_deref().unwrap_or(""),
+                    failure.config,
+                    failure.target.as_deref().unwrap_or("")
                 );
                 if seen.insert(key) {
-                    facts.push(fact(
-                        "minecraft.mixin_failure",
-                        vec![
-                            ("severity", text("critical")),
-                            ("config", text(config)),
-                            ("target", text(target)),
-                        ],
-                        mod_id
-                            .map(|id| vec![reference("mod_id", id, Strength::ExecTop)])
-                            .unwrap_or_default(),
-                        line_no,
-                        "mixin",
-                    ));
+                    facts.push(mixin_failure_fact(failure, line_no, Strength::ExecTop));
                 }
             }
 
@@ -296,7 +299,7 @@ impl BuiltInParser for LatestLogParser {
                 }
             }
 
-            if fatal_line.is_none() {
+            if fatal_line.is_none() && embedded_report.is_none_or(|start| offset > start) {
                 let message = strip_log_prefix(line);
                 if let Some((caused, class, _)) = exception_line(message) {
                     if !caused {
@@ -310,6 +313,15 @@ impl BuiltInParser for LatestLogParser {
         let (exception_facts, bucket) =
             parse_fatal_exception(&collected.lines, fatal_line.as_ref());
         facts.extend(exception_facts);
+
+        if !facts
+            .iter()
+            .any(|fact| fact.kind == "core.dependency_problem")
+        {
+            if let Some(problem) = loader_dependency_problem(&facts) {
+                facts.push(problem);
+            }
+        }
 
         // An out-of-memory error anywhere is its own fact, even if the first fatal was something else.
         let oom_line = collected.lines.iter().position(|line| {
@@ -492,6 +504,11 @@ impl BuiltInParser for LatestLogParser {
                 why: None,
             },
             Coverage {
+                kind: "minecraft.data_error".to_string(),
+                state: CoverageState::Checked,
+                why: None,
+            },
+            Coverage {
                 kind: "minecraft.ticking_object".to_string(),
                 state: CoverageState::NotApplicable,
                 why: None,
@@ -600,6 +617,10 @@ fn push_exception(
     line_no: usize,
 ) {
     let message = message.unwrap_or_default();
+    let mut exception_refs = vec![reference("class", class.to_string(), Strength::Mention)];
+    for named in named_message_classes(class, &message) {
+        exception_refs.push(reference("named_class", named, Strength::Mention));
+    }
     facts.push(fact(
         "core.exception",
         vec![
@@ -608,10 +629,13 @@ fn push_exception(
             ("message", text(message.clone())),
             ("depth", number(depth as f64)),
         ],
-        vec![reference("class", class.to_string(), Strength::Mention)],
+        exception_refs,
         line_no,
         "fatal",
     ));
+    if let Some(problem) = data_error_fact(class, &message, line_no, "fatal") {
+        facts.push(problem);
+    }
     if let Some(problem) = jvm_problem(class, &message, line_no, "fatal") {
         facts.push(problem);
     }
@@ -794,32 +818,6 @@ fn forge_dependency(line: &str) -> Option<(String, String, String, String)> {
         id.trim().to_string(),
         range.trim().to_string(),
     ))
-}
-
-fn mixin_failure(line: &str) -> Option<(Option<String>, String, String)> {
-    if let Some(rest) = line.split("Mixin apply for mod ").nth(1) {
-        let (mod_id, rest) = rest.split_once(" failed ")?;
-        let (config_and_mixin, rest) = rest.split_once(" -> ")?;
-        let config = config_and_mixin.split(':').next()?.trim();
-        let target = rest.split(':').next()?.trim();
-        return Some((
-            Some(mod_id.trim().to_string()),
-            config.to_string(),
-            target.to_string(),
-        ));
-    }
-    if let Some(rest) = line.split("Mixin apply failed ").nth(1) {
-        let (config_and_mixin, rest) = rest.split_once(" -> ")?;
-        let config = config_and_mixin.split(':').next()?.trim();
-        let target = rest.split(':').next()?.trim();
-        let mod_id = config
-            .split('.')
-            .next()
-            .filter(|token| !token.is_empty())
-            .map(str::to_string);
-        return Some((mod_id, config.to_string(), target.to_string()));
-    }
-    None
 }
 
 fn duplicate_mod(line: &str) -> Option<String> {

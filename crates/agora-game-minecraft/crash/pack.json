@@ -72,6 +72,34 @@
       ]
     },
     {
+      "kind": "mixin_config",
+      "lookup": { "facts": { "kind": "minecraft.mod", "key": "id", "name": "name" } },
+      "match": "segment",
+      "ignore": [
+        "client", "server", "common", "api", "core", "mixin", "mixins", "util", "lib",
+        "impl", "mod", "mods", "net", "com", "org", "io", "me", "dev", "json"
+      ]
+    },
+    {
+      "kind": "named_class",
+      "lookup": { "facts": { "kind": "minecraft.mod", "key": "id", "name": "name" } },
+      "match": "segment",
+      "ignore": [
+        "client", "server", "common", "api", "core", "mixin", "util", "lib", "impl",
+        "mod", "mods", "net", "com", "org", "io", "me", "dev"
+      ]
+    },
+    {
+      "kind": "needed_by",
+      "lookup": { "facts": { "kind": "minecraft.mod", "key": "id", "name": "name" } },
+      "match": "segment",
+      "ignore": [
+        "client", "server", "common", "api", "core", "mixin", "util", "lib", "impl",
+        "mod", "mods", "net", "com", "org", "io", "me", "dev"
+      ]
+    },
+    { "kind": "needed_by", "lookup": { "index": "mod_id" }, "match": "exact" },
+    {
       "kind": "file",
       "lookup": { "path": { "patterns": ["mods/{value}", "mods/*/{value}"], "archives": true } },
       "match": "casefold"
@@ -317,6 +345,114 @@
         }
       },
       "repairs": [{ "disable_content": { "key": { "owner_of": "owner" } } }],
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "mixin_config_owner",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.mixin_failure",
+          "where": { "severity": "critical" },
+          "ref": { "kind": "mixin_config", "bind": "config_owner" },
+          "bind": { "config": "config" }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "known_signature",
+            "candidate": { "owner_of": "config_owner" },
+            "weight": 11
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "{owner:config_owner} owns the mixin config {config} that failed to apply."
+        }
+      }
+    },
+    {
+      "id": "mixin_target_owner",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.mixin_failure",
+          "where": { "severity": "critical" },
+          "ref": { "kind": "class", "bind": "target_class" },
+          "bind": { "target": "target" }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "execution",
+            "candidate": { "owner_of": "target_class" },
+            "weight": 4
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The mixin failed on {target}, which {owner:target_class} provides."
+        }
+      }
+    },
+    {
+      "id": "exception_names_mod_class",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.exception",
+          "ref": { "kind": "named_class", "bind": "named_class" },
+          "bind": { "message": "message" }
+        }
+      },
+      "effects": [
+        {
+          "signal": {
+            "family": "known_signature",
+            "candidate": { "owner_of": "named_class" },
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The error names code that {owner:named_class} provides: {message}."
+        }
+      }
+    },
+    {
+      "id": "data_error_names_mod",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "minecraft.data_error",
+          "ref": { "kind": "mod_id", "bind": "mod" },
+          "bind": { "namespace": "namespace", "message": "message" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "candidate": { "owner_of": "mod" },
+            "family": "known_signature",
+            "weight": 6
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "A data file in {owner:mod}'s namespace ({namespace}) could not be read: {message}. Repairing or reinstalling that mod is a possible next step."
+        },
+        "why_not_sure": {
+          "en": "A broken data file can be unrelated to the crash, or another mod can change the same namespace."
+        }
+      },
       "next_step": "confirm_experiment"
     },
     {

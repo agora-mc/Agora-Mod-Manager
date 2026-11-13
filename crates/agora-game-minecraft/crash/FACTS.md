@@ -30,9 +30,11 @@ from an existing world. The answer tells the user to back the world up first.
 
 ## Facts
 
-An example below is invented. `mod_id` refs name a mod; `class` refs name a Java class; `module`
-refs name a native library; `file` refs name the jar a frame annotation named. The pack's
-`ref_maps` say how each kind is looked up.
+An example below is invented. `mod_id` refs name a mod; `class` refs name a Java class;
+`named_class` refs name a class an exception message mentions; `mixin_config` refs name a mixin
+config; `needed_by` refs name the mod that required a missing one; `module` refs name a native
+library; `file` refs name the jar a frame annotation named. The pack's `ref_maps` say how each kind
+is looked up.
 
 ### `core.exception`
 
@@ -44,7 +46,10 @@ refs name a native library; `file` refs name the jar a frame annotation named. T
 | `depth` | 0 for the outermost exception, then 1 for each `Caused by` |
 | `access`, `fault_address`, `near_null`, `pointer_class` | native faults only (`hs_err`; `pointer_class` describes how a bad address was formed) |
 
-Refs: `class` (Mention) from a crash report or log. Provided by all three artifact kinds.
+Refs: `class` (Mention) from a crash report or log. A class an exception message itself names is
+`named_class` (Mention): the JVM's null-pointer message, a mixin `ClassMetadataNotFoundException`,
+and the missing-member errors (`AbstractMethodError`, `NoSuchMethodError`, `NoSuchFieldError`,
+`IllegalAccessError`) are the shapes read. Provided by all three artifact kinds.
 
 ```json
 { "kind": "core.exception",
@@ -114,13 +119,17 @@ Provided by all three artifact kinds.
 | `requirement` | the range or version the loader named |
 | `needed_by` | the loader id of the mod that needs it |
 
-Refs: `mod_id` of the missing or wrong mod. Provided by `latest_log`. A recommendation
-(`recommends ...`) is deliberately not a dependency problem; only a hard requirement is.
+Refs: `mod_id` of the missing or wrong mod, then `needed_by` of the mod that required it.
+Provided by `latest_log` (Fabric and Forge lines), and by either parser when a Forge 1.7-1.12
+`LoaderException` fails because one mod's class is missing from another mod's package. A
+recommendation (`recommends ...`) is deliberately not a dependency problem; only a hard
+requirement is. The missing mod is named as the thing to install, never as the crash's cause.
 
 ```json
 { "kind": "core.dependency_problem",
   "attrs": { "state": "absent", "requirement": "2.0.0 or later", "needed_by": "examplemod" },
-  "refs": [{ "kind": "mod_id", "value": "examplelib", "strength": "mention" }] }
+  "refs": [{ "kind": "mod_id", "value": "examplelib", "strength": "mention" },
+           { "kind": "needed_by", "value": "examplemod", "strength": "mention" }] }
 ```
 
 ### `core.log_line`
@@ -230,15 +239,22 @@ that map misses. A report with no mod list, or an empty one, leaves the class na
 | `config` | the mixin config, without its `:MixinClass` suffix |
 | `target` | the class the mixin tried to change, when the line names one |
 
-Refs: `mod_id` of the owning mod. For the `Mixin apply failed` form that does not name a mod, the
-config's leading token is used and marked Mention; it is usually the mod id. A crash report's
-`Mixin [...] ... FAILED during` line is read too; when another transformer took the target
-(`removed by another injector`, `could not find any targets matching`) the owner is the victim, so
-no fact is emitted. Provided by `crash_report` and `latest_log`.
+Refs: `mod_id` of the owning mod (when a `from mod` or `Mixin apply for mod` names one), then
+`mixin_config` of the config, then `class` of the target. For the `Mixin apply failed` form that
+does not name a mod, the config's leading token is used and marked Mention; it is usually the mod
+id. The shapes read are `Mixin apply for mod ... failed`, `Mixin apply failed`, `Mixin apply` and
+`Mixin prepare` with `... was loaded too early`, and the crash report's `Mixin [...] ... FAILED
+during` line. `in <config>:<Mixin> from mod <id> failed injection check` names the config too. A
+target-already-loaded line is only read when it names a second, non-platform mod as its target.
+When another transformer took the target (`removed by another injector`, `could not find any
+targets matching`) the owner is the victim, so no fact is emitted. Provided by `crash_report` and
+`latest_log`.
 
 ```json
 { "kind": "minecraft.mixin_failure", "attrs": { "severity": "critical", "config": "examplemod.mixins.json", "target": "net.minecraft.class_123" },
-  "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "exec_top" }] }
+  "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "exec_top" },
+           { "kind": "mixin_config", "value": "examplemod.mixins.json", "strength": "mention" },
+           { "kind": "class", "value": "net.minecraft.class_123", "strength": "mention" }] }
 ```
 
 ### `minecraft.duplicate_mod`
@@ -331,6 +347,23 @@ Refs: `file` (Mention) of that name. Provided by `crash_report` and `latest_log`
   "refs": [{ "kind": "file", "value": "examplemod.toml.old", "strength": "mention" }] }
 ```
 
+### `minecraft.data_error`
+
+| Attribute | Meaning |
+|---|---|
+| `namespace` | the mod's data namespace (`examplemod` in `examplemod:recipes/...` or `data/examplemod/...`) |
+| `message` | the JSON exception message |
+
+Refs: `mod_id` of that namespace. Only a fatal JSON error (`JsonSyntaxException`,
+`JsonParseException`, `MalformedJsonException`) is read, so an unrelated warning earlier in a long
+log cannot accuse a mod. Provided by `crash_report` and `latest_log`.
+
+```json
+{ "kind": "minecraft.data_error",
+  "attrs": { "namespace": "examplemod", "message": "Failed to read data/examplemod/recipes/thing.json" },
+  "refs": [{ "kind": "mod_id", "value": "examplemod", "strength": "mention" }] }
+```
+
 ### `minecraft.ticking_object`
 
 | Attribute | Meaning |
@@ -411,9 +444,9 @@ parser looked for and found none in is `checked`.
 
 | Parser | `checked` | `absent` with a reason |
 |---|---|---|
-| `crash_report` | `minecraft.crash`, `core.exception`, `core.frame`, `core.process`, `core.system`, `minecraft.system`, `minecraft.loader`, `minecraft.mod`, `minecraft.section`, `minecraft.mod_crash`, `minecraft.mixin_failure`, `minecraft.ticking_object`, `minecraft.jvm_problem`, `minecraft.file_problem` | any of those with no data in this report |
-| `crash_report` | | `core.log_line`, `core.dependency_problem`, `core.module`, `minecraft.loader_problem`, `minecraft.mod_conflict`, `minecraft.world_mod` are `not_applicable` |
-| `latest_log` | `core.exception`, `core.frame`, `core.dependency_problem`, `minecraft.mixin_failure`, `minecraft.duplicate_mod`, `minecraft.loader_problem`, `minecraft.mod_error`, `minecraft.config_error`, `minecraft.world_error`, `minecraft.mod_crash`, `minecraft.mod_conflict`, `minecraft.world_mod`, `minecraft.jvm_problem`, `minecraft.file_problem`, `core.log_line` | `minecraft.loader`, `minecraft.system`, `core.process` when the log does not state them; `minecraft.mod` because `latest.log` does not list the whole mod set; `minecraft.ticking_object` is `not_applicable` |
+| `crash_report` | `minecraft.crash`, `core.exception`, `core.frame`, `core.process`, `core.system`, `minecraft.system`, `minecraft.loader`, `minecraft.mod`, `minecraft.section`, `minecraft.mod_crash`, `minecraft.mixin_failure`, `minecraft.ticking_object`, `minecraft.jvm_problem`, `minecraft.file_problem`, `minecraft.data_error`, `core.dependency_problem` | any of those with no data in this report |
+| `crash_report` | | `core.log_line`, `core.module`, `minecraft.loader_problem`, `minecraft.mod_conflict`, `minecraft.world_mod` are `not_applicable` |
+| `latest_log` | `core.exception`, `core.frame`, `core.dependency_problem`, `minecraft.mixin_failure`, `minecraft.duplicate_mod`, `minecraft.loader_problem`, `minecraft.mod_error`, `minecraft.config_error`, `minecraft.world_error`, `minecraft.mod_crash`, `minecraft.mod_conflict`, `minecraft.world_mod`, `minecraft.jvm_problem`, `minecraft.file_problem`, `minecraft.data_error`, `core.log_line` | `minecraft.loader`, `minecraft.system`, `core.process` when the log does not state them; `minecraft.mod` because `latest.log` does not list the whole mod set; `minecraft.ticking_object` is `not_applicable` |
 | `hs_err` | `core.exception`, `core.system` | `core.frame` and `core.module` when there is no problematic frame; `core.process` without a pid; `minecraft.system` without Java details |
 
 When a parser's read budget runs out, a kind it did not reach becomes `absent` with
@@ -430,6 +463,10 @@ The pack maps `mod_id` through an index named `mod_id` (exact) and `class` throu
   trace to a mod;
 - the jar file names under `mods/` (the `file` ref map, with `archives`), so a Forge/NeoForge
   frame annotation can trace to its mod.
+
+The same `facts`/`segment` matching maps `mixin_config` (`examplemod-common.mixins.json` is read
+as `examplemod.common.mixins.json`) and `named_class` refs, so a mixin config or an exception
+message can name its mod the way a class frame does.
 
 Until that index exists, a loose crash report still names a mod when its own mod list has the id
 (above), and otherwise a frame resolves to "something Agora could not identify" and the engine does

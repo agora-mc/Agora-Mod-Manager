@@ -594,6 +594,168 @@ Caused by: org.spongepowered.asm.mixin.injection.throwables.InvalidInjectionExce
     }
 
     #[test]
+    fn a_mixin_failure_carries_the_config_and_the_target_as_refs() {
+        let log = "[01:02:03] [main/ERROR]: Mixin apply for mod examplemod failed \
+examplemod.mixins.json:ExampleMixin -> com.other.mod.TargetScreen: boom\n";
+        let output = run_ok("latest_log", log.as_bytes());
+        let failure = output
+            .facts
+            .iter()
+            .find(|fact| fact.kind == "minecraft.mixin_failure")
+            .expect("a mixin failure");
+        assert_eq!(text_of(failure, "config"), "examplemod.mixins.json");
+        assert_eq!(text_of(failure, "target"), "com.other.mod.TargetScreen");
+        assert!(failure
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mixin_config"
+                && reference.value == "examplemod.mixins.json"));
+        assert!(failure
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "class"
+                && reference.value == "com.other.mod.TargetScreen"));
+    }
+
+    #[test]
+    fn a_target_already_loaded_names_two_mods_but_a_platform_target_names_one() {
+        let two_mods =
+            "[01:02:03] [main/FATAL]: Mixin prepare for mod examplemod failed preparing \
+ExampleMixin in examplemod.mixins.json: Critical problem: examplemod.mixins.json:ExampleMixin \
+from mod examplemod target com.other.mod.TargetScreen was loaded too early.\n";
+        let output = run_ok("latest_log", two_mods.as_bytes());
+        let failure = output
+            .facts
+            .iter()
+            .find(|fact| fact.kind == "minecraft.mixin_failure")
+            .expect("a mixin failure");
+        assert_eq!(text_of(failure, "target"), "com.other.mod.TargetScreen");
+        assert!(failure
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mod_id" && reference.value == "examplemod"));
+
+        let platform =
+            "[01:02:03] [main/FATAL]: Mixin prepare for mod examplemod failed preparing \
+ExampleMixin in examplemod.mixins.json: Critical problem: examplemod.mixins.json:ExampleMixin \
+from mod examplemod target net.minecraft.world.level.LevelReader was loaded too early.\n";
+        let output = run_ok("latest_log", platform.as_bytes());
+        assert!(!output
+            .facts
+            .iter()
+            .any(|fact| fact.kind == "minecraft.mixin_failure"));
+    }
+
+    #[test]
+    fn a_loader_exception_names_the_missing_mod_and_the_mod_that_needs_it() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Description: There was a severe problem during mod loading\n\
+\n\
+cpw.mods.fml.common.LoaderException: java.lang.NoClassDefFoundError: Lexampletardis/common/items/WidgetItem;\n\
+\tat cpw.mods.fml.common.LoadController.transition(LoadController.java:1)\n\
+Caused by: java.lang.NoClassDefFoundError: Lexampletardis/common/items/WidgetItem;\n\
+Caused by: java.lang.ClassNotFoundException: exampletardis.common.items.WidgetItem\n\
+Caused by: java.lang.NoClassDefFoundError: examplecraft/api/tools/ITool\n\
+Caused by: java.lang.ClassNotFoundException: examplecraft.api.tools.ITool\n\
+\n\
+A detailed walkthrough of the error:\n\
+-- System Details --\n\
+\tMinecraft Version: 1.7.10\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let problem = find(&output, "core.dependency_problem", "state", "absent")
+            .expect("a dependency problem");
+        assert_eq!(text_of(problem, "needed_by"), "exampletardis");
+        assert!(problem
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mod_id" && reference.value == "examplecraft"));
+        assert!(problem
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "needed_by" && reference.value == "exampletardis"));
+    }
+
+    #[test]
+    fn a_mixin_error_names_the_class_in_its_message() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Description: Initializing game\n\
+\n\
+org.spongepowered.asm.mixin.transformer.throwables.MixinTransformerError: broken\n\
+Caused by: org.spongepowered.asm.mixin.throwables.ClassMetadataNotFoundException: com.examplehidden.config.ThingConfig\n\
+\n\
+A detailed walkthrough of the error:\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let exception = find(
+            &output,
+            "core.exception",
+            "class",
+            "org.spongepowered.asm.mixin.throwables.ClassMetadataNotFoundException",
+        )
+        .expect("the mixin exception");
+        assert!(exception.refs.iter().any(|reference| {
+            reference.kind == "named_class"
+                && reference.value == "com.examplehidden.config.ThingConfig"
+        }));
+    }
+
+    #[test]
+    fn a_missing_member_names_the_provider_class() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Description: Rendering entity in world\n\
+\n\
+java.lang.AbstractMethodError: Receiver class com.example.app.Model does not define or inherit \
+an implementation of the resolved method 'abstract com.example.api.ProvidedThing root()' of \
+abstract class com.example.api.AbstractThing.\n\
+\n\
+A detailed walkthrough of the error:\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let exception = find(
+            &output,
+            "core.exception",
+            "class",
+            "java.lang.AbstractMethodError",
+        )
+        .expect("the abstract method error");
+        assert!(exception
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "named_class"
+                && reference.value == "com.example.api.AbstractThing"));
+    }
+
+    #[test]
+    fn a_fatal_json_error_names_the_mods_data_namespace() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Description: Initializing game\n\
+\n\
+java.lang.RuntimeException: could not reload\n\
+Caused by: com.google.gson.JsonSyntaxException: Failed to read data/examplemod/recipes/thing.json\n\
+\n\
+A detailed walkthrough of the error:\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let problem =
+            find(&output, "minecraft.data_error", "namespace", "examplemod").expect("a data error");
+        assert!(problem
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "mod_id" && reference.value == "examplemod"));
+    }
+
+    #[test]
     fn unsupported_class_version_records_the_required_java() {
         let report = "---- Minecraft Crash Report ----\n\
 Description: Initializing game\n\

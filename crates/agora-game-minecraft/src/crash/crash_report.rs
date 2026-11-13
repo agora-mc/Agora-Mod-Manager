@@ -1,10 +1,10 @@
 //! The `---- Minecraft Crash Report ----` file, whichever loader wrote it.
 
 use super::shared::{
-    absent, checked, collect_lines, crash_mixin_line, fact, file_problem, frame_symbol_and_class,
-    is_mod_id, jar_from_frame, java_exception_category, jvm_problem, looked_for,
-    mod_crash_from_message, mod_crash_line, not_applicable, notes_for, number, reference,
-    source_location, text,
+    absent, checked, collect_lines, crash_mixin_line, data_error_fact, fact, file_problem,
+    frame_symbol_and_class, is_mod_id, jar_from_frame, java_exception_category, jvm_problem,
+    loader_dependency_problem, looked_for, mod_crash_from_message, mod_crash_line,
+    named_message_classes, not_applicable, notes_for, number, reference, source_location, text,
 };
 use agora_game_api::crash::{
     BucketPart, BuiltInParser, BuiltInParserError, Fact, ParserOutput, ParserReads, ParserRequest,
@@ -141,6 +141,11 @@ impl BuiltInParser for CrashReportParser {
                     trace_index = 0;
                     let category = java_exception_category(&class);
                     let text_message = message.clone().unwrap_or_default();
+                    let mut exception_refs =
+                        vec![reference("class", class.clone(), Strength::Mention)];
+                    for named in named_message_classes(&class, &text_message) {
+                        exception_refs.push(reference("named_class", named, Strength::Mention));
+                    }
                     facts.push(fact(
                         "core.exception",
                         vec![
@@ -149,10 +154,15 @@ impl BuiltInParser for CrashReportParser {
                             ("message", text(text_message.clone())),
                             ("depth", number(current_depth as f64)),
                         ],
-                        vec![reference("class", class.clone(), Strength::Mention)],
+                        exception_refs,
                         line_no,
                         "exception",
                     ));
+                    if let Some(problem) =
+                        data_error_fact(&class, &text_message, line_no, "exception")
+                    {
+                        facts.push(problem);
+                    }
                     if let Some(problem) = jvm_problem(&class, &text_message, line_no, "exception")
                     {
                         facts.push(problem);
@@ -278,6 +288,17 @@ impl BuiltInParser for CrashReportParser {
         if let Some(object) = ticking.take() {
             if let Some(object_fact) = object.into_fact() {
                 facts.push(object_fact);
+            }
+        }
+
+        // A Forge 1.7-1.12 loader failure says which mod's class is missing and which mod needed
+        // it, in the cause chain rather than in a dependency table.
+        if !facts
+            .iter()
+            .any(|fact| fact.kind == "core.dependency_problem")
+        {
+            if let Some(problem) = loader_dependency_problem(&facts) {
+                facts.push(problem);
             }
         }
 
@@ -427,8 +448,9 @@ impl BuiltInParser for CrashReportParser {
             checked("minecraft.ticking_object"),
             checked("minecraft.jvm_problem"),
             checked("minecraft.file_problem"),
+            checked("minecraft.data_error"),
             not_applicable("core.log_line"),
-            not_applicable("core.dependency_problem"),
+            checked("core.dependency_problem"),
             not_applicable("core.module"),
             not_applicable("minecraft.loader_problem"),
             not_applicable("minecraft.mod_conflict"),
