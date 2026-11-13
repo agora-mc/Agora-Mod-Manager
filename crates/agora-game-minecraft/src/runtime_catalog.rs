@@ -191,10 +191,7 @@ fn is_valid_adoptium_url(url: &str) -> bool {
     }
     // Must contain "/releases/download/" in the path
     let after_host = &url[ADOPTIUM_GITHUB_RELEASE_HOST_PREFIX.len()..];
-    if !after_host.contains("/releases/download/") {
-        return false;
-    }
-    true
+    after_host.contains("/releases/download/")
 }
 
 /// Validate that a string is a 64-character lowercase hex SHA-256.
