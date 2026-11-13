@@ -223,18 +223,27 @@ impl CommunitySignature {
             return Err(errors);
         }
 
-        let game_condition = Condition::Fact(FactQuery {
-            kind: "core.instance".to_string(),
-            filter: BTreeMap::from([(
-                "game".to_string(),
-                AttrMatch::Test(MatchOps {
-                    any_of: Some(self.games.iter().cloned().map(Scalar::Text).collect()),
-                    ..MatchOps::default()
-                }),
-            )]),
-            reference: None,
-            bind: BTreeMap::new(),
-        });
+        let instance_game = |test: MatchOps| {
+            Condition::Fact(FactQuery {
+                kind: "core.instance".to_string(),
+                filter: BTreeMap::from([("game".to_string(), AttrMatch::Test(test))]),
+                reference: None,
+                bind: BTreeMap::new(),
+            })
+        };
+        // One of its games, or a loose file with no instance at all. A loose file is still kept to
+        // the right game: the community packs are split by game set, and the engine only lets a
+        // pack read a loose file when one of its games' parsers read it.
+        let game_condition = Condition::Any(vec![
+            instance_game(MatchOps {
+                any_of: Some(self.games.iter().cloned().map(Scalar::Text).collect()),
+                ..MatchOps::default()
+            }),
+            instance_game(MatchOps {
+                present: Some(false),
+                ..MatchOps::default()
+            }),
+        ]);
         // The text match is only allowed to stand on its own when the game is known, so the
         // game condition is the anchor the linter asks for.
         let when = Condition::All(vec![
@@ -365,7 +374,9 @@ pub fn load_community_pack(conn: &Connection) -> CrashPackReport {
         }
     };
 
-    let mut rules = Vec::new();
+    // Rules grouped by the games they name, one pack per group, so the engine's own game filter
+    // (an instance's game, or the games whose parsers read a loose file) applies to them.
+    let mut rules: BTreeMap<Vec<String>, Vec<Rule>> = BTreeMap::new();
     for row in rows {
         let row = match row {
             Ok(row) => row,
@@ -422,10 +433,13 @@ pub fn load_community_pack(conn: &Connection) -> CrashPackReport {
             ));
             continue;
         }
-        rules.push(rule);
+        let mut games = signature.games.clone();
+        games.sort();
+        games.dedup();
+        rules.entry(games).or_default().push(rule);
     }
 
-    if !rules.is_empty() {
+    for (games, rules) in rules {
         report.packs.push(LoadedCrashPack {
             plugin_id: COMMUNITY_PACK_PLUGIN_ID.to_string(),
             plugin_name: COMMUNITY_PACK_PLUGIN_NAME.to_string(),
@@ -435,8 +449,7 @@ pub fn load_community_pack(conn: &Connection) -> CrashPackReport {
             file: COMMUNITY_PACK_FILE.to_string(),
             pack: CrashPack {
                 contract: CRASH_CONTRACT_VERSION,
-                // Each rule carries its own game gate, so the pack itself applies to every game.
-                games: Vec::new(),
+                games,
                 sources: Vec::new(),
                 parsers: Vec::new(),
                 inspectors: Vec::new(),
