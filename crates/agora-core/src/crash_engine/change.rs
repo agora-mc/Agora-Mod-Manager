@@ -121,6 +121,8 @@ pub fn change_signals(changes: &[ManifestChange]) -> Vec<Signal> {
                 weight: change_weight(change.kind),
                 source: source.clone(),
                 evidence: Vec::new(),
+                // A change says when, not what kind of problem: it states no cause.
+                cause: None,
             })
         })
         .collect()
@@ -198,5 +200,6 @@ pub fn change_finding(changes: &[ManifestChange]) -> Option<Finding> {
         why_not_sure: Some(why),
         source: agora_source(),
         evidence: Vec::new(),
+        cause: agora_game_api::crash::Cause::Other,
     })
 }
