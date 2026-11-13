@@ -57,6 +57,15 @@ impl agora_game_minecraft::runtime_manager::RuntimeProgress for ConsoleRuntimePr
 struct ConsoleLaunchProgress {
     json: bool,
     timings: bool,
+    ctx: agora_core::ctx::Ctx,
+    instance_id: String,
+    /// The open session ledger row for this launch, while it runs.
+    session: Mutex<
+        Option<(
+            agora_core::session_ledger::MinecraftSession,
+            std::time::Instant,
+        )>,
+    >,
 }
 
 struct CliProgressSink {
@@ -105,6 +114,40 @@ impl agora_game_minecraft::launch_service::LaunchProgress for ConsoleLaunchProgr
         if self.timings {
             eprintln!("[timing] {name}: {duration_ms} ms");
         }
+    }
+
+    fn started(&self, started: &agora_game_minecraft::launch_service::LaunchStarted) {
+        // Record what this launch ran with, so a crash at its end can be diagnosed against it.
+        if let Some(session) =
+            agora_core::session_ledger::open_minecraft(&self.ctx, &self.instance_id)
+        {
+            if let Ok(mut slot) = self.session.lock() {
+                *slot = Some((session, std::time::Instant::now()));
+            }
+        }
+        let _ = started;
+    }
+
+    fn finished(&self, result: &agora_game_minecraft::launch_service::LaunchResult) {
+        let Some((session, started_at)) = self.session.lock().ok().and_then(|mut slot| slot.take())
+        else {
+            return;
+        };
+        let duration_ms = i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let _ = agora_core::session_ledger::finish_minecraft(
+            &self.ctx,
+            &session.session_id,
+            result.pid,
+            &result.outcome,
+            duration_ms,
+        );
+        // Diagnose before returning: a CLI process exits as soon as the launch does.
+        let host = std::sync::Arc::new(agora_plugin_host::QuickJsHost::new());
+        let _ = agora_game_minecraft::crash::diagnose_minecraft_session(
+            &self.ctx,
+            &session.session_id,
+            host,
+        );
     }
 }
 
@@ -4711,6 +4754,20 @@ async fn run_auth_command(
     Ok(())
 }
 
+/// The one-line answer for `crash list`: the engine's headline, or why it has none.
+fn crash_answer_summary(answer: &agora_core::crash_live::StoredAnswer) -> String {
+    use agora_core::crash_live::StoredAnswer;
+    match answer {
+        StoredAnswer::Analyzed { answer, .. } => answer
+            .headline
+            .get("en")
+            .cloned()
+            .unwrap_or_else(|| "an answer with no headline".to_string()),
+        StoredAnswer::NothingToRead { why } => format!("nothing to read: {why}"),
+        StoredAnswer::CouldNotAnalyze { why } => format!("could not analyze: {why}"),
+    }
+}
+
 async fn run_crash_command(
     action: CrashCmd,
     ctx: &agora_core::ctx::Ctx,
@@ -4719,25 +4776,44 @@ async fn run_crash_command(
     let json = output_fmt.is_json_output();
     match action {
         CrashCmd::List { instance } => {
-            let reports = CrashService::new(ctx.clone()).list_reports(&instance)?;
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
+            let answers = agora_core::crash_live::answers_for_instance(&conn, &instance)?;
+            if answers.is_empty() {
+                anyhow::bail!("No crash answer is stored for instance '{instance}'.");
+            }
             if json {
-                println!("{}", serde_json::to_string_pretty(&reports)?);
+                println!("{}", serde_json::to_string_pretty(&answers)?);
             } else {
-                let rows: Vec<Vec<String>> = reports
+                let rows: Vec<Vec<String>> = answers
                     .iter()
-                    .map(|r| {
+                    .map(|stored| {
                         vec![
-                            r.filename.clone(),
-                            r.modified_at.clone(),
-                            r.size_bytes.to_string(),
+                            stored.session_id.clone(),
+                            stored.created_at.clone(),
+                            crash_answer_summary(&stored.answer),
                         ]
                     })
                     .collect();
-                print_table(&["Filename", "Modified", "Size (bytes)"], &rows);
+                print_table(&["Session", "When", "Answer"], &rows);
             }
         }
         CrashCmd::Inspect { instance, file } => {
-            let content = CrashService::new(ctx.clone()).read_crash_log(&instance, &file)?;
+            // Reading one raw crash report is a file operation, not a diagnosis: keep it and
+            // name no parser. The stored answers are read by `last` and `show`.
+            let valid = std::path::Path::new(&file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == file);
+            if !valid {
+                anyhow::bail!("Invalid crash log filename.");
+            }
+            let path = ctx
+                .paths
+                .instance_dir(&instance)?
+                .join("crash-reports")
+                .join(&file);
+            let content = std::fs::read_to_string(&path)
+                .map_err(|error| anyhow::anyhow!("Could not read crash log '{file}': {error}"))?;
             if json {
                 println!(
                     "{}",
@@ -4789,52 +4865,7 @@ async fn run_crash_command(
             cli_crash::print_stored(&stored, json)?;
         }
         CrashCmd::Investigate { instance, files } => {
-            let investigation =
-                CrashService::new(ctx.clone()).investigate_evidence(&instance, &files)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&investigation)?);
-            } else {
-                if investigation.evidence.sources.is_empty() {
-                    anyhow::bail!("No crash evidence found for '{}'", instance);
-                }
-                println!("Evidence:");
-                for (index, source) in investigation.evidence.sources.iter().enumerate() {
-                    let role = if index == investigation.evidence.primary_index {
-                        "primary"
-                    } else {
-                        "supporting"
-                    };
-                    let truncated = if source.meta.truncated {
-                        ", truncated"
-                    } else {
-                        ""
-                    };
-                    println!("  - {} ({role}{truncated})", source.meta.basename);
-                }
-                println!("Category: {:?}", investigation.failure_category);
-                if let Some(name) = investigation.triage.signature_name.as_deref() {
-                    println!("Known signature: {name}");
-                }
-                if let Some(solution) = investigation.triage.solution_markdown.as_deref() {
-                    println!("Suggested fix: {solution}");
-                }
-                let rows: Vec<Vec<String>> = investigation
-                    .suspects
-                    .iter()
-                    .map(|s| {
-                        vec![
-                            s.mod_id.clone(),
-                            s.filename.clone(),
-                            format!("{:.2}", s.total_score),
-                            s.is_dependent_of.clone().unwrap_or_default(),
-                        ]
-                    })
-                    .collect();
-                print_table(&["Mod ID", "Filename", "Score", "Depends On"], &rows);
-                if investigation.suspects.is_empty() {
-                    println!("No mod suspects had positive deterministic evidence.");
-                }
-            }
+            cli_crash::investigate(ctx, &instance, &files, json).await?;
         }
     }
     Ok(())
@@ -7588,6 +7619,7 @@ async fn run_command(
                                                 packs: &live.packs,
                                                 built_in: &live.built_in,
                                                 host: live.host.as_ref(),
+                                                instances: None,
                                             },
                                         );
                                     }
@@ -12125,7 +12157,13 @@ async fn run_launch_service(
         health_scan_token: None,
         quick_play,
     };
-    let progress = ConsoleLaunchProgress { json, timings };
+    let progress = ConsoleLaunchProgress {
+        json,
+        timings,
+        ctx: ctx.clone(),
+        instance_id: instance.to_owned(),
+        session: Mutex::new(None),
+    };
     let launch_started = std::time::Instant::now();
     let result = match agora_game_minecraft::launch_service::LaunchService::new(ctx.clone())
         .launch(request, &progress)

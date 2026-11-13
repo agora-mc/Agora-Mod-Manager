@@ -3,6 +3,7 @@
 use agora_core::{
     content_store::place::same_file,
     crash_engine::attribution::{InstanceView, LayerOwner, LayerView},
+    crash_engine::instance_view::{ExtraInstanceProvider, ResolvedCrashInstance},
     ctx::Ctx,
     error::{LauncherError, LauncherResult},
     helpers::{content_subdir, hash_file_sha256},
@@ -754,6 +755,27 @@ pub fn crash_instance_view(ctx: &Ctx, instance_id: &str) -> LauncherResult<Optio
         view: InstanceView::new(layers),
         could_not_check,
     }))
+}
+
+/// The Minecraft branch of the shared crash-instance router. Core cannot name a game, so the
+/// caller that knows it hands this provider to `crash_live::diagnose_session`.
+pub struct MinecraftInstanceProvider;
+
+impl ExtraInstanceProvider for MinecraftInstanceProvider {
+    fn resolve(
+        &self,
+        ctx: &Ctx,
+        instance_id: &str,
+    ) -> LauncherResult<Option<ResolvedCrashInstance>> {
+        Ok(
+            crash_instance_view(ctx, instance_id)?.map(|found| ResolvedCrashInstance {
+                game_id: found.game_id,
+                runtime_version: found.runtime_version,
+                view: found.view,
+                could_not_check: found.could_not_check,
+            }),
+        )
+    }
 }
 
 /// One note for every mod whose packages could not be read, so a class from it is never silently

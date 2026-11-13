@@ -1024,3 +1024,125 @@ Details:\n\
         assert_eq!(number_of(process, "pid"), 2216.0);
     }
 }
+
+mod captured {
+    use super::*;
+
+    #[test]
+    fn captured_output_is_stripped_then_read_as_a_log() {
+        let output = run_ok("captured_launch", &fixture("captured_oom.txt"));
+        assert_eq!(output.producer.format, "minecraft_latest_log");
+        assert!(
+            find(&output, "core.exception", "category", "oom").is_some(),
+            "{:?}",
+            output.facts
+        );
+    }
+
+    #[test]
+    fn captured_crash_report_is_read_as_a_crash_report() {
+        let output = run_ok("captured_launch", &fixture("captured_crash.txt"));
+        assert_eq!(output.producer.format, "minecraft_crash_report");
+        assert!(output
+            .facts
+            .iter()
+            .any(|fact| fact.kind == "core.exception"));
+    }
+
+    #[test]
+    fn captured_output_with_no_lines_is_not_a_clean_bill() {
+        let request = request();
+        let error = parser("captured_launch")
+            .parse(
+                &request,
+                &Bytes(b"# Agora captured Java output\n# exit_code=1\n".to_vec()),
+            )
+            .expect_err("nothing to read");
+        assert!(error.message.contains("no lines"), "{error:?}");
+    }
+}
+
+mod gate {
+    use super::*;
+
+    fn text(name: &str) -> String {
+        String::from_utf8(fixture(name)).expect("fixture is text")
+    }
+
+    #[test]
+    fn a_known_crash_in_captured_output_sets_the_launch_flag() {
+        assert!(agora_game_minecraft::crash::captured_output_names_a_crash(
+            &text("captured_oom.txt")
+        ));
+    }
+
+    #[test]
+    fn a_known_crash_in_a_log_tail_sets_the_launch_flag() {
+        let log = "[01:02:03] [main/INFO]: Building unoptimized datafixer\n\
+                   [01:02:04] [main/ERROR]: java.lang.OutOfMemoryError: Java heap space";
+        assert!(agora_game_minecraft::crash::log_text_names_a_crash(log));
+    }
+
+    #[test]
+    fn ordinary_launch_output_does_not_set_the_launch_flag() {
+        let ordinary =
+            "[stdout] [01:02:03] [main/INFO]: Loading Minecraft 1.21 with Fabric Loader 0.16.0\n\
+                        [stdout] [01:02:04] [main/INFO]: Done.";
+        assert!(!agora_game_minecraft::crash::captured_output_names_a_crash(
+            ordinary
+        ));
+        assert!(!agora_game_minecraft::crash::captured_output_names_a_crash(
+            ""
+        ));
+    }
+}
+
+mod actions {
+    use super::*;
+    use agora_game_api::crash::ActionKind;
+
+    fn rules() -> Vec<agora_game_api::crash::Rule> {
+        let packs = built_in_packs();
+        lint_pack_json(&packs[0].json)
+            .expect("the built-in pack lints")
+            .rules
+    }
+
+    fn actions(rule_id: &str) -> Vec<agora_game_api::crash::ActionRequest> {
+        rules()
+            .into_iter()
+            .find(|rule| rule.id == rule_id)
+            .unwrap_or_else(|| panic!("no rule `{rule_id}`"))
+            .actions
+    }
+
+    #[test]
+    fn the_old_signature_buttons_are_offered_by_the_matching_rules() {
+        assert!(actions("missing_fabric_api").iter().any(|action| {
+            action.kind == ActionKind::InstallContent
+                && action.content_key.as_deref() == Some("fabric-api")
+        }));
+        for rule in ["missing_dependency", "mod_resolution_failed"] {
+            assert!(
+                actions(rule)
+                    .iter()
+                    .any(|action| action.kind == ActionKind::ReviewMods),
+                "{rule}"
+            );
+        }
+        assert!(actions("out_of_memory")
+            .iter()
+            .any(|action| action.kind == ActionKind::OpenJvmSettings));
+        for rule in ["mixin_apply_failed", "mixin_failed_crash_report"] {
+            assert!(
+                actions(rule)
+                    .iter()
+                    .any(|action| action.kind == ActionKind::OpenCrashLog),
+                "{rule}"
+            );
+        }
+        assert!(actions("duplicate_classpath_libraries")
+            .iter()
+            .any(|action| action.kind == ActionKind::OpenConsole));
+    }
+}

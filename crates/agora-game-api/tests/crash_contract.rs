@@ -1181,3 +1181,45 @@ fn a_parser_reads_as_primary_unless_it_says_extra() {
     assert_eq!(pack.parsers[0].reads, Reads::Primary);
     assert_eq!(pack.parsers[1].reads, Reads::Extra);
 }
+
+#[test]
+fn actions_use_only_the_closed_kinds_and_their_own_fields() {
+    use serde_json::json;
+    // A pack may offer an existing UI action, with its own words.
+    assert!(lint_rule_json(&with(
+        &["actions"],
+        json!([{ "kind": "install_content", "content_key": "example-api", "label": { "en": "Install Example API" } }])
+    ))
+    .is_ok());
+    assert!(lint_rule_json(&with(&["actions"], json!([{ "kind": "open_console" }]))).is_ok());
+    // Installing something needs to say what.
+    refused_with(
+        &with(&["actions"], json!([{ "kind": "install_content" }])),
+        LintCode::BadEffect,
+    );
+    refused_with(
+        &with(
+            &["actions"],
+            json!([{ "kind": "install_content", "content_key": "  " }]),
+        ),
+        LintCode::BadEffect,
+    );
+    // A key belongs only to install_content.
+    refused_with(
+        &with(
+            &["actions"],
+            json!([{ "kind": "review_mods", "content_key": "example-api" }]),
+        ),
+        LintCode::BadEffect,
+    );
+    // The kind is closed; an invented one is not parsed at all.
+    assert!(!codes(&with(&["actions"], json!([{ "kind": "open_everything" }]))).is_empty());
+    // A button label is user-facing text, so certainty is refused there too.
+    refused_with(
+        &with(
+            &["actions"],
+            json!([{ "kind": "review_mods", "label": { "en": "This definitely fixes it" } }]),
+        ),
+        LintCode::Wording,
+    );
+}

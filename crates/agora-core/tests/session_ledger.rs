@@ -615,6 +615,7 @@ fn diagnose(f: &Fixture, session: &str) -> Option<agora_core::crash_live::Sessio
             packs: &packs,
             built_in: &built_in,
             host: &host,
+            instances: None,
         },
     )
 }

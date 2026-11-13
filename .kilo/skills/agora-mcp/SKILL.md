@@ -55,25 +55,15 @@ The server speaks JSON-RPC 2.0 over HTTP with SSE (Server-Sent Events) for respo
 
 ### 4. `search_crash_signatures`
 
-- **Params:** `crash_text` (string) — the full crash log text.
-- **Returns:** `{"matches": [{"id", "name", "fix_hint"}, ...]}` — curated crash signature patterns that match the crash text, with their fix hints.
-- **Use when:** A user shares a crash log — search for known curated patterns first before deeper analysis. This is the fastest path to a solution when a curated signature exists.
+- **Params:** `crash_text` (string) — the crash log text.
+- **Returns:** `{"answer": <CrashAnswer>, "files": [<per-file report>]}` — the local crash doctor's answer, the same engine the app uses. `answer.candidates` is the ranked list (strongest first, never "certain"); `answer.findings` says what each rule recognised; `answer.could_not_check` lists what no parser could look at. `files` says which parser read each file, or why none did. An empty `crash_text` is an error, not an empty result.
+- **Use when:** A user shares crash text. Read `answer.headline`, `answer.level` and `answer.next` first; use the findings and could-not-check list to explain what Agora knows and does not know.
 
 ### 5. `suggest_mod_incompatibility`
 
-- **Params:** `instance_id` (string), `crash_text` (string) — the crash log text to analyze.
-- **Returns:** `{"suspects": [{"mod_id", "filename", "total_score", "is_dependent_of", "breakdown"}, ...]}` — ranked suspect mods from a dynamic weighted scoring algorithm.
-  - `total_score`: higher means more likely to be the cause.
-  - `is_dependent_of`: set to another mod's filename if this mod indirectly depends on a direct suspect (reduced score).
-  - `breakdown`: per-signal score contribution. Signal letters:
-    - **A** — stack-frame attribution (the mod's `java_packages` appear in the crash stack trace).
-    - **B** — fingerprint recurrence (this mod has been attributed in past crashes).
-    - **C** — co-crash signal (this mod co-occurs in crashes with other suspects).
-    - **D** — dampened by survival ubiquity (penalty for mods installed everywhere).
-    - **E** — confirmed prior (the mod was previously confirmed as a crash cause).
-    - **G** — curated conflict (a curated conflict entry flags these two mods).
-    - **F** — recency factor (recent attributions weigh more).
-- **Use when:** A crash log doesn't match a curated signature, or you need deeper analysis of which mod is causing the crash. The scoring algorithm gets smarter over time — confirmed attributions create priors that speed up future diagnosis.
+- **Params:** `instance_id` (string), `crash_text` (string) — the crash log text to analyse.
+- **Returns:** `{"answer": <CrashAnswer>, "files": [<per-file report>]}` — the same local crash doctor, run against that instance's deployed mods. `answer.candidates` holds the suspects, each with its `level`, `score`, `families`, `cause`, and the source rules that contributed. `answer.repairs` and `answer.actions` carry what the screen may offer; `answer.could_not_check` lists what could not be looked at.
+- **Use when:** You need to know which installed mods the local engine considers evidence against, and why. Do not overstate it: Agora never says a mod is certainly the cause.
 
 ### 6. `get_system_context`
 
@@ -84,8 +74,8 @@ The server speaks JSON-RPC 2.0 over HTTP with SSE (Server-Sent Events) for respo
 ### 7. `read_latest_crash`
 
 - **Params:** `instance_id` (string).
-- **Returns:** The last 200 lines of the newest crash report, its filename, and total line count.
-- **Use when:** A known instance crashed and you need its newest local report before scoring suspects.
+- **Returns:** `{"session_id", "instance_id", "created_at", "answer": <StoredAnswer>}` — the newest answer the crash doctor stored for the instance. `answer.status` is `analyzed` (with the `CrashAnswer` and the per-file report), `nothing_to_read` (with why), or `could_not_analyze` (with why). If no answer is stored, the call is an error: run the game once so a finished session can be diagnosed.
+- **Use when:** You need the result of the last diagnosed launch without re-running the analysis.
 
 ### 8. `read_mod_manifest`
 
@@ -111,15 +101,11 @@ Follow this decision tree when a user reports a crash:
 
 1. **Get context.** If you don't know the user's setup, call `get_system_context` or `list_instances` to understand what instances and mods they have.
 
-2. **Quick check.** If the user shares a crash log, call `search_crash_signatures` first. This is the fastest path — if a curated signature matches, you can provide the fix hint immediately.
+2. **Quick check.** If the user shares a crash log, call `search_crash_signatures` first. It runs the local crash doctor over the text; read its headline, level and findings.
 
-3. **Deep analysis.** If no curated match: call `suggest_mod_incompatibility` with the `instance_id` and crash text. This runs the weighted scoring algorithm across all installed mods.
+3. **Deep analysis.** Call `suggest_mod_incompatibility` with the `instance_id` and crash text. It runs the same engine against the instance's deployed mods, so candidates can be attributed to what is installed.
 
-4. **Review suspects.** Examine the ranked suspects — the top suspect has the highest `total_score`. Check the `breakdown` to understand why:
-    - `"A: 2.0"` means the mod's Java packages appear in the crash stack trace (strongest signal).
-    - `"E: 1.5"` means this mod was previously confirmed as a crash cause.
-    - `"B: 1.0"` means the crash fingerprint has appeared with this mod before.
-    - Look at the total score to gauge confidence.
+4. **Review the answer.** Read `answer.candidates` strongest first, with each candidate's `level`, `score`, `families` and `cause`, and the rule sources that contributed. Treat `answer.could_not_check` as missing information, not as a clean result. If nothing is named, say so and offer the next step (`next.kind`), usually a bisect.
 
 5. **Confirm and disable.** If the top suspect looks correct:
     - Call `list_instance_mods` to confirm the mod is installed and verify its details.

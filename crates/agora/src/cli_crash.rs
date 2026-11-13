@@ -50,6 +50,120 @@ pub fn load_live_packs(ctx: &agora_core::ctx::Ctx) -> anyhow::Result<LivePacks> 
     })
 }
 
+/// Collect the instance's recent evidence and diagnose it with the same engine `crash analyze`
+/// uses. Evidence collection is unchanged; the diagnosis is the engine's answer, not the old
+/// signature scanner's.
+pub async fn investigate(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+    explicit: &[PathBuf],
+    json: bool,
+) -> anyhow::Result<()> {
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
+    let evidence = agora_core::crash_evidence::CrashEvidenceService::new().collect_since(
+        &instance_dir,
+        explicit,
+        None,
+    );
+    if evidence.sources.is_empty() {
+        anyhow::bail!("No crash evidence found for '{instance_id}'.");
+    }
+    if !json {
+        for (index, source) in evidence.sources.iter().enumerate() {
+            let role = if index == evidence.primary_index {
+                "primary"
+            } else {
+                "supporting"
+            };
+            let truncated = if source.meta.truncated {
+                ", truncated"
+            } else {
+                ""
+            };
+            println!("Evidence: {} ({role}{truncated})", source.meta.basename);
+        }
+    }
+
+    let live = load_live_packs(ctx)?;
+    let mut packs = live.packs.clone();
+    packs.extend(agora_core::crash_packs::load_built_in_packs(&live.built_in).packs);
+    let resolved = agora_core::crash_engine::instance_view::resolve_crash_instance(
+        ctx,
+        instance_id,
+        Some(&agora_game_minecraft::installed_content::MinecraftInstanceProvider),
+    )?;
+    let game_packs: Vec<&LoadedCrashPack> = packs
+        .iter()
+        .filter(|pack| {
+            pack.pack.games.is_empty()
+                || pack.pack.games.iter().any(|game| game == &resolved.game_id)
+        })
+        .collect();
+    let ref_maps: Vec<agora_game_api::crash::RefMap> = game_packs
+        .iter()
+        .flat_map(|pack| pack.pack.ref_maps.iter().cloned())
+        .collect();
+    let roles: Vec<agora_game_api::crash::RoleRule> = game_packs
+        .iter()
+        .flat_map(|pack| pack.pack.roles.iter().cloned())
+        .collect();
+    let resolver = Resolver::new(resolved.view, ref_maps, roles);
+    let scope = Arc::new(
+        agora_core::game_script::instance_reads(ctx, instance_id)
+            .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?,
+    );
+    let inspector = InstanceInspector::new(
+        live.host.as_ref(),
+        &packs,
+        &resolver,
+        scope,
+        GameHandle {
+            id: resolved.game_id.clone(),
+            runtime_version: resolved.runtime_version.clone(),
+        },
+    );
+    let instance = InstanceAnalysis {
+        game_id: &resolved.game_id,
+        resolver: &resolver,
+        inspector: &inspector,
+        could_not_check: &resolved.could_not_check,
+    };
+    let files: Vec<CrashFile> = evidence
+        .sources
+        .iter()
+        .map(|source| CrashFile {
+            name: source.meta.basename.clone(),
+            bytes: source.text.as_bytes().to_vec(),
+        })
+        .collect();
+    let output = analyze(&AnalyzeInput {
+        packs: &packs,
+        files: &files,
+        runtime_version: resolved.runtime_version.as_deref(),
+        host: live.host.as_ref(),
+        built_in: &live.built_in,
+        instance: Some(instance),
+    })?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "answer": output.answer,
+                "files": output.files,
+            }))?
+        );
+    } else {
+        print_text(&output);
+    }
+    if !output.read_any() {
+        anyhow::bail!("No crash file could be read.");
+    }
+    Ok(())
+}
+
 pub struct AnalyzeArgs {
     pub files: Vec<PathBuf>,
     /// Analyze each file as its own crash, then summarize the pattern across them.

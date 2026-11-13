@@ -1109,6 +1109,135 @@ pub fn record_stop(ctx: &Ctx, instance_id: &str) {
     }));
 }
 
+/// A Minecraft launch row that also carries the session ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinecraftSession {
+    /// The row `launch_history` uses for the legacy history view.
+    pub row_id: i64,
+    /// The ledger id, for the crash answer.
+    pub session_id: String,
+}
+
+/// Open a Minecraft launch's session at the moment it starts. Minecraft keeps its own history row
+/// and its own launch service, so the row is opened the way it always was and the ledger columns
+/// are attached to it. Best effort: a launch is never blocked by its bookkeeping.
+pub fn open_minecraft(ctx: &Ctx, instance_id: &str) -> Option<MinecraftSession> {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
+        let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
+        let _ = close_orphans(&conn, &now, &Owner::is_alive);
+        let manifest_path = ctx.paths.instance_manifest(instance_id).ok()?;
+        let manifest = crate::helpers::read_manifest(&manifest_path).ok()?;
+        let row_id = crate::launch_history::begin_launch(
+            &conn,
+            instance_id,
+            &now,
+            manifest.mods.iter().filter(|entry| entry.enabled).count() as i64,
+            &manifest.minecraft_version,
+            &manifest.loader,
+        )
+        .ok()?;
+        let ledger = minecraft_manifest(&manifest);
+        let session_id =
+            attach_ledger(&conn, row_id, instance_id, &ledger, Owner::current()).ok()?;
+        Some(MinecraftSession { row_id, session_id })
+    }));
+    attempt.ok().flatten()
+}
+
+/// Attach a session id, manifest and watcher to an already-open history row. Returns the id.
+pub fn attach_ledger(
+    conn: &Connection,
+    row_id: i64,
+    instance_id: &str,
+    manifest: &LaunchManifest,
+    owner: Owner,
+) -> anyhow::Result<String> {
+    let session_id = uuid::Uuid::new_v4().simple().to_string();
+    let tx = conn.unchecked_transaction()?;
+    let hash = store_manifest(&tx, instance_id, manifest)?;
+    tx.execute(
+        "UPDATE launch_history
+            SET session_id = ?2, manifest_hash = ?3, owner_pid = ?4, owner_start = ?5
+          WHERE id = ?1",
+        params![row_id, session_id, hash, owner.pid, owner.started as i64],
+    )?;
+    tx.commit()?;
+    Ok(session_id)
+}
+
+/// Close a Minecraft session from the launch service's own outcome. The service already decides
+/// whether the launch was a crash, a stop or a clean end; this turns that into the ledger's verdict
+/// so the crash doctor can read the session. Best effort, like every other ledger write.
+pub fn finish_minecraft(
+    ctx: &Ctx,
+    session_id: &str,
+    pid: u32,
+    outcome: &crate::lkg::LaunchOutcome,
+    duration_ms: i64,
+) -> Option<SessionVerdict> {
+    use crate::lkg::LaunchOutcome;
+
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
+        let instance_id: Option<String> = conn
+            .query_row(
+                "SELECT instance_id FROM launch_history WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if matches!(outcome, LaunchOutcome::Cancelled) {
+            if let Some(instance_id) = &instance_id {
+                let _ = mark_stop_requested(&conn, instance_id);
+            }
+        }
+        let exit = ExitObservation::Code {
+            pid,
+            image: "Minecraft".to_string(),
+            code: 0,
+        };
+        let (exit, artifact) = match outcome {
+            // The launch service reports an outcome, not the game's exit code. A clean or brief
+            // end is its own statement that this was not a crash.
+            LaunchOutcome::Success | LaunchOutcome::Abandoned => (exit, None),
+            // A crash is not visible in an exit code the service did not keep, so the service's
+            // verdict is the evidence here.
+            LaunchOutcome::Crash => (
+                ExitObservation::unavailable(
+                    "Minecraft's launch service reported a crash without keeping the exit code",
+                ),
+                Some(ArtifactEvidence {
+                    bound_by: MatchedBy::Time,
+                }),
+            ),
+            LaunchOutcome::Cancelled => (
+                ExitObservation::unavailable("the player stopped the game"),
+                None,
+            ),
+            LaunchOutcome::Unknown => (
+                ExitObservation::unavailable(
+                    "Minecraft's launch service could not tell how the game ended",
+                ),
+                None,
+            ),
+        };
+        let done = SessionFinish {
+            ended_at: chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339(),
+            duration_ms,
+            exit,
+            game_runtime_ms: u64::try_from(duration_ms).ok(),
+            normal_exit_codes: vec![0],
+            artifact,
+            froze: false,
+        };
+        finish(&conn, session_id, &done).ok().flatten()
+    }));
+    attempt.ok().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

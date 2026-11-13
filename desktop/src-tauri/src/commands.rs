@@ -523,6 +523,10 @@ pub async fn launch_instance(
         );
     });
     tokio::spawn(async move {
+        // Open the session ledger before handing off, so a crash the official launcher leaves
+        // behind can be diagnosed against what this launch ran with.
+        let ledger = agora_core::session_ledger::open_minecraft(&ctx, &id_for_monitor);
+        let ledger_started = std::time::Instant::now();
         // Core-owned wait_delegated handles monitoring, LKG recording,
         // and retention. Desktop only emits the Tauri event.
         let outcome = agora_game_minecraft::launch_service::LaunchService::wait_delegated(
@@ -536,6 +540,27 @@ pub async fn launch_instance(
         .await;
         // The delegated game has ended; only a clean end counts as a survival.
         record_clean_survival(&app_for_monitor, &id_for_monitor, &outcome);
+        if let Some(session) = ledger {
+            let duration_ms =
+                i64::try_from(ledger_started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            let _ = agora_core::session_ledger::finish_minecraft(
+                &ctx,
+                &session.session_id,
+                0,
+                &outcome,
+                duration_ms,
+            );
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let host: std::sync::Arc<dyn agora_plugin_api::host::ScriptHost> =
+                    std::sync::Arc::new(agora_plugin_host::QuickJsHost::new());
+                let _ = agora_game_minecraft::crash::diagnose_minecraft_session(
+                    &ctx,
+                    &session.session_id,
+                    host,
+                );
+            });
+        }
         // The delegated session ended: release the launch marker so an install
         // for this instance is permitted again (SOL-2 §19.3).
         state_for_monitor
@@ -841,9 +866,9 @@ struct TauriLaunchProgress {
     instance_id: String,
     started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<LauncherResult<u32>>>>,
     session_id: std::sync::Mutex<Option<u64>>,
-    /// Open `launch_history` row and the clock it started on, so `finished`
-    /// can close it out. Local-only history; see `agora_core::launch_history`.
-    history: std::sync::Mutex<Option<(i64, std::time::Instant)>>,
+    /// Open `launch_history` row, the clock it started on, and the session ledger id, so
+    /// `finished` can close both out. Local-only; see `agora_core::launch_history`.
+    history: std::sync::Mutex<Option<(i64, std::time::Instant, String)>>,
     log_sender: std::sync::mpsc::SyncSender<QueuedGameLogLine>,
     dropped_log_lines: Arc<AtomicU64>,
 }
@@ -1027,47 +1052,16 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
         if let Ok(mut session_id) = self.session_id.lock() {
             *session_id = Some(started.session_id);
         }
-        // Open a local history row. Best-effort throughout: losing a history
-        // row must never interfere with actually launching the game.
+        // Open a local history row and the session ledger. Best-effort throughout: losing a
+        // history row must never interfere with actually launching the game.
         if let Ok(ctx) = crate::core_context(&self.app) {
-            let opened = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
-                .ok()
-                .and_then(|conn| {
-                    let manifest = ctx
-                        .paths
-                        .instance_manifest(&self.instance_id)
-                        .ok()
-                        .and_then(|path| agora_core::helpers::read_manifest(&path).ok());
-                    let (mods, mc, loader) = match manifest.as_ref() {
-                        Some(m) => (
-                            m.mods.iter().filter(|entry| entry.enabled).count() as i64,
-                            m.minecraft_version.clone(),
-                            m.loader.clone(),
-                        ),
-                        None => (0, String::new(), String::new()),
-                    };
-                    let row = agora_core::launch_history::begin_launch(
-                        &conn,
-                        &self.instance_id,
-                        &chrono::Utc::now().to_rfc3339(),
-                        mods,
-                        &mc,
-                        &loader,
-                    )
-                    .ok()?;
-                    // What this launch ran with. Losing it loses a record, never the launch.
-                    if let Some(m) = manifest.as_ref() {
-                        let _ = agora_core::session_ledger::attach_manifest(
-                            &conn,
-                            row,
-                            &self.instance_id,
-                            &agora_core::session_ledger::minecraft_manifest(m),
-                        );
-                    }
-                    Some(row)
-                });
-            if let (Some(id), Ok(mut slot)) = (opened, self.history.lock()) {
-                *slot = Some((id, std::time::Instant::now()));
+            let opened = agora_core::session_ledger::open_minecraft(&ctx, &self.instance_id);
+            if let (Some(session), Ok(mut slot)) = (opened, self.history.lock()) {
+                *slot = Some((
+                    session.row_id,
+                    std::time::Instant::now(),
+                    session.session_id,
+                ));
             }
         }
 
@@ -1122,7 +1116,10 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
         // Close out the local history row, then trim. Best-effort: a lost row
         // is a lost row, not a failed launch.
         let opened = self.history.lock().ok().and_then(|mut slot| slot.take());
-        if let (Some((id, since)), Ok(ctx)) = (opened, crate::core_context(&self.app)) {
+        if let (Some((id, since, ledger_session)), Ok(ctx)) =
+            (opened, crate::core_context(&self.app))
+        {
+            let duration_ms = i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX);
             if let Ok(conn) = agora_core::db::local_state_connection(&ctx.paths.local_state_db()) {
                 use agora_core::lkg::LaunchOutcome;
                 let outcome = match result.outcome {
@@ -1139,20 +1136,31 @@ impl agora_game_minecraft::launch_service::LaunchProgress for TauriLaunchProgres
                     &conn,
                     id,
                     None,
-                    i64::try_from(since.elapsed().as_millis()).ok(),
+                    Some(duration_ms),
                     outcome,
                     None,
                 );
-                // The launch service reports an outcome, not the game's exit code.
-                let _ = agora_core::session_ledger::note_exit(
-                    &conn,
-                    id,
-                    &agora_core::session_ledger::ExitObservation::unavailable(
-                        "Minecraft's launch service reports an outcome, not the game's exit code",
-                    ),
-                );
                 let _ = agora_core::launch_history::prune_history(&conn, &self.instance_id);
             }
+            // Close the ledger from the launch service's own outcome, then diagnose the session as
+            // soon as it ends, before a logger can rotate its evidence away.
+            let _ = agora_core::session_ledger::finish_minecraft(
+                &ctx,
+                &ledger_session,
+                result.pid,
+                &result.outcome,
+                duration_ms,
+            );
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let host: std::sync::Arc<dyn agora_plugin_api::host::ScriptHost> =
+                    std::sync::Arc::new(agora_plugin_host::QuickJsHost::new());
+                let _ = agora_game_minecraft::crash::diagnose_minecraft_session(
+                    &ctx,
+                    &ledger_session,
+                    host,
+                );
+            });
         }
 
         let app = self.app.clone();

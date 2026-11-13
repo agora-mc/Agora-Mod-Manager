@@ -2430,8 +2430,9 @@ pub async fn wait_and_classify_with_progress(
             runtime_ms,
             was_user_cancelled: false,
             crash_report_found,
-            log_crash_signature_matched: agora_core::crash_diagnostics::triage(&captured_text)
-                .matched,
+            log_crash_signature_matched: crate::crash::captured_output_names_a_crash(
+                &captured_text,
+            ),
         },
     ))
 }

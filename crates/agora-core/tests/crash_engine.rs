@@ -2652,3 +2652,87 @@ fn a_change_finding_names_what_changed_and_nothing_invents_a_change_without_one(
     assert!(headline.contains("settings"), "{headline}");
     assert_eq!(finding.candidate, None, "a change never accuses a mod");
 }
+
+#[test]
+fn a_fired_rule_carries_its_actions_and_the_answer_keeps_them() {
+    let rule = json!({
+        "id": "offer_buttons",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "actions": [
+            { "kind": "install_content", "content_key": "example-api", "label": { "en": "Install Example API" } },
+            { "kind": "review_mods" }
+        ],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = vec![parsed_with(
+        "p",
+        "parse",
+        "example",
+        vec![frame(0, "ExampleMod")],
+        Vec::new(),
+    )];
+    let resolver = FakeResolver::new().with("module", "ExampleMod", item("mod-a", "Mod A"), None);
+    let inspector = FixedInspector(Inspection::Missing);
+    let engine_facts: EngineFacts = Vec::new();
+    let (evaluated, consensus) = run(
+        &packs,
+        &parsed,
+        &engine_facts,
+        &resolver,
+        &inspector,
+        Some("1.0"),
+    );
+    assert_eq!(evaluated.actions.len(), 2);
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(answer.actions.len(), 2, "{:?}", answer.actions);
+    assert!(answer.actions.iter().any(|offer| {
+        offer.action.kind == agora_game_api::crash::ActionKind::InstallContent
+            && offer.action.content_key.as_deref() == Some("example-api")
+    }));
+    assert_eq!(
+        answer.actions[0].source.rule_id.as_deref(),
+        Some("offer_buttons")
+    );
+}
+
+#[test]
+fn a_rule_that_does_not_fire_offers_no_actions() {
+    let rule = json!({
+        "id": "never",
+        "version": 1,
+        "when": { "fact": { "kind": "core.frame", "ref": { "kind": "module", "bind": "m" } } },
+        "effects": [{ "signal": { "family": "execution", "candidate": { "owner_of": "m" }, "weight": 10 } }],
+        "actions": [{ "kind": "open_console" }],
+        "text": { "headline": { "en": "A clue." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let resolver = FakeResolver::new();
+    let inspector = FixedInspector(Inspection::Missing);
+    let engine_facts: EngineFacts = Vec::new();
+    let (evaluated, consensus) = run(
+        &packs,
+        &[],
+        &engine_facts,
+        &resolver,
+        &inspector,
+        Some("1.0"),
+    );
+    assert!(evaluated.actions.is_empty());
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert!(answer.actions.is_empty());
+}

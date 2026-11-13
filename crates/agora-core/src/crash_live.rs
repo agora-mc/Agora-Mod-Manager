@@ -113,6 +113,27 @@ pub fn latest_answer(
     row.map(decode_answer).transpose()
 }
 
+/// Every stored answer for an instance, newest first. This is a list of what Agora diagnosed,
+/// not a list of log files.
+pub fn answers_for_instance(
+    conn: &Connection,
+    instance_id: &str,
+) -> anyhow::Result<Vec<SessionAnswer>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, instance_id, created_at, answer_json
+           FROM session_answers WHERE instance_id = ?1
+           ORDER BY created_at DESC, session_id DESC",
+    )?;
+    let rows = stmt.query_map([instance_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })?;
+    let mut answers = Vec::new();
+    for row in rows {
+        answers.push(decode_answer(row?)?);
+    }
+    Ok(answers)
+}
+
 fn decode_answer(
     (session_id, instance_id, created_at, json): (String, String, String, String),
 ) -> anyhow::Result<SessionAnswer> {
@@ -130,6 +151,9 @@ pub struct LivePacks<'a> {
     pub packs: &'a [LoadedCrashPack],
     pub built_in: &'a [BuiltInPack],
     pub host: &'a dyn ScriptHost,
+    /// The game package that owns this instance system, when core does not read it itself. A
+    /// Minecraft session needs this; a generic game instance leaves it `None`.
+    pub instances: Option<&'a dyn crate::crash_engine::instance_view::ExtraInstanceProvider>,
 }
 
 /// Load every installed plugin's crash packs, activating the script host for any that need it.
@@ -235,9 +259,12 @@ fn diagnose_record(
     record: &SessionRecord,
     live: &LivePacks<'_>,
 ) -> Result<StoredAnswer, String> {
-    let resolved =
-        crate::crash_engine::instance_view::resolve_crash_instance(ctx, &record.instance_id, None)
-            .map_err(|error| format!("the instance could not be read: {error}"))?;
+    let resolved = crate::crash_engine::instance_view::resolve_crash_instance(
+        ctx,
+        &record.instance_id,
+        live.instances,
+    )
+    .map_err(|error| format!("the instance could not be read: {error}"))?;
     let game_id = resolved.game_id.clone();
     let runtime_version = resolved.runtime_version.clone();
     let could_not_check = resolved.could_not_check.clone();

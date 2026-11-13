@@ -38,6 +38,7 @@ fn answer(session: &str, instance: &str, created: &str, headline: &str) -> Sessi
                     keys: Vec::new(),
                 },
                 repairs: Vec::new(),
+                actions: Vec::new(),
                 artifacts: Vec::new(),
                 cause: None,
             }),

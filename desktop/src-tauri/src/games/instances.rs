@@ -1058,6 +1058,7 @@ fn spawn_exit_watch(
                             packs: &installed.packs,
                             built_in: &built_in,
                             host: host.as_ref(),
+                            instances: None,
                         },
                     );
                 }

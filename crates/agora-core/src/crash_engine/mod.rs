@@ -13,6 +13,7 @@ pub mod attribution;
 pub mod change;
 mod consensus;
 mod evaluate;
+pub mod gate;
 pub mod history;
 mod inspector;
 pub mod instance_view;

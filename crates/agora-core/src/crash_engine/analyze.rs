@@ -9,21 +9,24 @@
 //! itself unless a pack's `roles` say what part it plays. Every parser failure is kept and shown as
 //! "could not check", naming the plugin; none is ever read as "nothing found".
 
-use super::attribution::LooseResolver;
+use super::attribution::{LooseResolver, Resolver};
+use super::instance_view::{resolve_crash_instance, ExtraInstanceProvider};
 use super::{
     answer, consensus, evaluate, AnswerInput, ConsensusInput, ConsensusProfile, EvaluateInput,
-    Inspection, InspectionOutcome, InspectionRequest, Inspector, ParsedArtifact, PluginIdentity,
-    RefResolver,
+    Inspection, InspectionOutcome, InspectionRequest, Inspector, InstanceInspector, ParsedArtifact,
+    PluginIdentity, RefResolver,
 };
 use crate::crash_packs::{
-    artifact_handle, detect_parsers, parser_request, run_parser_with_builtin, LoadedCrashPack,
-    MemoryArtifact, ParserFailureKind, BUILT_IN_PLUGIN_ID,
+    artifact_handle, detect_parsers, load_built_in_packs, parser_request, run_parser_with_builtin,
+    LoadedCrashPack, MemoryArtifact, ParserFailureKind, BUILT_IN_PLUGIN_ID,
 };
+use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
+use crate::game_script::instance_reads;
 use agora_game_api::crash::{
     Artifact, AttrValue, BuiltInPack, CouldNotCheck, CouldNotCheckReason, CrashAnswer, Fact,
-    GameHandle, MatchedBy, ParserDecl, ParserLimits, Privacy, Reads, Retained, Scalar,
-    SessionVerdict, DETECT_HEAD_BYTES,
+    GameHandle, MatchedBy, ParserDecl, ParserLimits, Privacy, Reads, RefMap, Retained, RoleRule,
+    Scalar, SessionVerdict, DETECT_HEAD_BYTES,
 };
 use agora_plugin_api::host::{ScriptHost, ScriptReads};
 use serde::{Deserialize, Serialize};
@@ -550,6 +553,87 @@ pub fn analyze_with_facts(
         files: reports,
         parsed,
         record,
+    })
+}
+
+/// One pasted or captured text, analysed with every installed pack plus a game's built-in packs.
+pub struct TextAnalysis<'a> {
+    pub text: &'a str,
+    pub file_name: &'a str,
+    pub built_in: &'a [BuiltInPack],
+    pub host: Arc<dyn ScriptHost>,
+    /// The instance the text came from, with its game package's branch of the instance router.
+    pub instance: Option<(&'a str, &'a dyn ExtraInstanceProvider)>,
+}
+
+/// Run the engine over text a caller already has, not a file on disk. It loads the installed
+/// packs and the built-ins through the same pipeline a launch or a loose file uses, so a pasted
+/// snippet and a stored session cannot disagree about what a rule means.
+pub fn analyze_pasted_text(ctx: &Ctx, input: &TextAnalysis<'_>) -> LauncherResult<AnalyzeOutput> {
+    let installed = crate::crash_live::load_installed_packs(ctx, input.host.clone())?;
+    let mut packs = installed.packs;
+    packs.extend(load_built_in_packs(input.built_in).packs);
+    let files = [CrashFile {
+        name: input.file_name.to_string(),
+        bytes: input.text.as_bytes().to_vec(),
+    }];
+    let Some((instance_id, provider)) = input.instance else {
+        return analyze(&AnalyzeInput {
+            packs: &packs,
+            files: &files,
+            runtime_version: None,
+            host: input.host.as_ref(),
+            built_in: input.built_in,
+            instance: None,
+        });
+    };
+    let resolved = resolve_crash_instance(ctx, instance_id, Some(provider))?;
+    let game_packs: Vec<&LoadedCrashPack> = packs
+        .iter()
+        .filter(|pack| {
+            pack.pack.games.is_empty()
+                || pack.pack.games.iter().any(|game| game == &resolved.game_id)
+        })
+        .collect();
+    let ref_maps: Vec<RefMap> = game_packs
+        .iter()
+        .flat_map(|pack| pack.pack.ref_maps.iter().cloned())
+        .collect();
+    let roles: Vec<RoleRule> = game_packs
+        .iter()
+        .flat_map(|pack| pack.pack.roles.iter().cloned())
+        .collect();
+    let resolver = Resolver::new(resolved.view, ref_maps, roles);
+    let scope =
+        Arc::new(
+            instance_reads(ctx, instance_id).map_err(|error| LauncherError::Generic {
+                code: "ERR_CRASH_INSTANCE_READS".to_string(),
+                message: format!("Could not read instance '{instance_id}': {error}"),
+            })?,
+        );
+    let inspector = InstanceInspector::new(
+        input.host.as_ref(),
+        &packs,
+        &resolver,
+        scope,
+        GameHandle {
+            id: resolved.game_id.clone(),
+            runtime_version: resolved.runtime_version.clone(),
+        },
+    );
+    let instance = InstanceAnalysis {
+        game_id: &resolved.game_id,
+        resolver: &resolver,
+        inspector: &inspector,
+        could_not_check: &resolved.could_not_check,
+    };
+    analyze(&AnalyzeInput {
+        packs: &packs,
+        files: &files,
+        runtime_version: resolved.runtime_version.as_deref(),
+        host: input.host.as_ref(),
+        built_in: input.built_in,
+        instance: Some(instance),
     })
 }
 

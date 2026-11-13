@@ -96,6 +96,11 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
     } else {
         input.evaluated.repairs.clone()
     };
+    let actions = if not_a_crash {
+        Vec::new()
+    } else {
+        input.evaluated.actions.clone()
+    };
 
     CrashAnswer {
         contract: CRASH_CONTRACT_VERSION,
@@ -110,6 +115,7 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         trust_notes: input.evaluated.trust_notes.clone(),
         next,
         repairs,
+        actions,
         artifacts: Vec::new(),
     }
 }

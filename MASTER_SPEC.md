@@ -5005,6 +5005,8 @@ A plugin contributes **crash packs**: JSON files listed under `contributions.cra
 
 **Cause on findings** *(built)*. A `finding` effect may declare `cause` from a closed set: `mod`, `version_mismatch`, `missing_requirement`, `file`, `setting`, `save`, `memory`, `driver`, `game_install`, `other`. A root-cause finding about a mod defaults to `mod`; a finding that accuses nobody defaults to `other`. The kind reaches each `Finding` and the top `CrashAnswer.cause` (the top suspect's, or the strongest finding's when nobody is named), so the screen can group findings and the benchmark can grade the cause as well as the name. A cause other than `mod`, `version_mismatch` or `file` may name a candidate, but only with its own `why_not_sure`: the linter refuses one without a reason, because those causes rarely single out one mod.
 
+**Actions on rules** *(built)*. A rule may offer buttons, from a closed set the screen knows how to perform: `install_content` (with a `content_key`), `open_console`, `open_jvm_settings`, `open_crash_log`, `review_mods`. A rule supplies an optional label; the action becomes an `ActionOffer` on the answer with its source, alongside repairs. A pack never decides behaviour: it can only ask for an existing action. The linter refuses `install_content` without a key, a key on another kind, and certainty wording in a label. This carries the buttons the old diagnoser returned without teaching core a game.
+
 *Deferred until a game needs them:* derivers, scanners, bisect edges, rule macros, scoring profiles. The `agora-game-api` dependency list widens to `serde_json` and `regex` for this.
 
 ### 30.12 The platform contract

@@ -30,14 +30,20 @@ pub trait ExtraInstanceProvider {
     ) -> LauncherResult<Option<ResolvedCrashInstance>>;
 }
 
-/// Resolve `instance_id` once, for every caller. A generic game instance is read by core; when it
-/// is not one, `extra` (the game package that owns that instance system) is asked. An id neither
-/// knows is an error, never an empty view that would make every ref look foreign.
+/// Resolve `instance_id` once, for every caller. A game package that owns an instance system is
+/// asked first, because its manifest may also parse as a generic one; a generic game instance is
+/// read by core when that provider does not know the id. An id neither knows is an error, never an
+/// empty view that would make every ref look foreign.
 pub fn resolve_crash_instance(
     ctx: &Ctx,
     instance_id: &str,
     extra: Option<&dyn ExtraInstanceProvider>,
 ) -> LauncherResult<ResolvedCrashInstance> {
+    if let Some(extra) = extra {
+        if let Some(found) = extra.resolve(ctx, instance_id)? {
+            return Ok(found);
+        }
+    }
     match crate::game_instance::get_manifest(ctx, instance_id) {
         Ok(manifest) => {
             let view = from_instance(ctx, instance_id).map_err(|error| LauncherError::Generic {
@@ -51,17 +57,10 @@ pub fn resolve_crash_instance(
                 could_not_check: Vec::new(),
             })
         }
-        Err(generic_error) => {
-            if let Some(extra) = extra {
-                if let Some(found) = extra.resolve(ctx, instance_id)? {
-                    return Ok(found);
-                }
-            }
-            Err(LauncherError::Generic {
-                code: "ERR_CRASH_INSTANCE_UNKNOWN".to_string(),
-                message: format!("Unknown instance '{instance_id}': {generic_error}"),
-            })
-        }
+        Err(generic_error) => Err(LauncherError::Generic {
+            code: "ERR_CRASH_INSTANCE_UNKNOWN".to_string(),
+            message: format!("Unknown instance '{instance_id}': {generic_error}"),
+        }),
     }
 }
 

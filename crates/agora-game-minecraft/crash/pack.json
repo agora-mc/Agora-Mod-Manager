@@ -15,6 +15,7 @@
       "where": { "root": "instance", "path": "logs" },
       "match": { "glob": "latest.log" },
       "format": "latest_log",
+      "bind": [{ "time": { "before_s": 5, "after_s": 30 } }],
       "copy": "head_tail",
       "privacy": "personal"
     },
@@ -31,6 +32,15 @@
       "match": { "glob": "hs_err_pid*.log" },
       "format": "hs_err",
       "copy": "facts_only"
+    },
+    {
+      "id": "captured_launch",
+      "where": { "root": "instance", "path": "logs" },
+      "match": { "glob": "agora-launch-output.log" },
+      "format": "captured_launch",
+      "bind": [{ "time": { "before_s": 5, "after_s": 30 } }],
+      "copy": "head_tail",
+      "privacy": "personal"
     }
   ],
   "parsers": [
@@ -56,6 +66,16 @@
       "entry": { "built_in": { "name": "hs_err" } },
       "detect": {
         "all": ["(?m)^# A fatal error has been detected by the Java Runtime Environment:$"]
+      }
+    },
+    {
+      "id": "captured_launch",
+      "entry": { "built_in": { "name": "captured_launch" } },
+      "detect": {
+        "any": [
+          "(?m)^\\[(stdout|stderr)\\] ",
+          "(?m)^# Agora captured Java output"
+        ]
       }
     }
   ],
@@ -146,6 +166,7 @@
     {
       "id": "missing_dependency",
       "version": 1,
+      "actions": [{ "kind": "review_mods", "label": { "en": "Review Installed Mods" } }],
       "when": {
         "fact": {
           "kind": "core.dependency_problem",
@@ -168,6 +189,7 @@
     {
       "id": "missing_fabric_api",
       "version": 1,
+      "actions": [{ "kind": "install_content", "content_key": "fabric-api", "label": { "en": "Install Fabric API" } }],
       "supersedes": ["missing_dependency"],
       "when": {
         "fact": {
@@ -271,6 +293,7 @@
     {
       "id": "out_of_memory",
       "version": 1,
+      "actions": [{ "kind": "open_jvm_settings", "label": { "en": "Open JVM Settings" } }],
       "when": {
         "fact": {
           "kind": "core.exception",
@@ -291,6 +314,7 @@
     {
       "id": "missing_class",
       "version": 1,
+      "actions": [{ "kind": "review_mods", "label": { "en": "Review Installed Mods" } }],
       "when": {
         "fact": {
           "kind": "core.exception",
@@ -316,6 +340,7 @@
     {
       "id": "mixin_apply_failed",
       "version": 1,
+      "actions": [{ "kind": "open_crash_log", "label": { "en": "Open Crash Log" } }],
       "scope": { "producer": { "format": "minecraft_latest_log" } },
       "when": {
         "fact": {
@@ -351,6 +376,7 @@
     {
       "id": "mixin_config_owner",
       "version": 1,
+      "actions": [{ "kind": "open_crash_log", "label": { "en": "Open Crash Log" } }],
       "when": {
         "fact": {
           "kind": "minecraft.mixin_failure",
@@ -378,6 +404,7 @@
     {
       "id": "mixin_target_owner",
       "version": 1,
+      "actions": [{ "kind": "open_crash_log", "label": { "en": "Open Crash Log" } }],
       "when": {
         "fact": {
           "kind": "minecraft.mixin_failure",
@@ -496,6 +523,7 @@
     {
       "id": "mod_resolution_failed",
       "version": 1,
+      "actions": [{ "kind": "review_mods", "label": { "en": "Review Installed Mods" } }],
       "when": {
         "fact": {
           "kind": "minecraft.loader_problem",
@@ -516,6 +544,7 @@
     {
       "id": "incompatible_mods",
       "version": 1,
+      "actions": [{ "kind": "review_mods", "label": { "en": "Review Installed Mods" } }],
       "when": {
         "fact": {
           "kind": "minecraft.loader_problem",
@@ -536,6 +565,7 @@
     {
       "id": "duplicate_classpath_libraries",
       "version": 1,
+      "actions": [{ "kind": "open_console", "label": { "en": "Open Console" } }],
       "scope": { "producer": { "format": "minecraft_latest_log" } },
       "when": {
         "fact": {
@@ -557,6 +587,7 @@
     {
       "id": "mod_loading_error",
       "version": 1,
+      "actions": [{ "kind": "review_mods", "label": { "en": "Review Installed Mods" } }],
       "scope": { "producer": { "format": "minecraft_latest_log" } },
       "when": {
         "fact": {
@@ -890,6 +921,7 @@
     {
       "id": "jvm_memory_startup",
       "version": 1,
+      "actions": [{ "kind": "open_jvm_settings", "label": { "en": "Open JVM Settings" } }],
       "when": {
         "fact": {
           "kind": "minecraft.jvm_problem",
@@ -1022,6 +1054,7 @@
     {
       "id": "mixin_failed_crash_report",
       "version": 1,
+      "actions": [{ "kind": "open_crash_log", "label": { "en": "Open Crash Log" } }],
       "scope": { "producer": { "format": "minecraft_crash_report" } },
       "when": {
         "fact": {

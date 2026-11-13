@@ -66,6 +66,10 @@ pub struct Rule {
     /// Fixes this rule may offer. The user approves each one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repairs: Vec<RepairRequest>,
+    /// Buttons this rule offers. Each kind is one the UI already knows how to perform, so a pack
+    /// never decides behaviour, only which existing action is useful here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_step: Option<NextStepKind>,
     /// Sample artifacts in the plugin to run this rule against.
@@ -379,4 +383,41 @@ pub enum NextStepKind {
     RestoreSave,
     NothingNeeded,
     SecondOpinion,
+}
+
+/// A button a rule offers. Closed, because the screen has to know how to perform each one; a pack
+/// only says which of those existing actions fits this crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Install the content named by `content_key`.
+    InstallContent,
+    /// Open the launcher's own console or launch output.
+    OpenConsole,
+    /// Open the instance's JVM or memory settings.
+    OpenJvmSettings,
+    /// Open the crash report or log the finding came from.
+    OpenCrashLog,
+    /// Open the installed-mods view so the user can review the set.
+    ReviewMods,
+}
+
+impl ActionKind {
+    /// Whether this kind needs a content key.
+    pub fn needs_content_key(self) -> bool {
+        self == Self::InstallContent
+    }
+}
+
+/// One button a rule offers, in the pack's words and from the UI's closed set of actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionRequest {
+    pub kind: ActionKind,
+    /// The content key to install. Required for `install_content`, refused for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_key: Option<String>,
+    /// The button's words. Absent means the screen uses its own label for the kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<LocalText>,
 }

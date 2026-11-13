@@ -1,7 +1,8 @@
 //! What the engine produces. A plugin's rules feed it; the UI shows it.
 
 use super::{
-    Fact, InspectResult, LocalText, MatchedBy, NextStepKind, Privacy, SessionVerdict, SourceSpan,
+    ActionRequest, Fact, InspectResult, LocalText, MatchedBy, NextStepKind, Privacy,
+    SessionVerdict, SourceSpan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -197,6 +198,13 @@ pub struct Signal {
     pub source: SourceAttribution,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceLine>,
+}
+
+/// A button on offer, with who asked for it. The action is from the closed set the screen knows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionOffer {
+    pub action: ActionRequest,
+    pub source: SourceAttribution,
 }
 
 /// A statement shown to the user. **`source` isn't optional**: every finding names who said it.
@@ -412,5 +420,8 @@ pub struct CrashAnswer {
     pub trust_notes: Vec<TrustNote>,
     pub next: NextStep,
     pub repairs: Vec<RepairOffer>,
+    /// Buttons the screen can show, each with the rule that offered it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionOffer>,
     pub artifacts: Vec<Artifact>,
 }

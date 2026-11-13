@@ -1398,7 +1398,7 @@ fn crash_investigate_uses_latest_log_without_crash_report() {
     std::fs::create_dir_all(&logs).unwrap();
     std::fs::write(
         logs.join("latest.log"),
-        "[Render thread/ERROR]: java.lang.OutOfMemoryError: Java heap space\n",
+        "[01:02:04] [main/ERROR]: java.lang.OutOfMemoryError: Java heap space\n",
     )
     .unwrap();
 
@@ -1409,10 +1409,15 @@ fn crash_investigate_uses_latest_log_without_crash_report() {
         String::from_utf8_lossy(&output.stderr)
     );
     let parsed = assert_json_stdout(&output);
-    assert_eq!(parsed["failure_category"], "Oom");
-    assert_eq!(
-        parsed["evidence"]["sources"][0]["meta"]["basename"],
-        "latest.log"
+    assert_eq!(parsed["files"][0]["name"], "latest.log");
+    let findings = parsed["answer"]["findings"]
+        .as_array()
+        .expect("findings are an array");
+    assert!(
+        findings.iter().any(|finding| finding["headline"]["en"]
+            .as_str()
+            .is_some_and(|text| text.to_lowercase().contains("out of memory"))),
+        "the engine names the out-of-memory finding: {parsed}"
     );
 }
 
@@ -1424,7 +1429,14 @@ fn crash_investigate_accepts_explicit_text_evidence() {
     let extra = data_dir.join("selected-forge-crash.txt");
     std::fs::write(
         &extra,
-        "net.minecraftforge.fml.ModLoadingException: Missing mandatory dependency\nCaused by: java.lang.NoClassDefFoundError: example/api/EntryPoint\n",
+        "---- Minecraft Crash Report ----\n\
+         // Example\n\
+         \n\
+         Time: 2026-01-01 00:00:00\n\
+         Description: Example crash\n\
+         \n\
+         java.lang.NoClassDefFoundError: example/api/EntryPoint\n\
+         \tat example.mod.Example.init(Example.java:1)\n",
     )
     .unwrap();
 
@@ -1444,11 +1456,16 @@ fn crash_investigate_accepts_explicit_text_evidence() {
         String::from_utf8_lossy(&output.stderr)
     );
     let parsed = assert_json_stdout(&output);
-    assert_eq!(
-        parsed["evidence"]["sources"][0]["meta"]["basename"],
-        "selected-forge-crash.txt"
+    assert_eq!(parsed["files"][0]["name"], "selected-forge-crash.txt");
+    let findings = parsed["answer"]["findings"]
+        .as_array()
+        .expect("findings are an array");
+    assert!(
+        findings.iter().any(|finding| finding["headline"]["en"]
+            .as_str()
+            .is_some_and(|text| text.contains("class the game needed"))),
+        "the engine names the missing class: {parsed}"
     );
-    assert!(parsed["evidence"]["sources"][0].get("path").is_none());
 }
 
 fn write_crash_analyze_fixtures(root: &Path) -> (PathBuf, PathBuf) {
@@ -7734,4 +7751,52 @@ fn plugin_validate_notes_a_package_that_needs_an_absent_parent() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cannot be checked here"), "{stdout}");
+}
+
+#[test]
+fn crash_list_reads_stored_answers_and_inspect_reads_a_report() {
+    let (_tmp, data_dir) = temp_data_dir();
+    run_agora(&data_dir, &["paths"]);
+    create_vanilla_instance(&data_dir, "crash-stored", "1.21");
+
+    let ctx = agora_core::ctx::CoreContext::for_testing(data_dir.clone());
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    agora_core::crash_live::store_answer(
+        &conn,
+        &agora_core::crash_live::SessionAnswer {
+            session_id: "stored-session".to_string(),
+            instance_id: "crash-stored".to_string(),
+            created_at: "2026-01-01T00:01:00Z".to_string(),
+            answer: agora_core::crash_live::StoredAnswer::NothingToRead {
+                why: "the test has no evidence".to_string(),
+            },
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let listed = run_agora_json(&data_dir, &["crash", "list", "crash-stored"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let parsed = assert_json_stdout(&listed);
+    assert_eq!(parsed[0]["session_id"], "stored-session");
+
+    let reports = data_dir.join("instances/crash-stored/crash-reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::write(reports.join("crash-example.txt"), "an example report\n").unwrap();
+    let inspected = run_agora_json(
+        &data_dir,
+        &["crash", "inspect", "crash-stored", "crash-example.txt"],
+    );
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let parsed = assert_json_stdout(&inspected);
+    assert_eq!(parsed["filename"], "crash-example.txt");
+    assert_eq!(parsed["content"], "an example report\n");
 }

@@ -1072,7 +1072,7 @@ impl LaunchService {
                 });
 
             if let Some(ref log) = log_tail {
-                if agora_core::crash_diagnostics::triage(log).matched {
+                if crate::crash::log_text_names_a_crash(log) {
                     break LaunchOutcome::Crash;
                 }
                 // The delegated launcher does not expose the game PID or exit code.

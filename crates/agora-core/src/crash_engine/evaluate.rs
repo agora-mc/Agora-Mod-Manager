@@ -3,11 +3,11 @@
 
 use super::*;
 use agora_game_api::crash::{
-    AttrMatch, AttrValue, Cause, Condition, CouldNotCheck, CouldNotCheckReason, CountQuery,
-    Coverage, CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding, InspectResult,
-    InspectionRecord, Level, LocalText, MatchOps, NextStepKind, ParseNoteKind, Ref, RepairOffer,
-    RepairRequest, ResolvedRepair, Role, Rule, RuleText, Scalar, Scope, Signal, SourceAttribution,
-    Strength, TextMatch, TrustNote, Truth,
+    ActionOffer, AttrMatch, AttrValue, Cause, Condition, CouldNotCheck, CouldNotCheckReason,
+    CountQuery, Coverage, CoverageState, Effect, EvidenceLine, Fact, FactQuery, Family, Finding,
+    InspectResult, InspectionRecord, Level, LocalText, MatchOps, NextStepKind, ParseNoteKind, Ref,
+    RepairOffer, RepairRequest, ResolvedRepair, Role, Rule, RuleText, Scalar, Scope, Signal,
+    SourceAttribution, Strength, TextMatch, TrustNote, Truth,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,6 +33,8 @@ pub struct EvaluateOutput {
     /// The weakest cap a `trust` effect gave, if any.
     pub level_cap: Option<Level>,
     pub repairs: Vec<RepairOffer>,
+    /// Buttons the fired rules offer, with their source.
+    pub actions: Vec<ActionOffer>,
     pub next_steps: Vec<NextStepKind>,
     /// The role of each candidate owner, for consensus's demotion rule.
     pub roles: BTreeMap<String, Role>,
@@ -1320,6 +1322,7 @@ struct RuleProducts {
     trust_notes: Vec<TrustNote>,
     level_caps: Vec<Level>,
     repairs: Vec<RepairOffer>,
+    actions: Vec<ActionOffer>,
     next_steps: Vec<NextStepKind>,
     roles: BTreeMap<String, Role>,
 }
@@ -1375,6 +1378,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
     let mut could_not_check = Vec::new();
     let mut trust_notes = Vec::new();
     let mut repairs = Vec::new();
+    let mut actions = Vec::new();
     let mut next_steps = Vec::new();
     let mut roles = BTreeMap::new();
     let mut cap: Option<Level> = None;
@@ -1388,6 +1392,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         could_not_check.extend(product.could_not_check);
         trust_notes.extend(product.trust_notes);
         repairs.extend(product.repairs);
+        actions.extend(product.actions);
         next_steps.extend(product.next_steps);
         roles.extend(product.roles);
         for level in product.level_caps {
@@ -1453,6 +1458,14 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         )
     });
     repairs.dedup_by(|a, b| a.request == b.request && a.source == b.source);
+    actions.sort_by_key(|offer| {
+        format!(
+            "{}\0{}",
+            serde_json::to_string(&offer.action).unwrap_or_default(),
+            source_key(&offer.source)
+        )
+    });
+    actions.dedup_by(|a, b| a.action == b.action && source_key(&a.source) == source_key(&b.source));
     // Two rules may inspect the same file; show one row, not one per rule.
     inspections.sort_by_key(|inspection| {
         format!(
@@ -1480,6 +1493,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         trust_notes,
         level_cap: cap,
         repairs,
+        actions,
         next_steps,
         roles,
     }
@@ -1761,6 +1775,12 @@ fn evaluate_rule(
             {
                 product.repairs.push(offer);
             }
+        }
+        for action in &rule.actions {
+            product.actions.push(ActionOffer {
+                action: action.clone(),
+                source: rule_source(plugin, rule, None),
+            });
         }
         if let Some(next) = rule.next_step {
             product.next_steps.push(next);

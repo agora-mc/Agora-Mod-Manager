@@ -457,6 +457,7 @@ pub fn lint_rule(rule: &Rule) -> Vec<LintProblem> {
             | RepairRequest::CreateSnapshot { .. } => {}
         }
     }
+    lint.actions(rule, &bound);
     lint.out
 }
 
@@ -946,6 +947,38 @@ impl RuleLint {
         self.local_text(&text.headline, "`headline`", bound);
         if let Some(why) = &text.why_not_sure {
             self.local_text(why, "`why_not_sure`", bound);
+        }
+    }
+
+    /// An action is a closed kind the screen knows how to perform. A content key belongs only to
+    /// `install_content`, and a label is optional UI wording, never a claim about the cause.
+    fn actions(&mut self, rule: &Rule, bound: &Bound) {
+        for action in &rule.actions {
+            match action.kind {
+                ActionKind::InstallContent => {
+                    if action
+                        .content_key
+                        .as_deref()
+                        .is_none_or(|key| key.trim().is_empty())
+                    {
+                        self.push(
+                            LintCode::BadEffect,
+                            "an `install_content` action needs a non-empty `content_key`",
+                        );
+                    }
+                }
+                _ => {
+                    if action.content_key.is_some() {
+                        self.push(
+                            LintCode::BadEffect,
+                            "only an `install_content` action uses `content_key`",
+                        );
+                    }
+                }
+            }
+            if let Some(label) = &action.label {
+                self.local_text(label, "an action's `label`", bound);
+            }
         }
     }
 

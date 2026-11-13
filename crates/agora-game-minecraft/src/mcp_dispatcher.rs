@@ -6,13 +6,12 @@
 //! or Tauri types.
 
 use crate::instance_service::InstanceService;
+use agora_core::crash_engine::{analyze_pasted_text, AnalyzeOutput, TextAnalysis};
 use agora_core::ctx::Ctx;
 use agora_core::error::{LauncherError, LauncherResult};
 use agora_core::models::InstanceManifest;
-
-// ---------------------------------------------------------------------------
-// McpDispatcher struct — ergonomic wrapper for transport handlers
-// ---------------------------------------------------------------------------
+use agora_plugin_api::host::ScriptHost;
+use std::sync::Arc;
 
 /// Cloneable MCP dispatcher wrapping a shared [`Ctx`].
 ///
@@ -169,7 +168,7 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "search_crash_signatures",
-            "description": "Search the curated crash signature database for patterns matching the provided crash text. Returns matching signatures and fix hints.",
+            "description": "Run the local crash doctor over the provided crash text. Returns the engine's CrashAnswer and the per-file reader report; anything it could not check is listed, never silently treated as nothing found.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -233,7 +232,7 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "read_latest_crash",
-            "description": "Read the most recent crash report or log for an instance. Returns the last 200 lines of the newest crash file.",
+            "description": "Return the newest crash answer the crash doctor stored for an instance. A crash is diagnosed when a launch ends.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -247,7 +246,7 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "suggest_mod_incompatibility",
-            "description": "Analyze crash text against installed mods in an instance and return ranked suspect mods that may be causing the crash.",
+            "description": "Run the local crash doctor over crash text against an instance's installed mods. Returns the engine's CrashAnswer with ranked candidates, findings and what it could not check.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -264,6 +263,40 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// The crash engine behind the read-only diagnosis tools
+// ---------------------------------------------------------------------------
+
+/// Run the engine over pasted text, optionally against an instance's deployed view. The tools are
+/// read-only, and a parser that cannot run is "could not check", never "nothing found".
+fn analyze_crash_text(
+    ctx: &Ctx,
+    text: &str,
+    file_name: &str,
+    instance_id: Option<&str>,
+) -> Result<AnalyzeOutput, String> {
+    let host: Arc<dyn ScriptHost> = Arc::new(agora_core::crash_engine::gate::NoHost);
+    let built_in = crate::crash::built_in_packs();
+    let provider = crate::installed_content::MinecraftInstanceProvider;
+    analyze_pasted_text(
+        ctx,
+        &TextAnalysis {
+            text,
+            file_name,
+            built_in: &built_in,
+            host,
+            instance: instance_id.map(|id| {
+                (
+                    id,
+                    &provider
+                        as &dyn agora_core::crash_engine::instance_view::ExtraInstanceProvider,
+                )
+            }),
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -324,14 +357,19 @@ fn handle_tool_call(ctx: &Ctx, tool_name: &str, params: &serde_json::Value) -> s
         }
         "search_crash_signatures" => {
             let crash_text = get_str("crash_text").unwrap_or_default();
-            let result = handle_search_crash_signatures(ctx, &crash_text);
-            serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": serde_json::to_string(&result).unwrap_or_default(),
-                }],
-                "isError": false,
-            })
+            match handle_search_crash_signatures(ctx, &crash_text) {
+                Ok(result) => serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string(&result).unwrap_or_default(),
+                    }],
+                    "isError": false,
+                }),
+                Err(message) => serde_json::json!({
+                    "content": [{ "type": "text", "text": message }],
+                    "isError": true,
+                }),
+            }
         }
         "search_knowledge_base" => {
             let query = get_str("query").unwrap_or_default();
@@ -392,79 +430,33 @@ fn handle_tool_call(ctx: &Ctx, tool_name: &str, params: &serde_json::Value) -> s
         }
         "suggest_mod_incompatibility" => {
             let crash_text = get_str("crash_text").unwrap_or_default();
-            let service = agora_core::crash_service::CrashService::new(ctx.clone());
-            match service.suggest_mod_incompatibility(&instance_id, &crash_text) {
-                Ok(suspects) => {
-                    let results: Vec<serde_json::Value> = suspects
-                        .into_iter()
-                        .map(|s| {
-                            serde_json::json!({
-                                "mod_id": s.mod_id,
-                                "filename": s.filename,
-                                "total_score": s.total_score,
-                                "is_dependent_of": s.is_dependent_of,
-                                "breakdown": s.breakdown,
-                            })
-                        })
-                        .collect();
-                    serde_json::json!({
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string(&serde_json::json!({ "suspects": results }))
-                                .unwrap_or_default(),
-                        }],
-                        "isError": false,
-                    })
-                }
-                Err(e) => serde_json::json!({
-                    "content": [{ "type": "text", "text": format!("{}", e) }],
+            match handle_suggest_mod_incompatibility(ctx, &instance_id, &crash_text) {
+                Ok(result) => serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string(&result).unwrap_or_default(),
+                    }],
+                    "isError": false,
+                }),
+                Err(message) => serde_json::json!({
+                    "content": [{ "type": "text", "text": message }],
                     "isError": true,
                 }),
             }
         }
-        "read_latest_crash" => {
-            let service = agora_core::crash_service::CrashService::new(ctx.clone());
-            let reports = match service.list_reports(&instance_id) {
-                Ok(r) => r,
-                Err(e) => {
-                    return serde_json::json!({
-                        "content": [{"type": "text", "text": format!("Error listing crash reports: {}", e)}],
-                        "isError": true,
-                    })
-                }
-            };
-            let newest = match reports.first() {
-                Some(r) => r.filename.clone(),
-                None => {
-                    return serde_json::json!({
-                        "content": [{"type": "text", "text": format!("No crash reports found for instance '{}'", instance_id)}],
-                        "isError": false,
-                    })
-                }
-            };
-            let full = match service.read_crash_log(&instance_id, &newest) {
-                Ok(t) => t,
-                Err(e) => {
-                    return serde_json::json!({
-                        "content": [{"type": "text", "text": format!("Error reading crash log: {}", e)}],
-                        "isError": true,
-                    })
-                }
-            };
-            let lines: Vec<&str> = full.lines().collect();
-            let start = if lines.len() > 200 {
-                lines.len() - 200
-            } else {
-                0
-            };
-            let tail: Vec<&str> = lines[start..].to_vec();
-            serde_json::json!({
-                "content": [{"type": "text", "text": tail.join("\n")}],
+        "read_latest_crash" => match handle_read_latest_crash(ctx, &instance_id) {
+            Ok(result) => serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string(&result).unwrap_or_default(),
+                }],
                 "isError": false,
-                "filename": newest,
-                "total_lines": lines.len(),
-            })
-        }
+            }),
+            Err(message) => serde_json::json!({
+                "content": [{ "type": "text", "text": message }],
+                "isError": true,
+            }),
+        },
         _ => serde_json::json!({
             "content": [{
                 "type": "text",
@@ -691,18 +683,66 @@ fn build_system_context(ctx: &Ctx) -> String {
     lines.join("\n")
 }
 
-fn handle_search_crash_signatures(_ctx: &Ctx, crash_text: &str) -> serde_json::Value {
-    let result = agora_core::crash_diagnostics::triage(crash_text);
-    if result.matched {
-        serde_json::json!({
-            "matches": [{
-                "name": result.signature_name,
-                "fix_hint": result.solution_markdown,
-            }]
-        })
-    } else {
-        serde_json::json!({ "matches": [] })
+/// Run the engine over pasted crash text. Its output is the answer, with the per-file reader
+/// report so "could not check" is visible instead of reading as "nothing found".
+fn handle_search_crash_signatures(
+    ctx: &Ctx,
+    crash_text: &str,
+) -> Result<serde_json::Value, String> {
+    if crash_text.trim().is_empty() {
+        return Err("crash_text is empty, so there is nothing to read. An empty input is not a clean result.".to_string());
     }
+    let output = analyze_crash_text(ctx, crash_text, "pasted-crash.txt", None)?;
+    Ok(engine_answer(output))
+}
+
+/// Run the engine over pasted crash text against an instance's deployed view.
+fn handle_suggest_mod_incompatibility(
+    ctx: &Ctx,
+    instance_id: &str,
+    crash_text: &str,
+) -> Result<serde_json::Value, String> {
+    if instance_id.trim().is_empty() {
+        return Err("instance_id is required.".to_string());
+    }
+    if crash_text.trim().is_empty() {
+        return Err("crash_text is empty, so there is nothing to read. An empty input is not a clean result.".to_string());
+    }
+    let output = analyze_crash_text(ctx, crash_text, "pasted-crash.txt", Some(instance_id))?;
+    Ok(engine_answer(output))
+}
+
+/// The newest answer the crash doctor stored for an instance. A crash is diagnosed when a launch
+/// ends, so there is nothing to read until one has.
+fn handle_read_latest_crash(ctx: &Ctx, instance_id: &str) -> Result<serde_json::Value, String> {
+    if instance_id.trim().is_empty() {
+        return Err("instance_id is required.".to_string());
+    }
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| format!("Could not open the local state database: {error}"))?;
+    let stored = agora_core::crash_live::latest_answer(&conn, instance_id)
+        .map_err(|error| format!("Could not read the stored crash answers: {error}"))?;
+    let Some(stored) = stored else {
+        return Err(format!(
+            "No crash answer is stored for instance '{instance_id}'. Agora diagnoses a crash when \
+             a launch ends, so run the game once and ask again."
+        ));
+    };
+    Ok(serde_json::json!({
+        "crash_doctor": "The newest engine answer stored for this instance.",
+        "session_id": stored.session_id,
+        "instance_id": stored.instance_id,
+        "created_at": stored.created_at,
+        "answer": stored.answer,
+    }))
+}
+
+fn engine_answer(output: AnalyzeOutput) -> serde_json::Value {
+    serde_json::json!({
+        "crash_doctor": "The crash engine's answer. `answer.could_not_check` lists what no parser could look at; `files` says what read each file and why any did not.",
+        "answer": output.answer,
+        "files": output.files,
+    })
 }
 
 fn handle_search_knowledge_base(ctx: &Ctx, query: &str) -> serde_json::Value {
@@ -1001,6 +1041,11 @@ fn open_registry(ctx: &Ctx) -> LauncherResult<rusqlite::Connection> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agora_core::crash_live::{store_answer, SessionAnswer, StoredAnswer};
+    use agora_core::db::{local_state_connection, upsert_instance};
+    use agora_core::models::{
+        GameManifestFields, InstalledMod, InstanceManifest, InstanceRow, CURRENT_MANIFEST_VERSION,
+    };
 
     // -----------------------------------------------------------------------
     // McpDispatcher struct
@@ -1143,6 +1188,45 @@ mod tests {
         (ctx, tmp)
     }
 
+    /// Write a manifest the reader accepts. Optional fields serialise as `null`, which the
+    /// internally tagged enums refuse, so drop the nulls before writing.
+    fn write_test_manifest(ctx: &Ctx, instance_id: &str, manifest: &InstanceManifest) {
+        let mut value = serde_json::to_value(manifest).unwrap();
+        if let Some(object) = value.as_object_mut() {
+            object.retain(|_, value| !value.is_null());
+        }
+        let path = ctx.paths.instance_manifest(instance_id).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        // The instance view starts from the local-state row, so a manifest alone is not enough.
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        upsert_instance(
+            &conn,
+            &InstanceRow {
+                instance_id: instance_id.to_string(),
+                name: instance_id.to_string(),
+                minecraft_version: manifest.minecraft_version.clone(),
+                loader: manifest.loader.clone(),
+                loader_version: manifest.loader_version.clone(),
+                is_modpack: false,
+                is_locked: false,
+                last_launched_at: None,
+                jvm_memory_mb: 4096,
+                jvm_memory_mode: "auto".to_string(),
+                jvm_gc: "g1".to_string(),
+                jvm_custom_args: String::new(),
+                jvm_always_pre_touch: false,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                java_path: None,
+                java_incompatible_override: false,
+                icon_path: None,
+                launch_mode_override: "direct".to_string(),
+                import_source: None,
+                total_play_ms: 0,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn initialize_returns_protocol_metadata() {
         let (ctx, _tmp) = with_ctx();
@@ -1276,22 +1360,38 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_search_crash_signatures_returns_matches_or_empty() {
+    fn tool_call_search_crash_signatures_returns_the_engine_answer() {
         let (ctx, _tmp) = with_ctx();
         let params = serde_json::json!({
             "name": "search_crash_signatures",
-            "arguments": { "crash_text": "OutOfMemoryError: Java heap space" }
+            "arguments": { "crash_text": "[01:02:04] [main/ERROR]: java.lang.OutOfMemoryError: Java heap space" }
         });
         let result = handle_mcp_method(&ctx, "tools/call", Some(&params));
+        assert!(!result["isError"].as_bool().unwrap_or(true), "{result}");
         let content = result["content"]
             .as_array()
             .and_then(|c| c.first())
             .and_then(|c| c["text"].as_str())
             .unwrap_or("");
         assert!(
-            content.contains("\"matches\""),
-            "response should contain matches: {content}"
+            content.contains("\"answer\""),
+            "the engine answer: {content}"
         );
+        assert!(
+            content.contains("out of memory"),
+            "the memory finding is in the answer: {content}"
+        );
+    }
+
+    #[test]
+    fn tool_call_search_crash_signatures_refuses_empty_text() {
+        let (ctx, _tmp) = with_ctx();
+        let params = serde_json::json!({
+            "name": "search_crash_signatures",
+            "arguments": { "crash_text": "  " }
+        });
+        let result = handle_mcp_method(&ctx, "tools/call", Some(&params));
+        assert!(result["isError"].as_bool().unwrap_or(false), "{result}");
     }
 
     #[test]
@@ -1343,7 +1443,7 @@ mod tests {
     fn db_approval_destructive_with_always_allow() {
         let (ctx, tmp) = with_ctx();
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         conn.execute(
             "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
              VALUES ('disable_mod', 'test', 'always_allow', '2024-01-01T00:00:00Z')",
@@ -1361,7 +1461,7 @@ mod tests {
     fn db_approval_destructive_with_always_deny() {
         let (ctx, tmp) = with_ctx();
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         conn.execute(
             "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
              VALUES ('disable_mod', 'test', 'always_deny', '2024-01-01T00:00:00Z')",
@@ -1381,7 +1481,7 @@ mod tests {
     fn db_approval_destructive_with_session_grant() {
         let (ctx, tmp) = with_ctx();
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         conn.execute(
             "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
              VALUES ('enable_mod', 'test', 'session', '2024-01-01T00:00:00Z')",
@@ -1399,7 +1499,7 @@ mod tests {
     fn db_approval_destructive_wrong_tool_denies() {
         let (ctx, tmp) = with_ctx();
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         conn.execute(
             "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
              VALUES ('disable_mod', 'test', 'always_allow', '2024-01-01T00:00:00Z')",
@@ -1420,7 +1520,7 @@ mod tests {
     fn db_approval_destructive_wrong_instance_denies() {
         let (ctx, tmp) = with_ctx();
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         conn.execute(
             "INSERT INTO mcp_approval_grants (tool_name, instance_id, state, granted_at)
              VALUES ('disable_mod', 'instance-a', 'always_allow', '2024-01-01T00:00:00Z')",
@@ -1545,7 +1645,7 @@ mod tests {
         // Insert
         set_approval_grant(&ctx, "my_tool", "my_instance", "always_allow").unwrap();
         // Verify
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let state: String = conn
             .query_row(
                 "SELECT state FROM mcp_approval_grants WHERE tool_name = 'my_tool' AND instance_id = 'my_instance'",
@@ -1572,7 +1672,7 @@ mod tests {
     fn set_approval_session_expiry_is_set() {
         let (ctx, tmp) = with_ctx();
         set_approval_grant(&ctx, "session_tool", "session_inst", "session").unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let expires_at: Option<String> = conn
             .query_row(
                 "SELECT expires_at FROM mcp_approval_grants WHERE tool_name = 'session_tool' AND instance_id = 'session_inst'",
@@ -1591,7 +1691,7 @@ mod tests {
     fn set_approval_always_allow_expiry_is_null() {
         let (ctx, tmp) = with_ctx();
         set_approval_grant(&ctx, "persist_tool", "persist_inst", "always_allow").unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
         let expires_at: Option<String> = conn
             .query_row(
                 "SELECT expires_at FROM mcp_approval_grants WHERE tool_name = 'persist_tool' AND instance_id = 'persist_inst'",
@@ -1619,9 +1719,15 @@ mod tests {
             std::fs::write(instance_dir.join("mods").join(fname), b"fake mod").unwrap();
         }
 
-        let manifest = agora_core::models::InstanceManifest {
-            manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
-            game_data: Default::default(),
+        let manifest = InstanceManifest {
+            manifest_version: CURRENT_MANIFEST_VERSION,
+            game_data: GameManifestFields {
+                base: Some(agora_game_api::BaseReference::Unpinned {
+                    install: agora_game_api::InstallId::new("install-test").unwrap(),
+                    reason: "test".to_string(),
+                }),
+                ..Default::default()
+            },
             pack_origin: None,
             instance_id: instance_id.to_string(),
             name: instance_id.to_string(),
@@ -1632,7 +1738,7 @@ mod tests {
             is_locked: false,
             mods: mod_filenames
                 .iter()
-                .map(|fname| agora_core::models::InstalledMod {
+                .map(|fname| InstalledMod {
                     provider: None,
                     update_pinned: false,
                     pack_managed: false,
@@ -1665,12 +1771,7 @@ mod tests {
             worlds: vec![],
             user_preferences: serde_json::Value::Null,
         };
-        let manifest_path = ctx.paths.instance_manifest(instance_id).unwrap();
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
+        write_test_manifest(ctx, instance_id, &manifest);
     }
 
     #[test]
@@ -1787,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_read_latest_crash_no_reports() {
+    fn tool_call_read_latest_crash_without_a_stored_answer_says_so() {
         let (ctx, tmp) = with_ctx();
         create_test_instance(&ctx, "test-d", &[]);
 
@@ -1797,40 +1898,37 @@ mod tests {
         });
         let result = handle_mcp_method(&ctx, "tools/call", Some(&params));
 
-        // Should NOT be an error — "no reports" is a normal state
         assert!(
-            !result["isError"].as_bool().unwrap_or(true),
-            "no-reports should not error: {result}"
+            result["isError"].as_bool().unwrap_or(false),
+            "an absent answer is not a clean result: {result}"
         );
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(
-            text.contains("No crash reports found"),
-            "should mention no reports: {text}"
+            text.contains("No crash answer is stored"),
+            "should say no answer is stored: {text}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn tool_call_read_latest_crash_with_content() {
+    fn tool_call_read_latest_crash_returns_the_stored_answer() {
         let (ctx, tmp) = with_ctx();
         create_test_instance(&ctx, "test-e", &[]);
-
-        // Create a crash report file in the crash-reports directory
-        let crash_dir = ctx
-            .paths
-            .instance_dir("test-e")
-            .unwrap()
-            .join("crash-reports");
-        std::fs::create_dir_all(&crash_dir).unwrap();
-
-        // Write a crash log with 5 lines
-        let crash_content = "line 1\nline 2\nline 3\nline 4\nline 5\n";
-        std::fs::write(
-            crash_dir.join("crash-2024-01-01_12.00.00.txt"),
-            crash_content,
+        let conn = local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        store_answer(
+            &conn,
+            &SessionAnswer {
+                session_id: "stored-session".to_string(),
+                instance_id: "test-e".to_string(),
+                created_at: "2026-01-01T00:01:00Z".to_string(),
+                answer: StoredAnswer::NothingToRead {
+                    why: "the test has no report".to_string(),
+                },
+            },
         )
         .unwrap();
+        drop(conn);
 
         let params = serde_json::json!({
             "name": "read_latest_crash",
@@ -1842,14 +1940,10 @@ mod tests {
             !result["isError"].as_bool().unwrap_or(true),
             "should not error: {result}"
         );
-        assert_eq!(result["filename"], "crash-2024-01-01_12.00.00.txt");
-        assert_eq!(result["total_lines"], 5);
-
         let text = result["content"][0]["text"].as_str().unwrap_or("");
-        // Should contain all 5 lines since they're under 200
         assert!(
-            text.contains("line 3"),
-            "tail should include line 3: {text}"
+            text.contains("stored-session") && text.contains("nothing_to_read"),
+            "the stored engine answer: {text}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1870,16 +1964,14 @@ mod tests {
         });
         let result = handle_mcp_method(&ctx, "tools/call", Some(&params));
 
-        // Empty crash text: no fingerprint → suspects with score 0
-        assert!(!result["isError"].as_bool().unwrap_or(true));
+        assert!(
+            result["isError"].as_bool().unwrap_or(false),
+            "empty text is not a clean result: {result}"
+        );
         let content = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(
-            content.contains("\"suspects\""),
-            "should contain suspects: {content}"
-        );
-        assert!(
-            content.contains("\"total_score\":0.0"),
-            "expected 0.0 scores for empty crash text: {content}"
+            content.contains("nothing to read"),
+            "should say there is nothing to read: {content}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1908,6 +2000,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    fn example_crash_report(package: &str) -> String {
+        format!(
+            "---- Minecraft Crash Report ----\n\
+             // Example\n\
+             \n\
+             Time: 2026-01-01 00:00:00\n\
+             Description: Example crash\n\
+             \n\
+             java.lang.RuntimeException: Example\n\
+             \tat {package}.mod.Core.init(Core.java:10)\n\
+             \tat net.minecraft.client.Minecraft.tick(Minecraft.java:100)\n"
+        )
+    }
+
     #[test]
     fn tool_call_suggest_mod_incompatibility_matching_suspects() {
         let (ctx, tmp) = with_ctx();
@@ -1918,14 +2024,12 @@ mod tests {
             &[("suspect-mod.jar", vec!["com.example".into()])],
         );
 
-        let crash_text = "\
-Exception in thread \"main\" java.lang.RuntimeException: Test
-    at com.example.mod.Core.init(Core.java:10)
-    at net.minecraft.client.Minecraft.tick(Minecraft.java:100)";
-
         let params = serde_json::json!({
             "name": "suggest_mod_incompatibility",
-            "arguments": { "instance_id": "test-ic2", "crash_text": crash_text }
+            "arguments": {
+                "instance_id": "test-ic2",
+                "crash_text": example_crash_report("com.example")
+            }
         });
         let result = handle_mcp_method(&ctx, "tools/call", Some(&params));
 
@@ -1935,12 +2039,12 @@ Exception in thread \"main\" java.lang.RuntimeException: Test
         );
         let content = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(
-            content.contains("\"suspects\""),
-            "should contain suspects: {content}"
+            content.contains("\"answer\""),
+            "the engine answer: {content}"
         );
         assert!(
             content.contains("suspect-mod"),
-            "should contain the mod name: {content}"
+            "should name the mod whose code was on the stack: {content}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1959,9 +2063,15 @@ Exception in thread \"main\" java.lang.RuntimeException: Test
             std::fs::write(instance_dir.join("mods").join(fname), b"fake mod").unwrap();
         }
 
-        let manifest = agora_core::models::InstanceManifest {
-            manifest_version: agora_core::models::CURRENT_MANIFEST_VERSION,
-            game_data: Default::default(),
+        let manifest = InstanceManifest {
+            manifest_version: CURRENT_MANIFEST_VERSION,
+            game_data: GameManifestFields {
+                base: Some(agora_game_api::BaseReference::Unpinned {
+                    install: agora_game_api::InstallId::new("install-test").unwrap(),
+                    reason: "test".to_string(),
+                }),
+                ..Default::default()
+            },
             pack_origin: None,
             instance_id: instance_id.to_string(),
             name: instance_id.to_string(),
@@ -1972,7 +2082,7 @@ Exception in thread \"main\" java.lang.RuntimeException: Test
             is_locked: false,
             mods: mods
                 .iter()
-                .map(|(fname, packages)| agora_core::models::InstalledMod {
+                .map(|(fname, packages)| InstalledMod {
                     provider: None,
                     update_pinned: false,
                     pack_managed: false,
@@ -2005,12 +2115,7 @@ Exception in thread \"main\" java.lang.RuntimeException: Test
             worlds: vec![],
             user_preferences: serde_json::Value::Null,
         };
-        let manifest_path = ctx.paths.instance_manifest(instance_id).unwrap();
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_string_pretty(&manifest).unwrap(),
-        )
-        .unwrap();
+        write_test_manifest(ctx, instance_id, &manifest);
     }
 
     #[test]
@@ -2018,13 +2123,12 @@ Exception in thread \"main\" java.lang.RuntimeException: Test
         let (ctx, tmp) = with_ctx();
         create_test_instance(&ctx, "test-ic3", &["unrelated-mod.jar"]);
 
-        let crash_text = "\
-Exception in thread \"main\" java.lang.RuntimeException: Test
-    at com.unknown.mod.Core.init(Core.java:10)";
-
         let params = serde_json::json!({
             "name": "suggest_mod_incompatibility",
-            "arguments": { "instance_id": "test-ic3", "crash_text": crash_text }
+            "arguments": {
+                "instance_id": "test-ic3",
+                "crash_text": example_crash_report("com.unknown")
+            }
         });
         let result = handle_mcp_method(&ctx, "tools/call", Some(&params));
 
@@ -2034,8 +2138,8 @@ Exception in thread \"main\" java.lang.RuntimeException: Test
         );
         let content = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(
-            content.contains("\"total_score\":0.0"),
-            "expected 0.0 scores for unrelated mod: {content}"
+            content.contains("\"candidates\":[]"),
+            "expected no candidate for an unknown package: {content}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2094,41 +2198,13 @@ Exception in thread \"main\" java.lang.RuntimeException: Test
     }
 
     #[test]
-    fn tool_call_read_latest_crash_tail_only_200_lines() {
-        let (ctx, tmp) = with_ctx();
-        create_test_instance(&ctx, "test-f", &[]);
-
-        let crash_dir = ctx
-            .paths
-            .instance_dir("test-f")
-            .unwrap()
-            .join("crash-reports");
-        std::fs::create_dir_all(&crash_dir).unwrap();
-
-        // Write a crash log with 250 lines (should only return last 200)
-        let lines_250: Vec<String> = (1..=250).map(|i| format!("line {}", i)).collect();
-        let crash_content = lines_250.join("\n") + "\n";
-        std::fs::write(crash_dir.join("crash-large.txt"), &crash_content).unwrap();
-
+    fn tool_call_read_latest_crash_needs_an_instance_id() {
+        let (ctx, _tmp) = with_ctx();
         let params = serde_json::json!({
             "name": "read_latest_crash",
-            "arguments": { "instance_id": "test-f" }
+            "arguments": {}
         });
         let result = handle_mcp_method(&ctx, "tools/call", Some(&params));
-
-        assert!(!result["isError"].as_bool().unwrap_or(true));
-        assert_eq!(result["filename"], "crash-large.txt");
-        assert_eq!(result["total_lines"], 250);
-
-        let text = result["content"][0]["text"].as_str().unwrap_or("");
-        let returned_lines: Vec<&str> = text.lines().collect();
-        assert_eq!(returned_lines.len(), 200, "should return 200 lines");
-        assert!(
-            text.contains("line 51"),
-            "tail should start around line 51: {text}"
-        );
-        assert!(text.contains("line 250"), "tail should include last line");
-
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(result["isError"].as_bool().unwrap_or(false), "{result}");
     }
 }
