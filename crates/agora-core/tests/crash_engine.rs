@@ -2279,3 +2279,104 @@ fn equal_frame_indexes_across_artifacts_are_order_independent() {
         serde_json::to_string(&second).expect("serialize")
     );
 }
+
+#[test]
+fn a_change_since_the_last_good_launch_only_boosts_and_never_accuses_alone() {
+    use agora_core::session_ledger::{ChangeKind, ManifestChange};
+
+    let changes = vec![ManifestChange {
+        kind: ChangeKind::Updated,
+        key: Some("mod-a".to_string()),
+        from_version: Some("1.0".to_string()),
+        to_version: Some("2.0".to_string()),
+    }];
+
+    // A change by itself is boost-only: consensus names nobody.
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let none = evaluate(&EvaluateInput {
+        packs: &[],
+        parsed: &[],
+        engine_facts: &EngineFacts::new(),
+        runtime_version: None,
+        resolver: &resolver,
+        inspector: &FixedInspector(Inspection::Missing),
+    });
+    let mut signals = none.signals.clone();
+    signals.extend(agora_core::crash_engine::change::change_signals(&changes));
+    let alone = consensus(
+        &ConsensusInput {
+            signals: &signals,
+            roles: &none.roles,
+            level_caps: &[],
+        },
+        &ConsensusProfile::default(),
+    );
+    assert!(alone.candidates.is_empty(), "{alone:?}");
+
+    // The same change raises a suspect another family already named.
+    let packs = vec![pack("p", vec![signal_rule("r", "execution", 10)])];
+    let parsed = vec![parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    )];
+    let (evaluated, base) = run(
+        &packs,
+        &parsed,
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let mut boosted_signals = evaluated.signals.clone();
+    boosted_signals.extend(agora_core::crash_engine::change::change_signals(&changes));
+    let boosted = consensus(
+        &ConsensusInput {
+            signals: &boosted_signals,
+            roles: &evaluated.roles,
+            level_caps: &[],
+        },
+        &ConsensusProfile::default(),
+    );
+    assert_eq!(
+        boosted.candidates[0].owner,
+        item("mod-a", "Mod A"),
+        "the change kept the named suspect"
+    );
+    assert!(boosted.candidates[0].score > base.candidates[0].score);
+    assert!(boosted.candidates[0]
+        .families
+        .contains(&agora_game_api::crash::Family::ChangeCorrelation));
+}
+
+#[test]
+fn a_change_finding_names_what_changed_and_nothing_invents_a_change_without_one() {
+    use agora_core::session_ledger::{ChangeKind, ManifestChange};
+
+    assert!(agora_core::crash_engine::change::change_finding(&[]).is_none());
+    let finding = agora_core::crash_engine::change::change_finding(&[
+        ManifestChange {
+            kind: ChangeKind::Added,
+            key: Some("mod-b".to_string()),
+            from_version: None,
+            to_version: Some("1.0".to_string()),
+        },
+        ManifestChange {
+            kind: ChangeKind::Settings,
+            key: None,
+            from_version: None,
+            to_version: None,
+        },
+    ])
+    .expect("a change is described");
+    let headline = finding.headline.get("en").cloned().unwrap_or_default();
+    assert!(
+        headline.contains("This started after you changed"),
+        "{headline}"
+    );
+    assert!(headline.contains("added mod-b"), "{headline}");
+    assert!(headline.contains("settings"), "{headline}");
+    assert_eq!(finding.candidate, None, "a change never accuses a mod");
+}

@@ -1785,6 +1785,10 @@ enum CrashCmd {
     List { instance: String },
     /// Read the content of a crash report file.
     Inspect { instance: String, file: String },
+    /// Print the newest stored crash answer for an instance.
+    Last { instance: String },
+    /// Print a stored crash answer by session id.
+    Show { session: String },
     /// Collect recent logs and run the full local crash investigation.
     Investigate {
         instance: String,
@@ -4770,6 +4774,20 @@ async fn run_crash_command(
             )
             .await?;
         }
+        CrashCmd::Last { instance } => {
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
+            let Some(stored) = agora_core::crash_live::latest_answer(&conn, &instance)? else {
+                anyhow::bail!("No crash answer is stored for instance '{instance}'.");
+            };
+            cli_crash::print_stored(&stored, json)?;
+        }
+        CrashCmd::Show { session } => {
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
+            let Some(stored) = agora_core::crash_live::answer_for_session(&conn, &session)? else {
+                anyhow::bail!("No crash answer is stored for session '{session}'.");
+            };
+            cli_crash::print_stored(&stored, json)?;
+        }
         CrashCmd::Investigate { instance, files } => {
             let investigation =
                 CrashService::new(ctx.clone()).investigate_evidence(&instance, &files)?;
@@ -7557,6 +7575,31 @@ async fn run_command(
                                 std::time::Duration::from_secs(5),
                             );
                             let session_duration = launch_start.elapsed();
+                            // The session is recorded. Diagnose it now, after the game is gone
+                            // and before anything can rotate its log away. This never fails the
+                            // launch: the core path catches its own errors and stores the reason.
+                            if let Some(session) = session_id.as_deref() {
+                                match cli_crash::load_live_packs(ctx) {
+                                    Ok(live) => {
+                                        let _ = agora_core::crash_live::diagnose_session(
+                                            ctx,
+                                            session,
+                                            agora_core::crash_live::LivePacks {
+                                                packs: &live.packs,
+                                                built_in: &live.built_in,
+                                                host: live.host.as_ref(),
+                                            },
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let _ = agora_core::crash_live::record_could_not_analyze(
+                                            ctx,
+                                            session,
+                                            format!("the crash packs could not be loaded: {error}"),
+                                        );
+                                    }
+                                }
+                            }
                             let user_files = report_user_files_restore(
                                 agora_core::game_user_files::restore(ctx, game_def, &store),
                                 game_def.id.as_str(),
@@ -13181,6 +13224,26 @@ mod tests {
             cli.command,
             Commands::Crash {
                 action: super::CrashCmd::Inspect { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn crash_last_and_show_parse() {
+        let last =
+            Cli::try_parse_from(["agora", "crash", "last", "my-instance"]).expect("should parse");
+        assert!(matches!(
+            last.command,
+            Commands::Crash {
+                action: super::CrashCmd::Last { .. }
+            }
+        ));
+        let show =
+            Cli::try_parse_from(["agora", "crash", "show", "session-1"]).expect("should parse");
+        assert!(matches!(
+            show.command,
+            Commands::Crash {
+                action: super::CrashCmd::Show { .. }
             }
         ));
     }

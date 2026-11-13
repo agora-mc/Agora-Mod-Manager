@@ -212,6 +212,199 @@ fn sha_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// What changed in one launch's setup compared with the last session that ended normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Updated,
+    Enabled,
+    Disabled,
+    Moved,
+    LoadOrder,
+    Settings,
+}
+
+impl ChangeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Removed => "removed",
+            Self::Updated => "updated",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Moved => "moved",
+            Self::LoadOrder => "load_order",
+            Self::Settings => "settings",
+        }
+    }
+
+    /// Whether this change names a single content item.
+    pub fn names_an_item(self) -> bool {
+        !matches!(self, Self::LoadOrder | Self::Settings)
+    }
+}
+
+/// One difference between two manifests, in the crash engine's terms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestChange {
+    pub kind: ChangeKind,
+    /// The item's key, for a change that names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+}
+
+/// What differs between the setup that ended normally and the one this session ran.
+///
+/// Only differences that can explain a change in behaviour are returned: an item added, removed,
+/// updated or switched on or off; an item's position among the items both manifests have; the
+/// load order; and the settings. Additions and removals do not make every other item look moved,
+/// because order is compared only between the items both sides already have.
+pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Vec<ManifestChange> {
+    use std::collections::BTreeMap;
+
+    let mut changes = Vec::new();
+    let previous_items: BTreeMap<&str, &ManifestItem> = previous
+        .items
+        .iter()
+        .map(|item| (item.key.as_str(), item))
+        .collect();
+    let current_items: BTreeMap<&str, &ManifestItem> = current
+        .items
+        .iter()
+        .map(|item| (item.key.as_str(), item))
+        .collect();
+
+    for (key, item) in &current_items {
+        match previous_items.get(key) {
+            None => changes.push(ManifestChange {
+                kind: ChangeKind::Added,
+                key: Some((*key).to_string()),
+                from_version: None,
+                to_version: item.version.clone(),
+            }),
+            Some(before) => {
+                if before.enabled != item.enabled {
+                    changes.push(ManifestChange {
+                        kind: if item.enabled {
+                            ChangeKind::Enabled
+                        } else {
+                            ChangeKind::Disabled
+                        },
+                        key: Some((*key).to_string()),
+                        from_version: before.version.clone(),
+                        to_version: item.version.clone(),
+                    });
+                } else if before.version != item.version || before.hash != item.hash {
+                    changes.push(ManifestChange {
+                        kind: ChangeKind::Updated,
+                        key: Some((*key).to_string()),
+                        from_version: before.version.clone(),
+                        to_version: item.version.clone(),
+                    });
+                }
+            }
+        }
+    }
+    for (key, item) in &previous_items {
+        if !current_items.contains_key(key) {
+            changes.push(ManifestChange {
+                kind: ChangeKind::Removed,
+                key: Some((*key).to_string()),
+                from_version: item.version.clone(),
+                to_version: None,
+            });
+        }
+    }
+
+    // Position among the items present on both sides. An inserted item shifts every later order
+    // number, but not the relative order of the items that were there already.
+    let mut shared: Vec<&str> = current_items
+        .keys()
+        .copied()
+        .filter(|key| previous_items.contains_key(key))
+        .collect();
+    shared.sort_by_key(|key| (current_items[*key].order, *key));
+    let mut previous_order: Vec<&str> = shared.clone();
+    previous_order.sort_by_key(|key| (previous_items[*key].order, *key));
+    let previous_rank: BTreeMap<&str, usize> = previous_order
+        .into_iter()
+        .enumerate()
+        .map(|(rank, key)| (key, rank))
+        .collect();
+    for (rank, key) in shared.iter().enumerate() {
+        if let Some(before) = previous_rank.get(key) {
+            if *before != rank {
+                changes.push(ManifestChange {
+                    kind: ChangeKind::Moved,
+                    key: Some((*key).to_string()),
+                    from_version: previous_items[*key].version.clone(),
+                    to_version: current_items[*key].version.clone(),
+                });
+            }
+        }
+    }
+
+    if previous.load_orders_hash != current.load_orders_hash {
+        changes.push(ManifestChange {
+            kind: ChangeKind::LoadOrder,
+            key: None,
+            from_version: None,
+            to_version: None,
+        });
+    }
+    if previous.settings_hash != current.settings_hash {
+        changes.push(ManifestChange {
+            kind: ChangeKind::Settings,
+            key: None,
+            from_version: None,
+            to_version: None,
+        });
+    }
+
+    changes.sort_by(|left, right| {
+        (left.kind as u8, left.key.as_deref().unwrap_or(""))
+            .cmp(&(right.kind as u8, right.key.as_deref().unwrap_or("")))
+    });
+    changes
+}
+
+/// The manifest of the most recent session of this instance that ended normally before
+/// `before_started_at`, or `None` when there is no such session. A normal ending is the only one
+/// that can be a baseline: a crash is the thing being explained, not a known-good setup.
+pub fn previous_normal_manifest(
+    conn: &Connection,
+    instance_id: &str,
+    before_started_at: &str,
+) -> anyhow::Result<Option<LaunchManifest>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(verdict, ''), manifest_hash FROM launch_history
+          WHERE instance_id = ?1 AND ended_at IS NOT NULL AND manifest_hash IS NOT NULL
+            AND started_at < ?2
+          ORDER BY started_at DESC, id DESC
+          LIMIT 200",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![instance_id, before_started_at], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (verdict, hash) in rows {
+        let Ok(verdict) = serde_json::from_str::<SessionVerdict>(&verdict) else {
+            continue;
+        };
+        if verdict == SessionVerdict::Normal {
+            return read_manifest(conn, instance_id, &hash);
+        }
+    }
+    Ok(None)
+}
+
 fn compress(raw: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
     encoder.write_all(raw)?;
@@ -1472,6 +1665,74 @@ mod tests {
         );
         attach_manifest(&conn, row, "mc", &big_manifest(0)).unwrap();
         note_exit(&conn, row, &ExitObservation::unavailable("outcome only")).unwrap();
+    }
+
+    fn item(key: &str, version: &str, enabled: bool, order: u32) -> ManifestItem {
+        ManifestItem {
+            key: key.to_string(),
+            version: Some(version.to_string()),
+            hash: Some(format!("hash-{key}-{version}")),
+            enabled,
+            order,
+            unreadable: None,
+        }
+    }
+
+    #[test]
+    fn a_diff_names_every_kind_of_change_and_no_baseline_names_none() {
+        let previous = LaunchManifest {
+            items: vec![
+                item("kept", "1", true, 0),
+                item("updated", "1", true, 1),
+                item("switched-off", "1", true, 2),
+                item("removed", "1", true, 3),
+                item("moved", "1", true, 4),
+            ],
+            load_orders_hash: Some("load-1".into()),
+            settings_hash: Some("settings-1".into()),
+            runtime: "steam:1".into(),
+            ..LaunchManifest::default()
+        };
+        let current = LaunchManifest {
+            items: vec![
+                item("kept", "1", true, 1),
+                item("updated", "2", true, 0),
+                item("switched-off", "1", false, 2),
+                item("added", "1", true, 3),
+                item("moved", "1", true, 5),
+            ],
+            load_orders_hash: Some("load-2".into()),
+            settings_hash: Some("settings-2".into()),
+            runtime: "steam:1".into(),
+            ..LaunchManifest::default()
+        };
+        let changes = diff_manifests(&previous, &current);
+        let has = |kind: ChangeKind, key: &str| {
+            changes
+                .iter()
+                .any(|change| change.kind == kind && change.key.as_deref() == Some(key))
+        };
+        assert!(has(ChangeKind::Added, "added"));
+        assert!(has(ChangeKind::Removed, "removed"));
+        assert!(has(ChangeKind::Updated, "updated"));
+        assert!(has(ChangeKind::Disabled, "switched-off"));
+        assert!(has(ChangeKind::Moved, "kept"));
+        assert!(changes
+            .iter()
+            .any(|change| change.kind == ChangeKind::LoadOrder));
+        assert!(changes
+            .iter()
+            .any(|change| change.kind == ChangeKind::Settings));
+        assert!(
+            !has(ChangeKind::Moved, "added"),
+            "a new item is added, not moved"
+        );
+        assert!(
+            !has(ChangeKind::Moved, "removed"),
+            "a gone item is removed, not moved"
+        );
+
+        assert!(diff_manifests(&previous, &previous).is_empty());
     }
 
     #[test]

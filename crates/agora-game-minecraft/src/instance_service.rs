@@ -3862,6 +3862,9 @@ $#
                 // Stored manifests of what each launch ran with; deleted and restored with the
                 // instance like its history rows.
                 "launch_manifests",
+                // The crash answer attached to one session; deleted and restored with the
+                // instance because it never exists without one.
+                "session_answers",
                 "mcp_approval_grants",
                 "plugin_storage",
                 "user_instances",

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 23;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 24;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -903,6 +903,43 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (23)",
+            [],
+        )?;
+    }
+
+    if current < 24 {
+        // The answer the crash doctor reached for one finished session (MASTER_SPEC §30.4). It is
+        // kept beside the history row, never inside it, so a failed analysis is still a row with a
+        // reason. Answers are trimmed with their session row by `launch_history::prune_history`,
+        // and the triggers below delete them with their instance exactly as they delete history.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_answers (
+                 session_id TEXT PRIMARY KEY,
+                 instance_id TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 answer_json TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_session_answers_instance
+                 ON session_answers (instance_id, created_at DESC);
+             DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+             CREATE TRIGGER launch_history_minecraft_instance_gone
+                 AFTER DELETE ON user_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             END;
+             CREATE TRIGGER launch_history_game_instance_gone
+                 AFTER DELETE ON game_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+             END;",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (24)",
             [],
         )?;
     }

@@ -143,7 +143,17 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             message: "No crash files were given to analyze.".to_string(),
         });
     }
+    analyze_with_facts(input, &[], &[])
+}
 
+/// [`analyze`] with facts only a live session can supply: `core.session` and `core.change`.
+/// `changes` are the same differences those facts describe, used for the boost signals and for
+/// the finding shown when nothing else is named. A loose file passes neither.
+pub fn analyze_with_facts(
+    input: &AnalyzeInput<'_>,
+    extra_facts: &[Fact],
+    changes: &[crate::session_ledger::ManifestChange],
+) -> LauncherResult<AnalyzeOutput> {
     let mut packs: Vec<&LoadedCrashPack> = input.packs.iter().collect();
     packs.sort_by(|a, b| {
         a.plugin_id
@@ -321,12 +331,13 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         .collect(),
         None => Default::default(),
     };
-    let engine_facts: Vec<Fact> = vec![Fact {
+    let mut engine_facts: Vec<Fact> = vec![Fact {
         kind: "core.instance".to_string(),
         attrs: instance_attrs,
         refs: Vec::new(),
         span: None,
     }];
+    engine_facts.extend(extra_facts.iter().cloned());
     let loose_resolver = LooseResolver::from_packs(packs.iter().map(|pack| &pack.pack), &parsed);
     let resolver: &dyn RefResolver = match &input.instance {
         Some(instance) => instance.resolver,
@@ -337,7 +348,7 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         Some(instance) => instance.inspector,
         None => &no_inspector,
     };
-    let evaluated = evaluate(&EvaluateInput {
+    let mut evaluated = evaluate(&EvaluateInput {
         packs: &pack_inputs,
         parsed: &parsed,
         engine_facts: &engine_facts,
@@ -345,6 +356,10 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
         resolver,
         inspector,
     });
+    // A change since the last good launch only ever boosts a suspect another family named.
+    evaluated
+        .signals
+        .extend(super::change::change_signals(changes));
     let level_caps: Vec<_> = evaluated.level_cap.into_iter().collect();
     let scored = consensus(
         &ConsensusInput {
@@ -369,6 +384,14 @@ pub fn analyze(input: &AnalyzeInput<'_>) -> LauncherResult<AnalyzeOutput> {
             super::save_risk::merge(packs.iter().filter_map(|pack| pack.pack.save_risk.as_ref()))
         {
             super::save_risk::apply(&mut crash_answer.candidates, &rules, resolver);
+        }
+    }
+
+    // Nobody was named, but the setup changed since the last good launch: say what changed rather
+    // than leave the person with "not sure" and no lead.
+    if crash_answer.candidates.is_empty() {
+        if let Some(finding) = super::change::change_finding(changes) {
+            crash_answer.findings.push(finding);
         }
     }
 

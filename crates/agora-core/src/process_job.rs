@@ -176,26 +176,38 @@ mod windows {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE,
+        INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, WAIT_OBJECT_0};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-        JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
-        JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JobObjectAssociateCompletionPortInformation, JobObjectBasicAccountingInformation,
+        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, OpenJobObjectW,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
         JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     };
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-        WaitForSingleObject, CREATE_SUSPENDED, PROCESS_QUERY_LIMITED_INFORMATION,
+        WaitForSingleObject, CREATE_SUSPENDED, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
         PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    use windows_sys::Win32::System::IO::{
+        CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus, OVERLAPPED,
     };
 
     // Access rights for a job handle (winnt.h); windows-sys does not export them here.
     const JOB_OBJECT_TERMINATE: u32 = 0x0008;
     const JOB_OBJECT_QUERY: u32 = 0x0004;
+
+    // Job notification messages (`Win32_System_SystemServices`); the numbers are stable.
+    const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
+    const JOB_OBJECT_MSG_NEW_PROCESS: u32 = 6;
+
+    /// A message no job sends, used to tell the holder thread to stop.
+    const QUIT_KEY: usize = usize::MAX;
 
     fn wide(s: &str) -> Vec<u16> {
         std::ffi::OsStr::new(s)
@@ -221,16 +233,39 @@ mod windows {
 
     /// Jobs this run of Agora made that still had processes the last time they were asked about.
     /// Holding the handle is what keeps the job reachable by name.
-    fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, Handle>> {
+    /// A process a job notification opened before the watcher's next poll. Holding the handle is
+    /// the only way its exit code survives a process that ends immediately: Windows destroys the
+    /// process object once nothing holds it, and no later call can recover the code.
+    struct PreHeld {
+        handle: Handle,
+        pid: u32,
+        image: Option<String>,
+    }
+
+    /// The handles that keep a job reachable by name, plus the thread that catches new processes
+    /// the moment the job reports them.
+    struct JobState {
+        _job: Handle,
+        port: Handle,
+        held: std::sync::Arc<std::sync::Mutex<Vec<PreHeld>>>,
+    }
+
+    fn registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, JobState>> {
         static REGISTRY: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<String, Handle>>,
+            std::sync::Mutex<std::collections::HashMap<String, JobState>>,
         > = std::sync::OnceLock::new();
         REGISTRY.get_or_init(Default::default)
     }
 
     fn forget(name: &str) {
         if let Ok(mut jobs) = registry().lock() {
-            jobs.remove(name);
+            if let Some(state) = jobs.remove(name) {
+                // Wake the holder thread; it may be blocked with no more messages coming.
+                // SAFETY: the port is live until `state` is dropped at the end of this block.
+                unsafe {
+                    PostQueuedCompletionStatus(state.port.0, 0, QUIT_KEY, std::ptr::null());
+                }
+            }
         }
     }
 
@@ -357,18 +392,94 @@ mod windows {
         path.rsplit(['\\', '/']).next().map(str::to_string)
     }
 
+    /// Catch every process the job reports the moment it is created. Without this a game can be
+    /// born and gone between two watcher polls, and Windows leaves no way to ask for its code.
+    fn hold_new_processes(port: usize, held: std::sync::Arc<std::sync::Mutex<Vec<PreHeld>>>) {
+        std::thread::spawn(move || {
+            let port = port as HANDLE;
+            loop {
+                let mut bytes = 0u32;
+                let mut key = 0usize;
+                let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+                // SAFETY: the port is kept open by the registry entry for as long as this thread
+                // can receive messages; the out-pointers are valid for the call.
+                let ok = unsafe {
+                    GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut overlapped, INFINITE)
+                };
+                if key == QUIT_KEY {
+                    break;
+                }
+                if ok == 0 && overlapped.is_null() {
+                    break;
+                }
+                match bytes {
+                    JOB_OBJECT_MSG_NEW_PROCESS => {
+                        let pid = overlapped as usize as u32;
+                        // SAFETY: a plain open by pid; a failure (already ended) returns null.
+                        let raw = unsafe {
+                            OpenProcess(
+                                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                                0,
+                                pid,
+                            )
+                        };
+                        if !raw.is_null() {
+                            let handle = Handle(raw);
+                            let image = image_name(&handle);
+                            if let Ok(mut list) = held.lock() {
+                                list.push(PreHeld { handle, pid, image });
+                            }
+                        }
+                    }
+                    JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO => break,
+                    _ => {}
+                }
+            }
+        });
+    }
+
     pub(super) fn hold_game_processes(
         job: &str,
         images: &[String],
         already: &[u32],
     ) -> Vec<super::HeldProcess> {
-        let Ok(Some(job)) = open(job) else {
-            return Vec::new();
-        };
         let wanted: Vec<String> = images.iter().map(|i| i.to_lowercase()).collect();
+        let mut taken: Vec<u32> = already.to_vec();
         let mut held = Vec::new();
+
+        // Processes the notification thread caught before they could end.
+        let shared = registry()
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(job).map(|state| state.held.clone()));
+        if let Some(shared) = shared {
+            let waiting: Vec<PreHeld> = match shared.lock() {
+                Ok(mut list) => list.drain(..).collect(),
+                Err(_) => Vec::new(),
+            };
+            for pre in waiting {
+                if taken.contains(&pre.pid) {
+                    continue;
+                }
+                let Some(image) = pre.image else {
+                    continue;
+                };
+                if wanted.contains(&image.to_lowercase()) {
+                    taken.push(pre.pid);
+                    held.push(super::HeldProcess {
+                        handle: pre.handle,
+                        pid: pre.pid,
+                        image,
+                    });
+                }
+            }
+        }
+
+        let Ok(Some(job)) = open(job) else {
+            return held;
+        };
         for pid in job_pids(&job) {
-            if already.contains(&pid) {
+            if taken.contains(&pid) {
                 continue;
             }
             // SAFETY: a plain open by pid; a failure (the process just ended) returns null.
@@ -394,6 +505,7 @@ mod windows {
                 continue;
             };
             if wanted.contains(&image.to_lowercase()) {
+                taken.push(pid);
                 held.push(super::HeldProcess { handle, pid, image });
             }
         }
@@ -456,14 +568,49 @@ mod windows {
         if limits_set == 0 {
             return None;
         }
+        // A completion port tells us about each new process the moment the job gets it, so a game
+        // that starts and ends between two polls is still held by its handle.
+        // SAFETY: `INVALID_HANDLE_VALUE` creates a new port; no handle is needed for it here.
+        let port_raw =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
+        if port_raw.is_null() {
+            return None;
+        }
+        let port = Handle(port_raw);
+        let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: std::ptr::null_mut(),
+            CompletionPort: port.0,
+        };
+        // SAFETY: the structure and its size match the information class.
+        let associated = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectAssociateCompletionPortInformation,
+                (&association as *const JOBOBJECT_ASSOCIATE_COMPLETION_PORT).cast(),
+                std::mem::size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+            )
+        };
+        if associated == 0 {
+            return None;
+        }
         // SAFETY: both are live handles; the child's handle is owned by `child`.
         if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } == 0 {
             return None;
         }
         // The handle stays open (see the module docs); the job does not have kill-on-close set,
         // so the game outlives Agora, as it always has.
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port_value = port.0 as usize;
+        hold_new_processes(port_value, held.clone());
         let mut jobs = registry().lock().ok()?;
-        jobs.insert(name.clone(), job);
+        jobs.insert(
+            name.clone(),
+            JobState {
+                _job: job,
+                port,
+                held,
+            },
+        );
         Some(name)
     }
 
