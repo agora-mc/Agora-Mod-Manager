@@ -21,6 +21,14 @@ vi.mock('../plugins', () => ({ InstancePluginsTab: () => null }));
 vi.mock('../iniSaves', () => ({ InstanceIniSavesTab: () => <p>ini page</p> }));
 vi.mock('../tools', () => ({ InstanceToolsTab: () => null }));
 
+vi.mock('./crashAnswerApi', () => ({
+  listCrashAnswers: vi.fn(async () => ({ answers: [], latestVerdict: null, retainedCrashes: 40 })),
+  getCrashAnswer: vi.fn(),
+  analyzeCrashText: vi.fn(),
+  analyzeCrashFile: vi.fn(),
+  revealCrashArtifact: vi.fn(),
+}));
+
 vi.mock('./api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./api')>();
   return {
