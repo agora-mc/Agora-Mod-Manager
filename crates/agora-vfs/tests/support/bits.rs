@@ -22,18 +22,26 @@ pub enum Bits {
 }
 
 /// The two target folders: `target\debug` for 64-bit, `target\i686-pc-windows-msvc\debug` for 32-bit.
-/// Found from this test executable, which is in `target\debug\deps`.
+/// Found from this test executable, which is somewhere under `target\debug`.
 pub struct Artifacts {
     x64_dir: PathBuf,
     x86_dir: PathBuf,
 }
 
+/// `target\debug`, the nearest folder named `debug` above this test executable. Cargo has kept
+/// test binaries in `target\debug\deps` and, in its newer layout, in
+/// `target\debug\build\<crate>\<hash>\out`; the built DLLs are in `target\debug` either way.
+pub fn profile_dir() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .skip(1)
+        .find(|dir| dir.file_name() == Some(std::ffi::OsStr::new("debug")))
+        .unwrap_or_else(|| panic!("{} is not under a `debug` folder", exe.display()))
+        .to_path_buf()
+}
+
 pub fn artifacts() -> Artifacts {
-    let mut dir = std::env::current_exe().unwrap();
-    dir.pop();
-    if dir.file_name() == Some(std::ffi::OsStr::new("deps")) {
-        dir.pop();
-    }
+    let dir = profile_dir();
     let target = dir.parent().unwrap().to_path_buf();
     Artifacts {
         x64_dir: dir,

@@ -281,10 +281,7 @@ fn check_id_exists(
     let dir = paths
         .instance_dir(candidate)
         .map_err(|e| InstanceError::InvalidId(candidate.to_string(), e.to_string()))?;
-    if dir.exists() {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(dir.exists())
 }
 
 /// Create a generic game instance from an identified install.

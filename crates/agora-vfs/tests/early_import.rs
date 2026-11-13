@@ -25,11 +25,14 @@ use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 const EXIT_UNPROTECTED: i32 = 0xA6F5_0001_u32 as i32;
 
 fn artifacts() -> (PathBuf, PathBuf) {
-    let mut dir = std::env::current_exe().unwrap();
-    dir.pop();
-    if dir.file_name() == Some(std::ffi::OsStr::new("deps")) {
-        dir.pop();
-    }
+    // `target\debug`: test binaries are in `deps` or, in cargo's newer layout, under `build`.
+    let exe = std::env::current_exe().unwrap();
+    let dir = exe
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.file_name() == Some(std::ffi::OsStr::new("debug")))
+        .unwrap_or_else(|| panic!("{} is not under a `debug` folder", exe.display()))
+        .to_path_buf();
     let dll = dir.join("agora_vfs.dll");
     let exe = dir.join("agora-early-import-exe.exe");
     let dll_beside_exe = dir.join("agora_early_import.dll");
