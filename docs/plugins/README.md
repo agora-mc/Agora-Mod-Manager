@@ -278,6 +278,18 @@ own names: either a `core.exception` with a `module` ref and an `offset` attribu
 `core.frame` with its module or class ref and its `rva`, `symbol`, `address` or `symbol_offset`.
 Two crashes at the same place are treated as the same bug repeating.
 
+A pack's `sources` are also what Agora reads when it sweeps older crash logs. For an instance,
+every file the applicable packs' `sources` name is listed newest first, and a bounded number are
+analysed once each; only a small per-log record is kept, keyed by the file's content hash, so the
+same log is never analysed twice and the log's bytes are never copied. A plugin that declares
+another source (a mod's own log folder, say) is swept with no change to Agora. The scan is bounded,
+and when older logs are left for a later sweep the answer says so instead of treating them as
+absent. The count across crashes then reaches rules as the engine's `core.history` facts
+(`same_bucket_count`, `sessions_since_first`, `predates_last_change`), raises a recurring suspect
+with the boost-only `history_repeat` family, and adds one finding when a named suspect appeared in
+several crashes at different places. Framework and hook-framework owners are listed as always
+running and are never raised by that count.
+
 ### The runtime
 
 Scripts run in QuickJS through `rquickjs 0.13`, with separate bounded runtimes on host-owned worker threads. This is **not an OS process sandbox**. QuickJS supports ES modules, promises, and async functions; the host adds the `agora` module. It does not add `require`, `process`, filesystem access, DOM APIs, native modules, or global `fetch`. Bundle third-party JavaScript and mark `agora` external. Use the standalone declarations in `sdk/` for TypeScript.

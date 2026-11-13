@@ -452,7 +452,7 @@ pub fn collect_sources(
 
 /// Join the pack's part one component at a time, checking every component below the trusted root.
 /// The base itself is not checked: the caller chose it, and redirected folders are legitimate.
-fn folder_below_trusted_root(
+pub(crate) fn folder_below_trusted_root(
     base: &Path,
     relative: &str,
 ) -> Result<PathBuf, (SourceProblemKind, String)> {
@@ -483,7 +483,7 @@ fn folder_below_trusted_root(
     Ok(current)
 }
 
-fn marker_present(path: &Path, matching: &SourceMatch, folder: bool) -> bool {
+pub(crate) fn marker_present(path: &Path, matching: &SourceMatch, folder: bool) -> bool {
     let Some(marker) = matching.marker.as_deref() else {
         return true;
     };

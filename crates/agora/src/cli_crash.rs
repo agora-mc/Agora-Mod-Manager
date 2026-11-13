@@ -9,9 +9,10 @@
 use agora_core::crash_engine::attribution::Resolver;
 use agora_core::crash_engine::history::{summarize, CrashHistory, HistoryOwner};
 use agora_core::crash_engine::{
-    analyze, owner_name, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
+    analyze_with_history, owner_name, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
     InstanceInspector,
 };
+use agora_core::crash_history::{self, HistorySetup, LogSweepLimits, PreparedHistory};
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
 use agora_core::game_script::instance_reads;
 use agora_core::plugins::PluginService;
@@ -182,18 +183,86 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         _ => None,
     };
 
+    // With an instance, the same packs' sources also name older crash logs. Sweep them, then feed
+    // the pattern across those crashes into this analysis. A history failure is stated, never read
+    // as "no earlier crashes".
+    let limits = LogSweepLimits::default();
+    let (prepared, history_error): (Option<PreparedHistory>, Option<String>) = match (
+        args.instance.as_deref(),
+        instance_game_id.as_deref(),
+        instance_resolver.as_ref(),
+        instance_inspector.as_ref(),
+    ) {
+        (Some(instance_id), Some(game_id), Some(resolver), Some(inspector)) => {
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
+            let exclude_hashes: Vec<String> = crash_files
+                .iter()
+                .map(|file| crash_history::content_hash(&file.bytes))
+                .collect();
+            let latest = agora_core::session_ledger::list(&conn, instance_id, 1)
+                .ok()
+                .and_then(|mut sessions| sessions.pop());
+            let setup_pair = latest.as_ref().and_then(|session| {
+                session
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| (manifest.hash(), session.started_at.clone()))
+            });
+            match crash_history::prepare(
+                ctx,
+                &conn,
+                HistorySetup {
+                    instance_id,
+                    game_id,
+                    runtime_version: effective_version.as_deref(),
+                    packs: &packs,
+                    built_in: &built_in,
+                    host: host.as_ref(),
+                    resolver,
+                    inspector,
+                    could_not_check: &instance_notes,
+                    setup: setup_pair
+                        .as_ref()
+                        .map(|(hash, started)| (hash.as_str(), started.as_str())),
+                    exclude_hashes: &exclude_hashes,
+                },
+                limits,
+                true,
+            ) {
+                Ok(prepared) => (Some(prepared), None),
+                Err(why) => {
+                    eprintln!("Warning: the crash history was not read: {why}");
+                    (None, Some(why))
+                }
+            }
+        }
+        _ => (None, None),
+    };
+
     if args.each {
+        let history_input = prepared.as_ref().map(PreparedHistory::input);
         let mut outputs = Vec::with_capacity(crash_files.len());
         for file in &crash_files {
-            outputs.push(analyze(&AnalyzeInput {
-                packs: &packs,
-                files: std::slice::from_ref(file),
-                runtime_version: effective_version.as_deref(),
-                host: host.as_ref(),
-                built_in: &built_in,
-                instance,
-            })?);
+            outputs.push(analyze_with_history(
+                &AnalyzeInput {
+                    packs: &packs,
+                    files: std::slice::from_ref(file),
+                    runtime_version: effective_version.as_deref(),
+                    host: host.as_ref(),
+                    built_in: &built_in,
+                    instance,
+                },
+                &[],
+                &[],
+                history_input.as_ref(),
+            )?);
         }
+        add_history_notes(
+            &mut outputs,
+            prepared.as_ref(),
+            history_error.as_deref(),
+            limits,
+        );
         if args.json {
             let crashes: Vec<serde_json::Value> = outputs
                 .iter()
@@ -211,10 +280,14 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
                 .collect();
             let records: Vec<_> = outputs.iter().map(|output| output.record.clone()).collect();
             let summary = summarize(&records);
-            let value = serde_json::json!({
+            let mut value = serde_json::json!({
                 "crashes": crashes,
                 "summary": summary,
             });
+            if let Some(prepared) = &prepared {
+                value["stored_history"] = serde_json::to_value(prepared.summary())?;
+                value["sweep"] = serde_json::to_value(&prepared.sweep)?;
+            }
             println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             print_each_text(&outputs);
@@ -225,14 +298,26 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         return Ok(());
     }
 
-    let output = analyze(&AnalyzeInput {
-        packs: &packs,
-        files: &crash_files,
-        runtime_version: effective_version.as_deref(),
-        host: host.as_ref(),
-        built_in: &built_in,
-        instance,
-    })?;
+    let history_input = prepared.as_ref().map(PreparedHistory::input);
+    let mut output = analyze_with_history(
+        &AnalyzeInput {
+            packs: &packs,
+            files: &crash_files,
+            runtime_version: effective_version.as_deref(),
+            host: host.as_ref(),
+            built_in: &built_in,
+            instance,
+        },
+        &[],
+        &[],
+        history_input.as_ref(),
+    )?;
+    add_history_notes(
+        std::slice::from_mut(&mut output),
+        prepared.as_ref(),
+        history_error.as_deref(),
+        limits,
+    );
 
     if args.json {
         let mut value = serde_json::json!({
@@ -242,15 +327,209 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         if args.facts {
             value["parsed"] = parsed_json(&output);
         }
+        if let Some(prepared) = &prepared {
+            value["stored_history"] = serde_json::to_value(prepared.summary())?;
+            value["sweep"] = serde_json::to_value(&prepared.sweep)?;
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         print_text(&output);
+        if let Some(prepared) = &prepared {
+            if !prepared.prior.is_empty() {
+                println!();
+                println!("Stored crash history:");
+                print_history(&prepared.summary());
+            }
+        }
     }
 
     if !output.read_any() {
         anyhow::bail!("No crash file could be read.");
     }
     Ok(())
+}
+
+/// Add the sweep's limitations to each answer, so a log it did not reach is "not checked", never
+/// silently treated as absent.
+fn add_history_notes(
+    outputs: &mut [AnalyzeOutput],
+    prepared: Option<&PreparedHistory>,
+    history_error: Option<&str>,
+    limits: LogSweepLimits,
+) {
+    let Some(prepared) = prepared else {
+        if let Some(why) = history_error {
+            for output in outputs.iter_mut() {
+                output
+                    .answer
+                    .could_not_check
+                    .push(agora_game_api::crash::CouldNotCheck {
+                        reason: agora_game_api::crash::CouldNotCheckReason::NotRetained,
+                        subject: "older crash logs".to_string(),
+                        detail: Some(format!("the older crash logs could not be read: {why}")),
+                        source: None,
+                    });
+            }
+        }
+        return;
+    };
+    let mut notes = Vec::new();
+    if let Some(text) = prepared.skipped_note(limits) {
+        notes.push(text);
+    }
+    if let Some(sweep) = &prepared.sweep {
+        for skipped in &sweep.skipped {
+            notes.push(format!(
+                "{} was not checked as an older crash log: {}.",
+                skipped.name, skipped.reason
+            ));
+        }
+        for problem in &sweep.problems {
+            notes.push(format!(
+                "an older crash source ({}) could not be checked: {}",
+                problem.source_id, problem.detail
+            ));
+        }
+    }
+    for note in notes {
+        for output in outputs.iter_mut() {
+            output
+                .answer
+                .could_not_check
+                .push(agora_game_api::crash::CouldNotCheck {
+                    reason: agora_game_api::crash::CouldNotCheckReason::NotRetained,
+                    subject: "older crash logs".to_string(),
+                    detail: Some(note.clone()),
+                    source: None,
+                });
+        }
+    }
+}
+
+/// `agora crash patterns <instance>`: print the pattern across the crashes Agora already knows.
+/// An instance with nothing stored is swept first, so this both fills and reads the cache. A
+/// sweep that fails is an error, never an empty pattern.
+pub fn run_patterns(ctx: &agora_core::ctx::Ctx, instance: &str, json: bool) -> anyhow::Result<()> {
+    let live = load_live_packs(ctx)?;
+    let mut packs = live.packs;
+    let built_in_report = agora_core::crash_packs::load_built_in_packs(&live.built_in);
+    for problem in &built_in_report.problems {
+        eprintln!("Warning: {problem}");
+    }
+    packs.extend(built_in_report.packs);
+
+    let resolved = resolve_instance(ctx, instance)?;
+    let game_id = resolved.game_id.clone();
+    let runtime_version = resolved.runtime_version.clone();
+    let notes = resolved.could_not_check.clone();
+    let game_packs: Vec<&LoadedCrashPack> = packs
+        .iter()
+        .filter(|pack| {
+            pack.pack.games.is_empty() || pack.pack.games.iter().any(|game| game == &game_id)
+        })
+        .collect();
+    let ref_maps: Vec<RefMap> = game_packs
+        .iter()
+        .flat_map(|pack| pack.pack.ref_maps.iter().cloned())
+        .collect();
+    let roles: Vec<RoleRule> = game_packs
+        .iter()
+        .flat_map(|pack| pack.pack.roles.iter().cloned())
+        .collect();
+    let resolver = Resolver::new(resolved.view, ref_maps, roles);
+    let scope = Arc::new(
+        instance_reads(ctx, instance)
+            .map_err(|error| anyhow::anyhow!("Could not read instance '{instance}': {error}"))?,
+    );
+    let inspector = InstanceInspector::new(
+        live.host.as_ref(),
+        &packs,
+        &resolver,
+        scope,
+        GameHandle {
+            id: game_id.clone(),
+            runtime_version: runtime_version.clone(),
+        },
+    );
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
+    let stored = crash_history::stored_log_count(&conn, instance)?;
+    let latest = agora_core::session_ledger::list(&conn, instance, 1)
+        .ok()
+        .and_then(|mut sessions| sessions.pop());
+    let setup_pair = latest.as_ref().and_then(|session| {
+        session
+            .manifest
+            .as_ref()
+            .map(|manifest| (manifest.hash(), session.started_at.clone()))
+    });
+    let limits = LogSweepLimits::default();
+    let prepared = crash_history::prepare(
+        ctx,
+        &conn,
+        HistorySetup {
+            instance_id: instance,
+            game_id: &game_id,
+            runtime_version: runtime_version.as_deref(),
+            packs: &packs,
+            built_in: &live.built_in,
+            host: live.host.as_ref(),
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &notes,
+            setup: setup_pair
+                .as_ref()
+                .map(|(hash, started)| (hash.as_str(), started.as_str())),
+            exclude_hashes: &[],
+        },
+        limits,
+        stored == 0,
+    )
+    .map_err(|error| anyhow::anyhow!("The crash history could not be read: {error}"))?;
+
+    let summary = prepared.summary();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "instance": instance,
+                "stored_logs": stored,
+                "sweep": prepared.sweep,
+                "summary": summary,
+            }))?
+        );
+        return Ok(());
+    }
+    if let Some(sweep) = &prepared.sweep {
+        print_sweep(sweep);
+    }
+    if prepared.prior.is_empty() {
+        println!(
+            "No crash logs or stored session answers were found for instance '{instance}'.              Nothing was checked, so this is not a clean result."
+        );
+        return Ok(());
+    }
+    print_history(&summary);
+    Ok(())
+}
+
+fn print_sweep(sweep: &crash_history::LogSweepReport) {
+    println!(
+        "Swept {} source(s): {} log(s) found, {} newly analysed, {} already stored.",
+        sweep.sources, sweep.found, sweep.analyzed, sweep.reused
+    );
+    if sweep.skipped_older > 0 {
+        println!(
+            "{} older log(s) were left for a later sweep.",
+            sweep.skipped_older
+        );
+    }
+    if !sweep.problems.is_empty() {
+        println!("Could not check:");
+        for problem in &sweep.problems {
+            println!("  - {}: {}", problem.source_id, problem.detail);
+        }
+    }
 }
 
 /// The view behind `--instance`, through the one router the live path uses too. Core reads a
@@ -435,7 +714,7 @@ pub fn print_stored(
         return Ok(());
     }
     match &stored.answer {
-        StoredAnswer::Analyzed { answer, files } => print_answer(answer, files),
+        StoredAnswer::Analyzed { answer, files, .. } => print_answer(answer, files),
         StoredAnswer::NothingToRead { why } => {
             println!("Agora has no crash evidence to diagnose for this session.");
             println!("{why}");

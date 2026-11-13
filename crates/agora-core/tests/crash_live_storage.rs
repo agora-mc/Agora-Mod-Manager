@@ -42,6 +42,7 @@ fn answer(session: &str, instance: &str, created: &str, headline: &str) -> Sessi
                 cause: None,
             }),
             files: Vec::new(),
+            record: None,
         },
     }
 }
