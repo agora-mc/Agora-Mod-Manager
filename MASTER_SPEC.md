@@ -5150,9 +5150,10 @@ LOOT's own checks run before launch too (31.6): the order it would choose, its w
 - **Record label:** how a person reads the key, e.g. `GMST fJumpHeightMin` (type and editor id).
 - **Digest:** a hash of what the record says (its data, decompressed, without fields that change
   nothing in game such as version-control stamps). Equal digests mean the same change.
-- **Changer:** a plugin that has the record and whose digest differs from the record's previous
-  provider in load order. A plugin whose digest equals its master's copy (an "identical to master"
-  record) is not a changer.
+- **Definer:** the first item in load order that has the record. Its copy is the original, never a
+  change: overriding it is what a mod is for, so the definer never loses anything.
+- **Changer:** a later item whose digest differs from the copy of the item before it in load order.
+  A copy identical to the one before it ("identical to master") is not a change.
 
 ### 31.3 Who does what
 
@@ -5167,10 +5168,16 @@ LOOT's own checks run before launch too (31.6): the order it would choose, its w
 - **Core** (game-free) classifies each key in the current order:
   - the **winner** is the last item that has it;
   - when every changer's digest is the same, the plugins **agree**: nothing to show;
-  - when the winner lists every other changer as a master, the key is **patched**: shown as
-    resolved, never warned about;
-  - when a user rule (31.4) orders the winner after every other changer, the key is **decided**;
-  - otherwise it is a **conflict**: each other changer **loses** its change to the winner.
+  - each other changer is judged **as a pair** with the winner (one changer the winner does not
+    know about never turns the others into conflicts):
+    - the winner has that changer among its masters, directly or through its masters' masters:
+      **patched** (built on top of it on purpose), shown as resolved, never warned about;
+    - a user rule (31.4) orders the winner after that changer: **decided**;
+    - both are items the game always loads in a fixed order (implicit): **the game's own**, counted
+      in the summary only, since nobody can reorder them;
+    - otherwise a **conflict**: that changer **loses** its change to the winner.
+  (Corrected 2026-11-14 after the first real run counted the definer as a loser and judged
+  patches all-or-nothing per key.)
   Core groups conflicts by pair (winner, loser) with a count and up to ten labels, and keeps the
   result in the same cache as sorter notes (keyed by order, active set, file sizes and times), so a
   plain list read never runs the hook.

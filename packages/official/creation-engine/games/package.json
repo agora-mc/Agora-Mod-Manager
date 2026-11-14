@@ -31,6 +31,9 @@
               "hook": "lootSort",
               "update": "lootUpdate",
               "update_label": "Update masterlist"
+            },
+            "overlaps": {
+              "hook": "overlaps"
             }
           },
           "intro": "The game reads plugins from the top of this list down. When two plugins change the same thing, the one lower down wins. A plugin's masters must load above it.",
