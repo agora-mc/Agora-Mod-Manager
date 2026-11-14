@@ -95,8 +95,14 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
                 std::cmp::Reverse(finding.cause),
             )
         });
-    let finding_wins = strongest
-        .is_some_and(|finding| candidates.is_empty() || finding.level > top_candidate_level);
+    let finding_wins = strongest.is_some_and(|finding| {
+        candidates.is_empty()
+            || finding.level > top_candidate_level
+            // A specific non-mod cause at the same level as a suspect is the better answer: a mod
+            // on the stack during an out-of-memory is not what the log says caused it.
+            || (finding.level == top_candidate_level
+                && !matches!(finding.cause, Cause::Mod | Cause::Other))
+    });
     if finding_wins {
         if let Some(finding) = strongest {
             level = level.max(finding.level);

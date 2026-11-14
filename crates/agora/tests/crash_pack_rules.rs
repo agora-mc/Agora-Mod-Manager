@@ -1224,6 +1224,20 @@ mod retired_signatures {
             action(&output, "out_of_memory"),
             Some(ActionKind::OpenJvmSettings)
         );
+        assert_eq!(
+            output.answer.cause,
+            Some(agora_game_api::crash::Cause::Memory)
+        );
+        assert_eq!(output.answer.level, agora_game_api::crash::Level::Likely);
+        assert_eq!(
+            output.answer.next.kind,
+            agora_game_api::crash::NextStepKind::NothingNeeded
+        );
+        assert!(output
+            .answer
+            .headline
+            .get("en")
+            .is_some_and(|text| text.contains("ran out of memory")));
     }
 }
 

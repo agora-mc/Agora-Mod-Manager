@@ -2691,6 +2691,63 @@ fn a_likely_setting_finding_is_the_headline_and_never_starts_a_bisect() {
 }
 
 #[test]
+fn a_mod_on_the_stack_does_not_overrule_an_equally_likely_memory_cause() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let oom = json!({
+        "id": "out_of_memory",
+        "version": 1,
+        "actions": [{ "kind": "open_jvm_settings" }],
+        "when": { "fact": { "kind": "core.exception", "where": { "category": "oom" } } },
+        "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "memory" } }],
+        "text": {
+            "headline": { "en": "Java ran out of memory." },
+            "why_not_sure": { "en": "A mod can cause the memory pressure, but the log does not name one." }
+        },
+        "next_step": "nothing_needed"
+    });
+    let packs = vec![pack(
+        "p",
+        vec![oom, signal_rule("on_stack", "execution", 10)],
+    )];
+    let exception = Fact {
+        kind: "core.exception".to_string(),
+        attrs: [("category".to_string(), text_attr("oom"))]
+            .into_iter()
+            .collect(),
+        refs: Vec::new(),
+        span: None,
+    };
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![exception, frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.level, Level::Likely);
+    assert_eq!(consensus.candidates[0].level, Level::Likely);
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(answer.cause, Some(Cause::Memory));
+    assert_eq!(english(&answer.headline), "Java ran out of memory.");
+    assert_ne!(answer.next.kind, NextStepKind::Bisect);
+}
+
+#[test]
 fn a_change_since_the_last_good_launch_only_boosts_and_never_accuses_alone() {
     use agora_core::session_ledger::{ChangeKind, ManifestChange};
 

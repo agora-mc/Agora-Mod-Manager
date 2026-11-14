@@ -325,7 +325,7 @@
           "en": "A mod can cause the memory pressure, but the log does not name one."
         }
       },
-      "next_step": "confirm_experiment"
+      "next_step": "nothing_needed"
     },
     {
       "id": "missing_class",
