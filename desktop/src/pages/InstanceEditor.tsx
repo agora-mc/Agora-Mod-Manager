@@ -3677,7 +3677,7 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 <div className="space-y-2">
                   <label htmlFor="instance-java-args" className="text-sm font-medium">Additional JVM flags</label>
                   <p className="text-xs text-muted-foreground">
-                    Advanced flags are appended after Agora&apos;s managed memory settings. Do not include classpath or native-library flags.
+                    Advanced flags are appended after Agora&apos;s managed settings. A heap flag here (-Xmx, -Xms, or a RAM percentage) replaces Agora&apos;s matching one. Do not include classpath or native-library flags.
                   </p>
                   <textarea
                     id="instance-java-args"

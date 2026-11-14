@@ -170,6 +170,32 @@ pub fn generate_args(profile: GcProfile, heap_mb: i64, manual_args: &str) -> Str
     generate_args_for_java(profile, heap_mb, manual_args, 21)
 }
 
+/// Whether the user's custom arguments already choose the maximum heap, so Agora must not add
+/// its own `-Xmx` or RAM-percentage flag.
+fn manual_sets_max_heap(manual_args: &str) -> bool {
+    manual_args.split_whitespace().any(|argument| {
+        argument.starts_with("-Xmx")
+            || argument.starts_with("-XX:MaxHeapSize=")
+            || argument.starts_with("-XX:MaxRAM=")
+            || argument.starts_with("-XX:MaxRAMPercentage=")
+            || argument.starts_with("-XX:MaxRAMFraction=")
+    })
+}
+
+/// Whether the user's custom arguments already choose the initial heap, so Agora must not add
+/// its own `-Xms` or initial-percentage flag.
+fn manual_sets_initial_heap(manual_args: &str) -> bool {
+    manual_args.split_whitespace().any(|argument| {
+        argument.starts_with("-Xms")
+            || argument.starts_with("-XX:InitialHeapSize=")
+            || argument.starts_with("-XX:MinHeapSize=")
+            || argument.starts_with("-XX:InitialRAMPercentage=")
+            || argument.starts_with("-XX:InitialRAMFraction=")
+            || argument.starts_with("-XX:MinRAMPercentage=")
+            || argument.starts_with("-XX:MinRAMFraction=")
+    })
+}
+
 /// Generate arguments for a specific Java major. Explicit ZGC remains
 /// available on older Java releases, but the opt-in Generational ZGC flag is
 /// only emitted on Java 21 and 22 (it is the default from 23 and removed in 24).
@@ -181,9 +207,20 @@ pub fn generate_args_for_java(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    // Memory
-    parts.push(format!("-Xmx{}M", heap_mb));
-    parts.push(format!("-Xms{}M", heap_mb));
+    // Memory. A custom flag that sets the same thing wins: duplicating it would either be
+    // ignored (the JVM's last wins) or make an initial heap larger than the custom maximum,
+    // which the JVM refuses to start with.
+    let custom_sets_max = manual_sets_max_heap(manual_args);
+    let custom_sets_initial = manual_sets_initial_heap(manual_args);
+    if !custom_sets_max {
+        parts.push(format!("-Xmx{}M", heap_mb));
+    }
+    // Without a custom maximum, Agora's own maximum is safe to pair with its initial heap.
+    // With a custom maximum and no custom initial heap, the JVM derives the initial heap from
+    // that maximum, so emitting Agora's would still be able to exceed it.
+    if !custom_sets_initial && !custom_sets_max {
+        parts.push(format!("-Xms{}M", heap_mb));
+    }
 
     match profile {
         GcProfile::LowLatency => {
@@ -476,6 +513,39 @@ mod tests {
         assert!(args.contains("G1GC"));
         assert!(args.contains("MaxGCPauseMillis=50"));
         assert!(args.contains("ParallelRefProcEnabled"));
+    }
+
+    #[test]
+    fn a_custom_maximum_heap_replaces_agora_memory_flags() {
+        // The real failure: -Xmx200M beside Agora's -Xms2048M made Java refuse to start.
+        let args = generate_args(GcProfile::Manual, 4096, "-Xmx200M");
+        assert_eq!(args.matches("-Xmx").count(), 1, "{args}");
+        assert!(args.contains("-Xmx200M"), "{args}");
+        assert!(!args.contains("-Xmx4096M"), "{args}");
+        assert!(!args.contains("-Xms4096M"), "{args}");
+    }
+
+    #[test]
+    fn a_custom_initial_heap_replaces_only_agora_initial_flag() {
+        let args = generate_args(GcProfile::Manual, 4096, "-Xms512M");
+        assert!(args.contains("-Xmx4096M"), "{args}");
+        assert!(args.contains("-Xms512M"), "{args}");
+        assert!(!args.contains("-Xms4096M"), "{args}");
+    }
+
+    #[test]
+    fn custom_ram_percentage_flags_replace_agora_memory_flags() {
+        for (custom, keeps_max, keeps_initial) in [
+            ("-XX:MaxRAMPercentage=50", false, false),
+            ("-XX:InitialRAMPercentage=25", true, false),
+            ("-XX:MaxRAM=4g", false, false),
+            ("-XX:InitialHeapSize=2g -XX:MaxHeapSize=4g", false, false),
+        ] {
+            let args = generate_args(GcProfile::LowLatency, 4096, custom);
+            assert_eq!(args.contains("-Xmx4096M"), keeps_max, "{custom}: {args}");
+            assert_eq!(args.contains("-Xms4096M"), keeps_initial, "{custom}: {args}");
+            assert!(args.contains(custom), "{custom}: {args}");
+        }
     }
 
     #[test]
