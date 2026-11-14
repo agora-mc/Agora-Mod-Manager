@@ -533,6 +533,20 @@ impl LoaderCatalog {
         self.domain_allowlist.iter().any(|d| d == host)
     }
 
+    /// The newest pinned stable version for a loader + Minecraft version. This is the default
+    /// when a caller names a loader but no version; a prerelease is never chosen silently.
+    pub fn newest_verified(&self, loader: &str, mc_version: &str) -> Option<&LoaderEntry> {
+        self.list_versions(loader, mc_version)
+            .into_iter()
+            .filter(|entry| entry.release_channel == LoaderReleaseChannel::Stable)
+            .max_by(|left, right| {
+                agora_core::version_match::compare_versions(
+                    &left.loader_version,
+                    &right.loader_version,
+                )
+            })
+    }
+
     /// List pinned loader entries for a loader + Minecraft version.
     pub fn list_versions(&self, loader: &str, mc_version: &str) -> Vec<&LoaderEntry> {
         self.loaders
@@ -596,6 +610,11 @@ pub fn ensure_allowed_domain(raw_url: &str) -> LauncherResult<()> {
 /// Whether a host is on the loader domain allowlist (delegates).
 pub fn is_allowed_host(host: &str) -> bool {
     catalog().is_allowed_host(host)
+}
+
+/// The newest pinned stable loader version (delegates).
+pub fn newest_verified(loader: &str, mc_version: &str) -> Option<LoaderEntry> {
+    catalog().newest_verified(loader, mc_version).cloned()
 }
 
 /// List pinned loader versions (delegates).
@@ -788,6 +807,27 @@ mod tests {
             !fabric.contains(&"1.7.10".to_string()),
             "Fabric should not support 1.7.10"
         );
+    }
+
+    #[test]
+    fn newest_verified_is_the_newest_stable_and_never_a_prerelease() {
+        let mut older = test_entry("0.16.9");
+        older.release_channel = LoaderReleaseChannel::Stable;
+        let mut newest_stable = test_entry("0.16.10");
+        newest_stable.release_channel = LoaderReleaseChannel::Stable;
+        let mut newer_beta = test_entry("0.17.0-beta.1");
+        newer_beta.release_channel = LoaderReleaseChannel::Prerelease;
+        let catalog = LoaderCatalog {
+            domain_allowlist: vec!["example.com".into()],
+            loaders: std::collections::BTreeMap::from([(
+                "fabric".to_string(),
+                vec![older, newer_beta, newest_stable],
+            )]),
+        };
+
+        let chosen = catalog.newest_verified("fabric", "1.21").unwrap();
+        assert_eq!(chosen.loader_version, "0.16.10");
+        assert_eq!(catalog.newest_verified("quilt", "1.21"), None);
     }
 
     // -----------------------------------------------------------------------
