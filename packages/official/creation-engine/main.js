@@ -2143,6 +2143,89 @@ const EXTENDED_ESL_GAME = [1, 6, 1130, 0];
 // own package (Nexus Mods, Skyrim Special Edition) and Tullius (GPL-3); see crash/FACTS.md.
 const BACKPORTED_ESL_DLLS = ["BackportedESLSupport.dll", "bees.dll"];
 
+// The instance's in-use save folder, exposed read-only by the host under this name. A `.ess`
+// save's plugin list is recorded as a count, then for each plugin a length-prefixed name and an
+// active byte. The header is variable-length, so the block is found by its shape within a bounded
+// prefix and every name is validated; the rest of the save is never read. Layout followed:
+// UESP, "Skyrim Mod:Save File Format", section "Plugin Info" (https://en.uesp.net/wiki/Skyrim_Mod:Save_File_Format).
+const SAVE_VIEW = "@saves";
+const SAVE_HEADER_WINDOW = 8192;
+const SAVE_PLUGIN_NAME = /\.(?:esp|esm|esl)$/i;
+
+function savePluginList(bytes) {
+  const limit = Math.min(bytes.length, 512);
+  for (let start = 12; start < limit; start += 1) {
+    let at = start;
+    const count = bytes[at];
+    at += 1;
+    if (count < 1) continue;
+    const plugins = [];
+    let valid = true;
+    for (let index = 0; index < count; index += 1) {
+      if (at >= bytes.length) {
+        valid = false;
+        break;
+      }
+      const length = bytes[at];
+      at += 1;
+      if (length < 5 || at + length + 1 > bytes.length) {
+        valid = false;
+        break;
+      }
+      const name = ascii(bytes, at, length);
+      at += length;
+      if (!SAVE_PLUGIN_NAME.test(name)) {
+        valid = false;
+        break;
+      }
+      const active = bytes[at];
+      at += 1;
+      if (active !== 0 && active !== 1) {
+        valid = false;
+        break;
+      }
+      plugins.push({ name: name, active: active === 1 });
+    }
+    if (valid && plugins.length > 0) return plugins;
+  }
+  return null;
+}
+
+/// The newest save's active plugins, or why its header could not be read. No saves is not an
+/// error: there is simply nothing to compare.
+function newestSavePlugins() {
+  let listed;
+  try {
+    listed = game.list(SAVE_VIEW);
+  } catch (error) {
+    return { plugins: null, name: null, reason: null };
+  }
+  const saves = ((listed && listed.entries) || [])
+    .filter((entry) => entry && !entry.dir && /\.ess$/i.test(String(entry.name)))
+    .map((entry) => String(entry.name))
+    .sort((left, right) => right.localeCompare(left, undefined, { numeric: true }));
+  if (saves.length === 0) return { plugins: null, name: null, reason: null };
+  const name = saves[0];
+  try {
+    const bytes = new Uint8Array(game.readBytes(SAVE_VIEW + "/" + name, 0, SAVE_HEADER_WINDOW));
+    const plugins = savePluginList(bytes);
+    if (plugins === null) {
+      return {
+        plugins: null,
+        name: name,
+        reason: "its header does not have a readable plugin list",
+      };
+    }
+    return { plugins: plugins, name: name, reason: null };
+  } catch (error) {
+    return {
+      plugins: null,
+      name: name,
+      reason: String(error && error.message ? error.message : error),
+    };
+  }
+}
+
 function skseU16(bytes, at) {
   return bytes[at] | (bytes[at + 1] << 8);
 }
@@ -2709,6 +2792,52 @@ export function creationEngineDiagnostics(args) {
         "info",
       ),
     );
+  }
+
+  // A save records the plugins it was made with. Loading it after one of them is turned off can
+  // crash or silently lose that mod's changes, so the check says which ones are now inactive.
+  const save = newestSavePlugins();
+  if (save.reason !== null) {
+    findings.push(
+      creationDiagnostic(
+        "CE_SAVE_PLUGINS_NOT_CHECKED",
+        "Could not read the plugin list of the newest save '" +
+          save.name +
+          "' (" +
+          save.reason +
+          "), so Agora cannot say whether it needs a plugin that is now off.",
+        "info",
+      ),
+    );
+  } else if (save.plugins !== null) {
+    const active = new Set(enabled.map((entry) => String(entry.id).toLowerCase()));
+    const missing = save.plugins
+      .filter((plugin) => plugin.active && !active.has(plugin.name.toLowerCase()))
+      .map((plugin) => plugin.name);
+    if (missing.length > 0) {
+      findings.push(
+        creationDiagnostic(
+          "CE_SAVE_NEEDS_INACTIVE_PLUGIN",
+          "Your newest save '" +
+            save.name +
+            "' uses " +
+            missing.join(", ") +
+            ", which " +
+            (missing.length === 1 ? "is" : "are") +
+            " not active. Loading it may crash or lose " +
+            (missing.length === 1 ? "that mod's" : "those mods'") +
+            " changes.",
+          "warning",
+          [
+            "Enable " +
+              missing.join(", ") +
+              " in the Plugins tab, or load a save made without " +
+              (missing.length === 1 ? "it" : "them") +
+              ".",
+          ],
+        ),
+      );
+    }
   }
   return findings;
 }

@@ -274,7 +274,7 @@ Every hook is called with one object, and its reply is JSON:
 
 | Capability | Gives you | Limit |
 |---|---|---|
-| `game:read` | `game.readBytes`, `game.readLines`, `game.list` by game path, on the instance as the game will see it | A budget per call, and you never see a real path |
+| `game:read` | `game.readBytes`, `game.readLines`, `game.list` by game path, on the instance as the game will see it. `@saves/` is a read-only alias for the instance's in-use save folder | A budget per call, and you never see a real path |
 | `game:write` | `game.writeBytes`, `game.writeText`, adding files to your plugin's own layer for that instance | Size and file limits. You can't write to the game, a save or another layer |
 | `instance:read`, `instance:write`, `content:read`, `content:write` | The same calls Minecraft plugins use, for every game | As in the [service API](README.md#service-api) |
 

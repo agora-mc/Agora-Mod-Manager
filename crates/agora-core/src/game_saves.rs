@@ -187,6 +187,21 @@ fn resolve(path: &GamePath) -> Result<PathBuf, SavesError> {
     resolve_user_file_source(path).map_err(|e| SavesError::Other(e.to_string()))
 }
 
+/// The folder the game reads and writes for this instance, without surveying its contents.
+pub fn in_use_folder(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Result<PathBuf, SavesError> {
+    let manifest = manifest_of(ctx, instance_id)?;
+    let store = game_ini::store_of(ctx, instance_id)?;
+    let rule = no_rule_is_an_error(definition, &store)?;
+    match manifest.saves {
+        SavesChoice::Shared => shared_folder(rule),
+        SavesChoice::Own => own_folder(rule, instance_id),
+    }
+}
+
 /// The game's shared save folder for the rule.
 pub fn shared_folder(rule: &SaveLocationRule) -> Result<PathBuf, SavesError> {
     resolve(&rule.shared_dir)
