@@ -224,6 +224,7 @@ fn plugin_rule() -> LoadOrderDefinition {
             implicit: Vec::new(),
             implicit_list_file: None,
             sorter: None,
+            overlaps: None,
         },
         intro: None,
         item_heading: None,

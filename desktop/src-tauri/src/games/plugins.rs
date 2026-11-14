@@ -656,6 +656,8 @@ mod tests {
             findings,
             notes: Vec::new(),
             notes_out_of_date: false,
+            overlaps: None,
+            overlaps_out_of_date: false,
         }
     }
 

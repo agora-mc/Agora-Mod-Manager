@@ -579,6 +579,28 @@ pub fn previous_normal_manifest(
     Ok(None)
 }
 
+/// The manifest of this instance's most recent recorded session, whatever its verdict. The
+/// pre-launch check uses its load order to say which conflicts are new since the last launch.
+pub fn latest_manifest(
+    conn: &Connection,
+    instance_id: &str,
+) -> anyhow::Result<Option<LaunchManifest>> {
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT manifest_hash FROM launch_history
+              WHERE instance_id = ?1 AND manifest_hash IS NOT NULL
+              ORDER BY started_at DESC, id DESC
+              LIMIT 1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match hash {
+        Some(hash) => read_manifest(conn, instance_id, &hash),
+        None => Ok(None),
+    }
+}
+
 fn compress(raw: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
     encoder.write_all(raw)?;

@@ -1355,10 +1355,15 @@ pub fn launch_checks(
     } else {
         Some(orders.iter().map(|order| order.entries.len()).sum())
     };
-    let load_order: Vec<crate::game_load_order::Finding> = orders
-        .into_iter()
-        .flat_map(|order| order.findings)
+    let mut load_order: Vec<crate::game_load_order::Finding> = orders
+        .iter()
+        .flat_map(|order| order.findings.iter().cloned())
         .collect();
+    // Overlaps are checked here, not on a plain list read: the check can afford the reader's run,
+    // and the cache it fills is what a plain read shows afterwards.
+    load_order.extend(crate::game_load_order::overlap_findings(
+        ctx, id, definition, &orders,
+    ));
     let outputs =
         crate::game_tools::output_findings_with_view(ctx, id, definition, links.as_ref())?;
     let requirements = crate::catalog_install::requirement_findings(ctx, id, definition);

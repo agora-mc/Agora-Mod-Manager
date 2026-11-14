@@ -17,8 +17,9 @@
 
 use agora_game_api::{
     Behaviours, Diagnostic, DownloadRecognition, GameContext, GameError, GameFuture, GameInstall,
-    GamePackage, LoadOrderLine, PackageDefinition as PackageDefinitionType, RelPath,
-    RuntimeIdentity, SorterReply, SorterRequest, SorterRule, SorterStatus, Suggestion,
+    GamePackage, LoadOrderLine, OverlapReply, OverlapsRule,
+    PackageDefinition as PackageDefinitionType, RelPath, RuntimeIdentity, SorterReply,
+    SorterRequest, SorterRule, SorterStatus, Suggestion,
 };
 use agora_plugin_api::error::{PluginError, PluginErrorCode};
 use agora_plugin_api::host::GameReads;
@@ -173,6 +174,19 @@ impl ScriptedPackage {
             };
             if let Some(sorter) = order.rules.sorter.clone() {
                 return Some((sorter, game.id.as_str().to_string()));
+            }
+        }
+        None
+    }
+
+    /// A list's overlaps reader and the game it belongs to, when the list declares one.
+    fn overlaps_for(&self, list_id: &str) -> Option<(OverlapsRule, String)> {
+        for game in &self.definition.games {
+            let Some(order) = game.load_orders.iter().find(|order| order.id == list_id) else {
+                continue;
+            };
+            if let Some(overlaps) = order.rules.overlaps.clone() {
+                return Some((overlaps, game.id.as_str().to_string()));
             }
         }
         None
@@ -462,6 +476,7 @@ impl GamePackage for ScriptedPackage {
                 active,
                 locked,
                 implicit,
+                rules,
             } = request;
             let Some((sorter, game)) = self.sorter_for(&list_id) else {
                 return Ok(None);
@@ -475,6 +490,7 @@ impl GamePackage for ScriptedPackage {
                 "active": active,
                 "locked": locked,
                 "implicit": implicit,
+                "rules": rules,
             });
             let Some(value) =
                 self.call_required_with_timeout(&plugin, &sorter.hook, args, SORTER_TIMEOUT)?
@@ -482,6 +498,41 @@ impl GamePackage for ScriptedPackage {
                 return Ok(None);
             };
             Ok(Some(self.parse(&sorter.hook, value)?))
+        })
+    }
+
+    fn find_overlaps<'a>(&'a self, request: SorterRequest) -> GameFuture<'a, Option<OverlapReply>> {
+        Box::pin(async move {
+            let SorterRequest {
+                context,
+                list_id,
+                options,
+                entries,
+                active,
+                locked,
+                implicit,
+                rules,
+            } = request;
+            let Some((overlaps, game)) = self.overlaps_for(&list_id) else {
+                return Ok(None);
+            };
+            let plugin = self.script_owner(&game, &list_id, "overlaps")?;
+            let args = serde_json::json!({
+                "context": context,
+                "listId": list_id,
+                "options": options,
+                "entries": entries,
+                "active": active,
+                "locked": locked,
+                "implicit": implicit,
+                "rules": rules,
+            });
+            let Some(value) =
+                self.call_required_with_timeout(&plugin, &overlaps.hook, args, SORTER_TIMEOUT)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(self.parse(&overlaps.hook, value)?))
         })
     }
 
@@ -499,6 +550,7 @@ impl GamePackage for ScriptedPackage {
                 active,
                 locked,
                 implicit,
+                rules,
             } = request;
             let Some((sorter, game)) = self.sorter_for(&list_id) else {
                 return Ok(None);
@@ -515,6 +567,7 @@ impl GamePackage for ScriptedPackage {
                 "active": active,
                 "locked": locked,
                 "implicit": implicit,
+                "rules": rules,
                 "update": update,
             });
             let Some(value) =
@@ -647,11 +700,9 @@ pub fn needs_entrypoint(definition: &PackageDefinitionType) -> Option<&'static s
         return Some("it names script behaviours");
     }
     for game in &definition.games {
-        if game
-            .load_orders
-            .iter()
-            .any(|order| order.format.is_script() || order.rules.is_script())
-        {
+        if game.load_orders.iter().any(|order| {
+            order.format.is_script() || order.rules.is_script() || order.rules.overlaps.is_some()
+        }) {
             return Some("it names a script load order");
         }
     }
@@ -707,6 +758,14 @@ pub fn missing_entrypoint(
                     .unwrap_or(own_plugin);
                 if !has(owner) {
                     return Some((owner.to_string(), "it names script load order rules"));
+                }
+            }
+            if order.rules.overlaps.is_some() {
+                let owner = owners
+                    .script(game.id.as_str(), &order.id, "overlaps")
+                    .unwrap_or(own_plugin);
+                if !has(owner) {
+                    return Some((owner.to_string(), "it names a script overlaps reader"));
                 }
             }
         }
@@ -1000,6 +1059,7 @@ mod tests {
             active: vec!["A.esp".into()],
             locked: Vec::new(),
             implicit: Vec::new(),
+            rules: Vec::new(),
         }
     }
 

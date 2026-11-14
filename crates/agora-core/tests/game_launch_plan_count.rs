@@ -125,6 +125,7 @@ fn definition(plugin_list: u8) -> GameDefinition {
                 implicit: vec![],
                 implicit_list_file: None,
                 sorter: None,
+                overlaps: None,
             },
 
             intro: None,

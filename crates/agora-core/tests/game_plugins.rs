@@ -24,11 +24,12 @@ use agora_core::game_registry::{
     GameRegistry, GameRegistryError, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
-    Condition, DeploymentStrategy, GameContext, GameDefinition, GameFuture, GameId, GamePackage,
-    GamePath, InstallId, InstallKind, LaunchAlternative, LaunchRecipe, LoadOrderDefinition,
-    LoadOrderFormat, LoadOrderRule, LoadOrderRulesReply, PackageDefinition, RelPath,
-    RuntimeIdentity, SorterNote, SorterReply, SorterRequest, SorterRule, StoreId, StoreIdentifier,
-    UserDataLocation, UserFileMapping, UserFileStrategy,
+    Condition, DeploymentStrategy, GameContext, GameDefinition, GameError, GameFuture, GameId,
+    GamePackage, GamePath, InstallId, InstallKind, LaunchAlternative, LaunchRecipe,
+    LoadOrderDefinition, LoadOrderFormat, LoadOrderRule, LoadOrderRulesReply, OverlapKey,
+    OverlapReply, OverlapsRule, PackageDefinition, RelPath, RuntimeIdentity, SorterNote,
+    SorterReply, SorterRequest, SorterRule, StoreId, StoreIdentifier, UserDataLocation,
+    UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -43,8 +44,12 @@ struct Harness {
     install_dir: PathBuf,
     install: IdentifiedInstall,
     facts: Facts,
+    rules_fail: Arc<Mutex<Option<String>>>,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
+    sort_request: Arc<Mutex<Option<SorterRequest>>>,
+    overlaps: OverlapsReplySlot,
+    overlaps_calls: Arc<AtomicUsize>,
 }
 
 impl Drop for Harness {
@@ -65,11 +70,16 @@ type Facts = Arc<Mutex<HashMap<String, PluginFact>>>;
 struct TestPackage {
     definition: PackageDefinition,
     facts: Facts,
+    rules_fail: Arc<Mutex<Option<String>>>,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
+    sort_request: Arc<Mutex<Option<SorterRequest>>>,
+    overlaps: OverlapsReplySlot,
+    overlaps_calls: Arc<AtomicUsize>,
 }
 
 type SorterReplySlot = Arc<Mutex<Option<SorterReply>>>;
+type OverlapsReplySlot = Arc<Mutex<Option<Result<OverlapReply, String>>>>;
 
 impl GamePackage for TestPackage {
     fn definition(&self) -> &PackageDefinition {
@@ -84,7 +94,14 @@ impl GamePackage for TestPackage {
         _list_id: &'a str,
     ) -> GameFuture<'a, Option<LoadOrderRulesReply>> {
         let facts = self.facts.clone();
+        let failure = self.rules_fail.clone();
         Box::pin(async move {
+            if let Some(message) = failure.lock().unwrap().clone() {
+                return Err(GameError {
+                    code: "ERR_TEST_RULES".into(),
+                    message,
+                });
+            }
             let facts = facts.lock().unwrap();
             let mut rules = Vec::new();
             let mut badges = BTreeMap::new();
@@ -126,11 +143,32 @@ impl GamePackage for TestPackage {
     /// The test double answers the sorter hook with whatever a test put in the slot.
     fn sort_load_order<'a>(
         &'a self,
-        _request: SorterRequest,
+        request: SorterRequest,
     ) -> GameFuture<'a, Option<SorterReply>> {
         self.sorter_calls.fetch_add(1, Ordering::SeqCst);
+        *self.sort_request.lock().unwrap() = Some(request);
         let sorter = self.sorter.clone();
         Box::pin(async move { Ok(sorter.lock().unwrap().clone()) })
+    }
+
+    /// The test double answers the overlaps hook with whatever a test put in the slot.
+    fn find_overlaps<'a>(
+        &'a self,
+        _request: SorterRequest,
+    ) -> GameFuture<'a, Option<OverlapReply>> {
+        self.overlaps_calls.fetch_add(1, Ordering::SeqCst);
+        let overlaps = self.overlaps.clone();
+        Box::pin(async move {
+            let answer = overlaps.lock().unwrap().clone();
+            match answer {
+                None => Ok(None),
+                Some(Ok(reply)) => Ok(Some(reply)),
+                Some(Err(message)) => Err(GameError {
+                    code: "ERR_TEST_OVERLAPS".into(),
+                    message,
+                }),
+            }
+        })
     }
 }
 
@@ -172,6 +210,7 @@ fn plugin_rule() -> LoadOrderDefinition {
             implicit: Vec::new(),
             implicit_list_file: None,
             sorter: None,
+            overlaps: None,
         },
         intro: None,
         item_heading: None,
@@ -184,6 +223,27 @@ fn sorter_rule() -> SorterRule {
         update: None,
         update_label: None,
         options: serde_json::Value::Null,
+    }
+}
+
+fn overlaps_rule() -> OverlapsRule {
+    OverlapsRule {
+        hook: "overlaps".into(),
+        options: serde_json::Value::Null,
+    }
+}
+
+fn overlap_key(key: &str, label: &str, items: &[(&str, &str)]) -> OverlapKey {
+    OverlapKey {
+        key: key.into(),
+        label: label.into(),
+        items: items
+            .iter()
+            .map(|(name, digest)| agora_game_api::OverlapItem {
+                name: (*name).into(),
+                digest: (*digest).into(),
+            })
+            .collect(),
     }
 }
 
@@ -308,8 +368,12 @@ impl Harness {
         let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let facts: Facts = Arc::new(Mutex::new(HashMap::new()));
+        let rules_fail: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let sorter: SorterReplySlot = Arc::new(Mutex::new(None));
         let sorter_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let sort_request: Arc<Mutex<Option<SorterRequest>>> = Arc::new(Mutex::new(None));
+        let overlaps: OverlapsReplySlot = Arc::new(Mutex::new(None));
+        let overlaps_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let mut builder = GameRegistry::builder();
         builder
             .add(
@@ -319,8 +383,12 @@ impl Harness {
                 Arc::new(TestPackage {
                     definition: package_of(&def),
                     facts: facts.clone(),
+                    rules_fail: rules_fail.clone(),
                     sorter: sorter.clone(),
                     sorter_calls: sorter_calls.clone(),
+                    sort_request: sort_request.clone(),
+                    overlaps: overlaps.clone(),
+                    overlaps_calls: overlaps_calls.clone(),
                 }),
             )
             .expect("register test package");
@@ -335,8 +403,12 @@ impl Harness {
             install_dir,
             install,
             facts,
+            rules_fail,
             sorter,
             sorter_calls,
+            sort_request,
+            overlaps,
+            overlaps_calls,
         }
     }
 
@@ -382,6 +454,10 @@ impl Harness {
     }
 
     /// What the test double's sorter answers on the next call.
+    fn fail_rules(&self, reason: &str) {
+        *self.rules_fail.lock().unwrap() = Some(reason.to_string());
+    }
+
     fn answer_sorting(&self, reply: SorterReply) {
         *self.sorter.lock().unwrap() = Some(reply);
     }
@@ -392,6 +468,23 @@ impl Harness {
 
     fn reset_sorter_calls(&self) {
         self.sorter_calls.store(0, Ordering::SeqCst);
+    }
+
+    /// What the test double's overlaps reader answers on the next call.
+    fn answer_overlaps(&self, reply: OverlapReply) {
+        *self.overlaps.lock().unwrap() = Some(Ok(reply));
+    }
+
+    fn fail_overlaps(&self, reason: &str) {
+        *self.overlaps.lock().unwrap() = Some(Err(reason.to_string()));
+    }
+
+    fn overlaps_calls(&self) -> usize {
+        self.overlaps_calls.load(Ordering::SeqCst)
+    }
+
+    fn last_sort_request(&self) -> Option<SorterRequest> {
+        self.sort_request.lock().unwrap().clone()
     }
 
     fn copy_path(&self, inst: &GameInstanceRecord) -> PathBuf {
@@ -939,8 +1032,12 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
         Arc::new(TestPackage {
             definition: package_of(def),
             facts: Arc::new(Mutex::new(HashMap::new())),
+            rules_fail: Arc::new(Mutex::new(None)),
             sorter: Arc::new(Mutex::new(None)),
             sorter_calls: Arc::new(AtomicUsize::new(0)),
+            sort_request: Arc::new(Mutex::new(None)),
+            overlaps: Arc::new(Mutex::new(None)),
+            overlaps_calls: Arc::new(AtomicUsize::new(0)),
         }),
     )
 }
@@ -1911,4 +2008,473 @@ fn a_plain_list_read_marks_uncached_notes_out_of_date() {
     assert!(order.notes.is_empty());
     assert!(order.notes_out_of_date);
     assert_eq!(h.sorter_calls(), 0, "a plain read ran the sorter");
+}
+
+#[test]
+fn overlaps_are_cached_and_a_plain_read_does_not_run_the_reader() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-cache");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_overlaps(OverlapReply {
+        keys: vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "new")],
+        )],
+        notes: Vec::new(),
+    });
+
+    let report = game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None)
+        .expect("overlaps were checked");
+    assert_eq!(report.pairs.len(), 1);
+    assert_eq!(report.pairs[0].winner, "B.esp");
+    assert_eq!(report.pairs[0].loser, "A.esp");
+    assert_eq!(h.overlaps_calls(), 1);
+
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    assert_eq!(order.overlaps.as_ref().map(|r| r.pairs.len()), Some(1));
+    assert!(!order.overlaps_out_of_date);
+    assert_eq!(h.overlaps_calls(), 1, "a plain read ran the reader");
+}
+
+#[test]
+fn an_overlaps_reader_failure_says_could_not_check_not_no_conflicts() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-failure");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_overlaps("the reader could not open a plugin file");
+
+    let error =
+        game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None).unwrap_err();
+    assert!(matches!(error, LoadOrderError::Overlaps { .. }), "{error}");
+    assert!(error.to_string().contains("could not open"));
+
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    assert!(order.overlaps.is_none());
+    assert!(order.overlaps_out_of_date);
+}
+
+#[test]
+fn an_overlaps_reply_naming_an_unknown_plugin_is_refused() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-malformed");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_overlaps(OverlapReply {
+        keys: vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("NotLoaded.esp", "new")],
+        )],
+        notes: Vec::new(),
+    });
+
+    let error =
+        game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None).unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::OverlapsReply { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("does not load"));
+}
+
+#[test]
+fn a_load_after_rule_is_stored_and_shown_with_its_items() {
+    let h = Harness::new();
+    let inst = h.instance("rule-store");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let list = h.def.load_orders.first().unwrap().id.clone();
+    assert!(game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        "B.esp"
+    )
+    .unwrap());
+    assert!(!game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "a.ESP",
+        "b.esp"
+    )
+    .unwrap());
+    assert_eq!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, &list).unwrap(),
+        [game_load_order::LoadAfterRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }]
+    );
+    assert_eq!(
+        game_load_order::load_after_rule_views(&h.ctx, &inst.instance_id, &h.def, None).unwrap(),
+        [game_load_order::LoadAfterRuleView {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+            unused: None,
+        }]
+    );
+}
+
+#[test]
+fn a_rule_whose_item_left_the_list_is_kept_and_shown_unused() {
+    let h = Harness::new();
+    let inst = h.instance("rule-unused");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "Gone.esp",
+        "A.esp",
+    )
+    .unwrap();
+    let views =
+        game_load_order::load_after_rule_views(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].unused, Some("Gone.esp".to_string()));
+    assert_eq!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .len(),
+        1,
+        "an unused rule is kept"
+    );
+}
+
+#[test]
+fn a_rule_against_itself_is_refused() {
+    let h = Harness::new();
+    let inst = h.instance("rule-self");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        "a.ESP",
+    )
+    .unwrap_err();
+    assert!(matches!(error, LoadOrderError::RuleSelf(_)), "{error}");
+}
+
+#[test]
+fn a_rule_that_contradicts_a_master_is_refused() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-master");
+    let a = plugin_file(0, &["B.esm"]);
+    let b = plugin_file(1, &[]);
+    let item = h.item(
+        "mod",
+        &[("Data/A.esp", a.as_slice()), ("Data/B.esm", b.as_slice())],
+    );
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "B.esm",
+        "A.esp",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::RuleContradictsMaster { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_rule_that_would_make_a_loop_is_refused() {
+    let h = Harness::new();
+    let inst = h.instance("rule-loop");
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    for (item, after) in [("A.esp", "B.esp"), ("B.esp", "C.esp")] {
+        game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, item, after)
+            .unwrap();
+    }
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "C.esp",
+        "A.esp",
+    )
+    .unwrap_err();
+    assert!(matches!(error, LoadOrderError::RuleCycle { .. }), "{error}");
+}
+
+#[test]
+fn the_masters_only_sort_honours_a_load_after_rule() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-sort");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", "B.esp")
+        .unwrap();
+
+    let (report, order) =
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+    assert_eq!(report.mode, SortMode::Masters);
+    let names: Vec<&str> = order.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["B.esp", "A.esp"]);
+}
+
+#[test]
+fn a_sorter_request_carries_the_users_load_after_rules() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-sorter");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", "B.esp")
+        .unwrap();
+    let current: Vec<String> = h
+        .plugin_names(&inst)
+        .into_iter()
+        .map(|(name, ..)| name)
+        .collect();
+    h.answer_sorting(SorterReply {
+        order: current,
+        ..Default::default()
+    });
+
+    game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+    let request = h.last_sort_request().expect("the sorter was asked");
+    assert_eq!(
+        request.rules,
+        [agora_game_api::UserLoadOrderRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_move_that_breaks_a_rule_is_refused_unless_it_may_remove_it() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-move");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", "B.esp")
+        .unwrap();
+    game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+
+    let target = MoveTarget::Before("B.esp".to_string());
+    let error =
+        game_load_order::move_plugin_in(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", &target)
+            .unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::BreaksRule { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .len(),
+        1,
+        "a refused move removes nothing"
+    );
+
+    let report = game_load_order::move_plugin_in_breaking_rules(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        &target,
+    )
+    .expect("the move may remove the rule");
+    assert_eq!(
+        report.removed_rules,
+        [game_load_order::LoadAfterRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }]
+    );
+    assert!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_launch() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-check");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_overlaps(OverlapReply {
+        keys: vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "new")],
+        )],
+        notes: Vec::new(),
+    });
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+
+    // No recorded session yet: the count is known, but nothing can be "new since" it.
+    let findings = game_load_order::overlap_findings(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        std::slice::from_ref(&order),
+    );
+    assert!(findings
+        .iter()
+        .all(|f| !f.message().contains("now replaces")));
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.message().starts_with("Info: 1 conflict between 1 pair")),
+        "{findings:?}"
+    );
+
+    // A recorded session where A was off makes the pair new.
+    let conn = agora_core::db::local_state_connection(&h.ctx.paths.local_state_db()).unwrap();
+    let manifest = agora_core::session_ledger::LaunchManifest {
+        load_order: vec![
+            agora_core::session_ledger::LoadOrderEntry {
+                list: "plugins".into(),
+                name: "A.esp".into(),
+                active: false,
+            },
+            agora_core::session_ledger::LoadOrderEntry {
+                list: "plugins".into(),
+                name: "B.esp".into(),
+                active: true,
+            },
+        ],
+        ..Default::default()
+    };
+    agora_core::session_ledger::begin(
+        &conn,
+        &inst.instance_id,
+        "2026-01-01T00:00:00Z",
+        &manifest,
+        agora_core::session_ledger::Owner { pid: 1, started: 0 },
+    )
+    .unwrap();
+    drop(conn);
+
+    let findings = game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order]);
+    let warning = findings
+        .iter()
+        .find(|f| f.message().contains("now replaces"))
+        .expect("a new pair is warned about");
+    assert_eq!(
+        warning,
+        &game_load_order::Finding::ListLevel {
+            message: "Warning: 'B.esp' now replaces 1 change made by 'A.esp' (e.g. GMST \
+                      fJumpHeightMin). Keep this order, or let 'A.esp' win."
+                .to_string(),
+            items: vec!["B.esp".into(), "A.esp".into()],
+            refuses: false,
+        }
+    );
+}
+
+#[test]
+fn a_failed_overlaps_reader_is_reported_as_could_not_check() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-check-failure");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_overlaps("the reader timed out");
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+
+    let findings = game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order]);
+    let message = findings
+        .iter()
+        .map(game_load_order::Finding::message)
+        .find(|message| message.contains("overlaps could not be checked"))
+        .expect("a failed reader is reported, not a clean list");
+    assert!(message.contains("could not be checked"), "{message}");
+    assert!(message.contains("timed out"), "{message}");
+}
+
+#[test]
+fn a_rule_is_not_added_when_the_lists_rules_cannot_be_read() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-rules-fail");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_rules("the game's rule reader timed out");
+
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        "B.esp",
+    )
+    .unwrap_err();
+    assert!(matches!(error, LoadOrderError::RulesStore(_)), "{error}");
+    assert!(error.to_string().contains("cannot be checked"), "{error}");
+    assert!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .is_empty()
+    );
 }

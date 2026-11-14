@@ -155,6 +155,7 @@ fn a_rule_kind_of_anything_else_is_refused() {
                 implicit: Vec::new(),
                 implicit_list_file: None,
                 sorter: None,
+                overlaps: None,
             },
 
             intro: None,

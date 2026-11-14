@@ -277,6 +277,12 @@ fn required_exports(definition: &PackageDefinition) -> Vec<(String, String)> {
                     ));
                 }
             }
+            if let Some(overlaps) = &order.rules.overlaps {
+                required.push((
+                    format!("games.{}.load_orders.{}.rules.overlaps", game.id, order.id),
+                    overlaps.hook.clone(),
+                ));
+            }
         }
     }
     required
