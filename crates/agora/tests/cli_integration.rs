@@ -1683,6 +1683,58 @@ Details:\n\
 }
 
 #[test]
+fn crash_last_says_the_newest_session_has_no_answer_and_which_one_it_shows() {
+    let (_tmp, data_dir) = temp_data_dir();
+    let paths = agora_core::app_paths::AppPaths::from_root(data_dir.clone());
+    paths.create_required_dirs().unwrap();
+    agora_core::db::init_local_state_db(&paths.local_state_db()).unwrap();
+    let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+    conn.execute(
+        "INSERT INTO launch_history
+             (instance_id, started_at, ended_at, session_id, verdict)
+         VALUES ('inst', '2026-01-01T00:00:00Z', '2026-01-01T00:10:00Z', 'answered',
+                 '{\"kind\":\"crashed\",\"how\":\"time\"}')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO launch_history
+             (instance_id, started_at, ended_at, session_id, verdict)
+         VALUES ('inst', '2026-01-01T02:00:00Z', '2026-01-01T02:10:00Z', 'newest',
+                 '{\"kind\":\"failed_to_start\"}')",
+        [],
+    )
+    .unwrap();
+    agora_core::crash_live::store_answer(
+        &conn,
+        &agora_core::crash_live::SessionAnswer {
+            session_id: "answered".to_string(),
+            instance_id: "inst".to_string(),
+            created_at: "2026-01-01T00:11:00Z".to_string(),
+            answer: agora_core::crash_live::StoredAnswer::NothingToRead {
+                why: "an invented session with no log".to_string(),
+            },
+        },
+    )
+    .unwrap();
+
+    let output = run_agora(&data_dir, &["crash", "last", "inst"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let newest = stdout
+        .find("The newest session that ended 2026-01-01T02:10:00Z (did not start) has no crash answer yet.")
+        .unwrap_or_else(|| panic!("no newest-session line:\n{stdout}"));
+    let shown = stdout
+        .find("This answer is for the session that ended 2026-01-01T00:10:00Z (crashed).")
+        .unwrap_or_else(|| panic!("no answer-session line:\n{stdout}"));
+    assert!(newest < shown, "{stdout}");
+}
+
+#[test]
 fn crash_analyze_names_a_file_it_cannot_open() {
     // Agora's own packs always load, so with no plugin installed the run reaches the files.
     let (_tmp, data_dir) = temp_data_dir();

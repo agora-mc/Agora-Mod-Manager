@@ -4760,6 +4760,24 @@ async fn run_auth_command(
     Ok(())
 }
 
+/// When a session ran and how it ended, for telling a reader which answer they are seeing.
+fn describe_session(session: &agora_core::crash_live::SessionBrief) -> String {
+    use agora_game_api::crash::SessionVerdict;
+    let how = match session.verdict {
+        Some(SessionVerdict::Crashed { .. }) => "crashed",
+        Some(SessionVerdict::FailedToStart) => "did not start",
+        Some(SessionVerdict::Froze) => "froze",
+        Some(SessionVerdict::Stopped) => "was stopped",
+        Some(SessionVerdict::Normal) => "closed normally",
+        Some(SessionVerdict::ClosedUnknown) => "ended with no recorded verdict",
+        None => "its ending was not recorded",
+    };
+    match &session.ended_at {
+        Some(ended) => format!("that ended {ended} ({how})"),
+        None => format!("that started {} ({how})", session.started_at),
+    }
+}
+
 /// The one-line answer for `crash list`: the engine's headline, or why it has none.
 fn crash_answer_summary(answer: &agora_core::crash_live::StoredAnswer) -> String {
     use agora_core::crash_live::StoredAnswer;
@@ -4860,10 +4878,55 @@ async fn run_crash_command(
         }
         CrashCmd::Last { instance } => {
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
-            let Some(stored) = agora_core::crash_live::latest_answer(&conn, &instance)? else {
-                anyhow::bail!("No crash answer is stored for instance '{instance}'.");
-            };
-            cli_crash::print_stored(&stored, json)?;
+            let context = agora_core::crash_live::latest_answer_with_context(&conn, &instance)?;
+            let newest_session = context.newest_session.as_ref();
+            let newest_has_answer = newest_session.is_some_and(|newest| {
+                context
+                    .answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.session_id == newest.session_id)
+            });
+            if json {
+                let mut value = serde_json::to_value(&context.answer)?;
+                value["newest_session"] = serde_json::to_value(newest_session)?;
+                value["answer_session"] = serde_json::to_value(&context.answer_session)?;
+                value["newest_session_has_answer"] = serde_json::Value::Bool(newest_has_answer);
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                if let Some(newest) = newest_session {
+                    if !newest_has_answer {
+                        println!(
+                            "The newest session {} has no crash answer yet.",
+                            describe_session(newest)
+                        );
+                    }
+                }
+                match (&context.answer, &context.answer_session) {
+                    (Some(stored), Some(session)) => {
+                        println!(
+                            "This answer is for the session {}.",
+                            describe_session(session)
+                        );
+                        cli_crash::print_stored(stored, false)?;
+                    }
+                    (Some(stored), None) => {
+                        println!(
+                            "This answer is for session {}, which the session history no longer lists.",
+                            stored.session_id
+                        );
+                        cli_crash::print_stored(stored, false)?;
+                    }
+                    (None, _) => {
+                        if newest_session.is_none() {
+                            println!(
+                                "No session or crash answer is stored for instance '{instance}'."
+                            );
+                        } else {
+                            println!("No earlier crash answer is stored for this instance.");
+                        }
+                    }
+                }
+            }
         }
         CrashCmd::Show { session } => {
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
