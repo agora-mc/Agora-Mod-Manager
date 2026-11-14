@@ -195,6 +195,9 @@ pub struct Signal {
     /// What kind of cause this clue points at, when the rule states one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<Cause>,
+    /// Other enabled items that provide the same file, when the clue names one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_provided_by: Vec<String>,
     pub source: SourceAttribution,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceLine>,

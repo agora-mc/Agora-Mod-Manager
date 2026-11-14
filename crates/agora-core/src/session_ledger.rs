@@ -180,6 +180,11 @@ pub struct LaunchManifest {
     /// Hash of the active plugin load order. `None` when it could not be read (see `unreadable`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_orders_hash: Option<String>,
+    /// The named entries of each load order, so a difference can name the plugin that changed.
+    /// Empty in manifests stored before this was kept, which fall back to a generic load-order
+    /// change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_order: Vec<LoadOrderEntry>,
     /// The runtime: `store:version`, or the Minecraft version and loader.
     pub runtime: String,
     /// Hash of the instance's own settings files. `None` when they could not be read.
@@ -244,6 +249,16 @@ impl ChangeKind {
     pub fn names_an_item(self) -> bool {
         !matches!(self, Self::LoadOrder | Self::Settings)
     }
+}
+
+/// One named entry in a game's load order. The name is whatever the game calls it (a plugin file,
+/// a package), so core never has to know the game's format.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadOrderEntry {
+    /// Which declared load order this entry belongs to.
+    pub list: String,
+    pub name: String,
+    pub active: bool,
 }
 
 /// One difference between two manifests, in the crash engine's terms.
@@ -350,7 +365,61 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
         }
     }
 
-    if previous.load_orders_hash != current.load_orders_hash {
+    // Name the plugin that was turned on or off when both manifests kept the list. A manifest
+    // stored before this was kept has no entries, so it falls back to the generic change.
+    let mut named_load_order = false;
+    if !previous.load_order.is_empty() && !current.load_order.is_empty() {
+        let key = |entry: &LoadOrderEntry| (entry.list.clone(), entry.name.clone());
+        let previous_entries: BTreeMap<(String, String), &LoadOrderEntry> = previous
+            .load_order
+            .iter()
+            .map(|entry| (key(entry), entry))
+            .collect();
+        let current_entries: BTreeMap<(String, String), &LoadOrderEntry> = current
+            .load_order
+            .iter()
+            .map(|entry| (key(entry), entry))
+            .collect();
+        for (entry_key, entry) in &current_entries {
+            match previous_entries.get(entry_key) {
+                None => {
+                    changes.push(ManifestChange {
+                        kind: ChangeKind::Added,
+                        key: Some(entry.name.clone()),
+                        from_version: None,
+                        to_version: None,
+                    });
+                    named_load_order = true;
+                }
+                Some(before) if before.active != entry.active => {
+                    changes.push(ManifestChange {
+                        kind: if entry.active {
+                            ChangeKind::Enabled
+                        } else {
+                            ChangeKind::Disabled
+                        },
+                        key: Some(entry.name.clone()),
+                        from_version: None,
+                        to_version: None,
+                    });
+                    named_load_order = true;
+                }
+                Some(_) => {}
+            }
+        }
+        for (entry_key, entry) in &previous_entries {
+            if !current_entries.contains_key(entry_key) {
+                changes.push(ManifestChange {
+                    kind: ChangeKind::Removed,
+                    key: Some(entry.name.clone()),
+                    from_version: None,
+                    to_version: None,
+                });
+                named_load_order = true;
+            }
+        }
+    }
+    if previous.load_orders_hash != current.load_orders_hash && !named_load_order {
         changes.push(ManifestChange {
             kind: ChangeKind::LoadOrder,
             key: None,
@@ -603,6 +672,11 @@ pub fn build_manifest(
                         hasher.update(
                             format!("{}\t{}\t{}\n", rule.id, entry.name, entry.active).as_bytes(),
                         );
+                        manifest.load_order.push(LoadOrderEntry {
+                            list: rule.id.clone(),
+                            name: entry.name.clone(),
+                            active: entry.active,
+                        });
                     }
                 }
                 Err(e) => {
@@ -1446,6 +1520,7 @@ mod tests {
             plan_fingerprint: Some(sha_hex(format!("plan {changed}").as_bytes())),
             items,
             load_orders_hash: Some(sha_hex(b"load order")),
+            load_order: Vec::new(),
             runtime: "steam:1.6.1170.0".into(),
             settings_hash: Some(sha_hex(b"settings")),
             unreadable: vec![],
@@ -1862,6 +1937,42 @@ mod tests {
         );
 
         assert!(diff_manifests(&previous, &previous).is_empty());
+    }
+
+    #[test]
+    fn a_plugin_turned_off_is_named_instead_of_a_generic_load_order_change() {
+        let entry = |name: &str, active: bool| LoadOrderEntry {
+            list: "plugins".to_string(),
+            name: name.to_string(),
+            active,
+        };
+        let previous = LaunchManifest {
+            load_orders_hash: Some("load-1".into()),
+            load_order: vec![
+                entry("Example.esm", true),
+                entry("Unofficial Example Patch.esp", true),
+            ],
+            ..LaunchManifest::default()
+        };
+        let current = LaunchManifest {
+            load_orders_hash: Some("load-2".into()),
+            load_order: vec![
+                entry("Example.esm", true),
+                entry("Unofficial Example Patch.esp", false),
+            ],
+            ..LaunchManifest::default()
+        };
+        let changes = diff_manifests(&previous, &current);
+        assert!(changes.iter().any(|change| {
+            change.kind == ChangeKind::Disabled
+                && change.key.as_deref() == Some("Unofficial Example Patch.esp")
+        }));
+        assert!(
+            !changes
+                .iter()
+                .any(|change| change.kind == ChangeKind::LoadOrder),
+            "{changes:?}"
+        );
     }
 
     #[test]

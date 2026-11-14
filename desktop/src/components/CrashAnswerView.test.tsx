@@ -69,6 +69,16 @@ function renderView(props: Omit<ViewProps, 'onCheckAnother'> & { onCheckAnother?
 }
 
 describe('a named suspect', () => {
+  it('mentions an overridden item when more than one provides the file', () => {
+    renderView({
+      status: 'analyzed',
+      answer: answer({
+        candidates: [{ ...suspect, also_provided_by: ['acme.base'] }],
+      }),
+    });
+    expect(screen.getByText(/Also provided by acme\.base\./)).toBeInTheDocument();
+  });
+
   it('shows each save-risk chip in the design\u2019s words', () => {
     for (const [risk, words] of [
       ['safe', 'Safe to test on your save'],

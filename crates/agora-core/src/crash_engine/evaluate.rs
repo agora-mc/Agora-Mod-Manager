@@ -1844,6 +1844,14 @@ fn evaluate_rule(
         apply_effects(input, plugin, rule, &rule.effects, branch, &mut product);
         if let Some(verify) = &rule.verify {
             match branch.bindings.refs.get(&verify.target) {
+                // A framework's own runtime, the game itself or the system is not content to
+                // inspect or accuse. SKSE's own DLL declares no plugin version, and asking it is
+                // the trap that makes the framework look guilty.
+                Some(target)
+                    if matches!(
+                        input.resolver.resolve(&target.reference).role,
+                        Some(Role::System | Role::Platform | Role::Framework | Role::HookFramework)
+                    ) => {}
                 Some(target) => {
                     let outcome = input.inspector.inspect(&InspectionRequest {
                         plugin_id: &plugin.id,
@@ -2088,11 +2096,14 @@ fn apply_effects(
                     if let Some(role) = role {
                         product.roles.insert(owner_key(&owner), role);
                     }
+                    let also_provided_by =
+                        resolve_also(&candidate.owner_of, branch, input.resolver);
                     product.signals.push(Signal {
                         family: *family,
                         candidate: owner,
                         weight: *weight,
                         cause: *cause,
+                        also_provided_by,
                         source,
                         evidence: clean_evidence(branch.evidence.clone()),
                     });
@@ -2168,11 +2179,18 @@ fn apply_effects(
                 });
                 if effective_scope == Scope::RootCause {
                     if let (Some(owner), Some(family), Some(weight)) = (owner, family, weight) {
+                        let also_provided_by = candidate
+                            .as_ref()
+                            .map(|candidate| {
+                                resolve_also(&candidate.owner_of, branch, input.resolver)
+                            })
+                            .unwrap_or_default();
                         product.signals.push(Signal {
                             family: *family,
                             candidate: owner,
                             weight: *weight,
                             cause: Some(finding_cause),
+                            also_provided_by,
                             source,
                             evidence: clean_evidence(branch.evidence.clone()),
                         });
@@ -2226,6 +2244,15 @@ fn resolve_owner(
     let bound = branch.bindings.refs.get(variable)?;
     let resolved = resolver.resolve(&bound.reference);
     Some((resolved.owner, bound.parser.clone(), resolved.role))
+}
+
+fn resolve_also(variable: &str, branch: &Branch, resolver: &dyn RefResolver) -> Vec<String> {
+    branch
+        .bindings
+        .refs
+        .get(variable)
+        .map(|bound| resolver.also_provided_by(&bound.reference))
+        .unwrap_or_default()
 }
 
 fn resolve_repair(

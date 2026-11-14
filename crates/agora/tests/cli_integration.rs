@@ -1809,7 +1809,14 @@ fn crash_analyze_paste_reads_stdin_as_a_snippet_and_says_so() {
             .is_some_and(|text| text == agora_core::crash_engine::SNIPPET_TRUST_NOTE)),
         "{json:#}"
     );
-    assert_eq!(json["answer"]["level"], "not_sure", "{json:#}");
+    assert_eq!(json["answer"]["level"], "possible", "{json:#}");
+    assert!(
+        json["answer"]["headline"]["en"]
+            .as_str()
+            .is_some_and(|text| text.contains("ran out of memory")),
+        "{json:#}"
+    );
+    assert_ne!(json["answer"]["next"]["kind"], "bisect", "{json:#}");
 }
 
 #[test]

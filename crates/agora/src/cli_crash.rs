@@ -1040,8 +1040,16 @@ fn suspect_line(candidate: &agora_game_api::crash::Candidate) -> String {
         .map(save_risk_words)
         .map(|words| format!(" - {words}"))
         .unwrap_or_default();
+    let also = if candidate.also_provided_by.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (also provided by {})",
+            candidate.also_provided_by.join(", ")
+        )
+    };
     format!(
-        "{}: {}{risk}",
+        "{}: {}{risk}{also}",
         owner_name(&candidate.owner),
         candidate.level.label()
     )

@@ -243,6 +243,11 @@ export function CrashAnswerView({
                     onShowFiles={onShowSuspectFiles}
                   />
                 </div>
+                {candidate.also_provided_by !== undefined && candidate.also_provided_by.length > 0 && (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Also provided by {candidate.also_provided_by.join(', ')}.
+                  </p>
+                )}
                 <ul className="mt-2 space-y-1">
                   {answer.findings
                     .filter((finding) => finding.candidate !== undefined && ownerKey(finding.candidate) === ownerKey(candidate.owner))

@@ -1058,6 +1058,68 @@ fn inspector_failure_takes_on_unknown_and_never_the_passing_path() {
 }
 
 #[test]
+fn an_inspector_never_runs_against_a_framework_or_platform_owner() {
+    let resolver = FakeResolver::new().with(
+        "file",
+        "skse64_1_6_1170.dll",
+        item("skse", "Script Extender"),
+        Some(Role::Framework),
+    );
+    let rule = json!({
+        "id": "inspect_it",
+        "version": 1,
+        "when": { "fact": { "kind": "creation.object", "ref": { "kind": "file", "strength": "object", "bind": "target" } } },
+        "verify": {
+            "inspector": "plugin_declaration",
+            "target": "target",
+            "on_fail": [{ "finding": {
+                "scope": "root_cause",
+                "level": "likely",
+                "cause": "version_mismatch",
+                "candidate": { "owner_of": "target" }
+            } }],
+            "on_unknown": [{ "context": { "text": { "en": "The check could not decide." } } }]
+        },
+        "effects": [],
+        "text": { "headline": { "en": "A framework file was inspected." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![file_object("skse64_1_6_1170.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Fail),
+        Some("1.0"),
+    );
+    assert!(
+        evaluated.inspections.is_empty(),
+        "{:#?}",
+        evaluated.inspections
+    );
+    assert!(
+        !evaluated
+            .could_not_check
+            .iter()
+            .any(|note| note.subject == "plugin_declaration"),
+        "{:#?}",
+        evaluated.could_not_check
+    );
+    assert!(
+        consensus.candidates.is_empty(),
+        "{:#?}",
+        consensus.candidates
+    );
+}
+
+#[test]
 fn stopped_and_normal_exits_name_nobody() {
     let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
     let packs = vec![pack(
@@ -2745,6 +2807,25 @@ fn a_mod_on_the_stack_does_not_overrule_an_equally_likely_memory_cause() {
     assert_eq!(answer.cause, Some(Cause::Memory));
     assert_eq!(english(&answer.headline), "Java ran out of memory.");
     assert_ne!(answer.next.kind, NextStepKind::Bisect);
+}
+
+#[test]
+fn a_disabled_plugin_is_named_in_the_change_finding() {
+    use agora_core::session_ledger::{ChangeKind, ManifestChange};
+
+    let change = ManifestChange {
+        kind: ChangeKind::Disabled,
+        key: Some("Unofficial Example Patch.esp".to_string()),
+        from_version: None,
+        to_version: None,
+    };
+    let finding =
+        agora_core::crash_engine::change::change_finding(&[change]).expect("a change finding");
+    let headline = english(&finding.headline);
+    assert!(
+        headline.contains("switched off Unofficial Example Patch.esp"),
+        "{headline}"
+    );
 }
 
 #[test]

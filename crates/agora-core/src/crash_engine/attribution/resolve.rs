@@ -443,6 +443,10 @@ impl RefResolver for Resolver {
         }
     }
 
+    fn also_provided_by(&self, reference: &Ref) -> Vec<String> {
+        self.attribute(reference).also_provided_by
+    }
+
     fn item_files(&self, content_key: &str) -> Option<Vec<String>> {
         self.view.item_files(content_key)
     }

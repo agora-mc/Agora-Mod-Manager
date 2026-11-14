@@ -562,6 +562,7 @@ fn manifest(items: &[&str]) -> agora_core::session_ledger::LaunchManifest {
             })
             .collect(),
         load_orders_hash: Some("load".to_string()),
+        load_order: Vec::new(),
         runtime: "test:1.0".to_string(),
         settings_hash: Some("settings".to_string()),
         unreadable: Vec::new(),

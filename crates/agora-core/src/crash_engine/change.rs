@@ -133,6 +133,7 @@ pub fn change_signals(changes: &[ManifestChange]) -> Vec<Signal> {
                 weight: change_weight(change.kind),
                 source: source.clone(),
                 evidence: Vec::new(),
+                also_provided_by: Vec::new(),
                 // A change says when, not what kind of problem: it states no cause.
                 cause: None,
             })
