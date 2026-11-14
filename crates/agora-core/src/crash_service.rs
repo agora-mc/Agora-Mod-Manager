@@ -869,4 +869,82 @@ mod tests {
             assert!(validate_filename("D:\\bar.jar").is_err());
         }
     }
+
+    // ------------------------------------------------------------------
+    // Half-way failures must not leave the instance changed
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_disable_mod_rolls_back_rename_when_manifest_cannot_be_read() {
+        let (ctx, tmp) = setup_ctx();
+        let svc = CrashService::new(ctx.clone());
+        create_instance(&ctx, "test-instance", &["testmod.jar"]);
+        std::fs::write(
+            ctx.paths.instance_manifest("test-instance").unwrap(),
+            b"not valid json",
+        )
+        .unwrap();
+
+        let result = svc.disable_mod("test-instance", "testmod.jar");
+        assert!(
+            result.is_err(),
+            "the manifest could not be read, so disabling must report failure"
+        );
+        assert_mod_exists(&ctx, "test-instance", "testmod.jar");
+        assert_mod_not_exists(&ctx, "test-instance", "testmod.jar.disabled");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_enable_mod_rolls_back_rename_when_manifest_cannot_be_read() {
+        let (ctx, tmp) = setup_ctx();
+        let svc = CrashService::new(ctx.clone());
+        create_instance(&ctx, "test-instance", &["testmod.jar"]);
+        svc.disable_mod("test-instance", "testmod.jar").unwrap();
+        assert_disabled_exists(&ctx, "test-instance", "testmod.jar");
+        std::fs::write(
+            ctx.paths.instance_manifest("test-instance").unwrap(),
+            b"not valid json",
+        )
+        .unwrap();
+
+        let result = svc.enable_mod("test-instance", "testmod.jar");
+        assert!(
+            result.is_err(),
+            "the manifest could not be read, so enabling must report failure"
+        );
+        assert_disabled_exists(&ctx, "test-instance", "testmod.jar");
+        assert_mod_not_exists(&ctx, "test-instance", "testmod.jar");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_disable_mod_reports_failure_when_it_leaves_the_mod_enabled() {
+        let (ctx, tmp) = setup_ctx();
+        let svc = CrashService::new(ctx.clone());
+        create_instance(&ctx, "test-instance", &["testmod.jar"]);
+        let disabled_path = ctx
+            .paths
+            .instance_dir("test-instance")
+            .unwrap()
+            .join("mods")
+            .join("testmod.jar.disabled");
+        std::fs::write(&disabled_path, b"pre-existing disabled content").unwrap();
+
+        let result = svc.disable_mod("test-instance", "testmod.jar");
+        assert!(
+            result.is_err(),
+            "disable_mod returned success while the mod is still enabled, so a test \
+             would conclude the crash was caused by something else"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&disabled_path).unwrap(),
+            "pre-existing disabled content",
+            "the pre-existing disabled file must not be clobbered"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -841,3 +841,132 @@ fn a_session_left_open_when_agora_closed_ends_unknown_at_the_next_launch() {
     ));
     assert_ne!(record.verdict, Some(SessionVerdict::Normal));
 }
+
+fn write_named_log(f: &Fixture, name: &str, rva: &str) {
+    let logs = f
+        .ctx
+        .paths
+        .instance_dir(&f.record.instance_id)
+        .unwrap()
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join(name),
+        format!("ERRORS\naccess_violation Example.dll\n[rva {rva}]\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_live_diagnosed_crash_is_not_counted_again_when_its_log_is_swept() {
+    let f = fixture(1);
+    write_named_log(&f, "crash-1.txt", "1000");
+    let first = start_session(&f, &now_minus(180), &["mod-a"]);
+    end_session(&f, &first, &now_minus(150), 0xC000_0005);
+    diagnose(&f, &first).expect("the first crash is diagnosed");
+
+    write_named_log(&f, "crash-2.txt", "2000");
+    let second = start_session(&f, &now_minus(60), &["mod-a"]);
+    end_session(&f, &second, &now_minus(30), 0xC000_0005);
+    diagnose(&f, &second).expect("the second crash is diagnosed");
+
+    let prior =
+        agora_core::crash_history::load_recorded(&ledger(&f), &f.record.instance_id, &[]).unwrap();
+    assert_eq!(
+        prior.len(),
+        2,
+        "there were two crashes, but the first was stored once for its session and again \
+         for its swept log: {prior:#?}"
+    );
+}
+
+#[test]
+fn a_log_over_the_copy_limit_is_not_counted_as_its_own_history() {
+    let f = fixture(1);
+    let log_name = "crash-big.txt";
+    let logs = f
+        .ctx
+        .paths
+        .instance_dir(&f.record.instance_id)
+        .unwrap()
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let mut bytes = b"ERRORS\n[0] Example.dll+0x1000\n".to_vec();
+    while bytes.len() < 9 * 1024 * 1024 {
+        bytes.extend_from_slice(b"padding line for a very large invented log\n");
+    }
+    std::fs::write(logs.join(log_name), &bytes).unwrap();
+
+    let id = start_session(&f, &now_minus(30), &["mod-a"]);
+    end_session(&f, &id, &now_minus(1), 0xC000_0005);
+
+    // This pack gives the log a crash place and says so when the crash was counted in its own
+    // earlier history.
+    let built_in = [agora_game_api::crash::BuiltInPack {
+        file: "test/self-history/pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "crash_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "crash-*.txt" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 3600, "after_s": 3600 } }],
+                "role": "primary"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^ERRORS$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "errors",
+                        "header": "^ERRORS$",
+                        "lines": [{
+                            "pattern": "^\\[(?P<index>\\d+)\\] (?P<mod>[A-Za-z0-9_.-]+)\\+0x(?P<rva>[0-9a-fA-F]+)$",
+                            "kind": "core.frame",
+                            "attrs": { "index": "index", "rva": "rva" },
+                            "refs": [{ "kind": "module", "value": "mod", "strength": "exec" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "rules": [{
+                "id": "counted_in_own_history",
+                "version": 1,
+                "when": { "fact": { "kind": "core.history", "where": { "same_bucket_count": { "gte": 1 } } } },
+                "effects": [{ "context": { "text": { "en": "the crash was counted in its own history" } } }],
+                "text": { "headline": { "en": "A frame was seen." } }
+            }]
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    }];
+    let host = agora_plugin_host::QuickJsHost::new();
+    let empty_packs: Vec<agora_core::crash_packs::LoadedCrashPack> = Vec::new();
+    let answer = agora_core::crash_live::diagnose_session(
+        &f.ctx,
+        &id,
+        agora_core::crash_live::LivePacks {
+            packs: &empty_packs,
+            built_in: &built_in,
+            host: &host,
+            instances: None,
+        },
+    )
+    .expect("the crash is diagnosed");
+
+    let agora_core::crash_live::StoredAnswer::Analyzed { answer, .. } = answer.answer else {
+        panic!("expected an analyzed answer, got {answer:?}");
+    };
+    assert!(
+        answer.findings.iter().all(|finding| {
+            finding.headline.get("en").map(String::as_str)
+                != Some("the crash was counted in its own history")
+        }),
+        "a log over the copy limit was hashed from its head-and-tail copy, so the whole file \
+         the sweep read was not recognised as this crash and the crash boosted itself: {:#?}",
+        answer.findings
+    );
+}
