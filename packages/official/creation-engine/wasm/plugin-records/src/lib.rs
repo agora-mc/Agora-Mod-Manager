@@ -983,6 +983,7 @@ pub fn build_overlaps(indexes: &[Index]) -> (Vec<OverlapKey>, Vec<Note>) {
     // A plugin's master indexes are local to its own MAST list, so resolve every
     // record to the defining file's name before comparing across plugins.
     let mut global_files: Vec<String> = Vec::new();
+    let mut global_names: Vec<String> = Vec::new();
     let mut global_ids: HashMap<String, u32> = HashMap::new();
     let mut local_to_global: Vec<Vec<u32>> = Vec::with_capacity(indexes.len());
     for index in indexes {
@@ -995,6 +996,7 @@ pub fn build_overlaps(indexes: &[Index]) -> (Vec<OverlapKey>, Vec<Note>) {
                     let id = global_files.len() as u32;
                     global_ids.insert(folded.clone(), id);
                     global_files.push(folded);
+                    global_names.push(file.clone());
                     id
                 }
             };
@@ -1064,7 +1066,11 @@ pub fn build_overlaps(indexes: &[Index]) -> (Vec<OverlapKey>, Vec<Note>) {
                 };
                 key_entry.label = match edid {
                     Some(edid) => format!("{kind} {edid}"),
-                    None => format!("{kind} {}", key_entry.key),
+                    None => format!(
+                        "{kind} {:06X} in {}",
+                        record.low,
+                        global_names[file as usize]
+                    ),
                 };
             }
         }

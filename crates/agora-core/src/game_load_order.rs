@@ -394,15 +394,19 @@ pub struct ConflictPair {
 pub const CONFLICT_LABELS: usize = 10;
 
 /// The classification of one list's overlaps (MASTER_SPEC §31.3). A list with no conflicts still
-/// has a report: `pairs` is empty and `patched`/`decided` say what was resolved.
+/// has a report: `pairs` is empty and `patched`/`decided`/`implicit_pairs` say what was resolved.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OverlapReport {
     /// Conflicts grouped by (winner, loser), in the order the first one was found.
     pub pairs: Vec<ConflictPair>,
-    /// Keys the winner patches because it lists every other changer as a master.
+    /// Changer pairs the winner patches because it lists the changer as a master, directly or
+    /// through its masters' masters.
     pub patched: usize,
-    /// Keys a load-after rule already decides.
+    /// Changer pairs a load-after rule already decides.
     pub decided: usize,
+    /// Changer pairs between the game's own always-loaded files, which nobody can reorder.
+    #[serde(default)]
+    pub implicit_pairs: usize,
     /// What the reader said about the files it could not read, or about the list as a whole.
     pub notes: Vec<PluginNote>,
 }
@@ -1249,57 +1253,46 @@ pub fn classify_overlaps(
         }
         holders.sort_by_key(|(position, ..)| *position);
 
-        // A plugin whose digest equals the previous holder's is not a changer.
+        // The first holder is the definer: its copy is the original, never a change, so it is
+        // never a changer and never loses. A later holder whose digest equals the one before it
+        // is "identical to master" and is not a changer either.
         let mut changers: Vec<(usize, &str, &str, &LoadOrderEntry)> = Vec::new();
-        for (index, holder) in holders.iter().enumerate() {
-            if index == 0 || holder.2 != holders[index - 1].2 {
-                changers.push(*holder);
+        for index in 1..holders.len() {
+            if holders[index].2 != holders[index - 1].2 {
+                changers.push(holders[index]);
             }
         }
-        if changers.len() < 2 {
+        if changers.is_empty() {
             continue;
         }
-        let final_digest = holders.last().expect("an overlap has items").2;
-        if changers.iter().all(|changer| changer.2 == final_digest) {
-            continue;
-        }
-        let (_, winner_name, _, winner) = *holders.last().expect("an overlap has items");
-        let others: Vec<&(usize, &str, &str, &LoadOrderEntry)> = changers
-            .iter()
-            .filter(|changer| key(changer.1) != key(winner_name))
-            .collect();
-        if others.is_empty() {
-            continue;
-        }
-        let patched = others.iter().all(|changer| {
-            winner
-                .masters
-                .iter()
-                .any(|master| key(master) == key(changer.1))
-        });
-        if patched {
-            report.patched += 1;
-            continue;
-        }
-        let decided = others.iter().all(|changer| {
-            rules.iter().any(|rule| {
-                key(&rule.item) == key(winner_name) && key(&rule.after) == key(changer.1)
-            })
-        });
-        if decided {
-            report.decided += 1;
-            continue;
-        }
+        let (_, winner_name, winner_digest, winner) =
+            *holders.last().expect("an overlap has items");
         let label = if key_entry.label.trim().is_empty() {
             key_entry.key.clone()
         } else {
             key_entry.label.clone()
         };
-        for changer in others
-            .iter()
-            .filter(|changer| key(changer.1) != key(winner_name))
-            .filter(|changer| changer.2 != final_digest)
-        {
+        // Each changer is judged as a pair with the winner, so one changer the winner does not
+        // know about never turns the others into conflicts (MASTER_SPEC §31.3).
+        for changer in changers {
+            if key(changer.1) == key(winner_name) || changer.2 == winner_digest {
+                // The winner's own change, or one the winner copies identically: nothing is lost.
+                continue;
+            }
+            if winner_masters(entries, winner, changer.1) {
+                report.patched += 1;
+                continue;
+            }
+            if rules.iter().any(|rule| {
+                key(&rule.item) == key(winner_name) && key(&rule.after) == key(changer.1)
+            }) {
+                report.decided += 1;
+                continue;
+            }
+            if winner.implicit && changer.3.implicit {
+                report.implicit_pairs += 1;
+                continue;
+            }
             match report.pairs.iter_mut().find(|pair| {
                 key(&pair.winner) == key(winner_name) && key(&pair.loser) == key(changer.1)
             }) {
@@ -1321,6 +1314,29 @@ pub fn classify_overlaps(
         }
     }
     Ok(report)
+}
+
+/// Whether `winner` lists `changer` among its masters, directly or through its masters' masters.
+fn winner_masters(entries: &[LoadOrderEntry], winner: &LoadOrderEntry, changer: &str) -> bool {
+    let wanted = key(changer);
+    let by_name: HashMap<String, &LoadOrderEntry> = entries
+        .iter()
+        .map(|entry| (key(&entry.name), entry))
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut pending: Vec<String> = winner.masters.iter().map(|name| key(name)).collect();
+    while let Some(name) = pending.pop() {
+        if name == wanted {
+            return true;
+        }
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(entry) = by_name.get(&name) {
+            pending.extend(entry.masters.iter().map(|master| key(master)));
+        }
+    }
+    false
 }
 
 /// What an overlaps report is computed from: the same fingerprint as the sorter's notes, plus the
@@ -1487,9 +1503,14 @@ pub fn overlap_findings(
         if report.pairs.is_empty() {
             continue;
         }
+        let own = if report.implicit_pairs > 0 {
+            format!("; {} between the game's own files", report.implicit_pairs)
+        } else {
+            String::new()
+        };
         out.push(Finding::ListLevel {
             message: format!(
-                "Info: {} conflict{} between {} pair{} of plugins. Run \
+                "Info: {} conflict{} between {} pair{} of plugins{own}. Run \
                  'agora games instance plugins conflicts {instance_id}' to see them.",
                 report.conflicts(),
                 if report.conflicts() == 1 { "" } else { "s" },
@@ -3616,6 +3637,7 @@ mod tests {
     #[test]
     fn the_last_provider_wins_and_each_other_changer_loses_its_change() {
         let list = [
+            entry("Base.esm", &[]),
             entry("A.esp", &[]),
             entry("B.esp", &[]),
             entry("C.esp", &[]),
@@ -3623,7 +3645,12 @@ mod tests {
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "middle"), ("C.esp", "new")],
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("B.esp", "middle"),
+                ("C.esp", "new"),
+            ],
         )]);
         let report = classify_overlaps(&list, &reply, &[]).unwrap();
         assert_eq!(
@@ -3647,8 +3674,26 @@ mod tests {
     }
 
     #[test]
+    fn the_definer_never_loses_when_a_later_plugin_changes_the_record() {
+        // An earlier holder whose copy is the original is the record's definer. Overriding it is
+        // what a mod is for, so it is never reported as a loser (MASTER_SPEC §31.2).
+        let list = [entry("Base.esm", &[]), entry("Mod.esp", &[])];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("Base.esm", "base"), ("Mod.esp", "changed")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert!(report.pairs.is_empty());
+        assert_eq!(report.patched, 0);
+        assert_eq!(report.decided, 0);
+        assert_eq!(report.implicit_pairs, 0);
+    }
+
+    #[test]
     fn an_item_whose_digest_equals_the_previous_holder_is_not_a_changer() {
         let list = [
+            entry("Base.esm", &[]),
             entry("A.esp", &[]),
             entry("B.esp", &[]),
             entry("C.esp", &[]),
@@ -3656,12 +3701,23 @@ mod tests {
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "new"), ("C.esp", "new")],
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("B.esp", "old"),
+                ("C.esp", "new"),
+            ],
         )]);
         let report = classify_overlaps(&list, &reply, &[]).unwrap();
-        assert_eq!(report.pairs.len(), 1);
-        assert_eq!(report.pairs[0].winner, "C.esp");
-        assert_eq!(report.pairs[0].loser, "A.esp");
+        assert_eq!(
+            report.pairs,
+            [ConflictPair {
+                winner: "C.esp".into(),
+                loser: "A.esp".into(),
+                count: 1,
+                labels: vec!["GMST fJumpHeightMin".into()],
+            }]
+        );
     }
 
     #[test]
@@ -3676,17 +3732,22 @@ mod tests {
         assert!(report.pairs.is_empty());
         assert_eq!(report.patched, 0);
         assert_eq!(report.decided, 0);
+        assert_eq!(report.implicit_pairs, 0);
     }
 
     #[test]
     fn a_reply_that_leaves_out_agreeing_keys_reports_only_the_conflict() {
         // The reader returns only keys with two or more changing digests. A key every plugin
         // copies identically is simply absent, which is not a failure and not a conflict.
-        let list = [entry("A.esp", &[]), entry("B.esp", &[])];
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+        ];
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "new")],
+            &[("Base.esm", "original"), ("A.esp", "old"), ("B.esp", "new")],
         )]);
         let report = classify_overlaps(&list, &reply, &[]).unwrap();
         assert_eq!(report.pairs.len(), 1);
@@ -3695,34 +3756,20 @@ mod tests {
     }
 
     #[test]
-    fn the_earlier_holder_is_the_loser_when_a_later_plugin_changes_the_record() {
-        // The narrowed reply includes the earlier holder and the plugin that changes it, in load
-        // order. Without a master relationship, the earlier holder's change is lost.
-        let list = [entry("Base.esm", &[]), entry("Mod.esp", &[])];
+    fn a_winner_that_lists_a_changer_as_a_master_patches_that_pair() {
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("Patch.esp", &["Base.esm", "A.esp"]),
+        ];
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("Base.esm", "base"), ("Mod.esp", "changed")],
-        )]);
-        let report = classify_overlaps(&list, &reply, &[]).unwrap();
-        assert_eq!(
-            report.pairs,
-            [ConflictPair {
-                winner: "Mod.esp".into(),
-                loser: "Base.esm".into(),
-                count: 1,
-                labels: vec!["GMST fJumpHeightMin".into()],
-            }]
-        );
-    }
-
-    #[test]
-    fn a_winner_that_lists_every_other_changer_as_a_master_is_patched() {
-        let list = [entry("A.esp", &[]), entry("Patch.esp", &["A.esp"])];
-        let reply = overlap_reply(vec![overlap_key(
-            "Game:000001",
-            "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("Patch.esp", "new")],
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("Patch.esp", "new"),
+            ],
         )]);
         let report = classify_overlaps(&list, &reply, &[]).unwrap();
         assert!(report.pairs.is_empty());
@@ -3730,26 +3777,115 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_that_orders_the_winner_after_every_other_changer_decides_it() {
+    fn one_changer_the_winner_does_not_master_does_not_turn_the_others_into_conflicts() {
+        // The winner patches A on purpose, but nothing says it knows about C. Each changer is
+        // judged on its own, so C loses while A stays resolved.
         let list = [
+            entry("Base.esm", &[]),
             entry("A.esp", &[]),
-            entry("B.esp", &[]),
             entry("C.esp", &[]),
+            entry("Patch.esp", &["Base.esm", "A.esp"]),
         ];
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "middle"), ("C.esp", "new")],
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("C.esp", "other"),
+                ("Patch.esp", "new"),
+            ],
         )]);
-        let rules = [after("C.esp", "A.esp"), after("C.esp", "B.esp")];
-        let report = classify_overlaps(&list, &reply, &rules).unwrap();
-        assert!(report.pairs.is_empty());
-        assert_eq!(report.decided, 1);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(report.patched, 1);
+        assert_eq!(
+            report.pairs,
+            [ConflictPair {
+                winner: "Patch.esp".into(),
+                loser: "C.esp".into(),
+                count: 1,
+                labels: vec!["GMST fJumpHeightMin".into()],
+            }]
+        );
     }
 
     #[test]
-    fn a_rule_for_one_loser_does_not_decide_a_pair_that_has_another() {
+    fn a_winner_that_masters_a_changer_through_an_intermediate_master_is_patched() {
         let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("Middle.esp", &["Base.esm", "A.esp"]),
+            entry("Patch.esp", &["Middle.esp"]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("Patch.esp", "new"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert!(report.pairs.is_empty());
+        assert_eq!(report.patched, 1);
+    }
+
+    #[test]
+    fn a_pair_between_the_games_own_files_is_counted_and_not_listed() {
+        let list = [
+            implicit("Skyrim.esm"),
+            implicit("Dawnguard.esm"),
+            implicit("HearthFires.esm"),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Skyrim.esm", "original"),
+                ("Dawnguard.esm", "first"),
+                ("HearthFires.esm", "second"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert!(report.pairs.is_empty());
+        assert_eq!(report.implicit_pairs, 1);
+        assert_eq!(report.conflicts(), 0);
+    }
+
+    #[test]
+    fn a_pair_between_the_games_own_files_and_a_mod_is_still_a_conflict() {
+        let list = [
+            implicit("Skyrim.esm"),
+            implicit("Dawnguard.esm"),
+            entry("Mod.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Skyrim.esm", "original"),
+                ("Dawnguard.esm", "first"),
+                ("Mod.esp", "second"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(report.implicit_pairs, 0);
+        assert_eq!(
+            report.pairs,
+            [ConflictPair {
+                winner: "Mod.esp".into(),
+                loser: "Dawnguard.esm".into(),
+                count: 1,
+                labels: vec!["GMST fJumpHeightMin".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_load_after_rule_decides_the_pair_it_orders() {
+        let list = [
+            entry("Base.esm", &[]),
             entry("A.esp", &[]),
             entry("B.esp", &[]),
             entry("C.esp", &[]),
@@ -3757,15 +3893,51 @@ mod tests {
         let reply = overlap_reply(vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "middle"), ("C.esp", "new")],
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "old"),
+                ("B.esp", "middle"),
+                ("C.esp", "new"),
+            ],
         )]);
         let report = classify_overlaps(&list, &reply, &[after("C.esp", "A.esp")]).unwrap();
-        assert_eq!(report.decided, 0);
-        assert_eq!(report.pairs.len(), 2);
+        assert_eq!(report.decided, 1);
         assert_eq!(
-            report.pairs[0].labels,
-            vec!["GMST fJumpHeightMin".to_string()]
+            report.pairs,
+            [ConflictPair {
+                winner: "C.esp".into(),
+                loser: "B.esp".into(),
+                count: 1,
+                labels: vec!["GMST fJumpHeightMin".into()],
+            }]
         );
+    }
+
+    #[test]
+    fn a_rule_deciding_one_pair_of_three_leaves_the_other_two_alone() {
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+            entry("D.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[
+                ("Base.esm", "original"),
+                ("A.esp", "first"),
+                ("B.esp", "second"),
+                ("C.esp", "third"),
+                ("D.esp", "fourth"),
+            ],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[after("D.esp", "B.esp")]).unwrap();
+        assert_eq!(report.decided, 1);
+        assert_eq!(report.pairs.len(), 2);
+        assert_eq!(report.pairs[0].loser, "A.esp");
+        assert_eq!(report.pairs[1].loser, "C.esp");
     }
 
     #[test]
@@ -3811,13 +3983,17 @@ mod tests {
 
     #[test]
     fn conflicts_group_by_pair_and_list_at_most_ten_labels() {
-        let list = [entry("A.esp", &[]), entry("B.esp", &[])];
+        let list = [
+            entry("Base.esm", &[]),
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+        ];
         let keys: Vec<_> = (0..12)
             .map(|index| {
                 overlap_key(
                     &format!("Game:{index}"),
                     &format!("Record {index}"),
-                    &[("A.esp", "old"), ("B.esp", "new")],
+                    &[("Base.esm", "original"), ("A.esp", "old"), ("B.esp", "new")],
                 )
             })
             .collect();

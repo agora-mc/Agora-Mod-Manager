@@ -2016,14 +2016,21 @@ fn overlaps_are_cached_and_a_plain_read_does_not_run_the_reader() {
     def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
     let h = Harness::with_definition(def);
     let inst = h.instance("overlaps-cache");
-    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
     h.add(&inst, &item);
     h.deploy(&inst);
     h.answer_overlaps(OverlapReply {
         keys: vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "new")],
+            &[("A.esp", "original"), ("B.esp", "old"), ("C.esp", "new")],
         )],
         notes: Vec::new(),
     });
@@ -2031,8 +2038,8 @@ fn overlaps_are_cached_and_a_plain_read_does_not_run_the_reader() {
     let report = game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None)
         .expect("overlaps were checked");
     assert_eq!(report.pairs.len(), 1);
-    assert_eq!(report.pairs[0].winner, "B.esp");
-    assert_eq!(report.pairs[0].loser, "A.esp");
+    assert_eq!(report.pairs[0].winner, "C.esp");
+    assert_eq!(report.pairs[0].loser, "B.esp");
     assert_eq!(h.overlaps_calls(), 1);
 
     let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
@@ -2354,14 +2361,21 @@ fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_la
     def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
     let h = Harness::with_definition(def);
     let inst = h.instance("overlaps-check");
-    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
     h.add(&inst, &item);
     h.deploy(&inst);
     h.answer_overlaps(OverlapReply {
         keys: vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "new")],
+            &[("A.esp", "original"), ("B.esp", "old"), ("C.esp", "new")],
         )],
         notes: Vec::new(),
     });
@@ -2384,14 +2398,14 @@ fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_la
         "{findings:?}"
     );
 
-    // A recorded session where A was off makes the pair new.
+    // A recorded session without C makes the pair new, because C was added.
     let conn = agora_core::db::local_state_connection(&h.ctx.paths.local_state_db()).unwrap();
     let manifest = agora_core::session_ledger::LaunchManifest {
         load_order: vec![
             agora_core::session_ledger::LoadOrderEntry {
                 list: "plugins".into(),
                 name: "A.esp".into(),
-                active: false,
+                active: true,
             },
             agora_core::session_ledger::LoadOrderEntry {
                 list: "plugins".into(),
@@ -2419,10 +2433,10 @@ fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_la
     assert_eq!(
         warning,
         &game_load_order::Finding::ListLevel {
-            message: "Warning: 'B.esp' now replaces 1 change made by 'A.esp' (e.g. GMST \
-                      fJumpHeightMin). Keep this order, or let 'A.esp' win."
+            message: "Warning: 'C.esp' now replaces 1 change made by 'B.esp' (e.g. GMST \
+                      fJumpHeightMin). Keep this order, or let 'B.esp' win."
                 .to_string(),
-            items: vec!["B.esp".into(), "A.esp".into()],
+            items: vec!["C.esp".into(), "B.esp".into()],
             refuses: false,
         }
     );

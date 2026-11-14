@@ -11743,6 +11743,7 @@ fn plugins_load_order_command(
                     "pairs": report.pairs,
                     "patched": report.patched,
                     "decided": report.decided,
+                    "implicit_pairs": report.implicit_pairs,
                     "notes": report.notes,
                 });
                 if let Some(action) = action_json {
@@ -11967,10 +11968,17 @@ fn print_overlap_report(
     }
     if report.patched > 0 || report.decided > 0 {
         println!(
-            "{} record{} patched by its winner; {} decided by your rules.",
+            "{} pair{} patched by its winner; {} decided by your rules.",
             report.patched,
             if report.patched == 1 { "" } else { "s" },
             report.decided
+        );
+    }
+    if report.implicit_pairs > 0 {
+        println!(
+            "{} pair{} between the game's own files, which nobody can reorder.",
+            report.implicit_pairs,
+            if report.implicit_pairs == 1 { "" } else { "s" }
         );
     }
     for note in &report.notes {

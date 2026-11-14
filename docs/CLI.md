@@ -270,9 +270,12 @@ you ask for it.
 
 Two plugins that change the same record cannot both win: the one that loads later replaces the
 other's change. `plugins conflicts` shows the pairs where that happens, with how many records and
-an example for each. A record the plugins make identically is not a conflict, nor is one the
-winner patches by listing the other plugin as a master, nor one covered by a rule. The two
-actions add the rule that records your decision, so it survives every later sort:
+an example for each. A record's definer never loses, because overriding it is what a mod is for.
+A record the plugins make identically is not a conflict, nor is one the winner patches on purpose
+(the other plugin is one of its masters, directly or through another master), nor one covered by
+a rule. A pair between the game's own always-loaded files is counted in the summary and never
+listed or warned about, because nobody can reorder it. The two actions add the rule that records
+your decision, so it survives every later sort:
 `--keep <winner> --over <loser>` keeps the plugin that currently wins, and
 `--let-win <loser> --over <winner>` also moves the losing plugin after the winner now. Rules are
 kept per instance and list by `plugins rule`, and a rule whose plugin leaves the list is kept and
