@@ -487,7 +487,12 @@ fn diagnose_session_with(
 ) -> Option<SessionAnswer> {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
     let record = session_ledger::get(&conn, session_id).ok().flatten()?;
+    // A long session that exits non-zero is judged `ClosedUnknown` only because no artifact was
+    // known when the verdict was written. Losing that race must not lose the crash: the evidence
+    // is looked at here, and a log inside the window turns it into `Crashed`.
+    let nonzero = is_unexplained_nonzero_exit(&record);
     let diagnosable = diagnoses(record.verdict)
+        || nonzero
         || (allow_unknown && record.verdict == Some(SessionVerdict::ClosedUnknown));
     if !diagnosable || record.ended_at.is_none() {
         return None;
@@ -503,6 +508,7 @@ fn diagnose_session_with(
     // Crash evidence inside the session window is the verdict, whatever the exit code or the
     // session's length said. A bound artifact from a primary source is enough on its own; the
     // rules do not have to recognize the log. Corrections are best effort like every ledger write.
+    let found_crash = crash_artifact.is_some() || answer_finds_a_crash(&answer);
     if let Some(how) = crash_artifact {
         let _ = session_ledger::mark_crashed(&conn, session_id, how);
     } else if answer_finds_a_crash(&answer) {
@@ -510,9 +516,18 @@ fn diagnose_session_with(
     }
     // An unwatched session with no crash evidence is not a crash to explain; leave it unanswered
     // rather than storing a lead that would be invented from the verdict.
-    if allow_unknown && crash_artifact.is_none() && !answer_finds_a_crash(&answer) {
+    if allow_unknown && !found_crash {
         return None;
     }
+    // A non-zero exit with nothing to read still gets a stored reason. A blank row would read as
+    // "nothing happened", which is not what an unobserved abnormal ending means.
+    let answer = if nonzero && !found_crash {
+        StoredAnswer::CouldNotAnalyze {
+            why: no_crash_evidence_reason(&record),
+        }
+    } else {
+        answer
+    };
     let created_at = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
     let session_answer = SessionAnswer {
         session_id: record.session_id.clone(),
@@ -540,7 +555,8 @@ fn answer_finds_a_crash(answer: &StoredAnswer) -> bool {
 pub fn record_could_not_analyze(ctx: &Ctx, session_id: &str, why: String) -> Option<SessionAnswer> {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
     let record = session_ledger::get(&conn, session_id).ok().flatten()?;
-    if !diagnoses(record.verdict) || record.ended_at.is_none() {
+    let needed = diagnoses(record.verdict) || is_unexplained_nonzero_exit(&record);
+    if !needed || record.ended_at.is_none() {
         return None;
     }
     let stored = SessionAnswer {
@@ -551,6 +567,38 @@ pub fn record_could_not_analyze(ctx: &Ctx, session_id: &str, why: String) -> Opt
     };
     let _ = store_answer(&conn, &stored);
     Some(stored)
+}
+
+/// A session that exited non-zero but was judged `ClosedUnknown`: a long session whose crash log
+/// was not known when the verdict was written. The evidence is the only thing that can promote it
+/// to `Crashed`, and it must still be looked at.
+fn is_unexplained_nonzero_exit(record: &SessionRecord) -> bool {
+    matches!(record.verdict, Some(SessionVerdict::ClosedUnknown))
+        && matches!(
+            &record.exit,
+            Some(ExitObservation::Code { code, .. }) if *code != 0
+        )
+}
+
+/// The stored reason a non-zero ending with no crash evidence gets. It is a reason, never a
+/// verdict and never silence.
+fn no_crash_evidence_reason(record: &SessionRecord) -> String {
+    let how = match &record.exit {
+        Some(ExitObservation::Code { code, .. }) => format!("exit code {code}"),
+        Some(ExitObservation::Unavailable { reason }) => {
+            format!("an exit Agora could not observe ({reason})")
+        }
+        None => "no recorded exit".to_string(),
+    };
+    let ran = record_window(record)
+        .ok()
+        .and_then(|window| window.ended.duration_since(window.started).ok())
+        .map(|elapsed| format!(" after {} second(s)", elapsed.as_secs()))
+        .unwrap_or_default();
+    format!(
+        "The game ended with {how}{ran}, but no crash log or other crash evidence was written \
+         inside the session. There is no crash to explain."
+    )
 }
 
 /// Only a session that crashed, failed to start or froze has a crash to explain. A normal or
@@ -755,7 +803,12 @@ fn diagnose_record(
     };
 
     let changes = previous_changes(conn, record)?;
-    let engine_facts = session_engine_facts(record, &changes);
+    // A bound crash log is the verdict, whatever the exit code said when the session was closed.
+    // The rules must see `crashed`, or a resolved save-load frame would still be capped as unknown.
+    let effective_verdict = crash_artifact
+        .map(|how| SessionVerdict::Crashed { how })
+        .or(record.verdict);
+    let engine_facts = session_engine_facts(record, effective_verdict, &changes);
 
     // The same crash's own files may sit in a source folder, so leave them out of the history
     // comparison by their content hash. Hash the whole source file, never the stored copy: a log
@@ -983,8 +1036,12 @@ fn previous_changes(
         .unwrap_or_default())
 }
 
-fn session_engine_facts(record: &SessionRecord, changes: &[ManifestChange]) -> Vec<Fact> {
-    let verdict = match record.verdict {
+fn session_engine_facts(
+    record: &SessionRecord,
+    verdict: Option<SessionVerdict>,
+    changes: &[ManifestChange],
+) -> Vec<Fact> {
+    let verdict = match verdict {
         Some(SessionVerdict::Crashed { .. }) => "crashed",
         Some(SessionVerdict::FailedToStart) => "failed_to_start",
         Some(SessionVerdict::Froze) => "froze",

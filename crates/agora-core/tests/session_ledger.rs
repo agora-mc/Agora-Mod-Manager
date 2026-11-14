@@ -581,18 +581,22 @@ fn start_session(f: &Fixture, started: &str, items: &[&str]) -> String {
 }
 
 fn end_session(f: &Fixture, id: &str, ended: &str, code: u32) {
+    end_session_after(f, id, ended, code, 60_000);
+}
+
+fn end_session_after(f: &Fixture, id: &str, ended: &str, code: u32, runtime_ms: u64) {
     session_ledger::finish(
         &ledger(f),
         id,
         &session_ledger::SessionFinish {
             ended_at: ended.to_string(),
-            duration_ms: 60_000,
+            duration_ms: runtime_ms as i64,
             exit: session_ledger::ExitObservation::Code {
                 pid: 4242,
                 image: "Game.exe".to_string(),
                 code,
             },
-            game_runtime_ms: Some(60_000),
+            game_runtime_ms: Some(runtime_ms),
             normal_exit_codes: vec![0],
             artifact: None,
             froze: false,
@@ -709,6 +713,72 @@ fn a_log_locked_before_the_copy_is_reported_as_unreadable_not_as_no_log() {
         }
         other => panic!("expected nothing-to-read, got {other:?}"),
     }
+}
+
+#[test]
+fn a_long_nonzero_session_with_a_crash_log_is_crashed_and_answered() {
+    let f = fixture(1);
+    write_log(&f);
+    let id = start_session(&f, &now_minus(2_400), &["mod-a"]);
+    // 38 minutes and exit code 1: the ledger cannot call this a crash on the code alone, so the
+    // verdict starts as ClosedUnknown. A log inside the window still has to become the answer.
+    end_session_after(&f, &id, &now_minus(1), 1, 38 * 60 * 1_000);
+    assert_eq!(
+        session_ledger::get(&ledger(&f), &id)
+            .unwrap()
+            .unwrap()
+            .verdict,
+        Some(SessionVerdict::ClosedUnknown),
+        "the race this reproduces: no artifact was known when the verdict was written"
+    );
+
+    let answer = diagnose(&f, &id).expect("the crash log inside the window is an answer");
+    assert!(
+        matches!(
+            answer.answer,
+            agora_core::crash_live::StoredAnswer::Analyzed { .. }
+        ),
+        "{:?}",
+        answer.answer
+    );
+    assert!(
+        !headlines(&stored(&f, &id).answer).is_empty(),
+        "the log's finding reaches the stored answer"
+    );
+    assert!(
+        matches!(
+            session_ledger::get(&ledger(&f), &id)
+                .unwrap()
+                .unwrap()
+                .verdict,
+            Some(SessionVerdict::Crashed { .. })
+        ),
+        "a bound crash log corrects the verdict whatever the exit code said"
+    );
+}
+
+#[test]
+fn a_long_nonzero_session_with_no_crash_log_stores_a_reason() {
+    let f = fixture(1);
+    let id = start_session(&f, &now_minus(2_400), &["mod-a"]);
+    end_session_after(&f, &id, &now_minus(1), 1, 38 * 60 * 1_000);
+
+    let answer = diagnose(&f, &id).expect("an abnormal ending never gets a blank row");
+    match answer.answer {
+        agora_core::crash_live::StoredAnswer::CouldNotAnalyze { why } => {
+            assert!(why.contains("exit code 1"), "{why}");
+            assert!(why.contains("no crash log"), "{why}");
+        }
+        other => panic!("expected a stored reason, got {other:?}"),
+    }
+    assert_eq!(
+        session_ledger::get(&ledger(&f), &id)
+            .unwrap()
+            .unwrap()
+            .verdict,
+        Some(SessionVerdict::ClosedUnknown),
+        "no evidence says it was a crash, so the verdict is not invented"
+    );
 }
 
 #[test]
