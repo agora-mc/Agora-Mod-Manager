@@ -2235,27 +2235,35 @@ const EXTENDED_ESL_GAME = [1, 6, 1130, 0];
 // own package (Nexus Mods, Skyrim Special Edition) and Tullius (GPL-3); see crash/FACTS.md.
 const BACKPORTED_ESL_DLLS = ["BackportedESLSupport.dll", "bees.dll"];
 
-// The instance's in-use save folder, exposed read-only by the host under this name. A `.ess`
-// save's plugin list is recorded as a count, then for each plugin a length-prefixed name and an
-// active byte. The header is variable-length, so the block is found by its shape within a bounded
-// prefix and every name is validated; the rest of the save is never read. Layout followed:
-// UESP, "Skyrim Mod:Save File Format", section "Plugin Info" (https://en.uesp.net/wiki/Skyrim_Mod:Save_File_Format).
+// The instance's in-use save folder, exposed read-only by the host under this name. A save's
+// plugin list is a count followed by length-prefixed names. An SE save keeps it in an LZ4 body
+// after the header and screenshot; an older save keeps it near the start. Both are read within
+// bounds, and every name is validated. Layout followed: UESP, "Skyrim Mod:Save File Format",
+// section "Plugin Info" (https://en.uesp.net/wiki/Skyrim_Mod:Save_File_Format).
 const SAVE_VIEW = "@saves";
 const SAVE_HEADER_WINDOW = 8192;
 const SAVE_PLUGIN_NAME = /\.(?:esp|esm|esl)$/i;
 
-const SAVE_MAX_FILE = 32 * 1024 * 1024;
-const SAVE_MAX_UNCOMPRESSED = 64 * 1024 * 1024;
+// The compressed file is read whole (a late-game save is a few MB), but only the start of the
+// decompressed body is decoded. LZ4 block decoding produces output front to back, and the plugin
+// block is at the front, so the rest of the body is never decoded. The two limits are separate:
+// one caps what is read, the other what is decoded.
+const SAVE_MAX_FILE = 128 * 1024 * 1024;
+const SAVE_MAX_PLUGIN_BLOCK = 8 * 1024 * 1024;
 const SAVE_READ_CHUNK = 1024 * 1024;
 
-/// One LZ4 block (no frame header), as Skyrim SE writes after the save's screenshot. Bounded by
-/// the decompressed size the save states, so a hostile file cannot make the launcher grow without
-/// limit. Source for the block format: https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
-function saveLz4(bytes, start, end, expected) {
-  const out = new Uint8Array(expected);
+/// The start of one LZ4 block (no frame header), as Skyrim SE writes after the save's screenshot.
+/// Decoding runs front to back and stops once `target` bytes are out, so the rest of a multi-MB
+/// body is never decoded; a block whose tail is malformed or missing still reads when the bytes
+/// Agora uses are out first. `expected` is the decompressed size the save states. Returns the
+/// prefix, or null when the block ends before producing it. Source for the block format:
+/// https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
+function saveLz4Prefix(bytes, start, end, expected, target) {
+  if (target < 1 || target > expected) return null;
+  const out = new Uint8Array(target);
   let at = start;
   let outAt = 0;
-  while (at < end) {
+  while (at < end && outAt < target) {
     const token = bytes[at];
     at += 1;
     let literals = token >>> 4;
@@ -2267,11 +2275,12 @@ function saveLz4(bytes, start, end, expected) {
         if (next !== 255) break;
       }
     }
-    if (outAt + literals > expected || at + literals > end) return null;
-    out.set(bytes.subarray(at, at + literals), outAt);
-    at += literals;
-    outAt += literals;
-    if (at >= end) break;
+    const literal = Math.min(literals, target - outAt);
+    if (at + literal > end) return null;
+    out.set(bytes.subarray(at, at + literal), outAt);
+    at += literal;
+    outAt += literal;
+    if (outAt >= target) break;
     if (at + 2 > end) return null;
     const offset = bytes[at] | (bytes[at + 1] << 8);
     at += 2;
@@ -2285,13 +2294,13 @@ function saveLz4(bytes, start, end, expected) {
         if (next !== 255) break;
       }
     }
-    if (outAt + match > expected) return null;
-    for (let index = 0; index < match; index += 1) {
+    const copied = Math.min(match, target - outAt);
+    for (let index = 0; index < copied; index += 1) {
       out[outAt] = out[outAt - offset];
       outAt += 1;
     }
   }
-  return outAt === expected ? out : null;
+  return outAt === target ? out : null;
 }
 
 /// The plugin block at the start of an SE save's decompressed body: a marker byte, the block size,
@@ -2331,8 +2340,10 @@ function savePluginBlock(bytes) {
 }
 
 /// An SE save: `TESV_SAVEGAME`, header size, the header, a screenshot, then the size of the
-/// decompressed body, the compressed size, and one LZ4 block. The plugin list is in that body.
-/// Layout followed: UESP, "Skyrim Mod:Save File Format"
+/// decompressed body, the compressed size, and one LZ4 block. The plugin block is at the start of
+/// that body, so only it is decoded. Returns `null` when the bytes are not this shape (so the
+/// older parser may try), `{ plugins }` on success, or `{ reason }` when the block is over the
+/// limit Agora decodes. Layout followed: UESP, "Skyrim Mod:Save File Format"
 /// (https://en.uesp.net/wiki/Skyrim_Mod:Save_File_Format).
 function saveSePluginList(bytes) {
   if (bytes.length < 17 || ascii(bytes, 0, 13) !== "TESV_SAVEGAME") return null;
@@ -2376,11 +2387,31 @@ function saveSePluginList(bytes) {
   if (sizes + 8 > bytes.length) return null;
   const uncompressed = view.getUint32(sizes, true);
   const compressed = view.getUint32(sizes + 4, true);
-  if (uncompressed < 6 || compressed === 0 || uncompressed > SAVE_MAX_UNCOMPRESSED) return null;
+  if (uncompressed < 6 || compressed === 0) return null;
   const start = sizes + 8;
   const end = Math.min(bytes.length, start + compressed);
-  const body = saveLz4(bytes, start, end, uncompressed);
-  return body === null ? null : savePluginBlock(body);
+  // The body begins with a marker byte and the block's stated size. Read those five bytes first,
+  // so an oversized block is refused before anything is decoded for it.
+  const head = saveLz4Prefix(bytes, start, end, uncompressed, 5);
+  if (head === null) return null;
+  const blockSize = new DataView(head.buffer, head.byteOffset, head.byteLength).getUint32(1, true);
+  if (blockSize === 0) return null;
+  if (blockSize > SAVE_MAX_PLUGIN_BLOCK) {
+    return {
+      plugins: null,
+      reason:
+        "its plugin list is " +
+        blockSize +
+        " bytes, over the " +
+        SAVE_MAX_PLUGIN_BLOCK +
+        " byte limit Agora decodes",
+    };
+  }
+  const need = 5 + blockSize;
+  if (need > uncompressed) return null;
+  const body = saveLz4Prefix(bytes, start, end, uncompressed, need);
+  if (body === null) return null;
+  return { plugins: savePluginBlock(body), reason: null };
 }
 
 /// The old shape: a plugin count and length-prefixed names with an active byte, found by its shape
@@ -2455,16 +2486,32 @@ function newestSavePlugins() {
   if (saves.length === 0) return { plugins: null, name: null, reason: null };
   const newest = saves[0];
   const name = newest.name;
-  if (newest.size < 17 || newest.size > SAVE_MAX_FILE) {
+  if (newest.size < 17) {
     return {
       plugins: null,
       name: name,
-      reason: "its size is outside what Agora reads for a save",
+      reason: "it is too short to be a save",
+    };
+  }
+  if (newest.size > SAVE_MAX_FILE) {
+    return {
+      plugins: null,
+      name: name,
+      reason:
+        "it is " +
+        newest.size +
+        " bytes, over the " +
+        SAVE_MAX_FILE +
+        " byte limit Agora reads",
     };
   }
   try {
     const bytes = saveReadAll(SAVE_VIEW + "/" + name, newest.size);
-    const plugins = saveSePluginList(bytes) || savePluginList(bytes);
+    const se = saveSePluginList(bytes);
+    if (se !== null && se.reason !== null) {
+      return { plugins: null, name: name, reason: se.reason };
+    }
+    const plugins = (se !== null ? se.plugins : null) || savePluginList(bytes);
     if (plugins === null) {
       return {
         plugins: null,

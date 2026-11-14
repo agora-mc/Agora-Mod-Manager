@@ -350,6 +350,13 @@ describe('could not check', () => {
             detail: 'no parser looked for it (4 rules)',
             source,
           },
+          {
+            reason: 'skipped_on_purpose',
+            subject: 'older crash logs',
+            detail:
+              'older-1.txt was not checked as an older crash log: it belongs to the crash being analysed.',
+            source,
+          },
         ],
       }),
     });

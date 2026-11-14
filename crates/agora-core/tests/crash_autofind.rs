@@ -337,6 +337,31 @@ fn older_logs_over_the_sweep_bound_are_reported_as_skipped() {
 }
 
 #[test]
+fn a_log_that_is_this_crash_is_skipped_on_purpose_not_as_a_limitation() {
+    let fixture = Fixture::new();
+    write_log(&fixture.instance_dir, "logs/current.txt", "2000");
+    let bytes = std::fs::read(fixture.instance_dir.join("logs/current.txt")).unwrap();
+    let hash = agora_core::crash_history::content_hash(&bytes);
+    let setup = HistorySetup {
+        exclude_hashes: std::slice::from_ref(&hash),
+        ..fixture.setup()
+    };
+    let report = sweep_instance_logs(
+        &fixture.ctx,
+        &fixture.conn,
+        &setup,
+        LogSweepLimits::default(),
+    )
+    .unwrap();
+    let skipped = report
+        .skipped
+        .iter()
+        .find(|skipped| skipped.name == "current.txt")
+        .unwrap_or_else(|| panic!("expected a skipped log, got {:#?}", report.skipped));
+    assert!(skipped.intentional, "{:#?}", report.skipped);
+}
+
+#[test]
 fn a_recurring_suspect_boosts_the_answer_and_gets_one_counting_finding() {
     let fixture = Fixture::new();
     let file = CrashFile::new("current.txt", log_bytes("1000"));

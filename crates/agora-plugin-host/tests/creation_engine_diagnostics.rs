@@ -45,6 +45,9 @@ struct ViewReads {
     files: HashMap<String, Vec<u8>>,
     /// Paths whose read must fail as if the file could not be opened.
     unreadable: Vec<String>,
+    /// Sizes the listing reports instead of the bytes' length. Lets a test describe a file too
+    /// large to build without allocating it.
+    listed_sizes: HashMap<String, u64>,
 }
 
 impl GameReads for ViewReads {
@@ -96,7 +99,12 @@ impl GameReads for ViewReads {
             }
             let name = rest.split('/').next().unwrap_or(rest).to_string();
             let is_dir = rest.contains('/');
-            found.insert(name, (is_dir, bytes.len() as u64));
+            let size = self
+                .listed_sizes
+                .get(&format!("{prefix}{name}"))
+                .copied()
+                .unwrap_or(bytes.len() as u64);
+            found.insert(name, (is_dir, size));
         }
         let entries: Vec<serde_json::Value> = found
             .into_iter()
@@ -190,6 +198,16 @@ fn run(
     runtime: &str,
     entries: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
+    run_with_listed_sizes(files, Vec::new(), unreadable, runtime, entries)
+}
+
+fn run_with_listed_sizes(
+    files: Vec<(String, Vec<u8>)>,
+    listed_sizes: Vec<(String, u64)>,
+    unreadable: Vec<String>,
+    runtime: &str,
+    entries: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
     let (_dir, host, id) = engine_host();
     let reads = ViewReads {
         files: files
@@ -197,6 +215,10 @@ fn run(
             .map(|(name, bytes)| (key(&name), bytes))
             .collect(),
         unreadable: unreadable.into_iter().map(|name| key(&name)).collect(),
+        listed_sizes: listed_sizes
+            .into_iter()
+            .map(|(name, size)| (key(&name), size))
+            .collect(),
     };
     let args = serde_json::json!({ "context": context(runtime, entries) });
     let reply = host
@@ -491,10 +513,8 @@ fn se_lz4_literals(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// An invented Skyrim SE 1.6 save: the magic, a 79-byte header, a 1x1 screenshot, the decompressed
-/// and compressed sizes, and one LZ4 block. No bytes come from a real save.
-fn se_save_bytes(full: &[&str], light: &[&str]) -> Vec<u8> {
-    let block = se_plugin_block(full, light);
-    let compressed = se_lz4_literals(&block);
+/// and compressed sizes, and the given LZ4 bytes. No bytes come from a real save.
+fn se_save_with_body(uncompressed: usize, compressed: &[u8]) -> Vec<u8> {
     let mut header = Vec::new();
     header.extend_from_slice(&12u32.to_le_bytes()); // version
     header.extend_from_slice(&1u32.to_le_bytes()); // save number
@@ -520,10 +540,37 @@ fn se_save_bytes(full: &[&str], light: &[&str]) -> Vec<u8> {
     out.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&header);
     out.extend_from_slice(&[0u8; 4]); // the 1x1 RGBA screenshot
-    out.extend_from_slice(&u32::try_from(block.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&u32::try_from(uncompressed).unwrap().to_le_bytes());
     out.extend_from_slice(&u32::try_from(compressed.len()).unwrap().to_le_bytes());
-    out.extend_from_slice(&compressed);
+    out.extend_from_slice(compressed);
     out
+}
+
+fn se_save_bytes(full: &[&str], light: &[&str]) -> Vec<u8> {
+    let block = se_plugin_block(full, light);
+    let compressed = se_lz4_literals(&block);
+    se_save_with_body(block.len(), &compressed)
+}
+
+/// An invented SE save whose plugin block is followed by bytes that are not valid LZ4, and whose
+/// stated body is much larger than the block. A reader that decodes the whole body fails on the
+/// tail; the reader must stop once the plugin block is out. No bytes come from a real save.
+fn se_save_with_invalid_tail(full: &[&str], light: &[&str]) -> Vec<u8> {
+    let block = se_plugin_block(full, light);
+    let mut compressed = se_lz4_literals(&block);
+    // No literals and a match offset of zero: not a valid LZ4 sequence.
+    compressed.extend_from_slice(&[0x00, 0x00, 0x00]);
+    se_save_with_body(block.len() + 4 * 1024 * 1024, &compressed)
+}
+
+/// An invented SE save whose plugin block says it is one byte over the decode limit, with only
+/// the marker and size present. The reader should refuse it by name without decoding the rest.
+fn se_save_with_oversized_plugin_block() -> Vec<u8> {
+    const DECLARED: u32 = 8 * 1024 * 1024 + 1;
+    let mut head = vec![0x4e];
+    head.extend_from_slice(&DECLARED.to_le_bytes());
+    let compressed = se_lz4_literals(&head);
+    se_save_with_body(head.len() + DECLARED as usize, &compressed)
 }
 
 #[test]
@@ -578,6 +625,73 @@ fn an_lz4_save_whose_full_and_light_plugins_are_active_says_nothing() {
         ),
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn an_se_save_stops_decoding_once_the_plugin_block_is_out() {
+    let diagnostics = run(
+        vec![(
+            "@saves/large.ess".to_string(),
+            se_save_with_invalid_tail(&["Skyrim.esm"], &["InventedLight.esl"]),
+        )],
+        Vec::new(),
+        "1.6.1170",
+        &[entry("Skyrim.esm"), disabled("InventedLight.esl")],
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "CE_SAVE_PLUGINS_NOT_CHECKED"),
+        "{diagnostics:#?}"
+    );
+    let warned = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "CE_SAVE_NEEDS_INACTIVE_PLUGIN")
+        .unwrap_or_else(|| panic!("expected the save warning, got {diagnostics:#?}"));
+    assert!(message(warned).contains("InventedLight.esl"), "{warned:#?}");
+}
+
+#[test]
+fn an_oversized_plugin_block_names_the_decode_limit() {
+    let diagnostics = run(
+        vec![(
+            "@saves/huge.ess".to_string(),
+            se_save_with_oversized_plugin_block(),
+        )],
+        Vec::new(),
+        "1.6.1170",
+        &[],
+    );
+    let note = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "CE_SAVE_PLUGINS_NOT_CHECKED")
+        .unwrap_or_else(|| panic!("expected a not-checked note, got {diagnostics:#?}"));
+    let text = message(note);
+    assert!(text.contains("huge.ess"), "{text}");
+    assert!(text.contains("8388609"), "{text}");
+    assert!(text.contains("8388608"), "{text}");
+    assert!(text.contains("byte limit Agora decodes"), "{text}");
+}
+
+#[test]
+fn a_save_over_the_read_limit_names_that_limit() {
+    const LIMIT: u64 = 128 * 1024 * 1024;
+    let diagnostics = run_with_listed_sizes(
+        vec![("@saves/enormous.ess".to_string(), b"TESV_SAVEGAME".to_vec())],
+        vec![("@saves/enormous.ess".to_string(), LIMIT + 1)],
+        Vec::new(),
+        "1.6.1170",
+        &[],
+    );
+    let note = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "CE_SAVE_PLUGINS_NOT_CHECKED")
+        .unwrap_or_else(|| panic!("expected a not-checked note, got {diagnostics:#?}"));
+    let text = message(note);
+    assert!(text.contains("enormous.ess"), "{text}");
+    assert!(text.contains(&(LIMIT + 1).to_string()), "{text}");
+    assert!(text.contains(&LIMIT.to_string()), "{text}");
+    assert!(text.contains("byte limit Agora reads"), "{text}");
 }
 
 #[test]
