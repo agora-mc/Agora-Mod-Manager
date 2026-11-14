@@ -299,6 +299,9 @@ pub enum CouldNotCheckReason {
     InspectorMissing,
     /// Agora did not keep these bytes.
     NotRetained,
+    /// The file was left out on purpose (it is this crash, or one already diagnosed), not because
+    /// a check failed. A note for pack authors; the player answer drops it.
+    SkippedOnPurpose,
     /// A rule hit [`MAX_RULE_BRANCHES`](super::MAX_RULE_BRANCHES).
     TooManyMatches,
     /// The instance could not supply it: its listing or the metadata attribution needs was

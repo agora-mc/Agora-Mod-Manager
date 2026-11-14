@@ -480,12 +480,16 @@ function Changes({ changes }: { changes?: CrashChange[] }) {
 }
 
 /**
- * The checks a player can act on. A rule that hit its branch limit, or asked for a fact no parser
- * looked for, is a note for pack authors: the JSON answer keeps it, this list does not.
+ * The checks a player can act on. A rule that hit its branch limit, asked for a fact no parser
+ * looked for, or a log that was skipped on purpose is a note for pack authors: the JSON answer
+ * keeps it, this list does not.
  */
 export function playerCouldNotCheck(answer: CrashAnswer): CrashAnswer['could_not_check'] {
   return answer.could_not_check.filter(
-    (check) => check.reason !== 'too_many_matches' && check.reason !== 'not_covered',
+    (check) =>
+      check.reason !== 'too_many_matches'
+      && check.reason !== 'not_covered'
+      && check.reason !== 'skipped_on_purpose',
   );
 }
 

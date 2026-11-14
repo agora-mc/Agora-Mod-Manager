@@ -74,6 +74,10 @@ pub struct SkippedLog {
     pub source_id: String,
     pub name: String,
     pub reason: String,
+    /// It was left out on purpose (it is this crash, or one already diagnosed), not because a
+    /// limit, a bad read or a guard stopped it.
+    #[serde(default)]
+    pub intentional: bool,
 }
 
 /// What one sweep did. `skipped_older` is the count left for a later sweep because the per-sweep
@@ -357,6 +361,7 @@ pub fn sweep_instance_logs(
                         source_id: (*source_id).to_string(),
                         name,
                         reason: format!("its metadata could not be read: {error}"),
+                        intentional: false,
                     });
                     continue;
                 }
@@ -366,6 +371,7 @@ pub fn sweep_instance_logs(
                     source_id: (*source_id).to_string(),
                     name,
                     reason: "a junction or symlink is never followed".to_string(),
+                    intentional: false,
                 });
                 continue;
             }
@@ -377,6 +383,7 @@ pub fn sweep_instance_logs(
                     source_id: (*source_id).to_string(),
                     name,
                     reason: "the source says a marker file must show it is finished".to_string(),
+                    intentional: false,
                 });
                 continue;
             }
@@ -428,6 +435,7 @@ pub fn sweep_instance_logs(
                     "it is {} bytes, over the {} byte limit for one log",
                     candidate.size, limits.max_file_bytes
                 ),
+                intentional: false,
             });
             continue;
         }
@@ -438,6 +446,7 @@ pub fn sweep_instance_logs(
                     source_id: candidate.source_id.clone(),
                     name: candidate.name.clone(),
                     reason: format!("it could not be read: {error}"),
+                    intentional: false,
                 });
                 continue;
             }
@@ -455,6 +464,7 @@ pub fn sweep_instance_logs(
                 source_id: candidate.source_id.clone(),
                 name: candidate.name.clone(),
                 reason: "it belongs to the crash being analysed".to_string(),
+                intentional: true,
             });
             continue;
         }
@@ -465,6 +475,7 @@ pub fn sweep_instance_logs(
                 source_id: candidate.source_id.clone(),
                 name: candidate.name.clone(),
                 reason: "it was already analysed for a diagnosed session".to_string(),
+                intentional: true,
             });
             continue;
         }

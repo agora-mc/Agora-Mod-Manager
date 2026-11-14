@@ -469,7 +469,8 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
 }
 
 /// Add the sweep's limitations to each answer, so a log it did not reach is "not checked", never
-/// silently treated as absent.
+/// silently treated as absent. A log left out on purpose is a note for the pack author: the JSON
+/// answer keeps it, the player answer's filter drops it.
 fn add_history_notes(
     outputs: &mut [AnalyzeOutput],
     prepared: Option<&PreparedHistory>,
@@ -478,51 +479,64 @@ fn add_history_notes(
 ) {
     let Some(prepared) = prepared else {
         if let Some(why) = history_error {
+            let note = older_crash_note(
+                CouldNotCheckReason::NotRetained,
+                format!("the older crash logs could not be read: {why}"),
+            );
             for output in outputs.iter_mut() {
-                output
-                    .answer
-                    .could_not_check
-                    .push(agora_game_api::crash::CouldNotCheck {
-                        reason: agora_game_api::crash::CouldNotCheckReason::NotRetained,
-                        subject: "older crash logs".to_string(),
-                        detail: Some(format!("the older crash logs could not be read: {why}")),
-                        source: None,
-                    });
+                output.answer.could_not_check.push(note.clone());
             }
         }
         return;
     };
     let mut notes = Vec::new();
     if let Some(text) = prepared.skipped_note(limits) {
-        notes.push(text);
+        notes.push(older_crash_note(CouldNotCheckReason::NotRetained, text));
     }
     if let Some(sweep) = &prepared.sweep {
         for skipped in &sweep.skipped {
-            notes.push(format!(
-                "{} was not checked as an older crash log: {}.",
-                skipped.name, skipped.reason
-            ));
+            notes.push(skipped_log_note(skipped));
         }
         for problem in &sweep.problems {
-            notes.push(format!(
-                "an older crash source ({}) could not be checked: {}",
-                problem.source_id, problem.detail
+            notes.push(older_crash_note(
+                CouldNotCheckReason::NotRetained,
+                format!(
+                    "an older crash source ({}) could not be checked: {}",
+                    problem.source_id, problem.detail
+                ),
             ));
         }
     }
     for note in notes {
         for output in outputs.iter_mut() {
-            output
-                .answer
-                .could_not_check
-                .push(agora_game_api::crash::CouldNotCheck {
-                    reason: agora_game_api::crash::CouldNotCheckReason::NotRetained,
-                    subject: "older crash logs".to_string(),
-                    detail: Some(note.clone()),
-                    source: None,
-                });
+            output.answer.could_not_check.push(note.clone());
         }
     }
+}
+
+fn older_crash_note(reason: CouldNotCheckReason, detail: String) -> CouldNotCheck {
+    CouldNotCheck {
+        reason,
+        subject: "older crash logs".to_string(),
+        detail: Some(detail),
+        source: None,
+    }
+}
+
+/// A log the sweep left alone: a limitation a player may need to know about, or a file it skipped
+/// on purpose (this crash, or one already diagnosed) and only a pack author cares about.
+fn skipped_log_note(skipped: &crash_history::SkippedLog) -> CouldNotCheck {
+    older_crash_note(
+        if skipped.intentional {
+            CouldNotCheckReason::SkippedOnPurpose
+        } else {
+            CouldNotCheckReason::NotRetained
+        },
+        format!(
+            "{} was not checked as an older crash log: {}.",
+            skipped.name, skipped.reason
+        ),
+    )
 }
 
 /// `agora crash patterns <instance>`: print the pattern across the crashes Agora already knows.
@@ -1127,16 +1141,18 @@ fn inspect_words(result: agora_game_api::crash::InspectResult) -> &'static str {
     }
 }
 
-/// The checks a person can read. A rule's branch-limit note and a fact kind no parser covered are
-/// notes for the pack author; the JSON answer keeps them, but they are not "could not check" a
-/// player can act on.
+/// The checks a person can read. A rule's branch-limit note, a fact kind no parser covered, and a
+/// log skipped on purpose are notes for the pack author; the JSON answer keeps them, but they are
+/// not "could not check" a player can act on.
 fn player_could_not_check(checks: &[CouldNotCheck]) -> Vec<&CouldNotCheck> {
     checks
         .iter()
         .filter(|check| {
             !matches!(
                 check.reason,
-                CouldNotCheckReason::TooManyMatches | CouldNotCheckReason::NotCovered
+                CouldNotCheckReason::TooManyMatches
+                    | CouldNotCheckReason::NotCovered
+                    | CouldNotCheckReason::SkippedOnPurpose
             )
         })
         .collect()
@@ -1150,6 +1166,7 @@ fn reason_words(reason: CouldNotCheckReason) -> &'static str {
         CouldNotCheckReason::CodeFailed => "a parser failed",
         CouldNotCheckReason::InspectorMissing => "no inspector is installed",
         CouldNotCheckReason::NotRetained => "Agora did not keep these bytes",
+        CouldNotCheckReason::SkippedOnPurpose => "it was skipped on purpose",
         CouldNotCheckReason::TooManyMatches => "the rule matched too many times",
         CouldNotCheckReason::InstanceIncomplete => "the instance could not supply it",
     }
@@ -1173,6 +1190,7 @@ mod tests {
         let checks = vec![
             check(CouldNotCheckReason::TooManyMatches),
             check(CouldNotCheckReason::NotCovered),
+            check(CouldNotCheckReason::SkippedOnPurpose),
             check(CouldNotCheckReason::CodeFailed),
         ];
         let shown = player_could_not_check(&checks);
@@ -1180,5 +1198,29 @@ mod tests {
         assert_eq!(shown[0].reason, CouldNotCheckReason::CodeFailed);
         assert!(player_could_not_check(&[check(CouldNotCheckReason::TooManyMatches)]).is_empty());
         assert!(player_could_not_check(&[check(CouldNotCheckReason::NotCovered)]).is_empty());
+        assert!(player_could_not_check(&[check(CouldNotCheckReason::SkippedOnPurpose)]).is_empty());
+    }
+
+    #[test]
+    fn a_log_skipped_on_purpose_is_not_a_player_facing_check() {
+        let skipped = crash_history::SkippedLog {
+            source_id: "logs".to_string(),
+            name: "older-1.txt".to_string(),
+            reason: "it belongs to the crash being analysed".to_string(),
+            intentional: true,
+        };
+        let note = skipped_log_note(&skipped);
+        assert_eq!(note.reason, CouldNotCheckReason::SkippedOnPurpose);
+        assert!(player_could_not_check(std::slice::from_ref(&note)).is_empty());
+
+        let limitation = skipped_log_note(&crash_history::SkippedLog {
+            intentional: false,
+            ..skipped
+        });
+        assert_eq!(limitation.reason, CouldNotCheckReason::NotRetained);
+        assert_eq!(
+            player_could_not_check(std::slice::from_ref(&limitation)).len(),
+            1
+        );
     }
 }

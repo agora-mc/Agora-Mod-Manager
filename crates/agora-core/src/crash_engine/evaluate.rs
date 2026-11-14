@@ -2447,6 +2447,7 @@ fn reason_rank(reason: CouldNotCheckReason) -> u8 {
         CouldNotCheckReason::NotRetained => 5,
         CouldNotCheckReason::TooManyMatches => 6,
         CouldNotCheckReason::InstanceIncomplete => 7,
+        CouldNotCheckReason::SkippedOnPurpose => 8,
     }
 }
 
