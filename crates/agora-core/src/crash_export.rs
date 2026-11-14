@@ -102,6 +102,30 @@ const NO_EVIDENCE: &str = "\
 Agora has no crash evidence to export yet. Run the game and let it crash, or \
 paste a crash log into Crash Doctor first.";
 
+/// Keep log text from ending the code fence it is shown inside.
+///
+/// A log line that starts with three backticks closes the block, and the rest of the log becomes
+/// live Markdown in a document built to be pasted into an assistant or Discord. The text is
+/// already redacted, but it is not ours: it must stay text. Insert an invisible zero-width space
+/// after the first backtick of such a line, so it can never be read as a fence while the line
+/// still reads exactly as the log did.
+fn safe_inside_fence(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let first_visible = line
+                .find(|character: char| !character.is_whitespace())
+                .unwrap_or(line.len());
+            let (indent, rest) = line.split_at(first_visible);
+            if rest.starts_with("```") {
+                format!("{indent}`\u{200B}{}", &rest[1..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build the report.
 ///
 /// `manifest_path`, when supplied and readable, adds the instance's mod list —
@@ -120,7 +144,7 @@ pub fn build_crash_report(
     if let Some(ref crash_log) = context.crash_log {
         parts.push(format!(
             "## Crash Log\n\n```\n{}\n```",
-            crate::log_sanitizer::sanitize_log_lines(crash_log)
+            safe_inside_fence(&crate::log_sanitizer::sanitize_log_lines(crash_log))
         ));
     }
 

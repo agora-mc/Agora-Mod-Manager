@@ -562,6 +562,7 @@ pub fn run() {
             games::ini_saves::games_saves_get,
             games::ini_saves::games_saves_set,
             games::ini_saves::games_saves_backup,
+            games::ini_saves::games_saves_backup_for_session,
             games::ini_saves::games_saves_backups,
             games::ini_saves::games_saves_restore,
             games::tools::games_tools_list,

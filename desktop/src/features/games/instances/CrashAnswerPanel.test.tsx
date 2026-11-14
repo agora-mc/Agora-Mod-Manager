@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   openExternalUrl: vi.fn(),
   backupSaves: vi.fn(),
   restoreSaves: vi.fn(),
+  saveBackupForSession: vi.fn(),
 }));
 
 vi.mock('./crashAnswerApi', () => ({
@@ -35,6 +36,7 @@ vi.mock('./crashAnswerApi', () => ({
 vi.mock('../iniSaves/api', () => ({
   backupSaves: mocks.backupSaves,
   restoreSaves: mocks.restoreSaves,
+  saveBackupForSession: mocks.saveBackupForSession,
 }));
 
 vi.mock('@/lib/tauri', () => ({
@@ -123,6 +125,7 @@ beforeEach(() => {
     fileCount: 3,
     bytes: 2_400_000,
   });
+  mocks.saveBackupForSession.mockResolvedValue(null);
   mocks.restoreSaves.mockResolvedValue({
     backupId: 'backup-1',
     folder: 'D:/Saves',
@@ -247,7 +250,7 @@ describe('backing up saves before a test', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'See what happened' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Test without Example Mod' }));
 
-    await waitFor(() => expect(mocks.backupSaves).toHaveBeenCalledWith('inst'));
+    await waitFor(() => expect(mocks.backupSaves).toHaveBeenCalledWith('inst', 's2'));
     const note = await screen.findByTestId('crash-save-warning');
     expect(note).toHaveTextContent(
       'Agora backed up your saves before this test. You can restore them from here.',
@@ -265,7 +268,7 @@ describe('backing up saves before a test', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'See what happened' }));
     fireEvent.click(await screen.findByRole('button', { name: 'Test without Example Mod' }));
 
-    await waitFor(() => expect(mocks.backupSaves).toHaveBeenCalledWith('inst'));
+    await waitFor(() => expect(mocks.backupSaves).toHaveBeenCalledWith('inst', 's2'));
     expect(await screen.findByTestId('crash-save-warning')).toHaveTextContent(
       'Back up your saves before you test, or test on a new game.',
     );
@@ -274,7 +277,7 @@ describe('backing up saves before a test', () => {
 
   it('shows the backed-up wording when returning to an answer whose test was prepared', async () => {
     mocks.listCrashAnswers.mockResolvedValue(list());
-    mocks.getSetting.mockResolvedValue('backup-1');
+    mocks.saveBackupForSession.mockResolvedValue('backup-1');
     render(<CrashAnswerOverview instanceId="inst" />);
     fireEvent.click(await screen.findByRole('button', { name: 'See what happened' }));
 

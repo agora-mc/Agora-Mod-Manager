@@ -871,7 +871,8 @@ fn a_live_diagnosed_crash_is_not_counted_again_when_its_log_is_swept() {
     diagnose(&f, &second).expect("the second crash is diagnosed");
 
     let prior =
-        agora_core::crash_history::load_recorded(&ledger(&f), &f.record.instance_id, &[]).unwrap();
+        agora_core::crash_history::load_recorded(&ledger(&f), &f.record.instance_id, &[], None)
+            .unwrap();
     assert_eq!(
         prior.len(),
         2,

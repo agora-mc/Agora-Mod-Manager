@@ -15,7 +15,6 @@ use agora_core::crash_engine::{
 use agora_core::crash_history::{self, HistorySetup, LogSweepLimits, PreparedHistory};
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
 use agora_core::game_script::instance_reads;
-use agora_core::plugins::PluginService;
 use agora_game_api::crash::{
     CodeEntry, CouldNotCheck, CouldNotCheckReason, GameHandle, LocalText, RefMap, RoleRule,
     SaveRiskLabel,
@@ -139,6 +138,7 @@ pub async fn investigate(
             name: source.meta.basename.clone(),
             bytes: source.text.as_bytes().to_vec(),
             origin: agora_core::crash_engine::CrashFileOrigin::Collected,
+            source: None,
         })
         .collect();
     let output = analyze(&AnalyzeInput {
@@ -183,10 +183,9 @@ pub struct AnalyzeArgs {
 
 pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Result<()> {
     let host: Arc<dyn ScriptHost> = Arc::new(QuickJsHost::new());
-    let service = PluginService::headless(ctx.clone(), host.clone());
-    service.reload()?;
-
-    let installed = service.crash_packs();
+    // The one shared loader adds the signed catalog's community signatures and activates every
+    // script pack, so `agora crash analyze` reads exactly what a live diagnosis reads.
+    let installed = agora_core::crash_live::load_installed_packs(ctx, host.clone())?;
     for problem in &installed.problems {
         eprintln!("Warning: {problem}");
     }
@@ -198,14 +197,6 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
         eprintln!("Warning: {problem}");
     }
     packs.extend(built_in_report.packs);
-    let installed_script = installed_script_plugins(&packs);
-    for id in installed_script {
-        if let Ok(plugin_id) = PluginId::parse(&id) {
-            // A plugin whose code the user did not allow still loads its packs; its script parsers
-            // then fail, and every failure is shown as "could not check" rather than hidden.
-            let _ = service.activate(&plugin_id);
-        }
-    }
 
     for folder in &args.plugin_dirs {
         let (folder_packs, script_ids) = load_development_folder(folder)?;
@@ -352,6 +343,7 @@ pub async fn run(ctx: &agora_core::ctx::Ctx, args: AnalyzeArgs) -> anyhow::Resul
                         .as_ref()
                         .map(|(hash, started)| (hash.as_str(), started.as_str())),
                     exclude_hashes: &exclude_hashes,
+                    exclude_session_id: None,
                 },
                 limits,
                 true,
@@ -608,6 +600,7 @@ pub fn run_patterns(ctx: &agora_core::ctx::Ctx, instance: &str, json: bool) -> a
                 .as_ref()
                 .map(|(hash, started)| (hash.as_str(), started.as_str())),
             exclude_hashes: &[],
+            exclude_session_id: None,
         },
         limits,
         stored == 0,
@@ -738,16 +731,6 @@ fn load_development_folder(folder: &Path) -> anyhow::Result<(Vec<LoadedCrashPack
 }
 
 /// Plugin ids whose packs contain script code, deduplicated in a stable order.
-fn installed_script_plugins(packs: &[LoadedCrashPack]) -> Vec<String> {
-    packs
-        .iter()
-        .filter(|pack| has_script_code(pack))
-        .map(|pack| pack.plugin_id.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 fn has_script_code(pack: &LoadedCrashPack) -> bool {
     pack.pack
         .parsers

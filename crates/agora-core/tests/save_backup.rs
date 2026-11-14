@@ -249,6 +249,34 @@ fn retention_drops_the_oldest_backup() {
 }
 
 #[test]
+fn a_restore_is_refused_while_the_game_is_running_and_changes_nothing() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("running", SavesChoice::Shared);
+    h.write_save("Run.ess", b"before the test");
+    let backup = h.backup("running", &def);
+    h.write_save("Run.ess", b"written while the game ran");
+
+    let generation =
+        agora_core::instance_runtime::publish_starting(&h.ctx.paths, "running").unwrap();
+    let error = save_backup::restore(&h.ctx, "running", &def, &backup.id).unwrap_err();
+    assert!(
+        matches!(error, SaveBackupError::Other(_)),
+        "a restore under a running game must be refused, got {error:?}"
+    );
+    assert_eq!(
+        h.read_save("Run.ess"),
+        b"written while the game ran",
+        "a refused restore must not touch a save"
+    );
+
+    agora_core::instance_runtime::clear(&h.ctx.paths, "running", Some(&generation)).unwrap();
+    let restore = save_backup::restore(&h.ctx, "running", &def, &backup.id).unwrap();
+    assert_eq!(restore.restored, 1);
+    assert_eq!(h.read_save("Run.ess"), b"before the test");
+}
+
+#[test]
 fn list_is_empty_before_any_backup_and_unknown_backups_are_errors() {
     let h = Harness::new();
     let def = skyrim();

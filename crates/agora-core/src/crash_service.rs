@@ -25,8 +25,9 @@ impl CrashService {
     ///
     /// Validates instance ID and filename, acquires an instance lock, and
     /// updates the manifest to mark the mod as disabled. Never clobbers an
-    /// existing `.disabled` file. Returns `Ok(())` if the mod is already
-    /// disabled, and an error if the named file does not exist.
+    /// existing `.disabled` file: if one exists beside an enabled copy, the
+    /// operation fails and changes nothing. Returns `Ok(())` if the mod is
+    /// already disabled, and an error if the named file does not exist.
     pub fn disable_mod(&self, instance_id: &str, filename: &str) -> LauncherResult<()> {
         let sanitized = validate_instance_id(instance_id)?;
         validate_filename(filename)?;
@@ -42,6 +43,16 @@ impl CrashService {
         let dest = mods_dir.join(format!("{}.disabled", filename));
 
         if dest.exists() {
+            if source.exists() {
+                return Err(LauncherError::Generic {
+                    code: "ERR_MOD_DISABLED_COPY_EXISTS".into(),
+                    message: format!(
+                        "A disabled copy of '{filename}' already exists, so nothing was \
+                         changed. Remove 'mods/{filename}.disabled' and try again."
+                    ),
+                });
+            }
+            // The mod is already disabled and there is no enabled copy left to rename.
             return Ok(());
         }
 
@@ -58,7 +69,12 @@ impl CrashService {
         })?;
 
         let manifest_path = self.ctx.paths.instance_manifest(&sanitized)?;
-        update_manifest_disable(&manifest_path, filename)?;
+        if let Err(error) = update_manifest_disable(&manifest_path, filename) {
+            // The rename already happened. Put the file back so a reported failure leaves the
+            // instance exactly as it was found.
+            let _ = std::fs::rename(&dest, &source);
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -104,7 +120,12 @@ impl CrashService {
         })?;
 
         let manifest_path = self.ctx.paths.instance_manifest(&sanitized)?;
-        update_manifest_enable(&manifest_path, filename)?;
+        if let Err(error) = update_manifest_enable(&manifest_path, filename) {
+            // The rename already happened. Put the file back so a reported failure leaves the
+            // instance exactly as it was found.
+            let _ = std::fs::rename(&source, &disabled_path);
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -709,7 +730,12 @@ mod tests {
             .join("testmod.jar.disabled");
         std::fs::write(&disabled_path, b"pre-existing disabled content").unwrap();
 
-        svc.disable_mod("test-instance", "testmod.jar").unwrap();
+        let result = svc.disable_mod("test-instance", "testmod.jar");
+        assert!(
+            result.is_err(),
+            "a stale disabled copy stopped the rename, so the caller must be told the mod is \
+             still enabled"
+        );
 
         let content = std::fs::read_to_string(&disabled_path).unwrap();
         assert_eq!(content, "pre-existing disabled content");

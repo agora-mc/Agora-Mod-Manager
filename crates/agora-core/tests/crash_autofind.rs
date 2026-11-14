@@ -213,6 +213,7 @@ impl Fixture {
             could_not_check: &[],
             setup: None,
             exclude_hashes: &[],
+            exclude_session_id: None,
         }
     }
 
@@ -236,7 +237,7 @@ fn an_empty_source_folder_is_explicitly_nothing_to_read_not_a_clean_result() {
     assert_eq!(report.found, 0);
     assert_eq!(report.analyzed, 0);
     assert!(report.problems.is_empty(), "{:#?}", report.problems);
-    assert!(load_recorded(&fixture.conn, "inst", &[])
+    assert!(load_recorded(&fixture.conn, "inst", &[], None)
         .unwrap()
         .is_empty());
 }
@@ -270,7 +271,7 @@ fn both_declared_sources_are_swept_and_one_log_is_analysed_once() {
     assert_eq!(report.analyzed, 2, "{report:#?}");
     assert_eq!(report.reused, 0);
 
-    let stored = load_recorded(&fixture.conn, "inst", &[]).unwrap();
+    let stored = load_recorded(&fixture.conn, "inst", &[], None).unwrap();
     assert_eq!(stored.len(), 2);
     assert!(stored.iter().all(|crash| crash.record.readable));
     for crash in &stored {
@@ -292,14 +293,24 @@ fn both_declared_sources_are_swept_and_one_log_is_analysed_once() {
     assert_eq!(again.found, 2);
     assert_eq!(again.analyzed, 0);
     assert_eq!(again.reused, 2);
-    assert_eq!(load_recorded(&fixture.conn, "inst", &[]).unwrap().len(), 2);
+    assert_eq!(
+        load_recorded(&fixture.conn, "inst", &[], None)
+            .unwrap()
+            .len(),
+        2
+    );
 
     // Changed bytes are a new crash, analysed once.
     write_log(&fixture.instance_dir, "logs/first.txt", "3000");
     let changed = fixture.sweep();
     assert_eq!(changed.analyzed, 1);
     assert_eq!(changed.reused, 1);
-    assert_eq!(load_recorded(&fixture.conn, "inst", &[]).unwrap().len(), 3);
+    assert_eq!(
+        load_recorded(&fixture.conn, "inst", &[], None)
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[test]
@@ -585,7 +596,7 @@ fn a_stored_log_result_that_cannot_be_decoded_is_an_unreadable_crash_not_a_missi
         )
         .unwrap();
 
-    let stored = load_recorded(&fixture.conn, "inst", &[]).unwrap();
+    let stored = load_recorded(&fixture.conn, "inst", &[], None).unwrap();
     assert_eq!(
         stored.len(),
         1,

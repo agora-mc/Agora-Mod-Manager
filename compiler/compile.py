@@ -4395,6 +4395,51 @@ def validate_crash_signature(sig: Any) -> list[str]:
     return errors
 
 
+def _rust_regex_problem(pattern: str) -> str | None:
+    """Why the app's Rust regex engine refuses a pattern Python accepts, if it does.
+
+    The catalogue is read by the Rust `regex` crate, which has no look-around,
+    backreferences, atomic groups, conditionals or recursion. Validating with
+    Python's `re` alone would publish a row the app can never run, so the
+    compiler refuses those constructs here instead.
+    """
+    for token, construct in (
+        ("(?=", "a look-ahead"),
+        ("(?!", "a negative look-ahead"),
+        ("(?<=", "a look-behind"),
+        ("(?<!", "a negative look-behind"),
+        ("(?>", "an atomic group"),
+        ("(?(", "a conditional group"),
+        ("(?#", "a comment group"),
+        ("(?P=", "a named backreference"),
+        ("(?R", "recursion"),
+        ("(?0", "recursion"),
+    ):
+        if token in pattern:
+            return f"it uses {construct}, which the app's Rust regex engine does not support"
+
+    index = 0
+    while index < len(pattern):
+        if pattern[index] != "\\" or index + 1 >= len(pattern):
+            index += 1
+            continue
+        following = pattern[index + 1]
+        if following.isdigit() and following != "0":
+            return (
+                "it uses a numeric backreference, which the app's Rust regex "
+                "engine does not support"
+            )
+        if following == "k" and index + 2 < len(pattern) and pattern[index + 2] in "<'":
+            return (
+                "it uses a named backreference, which the app's Rust regex "
+                "engine does not support"
+            )
+        if following == "Z":
+            return "it uses `\\Z`; the app's Rust regex engine spells end-of-text `\\z`"
+        index += 2
+    return None
+
+
 def insert_crash_signature(
     conn: sqlite3.Connection,
     sig: dict[str, Any],
@@ -4430,6 +4475,12 @@ def insert_crash_signature(
         rejected[0] += 1
         return
 
+    # --- Rust compatibility ---
+    if (problem := _rust_regex_problem(raw_pattern)) is not None:
+        logger.error("Crash signature '%s' rejected: %s", name, problem)
+        rejected[0] += 1
+        return
+
     # --- Compile ---
     try:
         compiled = re.compile(raw_pattern)
@@ -4447,26 +4498,46 @@ def insert_crash_signature(
     # --- Insert ---
     action = sig.get("action") or {}
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO crash_signatures
-            (id, name, games_json, regex_pattern, level, cause, text,
-             action_kind, action_content_key, action_label)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
+    duplicate = cursor.execute(
+        "SELECT 1 FROM crash_signatures WHERE id = ?", (sig["id"],)
+    ).fetchone()
+    if duplicate is not None:
+        logger.error(
+            "Crash signature '%s' rejected: another file already uses id '%s'",
+            name,
             sig["id"],
-            sig["name"],
-            json.dumps(sig["games"], separators=(",", ":")),
-            raw_pattern,
-            sig.get("level", "possible"),
-            sig.get("cause", "other"),
-            sig["text"],
-            action.get("kind"),
-            action.get("content_key"),
-            action.get("label"),
-        ),
-    )
+        )
+        rejected[0] += 1
+        return
+    try:
+        cursor.execute(
+            """
+            INSERT INTO crash_signatures
+                (id, name, games_json, regex_pattern, level, cause, text,
+                 action_kind, action_content_key, action_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sig["id"],
+                sig["name"],
+                json.dumps(sig["games"], separators=(",", ":")),
+                raw_pattern,
+                sig.get("level", "possible"),
+                sig.get("cause", "other"),
+                sig["text"],
+                action.get("kind"),
+                action.get("content_key"),
+                action.get("label"),
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        logger.error(
+            "Crash signature '%s' rejected: it could not be stored (%s)",
+            name,
+            exc,
+        )
+        rejected[0] += 1
+        return
 
 
 # ---------------------------------------------------------------------------

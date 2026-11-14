@@ -67,6 +67,9 @@ pub struct CrashFile {
     pub name: String,
     pub bytes: Vec<u8>,
     pub origin: CrashFileOrigin,
+    /// The crash source that found this file, when a pack's source found it. `None` for a file
+    /// the user supplied, because then no source named it.
+    pub source: Option<String>,
 }
 
 impl CrashFile {
@@ -76,6 +79,7 @@ impl CrashFile {
             name: name.into(),
             bytes: bytes.into(),
             origin: CrashFileOrigin::File,
+            source: None,
         }
     }
 
@@ -85,6 +89,7 @@ impl CrashFile {
             name: name.into(),
             bytes: bytes.into(),
             origin: CrashFileOrigin::Pasted,
+            source: None,
         }
     }
 
@@ -94,12 +99,19 @@ impl CrashFile {
             name: name.into(),
             bytes: bytes.into(),
             origin: CrashFileOrigin::Collected,
+            source: None,
         }
     }
 
     /// The same file with another origin.
     pub fn with_origin(mut self, origin: CrashFileOrigin) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// The same file, known to have been found by the named crash source.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
         self
     }
 }
@@ -259,6 +271,16 @@ pub fn analyze_with_history(
             .then_with(|| a.plugin_id.cmp(&b.plugin_id))
             .then_with(|| a.file.cmp(&b.file))
     });
+    // A file from an instance has a known game, so another game's parser must never read it:
+    // detection runs before evaluation, and a fact from a foreign parser would already be in
+    // `parsed` by then. Drop every pack that is not for this game (or for every game) before a
+    // parser is even asked whether it recognises the file.
+    if let Some(instance) = &input.instance {
+        packs.retain(|pack| {
+            pack.pack.games.is_empty()
+                || pack.pack.games.iter().any(|game| game == instance.game_id)
+        });
+    }
 
     let limits = ParserLimits::DEFAULT;
     let game_id = input
@@ -404,7 +426,7 @@ pub fn analyze_with_history(
                         plugin: identity(claim.pack),
                         parser_id: attempt.parser_id.clone(),
                         artifact: file.name.clone(),
-                        source: None,
+                        source: file.source.clone(),
                         output: output.clone(),
                     });
                     if !is_primary {
@@ -457,7 +479,7 @@ pub fn analyze_with_history(
                             plugin: identity(claim.pack),
                             parser_id: attempt.parser_id.clone(),
                             artifact: file.name.clone(),
-                            source: None,
+                            source: file.source.clone(),
                             output: output.clone(),
                         });
                         if report.read_by.is_none() {
@@ -500,7 +522,7 @@ pub fn analyze_with_history(
             let text = String::from_utf8_lossy(&file.bytes[..file.bytes.len().min(cap)]);
             texts.push(ArtifactText {
                 artifact: file.name.clone(),
-                source: None,
+                source: file.source.clone(),
                 text: text.into_owned(),
             });
         }
@@ -796,6 +818,7 @@ pub fn analyze_pasted_text(ctx: &Ctx, input: &TextAnalysis<'_>) -> LauncherResul
         name: input.file_name.to_string(),
         bytes: input.text.as_bytes().to_vec(),
         origin: CrashFileOrigin::Pasted,
+        source: None,
     }];
     let Some((instance_id, provider)) = input.instance else {
         return analyze(&AnalyzeInput {

@@ -183,6 +183,7 @@ pub async fn analyze_crash_text(
             name: "pasted-crash-log.txt".to_string(),
             bytes: text.into_bytes(),
             origin: agora_core::crash_engine::CrashFileOrigin::Pasted,
+            source: None,
         }];
         supplied(&ctx, instance_id.as_deref(), files)
     })
@@ -390,6 +391,7 @@ fn detail(
             files,
             changes,
             record,
+            ..
         } => CrashAnswerDetail {
             session_id: stored.session_id,
             instance_id: stored.instance_id,
@@ -503,6 +505,7 @@ mod tests {
                     to_version: Some("2.1".to_string()),
                 }],
                 record: None,
+                artifact_hashes: Vec::new(),
             },
         }
     }

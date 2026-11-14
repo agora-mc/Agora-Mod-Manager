@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Expected schema version for the mutable local SQLite database.
 /// Migrations are applied sequentially on startup.
-pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 25;
+pub const LOCAL_STATE_SCHEMA_VERSION: i64 = 26;
 
 /// Open a read-write connection to the local state database.
 ///
@@ -984,6 +984,46 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (25)",
+            [],
+        )?;
+    }
+
+    if current < 26 {
+        // The save backup taken before one session's crash test (MASTER_SPEC §30.4). Keyed by
+        // session so the Restore button survives clearing user settings; the backup itself lives
+        // in the instance folder, and this row only says which one belongs to the session.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS crash_save_backups (
+                 session_id TEXT PRIMARY KEY,
+                 instance_id TEXT NOT NULL,
+                 backup_id TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_crash_save_backups_instance
+                 ON crash_save_backups (instance_id, created_at DESC);
+             DROP TRIGGER IF EXISTS launch_history_minecraft_instance_gone;
+             DROP TRIGGER IF EXISTS launch_history_game_instance_gone;
+             CREATE TRIGGER launch_history_minecraft_instance_gone
+                 AFTER DELETE ON user_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+                 DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+             END;
+             CREATE TRIGGER launch_history_game_instance_gone
+                 AFTER DELETE ON game_instances
+             BEGIN
+                 DELETE FROM launch_history WHERE instance_id = OLD.instance_id;
+                 DELETE FROM launch_manifests WHERE instance_id = OLD.instance_id;
+                 DELETE FROM session_answers WHERE instance_id = OLD.instance_id;
+                 DELETE FROM crash_log_results WHERE instance_id = OLD.instance_id;
+                 DELETE FROM crash_save_backups WHERE instance_id = OLD.instance_id;
+             END;",
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version) VALUES (26)",
             [],
         )?;
     }

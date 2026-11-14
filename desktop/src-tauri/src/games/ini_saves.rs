@@ -514,15 +514,38 @@ fn save_backup_row(backup: &SaveBackup) -> SaveBackupRow {
 
 /// Copy the instance's save folder into an Agora-owned backup before a crash test, and report how
 /// large the copy was. The folder comes from the game's declared save location, never a guess.
+///
+/// The backup is also recorded for the session in the database, so the answer screen still offers
+/// Restore after the user's settings are cleared.
 #[tauri::command]
 pub async fn games_saves_backup(
     app: tauri::AppHandle,
     instance_id: String,
+    session_id: String,
 ) -> Result<SaveBackupRow, GamesError> {
     run_blocking(app, "Backing up the saves", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
         let backup = save_backup::backup(&ctx, &instance_id, definition).map_err(core_failed)?;
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
+            .map_err(core_failed)?;
+        save_backup::set_session_backup(&conn, &instance_id, &session_id, &backup.id)
+            .map_err(core_failed)?;
         Ok(save_backup_row(&backup))
+    })
+    .await
+}
+
+/// The backup recorded for one session's test, or `None` when there is none.
+#[tauri::command]
+pub async fn games_saves_backup_for_session(
+    app: tauri::AppHandle,
+    instance_id: String,
+    session_id: String,
+) -> Result<Option<String>, GamesError> {
+    run_blocking(app, "Reading the save backup", move |ctx| {
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
+            .map_err(core_failed)?;
+        save_backup::session_backup(&conn, &instance_id, &session_id).map_err(core_failed)
     })
     .await
 }

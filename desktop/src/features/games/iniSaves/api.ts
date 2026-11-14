@@ -281,9 +281,24 @@ export async function setSaves(instanceId: string, choice: SaveChoice): Promise<
 }
 
 /** Copy the instance's save folder into an Agora-owned backup before a crash test. */
-export async function backupSaves(instanceId: string): Promise<SaveBackupRow> {
-  const reply = await invoke<unknown>('games_saves_backup', { instanceId });
+export async function backupSaves(
+  instanceId: string,
+  sessionId: string,
+): Promise<SaveBackupRow> {
+  const reply = await invoke<unknown>('games_saves_backup', { instanceId, sessionId });
   return checkedReply('games_saves_backup', reply, isSaveBackupRow);
+}
+
+/** The backup recorded for one session's test, or `null` when there is none. */
+export async function saveBackupForSession(
+  instanceId: string,
+  sessionId: string,
+): Promise<string | null> {
+  const reply = await invoke<unknown>('games_saves_backup_for_session', {
+    instanceId,
+    sessionId,
+  });
+  return typeof reply === 'string' && reply !== '' ? reply : null;
 }
 
 /** Every finished save backup for an instance, newest first. */

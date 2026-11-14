@@ -223,6 +223,7 @@ const BOOT_REPLIES = {
   games_instance_check: cleanCheck,
   list_crash_answers: listReply,
   get_crash_answer: detailReply,
+  games_saves_backup_for_session: null,
 };
 
 async function boot(
@@ -305,6 +306,7 @@ for (const mode of ['light', 'dark'] as const) {
 test('a backup made before a test is offered with a Restore saves button', async ({ page }) => {
   await boot(page, 'light', {
     replies: {
+      games_saves_backup_for_session: null,
       games_saves_backup: {
         id: 'backup-1',
         createdAt: '2026-11-12T21:15:30Z',

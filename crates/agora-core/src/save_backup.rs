@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agora_game_api::GameDefinition;
 use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::ctx::Ctx;
@@ -24,6 +25,7 @@ use crate::game_ini;
 use crate::game_instance::{self, InstanceError, SavesChoice};
 use crate::game_saves::{self, SavesError};
 use crate::helpers;
+use crate::lock_manager::LockResource;
 
 /// The newest backups kept per instance. A crash test makes one per suspect tried; five covers a
 /// normal round of testing while bounding the store, and each backup is a full copy of the folder.
@@ -417,6 +419,42 @@ pub fn list(ctx: &Ctx, instance_id: &str) -> Result<Vec<SaveBackup>, SaveBackupE
     list_dir(&backup_root(ctx, instance_id)?)
 }
 
+/// The backup taken before one session's crash test. It lives in the database, keyed by session,
+/// not in user settings: clearing settings must not lose the answer screen's Restore button.
+pub fn set_session_backup(
+    conn: &Connection,
+    instance_id: &str,
+    session_id: &str,
+    backup_id: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO crash_save_backups (session_id, instance_id, backup_id, created_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id) DO UPDATE SET
+             instance_id = excluded.instance_id,
+             backup_id = excluded.backup_id,
+             created_at = excluded.created_at",
+        params![session_id, instance_id, backup_id, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// The backup recorded for one session, if any.
+pub fn session_backup(
+    conn: &Connection,
+    instance_id: &str,
+    session_id: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT backup_id FROM crash_save_backups
+              WHERE session_id = ?1 AND instance_id = ?2",
+            params![session_id, instance_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 fn safe_relative(path: &str) -> Option<PathBuf> {
     if path.is_empty() {
         return None;
@@ -500,6 +538,17 @@ pub fn restore(
     if !is_valid_id(backup_id) {
         return Err(SaveBackupError::InvalidBackupId(backup_id.to_string()));
     }
+    // Hold the instance lock across the whole restore, exactly as a snapshot restore does, and
+    // refuse while the game is running: writing saves under a live game corrupts them.
+    let _guard = ctx
+        .lock_manager
+        .acquire(
+            LockResource::Instance(instance_id.to_string()),
+            "restore_save_backup",
+        )
+        .map_err(|error| SaveBackupError::Other(error.to_string()))?;
+    crate::instance_runtime::check_idle(&ctx.paths, instance_id)
+        .map_err(|error| SaveBackupError::Other(error.to_string()))?;
     let root = backup_root(ctx, instance_id)?;
     let dir = root.join(backup_id);
     if !dir.is_dir() {
@@ -583,6 +632,26 @@ mod tests {
         assert!(safe_relative("C:/escape.ess").is_none());
         assert!(safe_relative(r"a\b.ess").is_none());
         assert!(safe_relative("").is_none());
+    }
+
+    #[test]
+    fn a_session_backup_marker_is_kept_in_the_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+
+        assert_eq!(session_backup(&conn, "inst", "session-1").unwrap(), None);
+        set_session_backup(&conn, "inst", "session-1", "backup-1").unwrap();
+        assert_eq!(
+            session_backup(&conn, "inst", "session-1").unwrap(),
+            Some("backup-1".to_string())
+        );
+        // A second test in the same session replaces the marker rather than adding a row.
+        set_session_backup(&conn, "inst", "session-1", "backup-2").unwrap();
+        assert_eq!(
+            session_backup(&conn, "inst", "session-1").unwrap(),
+            Some("backup-2".to_string())
+        );
+        assert_eq!(session_backup(&conn, "inst", "session-2").unwrap(), None);
     }
 
     #[test]

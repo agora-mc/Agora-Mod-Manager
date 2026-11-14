@@ -3852,6 +3852,9 @@ $#
                 // One compact record per older crash log, keyed by content hash. It belongs to the
                 // instance, so it is captured, deleted and restored with it.
                 "crash_log_results",
+                // The save backup taken before one session's crash test, keyed by session. It
+                // belongs to the instance, so it is captured, deleted and restored with it.
+                "crash_save_backups",
                 // Other games' instances. Ids are unique across games, so a Minecraft delete finds
                 // no row here; the generic capture still carries one if it ever did.
                 "game_instances",

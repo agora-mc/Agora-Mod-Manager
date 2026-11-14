@@ -5,6 +5,7 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
 import {
   backupSaves,
+  saveBackupForSession,
   getIni,
   getModIni,
   getSaves,
@@ -131,12 +132,24 @@ describe('saves commands', () => {
 
   it('backs the saves up and lists what exists', async () => {
     invokeMock.mockResolvedValueOnce(backup);
-    await expect(backupSaves('inst-1')).resolves.toEqual(backup);
-    expect(invokeMock).toHaveBeenLastCalledWith('games_saves_backup', { instanceId: 'inst-1' });
+    await expect(backupSaves('inst-1', 'session-1')).resolves.toEqual(backup);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_saves_backup', { instanceId: 'inst-1', sessionId: 'session-1' });
 
     invokeMock.mockResolvedValueOnce([backup]);
     await expect(listSaveBackups('inst-1')).resolves.toEqual([backup]);
     expect(invokeMock).toHaveBeenLastCalledWith('games_saves_backups', { instanceId: 'inst-1' });
+  });
+
+  it('reads the backup recorded for one session, or null when there is none', async () => {
+    invokeMock.mockResolvedValueOnce('backup-1');
+    await expect(saveBackupForSession('inst-1', 'session-1')).resolves.toBe('backup-1');
+    expect(invokeMock).toHaveBeenLastCalledWith('games_saves_backup_for_session', {
+      instanceId: 'inst-1',
+      sessionId: 'session-1',
+    });
+
+    invokeMock.mockResolvedValueOnce(null);
+    await expect(saveBackupForSession('inst-1', 'session-1')).resolves.toBeNull();
   });
 
   it('restores a backup by id and reports what was kept beside it', async () => {
@@ -160,7 +173,7 @@ describe('saves commands', () => {
     ['a backup with a non-numeric size', { ...backup, bytes: '2 MB' }],
   ])('rejects a backup reply that is %s rather than reading it as a backup', async (_label, reply) => {
     invokeMock.mockResolvedValueOnce(reply);
-    await expect(backupSaves('inst-1')).rejects.toThrow('games_saves_backup did not return');
+    await expect(backupSaves('inst-1', 'session-1')).rejects.toThrow('games_saves_backup did not return');
   });
 });
 

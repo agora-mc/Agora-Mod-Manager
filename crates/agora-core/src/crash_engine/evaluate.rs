@@ -1002,6 +1002,23 @@ fn eval_text(text: &TextMatch, view: &View, limit: usize, bindings: &Bindings) -
             };
         }
     };
+    if regex.is_match("") {
+        // A pattern that matches the empty string matches every line, exactly as an empty regex
+        // does. The catalogue cannot be trusted to have meant that, so it is a check that could
+        // not run rather than a finding on every crash.
+        return EvalResult {
+            branches: vec![Branch {
+                truth: Truth::Unknown,
+                bindings: bindings.clone(),
+                evidence: Vec::new(),
+                unknown: vec![UnknownNote {
+                    subject: "core.log_line".to_string(),
+                    reason: CouldNotCheckReason::CodeFailed,
+                }],
+            }],
+            overflow: false,
+        };
+    }
     let mut branches = Vec::new();
     let mut overflow = false;
     for entry in lines {
@@ -1026,6 +1043,12 @@ fn eval_text(text: &TextMatch, view: &View, limit: usize, bindings: &Bindings) -
             continue;
         };
         for captures in regex.captures_iter(&line_text) {
+            // A match that found no characters says nothing about the line. A pattern such as
+            // `^` matches every line this way, and would otherwise fire on every crash.
+            match captures.get(0) {
+                Some(whole) if !whole.is_empty() => {}
+                _ => continue,
+            }
             let mut next = bindings.clone();
             let mut ok = true;
             for name in regex.capture_names().flatten() {
@@ -1116,6 +1139,21 @@ fn eval_whole_file(text: &TextMatch, view: &View, limit: usize, bindings: &Bindi
             };
         }
     };
+    if regex.is_match("") {
+        // See `eval_text`: an empty-matching pattern would match every artifact.
+        return EvalResult {
+            branches: vec![Branch {
+                truth: Truth::Unknown,
+                bindings: bindings.clone(),
+                evidence: Vec::new(),
+                unknown: vec![UnknownNote {
+                    subject: "artifact text".to_string(),
+                    reason: CouldNotCheckReason::CodeFailed,
+                }],
+            }],
+            overflow: false,
+        };
+    }
     let mut branches = Vec::new();
     let mut overflow = false;
     'texts: for artifact in &view.texts {
@@ -1128,6 +1166,11 @@ fn eval_whole_file(text: &TextMatch, view: &View, limit: usize, bindings: &Bindi
             let Some(whole) = captures.get(0) else {
                 continue;
             };
+            // A zero-width match names no text, so it is not evidence about this artifact. Without
+            // this a pattern such as `^` would fire on every crash.
+            if whole.is_empty() {
+                continue;
+            }
             let evidence = evidence_at(artifact, whole.start());
             let mut next = bindings.clone();
             let mut ok = true;
@@ -1190,6 +1233,12 @@ fn evidence_at(artifact: &ArtifactText, offset: usize) -> EvidenceLine {
         .find('\n')
         .map_or(artifact.text.len(), |newline| offset + newline);
     let line = artifact.text[start..end].trim_end_matches('\r');
+    // The raw text is bounded only by the read limit, not by the line limit the parsers apply. A
+    // single long line must not become an unbounded quote in the stored answer.
+    let quote = super::parsers::truncate_to(
+        line.to_string(),
+        agora_game_api::crash::ParserLimits::DEFAULT.max_line_len as usize,
+    );
     let line_number = artifact.text[..offset]
         .bytes()
         .filter(|byte| *byte == b'\n')
@@ -1203,7 +1252,7 @@ fn evidence_at(artifact: &ArtifactText, offset: usize) -> EvidenceLine {
             line_start: Some(line_number),
             line_end: Some(line_number),
         },
-        quote: Some(line.to_string()),
+        quote: Some(quote),
     }
 }
 

@@ -26,7 +26,12 @@ import {
   formatWhen,
   verdictWordFor,
 } from '@/components/CrashAnswerView';
-import { backupSaves, restoreSaves, type SaveBackupRow } from '../iniSaves/api';
+import {
+  backupSaves,
+  restoreSaves,
+  saveBackupForSession,
+  type SaveBackupRow,
+} from '../iniSaves/api';
 import {
   analyzeCrashFile,
   analyzeCrashText,
@@ -45,11 +50,6 @@ const DISMISS_KEY = 'crash_answer_dismissed';
 
 function dismissKey(instanceId: string): string {
   return `${DISMISS_KEY}_${instanceId}`;
-}
-
-/** The backup taken before this session's test, so returning to the answer can offer a restore. */
-function backupKey(instanceId: string, sessionId: string): string {
-  return `crash_save_backup_${instanceId}_${sessionId}`;
 }
 
 function summaryTopLine(summary: CrashAnswerSummary): string {
@@ -130,10 +130,8 @@ export function CrashAnswerOverview({
     getCrashAnswer(sessionId)
       .then(setDetail)
       .catch((error: unknown) => setDetailError(formatError(error)));
-    getSetting(backupKey(instanceId, sessionId))
-      .then((stored) => {
-        setOpenBackupId(typeof stored === 'string' && stored !== '' ? stored : null);
-      })
+    saveBackupForSession(instanceId, sessionId)
+      .then(setOpenBackupId)
       .catch(() => setOpenBackupId(null));
   };
 
@@ -164,9 +162,8 @@ export function CrashAnswerOverview({
     let backup: SaveBackupRow | null = null;
     let failure: string | null = null;
     try {
-      backup = await backupSaves(instanceId);
+      backup = await backupSaves(instanceId, sessionId);
       setOpenBackupId(backup.id);
-      void setSetting(backupKey(instanceId, sessionId), backup.id).catch(() => undefined);
     } catch (error) {
       failure = formatError(error);
     }

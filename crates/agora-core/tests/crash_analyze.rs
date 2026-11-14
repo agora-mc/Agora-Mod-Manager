@@ -919,6 +919,71 @@ fn a_verified_official_plugin_reads_before_a_community_one_whatever_its_id() {
     assert_eq!(report.also_recognised_by[0].plugin_id, "acme.zeta");
 }
 
+/// A whole-file text rule that names a crash source searches only the files that source found.
+/// The path fills `ArtifactText.source` from the file's known source, so the filter is reachable.
+#[test]
+fn a_whole_file_rule_with_a_source_only_searches_that_sources_files() {
+    let rule = r#"{
+  "id": "needle_in_the_named_source",
+  "version": 1,
+  "when": {
+    "all": [
+      { "fact": { "kind": "acme.fault" } },
+      { "text": { "whole_file": true, "source": "found", "regex": "invented needle" } }
+    ]
+  },
+  "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+  "text": { "headline": { "en": "The needle was in the named source." } }
+}"#;
+    let (_dir, pack) = plugin_folder(
+        "acme.source",
+        "Source-filtered rules",
+        &generic_pack("", rule),
+        None,
+    );
+    let host = idle_host();
+    let output = analyze(&AnalyzeInput {
+        packs: &[pack],
+        files: &[
+            CrashFile::new(
+                "found.txt",
+                "== FAULTS ==\nmodule ExampleMod failed\ninvented needle\n",
+            )
+            .with_source("found"),
+            CrashFile::new(
+                "other.txt",
+                "== FAULTS ==\nmodule ExampleMod failed\ninvented needle\n",
+            )
+            .with_source("other"),
+        ],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+
+    let finding = output
+        .answer
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.headline.get("en").map(String::as_str)
+                == Some("The needle was in the named source.")
+        })
+        .expect("the rule fired on the source it names");
+    let artifacts: Vec<&str> = finding
+        .evidence
+        .iter()
+        .map(|evidence| evidence.artifact.as_str())
+        .collect();
+    assert!(!artifacts.is_empty(), "the rule fired without evidence");
+    assert!(
+        artifacts.iter().all(|artifact| *artifact == "found.txt"),
+        "the rule searched a file its source did not name: {artifacts:?}"
+    );
+}
+
 struct NoResolver;
 
 impl RefResolver for NoResolver {

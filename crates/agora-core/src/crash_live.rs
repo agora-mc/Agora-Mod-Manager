@@ -38,6 +38,9 @@ use crate::session_ledger::{self, ExitObservation, ManifestChange, SessionRecord
 
 /// The answer stored for one session. A failed analysis is an answer too: it says what went wrong
 /// instead of being absent.
+// The analyzed variant is the serialized contract, and its size only grows. Boxing its fields to
+// satisfy this lint would change the shape every reader matches against for no runtime gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum StoredAnswer {
@@ -53,6 +56,11 @@ pub enum StoredAnswer {
         /// this field existed have none, and are still read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record: Option<RecordedCrash>,
+        /// Whole-file content hashes of the artifacts this session read. The sweep uses them to
+        /// recognise this crash's own logs and not count it again, including a log too large to
+        /// copy whole. Older answers have none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifact_hashes: Vec<String>,
     },
     /// Nothing was readable for this session. That is not a clean bill of health.
     NothingToRead { why: String },
@@ -102,7 +110,7 @@ pub fn answer_for_session(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    row.map(decode_answer).transpose()
+    Ok(row.map(decode_answer))
 }
 
 /// Every stored answer for an instance, newest session first. The newest is the card the overview
@@ -129,7 +137,7 @@ pub fn answers_for_instance(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    rows.into_iter().map(decode_answer).collect()
+    Ok(rows.into_iter().map(decode_answer).collect())
 }
 
 /// The newest stored answer for an instance.
@@ -146,18 +154,25 @@ pub fn latest_answer(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    row.map(decode_answer).transpose()
+    Ok(row.map(decode_answer))
 }
 
+/// One stored answer. A row this build cannot decode is reported as "could not analyze" for that
+/// session, never as an error that hides the other crashes: the database says it is there, and a
+/// reader must not turn "could not read" into "nothing there".
 fn decode_answer(
     (session_id, instance_id, created_at, json): (String, String, String, String),
-) -> anyhow::Result<SessionAnswer> {
-    Ok(SessionAnswer {
+) -> SessionAnswer {
+    let answer =
+        serde_json::from_str(&json).unwrap_or_else(|error| StoredAnswer::CouldNotAnalyze {
+            why: format!("the stored crash answer could not be read: {error}"),
+        });
+    SessionAnswer {
         session_id,
         instance_id,
         created_at,
-        answer: serde_json::from_str(&json)?,
-    })
+        answer,
+    }
 }
 
 /// The answer's candidates in the old test-it flow's shape, in rank order. Only an installed item
@@ -169,6 +184,9 @@ pub fn suspects_for_test(
 ) -> Vec<crate::crash_service::SuspectScore> {
     crate::crash_engine::suspects::installable_candidates(answer, view)
         .into_iter()
+        // An item the instance view cannot list has no file to disable. Offering its display
+        // name as if it were one presents a stale suspect as a live experiment.
+        .filter(|candidate| candidate.file.is_some())
         .map(|candidate| crate::crash_service::SuspectScore {
             mod_id: candidate.owner_key,
             filename: candidate.file.unwrap_or(candidate.name),
@@ -408,10 +426,14 @@ fn diagnose_record(
     let engine_facts = session_engine_facts(record, &changes);
 
     // The same crash's own files may sit in a source folder, so leave them out of the history
-    // comparison by their content hash.
-    let exclude_hashes: Vec<String> = files
+    // comparison by their content hash. Hash the whole source file, never the stored copy: a log
+    // over the copy limit is kept as head and tail, and its copy's hash would not match the whole
+    // file the sweep reads, so the crash would count itself as history.
+    let exclude_hashes: Vec<String> = collection
+        .bound
         .iter()
-        .map(|file| crate::crash_history::content_hash(&file.bytes))
+        .filter(|found| found.unit == agora_game_api::crash::ArtifactUnit::File)
+        .filter_map(|found| crate::crash_history::content_hash_file(&found.path).ok())
         .collect();
     let setup_hash = record.manifest.as_ref().map(|manifest| manifest.hash());
     let limits = crate::crash_history::LogSweepLimits::default();
@@ -432,6 +454,7 @@ fn diagnose_record(
                 .as_deref()
                 .map(|hash| (hash, record.started_at.as_str())),
             exclude_hashes: &exclude_hashes,
+            exclude_session_id: Some(&record.session_id),
         },
         limits,
         true,
@@ -488,6 +511,7 @@ fn diagnose_record(
         files: output.files,
         changes,
         record: Some(recorded),
+        artifact_hashes: exclude_hashes,
     })
 }
 
@@ -569,10 +593,16 @@ fn nothing_to_read(
 }
 
 fn readable_files(copied: &CopiedSession) -> Vec<CrashFile> {
-    let mut names: BTreeMap<&str, &str> = BTreeMap::new();
-    fn walk<'a>(artifacts: &'a [Artifact], names: &mut BTreeMap<&'a str, &'a str>) {
+    let mut names: BTreeMap<&str, (&str, Option<&str>)> = BTreeMap::new();
+    fn walk<'a>(
+        artifacts: &'a [Artifact],
+        names: &mut BTreeMap<&'a str, (&'a str, Option<&'a str>)>,
+    ) {
         for artifact in artifacts {
-            names.insert(artifact.id.as_str(), artifact.name.as_str());
+            names.insert(
+                artifact.id.as_str(),
+                (artifact.name.as_str(), artifact.source.as_deref()),
+            );
             walk(&artifact.children, names);
         }
     }
@@ -580,18 +610,20 @@ fn readable_files(copied: &CopiedSession) -> Vec<CrashFile> {
 
     let mut files = Vec::new();
     for (id, path) in &copied.objects {
-        let Some(name) = names.get(id.as_str()) else {
+        let Some((name, source)) = names.get(id.as_str()) else {
             continue;
         };
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        files.push(CrashFile {
+        let file = CrashFile {
             name: (*name).to_string(),
             bytes,
             // Agora found it: a whole file, never read by a snippet parser.
             origin: crate::crash_engine::CrashFileOrigin::Collected,
-        });
+            source: source.map(str::to_string),
+        };
+        files.push(file);
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));
     files

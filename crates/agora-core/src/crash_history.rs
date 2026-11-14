@@ -137,6 +137,9 @@ pub struct HistorySetup<'a> {
     pub setup: Option<(&'a str, &'a str)>,
     /// Content hashes the caller is analysing right now, so the same crash is not counted twice.
     pub exclude_hashes: &'a [String],
+    /// A session whose stored answer this analysis is replacing. Diagnosing one session twice must
+    /// not feed its first answer back in as an earlier crash.
+    pub exclude_session_id: Option<&'a str>,
 }
 
 /// What the history stage loaded, together with the sweep that produced it.
@@ -193,8 +196,13 @@ pub fn prepare(
     } else {
         None
     };
-    let prior = load_recorded(conn, setup.instance_id, setup.exclude_hashes)
-        .map_err(|error| format!("the stored crash history could not be read: {error}"))?;
+    let prior = load_recorded(
+        conn,
+        setup.instance_id,
+        setup.exclude_hashes,
+        setup.exclude_session_id,
+    )
+    .map_err(|error| format!("the stored crash history could not be read: {error}"))?;
     let sessions_since_first = sessions_since_first(conn, setup.instance_id, &prior)?;
     let setup_since_unix_ms = match setup.setup {
         Some((hash, started_at)) => setup_since(conn, setup.instance_id, hash, started_at)?,
@@ -216,6 +224,33 @@ pub fn stored_log_count(conn: &Connection, instance_id: &str) -> anyhow::Result<
         |row| row.get(0),
     )?;
     Ok(count as usize)
+}
+
+/// The whole-file hashes of artifacts that a live diagnosis already read, from its stored answer.
+/// A stored answer this build cannot decode simply contributes none.
+fn answered_artifact_hashes(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT answer_json FROM session_answers WHERE instance_id = ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([instance_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut hashes = BTreeSet::new();
+    for row in rows {
+        let Ok(json) = row else {
+            continue;
+        };
+        if let Ok(StoredAnswer::Analyzed {
+            artifact_hashes, ..
+        }) = serde_json::from_str::<StoredAnswer>(&json)
+        {
+            hashes.extend(artifact_hashes);
+        }
+    }
+    Ok(hashes)
 }
 
 /// List every file the applicable packs' `sources` point at, analyse the newest ones once, and
@@ -380,6 +415,10 @@ pub fn sweep_instance_logs(
         could_not_check: setup.could_not_check,
     };
     let analyzed_at = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
+    // Logs belonging to crashes Agora already diagnosed live. Read once; a bad answer is skipped,
+    // never allowed to stop the sweep.
+    let answered_hashes = answered_artifact_hashes(conn, setup.instance_id)
+        .map_err(|error| format!("the stored crash answers could not be read: {error}"))?;
     for candidate in &candidates {
         if candidate.size > limits.max_file_bytes {
             report.skipped.push(SkippedLog {
@@ -404,6 +443,31 @@ pub fn sweep_instance_logs(
             }
         };
         let hash = content_hash(&bytes);
+        // A log this analysis already holds is this crash's own evidence, never an earlier crash.
+        // Excluding it by whole-file hash also covers a log over the copy limit, whose stored copy
+        // is only head and tail.
+        if setup
+            .exclude_hashes
+            .iter()
+            .any(|excluded| excluded == &hash)
+        {
+            report.skipped.push(SkippedLog {
+                source_id: candidate.source_id.clone(),
+                name: candidate.name.clone(),
+                reason: "it belongs to the crash being analysed".to_string(),
+            });
+            continue;
+        }
+        // A crash Agora already diagnosed live has an answer stored for it. Its log must not then
+        // be stored again as a swept result, or one crash becomes two records in the history.
+        if answered_hashes.contains(&hash) {
+            report.skipped.push(SkippedLog {
+                source_id: candidate.source_id.clone(),
+                name: candidate.name.clone(),
+                reason: "it was already analysed for a diagnosed session".to_string(),
+            });
+            continue;
+        }
         if log_result_exists(conn, setup.instance_id, &hash)
             .map_err(|error| format!("the stored log result could not be checked: {error}"))?
         {
@@ -418,6 +482,7 @@ pub fn sweep_instance_logs(
                 bytes,
                 // The sweep found it: a whole file, never read by a snippet parser.
                 origin: crate::crash_engine::CrashFileOrigin::Collected,
+                source: Some(candidate.source_id.clone()),
             }],
             runtime_version: setup.runtime_version,
             host: setup.host,
@@ -484,6 +549,28 @@ fn source_folder(
 /// The SHA-256 of one log's bytes, in lower-case hex. The key a log is remembered by.
 pub fn content_hash(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
+    hex_digest(&digest)
+}
+
+/// The `content_hash` of a file on disk, read in bounded chunks. Used for the current session's
+/// artifacts, which may be far larger than the evidence copy keeps.
+pub fn content_hash_file(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_digest(&hasher.finalize()))
+}
+
+fn hex_digest(digest: &[u8]) -> String {
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));
@@ -589,6 +676,7 @@ pub fn load_recorded(
     conn: &Connection,
     instance_id: &str,
     exclude_hashes: &[String],
+    exclude_session_id: Option<&str>,
 ) -> anyhow::Result<Vec<RecordedCrash>> {
     let mut crashes: Vec<RecordedCrash> = Vec::new();
     {
@@ -605,8 +693,15 @@ pub fn load_recorded(
             if exclude_hashes.iter().any(|excluded| excluded == &hash) {
                 continue;
             }
-            if let Ok(recorded) = serde_json::from_str::<RecordedCrash>(&json) {
-                crashes.push(recorded);
+            match serde_json::from_str::<RecordedCrash>(&json) {
+                Ok(recorded) => crashes.push(recorded),
+                // The row exists, so the crash is counted. A record this build cannot decode is
+                // an unreadable crash, never a crash that never happened.
+                Err(_) => crashes.push(RecordedCrash {
+                    record: unreadable_record(format!("log {hash}")),
+                    bucket: Vec::new(),
+                    at_unix_ms: None,
+                }),
             }
         }
     }
@@ -628,6 +723,9 @@ pub fn load_recorded(
         })?;
         for row in rows {
             let (session_id, json, created_at, started_at) = row?;
+            if exclude_session_id == Some(session_id.as_str()) {
+                continue;
+            }
             let at = started_at
                 .as_deref()
                 .or(Some(created_at.as_str()))

@@ -40,6 +40,7 @@ pub fn names_a_crash(
         name: file_name.to_string(),
         bytes: text.as_bytes().to_vec(),
         origin: super::CrashFileOrigin::Collected,
+        source: None,
     }];
     let host = NoHost;
     match analyze(&AnalyzeInput {
