@@ -1,10 +1,11 @@
 //! The game's `latest.log`: the loader's own account of what it refused to load.
 
 use super::shared::{
-    collect_lines, data_error_fact, fabric_dependency, fact, file_problem, frame_symbol_and_class,
-    is_mod_id, jar_from_frame, java_exception_category, jvm_problem, loader_dependency_problem,
-    loader_problem, looked_for, mixin_failure_fact, mixin_failure_line, mod_crash_from_message,
-    mod_crash_line, named_message_classes, notes_for, number, reference, source_location, text,
+    collect_lines, damaged_archive, data_error_fact, fabric_dependency, fact, file_problem,
+    frame_symbol_and_class, is_mod_id, jar_from_frame, java_exception_category, jvm_problem,
+    loader_dependency_problem, loader_problem, looked_for, mixin_failure_fact, mixin_failure_line,
+    mod_crash_from_message, mod_crash_line, named_message_classes, notes_for, number, reference,
+    source_location, text,
 };
 use agora_game_api::crash::{
     BucketPart, BuiltInParser, BuiltInParserError, Coverage, CoverageState, Fact, ParserOutput,
@@ -207,6 +208,12 @@ impl BuiltInParser for LatestLogParser {
                 if seen.insert(key) {
                     facts.push(crash.into_fact(mod_crash_order, line_no));
                     mod_crash_order += 1;
+                }
+            }
+
+            if let Some(damaged) = damaged_archive(profile, line_no, "fatal", None) {
+                if seen.insert(format!("damaged\0{profile}")) {
+                    facts.push(damaged);
                 }
             }
 

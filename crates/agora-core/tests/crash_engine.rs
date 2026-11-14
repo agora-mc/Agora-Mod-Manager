@@ -297,6 +297,59 @@ fn empty_parser_output_abstains_and_names_nobody() {
     assert_ne!(answer.next.kind, NextStepKind::NothingNeeded);
 }
 
+#[test]
+fn the_same_finding_in_two_files_appears_once_with_evidence_from_both() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![root_cause_rule(
+            "same_rule",
+            "known_signature",
+            10,
+            "likely",
+        )],
+    )];
+    let mut log = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    log.artifact = "latest.log".to_string();
+    let mut captured = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    captured.artifact = "agora-launch-output.log".to_string();
+    let (evaluated, consensus) = run(
+        &packs,
+        &[log, captured],
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(answer.findings.len(), 1, "{:#?}", answer.findings);
+    let mut artifacts: Vec<String> = answer.findings[0]
+        .evidence
+        .iter()
+        .map(|evidence| evidence.artifact.clone())
+        .collect();
+    artifacts.sort();
+    assert_eq!(artifacts, ["agora-launch-output.log", "latest.log"]);
+}
+
 fn example(name: &str) -> String {
     let path = match name {
         "minecraft.pack" => {
@@ -1005,6 +1058,68 @@ fn inspector_failure_takes_on_unknown_and_never_the_passing_path() {
 }
 
 #[test]
+fn an_inspector_never_runs_against_a_framework_or_platform_owner() {
+    let resolver = FakeResolver::new().with(
+        "file",
+        "skse64_1_6_1170.dll",
+        item("skse", "Script Extender"),
+        Some(Role::Framework),
+    );
+    let rule = json!({
+        "id": "inspect_it",
+        "version": 1,
+        "when": { "fact": { "kind": "creation.object", "ref": { "kind": "file", "strength": "object", "bind": "target" } } },
+        "verify": {
+            "inspector": "plugin_declaration",
+            "target": "target",
+            "on_fail": [{ "finding": {
+                "scope": "root_cause",
+                "level": "likely",
+                "cause": "version_mismatch",
+                "candidate": { "owner_of": "target" }
+            } }],
+            "on_unknown": [{ "context": { "text": { "en": "The check could not decide." } } }]
+        },
+        "effects": [],
+        "text": { "headline": { "en": "A framework file was inspected." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![file_object("skse64_1_6_1170.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Fail),
+        Some("1.0"),
+    );
+    assert!(
+        evaluated.inspections.is_empty(),
+        "{:#?}",
+        evaluated.inspections
+    );
+    assert!(
+        !evaluated
+            .could_not_check
+            .iter()
+            .any(|note| note.subject == "plugin_declaration"),
+        "{:#?}",
+        evaluated.could_not_check
+    );
+    assert!(
+        consensus.candidates.is_empty(),
+        "{:#?}",
+        consensus.candidates
+    );
+}
+
+#[test]
 fn stopped_and_normal_exits_name_nobody() {
     let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
     let packs = vec![pack(
@@ -1188,7 +1303,7 @@ fn shuffled_input_gives_byte_identical_serialized_output() {
 }
 
 #[test]
-fn justified_abstention_names_nobody_and_starts_a_bisect() {
+fn a_likely_finding_is_the_answer_and_does_not_start_a_bisect() {
     let resolver = FakeResolver::new().with(
         "module",
         "hook.dll",
@@ -1252,8 +1367,12 @@ fn justified_abstention_names_nobody_and_starts_a_bisect() {
         &consensus,
     );
     assert!(answer.candidates.is_empty());
-    assert_eq!(answer.next.kind, NextStepKind::Bisect);
-    assert_ne!(english(&answer.headline), "");
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(answer.next.kind, NextStepKind::SecondOpinion);
+    assert_eq!(
+        english(&answer.headline),
+        "The game read a bad pointer in its own code."
+    );
 }
 
 #[test]
@@ -2551,6 +2670,162 @@ fn a_non_mod_cause_reaches_the_answer_when_nobody_is_named() {
     assert!(answer.candidates.is_empty());
     assert_eq!(answer.cause, Some(Cause::Memory));
     assert_eq!(answer.findings[0].cause, Cause::Memory);
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(english(&answer.headline), "The game ran out of memory.");
+}
+
+#[test]
+fn a_failed_start_says_content_never_loaded() {
+    use agora_core::crash_engine::change::session_facts;
+
+    let failed = session_facts("failed_to_start", Some(1), Some(300), &[]);
+    let session = failed
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .expect("a session fact");
+    assert_eq!(
+        session.attrs.get("content_loaded"),
+        Some(&AttrValue::Scalar(Scalar::Bool(false)))
+    );
+
+    let crashed = session_facts("crashed", Some(1), Some(30_000), &[]);
+    let session = crashed
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .expect("a session fact");
+    assert_eq!(
+        session.attrs.get("content_loaded"),
+        Some(&AttrValue::Scalar(Scalar::Bool(true)))
+    );
+
+    let unknown = session_facts("closed_unknown", None, None, &[]);
+    let session = unknown
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .expect("a session fact");
+    assert!(!session.attrs.contains_key("content_loaded"));
+}
+
+#[test]
+fn a_likely_setting_finding_is_the_headline_and_never_starts_a_bisect() {
+    use agora_core::crash_engine::change::session_facts;
+
+    let rule = json!({
+        "id": "jvm_startup",
+        "version": 1,
+        "when": { "fact": { "kind": "core.exception", "where": { "category": "managed" } } },
+        "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "setting" } }],
+        "text": {
+            "headline": { "en": "Java could not start because of its settings." },
+            "why_not_sure": { "en": "No mod had loaded when the JVM stopped." }
+        },
+        "next_step": "bisect"
+    });
+    let exception = Fact {
+        kind: "core.exception".to_string(),
+        attrs: [("category".to_string(), text_attr("managed"))]
+            .into_iter()
+            .collect(),
+        refs: Vec::new(),
+        span: None,
+    };
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with("p", "parser", "test", vec![exception], Vec::new());
+    let engine_facts = session_facts("failed_to_start", Some(1), Some(300), &[]);
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &engine_facts,
+        &FakeResolver::new(),
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(evaluated.content_loaded, Some(false));
+    let answer = answer_for(SessionVerdict::FailedToStart, &evaluated, &consensus);
+    assert!(answer.candidates.is_empty());
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(answer.cause, Some(Cause::Setting));
+    assert_eq!(
+        english(&answer.headline),
+        "Java could not start because of its settings."
+    );
+    assert_ne!(answer.next.kind, NextStepKind::Bisect);
+}
+
+#[test]
+fn a_mod_on_the_stack_does_not_overrule_an_equally_likely_memory_cause() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let oom = json!({
+        "id": "out_of_memory",
+        "version": 1,
+        "actions": [{ "kind": "open_jvm_settings" }],
+        "when": { "fact": { "kind": "core.exception", "where": { "category": "oom" } } },
+        "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "memory" } }],
+        "text": {
+            "headline": { "en": "Java ran out of memory." },
+            "why_not_sure": { "en": "A mod can cause the memory pressure, but the log does not name one." }
+        },
+        "next_step": "nothing_needed"
+    });
+    let packs = vec![pack(
+        "p",
+        vec![oom, signal_rule("on_stack", "execution", 10)],
+    )];
+    let exception = Fact {
+        kind: "core.exception".to_string(),
+        attrs: [("category".to_string(), text_attr("oom"))]
+            .into_iter()
+            .collect(),
+        refs: Vec::new(),
+        span: None,
+    };
+    let parsed = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![exception, frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(consensus.level, Level::Likely);
+    assert_eq!(consensus.candidates[0].level, Level::Likely);
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(answer.cause, Some(Cause::Memory));
+    assert_eq!(english(&answer.headline), "Java ran out of memory.");
+    assert_ne!(answer.next.kind, NextStepKind::Bisect);
+}
+
+#[test]
+fn a_disabled_plugin_is_named_in_the_change_finding() {
+    use agora_core::session_ledger::{ChangeKind, ManifestChange};
+
+    let change = ManifestChange {
+        kind: ChangeKind::Disabled,
+        key: Some("Unofficial Example Patch.esp".to_string()),
+        from_version: None,
+        to_version: None,
+    };
+    let finding =
+        agora_core::crash_engine::change::change_finding(&[change]).expect("a change finding");
+    let headline = english(&finding.headline);
+    assert!(
+        headline.contains("switched off Unofficial Example Patch.esp"),
+        "{headline}"
+    );
 }
 
 #[test]

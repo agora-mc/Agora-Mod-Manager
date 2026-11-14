@@ -176,7 +176,8 @@ pub const CORE_FACT_KINDS: &[(&str, &[&str])] = &[
 /// any other; a parser that emits one is refused. This is why rules need no special operators for
 /// history, changes or ownership.
 ///
-/// - `core.session`: how this session ended.
+/// - `core.session`: how this session ended. `content_loaded` is `false` when the verdict is a
+///   failed start, `true` when it ran, and absent when the ending is unknown.
 /// - `core.history`: how often this bucket has happened.
 /// - `core.change`: one per content item changed since the last good launch. `change` is `added`,
 ///   `removed` or `updated`; the item is in `refs` under kind `content`.
@@ -186,7 +187,10 @@ pub const CORE_FACT_KINDS: &[(&str, &[&str])] = &[
 ///   instance without making the rule unanchored.
 pub const ENGINE_FACT_KINDS: &[(&str, &[&str])] = &[
     ("core.instance", &["game"]),
-    ("core.session", &["verdict", "exit_code", "runtime_ms"]),
+    (
+        "core.session",
+        &["verdict", "exit_code", "runtime_ms", "content_loaded"],
+    ),
     (
         "core.history",
         &[
@@ -205,7 +209,8 @@ pub const ENGINE_FACT_KINDS: &[(&str, &[&str])] = &[
 /// Attributes the engine adds to a parser's fact once the pack's roles are known: usable in rules,
 /// refused from a parser. `actionable_index` counts frames after dropping those whose ref has the
 /// role `system` or `platform`, so a top frame inside the game itself or the Java standard library
-/// doesn't count as the place to look. `novel` marks a log line unseen in the last clean session.
+/// doesn't count as the place to look; a dropped frame carries `-1`. `novel` marks a log line
+/// unseen in the last clean session.
 pub const ENGINE_ATTRS: &[(&str, &[&str])] = &[
     ("core.frame", &["actionable_index"]),
     ("core.log_line", &["novel"]),

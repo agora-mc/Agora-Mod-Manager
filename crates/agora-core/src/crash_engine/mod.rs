@@ -114,7 +114,10 @@ pub(crate) fn clean_evidence(mut lines: Vec<EvidenceLine>) -> Vec<EvidenceLine> 
     lines
 }
 
-/// Sort and deduplicate findings by everything a user can see.
+/// Sort and deduplicate findings by everything a user can see. The same finding from the same rule
+/// in two artifacts is one finding: its evidence from both is kept, so the answer shows both
+/// places it was seen. Only the evidence may differ; a different rule, text, level or candidate
+/// stays its own finding.
 pub(crate) fn clean_findings(
     mut findings: Vec<agora_game_api::crash::Finding>,
 ) -> Vec<agora_game_api::crash::Finding> {
@@ -136,9 +139,8 @@ pub(crate) fn clean_findings(
             .and_then(|text| text.get("en"))
             .cloned()
             .unwrap_or_default();
-        let evidence: Vec<String> = finding.evidence.iter().map(evidence_key).collect();
         format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             scope_rank(finding.scope),
             finding.level.label(),
             finding.cause.label(),
@@ -146,13 +148,35 @@ pub(crate) fn clean_findings(
             candidate_name,
             headline,
             why,
-            source_key(&finding.source),
-            evidence.join("\u{1f}")
+            source_key(&finding.source)
         )
     }
-    findings.sort_by_key(key);
-    findings.dedup_by_key(|finding| key(finding));
-    findings
+    fn evidence_join(finding: &agora_game_api::crash::Finding) -> String {
+        finding
+            .evidence
+            .iter()
+            .map(evidence_key)
+            .collect::<Vec<_>>()
+            .join("\u{1f}")
+    }
+    findings.sort_by(|a, b| {
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| evidence_join(a).cmp(&evidence_join(b)))
+    });
+    let mut cleaned: Vec<agora_game_api::crash::Finding> = Vec::with_capacity(findings.len());
+    for mut finding in findings {
+        if let Some(previous) = cleaned.last_mut() {
+            if key(previous) == key(&finding) {
+                previous.evidence.append(&mut finding.evidence);
+                previous.evidence = clean_evidence(std::mem::take(&mut previous.evidence));
+                continue;
+            }
+        }
+        finding.evidence = clean_evidence(std::mem::take(&mut finding.evidence));
+        cleaned.push(finding);
+    }
+    cleaned
 }
 
 pub(crate) fn scope_rank(scope: agora_game_api::crash::Scope) -> u8 {

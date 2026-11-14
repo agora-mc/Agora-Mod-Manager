@@ -54,6 +54,12 @@ pub struct Resolved {
 pub trait RefResolver {
     fn resolve(&self, reference: &Ref) -> Resolved;
 
+    /// Other enabled items that provide the same file. Empty for a resolver that cannot see an
+    /// instance. It is separate from [`Resolved`] so a test resolver need not implement it.
+    fn also_provided_by(&self, _reference: &Ref) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The game-relative files an installed item provides, for checking whether removing it is
     /// safe for a save. `None` means this resolver cannot list the instance, so nothing is claimed.
     fn item_files(&self, _content_key: &str) -> Option<Vec<String>> {

@@ -891,11 +891,14 @@ fn print_answer(
         }
     }
 
-    if !answer.could_not_check.is_empty() {
+    // A rule that hit its branch limit is a note for pack authors, not a player-facing check. The
+    // JSON answer still carries it; this list is the one a person reads.
+    let player_checks = player_could_not_check(&answer.could_not_check);
+    if !player_checks.is_empty() {
         println!("Could not check:");
         // Several rules often miss the same thing; say it once, with how many.
         let mut lines: Vec<(String, usize)> = Vec::new();
-        for check in &answer.could_not_check {
+        for check in player_checks {
             let plugin = check
                 .source
                 .as_ref()
@@ -1020,8 +1023,16 @@ fn suspect_line(candidate: &agora_game_api::crash::Candidate) -> String {
         .map(save_risk_words)
         .map(|words| format!(" - {words}"))
         .unwrap_or_default();
+    let also = if candidate.also_provided_by.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (also provided by {})",
+            candidate.also_provided_by.join(", ")
+        )
+    };
     format!(
-        "{}: {}{risk}",
+        "{}: {}{risk}{also}",
         owner_name(&candidate.owner),
         candidate.level.label()
     )
@@ -1116,6 +1127,15 @@ fn inspect_words(result: agora_game_api::crash::InspectResult) -> &'static str {
     }
 }
 
+/// The checks a person can read. A rule's branch-limit note stays in the JSON answer for the pack
+/// author; it is not a "could not check" a player should see.
+fn player_could_not_check(checks: &[CouldNotCheck]) -> Vec<&CouldNotCheck> {
+    checks
+        .iter()
+        .filter(|check| check.reason != CouldNotCheckReason::TooManyMatches)
+        .collect()
+}
+
 fn reason_words(reason: CouldNotCheckReason) -> &'static str {
     match reason {
         CouldNotCheckReason::NotCovered => "no parser looked for it",
@@ -1126,5 +1146,31 @@ fn reason_words(reason: CouldNotCheckReason) -> &'static str {
         CouldNotCheckReason::NotRetained => "Agora did not keep these bytes",
         CouldNotCheckReason::TooManyMatches => "the rule matched too many times",
         CouldNotCheckReason::InstanceIncomplete => "the instance could not supply it",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(reason: CouldNotCheckReason) -> CouldNotCheck {
+        CouldNotCheck {
+            reason,
+            subject: "a rule".to_string(),
+            detail: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn a_branch_limit_note_is_not_a_player_facing_check() {
+        let checks = vec![
+            check(CouldNotCheckReason::TooManyMatches),
+            check(CouldNotCheckReason::NotCovered),
+        ];
+        let shown = player_could_not_check(&checks);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].reason, CouldNotCheckReason::NotCovered);
+        assert!(player_could_not_check(&[check(CouldNotCheckReason::TooManyMatches)]).is_empty());
     }
 }

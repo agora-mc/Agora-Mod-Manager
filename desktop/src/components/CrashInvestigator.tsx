@@ -167,9 +167,10 @@ export function renderAnswerText(answer: CrashAnswer): string {
       lines.push(`- ${english(finding.headline)} (from ${finding.source.plugin_name})`);
     });
   }
-  if (answer.could_not_check.length > 0) {
+  const playerChecks = answer.could_not_check.filter((check) => check.reason !== 'too_many_matches');
+  if (playerChecks.length > 0) {
     lines.push('', 'Could not check:');
-    answer.could_not_check.forEach((check) => {
+    playerChecks.forEach((check) => {
       lines.push(`- ${check.subject}: ${check.reason.split('_').join(' ')}${check.detail === undefined ? '' : `: ${check.detail}`}`);
     });
   }

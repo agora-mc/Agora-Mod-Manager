@@ -195,7 +195,8 @@
       "lookup": {
         "path": {
           "patterns": [
-            "Data/{value}"
+            "Data/{value}",
+            "{value}"
           ],
           "archives": true
         }

@@ -29,6 +29,7 @@ struct Bucket {
     owner: Owner,
     families: BTreeMap<Family, u32>,
     sources: BTreeMap<String, SourceAttribution>,
+    also: BTreeSet<String>,
     /// The strongest clue that states a cause, as (weight, specificity, cause). The candidate's
     /// cause comes from it; without one, the candidate is `mod`.
     cause: Option<(u32, u8, Cause)>,
@@ -87,6 +88,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             owner: signal.candidate.clone(),
             families: BTreeMap::new(),
             sources: BTreeMap::new(),
+            also: BTreeSet::new(),
             cause: None,
         });
         bucket
@@ -98,6 +100,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             .sources
             .entry(source_key(&signal.source))
             .or_insert_with(|| signal.source.clone());
+        bucket.also.extend(signal.also_provided_by.iter().cloned());
         if let Some(cause) = signal.cause {
             bucket.offer_cause(signal.weight, cause);
         }
@@ -112,6 +115,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
         role: Option<Role>,
         families: Vec<Family>,
         sources: Vec<SourceAttribution>,
+        also: Vec<String>,
         demoted: bool,
     }
 
@@ -152,6 +156,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             role,
             families,
             sources,
+            also: bucket.also.into_iter().collect(),
             demoted: matches!(role, Some(Role::HookFramework | Role::Framework)),
         });
     }
@@ -183,7 +188,7 @@ pub fn consensus(input: &ConsensusInput<'_>, profile: &ConsensusProfile) -> Cons
             role: scored.role,
             families: scored.families.clone(),
             sources: scored.sources.clone(),
-            also_provided_by: Vec::new(),
+            also_provided_by: scored.also.clone(),
             save_risk: None,
         })
         .collect();

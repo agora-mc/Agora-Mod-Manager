@@ -502,3 +502,210 @@ fn a_ref_that_is_not_in_the_instance_is_not_inspected() {
         "skse_plugin_built_for_another_game_version"
     ));
 }
+
+/// A mesh path the game records with its `data\` prefix and its own casing. Two layers provide
+/// the file; the higher one wins and the overridden one is named.
+const MESH_PATH: &str = r"data\MESHES\actors\character\character assets\skeleton.nif";
+const MESH_FILE: &str = "Data/MESHES/actors/character/character assets/skeleton.nif";
+
+fn mesh_log(path: &str) -> String {
+    format!(
+        "Skyrim SSE v{RUNNING}\nCrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00\n\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 SkyrimSE.exe+001000\tmov rax, [rcx]\n\n\
+SYSTEM SPECS:\n\tOS: Microsoft Windows 11 Pro v10.0.26200\n\tCPU: Invented CPU 9200\n\
+\tGPU #1: Invented Graphics 9200\n\tPHYSICAL MEMORY: 15.50 GB/16.00 GB\n\n\
+PROBABLE CALL STACK:\n\t[ 0] 0x7FF700000000 SkyrimSE.exe+001000\n\n\
+REGISTERS:\n\tRDX 0x0A000000000      (BSStream*)\n\
+\t\tstreamName: \"{path}\"\n\
+\t\tFormID: 0x00012345\n\
+\t\tFormType: Texture (61)\n\n\
+MODULES:\n\tSkyrimSE.exe                 0x7FF700000000\n\n\
+PLUGINS:\n\tLight: 0\tRegular: 1\tTotal: 1\n\t[ 0]     Skyrim.esm\n"
+    )
+}
+
+fn skeleton_view() -> InstanceView {
+    InstanceView::new(vec![
+        LayerView::new(
+            "base-skeleton",
+            true,
+            LayerOwner::Item {
+                key: "base-skeleton".to_string(),
+                name: "Base Skeleton Mod".to_string(),
+            },
+            vec![MESH_FILE.to_string()],
+        ),
+        LayerView::new(
+            "override-skeleton",
+            true,
+            LayerOwner::Item {
+                key: "override-skeleton".to_string(),
+                name: "Override Skeleton Mod".to_string(),
+            },
+            vec![MESH_FILE.to_string()],
+        ),
+    ])
+}
+
+#[test]
+fn a_mesh_named_with_the_data_prefix_resolves_to_the_mod_that_wins() {
+    let running = start();
+    let resolver = Resolver::new(
+        skeleton_view(),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: Vec::new() });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            mesh_log(MESH_PATH).into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: Some(InstanceAnalysis {
+            game_id: GAME,
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &[],
+        }),
+    })
+    .unwrap();
+    let top = output
+        .answer
+        .candidates
+        .first()
+        .unwrap_or_else(|| panic!("no suspect: {:#?}", output.answer));
+    assert_eq!(
+        top.owner,
+        Owner::Item {
+            key: "override-skeleton".to_string(),
+            name: "Override Skeleton Mod".to_string(),
+        }
+    );
+    assert!(
+        top.also_provided_by
+            .iter()
+            .any(|key| key == "base-skeleton"),
+        "the overridden item is named: {:#?}",
+        top.also_provided_by
+    );
+    assert!(
+        !output.answer.could_not_check.iter().any(|note| note
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("could not tell who owns"))),
+        "{:#?}",
+        output.answer.could_not_check
+    );
+}
+
+#[test]
+fn a_loose_mesh_file_is_still_named_plainly() {
+    let running = start();
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            mesh_log(MESH_PATH).into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: None,
+    })
+    .unwrap();
+    let top = output
+        .answer
+        .candidates
+        .first()
+        .unwrap_or_else(|| panic!("no suspect: {:#?}", output.answer));
+    assert_eq!(
+        top.owner,
+        Owner::Item {
+            key: MESH_PATH.to_string(),
+            name: MESH_PATH.to_string(),
+        }
+    );
+}
+
+#[test]
+fn the_script_extenders_own_runtime_is_not_inspected_or_named() {
+    let running = start();
+    let text = format!(
+        "Skyrim SSE v{RUNNING}\nCrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00\n\n\
+Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 SkyrimSE.exe+001000\tmov rax, [rcx]\n\n\
+SYSTEM SPECS:\n\tOS: Microsoft Windows 11 Pro v10.0.26200\n\tCPU: Invented CPU 9200\n\
+\tGPU #1: Invented Graphics 9200\n\tPHYSICAL MEMORY: 15.50 GB/16.00 GB\n\n\
+PROBABLE CALL STACK:\n\t[ 0] 0x7FF700000000 SkyrimSE.exe+001000\n\n\
+MODULES:\n\tSkyrimSE.exe                 0x7FF700000000\n\n\
+SKSE PLUGINS:\n\tskse64_1_6_1170.dll v1.6.1170\n\n\
+PLUGINS:\n\tLight: 0\tRegular: 1\tTotal: 1\n\t[ 0]     Skyrim.esm\n"
+    );
+    let resolver = Resolver::new(
+        view(),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: Vec::new() });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let output = analyze(&AnalyzeInput {
+        packs: std::slice::from_ref(&running.pack),
+        files: &[CrashFile::new(
+            "crash-2026-01-01-12-00-00.log",
+            text.into_bytes(),
+        )],
+        runtime_version: Some(RUNNING),
+        host: &running.host,
+        built_in: &[],
+        instance: Some(InstanceAnalysis {
+            game_id: GAME,
+            resolver: &resolver,
+            inspector: &inspector,
+            could_not_check: &[],
+        }),
+    })
+    .unwrap();
+    assert!(
+        output.answer.inspections.is_empty(),
+        "{:#?}",
+        output.answer.inspections
+    );
+    assert!(
+        !names(&output)
+            .iter()
+            .any(|name| name == "skse64_1_6_1170.dll"),
+        "{:?}",
+        names(&output)
+    );
+    assert!(
+        !output
+            .answer
+            .could_not_check
+            .iter()
+            .any(|note| note.subject == "skse_plugin_declaration"),
+        "{:#?}",
+        output.answer.could_not_check
+    );
+}

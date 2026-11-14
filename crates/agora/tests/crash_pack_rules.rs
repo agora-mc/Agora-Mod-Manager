@@ -549,6 +549,35 @@ mod crash {
     }
 
     #[test]
+    fn an_ordinary_full_stack_does_not_exhaust_the_frame_rule() {
+        let mut facts = Vec::new();
+        for index in 0..64u32 {
+            let mut frame = fact(
+                "core.frame",
+                &[("index", number(f64::from(index)))],
+                vec![strong_reference(
+                    "class",
+                    &format!("com.example.mod{index}.Thing"),
+                )],
+            );
+            frame
+                .attrs
+                .insert("actionable_index".to_string(), number(f64::from(index)));
+            facts.push(frame);
+        }
+        let evaluated = evaluate_one(output("minecraft_crash_report", facts));
+        assert!(
+            !evaluated
+                .could_not_check
+                .iter()
+                .any(|note| note.subject == "frame_on_stack"),
+            "{:#?}",
+            evaluated.could_not_check
+        );
+        assert!(signalled(&evaluated, "frame_on_stack"));
+    }
+
+    #[test]
     fn the_loader_naming_a_failed_mod_becomes_a_candidate() {
         let first = evaluate_one(output(
             "minecraft_crash_report",
@@ -655,6 +684,8 @@ mod crash {
         for (kind, rule) in [
             ("native_library", "missing_native_library"),
             ("memory_startup", "jvm_memory_startup"),
+            ("vm_option", "jvm_startup_setting"),
+            ("main_class", "jvm_startup_setting"),
             ("graphics", "graphics_driver_problem"),
             ("id_limit", "registry_limit"),
         ] {
@@ -695,6 +726,45 @@ mod crash {
             )],
         ));
         assert!(fired(&driver, "graphics_driver_frame"));
+    }
+
+    #[test]
+    fn a_jvm_startup_error_is_a_setting_and_offers_the_settings_action() {
+        use agora_game_api::crash::{ActionKind, Cause, Level, NextStepKind};
+
+        for (kind, rule) in [
+            ("memory_startup", "jvm_memory_startup"),
+            ("vm_option", "jvm_startup_setting"),
+            ("main_class", "jvm_startup_setting"),
+        ] {
+            let evaluated = evaluate_one(output(
+                "minecraft_latest_log",
+                vec![fact(
+                    "minecraft.jvm_problem",
+                    &[("kind", text(kind)), ("message", text("a message"))],
+                    Vec::new(),
+                )],
+            ));
+            let found = evaluated
+                .findings
+                .iter()
+                .find(|finding| finding.source.rule_id.as_deref() == Some(rule))
+                .unwrap_or_else(|| panic!("{kind}: {rule} did not fire"));
+            assert_eq!(found.cause, Cause::Setting, "{kind}");
+            assert_eq!(found.level, Level::Likely, "{kind}");
+            assert!(
+                evaluated.next_steps.contains(&NextStepKind::NothingNeeded),
+                "{kind}: {:?}",
+                evaluated.next_steps
+            );
+            assert!(
+                evaluated.actions.iter().any(|offer| {
+                    offer.action.kind == ActionKind::OpenJvmSettings
+                        && offer.source.rule_id.as_deref() == Some(rule)
+                }),
+                "{kind}: no settings action"
+            );
+        }
     }
 
     #[test]
@@ -811,6 +881,48 @@ mod crash {
         assert!(evaluated.signals.iter().any(|signal| {
             matches!(&signal.candidate, Owner::Item { key, .. } if key == "examplemod.toml.old")
         }));
+    }
+
+    #[test]
+    fn a_damaged_jar_names_the_file_and_outranks_resolution() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![
+                fact(
+                    "minecraft.loader_problem",
+                    &[
+                        ("kind", text("resolution")),
+                        ("message", text("the loader could not resolve the mod set")),
+                    ],
+                    Vec::new(),
+                ),
+                fact(
+                    "minecraft.file_problem",
+                    &[
+                        ("kind", text("damaged_archive")),
+                        ("path", text("examplemod.jar")),
+                        (
+                            "message",
+                            text("java.util.zip.ZipException: zip END header not found"),
+                        ),
+                    ],
+                    vec![reference("file", "examplemod.jar")],
+                ),
+            ],
+        ));
+        assert!(fired(&evaluated, "damaged_mod_file"));
+        assert!(!fired(&evaluated, "mod_resolution_failed"));
+        let found = evaluated
+            .findings
+            .iter()
+            .find(|finding| finding.source.rule_id.as_deref() == Some("damaged_mod_file"))
+            .expect("the damaged-file finding");
+        assert_eq!(found.cause, agora_game_api::crash::Cause::File);
+        assert_eq!(found.level, agora_game_api::crash::Level::VeryLikely);
+        assert!(matches!(
+            &found.candidate,
+            Some(Owner::Item { key, .. }) if key == "examplemod.jar"
+        ));
     }
 
     #[test]
@@ -1112,6 +1224,20 @@ mod retired_signatures {
             action(&output, "out_of_memory"),
             Some(ActionKind::OpenJvmSettings)
         );
+        assert_eq!(
+            output.answer.cause,
+            Some(agora_game_api::crash::Cause::Memory)
+        );
+        assert_eq!(output.answer.level, agora_game_api::crash::Level::Likely);
+        assert_eq!(
+            output.answer.next.kind,
+            agora_game_api::crash::NextStepKind::NothingNeeded
+        );
+        assert!(output
+            .answer
+            .headline
+            .get("en")
+            .is_some_and(|text| text.contains("ran out of memory")));
     }
 }
 

@@ -330,7 +330,7 @@
           "en": "A mod can cause the memory pressure, but the log does not name one."
         }
       },
-      "next_step": "confirm_experiment"
+      "next_step": "nothing_needed"
     },
     {
       "id": "missing_class",
@@ -788,10 +788,11 @@
     },
     {
       "id": "frame_on_stack",
-      "version": 1,
+      "version": 2,
       "when": {
         "fact": {
           "kind": "core.frame",
+          "where": { "actionable_index": { "lte": 8 } },
           "ref": { "kind": "class", "strength": "exec", "bind": "cls" }
         }
       },
@@ -869,6 +870,7 @@
     {
       "id": "unsupported_class_version",
       "version": 1,
+      "actions": [{ "kind": "open_jvm_settings", "label": { "en": "Open JVM Settings" } }],
       "when": {
         "fact": {
           "kind": "minecraft.jvm_problem",
@@ -885,7 +887,7 @@
           "en": "The class-file version names the Java the class needs; it does not say which mod shipped it."
         }
       },
-      "next_step": "confirm_experiment"
+      "next_step": "nothing_needed"
     },
     {
       "id": "java_too_new",
@@ -950,16 +952,38 @@
           "bind": { "message": "message" }
         }
       },
-      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "memory" } }],
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "setting" } }],
       "text": {
         "headline": {
-          "en": "Java could not start with the memory it was given ({message}). Using 64-bit Java, lowering the maximum heap, or freeing memory on the machine is a likely next step."
+          "en": "Java could not start with the memory settings it was given ({message}). Opening the JVM settings and lowering the maximum heap, or giving the instance a valid initial heap, is a likely next step."
         },
         "why_not_sure": {
           "en": "The JVM refused the requested memory before the game or any mod could run."
         }
       },
-      "next_step": "confirm_experiment"
+      "next_step": "nothing_needed"
+    },
+    {
+      "id": "jvm_startup_setting",
+      "version": 1,
+      "actions": [{ "kind": "open_jvm_settings", "label": { "en": "Open JVM Settings" } }],
+      "when": {
+        "fact": {
+          "kind": "minecraft.jvm_problem",
+          "where": { "kind": { "in": ["vm_option", "main_class"] } },
+          "bind": { "message": "message" }
+        }
+      },
+      "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "setting" } }],
+      "text": {
+        "headline": {
+          "en": "Java could not start with its launch settings ({message}). Opening the JVM settings and correcting the option or class it names is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The JVM refused the launch before the game or any mod could run."
+        }
+      },
+      "next_step": "nothing_needed"
     },
     {
       "id": "graphics_driver_problem",
@@ -1309,6 +1333,54 @@
         },
         "why_not_sure": {
           "en": "A leftover file can stop a mod from starting, but another file problem can print the same message."
+        }
+      },
+      "next_step": "confirm_experiment"
+    },
+    {
+      "id": "damaged_mod_file",
+      "version": 1,
+      "actions": [{ "kind": "review_mods", "label": { "en": "Review Installed Mods" } }],
+      "supersedes": [
+        "missing_dependency",
+        "missing_fabric_api",
+        "wrong_dependency_version",
+        "wrong_game_version",
+        "wrong_loader_version",
+        "mod_resolution_failed",
+        "incompatible_mods",
+        "mod_loading_error",
+        "mod_failed_to_load",
+        "missing_class",
+        "missing_member_wrong_version",
+        "data_error_names_mod"
+      ],
+      "when": {
+        "fact": {
+          "kind": "minecraft.file_problem",
+          "where": { "kind": "damaged_archive" },
+          "ref": { "kind": "file", "bind": "file" },
+          "bind": { "path": "path" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "cause": "file",
+            "scope": "root_cause",
+            "level": "very_likely",
+            "candidate": { "owner_of": "file" },
+            "family": "known_signature",
+            "weight": 16
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "{owner:file}'s file {path} is damaged, and the loader could not read it. Reinstalling {owner:file} is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The loader names the file it could not read; reinstalling it replaces the damaged copy with a good one."
         }
       },
       "next_step": "confirm_experiment"

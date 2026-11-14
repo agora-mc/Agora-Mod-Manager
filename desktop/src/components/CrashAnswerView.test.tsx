@@ -69,6 +69,16 @@ function renderView(props: Omit<ViewProps, 'onCheckAnother'> & { onCheckAnother?
 }
 
 describe('a named suspect', () => {
+  it('mentions an overridden item when more than one provides the file', () => {
+    renderView({
+      status: 'analyzed',
+      answer: answer({
+        candidates: [{ ...suspect, also_provided_by: ['acme.base'] }],
+      }),
+    });
+    expect(screen.getByText(/Also provided by acme\.base\./)).toBeInTheDocument();
+  });
+
   it('shows each save-risk chip in the design\u2019s words', () => {
     for (const [risk, words] of [
       ['safe', 'Safe to test on your save'],
@@ -321,6 +331,23 @@ describe('could not check', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByText(/core\.memory/)).toBeInTheDocument();
     expect(screen.getByText(/the parser timed out/)).toBeInTheDocument();
+  });
+
+  it('leaves a rule branch-limit note out of the player list', () => {
+    renderView({
+      status: 'analyzed',
+      answer: answer({
+        could_not_check: [
+          {
+            reason: 'too_many_matches',
+            subject: 'frame_on_stack',
+            detail: 'the rule matched more than 32 branches',
+            source,
+          },
+        ],
+      }),
+    });
+    expect(screen.queryByTestId('crash-could-not-check')).toBeNull();
   });
 });
 

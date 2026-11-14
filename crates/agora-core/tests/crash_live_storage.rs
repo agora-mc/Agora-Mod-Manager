@@ -1,8 +1,8 @@
 //! Storing, reading back and trimming the crash answer attached to a session. No game runs.
 
 use agora_core::crash_live::{
-    answer_for_session, answers_for_instance, latest_answer, store_answer, suspects_for_test,
-    SessionAnswer, StoredAnswer,
+    answer_for_session, answers_for_instance, latest_answer, latest_answer_with_context,
+    store_answer, suspects_for_test, SessionAnswer, StoredAnswer,
 };
 use agora_core::session_ledger::{ChangeKind, ManifestChange};
 use agora_game_api::crash::{
@@ -83,6 +83,75 @@ fn an_answer_round_trips_by_session_and_as_the_latest() {
     assert_eq!(found.session_id, "s1");
     let latest = latest_answer(&conn, "inst").unwrap().unwrap();
     assert_eq!(latest.session_id, "s2");
+}
+
+#[test]
+fn the_newest_session_without_an_answer_does_not_make_an_older_one_look_new() {
+    let conn = db();
+    insert_session(&conn, "answered", "inst", "2026-01-01T00:00:00Z");
+    conn.execute(
+        "UPDATE launch_history
+            SET ended_at = '2026-01-01T00:10:00Z', verdict = '{\"kind\":\"crashed\",\"how\":\"time\"}'
+          WHERE session_id = 'answered'",
+        [],
+    )
+    .unwrap();
+    store_answer(
+        &conn,
+        &answer(
+            "answered",
+            "inst",
+            "2026-01-01T00:11:00Z",
+            "the older answer",
+        ),
+    )
+    .unwrap();
+    insert_session(&conn, "newest", "inst", "2026-01-01T02:00:00Z");
+    conn.execute(
+        "UPDATE launch_history
+            SET ended_at = '2026-01-01T02:10:00Z', verdict = '{\"kind\":\"failed_to_start\"}'
+          WHERE session_id = 'newest'",
+        [],
+    )
+    .unwrap();
+
+    let context = latest_answer_with_context(&conn, "inst").unwrap();
+    assert_eq!(
+        context
+            .newest_session
+            .as_ref()
+            .map(|session| session.session_id.as_str()),
+        Some("newest")
+    );
+    assert_eq!(
+        context
+            .answer
+            .as_ref()
+            .map(|answer| answer.session_id.as_str()),
+        Some("answered")
+    );
+    assert_eq!(
+        context
+            .answer_session
+            .as_ref()
+            .map(|session| session.session_id.as_str()),
+        Some("answered")
+    );
+    assert_eq!(
+        context
+            .newest_session
+            .as_ref()
+            .and_then(|session| session.verdict),
+        Some(SessionVerdict::FailedToStart)
+    );
+    // The old accessor still reads by when the answer was stored; that is the trap this helper
+    // exists to avoid.
+    assert_eq!(
+        latest_answer(&conn, "inst")
+            .unwrap()
+            .map(|answer| answer.session_id),
+        Some("answered".to_string())
+    );
 }
 
 #[test]

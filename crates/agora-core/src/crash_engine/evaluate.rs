@@ -50,6 +50,9 @@ pub struct EvaluateOutput {
     pub next_steps: Vec<NextStepKind>,
     /// The role of each candidate owner, for consensus's demotion rule.
     pub roles: BTreeMap<String, Role>,
+    /// Whether content loaded this session, from the engine's `core.session` fact. `None` when the
+    /// engine could not say (a loose file, or an unknown ending).
+    pub content_loaded: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,14 +132,20 @@ fn annotate_frames(facts: &mut [FactEntry], resolver: &dyn RefResolver) {
                 Some(Role::System | Role::Platform)
             )
         });
-        if dropped {
-            continue;
-        }
+        // Every frame carries the attribute, so a rule testing it never reads a system or
+        // platform frame as "could not check". A dropped frame is -1, which no rule counting
+        // actionable frames will match.
+        let value = if dropped {
+            -1.0
+        } else {
+            let value = actionable as f64;
+            actionable += 1;
+            value
+        };
         facts[index].fact.attrs.insert(
             "actionable_index".to_string(),
-            AttrValue::Scalar(Scalar::Number(actionable as f64)),
+            AttrValue::Scalar(Scalar::Number(value)),
         );
-        actionable += 1;
     }
 }
 
@@ -1691,6 +1700,16 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
     next_steps.sort_by_key(|kind| next_step_rank(*kind));
     next_steps.dedup();
 
+    let content_loaded = input
+        .engine_facts
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .and_then(|fact| fact.attrs.get("content_loaded"))
+        .and_then(|value| match value {
+            AttrValue::Scalar(Scalar::Bool(loaded)) => Some(*loaded),
+            _ => None,
+        });
+
     EvaluateOutput {
         signals,
         findings: clean_findings(findings),
@@ -1702,6 +1721,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         actions,
         next_steps,
         roles,
+        content_loaded,
     }
 }
 
@@ -1873,6 +1893,14 @@ fn evaluate_rule(
         apply_effects(input, plugin, rule, &rule.effects, branch, &mut product);
         if let Some(verify) = &rule.verify {
             match branch.bindings.refs.get(&verify.target) {
+                // A framework's own runtime, the game itself or the system is not content to
+                // inspect or accuse. SKSE's own DLL declares no plugin version, and asking it is
+                // the trap that makes the framework look guilty.
+                Some(target)
+                    if matches!(
+                        input.resolver.resolve(&target.reference).role,
+                        Some(Role::System | Role::Platform | Role::Framework | Role::HookFramework)
+                    ) => {}
                 Some(target) => {
                     let outcome = input.inspector.inspect(&InspectionRequest {
                         plugin_id: &plugin.id,
@@ -2117,11 +2145,14 @@ fn apply_effects(
                     if let Some(role) = role {
                         product.roles.insert(owner_key(&owner), role);
                     }
+                    let also_provided_by =
+                        resolve_also(&candidate.owner_of, branch, input.resolver);
                     product.signals.push(Signal {
                         family: *family,
                         candidate: owner,
                         weight: *weight,
                         cause: *cause,
+                        also_provided_by,
                         source,
                         evidence: clean_evidence(branch.evidence.clone()),
                     });
@@ -2197,11 +2228,18 @@ fn apply_effects(
                 });
                 if effective_scope == Scope::RootCause {
                     if let (Some(owner), Some(family), Some(weight)) = (owner, family, weight) {
+                        let also_provided_by = candidate
+                            .as_ref()
+                            .map(|candidate| {
+                                resolve_also(&candidate.owner_of, branch, input.resolver)
+                            })
+                            .unwrap_or_default();
                         product.signals.push(Signal {
                             family: *family,
                             candidate: owner,
                             weight: *weight,
                             cause: Some(finding_cause),
+                            also_provided_by,
                             source,
                             evidence: clean_evidence(branch.evidence.clone()),
                         });
@@ -2255,6 +2293,15 @@ fn resolve_owner(
     let bound = branch.bindings.refs.get(variable)?;
     let resolved = resolver.resolve(&bound.reference);
     Some((resolved.owner, bound.parser.clone(), resolved.role))
+}
+
+fn resolve_also(variable: &str, branch: &Branch, resolver: &dyn RefResolver) -> Vec<String> {
+    branch
+        .bindings
+        .refs
+        .get(variable)
+        .map(|bound| resolver.also_provided_by(&bound.reference))
+        .unwrap_or_default()
 }
 
 fn resolve_repair(

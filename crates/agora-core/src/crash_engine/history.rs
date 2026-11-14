@@ -449,6 +449,7 @@ pub fn local_confirmation_signal(owner: Owner, count: u32) -> Signal {
         weight: 1 + count.min(3),
         source: confirmation_source(),
         evidence: Vec::new(),
+        also_provided_by: Vec::new(),
         cause: None,
     }
 }
@@ -480,6 +481,7 @@ pub fn repeat_signals(summary: &CrashHistory) -> Vec<Signal> {
             weight: 1 + owner.crashes_named.min(3) as u32,
             source: history_source(),
             evidence: Vec::new(),
+            also_provided_by: Vec::new(),
             cause: None,
         })
         .collect()

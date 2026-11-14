@@ -173,6 +173,60 @@ pub fn answers_for_instance(
     Ok(rows.into_iter().map(decode_answer).collect())
 }
 
+/// What a session was, for telling a reader which one an answer belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBrief {
+    pub session_id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub verdict: Option<SessionVerdict>,
+}
+
+impl From<SessionRecord> for SessionBrief {
+    fn from(record: SessionRecord) -> Self {
+        Self {
+            session_id: record.session_id,
+            started_at: record.started_at,
+            ended_at: record.ended_at,
+            verdict: record.verdict,
+        }
+    }
+}
+
+/// The newest session and the newest stored answer, which need not be the same session. A launch
+/// with no answer must not make an older one look like the newest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LatestAnswer {
+    /// The newest session the ledger knows, answered or not.
+    pub newest_session: Option<SessionBrief>,
+    /// The newest stored answer, by the session it belongs to.
+    pub answer: Option<SessionAnswer>,
+    /// The session that answer belongs to, when the ledger still knows it.
+    pub answer_session: Option<SessionBrief>,
+}
+
+/// The newest session beside the newest stored answer. Use this when telling a person what they are
+/// reading; [`latest_answer`] alone cannot say that the newest session has no answer yet.
+pub fn latest_answer_with_context(
+    conn: &Connection,
+    instance_id: &str,
+) -> anyhow::Result<LatestAnswer> {
+    let newest_session = session_ledger::list(conn, instance_id, 1)?
+        .into_iter()
+        .next()
+        .map(SessionBrief::from);
+    let answer = answers_for_instance(conn, instance_id)?.into_iter().next();
+    let answer_session = answer
+        .as_ref()
+        .and_then(|answer| session_ledger::get(conn, &answer.session_id).ok().flatten())
+        .map(SessionBrief::from);
+    Ok(LatestAnswer {
+        newest_session,
+        answer,
+        answer_session,
+    })
+}
+
 /// The newest stored answer for an instance.
 pub fn latest_answer(
     conn: &Connection,
