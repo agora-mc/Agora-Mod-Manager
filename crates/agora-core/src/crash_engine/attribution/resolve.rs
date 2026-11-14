@@ -17,8 +17,9 @@ use crate::crash_engine::types::{ParsedArtifact, RefResolver, Resolved};
 pub struct Attribution {
     pub owner: Owner,
     pub role: Option<Role>,
-    /// Content keys (or a short layer label) of the other enabled layers that provide the same
-    /// file. Sorted and deduplicated, so it does not depend on listing order.
+    /// Names of the other enabled layers that provide the same file, falling back to a content
+    /// key only when an item has no name (and to a short label for other kinds of layer). Sorted
+    /// and deduplicated, so it does not depend on listing order.
     pub also_provided_by: Vec<String>,
     /// The file the answer came from: the game-relative path, or an archive holding it.
     pub via: Option<String>,
