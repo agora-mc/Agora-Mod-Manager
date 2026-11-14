@@ -204,6 +204,67 @@ pub(crate) fn java_exception_category(class: &str) -> &'static str {
     }
 }
 
+/// A mod jar the loader could not read because the file itself is damaged. The forms cover
+/// Fabric, Quilt, Forge and NeoForge; the file name is kept only when the line names one.
+pub(crate) fn damaged_archive(line: &str, line_no: usize, section: &str) -> Option<Fact> {
+    let lower = line.to_ascii_lowercase();
+    let says_unreadable = lower.contains("error analyzing")
+        || lower.contains("failed to read mod file")
+        || lower.contains("invalid or corrupt jarfile");
+    let says_zip_damage = lower.contains("zipexception")
+        && (lower.contains("zip end header")
+            || lower.contains("invalid loc header")
+            || lower.contains("zip file is empty"));
+    if !says_unreadable && !says_zip_damage {
+        return None;
+    }
+    let file = jar_name_in(line)?;
+    let message = line.trim().to_string();
+    Some(fact(
+        "minecraft.file_problem",
+        vec![
+            ("kind", text("damaged_archive")),
+            ("path", text(file.clone())),
+            ("message", text(message)),
+        ],
+        vec![reference("file", file, Strength::Mention)],
+        line_no,
+        section,
+    ))
+}
+
+/// The jar a line names, as a bare file name. Directories are dropped so the file ref matches the
+/// mods folder's listing.
+fn jar_name_in(line: &str) -> Option<String> {
+    let named = if let Some(start) = line.find("Error analyzing [") {
+        let rest = &line[start + "Error analyzing [".len()..];
+        rest.split(']').next()
+    } else if let Some(start) = line.find("Failed to read mod file ") {
+        Some(&line[start + "Failed to read mod file ".len()..])
+    } else if let Some(start) = line.find("Invalid or corrupt jarfile ") {
+        Some(&line[start + "Invalid or corrupt jarfile ".len()..])
+    } else {
+        None
+    };
+    let candidate = named.map(|text| text.trim().trim_matches(['\'', '"', '`']));
+    let candidate = candidate.filter(|text| text.to_ascii_lowercase().ends_with(".jar"));
+    let candidate = candidate.or_else(|| {
+        line.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`'))
+            .map(|token| {
+                token.trim_matches(|c: char| {
+                    matches!(c, '[' | ']' | '(' | ')' | ':' | ',' | ';' | '.')
+                })
+            })
+            .find(|token| token.to_ascii_lowercase().ends_with(".jar"))
+    })?;
+    let name = candidate
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(candidate)
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// A file the game needed to create but found in the way, named so the answer can point at it.
 pub(crate) fn file_problem(
     exception_class: &str,

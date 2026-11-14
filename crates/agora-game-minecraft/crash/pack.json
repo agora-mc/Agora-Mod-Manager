@@ -1307,6 +1307,54 @@
         }
       },
       "next_step": "confirm_experiment"
+    },
+    {
+      "id": "damaged_mod_file",
+      "version": 1,
+      "actions": [{ "kind": "review_mods", "label": { "en": "Review Installed Mods" } }],
+      "supersedes": [
+        "missing_dependency",
+        "missing_fabric_api",
+        "wrong_dependency_version",
+        "wrong_game_version",
+        "wrong_loader_version",
+        "mod_resolution_failed",
+        "incompatible_mods",
+        "mod_loading_error",
+        "mod_failed_to_load",
+        "missing_class",
+        "missing_member_wrong_version",
+        "data_error_names_mod"
+      ],
+      "when": {
+        "fact": {
+          "kind": "minecraft.file_problem",
+          "where": { "kind": "damaged_archive" },
+          "ref": { "kind": "file", "bind": "file" },
+          "bind": { "path": "path" }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "cause": "file",
+            "scope": "root_cause",
+            "level": "very_likely",
+            "candidate": { "owner_of": "file" },
+            "family": "known_signature",
+            "weight": 16
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "{owner:file}'s file {path} is damaged, and the loader could not read it. Reinstalling {owner:file} is a likely next step."
+        },
+        "why_not_sure": {
+          "en": "The loader names the file it could not read; reinstalling it replaces the damaged copy with a good one."
+        }
+      },
+      "next_step": "confirm_experiment"
     }
   ]
 }

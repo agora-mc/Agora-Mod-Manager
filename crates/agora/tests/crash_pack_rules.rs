@@ -814,6 +814,48 @@ mod crash {
     }
 
     #[test]
+    fn a_damaged_jar_names_the_file_and_outranks_resolution() {
+        let evaluated = evaluate_one(output(
+            "minecraft_latest_log",
+            vec![
+                fact(
+                    "minecraft.loader_problem",
+                    &[
+                        ("kind", text("resolution")),
+                        ("message", text("the loader could not resolve the mod set")),
+                    ],
+                    Vec::new(),
+                ),
+                fact(
+                    "minecraft.file_problem",
+                    &[
+                        ("kind", text("damaged_archive")),
+                        ("path", text("examplemod.jar")),
+                        (
+                            "message",
+                            text("java.util.zip.ZipException: zip END header not found"),
+                        ),
+                    ],
+                    vec![reference("file", "examplemod.jar")],
+                ),
+            ],
+        ));
+        assert!(fired(&evaluated, "damaged_mod_file"));
+        assert!(!fired(&evaluated, "mod_resolution_failed"));
+        let found = evaluated
+            .findings
+            .iter()
+            .find(|finding| finding.source.rule_id.as_deref() == Some("damaged_mod_file"))
+            .expect("the damaged-file finding");
+        assert_eq!(found.cause, agora_game_api::crash::Cause::File);
+        assert_eq!(found.level, agora_game_api::crash::Level::VeryLikely);
+        assert!(matches!(
+            &found.candidate,
+            Some(Owner::Item { key, .. }) if key == "examplemod.jar"
+        ));
+    }
+
+    #[test]
     fn a_missing_member_is_a_version_mismatch_but_a_null_pointer_is_not() {
         let missing = evaluate_one(output(
             "minecraft_crash_report",

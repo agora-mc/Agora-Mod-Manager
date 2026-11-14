@@ -951,6 +951,64 @@ Details:\n\
     }
 
     #[test]
+    fn a_damaged_jar_is_named_in_each_loaders_shape() {
+        for line in [
+            "[01:02:03] [main/ERROR]: Error analyzing [mods/examplemod.jar]: \
+             java.util.zip.ZipException: zip END header not found\n",
+            "[01:02:03] [main/ERROR]: java.util.zip.ZipException: \
+             invalid LOC header (bad signature) in mods/examplemod.jar\n",
+            "[01:02:03] [main/ERROR]: Error analyzing [mods/examplemod.jar]: \
+             java.util.zip.ZipException: zip file is empty\n",
+            "Invalid or corrupt jarfile mods/examplemod.jar\n",
+            "Failed to read mod file /mods/examplemod.jar\n",
+        ] {
+            let output = run_ok("latest_log", line.as_bytes());
+            let problem = output
+                .facts
+                .iter()
+                .find(|fact| fact.kind == "minecraft.file_problem")
+                .unwrap_or_else(|| {
+                    panic!("no damaged-file fact for {line:?}: {:#?}", output.facts)
+                });
+            assert_eq!(text_of(problem, "kind"), "damaged_archive", "{line:?}");
+            assert_eq!(text_of(problem, "path"), "examplemod.jar", "{line:?}");
+            assert!(problem
+                .refs
+                .iter()
+                .any(|reference| reference.kind == "file" && reference.value == "examplemod.jar"));
+        }
+    }
+
+    #[test]
+    fn an_ordinary_exception_is_not_a_damaged_jar() {
+        let output = run_ok(
+            "latest_log",
+            b"[01:02:03] [main/ERROR]: java.lang.IllegalStateException: examplemod could not start\n",
+        );
+        assert!(!output
+            .facts
+            .iter()
+            .any(|fact| fact.kind == "minecraft.file_problem"));
+    }
+
+    #[test]
+    fn a_damaged_jar_in_a_crash_report_is_named() {
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Failed to read mod file /mods/examplemod.jar\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let problem = find(&output, "minecraft.file_problem", "kind", "damaged_archive")
+            .expect("a damaged-file fact");
+        assert_eq!(text_of(problem, "path"), "examplemod.jar");
+    }
+
+    #[test]
     fn a_jvm_problem_is_recorded_without_naming_a_mod() {
         let missing = run_ok(
             "latest_log",

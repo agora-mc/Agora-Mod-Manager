@@ -1,11 +1,11 @@
 //! The `---- Minecraft Crash Report ----` file, whichever loader wrote it.
 
 use super::shared::{
-    absent, checked, collect_lines, crash_mixin_line, data_error_fact, fabric_dependency, fact,
-    file_problem, frame_symbol_and_class, is_mod_id, jar_from_frame, java_exception_category,
-    jvm_problem, loader_dependency_problem, loader_problem, looked_for, mod_crash_from_message,
-    mod_crash_line, named_message_classes, not_applicable, notes_for, number, reference,
-    source_location, text,
+    absent, checked, collect_lines, crash_mixin_line, damaged_archive, data_error_fact,
+    fabric_dependency, fact, file_problem, frame_symbol_and_class, is_mod_id, jar_from_frame,
+    java_exception_category, jvm_problem, loader_dependency_problem, loader_problem, looked_for,
+    mod_crash_from_message, mod_crash_line, named_message_classes, not_applicable, notes_for,
+    number, reference, source_location, text,
 };
 use agora_game_api::crash::{
     BucketPart, BuiltInParser, BuiltInParserError, Fact, ParserOutput, ParserReads, ParserRequest,
@@ -124,6 +124,12 @@ impl BuiltInParser for CrashReportParser {
                         line_no,
                         "loader",
                     ));
+                }
+            }
+
+            if let Some(damaged) = damaged_archive(line, line_no, "loader") {
+                if seen.insert(format!("damaged\0{}", line.trim())) {
+                    facts.push(damaged);
                 }
             }
 
