@@ -14,7 +14,7 @@ pub mod json;
 
 use std::path::{Path, PathBuf};
 
-use libloot::metadata::MessageType;
+use libloot::metadata::{File, MessageType, PluginMetadata};
 use libloot::{EvalMode, Game, GameType, MergeMode};
 
 use json::Value;
@@ -28,6 +28,13 @@ pub struct Request {
     pub prelude: Option<String>,
     pub masterlist_yaml: Option<String>,
     pub prelude_yaml: Option<String>,
+    /// The instance's load-after rules, handed to libloot as user metadata.
+    pub rules: Vec<Rule>,
+}
+
+pub struct Rule {
+    pub item: String,
+    pub after: String,
 }
 
 impl Request {
@@ -44,6 +51,7 @@ impl Request {
             prelude: optional_string(value, "prelude")?,
             masterlist_yaml: optional_string(value, "masterlist_yaml")?,
             prelude_yaml: optional_string(value, "prelude_yaml")?,
+            rules: rules(value)?,
         })
     }
 }
@@ -79,6 +87,37 @@ fn string_array(value: &Value, key: &str) -> Result<Vec<String>, String> {
                 .ok_or_else(|| format!("every entry of '{key}' must be a string"))
         })
         .collect()
+}
+
+fn rules(value: &Value) -> Result<Vec<Rule>, String> {
+    let Some(entries) = value.get("rules") else {
+        return Ok(Vec::new());
+    };
+    if entries.is_null() {
+        return Ok(Vec::new());
+    }
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| "'rules' must be an array".to_string())?;
+    let mut rules = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let item = entry
+            .get("item")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "every rule needs a string 'item'".to_string())?;
+        let after = entry
+            .get("after")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "every rule needs a string 'after'".to_string())?;
+        if item.is_empty() || after.is_empty() {
+            return Err("a rule's 'item' and 'after' cannot be empty".to_string());
+        }
+        rules.push(Rule {
+            item: item.to_string(),
+            after: after.to_string(),
+        });
+    }
+    Ok(rules)
 }
 
 fn game_type(name: &str) -> Result<GameType, String> {
@@ -141,6 +180,34 @@ pub fn run_request(request_json: &str) -> Result<String, String> {
     sort(&request)
 }
 
+/// Hand the instance's load-after rules to libloot as user metadata, so the
+/// sort keeps them the same way it keeps a user's own LOOT edits.
+fn apply_rules(database: &mut libloot::Database, rules: &[Rule]) -> Result<(), String> {
+    for rule in rules {
+        let mut metadata = database
+            .plugin_user_metadata(&rule.item, EvalMode::DoNotEvaluate)
+            .map_err(|error| format!("LOOT cannot read its user metadata: {error}"))?
+            .map_or_else(
+                || {
+                    PluginMetadata::new(&rule.item).map_err(|error| {
+                        format!("'{item}' is not a plugin name: {error}", item = rule.item)
+                    })
+                },
+                Ok,
+            )?;
+        let mut after = metadata.load_after_files().to_vec();
+        if !after
+            .iter()
+            .any(|file| file.name().as_ref().eq_ignore_ascii_case(&rule.after))
+        {
+            after.push(File::new(rule.after.clone()));
+        }
+        metadata.set_load_after_files(after);
+        database.set_plugin_user_metadata(metadata);
+    }
+    Ok(())
+}
+
 fn sort(request: &Request) -> Result<String, String> {
     let game_type = game_type(&request.game_type)?;
     let data = PathBuf::from(&request.data);
@@ -183,6 +250,7 @@ fn sort(request: &Request) -> Result<String, String> {
         database
             .load_masterlist_from_str(&masterlist, prelude.as_deref())
             .map_err(|error| format!("the masterlist cannot be read: {error}"))?;
+        apply_rules(&mut database, &request.rules)?;
     }
 
     let names: Vec<&str> = request.load_order.iter().map(String::as_str).collect();

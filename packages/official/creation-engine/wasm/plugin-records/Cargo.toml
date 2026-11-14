@@ -1,0 +1,28 @@
+[package]
+name = "plugin-records"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Reads Creation Engine plugin records and reports the ones two or more plugins share (MASTER_SPEC §31.3)."
+
+# This crate is deliberately not a member of the repository workspace: it is
+# built for wasm32-wasip1 by scripts/build_records_wasm.py, with its own lockfile.
+[workspace]
+
+[dependencies]
+miniz_oxide = "=0.8.9"
+
+[[bin]]
+name = "plugin-records"
+path = "src/main.rs"
+
+[lib]
+name = "plugin_records"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
