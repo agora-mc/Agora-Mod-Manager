@@ -617,6 +617,7 @@ A runtime constraint is `{ "game": "...", "stores": [...], "versions": { ... }, 
 | `expected` | string | required | The file this runtime needs; `{1}`..`{9}` and `{version}` are filled |
 | `applies_to` | list of globs | optional | Versions the rule applies to; empty means all |
 | `repair` | string | required | What to do, shown with the finding |
+| `when_present` | glob | optional | A deployed path that means this file is needed even when its family is absent, such as `Data/SKSE/Plugins/*.dll` needing Address Library |
 
 ### Objects in hook calls
 
