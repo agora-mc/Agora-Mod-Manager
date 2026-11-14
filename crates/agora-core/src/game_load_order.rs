@@ -1265,7 +1265,8 @@ pub fn classify_overlaps(
         if changers.is_empty() {
             continue;
         }
-        let (_, winner_name, winner_digest, winner) = *holders.last().expect("an overlap has items");
+        let (_, winner_name, winner_digest, winner) =
+            *holders.last().expect("an overlap has items");
         let label = if key_entry.label.trim().is_empty() {
             key_entry.key.clone()
         } else {
@@ -1503,10 +1504,7 @@ pub fn overlap_findings(
             continue;
         }
         let own = if report.implicit_pairs > 0 {
-            format!(
-                "; {} between the game's own files",
-                report.implicit_pairs
-            )
+            format!("; {} between the game's own files", report.implicit_pairs)
         } else {
             String::new()
         };
@@ -3995,11 +3993,7 @@ mod tests {
                 overlap_key(
                     &format!("Game:{index}"),
                     &format!("Record {index}"),
-                    &[
-                        ("Base.esm", "original"),
-                        ("A.esp", "old"),
-                        ("B.esp", "new"),
-                    ],
+                    &[("Base.esm", "original"), ("A.esp", "old"), ("B.esp", "new")],
                 )
             })
             .collect();

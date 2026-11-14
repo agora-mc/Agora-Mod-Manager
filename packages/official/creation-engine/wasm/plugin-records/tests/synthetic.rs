@@ -190,6 +190,18 @@ fn two_plugins_that_change_one_record_differently_report_that_key() {
 }
 
 #[test]
+fn a_record_without_an_editor_id_is_labelled_by_its_type_id_and_defining_file() {
+    let cell = |value: u8| record(b"CELL", 0, 0x000d74, &subrecord(b"DATA", &[value]));
+    let master = index("Base.esm", &[], 0, &[cell(1)]);
+    let changed = index("Change.esp", &["Base.esm"], 0, &[cell(2)]);
+
+    let keys = overlaps(&[master, changed]);
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    assert_eq!(keys[0].0, "base.esm:000d74");
+    assert_eq!(keys[0].1, "CELL 000D74 in Base.esm");
+}
+
+#[test]
 fn the_same_change_has_the_same_digest() {
     let master = index("Master.esm", &[], 0, &[gmst(0x000abc, 1, "JumpSetting")]);
     let first = index(

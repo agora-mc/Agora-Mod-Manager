@@ -2030,11 +2030,7 @@ fn overlaps_are_cached_and_a_plain_read_does_not_run_the_reader() {
         keys: vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[
-                ("A.esp", "original"),
-                ("B.esp", "old"),
-                ("C.esp", "new"),
-            ],
+            &[("A.esp", "original"), ("B.esp", "old"), ("C.esp", "new")],
         )],
         notes: Vec::new(),
     });
