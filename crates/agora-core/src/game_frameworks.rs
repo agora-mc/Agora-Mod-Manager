@@ -7,7 +7,9 @@
 
 use std::path::PathBuf;
 
-use agora_game_api::{fold_path_case, FrameworkDefinition, FrameworkVersionSource, GameDefinition};
+use agora_game_api::{
+    fold_path_case, FrameworkDefinition, FrameworkVersionSource, GameDefinition, RuntimeFileFinding,
+};
 
 use crate::ctx::Ctx;
 use crate::error::{LauncherError, LauncherResult};
@@ -96,6 +98,21 @@ pub fn framework_status(
             unreadable: Some(reason),
         },
     })
+}
+
+/// Frameworks the game declares that are installed but missing files they need, judged over the
+/// files the game will see. Each finding is a warning: the owner decides whether to repair it.
+pub fn missing_required_findings<S: AsRef<str>>(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    paths: &[S],
+) -> Vec<RuntimeFileFinding> {
+    let frameworks: Vec<&FrameworkDefinition> = definition
+        .framework_ids
+        .iter()
+        .filter_map(|id| ctx.games.framework(&definition.id, id))
+        .collect();
+    agora_game_api::missing_framework_files(&frameworks, paths)
 }
 
 /// The version of the marker file at `source`, as the manifests write it, or why it cannot be read.

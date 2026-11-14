@@ -3,15 +3,16 @@ use std::time::SystemTime;
 
 use agora_core::app_paths::AppPaths;
 use agora_core::game_base::{
-    build_base, evaluate_link_support, get_file_identity, install_size, is_plain_base_id,
-    list_bases, make_base_id, remove_base, sanitize_base_id_part, verify_base, BaseEntry,
-    BaseError, BaseMode, BuildOptions, BuildOutcome, ProblemKind, VerifyDepth,
+    build_base, build_base_with_frameworks, evaluate_link_support, get_file_identity, install_size,
+    is_plain_base_id, list_bases, make_base_id, remove_base, sanitize_base_id_part, verify_base,
+    BaseEntry, BaseError, BaseMode, BuildOptions, BuildOutcome, ProblemKind, VerifyDepth,
 };
 use agora_core::game_discovery::{DiscoveredInstall, InstallKind};
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
 use agora_game_api::{
-    DeploymentStrategy, GameDefinition, GameId, InstallCapabilities, InstallId, RuntimeIdentity,
-    StoreId, VolumeInfo,
+    DeploymentStrategy, FrameworkDefinition, FrameworkDetection, FrameworkId,
+    FrameworkVersionSource, GameDefinition, GameId, InstallCapabilities, InstallId, RelPath,
+    RuntimeIdentity, StoreId, VolumeInfo,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -1870,4 +1871,85 @@ fn a_root_is_registered_once_however_often_it_is_built_into() {
     let roots: Vec<std::path::PathBuf> =
         serde_json::from_str(&std::fs::read_to_string(paths.base_roots_file()).unwrap()).unwrap();
     assert_eq!(roots, vec![root]);
+}
+
+fn framework_with_required(marker: &str, required: &[&str]) -> FrameworkDefinition {
+    FrameworkDefinition {
+        id: FrameworkId::new("skse").unwrap(),
+        game: GameId::new("skyrim-se").unwrap(),
+        name: "Skyrim Script Extender".into(),
+        version: "2.2.6".into(),
+        supported_runtimes: Vec::new(),
+        required_frameworks: Vec::new(),
+        content: Vec::new(),
+        launch: None,
+        detection: Some(FrameworkDetection {
+            marker: RelPath::new(marker).unwrap(),
+            required: required
+                .iter()
+                .map(|path| RelPath::new(*path).unwrap())
+                .collect(),
+            version: Some(FrameworkVersionSource::PeFileVersion),
+        }),
+    }
+}
+
+#[test]
+fn a_framework_marker_brings_its_required_files_even_from_an_excluded_path() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-complete"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    std::fs::create_dir_all(install_dir.join("Data/Scripts")).unwrap();
+    std::fs::write(install_dir.join("Data/Scripts/SKSE.pex"), b"pex").unwrap();
+
+    let mut definition = test_definition();
+    definition.excluded_paths = vec!["Data/Scripts/**".into()];
+    let framework = framework_with_required("skse64_loader.exe", &["Data/Scripts/SKSE.pex"]);
+    let frameworks = [&framework];
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &definition,
+        &frameworks,
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let manifest = outcome.manifest();
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|file| file.path == "Data/Scripts/SKSE.pex"),
+        "an excluded required file still belongs to the base: {:?}",
+        manifest.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+    assert!(manifest.incomplete_frameworks.is_empty());
+}
+
+#[test]
+fn a_framework_missing_a_required_file_is_recorded_as_incomplete() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-incomplete"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+
+    let framework = framework_with_required("skse64_loader.exe", &["Data/Scripts/SKSE.pex"]);
+    let frameworks = [&framework];
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &frameworks,
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let recorded = &outcome.manifest().incomplete_frameworks;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].framework, "skse");
+    assert_eq!(recorded[0].missing, vec!["Data/Scripts/SKSE.pex"]);
 }

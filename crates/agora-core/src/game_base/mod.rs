@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use agora_game_api::{fold_path_case, GameDefinition, InstallId, RuntimeIdentity, VolumeInfo};
+use agora_game_api::{
+    fold_path_case, FrameworkDefinition, GameDefinition, InstallId, RuntimeIdentity, VolumeInfo,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -49,6 +51,19 @@ pub struct BaseManifest {
     pub created_unix_ms: i64,
     pub files: Vec<BaseFile>, // sorted by path
     pub skipped: Vec<String>, // source entries not copied (symlinks, junctions), with reasons
+    /// Frameworks whose marker the source install had but whose declared required files were not
+    /// all there. Recorded at pin time so an incomplete pin is visible even before a check.
+    #[serde(default)]
+    pub incomplete_frameworks: Vec<IncompleteFramework>,
+}
+
+/// A framework installed in a source install with files it declares missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteFramework {
+    pub framework: String,
+    pub name: String,
+    /// The declared game paths the source install did not have.
+    pub missing: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -566,6 +581,34 @@ pub fn build_base(
     options: BuildOptions,
     progress: &(dyn Fn(BuildProgress) + Send + Sync),
 ) -> Result<BuildOutcome, BaseError> {
+    build_base_with_frameworks(
+        paths,
+        install,
+        definition,
+        &[],
+        mode,
+        root_override,
+        options,
+        progress,
+    )
+}
+
+/// Build a base, also applying the game's framework declarations.
+///
+/// A framework whose marker is in the source install has its declared required files copied even
+/// when the game's excluded paths would leave them out. Files it declares but the install does not
+/// have are recorded in the manifest as an incomplete framework.
+#[allow(clippy::too_many_arguments)]
+pub fn build_base_with_frameworks(
+    paths: &AppPaths,
+    install: &IdentifiedInstall,
+    definition: &GameDefinition,
+    frameworks: &[&FrameworkDefinition],
+    mode: BaseMode,
+    root_override: Option<&Path>,
+    options: BuildOptions,
+    progress: &(dyn Fn(BuildProgress) + Send + Sync),
+) -> Result<BuildOutcome, BaseError> {
     // 1. Runtime must be Identified
     let runtime = match &install.runtime {
         crate::game_registry::RuntimeResolution::Identified { runtime, .. } => runtime,
@@ -633,6 +676,62 @@ pub fn build_base(
         &mut entries,
         &mut skipped,
     )?;
+
+    // A framework the install has is part of the base even when its files sit on an excluded
+    // path. A declared file the install does not have is recorded so the pin is not a silent
+    // half-install.
+    let mut incomplete_frameworks = Vec::new();
+    let mut present: HashSet<String> = entries
+        .iter()
+        .map(|entry| fold_path_case(&entry.rel_path))
+        .collect();
+    for framework in frameworks {
+        let Some(detection) = &framework.detection else {
+            continue;
+        };
+        if detection.required.is_empty() {
+            continue;
+        }
+        let marker = fold_path_case(detection.marker.as_str());
+        let marker_present = entries.iter().any(|entry| {
+            let path = fold_path_case(&entry.rel_path);
+            if marker.contains('*') {
+                agora_game_api::glob_match(&marker, &path)
+            } else {
+                path == marker
+            }
+        });
+        if !marker_present {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for required in &detection.required {
+            let required = required.as_str();
+            if present.contains(&fold_path_case(required)) {
+                continue;
+            }
+            let candidate = source_dir.join(required);
+            match candidate.metadata() {
+                Ok(metadata) if metadata.is_file() => {
+                    present.insert(fold_path_case(required));
+                    entries.push(SourceEntry {
+                        rel_path: required.to_string(),
+                        abs_src_path: candidate,
+                        size: metadata.len(),
+                        is_archive: definition.is_linked_archive(required),
+                    });
+                }
+                _ => missing.push(required.to_string()),
+            }
+        }
+        if !missing.is_empty() {
+            incomplete_frameworks.push(IncompleteFramework {
+                framework: framework.id.as_str().to_string(),
+                name: framework.name.clone(),
+                missing,
+            });
+        }
+    }
 
     let total_source_bytes: u64 = entries.iter().map(|e| e.size).sum();
 
@@ -815,6 +914,7 @@ pub fn build_base(
         created_unix_ms,
         files: base_files,
         skipped,
+        incomplete_frameworks,
     };
 
     // Write manifest (temp file + rename)

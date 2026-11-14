@@ -554,6 +554,7 @@ selected runtime; `user_data` means a known user folder, resolved by Agora.
 | `launch` | launch recipe | optional | Its own launcher, or `null` |
 | `detection` | framework detection | optional | How Agora finds it and reads its version |
 | `marker` | path | required for detection | A file whose presence means it is installed |
+| `required` | list of paths | optional for detection | Exact game files the framework needs; when the marker is present but one is missing, the instance and launch checks name the missing files as a warning |
 | `version` | string | optional for detection | `pe_file_version`, or absent when presence is all Agora knows |
 
 A runtime constraint is `{ "game": "...", "stores": [...], "versions": { ... }, "builds": [...] }`.

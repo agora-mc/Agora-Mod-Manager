@@ -269,10 +269,12 @@ pub async fn games_base_build(
             )
         })?;
         let progress = progress_emitter(app.clone(), install_id.clone());
-        let result = game_base::build_base(
+        let frameworks = ctx.games.frameworks_for(&definition.id);
+        let result = game_base::build_base_with_frameworks(
             &ctx.paths,
             &install,
             definition,
+            &frameworks,
             base_mode,
             None,
             BuildOptions { include_excluded },

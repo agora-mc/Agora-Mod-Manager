@@ -260,6 +260,16 @@ mod tests {
         );
         assert_eq!(def.frameworks[0].game, GameId::new("skyrim-se").unwrap());
         assert_eq!(def.frameworks[0].name, "Skyrim Script Extender");
+        // SKSE's archive ships this Papyrus script beside the loader and DLLs; without it the
+        // loader starts but RaceMenu and SkyUI see SKSE version 0.0.0.0.
+        assert_eq!(
+            def.frameworks[0]
+                .detection
+                .as_ref()
+                .expect("SKSE is detectable")
+                .required,
+            vec![RelPath::new("Data/Scripts/SKSE.pex").unwrap()]
+        );
         assert_eq!(
             def.frameworks[1].id,
             agora_game_api::FrameworkId::new("address-library").unwrap()

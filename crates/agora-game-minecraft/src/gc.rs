@@ -543,7 +543,11 @@ mod tests {
         ] {
             let args = generate_args(GcProfile::LowLatency, 4096, custom);
             assert_eq!(args.contains("-Xmx4096M"), keeps_max, "{custom}: {args}");
-            assert_eq!(args.contains("-Xms4096M"), keeps_initial, "{custom}: {args}");
+            assert_eq!(
+                args.contains("-Xms4096M"),
+                keeps_initial,
+                "{custom}: {args}"
+            );
             assert!(args.contains(custom), "{custom}: {args}");
         }
     }

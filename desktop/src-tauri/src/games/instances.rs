@@ -1340,6 +1340,14 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
             "A framework built for another game version often stops the game from starting, or makes it crash."
                 .to_string(),
         ),
+        RuntimeFileProblem::MissingFiles => (
+            format!(
+                "{} is installed but some of its files are missing: {}.",
+                finding.rule_name,
+                finding.found.join(", ")
+            ),
+            "The framework starts, but scripts or other files it provides are absent, so mods that rely on them can behave as if it is not installed.".to_string(),
+        ),
         RuntimeFileProblem::CannotCheck { reason } => (
             format!("This rule cannot be checked: {reason}."),
             "Agora could not compare this framework with the game, so it cannot say whether they match.".to_string(),
@@ -1870,6 +1878,28 @@ mod tests {
     }
 
     #[test]
+    fn a_framework_missing_required_files_only_warns_and_names_them() {
+        let finding = RuntimeFileFinding {
+            found: vec!["Data/Scripts/SKSE.pex".into()],
+            problem: RuntimeFileProblem::MissingFiles,
+            ..wrong_version(Vec::new())
+        };
+        let shown = framework_finding(&finding);
+        assert!(
+            !shown.blocks,
+            "missing framework files never block a launch"
+        );
+        assert!(
+            shown
+                .detail
+                .contains("installed but some of its files are missing"),
+            "{}",
+            shown.detail
+        );
+        assert!(shown.detail.contains("Data/Scripts/SKSE.pex"));
+    }
+
+    #[test]
     fn only_refusing_plugin_findings_block() {
         let cycle = load_order_finding(&Finding::MasterCycle {
             plugins: vec!["a.esm".into(), "b.esm".into()],
@@ -1904,7 +1934,10 @@ mod tests {
             problem: agora_core::game_load_order::MasterProblem::Later,
         });
         assert!(
-            late.repair.as_deref().unwrap_or_default().contains("choose Sort"),
+            late.repair
+                .as_deref()
+                .unwrap_or_default()
+                .contains("choose Sort"),
             "{:?}",
             late.repair
         );

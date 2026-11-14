@@ -343,6 +343,9 @@
       "launch": null,
       "detection": {
         "marker": "skse64_loader.exe",
+        "required": [
+          "Data/Scripts/SKSE.pex"
+        ],
         "version": "pe_file_version"
       }
     },

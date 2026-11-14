@@ -605,8 +605,10 @@ pub async fn run_instance_tools(
                     }
                 );
                 if let Some(requested) = memory {
-                    let total_ram_mb = agora_game_minecraft::gc::SystemResources::detect().total_ram_mb;
-                    for warning in agora_game_minecraft::gc::memory_warnings(requested, total_ram_mb)
+                    let total_ram_mb =
+                        agora_game_minecraft::gc::SystemResources::detect().total_ram_mb;
+                    for warning in
+                        agora_game_minecraft::gc::memory_warnings(requested, total_ram_mb)
                     {
                         eprintln!("[WARN] {warning}");
                     }

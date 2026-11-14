@@ -6166,10 +6166,12 @@ async fn run_command(
 
                     let start = std::time::Instant::now();
                     let options = agora_core::game_base::BuildOptions { include_excluded };
-                    let result = agora_core::game_base::build_base(
+                    let frameworks = ctx.games.frameworks_for(&game_def.id);
+                    let result = agora_core::game_base::build_base_with_frameworks(
                         &ctx.paths,
                         install,
                         game_def,
+                        &frameworks,
                         base_mode,
                         None,
                         options,
@@ -7225,10 +7227,7 @@ async fn run_command(
                                         "Instance '{instance_id}' has plugin load order problems that would stop the game:"
                                     );
                                     print_load_order_findings(&findings);
-                                    eprintln!(
-                                        "{}",
-                                        launch_refusal_hint(&instance_id, &findings)
-                                    );
+                                    eprintln!("{}", launch_refusal_hint(&instance_id, &findings));
                                 }
                                 std::process::exit(1);
                             }
@@ -11375,6 +11374,14 @@ fn runtime_finding_lines(findings: &[agora_game_api::RuntimeFileFinding]) -> Vec
                 ));
                 lines.push(format!("    Repair: {}", finding.repair));
             }
+            RuntimeFileProblem::MissingFiles => {
+                lines.push(format!(
+                    "  - {} is installed but some of its files are missing: {}",
+                    finding.rule_name,
+                    finding.found.join(", ")
+                ));
+                lines.push(format!("    Repair: {}", finding.repair));
+            }
             RuntimeFileProblem::CannotCheck { reason } => {
                 lines.push(format!(
                     "  - {} ({}): cannot be checked: {reason}",
@@ -12796,10 +12803,7 @@ mod tests {
             problem: MasterProblem::Inactive,
         }];
         let hint = launch_refusal_hint("skyrim", &findings);
-        assert!(
-            hint.contains("plugins enable skyrim Base.esm"),
-            "{hint}"
-        );
+        assert!(hint.contains("plugins enable skyrim Base.esm"), "{hint}");
         assert!(!hint.contains("plugins sort"), "{hint}");
     }
 

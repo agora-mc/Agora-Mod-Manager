@@ -825,6 +825,8 @@ pub const RUNTIME_FILE_FINDING_MAX_FOUND: usize = 5;
 pub enum RuntimeFileProblem {
     /// Files of the family are present, but not the one this runtime needs.
     WrongVersion,
+    /// The framework's marker is present, but files it declares as required are not.
+    MissingFiles,
     /// The rule cannot be evaluated against this runtime. That is a bad definition, and it is
     /// shown as a finding rather than skipped.
     CannotCheck { reason: String },
@@ -846,7 +848,8 @@ pub struct RuntimeFileFinding {
 
 impl RuntimeFileFinding {
     /// Only a framework built for another version refuses a launch. A rule that cannot be checked
-    /// is a definition bug: it is carried as a warning, never a refusal.
+    /// is a definition bug, and missing required files are the user's call to repair: both are
+    /// carried as warnings, never refusals.
     pub fn refuses_launch(&self) -> bool {
         matches!(self.problem, RuntimeFileProblem::WrongVersion)
     }
@@ -867,6 +870,12 @@ impl RuntimeFileFinding {
                     self.rule_name, self.rule_id, self.expected, found, self.repair
                 )
             }
+            RuntimeFileProblem::MissingFiles => format!(
+                "{} is installed but some of its files are missing: {}. Repair: {}",
+                self.rule_name,
+                self.found.join(", "),
+                self.repair
+            ),
             RuntimeFileProblem::CannotCheck { reason } => {
                 format!(
                     "{} ({}) cannot be checked: {reason}",
@@ -983,6 +992,57 @@ pub fn runtime_file_passes<S: AsRef<str>>(
         }
     }
     passes
+}
+
+/// Frameworks whose marker is present on a path but whose declared required files are not.
+///
+/// Pure: `deployed_paths` are `/`-separated paths relative to the game root, and matching is
+/// case-insensitive. A framework with no marker or no required list says nothing. This is a
+/// warning finding, never a refusal: the owner decides whether to reinstall the framework.
+pub fn missing_framework_files<S: AsRef<str>>(
+    frameworks: &[&FrameworkDefinition],
+    deployed_paths: &[S],
+) -> Vec<RuntimeFileFinding> {
+    let mut findings = Vec::new();
+    for framework in frameworks {
+        let Some(detection) = &framework.detection else {
+            continue;
+        };
+        if detection.required.is_empty() {
+            continue;
+        }
+        if !deployed_paths
+            .iter()
+            .any(|path| runtime_path_matches(detection.marker.as_str(), path.as_ref()))
+        {
+            continue;
+        }
+        let missing: Vec<String> = detection
+            .required
+            .iter()
+            .filter(|required| {
+                !deployed_paths
+                    .iter()
+                    .any(|path| runtime_path_matches(required.as_str(), path.as_ref()))
+            })
+            .map(|required| required.as_str().to_string())
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        findings.push(RuntimeFileFinding {
+            rule_id: framework.id.as_str().to_string(),
+            rule_name: framework.name.clone(),
+            expected: detection.marker.as_str().to_string(),
+            found: missing,
+            repair: format!(
+                "Reinstall {} so all of its files are present.",
+                framework.name
+            ),
+            problem: RuntimeFileProblem::MissingFiles,
+        });
+    }
+    findings
 }
 
 /// Whether `rule`'s `applies_to` patterns cover `version`.
@@ -2189,6 +2249,11 @@ pub struct FrameworkDefinition {
 pub struct FrameworkDetection {
     /// A path relative to the game root, matched case-insensitively, e.g. `skse64_loader.exe`.
     pub marker: RelPath,
+    /// Files the framework needs to work, as exact game paths (globs are refused by the linter).
+    /// When the marker is present but one of these is not, the framework is installed but
+    /// incomplete, and the instance and launch checks say which files are missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<RelPath>,
     /// Where the version is read from. Absent means presence is all core knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<FrameworkVersionSource>,
@@ -2554,6 +2619,56 @@ mod runtime_file_tests {
     fn the_matching_runtime_gives_no_findings() {
         let findings = check_runtime_files(&skyrim_rules(), "1.6.1170.0", &skyrim_1_6_1170_files());
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    fn skse_framework() -> FrameworkDefinition {
+        FrameworkDefinition {
+            id: FrameworkId::new("skse").unwrap(),
+            game: GameId::new("skyrim-se").unwrap(),
+            name: "Skyrim Script Extender".into(),
+            version: "2.2.6".into(),
+            supported_runtimes: Vec::new(),
+            required_frameworks: Vec::new(),
+            content: Vec::new(),
+            launch: None,
+            detection: Some(FrameworkDetection {
+                marker: RelPath::new("skse64_loader.exe").unwrap(),
+                required: vec![RelPath::new("Data/Scripts/SKSE.pex").unwrap()],
+                version: Some(FrameworkVersionSource::PeFileVersion),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_framework_with_its_marker_but_not_its_required_files_is_named_and_not_refused() {
+        let frameworks = [skse_framework()];
+        let refs: Vec<&FrameworkDefinition> = frameworks.iter().collect();
+        let paths = ["SkyrimSE.exe", "skse64_loader.exe"];
+        let findings = missing_framework_files(&refs, &paths);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding.rule_id, "skse");
+        assert_eq!(finding.found, vec!["Data/Scripts/SKSE.pex"]);
+        assert_eq!(finding.problem, RuntimeFileProblem::MissingFiles);
+        assert!(
+            !finding.refuses_launch(),
+            "a missing framework file only warns"
+        );
+        assert_eq!(
+            finding.summary(),
+            "Skyrim Script Extender is installed but some of its files are missing: Data/Scripts/SKSE.pex. Repair: Reinstall Skyrim Script Extender so all of its files are present."
+        );
+    }
+
+    #[test]
+    fn a_framework_is_complete_case_insensitively_and_absent_markers_say_nothing() {
+        let frameworks = [skse_framework()];
+        let refs: Vec<&FrameworkDefinition> = frameworks.iter().collect();
+        assert!(
+            missing_framework_files(&refs, &["skse64_loader.exe", "data/scripts/skse.PEX"])
+                .is_empty()
+        );
+        assert!(missing_framework_files(&refs, &["SkyrimSE.exe"]).is_empty());
     }
 
     #[test]

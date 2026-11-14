@@ -4579,6 +4579,7 @@ mod tests {
             created_unix_ms: 0,
             files: Vec::new(),
             skipped: Vec::new(),
+            incomplete_frameworks: Vec::new(),
         };
 
         let roots = output_forbidden_roots(&ctx, "inst", &base).unwrap();
