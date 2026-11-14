@@ -663,7 +663,8 @@ enum GameInstanceCmd {
     Ini {
         /// Instance ID.
         instance_id: String,
-        /// The game's file, as the instance names it, e.g. user/Skyrim.ini.
+        /// The game's file, as the instance names it, e.g. user/Skyrim.ini, or a bare file name
+        /// when exactly one of the instance's files has it.
         file: Option<String>,
         /// The section, e.g. General.
         section: Option<String>,

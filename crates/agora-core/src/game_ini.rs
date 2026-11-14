@@ -40,6 +40,15 @@ pub enum IniError {
         file: String,
         known: String,
     },
+    #[error(
+        "'{file}' matches more than one per-user file of {game} for the '{store}' store: {matches}. Name the path in full."
+    )]
+    AmbiguousFile {
+        game: String,
+        store: String,
+        file: String,
+        matches: String,
+    },
     #[error("{0}")]
     Invalid(String),
     #[error(
@@ -487,31 +496,63 @@ fn mapping_for<'a>(
     })
 }
 
-/// The file a name refers to for this store: a valid relative path that the game keeps.
+/// The last component of an instance path, such as `Skyrim.ini`.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The file a name refers to for this store: a valid relative path that the game keeps. A bare file
+/// name is accepted when exactly one of the store's files has it, so `Skyrim.ini` works where
+/// `user/Skyrim.ini` is the only match; an ambiguous name says which paths it could mean.
 fn resolve_file<'a>(
     definition: &'a GameDefinition,
     store: &StoreId,
     file: &str,
 ) -> Result<(RelPath, &'a UserFileMapping), IniError> {
     let rel = RelPath::new(file).map_err(|e| IniError::Invalid(e.to_string()))?;
-    match mapping_for(definition, store, &rel) {
-        Some(mapping) => Ok((rel, mapping)),
-        None => {
-            let known = definition
-                .user_files
+    if let Some(mapping) = mapping_for(definition, store, &rel) {
+        return Ok((rel, mapping));
+    }
+    if !file.contains('/') {
+        let mut matches: Vec<&UserFileMapping> = definition
+            .user_files
+            .iter()
+            .filter(|m| m.applies_to_store(store))
+            .filter(|m| file_name_of(m.instance_path.as_str()).eq_ignore_ascii_case(file))
+            .collect();
+        if matches.len() == 1 {
+            let mapping = matches.remove(0);
+            let rel = RelPath::new(mapping.instance_path.as_str())
+                .map_err(|e| IniError::Invalid(e.to_string()))?;
+            return Ok((rel, mapping));
+        }
+        if matches.len() > 1 {
+            let mut names: Vec<String> = matches
                 .iter()
-                .filter(|m| m.applies_to_store(store))
                 .map(|m| m.instance_path.as_str().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(IniError::NotAGameFile {
+                .collect();
+            names.sort();
+            return Err(IniError::AmbiguousFile {
                 game: definition.id.as_str().to_string(),
                 store: store.as_str().to_string(),
                 file: file.to_string(),
-                known,
-            })
+                matches: names.join(", "),
+            });
         }
     }
+    let known = definition
+        .user_files
+        .iter()
+        .filter(|m| m.applies_to_store(store))
+        .map(|m| m.instance_path.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(IniError::NotAGameFile {
+        game: definition.id.as_str().to_string(),
+        store: store.as_str().to_string(),
+        file: file.to_string(),
+        known,
+    })
 }
 
 /// The game's per-user files for an instance, and whether each has a copy yet.
