@@ -457,3 +457,103 @@ fn a_failed_to_start_verdict_is_corrected_when_the_crash_log_is_found() {
         "the crash report written during the session is the verdict, not the short exit"
     );
 }
+
+#[test]
+fn a_crash_log_no_rule_matches_is_still_a_crash() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let dir = ctx.paths.instance_dir(&instance_id).unwrap();
+    std::fs::remove_file(dir.join("crash-reports").join("crash-example.txt")).unwrap();
+    // An hs_err file is a crash log by its source's declaration. This one names a failure no
+    // rule knows, so only the artifact itself can decide the verdict.
+    std::fs::write(
+        dir.join("hs_err_pid4242.log"),
+        "# A fatal error has been detected by the Java Runtime Environment:\n\
+         #\n\
+         # A made-up native failure that no rule recognises.\n",
+    )
+    .unwrap();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    let caught = catch_up(&ctx, &instance_id);
+    assert_eq!(caught.sessions.len(), 1, "{caught:?}");
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let record = session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.verdict,
+        Some(SessionVerdict::Crashed {
+            how: agora_game_api::crash::MatchedBy::Time
+        }),
+        "the bound crash artifact is the verdict, rules or not"
+    );
+}
+
+#[test]
+fn a_delegated_log_with_a_normal_shutdown_closes_as_normal() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let dir = ctx.paths.instance_dir(&instance_id).unwrap();
+    std::fs::remove_file(dir.join("crash-reports").join("crash-example.txt")).unwrap();
+    let logs = dir.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("latest.log"),
+        "[18:31:20] [Render thread/INFO]: Stopping server\n\
+         [18:31:20] [Render thread/INFO]: Saving worlds\n\
+         [18:31:21] [Render thread/INFO]: Stopping worker threads\n\
+         [18:31:21] [Render thread/INFO]: Stopping!\n",
+    )
+    .unwrap();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    let caught = catch_up(&ctx, &instance_id);
+    assert_eq!(caught.sessions.len(), 1, "{caught:?}");
+    assert!(
+        caught.sessions[0].answer.is_none(),
+        "a normal end has no crash to explain"
+    );
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let record = session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.verdict, Some(SessionVerdict::Normal));
+    assert!(record.ended_at.is_some());
+    assert!(
+        agora_core::crash_live::answer_for_session(&conn, &opened.session_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_delegated_log_that_just_stops_is_not_evidence() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let dir = ctx.paths.instance_dir(&instance_id).unwrap();
+    std::fs::remove_file(dir.join("crash-reports").join("crash-example.txt")).unwrap();
+    let logs = dir.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("latest.log"),
+        "[18:31:20] [Render thread/INFO]: Loaded 12 recipes\n\
+         [18:31:20] [Render thread/INFO]: Time elapsed: 2312 ms\n",
+    )
+    .unwrap();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    let caught = catch_up(&ctx, &instance_id);
+    assert!(
+        caught.sessions.is_empty(),
+        "a log that only stops growing is not proof: {caught:?}"
+    );
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    assert!(session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap()
+        .ended_at
+        .is_none());
+}

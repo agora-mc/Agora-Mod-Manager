@@ -16,6 +16,7 @@ use std::time::SystemTime;
 
 use agora_game_api::crash::{
     Artifact, BuiltInPack, CrashAnswer, Fact, MatchedBy, RefMap, RoleRule, SessionVerdict,
+    SourceRole,
 };
 use agora_game_api::GamePath;
 use agora_plugin_api::host::ScriptHost;
@@ -25,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::crash_engine::attribution::Resolver;
 use crate::crash_engine::evidence::{
     collect_sources, ArtifactFacts, CollectionLimits, CopiedSession, CopyLimits, CrashSession,
-    EvidenceStore, NoArtifactFacts, RetentionLimits, SessionWindow, SourceLocation, SourceRoots,
-    SourceSpec, EVIDENCE_STORE_DIR,
+    EvidenceStore, NoArtifactFacts, RetentionLimits, SessionWindow, SourceCollection,
+    SourceLocation, SourceRoots, SourceSpec, EVIDENCE_STORE_DIR,
 };
 use crate::crash_engine::{
     analyze_with_history, history::LocalConfirmation, history::RecordedCrash, AnalyzeInput,
@@ -300,10 +301,12 @@ pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> CatchUpRep
             }
         }
         let mut evidence = None;
+        let mut normal_stop = false;
         if !provably_gone {
             // A recorded launch that is still alive, or was never finished starting, is not ours
             // to close. Only a launch with no runtime record at all can be ended on positive
-            // evidence: a crash artifact written inside the session. A failure is not evidence.
+            // evidence: a crash log inside the session, or a log whose last lines say the game
+            // stopped normally. A failed check is not evidence.
             if crate::instance_runtime::game_has_record(&ctx.paths, instance_id) {
                 continue;
             }
@@ -320,18 +323,39 @@ pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> CatchUpRep
             }))
             .unwrap_or_else(|_| Err("the crash analysis panicked".to_string()));
             match stored {
-                Ok(answer) if answer_finds_a_crash(&answer) => evidence = Some(answer),
+                Ok(diagnosed)
+                    if diagnosed.crash_artifact.is_some()
+                        || answer_finds_a_crash(&diagnosed.answer) =>
+                {
+                    evidence = Some(diagnosed);
+                }
+                Ok(diagnosed) if diagnosed.normal_stop => normal_stop = true,
                 _ => continue,
             }
         }
-        let Some(closed) = session_ledger::close_unwatched_session(
-            &conn,
-            &session.session_id,
-            &now,
-            "Agora was not watching when the game ended, so nothing saw how it ended",
-        )
-        .ok()
-        .flatten() else {
+        let (why, judged) = if let Some(found) = &evidence {
+            (
+                "a crash log was written during the session",
+                Some(SessionVerdict::Crashed {
+                    how: found.crash_artifact.unwrap_or(MatchedBy::Time),
+                }),
+            )
+        } else if normal_stop {
+            (
+                "the game's log shows it stopped normally",
+                Some(SessionVerdict::Normal),
+            )
+        } else {
+            (
+                "Agora was not watching when the game ended, so nothing saw how it ended",
+                None,
+            )
+        };
+        let Some(closed) =
+            session_ledger::close_open_session(&conn, &session.session_id, &now, why, judged)
+                .ok()
+                .flatten()
+        else {
             continue;
         };
         // A stored answer belongs to a session that was already diagnosed.
@@ -346,11 +370,12 @@ pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> CatchUpRep
                 session_id: closed.session_id.clone(),
                 instance_id: closed.instance_id.clone(),
                 created_at: now.clone(),
-                answer: found,
+                answer: found.answer,
             };
             let _ = store_answer(&conn, &session_answer);
-            let _ = session_ledger::mark_crashed(&conn, &closed.session_id, MatchedBy::Time);
             Some(session_answer)
+        } else if normal_stop {
+            None
         } else {
             diagnose_session_with(ctx, &closed.session_id, &live, true)
         };
@@ -399,18 +424,21 @@ fn diagnose_session_with(
         diagnose_record(ctx, &conn, &record, live)
     }))
     .unwrap_or_else(|_| Err("the crash analysis panicked".to_string()));
-    let answer = match stored {
-        Ok(answer) => answer,
-        Err(why) => StoredAnswer::CouldNotAnalyze { why },
+    let (answer, crash_artifact) = match stored {
+        Ok(diagnosed) => (diagnosed.answer, diagnosed.crash_artifact),
+        Err(why) => (StoredAnswer::CouldNotAnalyze { why }, None),
     };
     // Crash evidence inside the session window is the verdict, whatever the exit code or the
-    // session's length said. Corrections are best effort like every ledger write.
-    if answer_names_a_crash(&answer) {
+    // session's length said. A bound artifact from a primary source is enough on its own; the
+    // rules do not have to recognize the log. Corrections are best effort like every ledger write.
+    if let Some(how) = crash_artifact {
+        let _ = session_ledger::mark_crashed(&conn, session_id, how);
+    } else if answer_finds_a_crash(&answer) {
         let _ = session_ledger::mark_crashed(&conn, session_id, MatchedBy::Time);
     }
     // An unwatched session with no crash evidence is not a crash to explain; leave it unanswered
     // rather than storing a lead that would be invented from the verdict.
-    if allow_unknown && !answer_names_a_crash(&answer) {
+    if allow_unknown && crash_artifact.is_none() && !answer_finds_a_crash(&answer) {
         return None;
     }
     let created_at = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
@@ -433,12 +461,6 @@ fn answer_finds_a_crash(answer: &StoredAnswer) -> bool {
         }
         StoredAnswer::NothingToRead { .. } | StoredAnswer::CouldNotAnalyze { .. } => false,
     }
-}
-
-/// Whether an answer is worth storing for an unwatched session: found a crash, or failed to check
-/// and says why. `NothingToRead` alone is not a crash to explain.
-fn answer_names_a_crash(answer: &StoredAnswer) -> bool {
-    answer_finds_a_crash(answer) || matches!(answer, StoredAnswer::CouldNotAnalyze { .. })
 }
 
 /// Store "could not analyze" for a session whose packs or host could not even be prepared. This is
@@ -470,12 +492,80 @@ fn diagnoses(verdict: Option<SessionVerdict>) -> bool {
     )
 }
 
+/// What one diagnosis found beyond the answer itself.
+struct Diagnosed {
+    answer: StoredAnswer,
+    /// A bound artifact from a source that declares itself primary: a crash log written inside the
+    /// session window, whatever the rules made of it.
+    crash_artifact: Option<MatchedBy>,
+    /// A log whose last lines say the game stopped normally.
+    normal_stop: bool,
+}
+
+/// The first artifact bound from a `primary` source. That declaration is the pack's way of saying
+/// "a file from here is a crash log", so the verdict does not depend on a rule recognizing it.
+fn primary_crash_artifact(
+    collection: &SourceCollection,
+    game_packs: &[&LoadedCrashPack],
+) -> Option<MatchedBy> {
+    collection.bound.iter().find_map(|found| {
+        let primary = game_packs.iter().any(|pack| {
+            pack.plugin_id == found.plugin_id
+                && pack.pack.sources.iter().any(|source| {
+                    source.id == found.source_id && source.role == SourceRole::Primary
+                })
+        });
+        primary.then_some(found.matched_by)
+    })
+}
+
+/// Whether a bound log whose source declares `normal_stop` says the game stopped normally. Only
+/// the last lines count: a log that merely stops growing is not evidence, because a paused game
+/// also stops logging.
+fn log_shows_normal_stop(
+    collection: &SourceCollection,
+    game_packs: &[&LoadedCrashPack],
+    copied: Option<&CopiedSession>,
+) -> bool {
+    collection.bound.iter().any(|found| {
+        let markers = game_packs
+            .iter()
+            .find(|pack| pack.plugin_id == found.plugin_id)
+            .and_then(|pack| {
+                pack.pack
+                    .sources
+                    .iter()
+                    .find(|source| source.id == found.source_id)
+            })
+            .map(|source| source.normal_stop.as_slice())
+            .unwrap_or(&[]);
+        if markers.is_empty() {
+            return false;
+        }
+        let text = std::fs::read_to_string(&found.path).ok().or_else(|| {
+            let copy = copied?;
+            let artifact = copy
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.name == found.name)?;
+            let path = copy.objects.get(&artifact.id)?;
+            std::fs::read_to_string(path).ok()
+        });
+        text.is_some_and(|text| {
+            text.lines()
+                .rev()
+                .take(40)
+                .any(|line| markers.iter().any(|marker| line.contains(marker)))
+        })
+    })
+}
+
 fn diagnose_record(
     ctx: &Ctx,
     conn: &Connection,
     record: &SessionRecord,
     live: &LivePacks<'_>,
-) -> Result<StoredAnswer, String> {
+) -> Result<Diagnosed, String> {
     let resolved = crate::crash_engine::instance_view::resolve_crash_instance(
         ctx,
         &record.instance_id,
@@ -496,11 +586,15 @@ fn diagnose_record(
         })
         .collect();
     if game_packs.is_empty() {
-        return Ok(StoredAnswer::NothingToRead {
-            why: format!(
-                "No crash pack applies to the game '{game_id}', so there was nothing to read the \
-                 session with."
-            ),
+        return Ok(Diagnosed {
+            answer: StoredAnswer::NothingToRead {
+                why: format!(
+                    "No crash pack applies to the game '{game_id}', so there was nothing to read the \
+                     session with."
+                ),
+            },
+            crash_artifact: None,
+            normal_stop: false,
         });
     }
 
@@ -538,6 +632,8 @@ fn diagnose_record(
         &session,
         CollectionLimits::default(),
     );
+    // The verdict rests on the evidence, not on whether a rule understood it.
+    let crash_artifact = primary_crash_artifact(&collection, &game_packs);
 
     let store_root = ctx.paths.root().join(EVIDENCE_STORE_DIR);
     let store = EvidenceStore::new(store_root);
@@ -548,11 +644,16 @@ fn diagnose_record(
         RetentionLimits::default(),
     );
     let copied = copied.map_err(|error| format!("the evidence could not be copied: {error}"))?;
+    let normal_stop = log_shows_normal_stop(&collection, &game_packs, Some(&copied));
 
     let files = readable_files(&copied);
     if files.is_empty() {
-        return Ok(StoredAnswer::NothingToRead {
-            why: nothing_to_read(&collection.folders, &collection.problems, &copied),
+        return Ok(Diagnosed {
+            answer: StoredAnswer::NothingToRead {
+                why: nothing_to_read(&collection.folders, &collection.problems, &copied),
+            },
+            crash_artifact,
+            normal_stop,
         });
     }
 
@@ -660,11 +761,15 @@ fn diagnose_record(
         at_unix_ms,
     };
 
-    Ok(StoredAnswer::Analyzed {
-        answer: Box::new(output.answer),
-        files: output.files,
-        changes,
-        record: Some(recorded),
+    Ok(Diagnosed {
+        answer: StoredAnswer::Analyzed {
+            answer: Box::new(output.answer),
+            files: output.files,
+            changes,
+            record: Some(recorded),
+        },
+        crash_artifact,
+        normal_stop,
     })
 }
 

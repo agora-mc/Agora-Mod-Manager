@@ -16,6 +16,7 @@
       "match": { "glob": "latest.log" },
       "format": "latest_log",
       "bind": [{ "time": { "before_s": 5, "after_s": 30 } }],
+      "normal_stop": ["Stopping!", "Stopping worker threads"],
       "copy": "head_tail",
       "privacy": "personal"
     },
@@ -24,6 +25,8 @@
       "where": { "root": "instance", "path": "" },
       "match": { "glob": "hs_err_pid*.log" },
       "format": "hs_err",
+      "bind": [{ "time": { "before_s": 5, "after_s": 30 } }],
+      "role": "primary",
       "copy": "facts_only"
     },
     {
@@ -31,6 +34,8 @@
       "where": { "root": "instance", "path": "logs" },
       "match": { "glob": "hs_err_pid*.log" },
       "format": "hs_err",
+      "bind": [{ "time": { "before_s": 5, "after_s": 30 } }],
+      "role": "primary",
       "copy": "facts_only"
     },
     {

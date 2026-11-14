@@ -1010,6 +1010,19 @@ pub fn close_unwatched_session(
     now: &str,
     why: &str,
 ) -> anyhow::Result<Option<ClosedSession>> {
+    close_open_session(conn, session_id, now, why, None)
+}
+
+/// Close one open session with a verdict already decided by positive evidence. The exit is
+/// unobserved; the evidence is why the row is closed. `None` for `judged` asks for the normal
+/// stop/unknown judgement.
+pub fn close_open_session(
+    conn: &Connection,
+    session_id: &str,
+    now: &str,
+    why: &str,
+    judged: Option<SessionVerdict>,
+) -> anyhow::Result<Option<ClosedSession>> {
     let open: Option<(i64, String, bool)> = conn
         .query_row(
             "SELECT id, instance_id, stop_requested FROM launch_history
@@ -1022,13 +1035,15 @@ pub fn close_unwatched_session(
         return Ok(None);
     };
     let exit = ExitObservation::unavailable(why);
-    let judged = verdict(&VerdictInput {
-        exit: &exit,
-        stop_requested,
-        runtime_ms: 0,
-        normal_exit_codes: &[],
-        artifact: None,
-        froze: false,
+    let judged = judged.unwrap_or_else(|| {
+        verdict(&VerdictInput {
+            exit: &exit,
+            stop_requested,
+            runtime_ms: 0,
+            normal_exit_codes: &[],
+            artifact: None,
+            froze: false,
+        })
     });
     write_end(conn, row_id, now, None, &exit, judged)?;
     Ok(Some(ClosedSession {

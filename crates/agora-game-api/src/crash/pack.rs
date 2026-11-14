@@ -73,6 +73,11 @@ pub struct CrashSource {
     /// and shown. A `primary` source needs at least one, or an old log would read as a new crash.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bind: Vec<SourceBind>,
+    /// Lines whose presence near the end of this artifact mean the game stopped normally. An
+    /// empty list says nothing. A log that only stops growing is not evidence: a paused game also
+    /// stops logging.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normal_stop: Vec<String>,
     #[serde(default)]
     pub role: SourceRole,
     #[serde(default)]
