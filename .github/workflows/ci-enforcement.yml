@@ -223,6 +223,8 @@ jobs:
           workspaces: . -> target
       - name: Check the committed LOOT WebAssembly module
         run: python scripts/build_loot_wasm.py --check
+      - name: Check the committed plugin-records WebAssembly module
+        run: python scripts/build_records_wasm.py --check
 
   frontend:
     runs-on: ubuntu-latest
