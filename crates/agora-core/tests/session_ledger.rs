@@ -577,6 +577,67 @@ fn live_pack() -> agora_game_api::crash::BuiltInPack {
         }
 }
 
+/// A pack whose supplementary log names a load the game refused. The fact is core's own
+/// `core.load_verdict`, so the decision to answer a clean session is game-free.
+fn refusal_pack() -> agora_game_api::crash::BuiltInPack {
+    agora_game_api::crash::BuiltInPack {
+        file: "test/crash/refusal-pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "startup_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "startup-*.txt" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 3600, "after_s": 3600 } }],
+                "role": "supplementary"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^REFUSED$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "load",
+                        "header": "^REFUSED$",
+                        "kind": "core.load_verdict",
+                        "lines": [{
+                            "pattern": "^(?P<outcome>refused) (?P<module>\\S+) (?P<reason>\\S+)$",
+                            "attrs": { "outcome": "outcome", "reason": "reason" },
+                            "refs": [{ "kind": "module", "value": "module", "strength": "mention" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "rules": [{
+                "id": "refused_plugin",
+                "version": 1,
+                "when": { "fact": { "kind": "core.load_verdict", "where": { "outcome": "refused" }, "ref": { "kind": "module", "bind": "d" } } },
+                "effects": [{ "finding": { "cause": "version_mismatch", "scope": "mechanism", "level": "possible" } }],
+                "text": { "headline": { "en": "The game refused to load {d} because it is built for another game version. Update it or turn it off." } }
+            }]
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    }
+}
+
+fn write_startup_log(f: &Fixture) {
+    let logs = f
+        .ctx
+        .paths
+        .instance_dir(&f.record.instance_id)
+        .unwrap()
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("startup-1.txt"),
+        "REFUSED\nrefused ExampleStartup.dll different_game_version\n",
+    )
+    .unwrap();
+}
+
 fn write_log(f: &Fixture) {
     let dir = f.ctx.paths.instance_dir(&f.record.instance_id).unwrap();
     let logs = dir.join("logs");
@@ -653,15 +714,23 @@ fn now_minus(seconds: i64) -> String {
 }
 
 fn diagnose(f: &Fixture, session: &str) -> Option<agora_core::crash_live::SessionAnswer> {
+    let built_in = [live_pack()];
+    diagnose_with(f, session, &built_in)
+}
+
+fn diagnose_with(
+    f: &Fixture,
+    session: &str,
+    built_in: &[agora_game_api::crash::BuiltInPack],
+) -> Option<agora_core::crash_live::SessionAnswer> {
     let host = agora_plugin_host::QuickJsHost::new();
     let packs: Vec<agora_core::crash_packs::LoadedCrashPack> = Vec::new();
-    let built_in = [live_pack()];
     agora_core::crash_live::diagnose_session(
         &f.ctx,
         session,
         agora_core::crash_live::LivePacks {
             packs: &packs,
-            built_in: &built_in,
+            built_in,
             host: &host,
             instances: None,
         },
@@ -831,6 +900,54 @@ fn a_normal_exit_stores_no_answer_at_all() {
     end_session(&f, &id, &now_minus(1), 0);
 
     assert!(diagnose(&f, &id).is_none());
+    assert!(agora_core::crash_live::answer_for_session(&ledger(&f), &id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_clean_session_that_refused_a_plugin_gets_a_normal_answer() {
+    let f = fixture(1);
+    write_startup_log(&f);
+    let id = start_session(&f, &now_minus(120), &["mod-a"]);
+    end_session_after(&f, &id, &now_minus(1), 0, 100_000);
+
+    let built_in = [refusal_pack()];
+    let answer = diagnose_with(&f, &id, &built_in).expect("a refused plugin is worth an answer");
+    let agora_core::crash_live::StoredAnswer::Analyzed { answer, .. } = answer.answer else {
+        panic!("expected an analyzed answer, got a different one");
+    };
+    assert_eq!(
+        answer.verdict,
+        SessionVerdict::Normal,
+        "the process exited normally; the answer explains a refusal, not a crash"
+    );
+    assert!(answer.candidates.is_empty(), "nobody is accused of a crash");
+    let headline = answer.headline.get("en").cloned().unwrap_or_default();
+    assert!(headline.contains("refused to load"), "{headline}");
+    assert!(headline.contains("ExampleStartup.dll"), "{headline}");
+    assert!(
+        headline.contains("Update it or turn it off"),
+        "the answer says what to do: {headline}"
+    );
+    assert_eq!(
+        session_ledger::get(&ledger(&f), &id)
+            .unwrap()
+            .unwrap()
+            .verdict,
+        Some(SessionVerdict::Normal),
+        "a refusal at startup does not rewrite a clean exit as a crash"
+    );
+}
+
+#[test]
+fn an_ordinary_clean_session_with_no_refusal_gets_no_answer() {
+    let f = fixture(1);
+    let id = start_session(&f, &now_minus(120), &["mod-a"]);
+    end_session_after(&f, &id, &now_minus(1), 0, 100_000);
+
+    let built_in = [refusal_pack()];
+    assert!(diagnose_with(&f, &id, &built_in).is_none());
     assert!(agora_core::crash_live::answer_for_session(&ledger(&f), &id)
         .unwrap()
         .is_none());
