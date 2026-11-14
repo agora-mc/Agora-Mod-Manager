@@ -402,3 +402,33 @@ fn a_round_tripped_index_still_finds_an_overlap() {
     assert_eq!(keys.len(), 1, "{keys:?}");
     assert_eq!(keys[0].0, "master.esm:000abc");
 }
+
+#[test]
+fn a_restricted_parse_keeps_only_the_named_keys() {
+    let bytes = plugin(
+        &[],
+        0,
+        &group(
+            b"GMST",
+            0,
+            &[
+                gmst(0x000abc, 1, "JumpSetting"),
+                gmst(0x000def, 2, "OtherSetting"),
+            ]
+            .concat(),
+        ),
+    );
+    let full = parse_plugin("Master.esm", &bytes).unwrap();
+    assert_eq!(full.records.len(), 2);
+    assert_eq!(full.only_hash, 0);
+
+    let restricted = plugin_records::parse_plugin_restricted(
+        "Master.esm",
+        &bytes,
+        &["master.esm:000abc".into()],
+    )
+    .unwrap();
+    assert_eq!(restricted.records.len(), 1);
+    assert_eq!(restricted.records[0].low, 0x000abc);
+    assert_ne!(restricted.only_hash, 0);
+}

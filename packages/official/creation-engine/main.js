@@ -3208,10 +3208,12 @@ const OVERLAPS_INDEX_KEY = "overlaps.index";
 function overlapsEntries(args) {
   const entries = (args && args.entries) || [];
   const names = [];
+  const implicit = new Set();
   const seen = new Set();
   for (const entry of entries) {
     if (!entry.present) continue;
     if (!entry.active && !entry.implicit) continue;
+    if (entry.implicit) implicit.add(entry.name);
     if (seen.has(entry.name)) continue;
     seen.add(entry.name);
     names.push(entry.name);
@@ -3222,8 +3224,35 @@ function overlapsEntries(args) {
       seen.add(name);
       names.push(name);
     }
+    for (const name of (args && args.implicit) || []) implicit.add(name);
   }
-  return { names: names };
+  return { names: names, implicit: implicit };
+}
+
+/// A master in the list: named by the instance as implicit, or a .esm/.esl.
+function isMasterName(name, implicit) {
+  return implicit.has(name) || /\.(esm|esl)$/i.test(name);
+}
+
+/// A 64-bit, order-sensitive hash of the needed key list, for cache invalidation.
+function keysFingerprint(keys) {
+  let a = 0x811c9dc5;
+  let b = 0x9e3779b9;
+  for (const key of keys) {
+    for (let index = 0; index < key.length; index += 1) {
+      const code = key.charCodeAt(index);
+      a = Math.imul(a ^ code, 16777619) >>> 0;
+      b = Math.imul(b ^ (code + 31), 16777619) >>> 0;
+    }
+    a = Math.imul(a ^ 10, 16777619) >>> 0;
+    b = Math.imul(b ^ 10, 16777619) >>> 0;
+  }
+  return (
+    a.toString(16).padStart(8, "0") +
+    b.toString(16).padStart(8, "0") +
+    "-" +
+    keys.length
+  );
 }
 
 const RECORDS_DATA_MOUNT = {
@@ -3308,16 +3337,18 @@ const RECORDS_BLOB_BYTES = 512 * 1024;
 const OVERLAPS_PAGE = 10000;
 
 /// Index one file in parts and keep every part in the plugin's own store.
-async function indexRecordFile(name, previous) {
+async function indexRecordFile(name, previous, only) {
   let from = 0;
   let notes = [];
   let entry = null;
   const chunks = [];
+  const request = (from) => {
+    const out = { mode: "index", plugins: [name], from: from, length: RECORDS_PART_BYTES };
+    if (only && only.length) out.only = only;
+    return out;
+  };
   for (let part = 0; part < 64; part += 1) {
-    const reply = runRecords(
-      { mode: "index", plugins: [name], from: from, length: RECORDS_PART_BYTES },
-      [],
-    );
+    const reply = runRecords(request(from), []);
     notes = reply.notes || [];
     const built = (reply.indexes || [])[0];
     if (!built) return { notes: notes };
@@ -3365,8 +3396,20 @@ function overlapNotes(notes) {
 }
 
 /// The records shared by the active plugins, in load order (MASTER_SPEC §31.3).
+///
+/// Only keys whose providers disagree at least twice are returned: one change
+/// is a single mod editing a record, which core calls "agree", and two or more
+/// distinct changes are the only ones that can become a conflict, a patch or a
+/// decided key. Every provider of a kept key is returned, including the earlier
+/// holder a changer replaces, so core can tell an identical-to-master copy from
+/// a change.
+///
+/// Large masters are indexed only for the records a non-master plugin actually
+/// uses. The master keeps a restricted index, keyed by the file and by a
+/// fingerprint of the key set, so a changed active set re-indexes it.
 export async function overlaps(args) {
-  const names = overlapsEntries(args).names;
+  const entries = overlapsEntries(args);
+  const names = entries.names;
   if (names.length < 2) return { keys: [], notes: [] };
 
   const saved = await storage.get(OVERLAPS_INDEX_KEY);
@@ -3380,21 +3423,88 @@ export async function overlaps(args) {
     }
   };
 
-  for (const name of names) {
+  const masters = names.filter((name) => isMasterName(name, entries.implicit));
+  const masterSet = new Set(masters);
+  const others = names.filter((name) => !masterSet.has(name));
+
+  // A non-master is small enough to index whole; its records tell us which
+  // master records the list actually uses.
+  for (const name of others) {
     const entry = files[name];
     if (entry && Array.isArray(entry.chunks) && entry.chunks.length) continue;
-    const indexed = await indexRecordFile(name, entry);
+    const indexed = await indexRecordFile(name, entry, null);
     addNotes(indexed.notes);
     if (indexed.entry) files[name] = indexed.entry;
     else failed.add(name);
   }
-  if (Object.keys(files).length) await storage.set(OVERLAPS_INDEX_KEY, { files });
 
+  let needed = [];
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const checked = names.filter((name) => !failed.has(name));
+    const checked = others.filter((name) => !failed.has(name));
     const cached = [];
     const stored = [];
     for (const name of checked) {
+      const entry = files[name];
+      if (!entry || !Array.isArray(entry.chunks)) continue;
+      cached.push({ name: name, chunks: entry.chunks });
+      for (const chunk of entry.chunks) stored.push(chunk);
+    }
+    const reply = runRecords(
+      { mode: "needed", plugins: checked, masters: masters, cached: cached },
+      stored,
+    );
+    addNotes(reply.notes);
+    const stale = reply.stale || [];
+    if (stale.length === 0) {
+      needed = reply.needed || [];
+      break;
+    }
+    let progressed = false;
+    for (const name of stale) {
+      const indexed = await indexRecordFile(name, files[name], null);
+      addNotes(indexed.notes);
+      if (indexed.entry) {
+        files[name] = indexed.entry;
+        progressed = true;
+      } else {
+        failed.add(name);
+        progressed = true;
+      }
+    }
+    if (!progressed || attempt === 2) break;
+  }
+
+  const fingerprint = needed.length ? keysFingerprint(needed) : null;
+  if (needed.length && saved && saved.neededHash !== fingerprint) {
+    // The key set changed, so every master's restricted index is out of date.
+    for (const name of masters) {
+      const indexed = await indexRecordFile(name, files[name], needed);
+      addNotes(indexed.notes);
+      if (indexed.entry) files[name] = indexed.entry;
+      else failed.add(name);
+      await storage.set(OVERLAPS_INDEX_KEY, { files: files, neededHash: null });
+    }
+  } else if (needed.length) {
+    for (const name of masters) {
+      const entry = files[name];
+      if (entry && Array.isArray(entry.chunks) && entry.chunks.length) continue;
+      const indexed = await indexRecordFile(name, entry, needed);
+      addNotes(indexed.notes);
+      if (indexed.entry) files[name] = indexed.entry;
+      else failed.add(name);
+    }
+  }
+  await storage.set(OVERLAPS_INDEX_KEY, { files: files, neededHash: fingerprint });
+
+  const checkedNames = names.filter(
+    (name) => !failed.has(name) && (needed.length > 0 || !masterSet.has(name)),
+  );
+  if (checkedNames.length < 2) return { keys: [], notes: notes };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const cached = [];
+    const stored = [];
+    for (const name of checkedNames) {
       const entry = files[name];
       if (!entry || !Array.isArray(entry.chunks)) continue;
       cached.push({ name: name, chunks: entry.chunks });
@@ -3405,18 +3515,10 @@ export async function overlaps(args) {
     let stale = [];
     while (true) {
       const reply = runRecords(
-        { mode: "overlaps", plugins: checked, cached: cached, offset: offset, limit: OVERLAPS_PAGE },
+        { mode: "overlaps", plugins: checkedNames, cached: cached, offset: offset, limit: OVERLAPS_PAGE },
         stored,
       );
       addNotes(reply.notes);
-      for (const built of reply.indexes || []) {
-        const indexed = await indexRecordFile(built.name, files[built.name]);
-        if (indexed.entry) files[built.name] = indexed.entry;
-        addNotes(indexed.notes);
-      }
-      if (reply.indexes && reply.indexes.length) {
-        await storage.set(OVERLAPS_INDEX_KEY, { files: files });
-      }
       stale = reply.stale || [];
       if (stale.length) break;
       const page = reply.keys || [];
@@ -3428,7 +3530,8 @@ export async function overlaps(args) {
     }
     let progressed = false;
     for (const name of stale) {
-      const indexed = await indexRecordFile(name, files[name]);
+      const only = needed.length && masterSet.has(name) ? needed : null;
+      const indexed = await indexRecordFile(name, files[name], only);
       addNotes(indexed.notes);
       if (indexed.entry) {
         files[name] = indexed.entry;
@@ -3438,12 +3541,11 @@ export async function overlaps(args) {
         progressed = true;
       }
     }
-    await storage.set(OVERLAPS_INDEX_KEY, { files: files });
+    await storage.set(OVERLAPS_INDEX_KEY, { files: files, neededHash: fingerprint });
     if (!progressed) break;
     if (attempt === 2) {
       throw new Error("the plugin records could not be re-indexed: " + stale.join(", "));
     }
   }
-  // The files that could not be read were named in a note, and the rest were checked.
   return { keys: [], notes: notes };
 }

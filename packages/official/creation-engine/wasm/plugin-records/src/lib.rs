@@ -29,8 +29,8 @@ use json::Value;
 const RECORD_HEADER: usize = 24;
 const GROUP_HEADER: usize = 24;
 const COMPRESSED_FLAG: u32 = 0x0004_0000;
-const INDEX_MAGIC: &[u8; 8] = b"AGRIDX02";
-pub const INDEX_VERSION: u32 = 2;
+const INDEX_MAGIC: &[u8; 8] = b"AGRIDX03";
+pub const INDEX_VERSION: u32 = 3;
 const MAX_GROUP_DEPTH: u32 = 64;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -54,6 +54,8 @@ pub struct Index {
     pub name: String,
     pub size: u64,
     pub modified: u64,
+    /// 0 for a whole-file index; otherwise a hash of the restricted key set.
+    pub only_hash: u64,
     /// The plugin's masters in MAST order, then the plugin's own name.
     pub files: Vec<String>,
     pub records: Vec<Record>,
@@ -100,6 +102,8 @@ pub struct Reply {
     /// caller can page through a large set without one huge script object.
     pub total: u64,
     pub offset: u64,
+    /// Keys a master needs to index for the current non-master set (`needed` mode).
+    pub needed: Vec<String>,
 }
 
 /// Run one request. `mode` is `index` (index the named plugins and return their
@@ -120,6 +124,10 @@ struct Request {
     length: u64,
     offset: u64,
     limit: u64,
+    /// Index mode only: keep only these canonical keys.
+    only: Vec<String>,
+    /// Needed mode: the file names whose records the non-master set references.
+    masters: Vec<String>,
     /// How many digest changes a key needs before it can matter to the core.
     /// One change is a single mod editing a record (never a conflict); two or
     /// more distinct changes can be. The default filters the rest, because a
@@ -140,8 +148,8 @@ impl Request {
             Some(Value::String(mode)) => mode.clone(),
             Some(_) => return Err("'mode' must be a string".to_string()),
         };
-        if mode != "index" && mode != "overlaps" {
-            return Err(format!("'{mode}' is not an index or overlaps mode"));
+        if mode != "index" && mode != "overlaps" && mode != "needed" {
+            return Err(format!("'{mode}' is not an index, overlaps or needed mode"));
         }
         let plugins = string_array(value, "plugins")?;
         let from = value.get("from").and_then(Value::as_u64).unwrap_or(0);
@@ -158,6 +166,8 @@ impl Request {
             .get("min_changes")
             .and_then(Value::as_u64)
             .unwrap_or(2);
+        let only = optional_string_array(value, "only")?;
+        let masters = optional_string_array(value, "masters")?;
         let mut cached = Vec::new();
         if let Some(entries) = value.get("cached") {
             let entries = entries
@@ -196,7 +206,17 @@ impl Request {
             offset,
             limit,
             min_changes,
+            only,
+            masters,
         })
+    }
+}
+
+fn optional_string_array(value: &Value, key: &str) -> Result<Vec<String>, String> {
+    match value.get(key) {
+        None => Ok(Vec::new()),
+        Some(Value::Null) => Ok(Vec::new()),
+        Some(_) => string_array(value, key),
     }
 }
 
@@ -249,7 +269,7 @@ fn run(request: &Request) -> Result<Reply, String> {
         let size = metadata.len();
         let modified = modified_ns(&metadata);
 
-        if request.mode == "overlaps" {
+        if request.mode == "overlaps" || request.mode == "needed" {
             let Some(entry) = cached.get(name.as_str()) else {
                 stale.push(name.clone());
                 continue;
@@ -261,7 +281,14 @@ fn run(request: &Request) -> Result<Reply, String> {
             continue;
         }
 
-        match parse_plugin_file(name, &path, size) {
+        let only = only_set(&request.only)?;
+        let only_hash = if only.is_empty() {
+            0
+        } else {
+            hash_keys(&request.only)
+        };
+        let restricted = (!only.is_empty()).then_some(&only);
+        match parse_plugin_file(name, &path, size, restricted, only_hash) {
             Ok(mut index) => {
                 index.size = size;
                 index.modified = modified;
@@ -292,6 +319,7 @@ fn run(request: &Request) -> Result<Reply, String> {
         }
     }
 
+    let mut needed = Vec::new();
     let mut keys = if request.mode == "overlaps" && stale.is_empty() {
         let mut keys = build_overlaps(&indexes).0;
         let min_changes = usize::try_from(request.min_changes).unwrap_or(usize::MAX);
@@ -310,6 +338,38 @@ fn run(request: &Request) -> Result<Reply, String> {
             .min(keys.len());
         keys = keys.drain(start..end).collect();
     }
+    if request.mode == "needed" && stale.is_empty() {
+        let masters: Vec<String> = request
+            .masters
+            .iter()
+            .map(|name| name.to_lowercase())
+            .collect();
+        let mut found: Vec<String> = Vec::new();
+        for index in &indexes {
+            for record in &index.records {
+                let file = index.files[record.file as usize].to_lowercase();
+                if masters.iter().any(|master| master == &file) {
+                    found.push(format!("{file}:{:06x}", record.low));
+                }
+            }
+        }
+        let master_set: std::collections::HashSet<String> = masters.iter().cloned().collect();
+        for master in &request.masters {
+            if !plain_file_name(master) {
+                continue;
+            }
+            let path = format!("/data/{master}");
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if let Ok(keys) = scan_references(master, &path, metadata.len(), &master_set) {
+                found.extend(keys);
+            }
+        }
+        found.sort();
+        found.dedup();
+        needed = found;
+    }
     Ok(Reply {
         keys,
         notes,
@@ -317,7 +377,37 @@ fn run(request: &Request) -> Result<Reply, String> {
         stale,
         total,
         offset: request.offset,
+        needed,
     })
+}
+
+/// Parse the restricted key list into `(defining file, low 24 bits)`.
+fn only_set(only: &[String]) -> Result<std::collections::HashSet<(String, u32)>, String> {
+    let mut set = std::collections::HashSet::new();
+    for key in only {
+        let (file, low) = key
+            .rsplit_once(':')
+            .ok_or_else(|| format!("'{key}' is not a record key"))?;
+        let low =
+            u32::from_str_radix(low, 16).map_err(|_| format!("'{key}' has no hex low 24 bits"))?;
+        set.insert((file.to_lowercase(), low & 0x00FF_FFFF));
+    }
+    Ok(set)
+}
+
+/// A stable hash of the restricted key list, so a restricted index is never
+/// mistaken for a whole-file one or for a different restriction.
+fn hash_keys(keys: &[String]) -> u64 {
+    let mut sorted: Vec<&str> = keys.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let mut hash = FNV_OFFSET;
+    for key in sorted {
+        for byte in key.as_bytes().iter().chain(&[0u8]) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash.max(1)
 }
 
 fn plain_file_name(name: &str) -> bool {
@@ -365,6 +455,7 @@ fn index_key(index: &Index) -> String {
         .to_le_bytes()
         .iter()
         .chain(index.modified.to_le_bytes().iter())
+        .chain(index.only_hash.to_le_bytes().iter())
     {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
@@ -377,6 +468,7 @@ fn index_key(index: &Index) -> String {
 trait Source {
     fn len(&self) -> u64;
     fn read(&mut self, offset: u64, length: usize) -> Result<Vec<u8>, String>;
+    fn skip(&mut self, offset: u64, length: usize) -> Result<(), String>;
 }
 
 struct SliceSource<'a> {
@@ -397,6 +489,16 @@ impl Source for SliceSource<'_> {
             .get(start..end)
             .map(<[u8]>::to_vec)
             .ok_or_else(|| "the file is truncated".to_string())
+    }
+
+    fn skip(&mut self, offset: u64, length: usize) -> Result<(), String> {
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| "a skip length overflows".to_string())?;
+        if end > self.len() {
+            return Err("the file is truncated".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -447,17 +549,53 @@ impl Source for FileSource {
         self.pos = end;
         Ok(self.block[start..start + length].to_vec())
     }
+
+    fn skip(&mut self, offset: u64, length: usize) -> Result<(), String> {
+        if offset != self.pos {
+            return Err("the parser asked for bytes out of order".to_string());
+        }
+        let end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| "a skip length overflows".to_string())?;
+        if end > self.len {
+            return Err("the file is truncated".to_string());
+        }
+        self.pos = end;
+        // The next read will refill the block from the new position.
+        if end > self.block_start + self.block.len() as u64 {
+            self.block.clear();
+            self.block_start = end;
+        }
+        Ok(())
+    }
 }
 
 /// Parse one plugin file into its index.
 pub fn parse_plugin(name: &str, bytes: &[u8]) -> Result<Index, String> {
     let mut source = SliceSource { bytes };
     let total = source.len();
-    parse_source(name, &mut source, total)
+    parse_source(name, &mut source, total, None, 0)
+}
+
+/// Parse one plugin from bytes, keeping only the named canonical keys. Test-only
+/// shape of the restricted parse the master index uses.
+pub fn parse_plugin_restricted(name: &str, bytes: &[u8], only: &[String]) -> Result<Index, String> {
+    let set = only_set(only)?;
+    let hash = if set.is_empty() { 0 } else { hash_keys(only) };
+    let mut source = SliceSource { bytes };
+    let total = bytes.len() as u64;
+    let restricted = (!set.is_empty()).then_some(&set);
+    parse_source(name, &mut source, total, restricted, hash)
 }
 
 /// Parse a plugin file from disk without loading the whole file into memory.
-pub fn parse_plugin_file(name: &str, path: &str, size: u64) -> Result<Index, String> {
+pub fn parse_plugin_file(
+    name: &str,
+    path: &str,
+    size: u64,
+    only: Option<&std::collections::HashSet<(String, u32)>>,
+    only_hash: u64,
+) -> Result<Index, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut source = FileSource {
         file,
@@ -466,10 +604,134 @@ pub fn parse_plugin_file(name: &str, path: &str, size: u64) -> Result<Index, Str
         block_start: 0,
         block: Vec::new(),
     };
-    parse_source(name, &mut source, size)
+    parse_source(name, &mut source, size, only, only_hash)
 }
 
-fn parse_source(name: &str, source: &mut dyn Source, total: u64) -> Result<Index, String> {
+/// Walk a plugin's records without reading their data, collecting the keys it
+/// references that a master defines. Used to give a master the records another
+/// master overrides, which the non-master scan cannot see.
+pub fn scan_references(
+    name: &str,
+    path: &str,
+    size: u64,
+    masters: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut source = FileSource {
+        file,
+        pos: 0,
+        len: size,
+        block_start: 0,
+        block: Vec::new(),
+    };
+    if size < RECORD_HEADER as u64 {
+        return Err("the file is shorter than one record header".to_string());
+    }
+    let header = source.read(0, RECORD_HEADER)?;
+    if &header[0..4] != b"TES4" {
+        return Err("the file does not start with a TES4 header record".to_string());
+    }
+    let header_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
+    let data_end = RECORD_HEADER as u64 + header_size;
+    if data_end > size {
+        return Err("the TES4 record is truncated".to_string());
+    }
+    let header_data = source.read(RECORD_HEADER as u64, header_size as usize)?;
+    let mut files = Vec::new();
+    scan_subrecords(&header_data, |kind, data| {
+        if kind == b"MAST" {
+            let end = data
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(data.len());
+            if let Ok(text) = std::str::from_utf8(&data[..end]) {
+                files.push(text.to_string());
+            }
+        }
+    });
+    files.push(name.to_string());
+    let own = name.to_lowercase();
+    let mut found = Vec::new();
+    let mut pos = data_end;
+    while pos < size {
+        pos = scan_entry(&mut source, pos, size, &files, &own, masters, &mut found, 0)?;
+    }
+    Ok(found)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_entry(
+    source: &mut dyn Source,
+    start: u64,
+    end: u64,
+    files: &[String],
+    own: &str,
+    masters: &std::collections::HashSet<String>,
+    found: &mut Vec<String>,
+    depth: u32,
+) -> Result<u64, String> {
+    if depth > MAX_GROUP_DEPTH {
+        return Err("the groups are nested too deeply".to_string());
+    }
+    if end - start < RECORD_HEADER as u64 {
+        return Err("a partial record header ends the file".to_string());
+    }
+    let header = source.read(start, RECORD_HEADER)?;
+    if &header[0..4] == b"GRUP" {
+        let size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
+        let group_end = start
+            .checked_add(size)
+            .ok_or_else(|| "a group size overflows".to_string())?;
+        if size < GROUP_HEADER as u64 || group_end > end {
+            return Err("a group overruns its parent".to_string());
+        }
+        let mut pos = start + GROUP_HEADER as u64;
+        while pos < group_end {
+            pos = scan_entry(
+                source,
+                pos,
+                group_end,
+                files,
+                own,
+                masters,
+                found,
+                depth + 1,
+            )?;
+        }
+        return Ok(group_end);
+    }
+    let data_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
+    let form_id = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    let data_start = start + RECORD_HEADER as u64;
+    let data_end = data_start
+        .checked_add(data_size)
+        .ok_or_else(|| "a record size overflows".to_string())?;
+    if data_end > end {
+        return Err("a record overruns its group".to_string());
+    }
+    if &header[0..4] != b"TES4" {
+        let top = (form_id >> 24) as usize;
+        let file_index = if top < files.len() {
+            top
+        } else {
+            files.len() - 1
+        };
+        let file = files[file_index].to_lowercase();
+        if file != own && masters.contains(&file) {
+            found.push(format!("{file}:{:06x}", form_id & 0x00FF_FFFF));
+        }
+    }
+    source.skip(data_start, data_size as usize)?;
+    Ok(data_end)
+}
+
+fn parse_source(
+    name: &str,
+    source: &mut dyn Source,
+    total: u64,
+    only: Option<&std::collections::HashSet<(String, u32)>>,
+    only_hash: u64,
+) -> Result<Index, String> {
     if total < RECORD_HEADER as u64 {
         return Err("the file is shorter than one record header".to_string());
     }
@@ -513,6 +775,7 @@ fn parse_source(name: &str, source: &mut dyn Source, total: u64) -> Result<Index
         name: name.to_string(),
         size: total,
         modified: 0,
+        only_hash,
         files,
         records: Vec::new(),
         strings: Vec::new(),
@@ -520,18 +783,20 @@ fn parse_source(name: &str, source: &mut dyn Source, total: u64) -> Result<Index
     let mut edids: HashMap<String, u16> = HashMap::new();
     let mut pos = data_end;
     while pos < total {
-        pos = parse_entry(source, pos, total, &mut index, &mut edids, 0)?;
+        pos = parse_entry(source, pos, total, &mut index, &mut edids, only, 0)?;
     }
     Ok(index)
 }
 
 /// Parse one record or group at `start`; return the offset just past it.
+#[allow(clippy::too_many_arguments)]
 fn parse_entry(
     source: &mut dyn Source,
     start: u64,
     end: u64,
     index: &mut Index,
     edids: &mut HashMap<String, u16>,
+    only: Option<&std::collections::HashSet<(String, u32)>>,
     depth: u32,
 ) -> Result<u64, String> {
     if depth > MAX_GROUP_DEPTH {
@@ -552,7 +817,7 @@ fn parse_entry(
         }
         let mut pos = start + GROUP_HEADER as u64;
         while pos < group_end {
-            pos = parse_entry(source, pos, group_end, index, edids, depth + 1)?;
+            pos = parse_entry(source, pos, group_end, index, edids, only, depth + 1)?;
         }
         return Ok(group_end);
     }
@@ -567,7 +832,6 @@ fn parse_entry(
     if data_end > end {
         return Err("a record overruns its group".to_string());
     }
-    let data = source.read(data_start, data_size as usize)?;
 
     let mut record_kind = [0u8; 4];
     record_kind.copy_from_slice(kind);
@@ -582,6 +846,14 @@ fn parse_entry(
         if file.is_empty() {
             return Err("a record names an empty master file".to_string());
         }
+        if let Some(only) = only {
+            let key = (file.to_lowercase(), form_id & 0x00FF_FFFF);
+            if !only.contains(&key) {
+                source.skip(data_start, data_size as usize)?;
+                return Ok(data_end);
+            }
+        }
+        let data = source.read(data_start, data_size as usize)?;
         let owned;
         let fields: &[u8] = if flags & COMPRESSED_FLAG != 0 {
             owned = decompress(&data)?;
@@ -840,6 +1112,7 @@ impl Index {
         write_str16(&mut out, &self.name);
         out.extend_from_slice(&self.size.to_le_bytes());
         out.extend_from_slice(&self.modified.to_le_bytes());
+        out.extend_from_slice(&self.only_hash.to_le_bytes());
         out.extend_from_slice(&(self.files.len() as u16).to_le_bytes());
         for file in &self.files {
             write_str16(&mut out, file);
@@ -877,6 +1150,7 @@ impl Index {
         let name = reader.str16()?;
         let size = reader.u64()?;
         let modified = reader.u64()?;
+        let only_hash = reader.u64()?;
         let file_count = reader.u16()? as usize;
         let mut files = Vec::with_capacity(file_count);
         for _ in 0..file_count {
@@ -920,6 +1194,7 @@ impl Index {
             name,
             size,
             modified,
+            only_hash,
             files,
             records,
             strings,
@@ -1045,7 +1320,14 @@ fn write_reply(reply: &Reply) -> String {
     out.push_str(&reply.total.to_string());
     out.push_str(",\"offset\":");
     out.push_str(&reply.offset.to_string());
-    out.push_str("}\n");
+    out.push_str(",\"needed\":[");
+    for (index, key) in reply.needed.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        json::write_string(key, &mut out);
+    }
+    out.push_str("]}\n");
     out
 }
 

@@ -886,6 +886,33 @@ fn real_data_cold_and_warm() {
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .collect();
     names.sort_by_key(|name| name.to_lowercase());
+    // The instance's load order, not alphabetical order: the official masters
+    // load first, and Moon Jump loads after Heavy Boots.
+    let officials = [
+        "Skyrim.esm",
+        "Update.esm",
+        "Dawnguard.esm",
+        "HearthFires.esm",
+        "Dragonborn.esm",
+    ];
+    let mut ordered = Vec::with_capacity(names.len());
+    for official in officials {
+        if let Some(name) = names
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(official))
+        {
+            ordered.push(name.clone());
+        }
+    }
+    for name in &names {
+        if !officials
+            .iter()
+            .any(|official| name.eq_ignore_ascii_case(official))
+        {
+            ordered.push(name.clone());
+        }
+    }
+    names = ordered;
     if let Ok(only) = std::env::var("AGORA_OVERLAPS_PLUGINS") {
         names = only
             .split(',')
@@ -961,6 +988,20 @@ fn real_data_cold_and_warm() {
         "Heavy Boots must share skyrim.esm:0abef6: {found:?}"
     );
 
+    let expected: Vec<String> = name_refs
+        .iter()
+        .filter(|name| {
+            **name == "Skyrim.esm"
+                || **name == "AgoraTest - Heavy Boots.esp"
+                || **name == "AgoraTest - Moon Jump.esp"
+        })
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(
+        found, expected,
+        "items must follow load order, with Skyrim.esm (which loads first) first"
+    );
+
     let cold_keys = cold["keys"].as_array().map(Vec::len).unwrap_or(0);
     let warm_keys = warm["keys"].as_array().map(Vec::len).unwrap_or(0);
     eprintln!(
@@ -969,6 +1010,55 @@ fn real_data_cold_and_warm() {
         index_bytes,
         blobs.len(),
         found
+    );
+    host.deactivate(&id).ok();
+}
+
+#[test]
+fn items_follow_load_order_not_alphabetical_order() {
+    let (_dir, host, id, bridge) = engine();
+    let data = data_folder(&[
+        (
+            "Master.esm",
+            plugin(
+                &[],
+                0,
+                &group(b"GMST", 0, &gmst(0x000abc, 1, "JumpSetting")),
+            ),
+        ),
+        (
+            "Zeta.esp",
+            plugin(
+                &["Master.esm"],
+                0,
+                &group(b"GMST", 0, &gmst(0x000abc, 2, "JumpSetting")),
+            ),
+        ),
+        (
+            "Alpha.esp",
+            plugin(
+                &["Master.esm"],
+                0,
+                &group(b"GMST", 0, &gmst(0x000abc, 3, "JumpSetting")),
+            ),
+        ),
+    ]);
+    // Load order: Master.esm, Zeta.esp, Alpha.esp. Alphabetical would be
+    // Alpha.esp, Master.esm, Zeta.esp.
+    let reply = invoke(
+        &host,
+        &id,
+        &["Master.esm", "Zeta.esp", "Alpha.esp"],
+        data.path(),
+        &bridge,
+    );
+    let found = items(&reply, "master.esm:000abc");
+    assert_eq!(
+        found
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["Master.esm", "Zeta.esp", "Alpha.esp"]
     );
     host.deactivate(&id).ok();
 }
