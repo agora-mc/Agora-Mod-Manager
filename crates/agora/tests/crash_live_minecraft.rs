@@ -2,12 +2,14 @@
 //! instance. No game runs and no file leaves the test's temporary folder.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use agora_core::ctx::CoreContext;
 use agora_core::lkg::LaunchOutcome;
 use agora_core::models::{InstanceManifest, InstanceRow, CURRENT_MANIFEST_VERSION};
 use agora_core::session_ledger;
 use agora_game_api::crash::SessionVerdict;
+use agora_plugin_api::host::ScriptHost;
 
 fn instance_row(instance_id: &str) -> InstanceRow {
     InstanceRow {
@@ -237,4 +239,154 @@ fn a_live_session_reads_the_captured_launch_output_when_no_report_was_written() 
         }
         other => panic!("expected an analyzed answer, got {other:?}"),
     }
+}
+
+/// Open a session whose owner process is gone, as a CLI or desktop that closed mid-session would
+/// leave it. The game is not running: this fixture writes no runtime lease.
+fn abandon_owner(ctx: &CoreContext, session_id: &str) {
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    conn.execute(
+        "UPDATE launch_history SET owner_pid = ?2, owner_start = ?3 WHERE session_id = ?1",
+        rusqlite::params![session_id, u32::MAX - 2, 5_i64],
+    )
+    .unwrap();
+}
+
+fn catch_up(ctx: &CoreContext, instance_id: &str) -> Vec<agora_core::crash_live::CaughtUp> {
+    let host: Arc<dyn ScriptHost> = Arc::new(agora_plugin_host::QuickJsHost::new());
+    let installed = agora_core::crash_live::load_installed_packs(ctx, host.clone()).unwrap();
+    let built_in = agora_game_minecraft::crash::built_in_packs();
+    let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
+    agora_core::crash_live::catch_up(
+        ctx,
+        instance_id,
+        agora_core::crash_live::LivePacks {
+            packs: &installed.packs,
+            built_in: &built_in,
+            host: host.as_ref(),
+            instances: Some(&instances),
+        },
+    )
+}
+
+#[test]
+fn an_unwatched_session_is_closed_and_diagnosed() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    let caught = catch_up(&ctx, &instance_id);
+    assert_eq!(caught.len(), 1, "{caught:?}");
+    assert!(
+        caught[0].answer.is_some(),
+        "the crash report written during the session is diagnosed"
+    );
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let record = session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap();
+    assert!(record.ended_at.is_some(), "the session is closed");
+    assert_eq!(record.verdict, Some(SessionVerdict::ClosedUnknown));
+    assert!(
+        agora_core::crash_live::answer_for_session(&conn, &opened.session_id)
+            .unwrap()
+            .is_some(),
+        "an answer is stored beside the closed session"
+    );
+}
+
+#[test]
+fn a_finished_session_is_not_diagnosed_twice() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    let first = catch_up(&ctx, &instance_id);
+    assert_eq!(first.len(), 1);
+    let created_at = first[0]
+        .answer
+        .as_ref()
+        .expect("the first catch-up answers")
+        .created_at
+        .clone();
+
+    let second = catch_up(&ctx, &instance_id);
+    assert!(
+        second.is_empty(),
+        "an ended session is left alone: {second:?}"
+    );
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let stored = agora_core::crash_live::answer_for_session(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.created_at, created_at, "the answer was not replaced");
+}
+
+#[test]
+fn a_session_whose_game_might_still_run_stays_open() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    // This test process is a live process with a verifiable identity.
+    let identity = agora_core::process_identity::capture(std::process::id()).unwrap();
+    let generation =
+        agora_core::instance_runtime::publish_starting(&ctx.paths, &instance_id).unwrap();
+    agora_core::instance_runtime::publish_running(&ctx.paths, &instance_id, &generation, identity)
+        .unwrap();
+
+    let caught = catch_up(&ctx, &instance_id);
+    assert!(
+        caught.is_empty(),
+        "a game that may run keeps its session open"
+    );
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    assert!(session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap()
+        .ended_at
+        .is_none());
+    assert!(
+        agora_core::crash_live::answer_for_session(&conn, &opened.session_id)
+            .unwrap()
+            .is_none()
+    );
+
+    agora_core::instance_runtime::clear(&ctx.paths, &instance_id, Some(&generation)).unwrap();
+}
+
+#[test]
+fn crash_last_closes_an_unwatched_session_and_stores_its_answer() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agora"))
+        .arg("--data-dir")
+        .arg(ctx.paths.root())
+        .args(["crash", "last", &instance_id])
+        .output()
+        .expect("the agora binary runs");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let record = session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap();
+    assert!(record.ended_at.is_some(), "crash last closed the session");
+    let stored = agora_core::crash_live::answer_for_session(&conn, &opened.session_id)
+        .unwrap()
+        .expect("crash last stored an answer");
+    assert!(matches!(
+        stored.answer,
+        agora_core::crash_live::StoredAnswer::Analyzed { .. }
+    ));
 }

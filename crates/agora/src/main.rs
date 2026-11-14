@@ -125,6 +125,12 @@ impl agora_game_minecraft::launch_service::LaunchProgress for ConsoleLaunchProgr
                 *slot = Some((session, std::time::Instant::now()));
             }
         }
+        if !self.json {
+            eprintln!(
+                "Minecraft is running. Agora is waiting for it to exit; closing this window or \
+                 pressing Ctrl+C stops the waiting, not the game."
+            );
+        }
         let _ = started;
     }
 
@@ -4774,6 +4780,38 @@ fn crash_answer_summary(answer: &agora_core::crash_live::StoredAnswer) -> String
     }
 }
 
+/// Close this instance's sessions nobody watched to the end and diagnose the evidence written
+/// since they started, before a stored answer is read. Best effort: a failed pack load is reported
+/// and the answers already stored are still read.
+fn catch_up_crash_answers(ctx: &agora_core::ctx::Ctx, instance: &str) {
+    let live = match cli_crash::load_live_packs(ctx) {
+        Ok(live) => live,
+        Err(error) => {
+            eprintln!("Warning: unwatched crash sessions were not checked: {error}");
+            return;
+        }
+    };
+    let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
+    let caught = agora_core::crash_live::catch_up(
+        ctx,
+        instance,
+        agora_core::crash_live::LivePacks {
+            packs: &live.packs,
+            built_in: &live.built_in,
+            host: live.host.as_ref(),
+            instances: Some(&instances),
+        },
+    );
+    for session in caught {
+        if session.answer.is_some() {
+            eprintln!(
+                "Closed session '{}', which was not watched to the end, and checked it for a crash.",
+                session.session_id
+            );
+        }
+    }
+}
+
 async fn run_crash_command(
     action: CrashCmd,
     ctx: &agora_core::ctx::Ctx,
@@ -4782,6 +4820,7 @@ async fn run_crash_command(
     let json = output_fmt.is_json_output();
     match action {
         CrashCmd::List { instance } => {
+            catch_up_crash_answers(ctx, &instance);
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
             let answers = agora_core::crash_live::answers_for_instance(&conn, &instance)?;
             if answers.is_empty() {
@@ -4859,6 +4898,7 @@ async fn run_crash_command(
             .await?;
         }
         CrashCmd::Last { instance } => {
+            catch_up_crash_answers(ctx, &instance);
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
             let Some(stored) = agora_core::crash_live::latest_answer(&conn, &instance)? else {
                 anyhow::bail!("No crash answer is stored for instance '{instance}'.");
@@ -4866,6 +4906,10 @@ async fn run_crash_command(
             cli_crash::print_stored(&stored, json)?;
         }
         CrashCmd::Show { session } => {
+            let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
+            if let Some(record) = agora_core::session_ledger::get(&conn, &session)? {
+                catch_up_crash_answers(ctx, &record.instance_id);
+            }
             let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())?;
             let Some(stored) = agora_core::crash_live::answer_for_session(&conn, &session)? else {
                 anyhow::bail!("No crash answer is stored for session '{session}'.");
@@ -7135,6 +7179,21 @@ async fn run_command(
                     let game_def = ctx.games.game(&record.game).ok_or_else(|| {
                         anyhow::anyhow!("Game definition not found for {}", record.game)
                     })?;
+
+                    // A session left open by a previous run is closed and checked before this
+                    // launch starts, while no runtime lease for the new launch exists yet.
+                    if let Ok(live) = cli_crash::load_live_packs(ctx) {
+                        let _ = agora_core::crash_live::catch_up(
+                            ctx,
+                            &instance_id,
+                            agora_core::crash_live::LivePacks {
+                                packs: &live.packs,
+                                built_in: &live.built_in,
+                                host: live.host.as_ref(),
+                                instances: None,
+                            },
+                        );
+                    }
 
                     // The rung a "yes" to the fallback question started this launch from, so the
                     // way to keep it can be printed once the game is running.
@@ -12157,6 +12216,8 @@ async fn run_launch_service(
     output_fmt: OutputFormat,
 ) -> anyhow::Result<()> {
     let json = output_fmt.is_json_output();
+    // A session left open by a previous run is closed and checked before this launch starts.
+    catch_up_crash_answers(ctx, instance);
     let request = agora_game_minecraft::launch_service::LaunchRequest {
         instance_id: instance.to_owned(),
         mode: agora_game_minecraft::launch_service::LaunchMode::Direct,

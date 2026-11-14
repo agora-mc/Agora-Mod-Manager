@@ -920,39 +920,99 @@ fn write_end(
     Ok(())
 }
 
+/// An open session the catch-up closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedSession {
+    pub session_id: String,
+    pub instance_id: String,
+    pub verdict: SessionVerdict,
+}
+
+/// Close this instance's open sessions whose owner is gone and whose game is not running, as
+/// `ClosedUnknown` (or `Stopped`, when the player had pressed Stop). A session whose game might
+/// still be running is left alone: a gone owner proves nothing about the game.
+/// `owner_alive` decides whether the owner still runs ([`Owner::is_alive`] is the real check);
+/// `game_may_be_running` is [`crate::instance_runtime::game_may_be_running`] in production.
+pub fn close_unwatched_for_instance(
+    conn: &Connection,
+    instance_id: &str,
+    now: &str,
+    owner_alive: &dyn Fn(u32, u64) -> bool,
+    game_may_be_running: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<Vec<ClosedSession>> {
+    close_unwatched(
+        conn,
+        Some(instance_id),
+        now,
+        "Agora was not watching when the game ended, so nothing saw how it ended",
+        owner_alive,
+        game_may_be_running,
+    )
+}
+
 /// Close every open session whose owner is gone, as `ClosedUnknown` (or `Stopped`, when the player
 /// had pressed Stop). Agora closing mid-session leaves a row nobody will finish; calling it
-/// "normal" would be a false claim, so it says what is true: nothing watched how it ended.
+/// "normal" would be a false claim, so it says what is true: nothing watched how it ended. A
+/// session whose game might still be running is left open.
 /// `owner_alive` decides whether the owner still runs; [`Owner::is_alive`] is the real check.
+/// `game_may_be_running` is [`crate::instance_runtime::game_may_be_running`] in production.
 pub fn close_orphans(
     conn: &Connection,
     now: &str,
     owner_alive: &dyn Fn(u32, u64) -> bool,
+    game_may_be_running: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<usize> {
+    Ok(close_unwatched(
+        conn,
+        None,
+        now,
+        "Agora closed while the game was running, so nothing watched how it ended",
+        owner_alive,
+        game_may_be_running,
+    )?
+    .len())
+}
+
+type OpenSessionRow = (i64, String, String, Option<u32>, Option<i64>, bool);
+
+fn close_unwatched(
+    conn: &Connection,
+    only_instance: Option<&str>,
+    now: &str,
+    why: &str,
+    owner_alive: &dyn Fn(u32, u64) -> bool,
+    game_may_be_running: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<Vec<ClosedSession>> {
     let mut stmt = conn.prepare(
-        "SELECT id, owner_pid, owner_start, stop_requested FROM launch_history
-          WHERE session_id IS NOT NULL AND ended_at IS NULL",
+        "SELECT id, session_id, instance_id, owner_pid, owner_start, stop_requested
+           FROM launch_history
+          WHERE session_id IS NOT NULL AND ended_at IS NULL
+            AND (?1 IS NULL OR instance_id = ?1)",
     )?;
-    let open: Vec<(i64, Option<u32>, Option<i64>, bool)> = stmt
-        .query_map([], |row| {
+    let open: Vec<OpenSessionRow> = stmt
+        .query_map([only_instance], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
-                row.get::<_, i64>(3)? != 0,
+                row.get(3)?,
+                row.get(4)?,
+                row.get::<_, i64>(5)? != 0,
             ))
         })?
         .collect::<Result<_, _>>()?;
-    let mut closed = 0;
-    for (row_id, pid, started, stop_requested) in open {
+    let mut closed = Vec::new();
+    for (row_id, session_id, instance_id, pid, started, stop_requested) in open {
         if let (Some(pid), Some(started)) = (pid, started) {
             if owner_alive(pid, started as u64) {
                 continue;
             }
         }
-        let exit = ExitObservation::unavailable(
-            "Agora closed while the game was running, so nothing watched how it ended",
-        );
+        // A gone owner says nothing about the game; never close one that might still run.
+        if game_may_be_running(&instance_id) {
+            continue;
+        }
+        let exit = ExitObservation::unavailable(why);
         let judged = verdict(&VerdictInput {
             exit: &exit,
             stop_requested,
@@ -962,7 +1022,11 @@ pub fn close_orphans(
             froze: false,
         });
         write_end(conn, row_id, now, None, &exit, judged)?;
-        closed += 1;
+        closed.push(ClosedSession {
+            session_id,
+            instance_id,
+            verdict: judged,
+        });
     }
     Ok(closed)
 }
@@ -1069,7 +1133,9 @@ pub fn record_launch(
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
         let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
-        let _ = close_orphans(&conn, &now, &Owner::is_alive);
+        let _ = close_orphans(&conn, &now, &Owner::is_alive, &|instance_id| {
+            crate::instance_runtime::game_may_be_running(&ctx.paths, instance_id)
+        });
         let manifest = build_manifest(ctx, instance_id, definition, store);
         begin(&conn, instance_id, &now, &manifest, Owner::current()).ok()
     }));
@@ -1125,7 +1191,9 @@ pub fn open_minecraft(ctx: &Ctx, instance_id: &str) -> Option<MinecraftSession> 
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
         let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
-        let _ = close_orphans(&conn, &now, &Owner::is_alive);
+        let _ = close_orphans(&conn, &now, &Owner::is_alive, &|instance_id| {
+            crate::instance_runtime::game_may_be_running(&ctx.paths, instance_id)
+        });
         let manifest_path = ctx.paths.instance_manifest(instance_id).ok()?;
         let manifest = crate::helpers::read_manifest(&manifest_path).ok()?;
         let row_id = crate::launch_history::begin_launch(
@@ -1578,7 +1646,7 @@ mod tests {
         assert_eq!(record.verdict, Some(SessionVerdict::Normal));
         assert_eq!(record.exit, Some(code(0)));
         assert_eq!(
-            close_orphans(&conn, "2026-01-02T00:00:00Z", &|_, _| false).unwrap(),
+            close_orphans(&conn, "2026-01-02T00:00:00Z", &|_, _| false, &|_| false).unwrap(),
             0
         );
     }
@@ -1656,7 +1724,10 @@ mod tests {
         .unwrap();
 
         // Agora (pid 111) closed and was reopened; pid 222 is still running.
-        let closed = close_orphans(&conn, "2026-01-01T02:00:00Z", &|pid, _| pid == 222).unwrap();
+        let closed = close_orphans(&conn, "2026-01-01T02:00:00Z", &|pid, _| pid == 222, &|_| {
+            false
+        })
+        .unwrap();
         assert_eq!(closed, 2);
 
         let orphan = get(&conn, &orphan).unwrap().unwrap();
@@ -1681,6 +1752,74 @@ mod tests {
             )
             .unwrap();
         assert!(still_open.is_none());
+    }
+
+    #[test]
+    fn a_session_is_not_closed_while_its_game_might_still_be_running() {
+        let conn = db();
+        let open = begin(
+            &conn,
+            "skyrim",
+            "2026-01-01T00:00:00Z",
+            &big_manifest(0),
+            owner(111),
+        )
+        .unwrap();
+        let closed = close_unwatched_for_instance(
+            &conn,
+            "skyrim",
+            "2026-01-01T02:00:00Z",
+            &|_, _| false,
+            &|instance| instance == "skyrim",
+        )
+        .unwrap();
+        assert!(
+            closed.is_empty(),
+            "a game that may run keeps its session open"
+        );
+        assert!(get(&conn, &open).unwrap().unwrap().ended_at.is_none());
+
+        // Once the game is provably gone, the same call closes it as unknown.
+        let closed = close_unwatched_for_instance(
+            &conn,
+            "skyrim",
+            "2026-01-01T02:00:00Z",
+            &|_, _| false,
+            &|_| false,
+        )
+        .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].session_id, open);
+        assert_eq!(closed[0].verdict, SessionVerdict::ClosedUnknown);
+        assert!(get(&conn, &open).unwrap().unwrap().ended_at.is_some());
+    }
+
+    #[test]
+    fn an_already_finished_session_is_not_closed_again() {
+        let conn = db();
+        let finished = begin(
+            &conn,
+            "skyrim",
+            "2026-01-01T00:00:00Z",
+            &big_manifest(0),
+            owner(111),
+        )
+        .unwrap();
+        finish(&conn, &finished, &finish_with(code(0))).unwrap();
+
+        let closed = close_unwatched_for_instance(
+            &conn,
+            "skyrim",
+            "2026-01-01T02:00:00Z",
+            &|_, _| false,
+            &|_| false,
+        )
+        .unwrap();
+        assert!(closed.is_empty());
+        assert_eq!(
+            get(&conn, &finished).unwrap().unwrap().verdict,
+            Some(SessionVerdict::Normal)
+        );
     }
 
     #[test]

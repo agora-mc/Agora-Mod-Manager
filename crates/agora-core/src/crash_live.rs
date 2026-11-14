@@ -69,6 +69,16 @@ pub struct SessionAnswer {
     pub answer: StoredAnswer,
 }
 
+/// A session the catch-up closed, and the answer it stored when the evidence named a crash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaughtUp {
+    pub session_id: String,
+    pub instance_id: String,
+    /// `None` when the session was already answered, or when nothing in the evidence named a crash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<SessionAnswer>,
+}
+
 /// Store an answer, replacing an earlier one for the same session. The answer is a few KB of
 /// JSON and lives under the same retention limit as its history row.
 pub fn store_answer(conn: &Connection, stored: &SessionAnswer) -> anyhow::Result<()> {
@@ -240,19 +250,77 @@ pub fn load_installed_packs(
 /// This is best effort, like the ledger itself: every error is stored as
 /// [`StoredAnswer::CouldNotAnalyze`], and a panic is caught. It never fails the caller.
 pub fn diagnose_session(ctx: &Ctx, session_id: &str, live: LivePacks<'_>) -> Option<SessionAnswer> {
+    diagnose_session_with(ctx, session_id, &live, false)
+}
+
+/// Close the sessions of this instance that nobody watched to the end, then diagnose the evidence
+/// written since they started.
+///
+/// Only a session whose owner process is gone **and** whose game is not running is closed: a gone
+/// owner proves nothing about the game. A session already finished is never touched, so nothing is
+/// diagnosed twice. Closing and diagnosing are best effort, like the ledger itself: a failure
+/// returns fewer entries, never an error that could block the caller. An unknown ending is stored
+/// as an answer only when the evidence names a crash, so a clean unwatched session stays quiet.
+pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> Vec<CaughtUp> {
+    let Ok(conn) = crate::db::local_state_connection(&ctx.paths.local_state_db()) else {
+        return Vec::new();
+    };
+    let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
+    let closed = session_ledger::close_unwatched_for_instance(
+        &conn,
+        instance_id,
+        &now,
+        &session_ledger::Owner::is_alive,
+        &|instance_id| crate::instance_runtime::game_may_be_running(&ctx.paths, instance_id),
+    )
+    .unwrap_or_default();
+    let mut caught = Vec::new();
+    for session in closed {
+        // A stored answer belongs to a session that was already diagnosed.
+        let already_answered = answer_for_session(&conn, &session.session_id)
+            .ok()
+            .flatten()
+            .is_some();
+        let answer = if already_answered {
+            None
+        } else {
+            diagnose_session_with(ctx, &session.session_id, &live, true)
+        };
+        caught.push(CaughtUp {
+            session_id: session.session_id,
+            instance_id: session.instance_id,
+            answer,
+        });
+    }
+    caught
+}
+
+fn diagnose_session_with(
+    ctx: &Ctx,
+    session_id: &str,
+    live: &LivePacks<'_>,
+    allow_unknown: bool,
+) -> Option<SessionAnswer> {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
     let record = session_ledger::get(&conn, session_id).ok().flatten()?;
-    if !diagnoses(record.verdict) || record.ended_at.is_none() {
+    let diagnosable = diagnoses(record.verdict)
+        || (allow_unknown && record.verdict == Some(SessionVerdict::ClosedUnknown));
+    if !diagnosable || record.ended_at.is_none() {
         return None;
     }
     let stored = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        diagnose_record(ctx, &conn, &record, &live)
+        diagnose_record(ctx, &conn, &record, live)
     }))
     .unwrap_or_else(|_| Err("the crash analysis panicked".to_string()));
     let answer = match stored {
         Ok(answer) => answer,
         Err(why) => StoredAnswer::CouldNotAnalyze { why },
     };
+    // An unwatched session with no crash evidence is not a crash to explain; leave it unanswered
+    // rather than storing a lead that would be invented from the verdict.
+    if allow_unknown && !answer_names_a_crash(&answer) {
+        return None;
+    }
     let created_at = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
     let session_answer = SessionAnswer {
         session_id: record.session_id.clone(),
@@ -262,6 +330,18 @@ pub fn diagnose_session(ctx: &Ctx, session_id: &str, live: LivePacks<'_>) -> Opt
     };
     let _ = store_answer(&conn, &session_answer);
     Some(session_answer)
+}
+
+/// Whether an answer found something that names a crash. A `NothingToRead` answer did not, and a
+/// `CouldNotAnalyze` is kept: it says why the check failed instead of hiding it.
+fn answer_names_a_crash(answer: &StoredAnswer) -> bool {
+    match answer {
+        StoredAnswer::Analyzed { answer, .. } => {
+            !answer.findings.is_empty() || !answer.candidates.is_empty()
+        }
+        StoredAnswer::CouldNotAnalyze { .. } => true,
+        StoredAnswer::NothingToRead { .. } => false,
+    }
 }
 
 /// Store "could not analyze" for a session whose packs or host could not even be prepared. This is
