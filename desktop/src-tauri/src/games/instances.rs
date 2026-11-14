@@ -885,6 +885,11 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
     for requirement in &checks.requirements {
         findings.push(requirement_finding(requirement));
     }
+    for diagnostic in &checks.diagnostics {
+        if diagnostic.severity != agora_game_api::DiagnosticSeverity::Info {
+            findings.push(diagnostic_finding(diagnostic));
+        }
+    }
     Ok(InstanceCheck {
         instance_id: instance_id.to_string(),
         checked: pinned,
@@ -987,6 +992,14 @@ fn launch_instance(
     findings.extend(prepared.runtime_findings.iter().map(framework_finding));
     findings.extend(prepared.load_order_findings.iter().map(load_order_finding));
     findings.extend(prepared.generated_findings.iter().map(tool_finding));
+    findings.extend(
+        prepared
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity != agora_game_api::DiagnosticSeverity::Info)
+            .map(diagnostic_finding),
+    );
+    findings.extend(prepared.requirements.iter().map(requirement_finding));
     let reply = LaunchReply {
         status: "launched",
         pid: Some(game.pid()),
@@ -1319,6 +1332,18 @@ fn before_launch_failed(tool: String, name: String, message: String) -> LaunchRe
 
 /// A framework a catalog mod in the instance needs. It never stops a launch: the user may have
 /// installed the mod past exactly this, so the page keeps saying so instead of asking again.
+fn diagnostic_finding(diagnostic: &agora_game_api::Diagnostic) -> CheckFinding {
+    CheckFinding {
+        kind: "diagnostic",
+        blocks: diagnostic.severity == agora_game_api::DiagnosticSeverity::Error,
+        title: "The game's plugin check".to_string(),
+        detail: diagnostic.message.clone(),
+        why: "The game's own plugin reported this while checking the instance.".to_string(),
+        repair: diagnostic.repairs.first().cloned(),
+        repair_base: None,
+    }
+}
+
 pub fn requirement_finding(
     finding: &agora_core::catalog_install::RequirementFinding,
 ) -> CheckFinding {
@@ -1857,6 +1882,27 @@ mod tests {
         let other = map_error(InstanceError::Other("disk full".into()));
         assert_eq!(other.code, CORE_FAILED);
         assert!(other.message.contains("disk full"));
+    }
+
+    #[test]
+    fn a_game_package_diagnostic_is_a_finding_and_only_an_error_blocks() {
+        let diagnostic = agora_game_api::Diagnostic {
+            code: "CE_SKSE_PLUGIN_OTHER_GAME_VERSION".to_string(),
+            message: "'example.dll': Example was built for another game version.".to_string(),
+            severity: agora_game_api::DiagnosticSeverity::Warning,
+            repairs: vec!["Update it.".to_string()],
+        };
+        let shown = diagnostic_finding(&diagnostic);
+        assert_eq!(shown.kind, "diagnostic");
+        assert!(!shown.blocks);
+        assert!(shown.detail.contains("built for another game version"));
+        assert_eq!(shown.repair.as_deref(), Some("Update it."));
+
+        let error = agora_game_api::Diagnostic {
+            severity: agora_game_api::DiagnosticSeverity::Error,
+            ..diagnostic
+        };
+        assert!(diagnostic_finding(&error).blocks);
     }
 
     #[test]

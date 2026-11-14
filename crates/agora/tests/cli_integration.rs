@@ -12,6 +12,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+// Invented PE files for the SKSE declaration checks, shared with core's own tests.
+#[path = "../../agora-core/tests/common/dll.rs"]
+mod dll;
+
 /// Path to the compiled `agora` binary, set by Cargo for integration tests.
 const AGORA_BIN: &str = env!("CARGO_BIN_EXE_agora");
 const TEST_MSA_CREDENTIALS_ENV: &str = "AGORA_TEST_MSA_CREDENTIALS_JSON";
@@ -5139,6 +5143,16 @@ fn install_skyrim_development_plugin_in(data_dir: &Path) {
 /// A Skyrim SE instance (no content) whose runtime is `version`. Each of `extra_files`, a path
 /// relative to the install folder, is written into the install before the instance is created.
 fn skyrim_fixture(version: &str, extra_files: &[&str]) -> VfsFixture {
+    skyrim_fixture_with(version, extra_files, |_| {})
+}
+
+/// [`skyrim_fixture`] with a chance to write more of the install (a binary fixture, say) before the
+/// base manifest is built, so the instance view lists it.
+fn skyrim_fixture_with(
+    version: &str,
+    extra_files: &[&str],
+    before_create: impl FnOnce(&Path),
+) -> VfsFixture {
     use agora_core::game_discovery::{DiscoveredInstall, InstallCapabilities};
     use agora_core::game_registry::{GameRegistry, IdentifiedInstall, PackageSource};
     use agora_game_api::{GameId, InstallId, InstallKind, RuntimeIdentity, StoreId};
@@ -5162,6 +5176,7 @@ fn skyrim_fixture(version: &str, extra_files: &[&str]) -> VfsFixture {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"fake framework file").unwrap();
     }
+    before_create(&install_dir);
 
     let mut builder = GameRegistry::builder();
     builder
@@ -5454,6 +5469,58 @@ fn games_instance_check_names_a_framework_built_for_another_version() {
     let stderr = String::from_utf8_lossy(&out_launch.stderr);
     assert!(stderr.contains("Skyrim Script Extender (SKSE)"), "{stderr}");
     assert!(stderr.contains("--launch-anyway"), "{stderr}");
+}
+
+/// The fixture with one invented SKSE plugin built only for 1.6.640, in the install's
+/// `Data/SKSE/Plugins`, so the Creation Engine diagnostics hook has something to warn about.
+fn skyrim_fixture_with_old_skse_plugin() -> VfsFixture {
+    skyrim_fixture_with("1.6.1170.0", &[], |install| {
+        let plugins = install.join("Data").join("SKSE").join("Plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let data = dll::VersionData {
+            name: "Example Old Plugin".to_string(),
+            compatible: vec![[1, 6, 640, 0]],
+            ..dll::VersionData::default()
+        };
+        std::fs::write(plugins.join("ExampleOld.dll"), dll::dll(&data)).unwrap();
+    })
+}
+
+#[test]
+fn a_launch_prints_the_plugin_version_warning_the_check_prints() {
+    let fixture = skyrim_fixture_with_old_skse_plugin();
+    let id = fixture.instance_id.clone();
+
+    let check = run_agora(&fixture.data_dir, &["games", "instance", "check", &id]);
+    let check_out = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        check_out.contains("exampleold.dll")
+            && check_out.contains("built for another game version"),
+        "the check must warn about the old plugin: {check_out}"
+    );
+
+    let out = run_vfs_fixture(
+        &fixture,
+        &[
+            "games",
+            "instance",
+            "launch",
+            &id,
+            "--deployment",
+            "links",
+            "--wait",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("exampleold.dll"),
+        "the launch did not print the check's plugin-version warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("built for another game version"),
+        "the launch did not print the check's plugin-version warning: {stderr}"
+    );
 }
 
 #[test]

@@ -7773,6 +7773,14 @@ async fn run_command(
                                 eprintln!("{hint}");
                             }
                         }
+                        if !json {
+                            for line in diagnostic_lines(&prepared.diagnostics) {
+                                eprintln!("{line}");
+                            }
+                            for finding in &prepared.requirements {
+                                eprintln!("  - {}", finding.summary());
+                            }
+                        }
 
                         let env_map: std::collections::BTreeMap<String, String> = prepared
                             .resolved
@@ -7800,6 +7808,8 @@ async fn run_command(
                                     "runtime_findings": prepared.runtime_findings,
                                     "load_order_findings": prepared.load_order_findings,
                                     "generated_findings": prepared.generated_findings,
+                                    "diagnostics": prepared.diagnostics,
+                                    "requirement_findings": prepared.requirements,
                                     "deployment": prepared.deployment.map(|m| m.as_str()),
                                     "notice": prepared.notice,
                                     "alternative": prepared.alternative,
@@ -7948,6 +7958,8 @@ async fn run_command(
                                     "runtime_findings": prepared.runtime_findings,
                                     "load_order_findings": prepared.load_order_findings,
                                     "generated_findings": prepared.generated_findings,
+                                    "diagnostics": prepared.diagnostics,
+                                    "requirement_findings": prepared.requirements,
                                     "deployment": prepared.deployment.map(|m| m.as_str()),
                                     "notice": prepared.notice,
                                     "processes": exit_report.processes,
@@ -8888,13 +8900,8 @@ async fn run_command(
                         }
                     }
                     if !json {
-                        for diagnostic in &diagnostics {
-                            let label = match diagnostic.severity {
-                                agora_game_api::DiagnosticSeverity::Info => "Info",
-                                agora_game_api::DiagnosticSeverity::Warning => "Warning",
-                                agora_game_api::DiagnosticSeverity::Error => "Error",
-                            };
-                            println!("- {label}: {}", diagnostic.message);
+                        for line in diagnostic_lines(&diagnostics) {
+                            println!("{line}");
                         }
                     }
                     if refuses {
@@ -9165,6 +9172,14 @@ async fn run_command(
                     );
                     print_runtime_findings(&prepared.runtime_findings);
                 }
+                if !json {
+                    for line in diagnostic_lines(&prepared.diagnostics) {
+                        eprintln!("{line}");
+                    }
+                    for finding in &prepared.requirements {
+                        eprintln!("  - {}", finding.summary());
+                    }
+                }
 
                 let mut launched = match agora_core::game_launch::launch(&prepared) {
                     Ok(l) => l,
@@ -9211,6 +9226,8 @@ async fn run_command(
                             "runtime_findings": prepared.runtime_findings,
                             "load_order_findings": prepared.load_order_findings,
                             "generated_findings": prepared.generated_findings,
+                            "diagnostics": prepared.diagnostics,
+                            "requirement_findings": prepared.requirements,
                         });
                         println!("{}", serde_json::to_string_pretty(&out)?);
                     } else {
@@ -9277,6 +9294,8 @@ async fn run_command(
                             "runtime_findings": prepared.runtime_findings,
                             "load_order_findings": prepared.load_order_findings,
                             "generated_findings": prepared.generated_findings,
+                            "diagnostics": prepared.diagnostics,
+                            "requirement_findings": prepared.requirements,
                             "processes": exit_report.processes,
                             "relaunched_outside": exit_report.relaunched_outside,
                             "game_writes": ver.game_writes,
@@ -11635,6 +11654,22 @@ fn runtime_finding_lines(findings: &[agora_game_api::RuntimeFileFinding]) -> Vec
         }
     }
     lines
+}
+
+/// One line per game-package diagnostic, the same words the instance check prints. A launch and a
+/// check share this function so a warning cannot exist in one and be missing from the other.
+fn diagnostic_lines(diagnostics: &[agora_game_api::Diagnostic]) -> Vec<String> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let label = match diagnostic.severity {
+                agora_game_api::DiagnosticSeverity::Info => "Info",
+                agora_game_api::DiagnosticSeverity::Warning => "Warning",
+                agora_game_api::DiagnosticSeverity::Error => "Error",
+            };
+            format!("- {label}: {}", diagnostic.message)
+        })
+        .collect()
 }
 
 /// How many bytes a catalog file is, or that it is not known until it is downloaded.

@@ -108,6 +108,11 @@ pub struct PreparedLaunch {
     pub load_order_findings: Vec<Finding>,
     /// Tool output that is stale or unknown (MASTER_SPEC §26.9). Warnings only, never a refusal.
     pub generated_findings: Vec<crate::game_tools::OutputFinding>,
+    /// What the game package's own `diagnostics` hook reported. The same list the instance check
+    /// prints, so a launch does not hide a warning the check shows.
+    pub diagnostics: Vec<agora_game_api::Diagnostic>,
+    /// Frameworks the instance's mods need and it does not satisfy. A warning, never a refusal.
+    pub requirements: Vec<crate::catalog_install::RequirementFinding>,
 }
 
 impl PreparedLaunch {
@@ -129,6 +134,8 @@ impl PreparedLaunch {
             runtime_findings: Vec::new(),
             load_order_findings: Vec::new(),
             generated_findings: Vec::new(),
+            diagnostics: Vec::new(),
+            requirements: Vec::new(),
         }
     }
 }
