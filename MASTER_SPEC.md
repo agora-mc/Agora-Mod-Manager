@@ -1552,8 +1552,8 @@ The Mojang launcher opens, sees the user is already logged in (we never touched 
 ### 8.5 JVM Argument Builder (UI → Args)
 
 **Memory Slider:**
-- User drags a slider (e.g., 1GB – 32GB based on detected system RAM).
-- Rust translates: a selection of `8GB` → `-Xmx8G -Xms8G` (setting min and max to the same value is best practice for modded Minecraft; prevents GC pressure from heap resizing).
+- User drags a slider, or sets the value from the CLI. The chosen value is kept: only zero, a negative value, or one the JVM cannot represent is refused. Below 2 GB Agora warns that Minecraft will likely run out of memory; above the machine's memory it warns that the game may fail to start.
+- Rust translates: a selection of `8GB` → `-Xmx8G -Xms8G` (setting min and max to the same value is best practice for modded Minecraft; prevents GC pressure from heap resizing). Automatic estimates keep their own safe bounds.
 
 **Garbage Collector Dropdown:**
 | UI Label | JVM Flag | Notes |

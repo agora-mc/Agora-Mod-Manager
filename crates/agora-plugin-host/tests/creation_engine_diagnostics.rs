@@ -438,3 +438,77 @@ fn an_unreadable_plugin_header_is_not_a_warning() {
     );
     assert!(warnings(&diagnostics).is_empty(), "{diagnostics:#?}");
 }
+
+/// An invented minimal `.ess` header: the plugin block starts right after a short fixed prefix,
+/// with the count, length-prefixed names and active byte the parser looks for.
+fn ess_bytes(plugins: &[(&str, bool)]) -> Vec<u8> {
+    let mut out = b"TESV".to_vec();
+    out.extend_from_slice(&[0u8; 8]);
+    out.push(u8::try_from(plugins.len()).unwrap());
+    for (name, active) in plugins {
+        out.push(u8::try_from(name.len()).unwrap());
+        out.extend_from_slice(name.as_bytes());
+        out.push(u8::from(*active));
+    }
+    out
+}
+
+#[test]
+fn a_save_that_needs_a_now_inactive_plugin_is_a_warning_naming_it() {
+    let diagnostics = run(
+        vec![(
+            "@saves/new-save.ess".to_string(),
+            ess_bytes(&[("Active.esp", true), ("Switched Off.esp", true)]),
+        )],
+        Vec::new(),
+        "1.6.1170",
+        &[entry("Active.esp"), disabled("Switched Off.esp")],
+    );
+    let warned = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "CE_SAVE_NEEDS_INACTIVE_PLUGIN")
+        .unwrap_or_else(|| panic!("expected the save warning, got {diagnostics:#?}"));
+    assert_eq!(severity(warned), "warning");
+    let text = message(warned);
+    assert!(text.contains("new-save.ess"), "{text}");
+    assert!(text.contains("Switched Off.esp"), "{text}");
+    assert!(!text.contains("Active.esp"), "{text}");
+}
+
+#[test]
+fn a_save_whose_plugins_are_all_active_says_nothing() {
+    let diagnostics = run(
+        vec![(
+            "@saves/clean.ess".to_string(),
+            ess_bytes(&[("Active.esp", true)]),
+        )],
+        Vec::new(),
+        "1.6.1170",
+        &[entry("Active.esp")],
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "CE_SAVE_NEEDS_INACTIVE_PLUGIN"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn an_unreadable_save_header_is_reported_not_treated_as_clean() {
+    let diagnostics = run(
+        vec![(
+            "@saves/broken.ess".to_string(),
+            b"TESV not a save header".to_vec(),
+        )],
+        Vec::new(),
+        "1.6.1170",
+        &[],
+    );
+    let note = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "CE_SAVE_PLUGINS_NOT_CHECKED")
+        .unwrap_or_else(|| panic!("expected a not-checked note, got {diagnostics:#?}"));
+    assert_eq!(severity(note), "info");
+    assert!(message(note).contains("broken.ess"), "{}", message(note));
+}

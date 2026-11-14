@@ -362,7 +362,7 @@ A `stored` mount reaches the same blobs from a module without passing them throu
 | Game packages | `game:define` | Define games: their stores, versions, folders and how to launch them |
 | `crash.readBytes/readLines` | `crash:contribute` | Scoped reads of the artifact in a parser or inspector call: bytes or text, never a path |
 | Crash packs | `crash:contribute` | Read the crash evidence Agora gives them and add rules to its diagnosis; every finding names the plugin |
-| `game.readBytes/readLines/list` | `game:read` | Scoped reads of one instance's merged view by game path, with a byte budget; a script never sees a real path |
+| `game.readBytes/readLines/list` | `game:read` | Scoped reads of one instance's merged view by game path, with a byte budget; a script never sees a real path. The read-only alias `@saves/` names the instance's in-use save folder |
 | `game.writeBytes/writeText` | `game:write` | Write into this plugin's own generated layer for one instance, with byte and file budgets; it cannot change the game, a save, or another layer |
 | `wasm.run` | No extra capability | Run a shipped WASI command in a sandbox; a view mount needs `game:read` |
 | `behaviours` in a game package | `game:define` | `detect_runtime`, `classify`, `recognize_download`, `load_order_rules`, `diagnostics`, `prepare_launch` and script load-order parsing/rendering, each time- and memory-limited by the plugin runtime |

@@ -145,6 +145,18 @@ pub struct CheckFinding {
     pub why: String,
     /// What to do about it.
     pub repair: Option<String>,
+    /// For a framework whose base lacks required files: the base and framework a repair would use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_base: Option<FrameworkRepairRef>,
+}
+
+/// The base and framework a `repairBaseFramework` call needs, offered beside the finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameworkRepairRef {
+    pub base_id: String,
+    pub framework: String,
+    pub name: String,
 }
 
 /// An instance's launch checks. A pinned instance is checked; an unpinned one has nothing to check.
@@ -852,7 +864,17 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
         })?;
     let mut findings = Vec::new();
     for finding in &checks.runtime {
-        findings.push(framework_finding(finding));
+        let mut shown = framework_finding(finding);
+        if finding.problem == RuntimeFileProblem::MissingFiles {
+            if let BaseReference::Pinned { id, .. } = &record.base {
+                shown.repair_base = Some(FrameworkRepairRef {
+                    base_id: id.clone(),
+                    framework: finding.rule_id.clone(),
+                    name: finding.rule_name.clone(),
+                });
+            }
+        }
+        findings.push(shown);
     }
     for finding in &checks.load_order {
         findings.push(load_order_finding(finding));
@@ -1312,6 +1334,7 @@ pub fn requirement_finding(
                 Some(entry) => format!("Install {} from \"Browse\".", entry.name),
                 None => format!("Add {} to this instance.", unmet.name),
             }),
+            repair_base: None,
         },
         RequirementFinding::NotChecked { .. } => CheckFinding {
             kind: "framework",
@@ -1320,6 +1343,7 @@ pub fn requirement_finding(
             detail: finding.summary(),
             why: "Agora cannot say whether these mods have what they need.".to_string(),
             repair: None,
+            repair_base: None,
         },
     }
 }
@@ -1340,6 +1364,10 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
             "A framework built for another game version often stops the game from starting, or makes it crash."
                 .to_string(),
         ),
+        RuntimeFileProblem::MissingFiles => (
+            format!("{}.", finding.missing_files_sentence()),
+            "The framework starts, but scripts or other files it provides are absent, so mods that rely on them can behave as if it is not installed.".to_string(),
+        ),
         RuntimeFileProblem::CannotCheck { reason } => (
             format!("This rule cannot be checked: {reason}."),
             "Agora could not compare this framework with the game, so it cannot say whether they match.".to_string(),
@@ -1352,11 +1380,39 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
         detail,
         why,
         repair: non_empty(&finding.repair),
+        repair_base: None,
     }
 }
 
 pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> CheckFinding {
+    use agora_core::game_load_order::{Finding, MasterProblem};
     let blocks = finding.refuses_launch();
+    let repair = match finding {
+        Finding::MasterNotEarlier {
+            master,
+            problem: MasterProblem::Inactive,
+            ..
+        } => format!(
+            "Open this instance's Plugins tab and enable '{master}', then check again. Sorting cannot enable an inactive master."
+        ),
+        Finding::MasterNotEarlier {
+            master,
+            problem: MasterProblem::Missing,
+            ..
+        } => format!(
+            "Install '{master}', or disable the plugin that needs it. Sorting cannot add a missing master."
+        ),
+        Finding::MasterNotEarlier {
+            problem: MasterProblem::Later,
+            ..
+        } => "Open this instance's Plugins tab and choose Sort, then check again.".to_string(),
+        Finding::MasterCycle { plugins } => format!(
+            "Disable one of {}, because they need one another in a loop; Sort cannot fix a loop.",
+            plugins.join(", ")
+        ),
+        _ => "Open this instance's Plugins tab and review the problem, then check again."
+            .to_string(),
+    };
     CheckFinding {
         kind: "load_order",
         blocks,
@@ -1369,9 +1425,8 @@ pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> Che
             "The game may still load these plugins, but the order can cause odd behaviour."
                 .to_string()
         },
-        repair: Some(
-            "Open this instance's Plugins tab and choose Sort, then check again.".to_string(),
-        ),
+        repair: Some(repair),
+        repair_base: None,
     }
 }
 
@@ -1384,6 +1439,7 @@ pub fn tool_finding(output: &agora_core::game_tools::OutputFinding) -> CheckFind
         why: "Tool output made from older files, or that conflicts with another tool, may not match the mods now installed."
             .to_string(),
         repair: Some("Run the tool again from this instance's Tools tab.".to_string()),
+        repair_base: None,
     }
 }
 
@@ -1401,6 +1457,7 @@ fn base_finding(problem: &BaseProblem, blocks: bool) -> CheckFinding {
         why: "The game's files differ from what Agora recorded when it built the base, so the game may behave oddly or crash."
             .to_string(),
         repair: Some("Verify this base on the game's Bases page in Settings, or launch anyway at your own risk.".to_string()),
+        repair_base: None,
     }
 }
 
@@ -1678,6 +1735,7 @@ mod tests {
             detail: "d".into(),
             why: "w".into(),
             repair: None,
+            repair_base: None,
         }
     }
 
@@ -1695,6 +1753,7 @@ mod tests {
             expected: "skse64_1_6_1170.dll".into(),
             found: found.into_iter().map(str::to_string).collect(),
             repair: "Install the matching extender.".into(),
+            required_total: None,
             problem: RuntimeFileProblem::WrongVersion,
         }
     }
@@ -1845,6 +1904,28 @@ mod tests {
     }
 
     #[test]
+    fn a_framework_missing_required_files_only_warns_and_names_them() {
+        let finding = RuntimeFileFinding {
+            found: vec!["Data/Scripts/SKSE.pex".into()],
+            problem: RuntimeFileProblem::MissingFiles,
+            ..wrong_version(Vec::new())
+        };
+        let shown = framework_finding(&finding);
+        assert!(
+            !shown.blocks,
+            "missing framework files never block a launch"
+        );
+        assert!(
+            shown
+                .detail
+                .contains("is installed, but 1 of its 1 script files is missing"),
+            "{}",
+            shown.detail
+        );
+        assert!(shown.detail.contains("SKSE.pex"));
+    }
+
+    #[test]
     fn only_refusing_plugin_findings_block() {
         let cycle = load_order_finding(&Finding::MasterCycle {
             plugins: vec!["a.esm".into(), "b.esm".into()],
@@ -1860,6 +1941,32 @@ mod tests {
             "a header that cannot be read is a warning"
         );
         assert_eq!(unreadable.kind, "load_order");
+    }
+
+    #[test]
+    fn an_inactive_master_repair_says_to_enable_it_not_sort() {
+        let inactive = load_order_finding(&Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: agora_core::game_load_order::MasterProblem::Inactive,
+        });
+        let repair = inactive.repair.as_deref().unwrap_or_default();
+        assert!(repair.contains("enable 'Base.esm'"), "{repair}");
+        assert!(!repair.contains("choose Sort"), "{repair}");
+
+        let late = load_order_finding(&Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: agora_core::game_load_order::MasterProblem::Later,
+        });
+        assert!(
+            late.repair
+                .as_deref()
+                .unwrap_or_default()
+                .contains("choose Sort"),
+            "{:?}",
+            late.repair
+        );
     }
 
     #[test]

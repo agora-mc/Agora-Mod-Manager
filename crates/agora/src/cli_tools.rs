@@ -605,11 +605,12 @@ pub async fn run_instance_tools(
                     }
                 );
                 if let Some(requested) = memory {
-                    if requested != row.jvm_memory_mb {
-                        eprintln!(
-                            "[WARN] Memory was set to {} MB. Agora keeps heap sizes between 2048 and 32768 MB.",
-                            row.jvm_memory_mb
-                        );
+                    let total_ram_mb =
+                        agora_game_minecraft::gc::SystemResources::detect().total_ram_mb;
+                    for warning in
+                        agora_game_minecraft::gc::memory_warnings(requested, total_ram_mb)
+                    {
+                        eprintln!("[WARN] {warning}");
                     }
                 }
             }

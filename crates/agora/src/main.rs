@@ -940,6 +940,14 @@ enum BaseCmd {
         /// Base ID to remove.
         base_id: String,
     },
+    /// Copy a framework's declared required files from the source install into an existing base.
+    #[command(name = "repair-framework")]
+    RepairFramework {
+        /// Base ID to repair.
+        base_id: String,
+        /// Framework id, as the game package declares it, e.g. skse.
+        framework: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6311,10 +6319,12 @@ async fn run_command(
 
                     let start = std::time::Instant::now();
                     let options = agora_core::game_base::BuildOptions { include_excluded };
-                    let result = agora_core::game_base::build_base(
+                    let frameworks = ctx.games.frameworks_for(&game_def.id);
+                    let result = agora_core::game_base::build_base_with_frameworks(
                         &ctx.paths,
                         install,
                         game_def,
+                        &frameworks,
                         base_mode,
                         None,
                         options,
@@ -6564,6 +6574,80 @@ async fn run_command(
                         Err(e) => {
                             anyhow::bail!("{e}");
                         }
+                    }
+                }
+                BaseCmd::RepairFramework { base_id, framework } => {
+                    let manifest_path = ctx.paths.base_manifest_path(&base_id);
+                    if !manifest_path.exists() {
+                        if json {
+                            eprintln!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "error": format!("Base '{base_id}' not found."),
+                                    "exitCode": 1,
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Error: Base '{base_id}' not found.");
+                        }
+                        std::process::exit(1);
+                    }
+                    let manifest: agora_core::game_base::BaseManifest =
+                        serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+                    let game_def = ctx.games.game(&manifest.runtime.game).ok_or_else(|| {
+                        anyhow::anyhow!("Game definition not found for {}", manifest.runtime.game)
+                    })?;
+                    let framework_id = agora_game_api::FrameworkId::new(framework.as_str())
+                        .map_err(|_| anyhow::anyhow!("'{framework}' is not a framework id."))?;
+                    let declared = ctx
+                        .games
+                        .framework(&manifest.runtime.game, &framework_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "{} does not declare a framework called '{framework}'.",
+                                game_def.name
+                            )
+                        })?;
+                    let repaired =
+                        agora_core::game_base::repair_framework(&ctx.paths, &base_id, declared)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "baseId": base_id,
+                                "framework": repaired.framework,
+                                "name": repaired.name,
+                                "requiredTotal": repaired.required_total,
+                                "restored": repaired.copied.len(),
+                                "copied": repaired.copied,
+                                "alreadyPresent": repaired.already_present,
+                                "missingFromSource": repaired.missing_from_source,
+                                "exitCode": if repaired.is_complete() { 0 } else { 1 },
+                            }))?
+                        );
+                    } else if repaired.is_complete() {
+                        println!(
+                            "Base '{base_id}' now has every file {} needs. Restored {} of {} required script files from the source install.",
+                            repaired.name,
+                            repaired.copied.len(),
+                            repaired.required_total
+                        );
+                    } else {
+                        println!(
+                            "Base '{base_id}' restored {} of {} required script files; these are still missing:",
+                            repaired.copied.len(),
+                            repaired.required_total
+                        );
+                        for file in &repaired.missing_from_source {
+                            println!("  - {file}");
+                        }
+                        println!(
+                            "The source install does not have them either. Install {} as content in the instance, or reinstall it into the game install, then run this again.",
+                            repaired.name
+                        );
+                    }
+                    if !repaired.is_complete() {
+                        std::process::exit(1);
                     }
                 }
             },
@@ -7386,9 +7470,7 @@ async fn run_command(
                                         "Instance '{instance_id}' has plugin load order problems that would stop the game:"
                                     );
                                     print_load_order_findings(&findings);
-                                    eprintln!(
-                                        "Run 'agora games instance plugins sort {instance_id}' to fix master order, or pass --launch-anyway to start the game anyway."
-                                    );
+                                    eprintln!("{}", launch_refusal_hint(&instance_id, &findings));
                                 }
                                 std::process::exit(1);
                             }
@@ -11048,6 +11130,53 @@ fn sort_hint(
     })
 }
 
+/// What to do about a launch the plugin load order refuses. An inactive master is enabled;
+/// only a master that is merely out of order is sorted.
+fn launch_refusal_hint(
+    instance_id: &str,
+    findings: &[agora_core::game_load_order::Finding],
+) -> String {
+    use agora_core::game_load_order::{Finding, MasterProblem};
+    let mut inactive: Vec<&str> = Vec::new();
+    let mut late = false;
+    for finding in findings {
+        if let Finding::MasterNotEarlier {
+            master, problem, ..
+        } = finding
+        {
+            match problem {
+                MasterProblem::Inactive => {
+                    if !inactive.contains(&master.as_str()) {
+                        inactive.push(master);
+                    }
+                }
+                MasterProblem::Later => late = true,
+                MasterProblem::Missing => {}
+            }
+        }
+    }
+    let mut hints = Vec::new();
+    for master in inactive {
+        hints.push(format!(
+            "Run 'agora games instance plugins enable {instance_id} {master}' to enable the inactive master."
+        ));
+    }
+    if late {
+        hints.push(format!(
+            "Run 'agora games instance plugins sort {instance_id}' to put a late master above its plugin."
+        ));
+    }
+    if hints.is_empty() {
+        hints.push(format!(
+            "Run 'agora games instance plugins check {instance_id}' for the full list."
+        ));
+    }
+    format!(
+        "{} Or pass --launch-anyway to start the game anyway.",
+        hints.join(" ")
+    )
+}
+
 /// The instance's effective load order, one plugin per line: position, state, the master and
 /// the game's badges for it, the lock, who put the line there, and the name.
 fn print_load_order(instance_id: &str, order: &agora_core::game_load_order::LoadOrder) {
@@ -11491,6 +11620,10 @@ fn runtime_finding_lines(findings: &[agora_game_api::RuntimeFileFinding]) -> Vec
                     "  - {} ({}): needs {}, the game has {}",
                     finding.rule_name, finding.rule_id, finding.expected, found
                 ));
+                lines.push(format!("    Repair: {}", finding.repair));
+            }
+            RuntimeFileProblem::MissingFiles => {
+                lines.push(format!("  - {}", finding.missing_files_sentence()));
                 lines.push(format!("    Repair: {}", finding.repair));
             }
             RuntimeFileProblem::CannotCheck { reason } => {
@@ -12912,6 +13045,7 @@ mod tests {
     use super::describe_loadout_change;
     use super::exit_code_from_error;
     use super::exit_code_from_launcher_error;
+    use super::launch_refusal_hint;
     use super::Cli;
     use super::Commands;
     use super::LoadoutCmd;
@@ -12933,6 +13067,32 @@ mod tests {
         SourceType,
     };
     use clap::Parser;
+
+    #[test]
+    fn an_inactive_master_hint_names_the_plugin_and_the_enable_command() {
+        use agora_core::game_load_order::{Finding, MasterProblem};
+        let findings = vec![Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: MasterProblem::Inactive,
+        }];
+        let hint = launch_refusal_hint("skyrim", &findings);
+        assert!(hint.contains("plugins enable skyrim Base.esm"), "{hint}");
+        assert!(!hint.contains("plugins sort"), "{hint}");
+    }
+
+    #[test]
+    fn a_late_master_keeps_the_sort_hint() {
+        use agora_core::game_load_order::{Finding, MasterProblem};
+        let findings = vec![Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: MasterProblem::Later,
+        }];
+        let hint = launch_refusal_hint("skyrim", &findings);
+        assert!(hint.contains("plugins sort skyrim"), "{hint}");
+        assert!(!hint.contains("plugins enable"), "{hint}");
+    }
 
     #[test]
     fn inventory_command_parses_instance_id() {

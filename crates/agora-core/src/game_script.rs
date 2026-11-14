@@ -416,12 +416,18 @@ fn reject_reparse_chain(root: &Path, rel: &str) -> Result<(), ScriptReadError> {
 /// game path. The root itself is trusted — a person may redirect a game folder
 /// through a junction — and every component *below* it is checked. No reply,
 /// error or log line contains one of them.
+/// The game path a script uses for the instance's in-use save folder. It is a read-only view: the
+/// folder itself is outside the deployment, and the game's save format stays in the plugin.
+pub const SAVE_VIEW_PATH: &str = "@saves";
+
 pub struct GameViewReads {
     roots: Vec<PathBuf>,
     /// When present, the exact merged view: one source per game path, already
     /// resolved in deploy precedence. Roots are then only a fallback for a
     /// view that has no deployment.
     entries: Option<HashMap<String, ViewEntry>>,
+    /// The instance's in-use save folder, reached only through [`SAVE_VIEW_PATH`].
+    save_root: Option<PathBuf>,
     limits: GameReadLimits,
     budget: Arc<ReadBudget>,
     instance: Option<String>,
@@ -450,6 +456,7 @@ impl GameViewReads {
         Self {
             roots,
             entries: None,
+            save_root: None,
             limits,
             budget,
             instance: None,
@@ -467,6 +474,7 @@ impl GameViewReads {
         Self {
             roots: Vec::new(),
             entries: Some(entries),
+            save_root: None,
             limits,
             budget,
             instance: Some(instance.into()),
@@ -480,12 +488,36 @@ impl GameViewReads {
         self
     }
 
+    /// Make the instance's in-use save folder readable at [`SAVE_VIEW_PATH`].
+    pub fn with_save_root(mut self, save_root: impl Into<PathBuf>) -> Self {
+        self.save_root = Some(save_root.into());
+        self
+    }
+
     /// The physical file or directory `rel` names, if any layer has it.
     ///
     /// A reparse point in the *chosen* root is an error, not a fall-through:
     /// quietly reading a lower layer would hide the fact that a link was put
     /// in the way.
     fn physical(&self, rel: &str) -> Result<Option<PathBuf>, ScriptReadError> {
+        let folded = agora_game_api::fold_path_case(rel);
+        let save_prefix = agora_game_api::fold_path_case(SAVE_VIEW_PATH);
+        if folded == save_prefix || folded.starts_with(&(save_prefix.clone() + "/")) {
+            let Some(root) = &self.save_root else {
+                return Ok(None);
+            };
+            let rest = if folded == save_prefix {
+                ""
+            } else {
+                &rel[SAVE_VIEW_PATH.len() + 1..]
+            };
+            reject_reparse_chain(root, rest)?;
+            let candidate = rest
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .fold(root.clone(), |path, part| path.join(part));
+            return Ok(candidate.exists().then_some(candidate));
+        }
         if let Some(entries) = &self.entries {
             let Some(entry) = entries.get(&agora_game_api::fold_path_case(rel)) else {
                 return Ok(None);
@@ -663,6 +695,51 @@ impl GameReads for GameViewReads {
     fn list(&self, path: &str) -> Result<serde_json::Value, ScriptReadError> {
         let rel = parse_game_path(path)?;
         let rel_str = rel.as_str().to_string();
+        let folded = agora_game_api::fold_path_case(&rel_str);
+        let save_prefix = agora_game_api::fold_path_case(SAVE_VIEW_PATH);
+        if folded == save_prefix || folded.starts_with(&(save_prefix.clone() + "/")) {
+            let Some(root) = &self.save_root else {
+                return Ok(serde_json::json!({ "entries": [], "cut": false }));
+            };
+            let rest = if folded == save_prefix {
+                ""
+            } else {
+                &rel_str[SAVE_VIEW_PATH.len() + 1..]
+            };
+            reject_reparse_chain(root, rest)?;
+            let folder = rest
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .fold(root.clone(), |path, part| path.join(part));
+            let mut found: BTreeMap<String, (bool, u64)> = BTreeMap::new();
+            let mut cut = false;
+            let Ok(read_dir) = std::fs::read_dir(&folder) else {
+                return Ok(serde_json::json!({ "entries": [], "cut": false }));
+            };
+            for entry in read_dir.flatten() {
+                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                    continue;
+                };
+                if is_reparse_point(&meta) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if found.len() >= self.limits.max_list_entries as usize {
+                    cut = true;
+                    break;
+                }
+                self.budget.spend(&self.limits, name.len() as u64 + 64)?;
+                found.insert(
+                    name,
+                    (meta.is_dir(), if meta.is_file() { meta.len() } else { 0 }),
+                );
+            }
+            let entries: Vec<serde_json::Value> = found
+                .into_iter()
+                .map(|(name, (dir, size))| serde_json::json!({ "name": name, "dir": dir, "size": size }))
+                .collect();
+            return Ok(serde_json::json!({ "entries": entries, "cut": cut }));
+        }
         if let Some(view) = &self.entries {
             let prefix = if rel_str.is_empty() {
                 String::new()
@@ -1287,12 +1364,12 @@ pub fn instance_reads_with_budget(
             }
         }
     }
-    Ok(GameViewReads::from_entries(
-        entries,
-        GameReadLimits::default(),
-        budget,
-        instance_id,
-    ))
+    let mut reads =
+        GameViewReads::from_entries(entries, GameReadLimits::default(), budget, instance_id);
+    if let Ok(save_folder) = crate::game_saves::in_use_folder(ctx, instance_id, &definition) {
+        reads = reads.with_save_root(save_folder);
+    }
+    Ok(reads)
 }
 
 /// A `game:read` scope over one install, by game path. Used by
@@ -2509,5 +2586,45 @@ mod tests {
         if let Some(parent) = destination.parent() {
             std::fs::remove_dir_all(parent).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod save_view_tests {
+    use super::*;
+    use agora_plugin_api::host::GameReads;
+
+    #[test]
+    fn the_save_view_reaches_the_in_use_folder_and_nothing_beyond_it() {
+        let root = std::env::temp_dir().join(format!(
+            "agora-save-view-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let game = root.join("game");
+        let saves = root.join("saves");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::write(game.join("secret.txt"), b"not a save").unwrap();
+        std::fs::write(saves.join("New.ess"), b"TESVheader").unwrap();
+
+        let reads =
+            GameViewReads::new(vec![game], GameReadLimits::default()).with_save_root(saves.clone());
+        assert_eq!(reads.read_bytes("@saves/New.ess", 0, 4).unwrap(), b"TESV");
+        let listed = reads.list("@saves").unwrap();
+        let entries = listed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], "New.ess");
+
+        // The alias cannot escape its folder, and the game view is still separate.
+        assert!(reads.read_bytes("@saves/../game/secret.txt", 0, 1).is_err());
+        assert!(reads
+            .read_bytes("@saves/New.ess/../../game/secret.txt", 0, 1)
+            .is_err());
+        assert!(reads.read_bytes("secret.txt", 0, 1).unwrap() == b"n");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

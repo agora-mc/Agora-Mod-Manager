@@ -361,8 +361,16 @@ pub fn create_with_options(
     let (base_ref, build_outcome) = if install.discovered.capabilities.executables_readable
         && install.discovered.capabilities.relocatable
     {
-        let outcome = crate::game_base::build_base(
-            &ctx.paths, install, definition, mode, None, options, progress,
+        let frameworks = ctx.games.frameworks_for(&definition.id);
+        let outcome = crate::game_base::build_base_with_frameworks(
+            &ctx.paths,
+            install,
+            definition,
+            &frameworks,
+            mode,
+            None,
+            options,
+            progress,
         )?;
         let manifest = outcome.manifest();
         let b_ref = BaseReference::Pinned {
@@ -1236,8 +1244,13 @@ fn runtime_check(
         Some(mode) => crate::game_deploy::visible_paths(ctx, id, definition, mode)?,
         None => base_manifest.files.iter().map(|f| f.path.clone()).collect(),
     };
+    let mut findings =
+        crate::game_launch::runtime_findings(definition, &base_manifest.runtime.version, &paths);
+    findings.extend(crate::game_frameworks::missing_required_findings(
+        ctx, definition, &paths,
+    ));
     Ok((
-        crate::game_launch::runtime_findings(definition, &base_manifest.runtime.version, &paths),
+        findings,
         crate::game_launch::runtime_passes(definition, &base_manifest.runtime.version, &paths),
     ))
 }
@@ -1655,7 +1668,7 @@ pub fn prepare_launch_with(
                     return Err(LaunchError::NoRecipe.into());
                 };
                 let mut notes = Vec::new();
-                let prepared = if crate::game_launch::needs_instance_facts(
+                let mut prepared = if crate::game_launch::needs_instance_facts(
                     definition,
                     recipe,
                     options.plain,
@@ -1678,6 +1691,14 @@ pub fn prepare_launch_with(
                         options.plain,
                     )?
                 };
+                let base_paths: Vec<&str> = base_manifest
+                    .files
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .collect();
+                prepared.runtime_findings.extend(
+                    crate::game_frameworks::missing_required_findings(ctx, definition, &base_paths),
+                );
                 write_launch_notes(ctx, id, &notes)?;
                 Ok(prepared)
             }
@@ -1803,14 +1824,15 @@ fn prepare_deployed(
     let (outcome, deployed) =
         crate::game_deploy::deploy_checked(ctx, id, definition, rung.mode, |plan| {
             let visible = crate::game_deploy::visible_paths_of(ctx, id, plan)?;
-            findings = crate::game_launch::refuse_runtime_mismatch(
-                crate::game_launch::runtime_findings(
-                    definition,
-                    &base_manifest.runtime.version,
-                    &visible,
-                ),
-                options.launch_anyway,
-            )?;
+            let mut runtime = crate::game_launch::runtime_findings(
+                definition,
+                &base_manifest.runtime.version,
+                &visible,
+            );
+            runtime.extend(crate::game_frameworks::missing_required_findings(
+                ctx, definition, &visible,
+            ));
+            findings = crate::game_launch::refuse_runtime_mismatch(runtime, options.launch_anyway)?;
             Ok::<(), InstanceError>(())
         })??;
 

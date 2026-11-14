@@ -19,9 +19,10 @@ use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
-    BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
-    InstallKind, LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath,
-    RuntimeFileProblem, RuntimeFileRule, RuntimeIdentity, StoreId, StoreIdentifier,
+    BaseReference, DeploymentStrategy, FrameworkDefinition, FrameworkDetection, FrameworkId,
+    FrameworkVersionSource, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
+    LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath, RuntimeFileProblem,
+    RuntimeFileRule, RuntimeIdentity, StoreId, StoreIdentifier,
 };
 use tempfile::TempDir;
 
@@ -146,6 +147,14 @@ impl GamePackage for TestPackage {
 }
 
 fn create_test_context(tmp: &TempDir, def: &GameDefinition) -> CoreContext {
+    create_test_context_with(tmp, def, Vec::new())
+}
+
+fn create_test_context_with(
+    tmp: &TempDir,
+    def: &GameDefinition,
+    frameworks: Vec<FrameworkDefinition>,
+) -> CoreContext {
     let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     let mut builder = GameRegistry::builder();
@@ -157,7 +166,7 @@ fn create_test_context(tmp: &TempDir, def: &GameDefinition) -> CoreContext {
         game_templates: std::collections::BTreeMap::new(),
         behaviours: None,
         games: vec![def.clone()],
-        frameworks: vec![],
+        frameworks,
         tools: vec![],
     };
     builder
@@ -558,4 +567,75 @@ fn an_unpinned_instance_passes_nothing() {
 
     let checks = launch_checks(&ctx, &instance, &def).expect("the launch checks run");
     assert!(checks.passed.is_empty(), "{:?}", checks.passed);
+}
+
+#[test]
+fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
+    let tmp = TempDir::new().unwrap();
+    let mut def = make_test_definition();
+    def.framework_ids = vec![FrameworkId::new("skse").unwrap()];
+    let framework = FrameworkDefinition {
+        id: FrameworkId::new("skse").unwrap(),
+        game: GameId::new("skyrim-se").unwrap(),
+        name: "Skyrim Script Extender".into(),
+        version: "2.2.6".into(),
+        supported_runtimes: Vec::new(),
+        required_frameworks: Vec::new(),
+        content: Vec::new(),
+        launch: None,
+        detection: Some(FrameworkDetection {
+            marker: RelPath::new("skse64_loader.exe").unwrap(),
+            required: vec![RelPath::new("Data/Scripts/SKSE.pex").unwrap()],
+            version: Some(FrameworkVersionSource::PeFileVersion),
+        }),
+    };
+    let ctx = create_test_context_with(&tmp, &def, vec![framework]);
+    // The loader is there, as on the real install, but its Papyrus scripts are not.
+    let install = make_install(&tmp, &["skse64_1_6_1170.dll", "skse64_loader.exe"]);
+    let instance = create(
+        &ctx,
+        &install,
+        &def,
+        "Half SKSE",
+        None,
+        BaseMode::Linked,
+        &|_| {},
+    )
+    .expect("create instance");
+    let s = Setup {
+        _tmp: tmp,
+        ctx,
+        def,
+        instance,
+    };
+
+    let findings = runtime_findings(&s.ctx, &s.instance.instance_id, &s.def).unwrap();
+    let missing = findings
+        .iter()
+        .find(|finding| finding.problem == RuntimeFileProblem::MissingFiles)
+        .expect("the instance check names the missing framework files");
+    assert_eq!(missing.rule_id, "skse");
+    assert_eq!(missing.found, vec!["Data/Scripts/SKSE.pex"]);
+    assert!(!missing.refuses_launch(), "a missing file only warns");
+
+    let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
+    assert!(
+        checks
+            .runtime
+            .iter()
+            .any(|finding| finding.problem == RuntimeFileProblem::MissingFiles),
+        "{:?}",
+        checks.runtime
+    );
+
+    let prepared =
+        prepare(&s, false, &NoVfs).expect("a missing framework file does not refuse the launch");
+    assert!(
+        prepared
+            .runtime_findings
+            .iter()
+            .any(|finding| finding.problem == RuntimeFileProblem::MissingFiles),
+        "{:?}",
+        prepared.runtime_findings
+    );
 }

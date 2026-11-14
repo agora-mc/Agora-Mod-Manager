@@ -95,6 +95,19 @@ export interface VerifyReply {
   problems: BaseFileProblem[];
 }
 
+/** What a framework repair copied into a base, and what the source install lacks. */
+export interface FrameworkRepairReply {
+  baseId: string;
+  framework: string;
+  name: string;
+  requiredTotal: number;
+  restored: number;
+  copied: string[];
+  alreadyPresent: string[];
+  missingFromSource: string[];
+  complete: boolean;
+}
+
 export interface RemoveReply {
   baseId: string;
   status: 'removed';
@@ -188,6 +201,19 @@ function isRemoveReply(value: unknown): value is RemoveReply {
   return isObj(value) && isStr(value.baseId) && value.status === 'removed';
 }
 
+function isFrameworkRepairReply(value: unknown): value is FrameworkRepairReply {
+  return isObj(value)
+    && isStr(value.baseId)
+    && isStr(value.framework)
+    && isStr(value.name)
+    && isNum(value.requiredTotal)
+    && isNum(value.restored)
+    && Array.isArray(value.copied) && value.copied.every(isStr)
+    && Array.isArray(value.alreadyPresent) && value.alreadyPresent.every(isStr)
+    && Array.isArray(value.missingFromSource) && value.missingFromSource.every(isStr)
+    && isBool(value.complete);
+}
+
 function reject(command: string): never {
   throw new Error(`${command} did not return the documented shape.`);
 }
@@ -228,6 +254,16 @@ export async function removeBase(baseId: string): Promise<RemoveReply> {
   const reply: unknown = await invoke<unknown>('games_base_remove', { baseId });
   if (!isRemoveReply(reply)) reject('games_base_remove');
   return reply as RemoveReply;
+}
+
+/**
+ * Copy a framework's declared required files from the source install into an existing base.
+ * Files the source lacks come back in `missingFromSource`, never as a silent success.
+ */
+export async function repairBaseFramework(baseId: string, framework: string): Promise<FrameworkRepairReply> {
+  const reply: unknown = await invoke<unknown>('games_base_repair_framework', { baseId, framework });
+  if (!isFrameworkRepairReply(reply)) reject('games_base_repair_framework');
+  return reply as FrameworkRepairReply;
 }
 
 /** Progress for builds, as the backend hashes files. Resolves to the function that stops listening. */

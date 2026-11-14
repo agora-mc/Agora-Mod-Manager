@@ -296,6 +296,7 @@ fn skse(game: &GameId) -> FrameworkDefinition {
         launch: None,
         detection: Some(FrameworkDetection {
             marker: RelPath::new("skse64_loader.exe").unwrap(),
+            required: Vec::new(),
             version: Some(FrameworkVersionSource::PeFileVersion),
         }),
     }
@@ -910,6 +911,7 @@ fn second_framework() -> FrameworkDefinition {
         name: "Address Library".into(),
         detection: Some(FrameworkDetection {
             marker: RelPath::new("Data/versionlib.bin").unwrap(),
+            required: Vec::new(),
             version: None,
         }),
         ..skse(&test_definition().id)

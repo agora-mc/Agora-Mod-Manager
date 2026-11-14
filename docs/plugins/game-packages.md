@@ -274,7 +274,7 @@ Every hook is called with one object, and its reply is JSON:
 
 | Capability | Gives you | Limit |
 |---|---|---|
-| `game:read` | `game.readBytes`, `game.readLines`, `game.list` by game path, on the instance as the game will see it | A budget per call, and you never see a real path |
+| `game:read` | `game.readBytes`, `game.readLines`, `game.list` by game path, on the instance as the game will see it. `@saves/` is a read-only alias for the instance's in-use save folder | A budget per call, and you never see a real path |
 | `game:write` | `game.writeBytes`, `game.writeText`, adding files to your plugin's own layer for that instance | Size and file limits. You can't write to the game, a save or another layer |
 | `instance:read`, `instance:write`, `content:read`, `content:write` | The same calls Minecraft plugins use, for every game | As in the [service API](README.md#service-api) |
 
@@ -554,6 +554,7 @@ selected runtime; `user_data` means a known user folder, resolved by Agora.
 | `launch` | launch recipe | optional | Its own launcher, or `null` |
 | `detection` | framework detection | optional | How Agora finds it and reads its version |
 | `marker` | path | required for detection | A file whose presence means it is installed |
+| `required` | list of paths | optional for detection | Exact game files the framework needs; when the marker is present but one is missing, the instance and launch checks name the missing files as a warning |
 | `version` | string | optional for detection | `pe_file_version`, or absent when presence is all Agora knows |
 
 A runtime constraint is `{ "game": "...", "stores": [...], "versions": { ... }, "builds": [...] }`.

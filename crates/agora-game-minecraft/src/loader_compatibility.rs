@@ -533,6 +533,12 @@ fn evaluate_spec_against(
     }
 }
 
+/// Compare two loader version strings the way every loader choice compares them. Kept here so
+/// `loader_manifests` can pick the newest pin without its own version logic.
+pub(crate) fn compare_loader_versions(left: &str, right: &str) -> Ordering {
+    compare_versions(left, right)
+}
+
 /// Deterministic preference order for recommendation and listing:
 /// stable before prerelease, explicit lower rank before missing rank, then
 /// newest version as the deterministic fallback.

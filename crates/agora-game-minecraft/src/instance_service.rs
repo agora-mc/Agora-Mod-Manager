@@ -480,7 +480,15 @@ impl InstanceService {
         memory_mode: &str,
     ) -> LauncherResult<()> {
         let instance_id = self.validate_id(instance_id)?;
-        let memory_mb = memory_mb.clamp(2048, 32768);
+        if !crate::gc::memory_mb_is_possible(memory_mb) {
+            return Err(LauncherError::Generic {
+                code: "ERR_INVALID_JVM_MEMORY".into(),
+                message: format!(
+                    "Heap size must be a positive number of megabytes the JVM can represent (at most {} MB); got {memory_mb} MB.",
+                    crate::gc::JVM_MAX_HEAP_MB
+                ),
+            });
+        }
         let gc_selection = crate::gc::GcSelection::from_input(gc).ok_or_else(|| {
             LauncherError::Generic {
                 code: "ERR_INVALID_JVM_GC".into(),
@@ -1707,6 +1715,14 @@ impl InstanceService {
         if request.name.trim().is_empty() || request.minecraft_version.trim().is_empty() {
             return Err(LauncherError::InstanceCreateFailed);
         }
+        let request = CreateInstanceRequest {
+            loader_version: resolve_loader_version(
+                &request.loader,
+                &request.minecraft_version,
+                &request.loader_version,
+            )?,
+            ..request
+        };
         let op = self
             .ctx
             .operation_manager
@@ -2023,6 +2039,23 @@ fn apply_template_jvm_to_request(
     if request.jvm_always_pre_touch.is_none() {
         request.jvm_always_pre_touch = jvm.jvm_always_pre_touch;
     }
+}
+
+/// The loader version a create request should use. A named version is kept; an empty one for a
+/// modded loader resolves to the newest verified stable pin, as the desktop's picker starts on.
+/// A game with no such pin is an error, never an instance that cannot launch.
+fn resolve_loader_version(
+    loader: &str,
+    minecraft_version: &str,
+    requested: &str,
+) -> LauncherResult<String> {
+    let requested = requested.trim();
+    if matches!(loader, "" | "vanilla") || !requested.is_empty() {
+        return Ok(requested.to_string());
+    }
+    crate::loader_manifests::newest_verified(loader, minecraft_version)
+        .map(|entry| entry.loader_version)
+        .ok_or(LauncherError::UnsupportedLoader)
 }
 
 pub(crate) fn prepare_row(instance_id: &str, request: &CreateInstanceRequest) -> InstanceRow {
@@ -2610,7 +2643,60 @@ mod tests {
             assert_eq!(after.jvm_gc, before.jvm_gc);
         }
 
+        // A manual heap is the user's: it is kept as chosen, and only an impossible size is
+        // refused. The row is read through the service, which owns this table's access.
+        service
+            .update_jvm("gc-invalid", 200, "auto", true, "", "manual")
+            .unwrap();
+        assert_eq!(
+            service
+                .get("gc-invalid")
+                .unwrap()
+                .unwrap()
+                .row
+                .jvm_memory_mb,
+            200
+        );
+        for impossible in [0, -1, crate::gc::JVM_MAX_HEAP_MB + 1] {
+            let error = service
+                .update_jvm("gc-invalid", impossible, "auto", true, "", "manual")
+                .unwrap_err();
+            assert_eq!(error.code(), "ERR_INVALID_JVM_MEMORY");
+        }
+        assert_eq!(
+            service
+                .get("gc-invalid")
+                .unwrap()
+                .unwrap()
+                .row
+                .jvm_memory_mb,
+            200,
+            "a rejected value changes nothing"
+        );
+
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_empty_loader_version_resolves_to_the_newest_verified_stable_pin() {
+        let resolved = resolve_loader_version("fabric", "1.21", "").unwrap();
+        let newest = crate::loader_manifests::newest_verified("fabric", "1.21")
+            .expect("the bundled catalog pins a stable Fabric build for 1.21");
+        assert_eq!(resolved, newest.loader_version);
+        assert!(!resolved.is_empty());
+
+        // A named version is the user's, and vanilla has no loader version at all.
+        assert_eq!(
+            resolve_loader_version("fabric", "1.21", "0.16.0").unwrap(),
+            "0.16.0"
+        );
+        assert_eq!(resolve_loader_version("vanilla", "1.21", "").unwrap(), "");
+
+        // Nothing pinned means an error, never an empty version that fails later.
+        assert!(matches!(
+            resolve_loader_version("fabric", "0.0.0", ""),
+            Err(LauncherError::UnsupportedLoader)
+        ));
     }
 
     #[test]

@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use agora_game_api::{fold_path_case, GameDefinition, InstallId, RuntimeIdentity, VolumeInfo};
+use agora_game_api::{
+    fold_path_case, FrameworkDefinition, GameDefinition, InstallId, RuntimeIdentity, VolumeInfo,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -49,6 +51,19 @@ pub struct BaseManifest {
     pub created_unix_ms: i64,
     pub files: Vec<BaseFile>, // sorted by path
     pub skipped: Vec<String>, // source entries not copied (symlinks, junctions), with reasons
+    /// Frameworks whose marker the source install had but whose declared required files were not
+    /// all there. Recorded at pin time so an incomplete pin is visible even before a check.
+    #[serde(default)]
+    pub incomplete_frameworks: Vec<IncompleteFramework>,
+}
+
+/// A framework installed in a source install with files it declares missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteFramework {
+    pub framework: String,
+    pub name: String,
+    /// The declared game paths the source install did not have.
+    pub missing: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +178,8 @@ pub enum BaseError {
     LinkUnavailable { reason: String, copied_bytes: u64 },
     #[error("base not found: {0}")]
     NotFound(String),
+    #[error("framework '{0}' is not installed in this base")]
+    FrameworkNotInstalled(String),
     #[error("base is in use by instance(s): {}", instances.join(", "))]
     InUse { instances: Vec<String> },
     #[error("declared write matches linked file: {path}")]
@@ -566,6 +583,34 @@ pub fn build_base(
     options: BuildOptions,
     progress: &(dyn Fn(BuildProgress) + Send + Sync),
 ) -> Result<BuildOutcome, BaseError> {
+    build_base_with_frameworks(
+        paths,
+        install,
+        definition,
+        &[],
+        mode,
+        root_override,
+        options,
+        progress,
+    )
+}
+
+/// Build a base, also applying the game's framework declarations.
+///
+/// A framework whose marker is in the source install has its declared required files copied even
+/// when the game's excluded paths would leave them out. Files it declares but the install does not
+/// have are recorded in the manifest as an incomplete framework.
+#[allow(clippy::too_many_arguments)]
+pub fn build_base_with_frameworks(
+    paths: &AppPaths,
+    install: &IdentifiedInstall,
+    definition: &GameDefinition,
+    frameworks: &[&FrameworkDefinition],
+    mode: BaseMode,
+    root_override: Option<&Path>,
+    options: BuildOptions,
+    progress: &(dyn Fn(BuildProgress) + Send + Sync),
+) -> Result<BuildOutcome, BaseError> {
     // 1. Runtime must be Identified
     let runtime = match &install.runtime {
         crate::game_registry::RuntimeResolution::Identified { runtime, .. } => runtime,
@@ -633,6 +678,62 @@ pub fn build_base(
         &mut entries,
         &mut skipped,
     )?;
+
+    // A framework the install has is part of the base even when its files sit on an excluded
+    // path. A declared file the install does not have is recorded so the pin is not a silent
+    // half-install.
+    let mut incomplete_frameworks = Vec::new();
+    let mut present: HashSet<String> = entries
+        .iter()
+        .map(|entry| fold_path_case(&entry.rel_path))
+        .collect();
+    for framework in frameworks {
+        let Some(detection) = &framework.detection else {
+            continue;
+        };
+        if detection.required.is_empty() {
+            continue;
+        }
+        let marker = fold_path_case(detection.marker.as_str());
+        let marker_present = entries.iter().any(|entry| {
+            let path = fold_path_case(&entry.rel_path);
+            if marker.contains('*') {
+                agora_game_api::glob_match(&marker, &path)
+            } else {
+                path == marker
+            }
+        });
+        if !marker_present {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for required in &detection.required {
+            let required = required.as_str();
+            if present.contains(&fold_path_case(required)) {
+                continue;
+            }
+            let candidate = source_dir.join(required);
+            match candidate.metadata() {
+                Ok(metadata) if metadata.is_file() => {
+                    present.insert(fold_path_case(required));
+                    entries.push(SourceEntry {
+                        rel_path: required.to_string(),
+                        abs_src_path: candidate,
+                        size: metadata.len(),
+                        is_archive: definition.is_linked_archive(required),
+                    });
+                }
+                _ => missing.push(required.to_string()),
+            }
+        }
+        if !missing.is_empty() {
+            incomplete_frameworks.push(IncompleteFramework {
+                framework: framework.id.as_str().to_string(),
+                name: framework.name.clone(),
+                missing,
+            });
+        }
+    }
 
     let total_source_bytes: u64 = entries.iter().map(|e| e.size).sum();
 
@@ -815,6 +916,7 @@ pub fn build_base(
         created_unix_ms,
         files: base_files,
         skipped,
+        incomplete_frameworks,
     };
 
     // Write manifest (temp file + rename)
@@ -1433,6 +1535,162 @@ pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
         // it is a plain folder.
         Err(_) => remove_damaged_base(paths, base_id, &manifest_path),
     }
+}
+
+/// What repairing one framework in a pinned base copied and what it could not find.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameworkRepair {
+    pub framework: String,
+    pub name: String,
+    /// How many files the framework declares as required.
+    pub required_total: usize,
+    /// Required files copied from the source install into the base in this repair.
+    pub copied: Vec<String>,
+    /// Required files the base already had (any case).
+    pub already_present: Vec<String>,
+    /// Required files the source install does not have either.
+    pub missing_from_source: Vec<String>,
+}
+
+impl FrameworkRepair {
+    /// Whether the base now has every required file.
+    pub fn is_complete(&self) -> bool {
+        self.missing_from_source.is_empty()
+    }
+}
+
+/// Re-capture a framework's declared required files from the source install into an existing
+/// base. This repairs a base pinned before the framework's `required` list existed, or one whose
+/// source install lacked the scripts. Files the source lacks are reported, not invented; the
+/// caller can then tell the user to install the framework as content.
+pub fn repair_framework(
+    paths: &AppPaths,
+    base_id: &str,
+    framework: &FrameworkDefinition,
+) -> Result<FrameworkRepair, BaseError> {
+    if !is_plain_base_id(base_id) {
+        return Err(BaseError::NotFound(base_id.to_string()));
+    }
+    let manifest_path = paths.base_manifest_path(base_id);
+    if !manifest_path.exists() {
+        return Err(BaseError::NotFound(base_id.to_string()));
+    }
+    let read_manifest = || -> Result<BaseManifest, BaseError> {
+        Ok(serde_json::from_str::<BaseManifest>(
+            &std::fs::read_to_string(&manifest_path)?,
+        )?)
+    };
+    let mut manifest = read_manifest()?;
+    let Some(detection) = &framework.detection else {
+        return Err(BaseError::Other(format!(
+            "{} declares no detection, so there is nothing to repair",
+            framework.name
+        )));
+    };
+    if detection.required.is_empty() {
+        return Err(BaseError::Other(format!(
+            "{} declares no required files, so there is nothing to repair",
+            framework.name
+        )));
+    }
+    let marker_matches = |path: &str| {
+        let marker = fold_path_case(detection.marker.as_str());
+        let path = fold_path_case(path);
+        if marker.contains('*') {
+            agora_game_api::glob_match(&marker, &path)
+        } else {
+            marker == path
+        }
+    };
+    if !manifest.files.iter().any(|file| marker_matches(&file.path)) {
+        return Err(BaseError::FrameworkNotInstalled(framework.name.clone()));
+    }
+    if !manifest.location.is_dir() {
+        return Err(BaseError::Other(format!(
+            "the base folder {} is missing",
+            manifest.location.display()
+        )));
+    }
+    if !manifest.source_location.is_dir() {
+        return Err(BaseError::Other(format!(
+            "the source install {} is missing",
+            manifest.source_location.display()
+        )));
+    }
+
+    let _lock = crate::lock_manager::LockManager::new(paths.locks_root())
+        .acquire(
+            crate::lock_manager::LockResource::Base(base_id.to_string()),
+            "repair-framework",
+        )
+        .map_err(|e| BaseError::Other(e.to_string()))?;
+    // A build may have finished while this waited; repair the record that is on disk now.
+    manifest = read_manifest()?;
+
+    let mut copied = Vec::new();
+    let mut already_present = Vec::new();
+    let mut missing_from_source = Vec::new();
+    for required in &detection.required {
+        let required = required.as_str();
+        if manifest
+            .files
+            .iter()
+            .any(|file| fold_path_case(&file.path) == fold_path_case(required))
+        {
+            already_present.push(required.to_string());
+            continue;
+        }
+        let source = manifest.source_location.join(required);
+        if !source.is_file() {
+            missing_from_source.push(required.to_string());
+            continue;
+        }
+        let destination = manifest.location.join(required);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&source, &destination)?;
+        let sha256 = hash_file(&destination)?;
+        let metadata = std::fs::metadata(&destination)?;
+        manifest.files.push(BaseFile {
+            path: required.to_string(),
+            size: metadata.len(),
+            sha256,
+            linked: false,
+            identity: get_file_identity(&destination),
+            modified_unix_ms: get_modified_unix_ms(&metadata),
+        });
+        copied.push(required.to_string());
+    }
+    manifest
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    manifest
+        .incomplete_frameworks
+        .retain(|entry| entry.framework != framework.id.as_str());
+    if !missing_from_source.is_empty() {
+        manifest.incomplete_frameworks.push(IncompleteFramework {
+            framework: framework.id.as_str().to_string(),
+            name: framework.name.clone(),
+            missing: missing_from_source.clone(),
+        });
+    }
+
+    let unique = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+    let manifests_dir = paths.base_manifests_dir();
+    std::fs::create_dir_all(&manifests_dir)?;
+    let tmp_manifest = manifests_dir.join(format!("{base_id}.json.tmp-{unique}"));
+    std::fs::write(&tmp_manifest, serde_json::to_string_pretty(&manifest)?)?;
+    std::fs::rename(&tmp_manifest, &manifest_path)?;
+
+    Ok(FrameworkRepair {
+        framework: framework.id.as_str().to_string(),
+        name: framework.name.clone(),
+        required_total: detection.required.len(),
+        copied,
+        already_present,
+        missing_from_source,
+    })
 }
 
 /// Remove a base whose record cannot be read: the folder the id names in the data folder's bases

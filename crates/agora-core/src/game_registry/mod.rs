@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agora_game_api::{
-    Condition, FrameworkId, GameDefinition, GameId, GameInstall, GamePackage, GamePath, InstallId,
-    InstallKind, LoadOrderFormat, RelPath, RuntimeIdentity, StoreId, ToolId, UserFileStrategy,
-    GAME_API_VERSION,
+    fold_path_case, Condition, FrameworkId, GameDefinition, GameId, GameInstall, GamePackage,
+    GamePath, InstallId, InstallKind, LoadOrderFormat, RelPath, RuntimeIdentity, StoreId, ToolId,
+    UserFileStrategy, GAME_API_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,11 @@ pub enum GameRegistryError {
     UndefinedGameInFramework {
         framework_id: FrameworkId,
         game_id: GameId,
+    },
+    #[error("framework {framework_id} has an invalid detection: {reason}")]
+    InvalidFrameworkDetection {
+        framework_id: FrameworkId,
+        reason: String,
     },
     #[error("tool {tool_id} names undefined game {game_id}")]
     UndefinedGameInTool { tool_id: ToolId, game_id: GameId },
@@ -230,13 +235,45 @@ impl GameRegistryBuilder {
             }
         }
 
-        // 5. Frameworks name defined games
+        // 5. Frameworks name defined games, and their detection paths can be checked
         for framework in &def.frameworks {
             if !new_game_ids.contains(&framework.game) {
                 return Err(GameRegistryError::UndefinedGameInFramework {
                     framework_id: framework.id.clone(),
                     game_id: framework.game.clone(),
                 });
+            }
+            if let Some(detection) = &framework.detection {
+                if detection.marker.as_str().trim().is_empty() {
+                    return Err(GameRegistryError::InvalidFrameworkDetection {
+                        framework_id: framework.id.clone(),
+                        reason: "its detection marker is empty".to_string(),
+                    });
+                }
+                let mut seen = BTreeSet::new();
+                for required in &detection.required {
+                    let path = required.as_str();
+                    if path.trim().is_empty() {
+                        return Err(GameRegistryError::InvalidFrameworkDetection {
+                            framework_id: framework.id.clone(),
+                            reason: "a required file path is empty".to_string(),
+                        });
+                    }
+                    if path.contains('*') {
+                        return Err(GameRegistryError::InvalidFrameworkDetection {
+                            framework_id: framework.id.clone(),
+                            reason: format!(
+                                "required file '{path}' is a glob; required files must be exact paths"
+                            ),
+                        });
+                    }
+                    if !seen.insert(fold_path_case(path)) {
+                        return Err(GameRegistryError::InvalidFrameworkDetection {
+                            framework_id: framework.id.clone(),
+                            reason: format!("required file '{path}' is listed more than once"),
+                        });
+                    }
+                }
             }
         }
 
@@ -538,6 +575,20 @@ impl GameRegistry {
             .frameworks
             .iter()
             .find(|framework| framework.game == *game && framework.id == *framework_id)
+    }
+
+    /// Every framework the game declares, as its package lists them.
+    pub fn frameworks_for(&self, game: &GameId) -> Vec<&agora_game_api::FrameworkDefinition> {
+        self.package_for(game)
+            .map(|package| {
+                package
+                    .definition()
+                    .frameworks
+                    .iter()
+                    .filter(|framework| framework.game == *game)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The tool `tool_id` of `game`, as the game's package declares it (MASTER_SPEC §26.9).
@@ -938,5 +989,80 @@ pub mod test_support {
             frameworks: Vec::new(),
             tools: Vec::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod framework_detection_tests {
+    use super::*;
+    use agora_game_api::{
+        FrameworkDefinition, FrameworkDetection, FrameworkVersionSource, GamePackage,
+        PackageDefinition,
+    };
+    use std::sync::Arc;
+
+    struct Package(PackageDefinition);
+
+    impl GamePackage for Package {
+        fn definition(&self) -> &PackageDefinition {
+            &self.0
+        }
+    }
+
+    fn package_with_required(required: &[&str]) -> Arc<dyn GamePackage> {
+        let base = test_support::package("detection-game");
+        let mut definition = base.definition().clone();
+        definition.frameworks = vec![FrameworkDefinition {
+            id: FrameworkId::new("skse").unwrap(),
+            game: GameId::new("detection-game").unwrap(),
+            name: "Script extender".into(),
+            version: "1.0".into(),
+            supported_runtimes: Vec::new(),
+            required_frameworks: Vec::new(),
+            content: Vec::new(),
+            launch: None,
+            detection: Some(FrameworkDetection {
+                marker: RelPath::new("loader.exe").unwrap(),
+                required: required
+                    .iter()
+                    .map(|path| RelPath::new(*path).unwrap())
+                    .collect(),
+                version: Some(FrameworkVersionSource::PeFileVersion),
+            }),
+        }];
+        Arc::new(Package(definition))
+    }
+
+    #[test]
+    fn required_framework_files_must_be_exact_non_empty_and_unique() {
+        for (required, expected) in [
+            (vec!["Data/*.pex"], "glob"),
+            (vec!["Data/SKSE.pex", "data/skse.PEX"], "more than once"),
+            (vec![""], "empty"),
+        ] {
+            let mut builder = GameRegistry::builder();
+            let error = builder
+                .add(
+                    PackageSource::Compiled {
+                        crate_name: "test".into(),
+                    },
+                    package_with_required(&required),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{required:?}: {error}"
+            );
+        }
+
+        let mut builder = GameRegistry::builder();
+        builder
+            .add(
+                PackageSource::Compiled {
+                    crate_name: "test".into(),
+                },
+                package_with_required(&["Data/Scripts/SKSE.pex"]),
+            )
+            .unwrap();
     }
 }
