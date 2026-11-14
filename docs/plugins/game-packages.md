@@ -153,8 +153,6 @@ A script's rule is `before`, `requires` or `conflicts`, written as JSON from you
 
 With `optional: true`, a rule applies only when both items are present, or both active for `conflicts`. Without it, a missing item is reported to the player.
 
-`requires` takes `order: false` when the engine loads the item in a later pass, so the master only has to be installed and active rather than above the item. The Creation Engine uses this for a light plugin's full master: the game moves every light plugin to the end of the load order, so a full master always loads first. Ordering and cycle checks ignore such an edge; a missing or inactive master is still reported.
-
 `load_order_rules` may also return an object, so it can add badges and list-level findings:
 
 ```json
@@ -520,7 +518,6 @@ selected runtime; `user_data` means a known user folder, resolved by Agora.
 | `item` | string | required for `requires` | The item that needs the master |
 | `master` | string | required for `requires` | The item it needs |
 | `optional` | boolean | optional | Say nothing when the other item is absent; for `conflicts`, both must be active |
-| `order` | boolean | optional | For `requires`: whether the master must also load above the item; default `true` |
 | `name` | string | required | The item's name as the file writes it |
 | `active` | boolean | required | Whether the game loads it |
 

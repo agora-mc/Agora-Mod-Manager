@@ -1415,7 +1415,7 @@ pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> Che
             problem: MasterProblem::Later,
             movable: false,
             ..
-        } => "Open this instance's Plugins tab, unlock the master (or move it above the plugin by hand), then check again; Sort cannot move a locked or always-loaded master."
+        } => "Open this instance's Plugins tab and unlock the locked plugin (or move the master above the plugin by hand), then check again; Sort cannot move a locked or always-loaded plugin."
             .to_string(),
         Finding::MasterCycle { plugins } => format!(
             "Disable one of {}, because they need one another in a loop; Sort cannot fix a loop.",

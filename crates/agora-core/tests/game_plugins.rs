@@ -111,7 +111,6 @@ impl GamePackage for TestPackage {
                             item: entry.id.clone(),
                             master: master.clone(),
                             optional: false,
-                            order: true,
                         });
                     }
                 }

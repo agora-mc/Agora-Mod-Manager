@@ -11159,7 +11159,7 @@ fn sort_hint(
     }
     if stuck {
         lines.push(format!(
-            "Warning: a plugin loads before its master, and that master is locked or always loaded, so 'agora games instance plugins sort {instance_id}' cannot move it. Unlock the master, or move it above the plugin by hand."
+            "Warning: a plugin loads before its master, and one of them is locked or always loaded, so 'agora games instance plugins sort {instance_id}' cannot move it. Unlock it, or move the master above the plugin by hand."
         ));
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
@@ -11372,7 +11372,7 @@ fn plugins_load_order_command(
                         }
                         for b in &report.blocked {
                             println!(
-                                "Cannot fix: '{}' loads above its master '{}', and that master is locked or always loaded.",
+                                "Cannot fix: '{}' loads above its master '{}', and one of them is locked or always loaded.",
                                 b.plugin, b.master
                             );
                         }

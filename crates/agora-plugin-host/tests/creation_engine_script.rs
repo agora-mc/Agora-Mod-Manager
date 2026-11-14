@@ -183,10 +183,9 @@ fn the_script_reads_flags_masters_and_extensions() {
 }
 
 #[test]
-fn a_light_plugins_full_master_need_not_load_above_it() {
-    // The game moves every light plugin to the end of the load order, so a full master always
-    // loads first; only another light master can still come after it. Source:
-    // https://github.com/Ortham/libloadorder/blob/master/doc/src/load_order_mechanisms.md
+fn a_light_plugin_still_declares_its_master() {
+    // A master below its dependent is wrong whatever the flags; the sorter, not a missing rule,
+    // is what puts it right. LOOT orders a light master above its light dependent too.
     let reply = run(
         vec![
             (
@@ -220,12 +219,9 @@ fn a_light_plugins_full_master_need_not_load_above_it() {
             .find(|rule| rule["item"] == item)
             .unwrap_or_else(|| panic!("no rule for {item}"))
     };
-    assert_eq!(rule("LightMod.esp")["order"], serde_json::json!(false));
     assert_eq!(rule("LightMod.esp")["master"], "FullMaster.esp");
-    assert!(rule("FullMaster.esp").get("order").is_none());
-    // A light master is still moved to the light section, and among light plugins the list order
-    // is what the game keeps, so this one must load above its dependent.
-    assert!(rule("UsesLightMaster.esp").get("order").is_none());
+    assert_eq!(rule("UsesLightMaster.esp")["master"], "LightMaster.esl");
+    assert!(rules.iter().all(|rule| rule.get("order").is_none()));
 }
 
 #[test]
