@@ -993,7 +993,7 @@ impl RuntimeFileFinding {
                 } else {
                     format!(
                         "{} installed file(s) need it, such as {}",
-                        self.found.len(),
+                        self.required_total.unwrap_or(self.found.len()),
                         self.found
                             .iter()
                             .take(RUNTIME_FILE_FINDING_MAX_FOUND)
@@ -1093,7 +1093,7 @@ pub fn check_runtime_files<S: AsRef<str>>(
                     .collect(),
                 repair: rule.repair.replace("{version}", version),
                 repair_from_source: false,
-                required_total: None,
+                required_total: Some(needing.len()),
                 problem: RuntimeFileProblem::Missing,
             });
             continue;
