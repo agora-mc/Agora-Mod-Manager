@@ -67,6 +67,7 @@ impl BuiltInParser for CrashReportParser {
         let mut mod_list = ModList::None;
         let mut ticking: Option<Ticking> = None;
         let mut mod_crash_order = 0u32;
+        let mut mod_file: Option<String> = None;
         // A mixin that lost its target to another transformer is a conflict, not that mixin's fault.
         let mixin_conflict = collected.lines.iter().any(|line| {
             line.contains("was removed by another injector")
@@ -127,7 +128,13 @@ impl BuiltInParser for CrashReportParser {
                 }
             }
 
-            if let Some(damaged) = damaged_archive(line, line_no, "loader") {
+            if let Some(rest) = line.trim().strip_prefix("Mod File: ") {
+                let name = rest.trim().trim_matches(['\'', '"']);
+                if name.to_ascii_lowercase().ends_with(".jar") {
+                    mod_file = Some(name.to_string());
+                }
+            }
+            if let Some(damaged) = damaged_archive(line, line_no, "loader", mod_file.as_deref()) {
                 if seen.insert(format!("damaged\0{}", line.trim())) {
                     facts.push(damaged);
                 }

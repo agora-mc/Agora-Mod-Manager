@@ -92,7 +92,7 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
             (
                 std::cmp::Reverse(finding.level),
                 scope_rank(finding.scope),
-                std::cmp::Reverse(finding.cause),
+                std::cmp::Reverse(cause_rank(finding.cause)),
             )
         });
     let finding_wins = strongest.is_some_and(|finding| {
@@ -167,6 +167,16 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         repairs,
         actions,
         artifacts: Vec::new(),
+    }
+}
+
+/// How specific a cause is when two findings tie on level and scope. `other` is the open door, so
+/// it is the last choice; `mod` is more specific than `other` but less than a named kind.
+fn cause_rank(cause: Cause) -> u8 {
+    match cause {
+        Cause::Other => 0,
+        Cause::Mod => 1,
+        _ => 2,
     }
 }
 

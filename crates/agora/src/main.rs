@@ -4887,11 +4887,29 @@ async fn run_crash_command(
                     .is_some_and(|answer| answer.session_id == newest.session_id)
             });
             if json {
-                let mut value = serde_json::to_value(&context.answer)?;
-                value["newest_session"] = serde_json::to_value(newest_session)?;
-                value["answer_session"] = serde_json::to_value(&context.answer_session)?;
-                value["newest_session_has_answer"] = serde_json::Value::Bool(newest_has_answer);
-                println!("{}", serde_json::to_string_pretty(&value)?);
+                let mut value = match &context.answer {
+                    Some(answer) => match serde_json::to_value(answer)? {
+                        serde_json::Value::Object(map) => map,
+                        _ => serde_json::Map::new(),
+                    },
+                    None => serde_json::Map::new(),
+                };
+                value.insert(
+                    "newest_session".to_string(),
+                    serde_json::to_value(newest_session)?,
+                );
+                value.insert(
+                    "answer_session".to_string(),
+                    serde_json::to_value(&context.answer_session)?,
+                );
+                value.insert(
+                    "newest_session_has_answer".to_string(),
+                    serde_json::Value::Bool(newest_has_answer),
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(value))?
+                );
             } else {
                 if let Some(newest) = newest_session {
                     if !newest_has_answer {

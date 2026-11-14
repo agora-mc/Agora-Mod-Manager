@@ -1006,6 +1006,27 @@ A detailed walkthrough of the error:\n\
         let problem = find(&output, "minecraft.file_problem", "kind", "damaged_archive")
             .expect("a damaged-file fact");
         assert_eq!(text_of(problem, "path"), "examplemod.jar");
+
+        // Forge-style: the jar is on a `Mod File:` line and only the zip error is in the cause.
+        let report = "---- Minecraft Crash Report ----\n\
+// An invented crash for these tests.\n\
+\n\
+Description: Mod loading error has occurred\n\
+\n\
+java.lang.Exception: Mod loading failed\n\
+\n\
+Mod File: /mods/examplemod.jar\n\
+Failure message: Example Mod (examplemod) has failed to load correctly\n\
+Caused by: java.util.zip.ZipException: zip END header not found\n\
+\n\
+A detailed walkthrough of the error:\n\
+\n\
+-- System Details --\n\
+\tMinecraft Version: 1.20.1\n";
+        let output = run_ok("crash_report", report.as_bytes());
+        let problem = find(&output, "minecraft.file_problem", "kind", "damaged_archive")
+            .expect("a damaged-file fact from the Mod File line");
+        assert_eq!(text_of(problem, "path"), "examplemod.jar");
     }
 
     #[test]

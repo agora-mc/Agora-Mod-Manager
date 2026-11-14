@@ -206,7 +206,12 @@ pub(crate) fn java_exception_category(class: &str) -> &'static str {
 
 /// A mod jar the loader could not read because the file itself is damaged. The forms cover
 /// Fabric, Quilt, Forge and NeoForge; the file name is kept only when the line names one.
-pub(crate) fn damaged_archive(line: &str, line_no: usize, section: &str) -> Option<Fact> {
+pub(crate) fn damaged_archive(
+    line: &str,
+    line_no: usize,
+    section: &str,
+    known_file: Option<&str>,
+) -> Option<Fact> {
     let lower = line.to_ascii_lowercase();
     let says_unreadable = lower.contains("error analyzing")
         || lower.contains("failed to read mod file")
@@ -218,7 +223,8 @@ pub(crate) fn damaged_archive(line: &str, line_no: usize, section: &str) -> Opti
     if !says_unreadable && !says_zip_damage {
         return None;
     }
-    let file = jar_name_in(line)?;
+    // A crash report may put the jar on an earlier `Mod File:` line and only the zip error here.
+    let file = jar_name_in(line).or_else(|| known_file.map(jar_basename))?;
     let message = line.trim().to_string();
     Some(fact(
         "minecraft.file_problem",
@@ -257,12 +263,15 @@ fn jar_name_in(line: &str) -> Option<String> {
             })
             .find(|token| token.to_ascii_lowercase().ends_with(".jar"))
     })?;
-    let name = candidate
-        .rsplit(['\\', '/'])
+    Some(jar_basename(candidate))
+}
+
+fn jar_basename(path: &str) -> String {
+    path.rsplit(['\\', '/'])
         .next()
-        .unwrap_or(candidate)
-        .trim();
-    (!name.is_empty()).then(|| name.to_string())
+        .unwrap_or(path)
+        .trim()
+        .to_string()
 }
 
 /// A file the game needed to create but found in the way, named so the answer can point at it.

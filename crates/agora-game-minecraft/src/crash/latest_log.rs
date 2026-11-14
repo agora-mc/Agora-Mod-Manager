@@ -211,7 +211,7 @@ impl BuiltInParser for LatestLogParser {
                 }
             }
 
-            if let Some(damaged) = damaged_archive(profile, line_no, "fatal") {
+            if let Some(damaged) = damaged_archive(profile, line_no, "fatal", None) {
                 if seen.insert(format!("damaged\0{profile}")) {
                     facts.push(damaged);
                 }

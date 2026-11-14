@@ -1732,6 +1732,18 @@ fn crash_last_says_the_newest_session_has_no_answer_and_which_one_it_shows() {
         .find("This answer is for the session that ended 2026-01-01T00:10:00Z (crashed).")
         .unwrap_or_else(|| panic!("no answer-session line:\n{stdout}"));
     assert!(newest < shown, "{stdout}");
+
+    let json = run_agora_json(&data_dir, &["crash", "last", "inst"]);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let parsed = assert_json_stdout(&json);
+    assert_eq!(parsed["session_id"], "answered");
+    assert_eq!(parsed["newest_session"]["session_id"], "newest");
+    assert_eq!(parsed["answer_session"]["session_id"], "answered");
+    assert_eq!(parsed["newest_session_has_answer"], false);
 }
 
 #[test]
