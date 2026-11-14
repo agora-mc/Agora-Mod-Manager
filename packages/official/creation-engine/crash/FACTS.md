@@ -44,8 +44,8 @@ is rejected rather than read as this run's.
 ## Function names
 
 Crash Logger usually prints only an Address Library id (`-> 19142+0x10`), while
-other analyzers match crashes by function name. `crash/addrlib-names.json` and
-`crash/addrlib-names.js` are generated from
+other analyzers match crashes by function name. `crash/addrlib-names.js` is
+generated from
 [CommonLibSSE-NG](https://github.com/alandtse/CommonLibSSE-NG) at commit
 `f49373ed922fde1dfbff0208f63a49bf8846c109` (GPL-3.0 with modding exceptions; see
 its `COPYING.txt` and `EXCEPTIONS.md`). `scripts/gen_addrlib_names.py` reads the

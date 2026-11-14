@@ -4,7 +4,7 @@
  * a pasted snippet, a collapsed could-not-check, the exact save warning and the primary button.
  */
 import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { CrashAnswerCard, CrashAnswerView, nextStepLabel } from './CrashAnswerView';
 import type {
   CrashAnswer,
@@ -210,6 +210,32 @@ describe('the save warning', () => {
       }),
     });
     expect(screen.queryByTestId('crash-save-warning')).toBeNull();
+  });
+
+  it('says Agora backed the saves up, with a Restore saves button, for a game instance', () => {
+    const restore = vi.fn();
+    renderView({
+      status: 'analyzed',
+      answer: answer(),
+      saveBackup: 'game',
+      onRestoreSaves: restore,
+    });
+    const note = screen.getByTestId('crash-save-warning');
+    expect(note).toHaveTextContent(
+      'Agora backed up your saves before this test. You can restore them from here.',
+    );
+    expect(note).not.toHaveTextContent(words);
+    fireEvent.click(screen.getByRole('button', { name: 'Restore saves' }));
+    expect(restore).toHaveBeenCalledTimes(1);
+  });
+
+  it('says worlds were included for the Minecraft test flow, with no game restore button', () => {
+    renderView({ status: 'analyzed', answer: answer(), saveBackup: 'minecraft' });
+    const note = screen.getByTestId('crash-save-warning');
+    expect(note).toHaveTextContent(
+      'Agora backed up this instance, worlds included, before this test.',
+    );
+    expect(screen.queryByRole('button', { name: 'Restore saves' })).toBeNull();
   });
 
   it('does not show when nothing is removed or tested', () => {

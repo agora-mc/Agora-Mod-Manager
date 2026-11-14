@@ -34,6 +34,9 @@ import type {
 
 export type CrashAnswerOrigin = 'session' | 'pasted' | 'file';
 
+/** Which test flow backed the saves up before it started. */
+export type SaveBackupOrigin = 'game' | 'minecraft';
+
 export interface CrashAnswerViewProps {
   status: AnswerStatus;
   answer?: CrashAnswer | null;
@@ -50,6 +53,10 @@ export interface CrashAnswerViewProps {
   onAskPhostwood?: () => void;
   onShowFile?: (artifact: CrashArtifact) => void;
   onTestWithout?: (candidate: CrashCandidate) => void;
+  /** Set when the test flow copied the saves first; the warning then says so. */
+  saveBackup?: SaveBackupOrigin;
+  /** Put a game instance's saves back; shown only when `saveBackup` is `game`. */
+  onRestoreSaves?: () => void;
   onOpenModPage?: (candidate: CrashCandidate) => void;
   onShowSuspectFiles?: (candidate: CrashCandidate) => void;
   /** The answer's own buttons, from a pack's closed set of actions. */
@@ -88,6 +95,11 @@ const SECOND_OPINION_NOTE = 'Copies the crash log and opens a website.';
 const SAVE_WARNING =
   'Removing a mod partway through a playthrough can damage your save. Back up your saves before you test, or test on a new game.';
 
+const BACKUP_NOTE: Record<SaveBackupOrigin, string> = {
+  game: 'Agora backed up your saves before this test. You can restore them from here.',
+  minecraft: 'Agora backed up this instance, worlds included, before this test.',
+};
+
 /** The sentence shown when a log was read and Agora named nobody. */
 const NAMED_NOBODY =
   "Agora couldn't name a cause from this crash. That's common: about a third of crashes leave no clue in the log.";
@@ -112,6 +124,8 @@ export function CrashAnswerView({
   onOpenModPage,
   onShowSuspectFiles,
   onAction,
+  saveBackup,
+  onRestoreSaves,
 }: CrashAnswerViewProps) {
   if (status === 'nothing_to_read' && origin === 'session') {
     return (
@@ -172,14 +186,29 @@ export function CrashAnswerView({
 
       <Actions actions={answer.actions} onAction={onAction} />
 
-      {saveWarning && (
+      {(saveWarning || saveBackup !== undefined) && (
         <div
           role="note"
           className="flex items-start gap-2 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 text-sm"
           data-testid="crash-save-warning"
+          data-backup={saveBackup}
         >
           <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />
-          <p>{SAVE_WARNING}</p>
+          <div>
+            <p>{saveBackup === undefined ? SAVE_WARNING : BACKUP_NOTE[saveBackup]}</p>
+            {saveBackup === 'game' && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="mt-2"
+                disabled={onRestoreSaves === undefined}
+                onClick={() => onRestoreSaves?.()}
+              >
+                Restore saves
+              </Button>
+            )}
+          </div>
         </div>
       )}
 

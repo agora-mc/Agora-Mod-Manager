@@ -225,10 +225,14 @@ const BOOT_REPLIES = {
   get_crash_answer: detailReply,
 };
 
-async function boot(page: Page, mode: 'light' | 'dark') {
+async function boot(
+  page: Page,
+  mode: 'light' | 'dark',
+  extra: { replies?: Record<string, unknown>; settings?: Record<string, unknown> } = {},
+) {
   await installGamesMock(page, {
-    replies: { ...BOOT_REPLIES, games_list: { games: [skyrim] } },
-    settings: { active_game: 'skyrim-se' },
+    replies: { ...BOOT_REPLIES, games_list: { games: [skyrim] }, ...extra.replies },
+    settings: { active_game: 'skyrim-se', ...extra.settings },
   });
   await page.addInitScript((colorMode: string) => {
     // `colorMode` alone leaves the default custom dark surfaces in place, so a light shot needs
@@ -297,3 +301,38 @@ for (const mode of ['light', 'dark'] as const) {
     await expectNoUnmockedCommands(page);
   });
 }
+
+test('a backup made before a test is offered with a Restore saves button', async ({ page }) => {
+  await boot(page, 'light', {
+    replies: {
+      games_saves_backup: {
+        id: 'backup-1',
+        createdAt: '2026-11-12T21:15:30Z',
+        source: 'D:/Games/User/Saves',
+        fileCount: 3,
+        bytes: 2_400_000,
+      },
+      games_saves_restore: {
+        backupId: 'backup-1',
+        folder: 'D:/Games/User/Saves',
+        restored: 3,
+        keptCurrent: [],
+      },
+    },
+  });
+  await cardFor(page, 'Grounded').getByRole('button', { name: 'Edit Grounded' }).click();
+  await page.getByRole('button', { name: 'See what happened' }).click();
+
+  await page.getByRole('button', { name: 'Test without Example Overhaul' }).click();
+  await page.getByRole('button', { name: 'Stay here' }).click();
+
+  const note = page.getByTestId('crash-save-warning');
+  await expect(note).toContainText(
+    'Agora backed up your saves before this test. You can restore them from here.',
+  );
+
+  await page.getByRole('button', { name: 'Restore saves' }).click();
+  await expect(page.getByText('Agora put 3 save files back.')).toBeVisible();
+
+  await expectNoUnmockedCommands(page);
+});

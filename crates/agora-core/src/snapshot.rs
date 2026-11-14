@@ -3065,6 +3065,28 @@ mod tests {
         assert_eq!(snapshot_readiness(tmp.path()), SnapshotReadiness::Failed);
     }
 
+    /// The crash answer's test flow takes this full snapshot, so a world changed during the
+    /// test must be put back with it.
+    #[test]
+    fn a_full_snapshot_restores_a_world_changed_during_a_test() {
+        let tmp = TempDir::new().unwrap();
+        let inst = make_instance(&tmp);
+        let world = inst.join("saves").join("world1");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(world.join("level.dat"), b"world before the test").unwrap();
+
+        let snap = create_snapshot(&inst, Some("crash-doctor-test")).unwrap();
+        fs::write(world.join("level.dat"), b"world changed by the test").unwrap();
+
+        let outcome = restore_snapshot(&inst, &snap.id).unwrap();
+
+        assert!(outcome.restored_roots.iter().any(|root| root == "saves"));
+        assert_eq!(
+            fs::read(world.join("level.dat")).unwrap(),
+            b"world before the test"
+        );
+    }
+
     #[test]
     fn restore_snapshot_preserves_content() {
         let tmp = TempDir::new().unwrap();

@@ -9,6 +9,7 @@ use agora_core::game_ini::{self, IniFile, IniRead, IniSource};
 use agora_core::game_instance::SavesChoice;
 use agora_core::game_mod_ini::{self, ModIni, ModIniRead, ModIniSource};
 use agora_core::game_saves::{self, SaveFolder, SavesStatus, SettingChange};
+use agora_core::save_backup::{self, SaveBackup, SaveRestore};
 use serde::Serialize;
 
 use super::error::GamesError;
@@ -469,6 +470,100 @@ pub async fn games_saves_set(
         })
     })
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Save backups taken before a crash test
+// ---------------------------------------------------------------------------
+
+/// One Agora-owned backup of an instance's save folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveBackupRow {
+    pub id: String,
+    /// RFC 3339 in UTC.
+    pub created_at: String,
+    /// The folder the files were copied from.
+    pub source: String,
+    pub file_count: usize,
+    pub bytes: u64,
+}
+
+/// What a restore put back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveRestoreRow {
+    pub backup_id: String,
+    /// The save folder the files went back into.
+    pub folder: String,
+    /// Files written, including ones already identical.
+    pub restored: usize,
+    /// Current files kept beside their backed-up copies, as `.before-restore`.
+    pub kept_current: Vec<String>,
+}
+
+fn save_backup_row(backup: &SaveBackup) -> SaveBackupRow {
+    SaveBackupRow {
+        id: backup.id.clone(),
+        created_at: backup.created_at.clone(),
+        source: backup.source.display().to_string(),
+        file_count: backup.file_count,
+        bytes: backup.bytes,
+    }
+}
+
+/// Copy the instance's save folder into an Agora-owned backup before a crash test, and report how
+/// large the copy was. The folder comes from the game's declared save location, never a guess.
+#[tauri::command]
+pub async fn games_saves_backup(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<SaveBackupRow, GamesError> {
+    run_blocking(app, "Backing up the saves", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let backup = save_backup::backup(&ctx, &instance_id, definition).map_err(core_failed)?;
+        Ok(save_backup_row(&backup))
+    })
+    .await
+}
+
+/// Every finished save backup for an instance, newest first.
+#[tauri::command]
+pub async fn games_saves_backups(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<Vec<SaveBackupRow>, GamesError> {
+    run_blocking(app, "Reading the save backups", move |ctx| {
+        let backups = save_backup::list(&ctx, &instance_id).map_err(core_failed)?;
+        Ok(backups.iter().map(save_backup_row).collect())
+    })
+    .await
+}
+
+/// Put a save backup back. Never deletes: a current file of the same name is kept beside its
+/// backed-up copy, and saves made after the backup are left alone.
+#[tauri::command]
+pub async fn games_saves_restore(
+    app: tauri::AppHandle,
+    instance_id: String,
+    backup_id: String,
+) -> Result<SaveRestoreRow, GamesError> {
+    run_blocking(app, "Restoring the saves", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let restore = save_backup::restore(&ctx, &instance_id, definition, &backup_id)
+            .map_err(core_failed)?;
+        Ok(save_restore_row(&restore))
+    })
+    .await
+}
+
+fn save_restore_row(restore: &SaveRestore) -> SaveRestoreRow {
+    SaveRestoreRow {
+        backup_id: restore.backup_id.clone(),
+        folder: restore.folder.display().to_string(),
+        restored: restore.restored,
+        kept_current: restore.kept_current.clone(),
+    }
 }
 
 #[cfg(test)]

@@ -98,6 +98,28 @@ export interface SavesChange {
   saves: SavesView;
 }
 
+/** One Agora-owned backup of an instance's save folder. */
+export interface SaveBackupRow {
+  id: string;
+  /** RFC 3339 in UTC. */
+  createdAt: string;
+  /** The folder the files were copied from. */
+  source: string;
+  fileCount: number;
+  bytes: number;
+}
+
+/** What restoring a save backup put back. */
+export interface SaveRestoreRow {
+  backupId: string;
+  /** The save folder the files went back into. */
+  folder: string;
+  /** Files written, including ones already identical. */
+  restored: number;
+  /** Current files kept beside their backed-up copies, as `.before-restore`. */
+  keptCurrent: string[];
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -190,6 +212,24 @@ function isSavesChange(value: unknown): value is SavesChange {
     && isSavesView(value.saves);
 }
 
+function isSaveBackupRow(value: unknown): value is SaveBackupRow {
+  return isObject(value)
+    && typeof value.id === 'string'
+    && typeof value.createdAt === 'string'
+    && typeof value.source === 'string'
+    && typeof value.fileCount === 'number'
+    && typeof value.bytes === 'number';
+}
+
+function isSaveRestoreRow(value: unknown): value is SaveRestoreRow {
+  return isObject(value)
+    && typeof value.backupId === 'string'
+    && typeof value.folder === 'string'
+    && typeof value.restored === 'number'
+    && Array.isArray(value.keptCurrent)
+    && value.keptCurrent.every((path) => typeof path === 'string');
+}
+
 /** Returns the reply when it has the documented shape, and rejects by command name when it does not. */
 function checkedReply<T>(command: string, reply: unknown, ok: (value: unknown) => value is T): T {
   if (!ok(reply)) {
@@ -238,6 +278,27 @@ export async function getSaves(instanceId: string): Promise<SavesView> {
 export async function setSaves(instanceId: string, choice: SaveChoice): Promise<SavesChange> {
   const reply = await invoke<unknown>('games_saves_set', { instanceId, choice });
   return checkedReply('games_saves_set', reply, isSavesChange);
+}
+
+/** Copy the instance's save folder into an Agora-owned backup before a crash test. */
+export async function backupSaves(instanceId: string): Promise<SaveBackupRow> {
+  const reply = await invoke<unknown>('games_saves_backup', { instanceId });
+  return checkedReply('games_saves_backup', reply, isSaveBackupRow);
+}
+
+/** Every finished save backup for an instance, newest first. */
+export async function listSaveBackups(instanceId: string): Promise<SaveBackupRow[]> {
+  const reply = await invoke<unknown>('games_saves_backups', { instanceId });
+  if (!Array.isArray(reply) || !reply.every(isSaveBackupRow)) {
+    throw new Error('games_saves_backups did not return the expected save backup data.');
+  }
+  return reply;
+}
+
+/** Put a save backup back. Never deletes: current files are kept as `.before-restore`. */
+export async function restoreSaves(instanceId: string, backupId: string): Promise<SaveRestoreRow> {
+  const reply = await invoke<unknown>('games_saves_restore', { instanceId, backupId });
+  return checkedReply('games_saves_restore', reply, isSaveRestoreRow);
 }
 
 /** The INI files the instance's enabled mods ship, with the instance's own overrides listed too. */
