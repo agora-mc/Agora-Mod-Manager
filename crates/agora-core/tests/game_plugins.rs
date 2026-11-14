@@ -44,6 +44,7 @@ struct Harness {
     install_dir: PathBuf,
     install: IdentifiedInstall,
     facts: Facts,
+    rules_fail: Arc<Mutex<Option<String>>>,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
     sort_request: Arc<Mutex<Option<SorterRequest>>>,
@@ -69,6 +70,7 @@ type Facts = Arc<Mutex<HashMap<String, PluginFact>>>;
 struct TestPackage {
     definition: PackageDefinition,
     facts: Facts,
+    rules_fail: Arc<Mutex<Option<String>>>,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
     sort_request: Arc<Mutex<Option<SorterRequest>>>,
@@ -92,7 +94,14 @@ impl GamePackage for TestPackage {
         _list_id: &'a str,
     ) -> GameFuture<'a, Option<LoadOrderRulesReply>> {
         let facts = self.facts.clone();
+        let failure = self.rules_fail.clone();
         Box::pin(async move {
+            if let Some(message) = failure.lock().unwrap().clone() {
+                return Err(GameError {
+                    code: "ERR_TEST_RULES".into(),
+                    message,
+                });
+            }
             let facts = facts.lock().unwrap();
             let mut rules = Vec::new();
             let mut badges = BTreeMap::new();
@@ -358,6 +367,7 @@ impl Harness {
         let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
         agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
         let facts: Facts = Arc::new(Mutex::new(HashMap::new()));
+        let rules_fail: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let sorter: SorterReplySlot = Arc::new(Mutex::new(None));
         let sorter_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let sort_request: Arc<Mutex<Option<SorterRequest>>> = Arc::new(Mutex::new(None));
@@ -372,6 +382,7 @@ impl Harness {
                 Arc::new(TestPackage {
                     definition: package_of(&def),
                     facts: facts.clone(),
+                    rules_fail: rules_fail.clone(),
                     sorter: sorter.clone(),
                     sorter_calls: sorter_calls.clone(),
                     sort_request: sort_request.clone(),
@@ -391,6 +402,7 @@ impl Harness {
             install_dir,
             install,
             facts,
+            rules_fail,
             sorter,
             sorter_calls,
             sort_request,
@@ -441,6 +453,10 @@ impl Harness {
     }
 
     /// What the test double's sorter answers on the next call.
+    fn fail_rules(&self, reason: &str) {
+        *self.rules_fail.lock().unwrap() = Some(reason.to_string());
+    }
+
     fn answer_sorting(&self, reply: SorterReply) {
         *self.sorter.lock().unwrap() = Some(reply);
     }
@@ -1015,6 +1031,7 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
         Arc::new(TestPackage {
             definition: package_of(def),
             facts: Arc::new(Mutex::new(HashMap::new())),
+            rules_fail: Arc::new(Mutex::new(None)),
             sorter: Arc::new(Mutex::new(None)),
             sorter_calls: Arc::new(AtomicUsize::new(0)),
             sort_request: Arc::new(Mutex::new(None)),
@@ -2428,4 +2445,33 @@ fn a_failed_overlaps_reader_is_reported_as_could_not_check() {
         .expect("a failed reader is reported, not a clean list");
     assert!(message.contains("could not be checked"), "{message}");
     assert!(message.contains("timed out"), "{message}");
+}
+
+#[test]
+fn a_rule_is_not_added_when_the_lists_rules_cannot_be_read() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-rules-fail");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_rules("the game's rule reader timed out");
+
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        "B.esp",
+    )
+    .unwrap_err();
+    assert!(matches!(error, LoadOrderError::RulesStore(_)), "{error}");
+    assert!(error.to_string().contains("cannot be checked"), "{error}");
+    assert!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .is_empty()
+    );
 }

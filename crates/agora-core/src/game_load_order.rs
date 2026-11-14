@@ -845,9 +845,9 @@ fn sorter_request(
 }
 
 /// Whether `from` reaches `to` by one or more "must come before" edges.
-fn reaches(before: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
+fn reaches(edges: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = before.get(from).cloned().unwrap_or_default();
+    let mut stack: Vec<String> = edges.get(from).cloned().unwrap_or_default();
     while let Some(next) = stack.pop() {
         if next == to {
             return true;
@@ -855,7 +855,7 @@ fn reaches(before: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool 
         if !seen.insert(next.clone()) {
             continue;
         }
-        if let Some(more) = before.get(&next) {
+        if let Some(more) = edges.get(&next) {
             stack.extend(more.iter().cloned());
         }
     }
@@ -886,6 +886,15 @@ pub fn add_load_after_rule(
     }
 
     let order = order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    if let Some(Finding::RulesFailed { reason, .. }) = order
+        .findings
+        .iter()
+        .find(|finding| matches!(finding, Finding::RulesFailed { .. }))
+    {
+        return Err(LoadOrderError::RulesStore(format!(
+            "the list's rules could not be read, so the rule cannot be checked: {reason}"
+        )));
+    }
     let canonical = |name: &str| {
         order
             .entries
