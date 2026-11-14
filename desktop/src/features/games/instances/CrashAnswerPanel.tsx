@@ -16,14 +16,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { useConfirm } from '@/components/ui/confirm';
 import { formatError, getSetting, openExternalUrl, pickOpenFile, setSetting } from '@/lib/tauri';
 import type { GameInstancePage } from '@/lib/useDestination';
 import {
   CrashAnswerCard,
   CrashAnswerView,
+  formatSize,
   formatWhen,
   verdictWordFor,
 } from '@/components/CrashAnswerView';
+import { backupSaves, restoreSaves, type SaveBackupRow } from '../iniSaves/api';
 import {
   analyzeCrashFile,
   analyzeCrashText,
@@ -42,6 +45,11 @@ const DISMISS_KEY = 'crash_answer_dismissed';
 
 function dismissKey(instanceId: string): string {
   return `${DISMISS_KEY}_${instanceId}`;
+}
+
+/** The backup taken before this session's test, so returning to the answer can offer a restore. */
+function backupKey(instanceId: string, sessionId: string): string {
+  return `crash_save_backup_${instanceId}_${sessionId}`;
 }
 
 function summaryTopLine(summary: CrashAnswerSummary): string {
@@ -73,6 +81,9 @@ export function CrashAnswerOverview({
   const [supplied, setSupplied] = useState<SuppliedCrashAnswer | null>(null);
   const [suppliedOrigin, setSuppliedOrigin] = useState<'pasted' | 'file'>('pasted');
   const [notice, setNotice] = useState<string | null>(null);
+  const [openBackupId, setOpenBackupId] = useState<string | null>(null);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const { confirm } = useConfirm();
 
   useEffect(() => {
     let alive = true;
@@ -114,9 +125,79 @@ export function CrashAnswerOverview({
     setOpenSession(sessionId);
     setDetail(null);
     setDetailError(null);
+    setOpenBackupId(null);
+    setSaveNotice(null);
     getCrashAnswer(sessionId)
       .then(setDetail)
       .catch((error: unknown) => setDetailError(formatError(error)));
+    getSetting(backupKey(instanceId, sessionId))
+      .then((stored) => {
+        setOpenBackupId(typeof stored === 'string' && stored !== '' ? stored : null);
+      })
+      .catch(() => setOpenBackupId(null));
+  };
+
+  const restoreSavesNow = async () => {
+    if (openBackupId === null) return;
+    setSaveNotice(null);
+    try {
+      const result = await restoreSaves(instanceId, openBackupId);
+      const files = result.restored === 1 ? '1 save file' : `${result.restored} save files`;
+      const kept = result.keptCurrent.length;
+      setSaveNotice(
+        kept === 0
+          ? `Agora put ${files} back.`
+          : `Agora put ${files} back and kept ${kept} current ${
+              kept === 1 ? 'file' : 'files'
+            } beside them as .before-restore.`,
+      );
+    } catch (error) {
+      setSaveNotice(`The saves were not restored. ${formatError(error)}`);
+    }
+  };
+
+  /**
+   * Before the interim test flow opens Content, copy the instance's saves. Either way the user is
+   * told before the test can start; a backup made here lets the answer screen offer a restore.
+   */
+  const startTest = async (sessionId: string) => {
+    let backup: SaveBackupRow | null = null;
+    let failure: string | null = null;
+    try {
+      backup = await backupSaves(instanceId);
+      setOpenBackupId(backup.id);
+      void setSetting(backupKey(instanceId, sessionId), backup.id).catch(() => undefined);
+    } catch (error) {
+      failure = formatError(error);
+    }
+
+    if (backup !== null) {
+      const proceed = await confirm({
+        title: 'Saves backed up',
+        body: `Agora copied ${formatSize(backup.bytes)} of saves. Open Content, disable the suspect there, then launch again. You can restore the saves from this answer.`,
+        confirmLabel: 'Open Content',
+        cancelLabel: 'Stay here',
+      });
+      if (proceed) {
+        setOpenSession(null);
+        onNavigatePage?.('content');
+      }
+      return;
+    }
+
+    const proceed = await confirm({
+      title: 'The saves were not backed up',
+      body: `${failure ?? 'Agora could not back up the saves.'}
+
+Removing a mod partway through a playthrough can damage your saves. Back them up yourself first, or test on a new game.`,
+      confirmLabel: 'Open Content anyway',
+      cancelLabel: 'Cancel',
+      tone: 'danger',
+    });
+    if (proceed) {
+      setOpenSession(null);
+      onNavigatePage?.('content');
+    }
   };
 
   const openCheck = () => {
@@ -170,6 +251,14 @@ export function CrashAnswerOverview({
   };
 
   const next = (kind: string) => {
+    if (kind === 'confirm_experiment' || kind === 'bisect') {
+      if (openSession !== null) {
+        void startTest(openSession);
+      } else {
+        onNavigatePage?.('content');
+      }
+      return;
+    }
     setOpenSession(null);
     if (kind === 'recapture') {
       setNotice('Launch the game again from its page when you are ready.');
@@ -182,11 +271,6 @@ export function CrashAnswerOverview({
     }
     if (kind === 'second_opinion') {
       openCheck();
-      return;
-    }
-    if (kind === 'confirm_experiment' || kind === 'bisect') {
-      setNotice('Open Content, disable the suspect there, and launch again.');
-      onNavigatePage?.('content');
       return;
     }
     if (kind === 'apply_repair') {
@@ -275,6 +359,11 @@ export function CrashAnswerOverview({
               origin="session"
               onNext={(kind) => next(kind)}
               onRunAgain={onRunAgain}
+              onTestWithout={() => {
+                if (openSession !== null) void startTest(openSession);
+              }}
+              saveBackup={openBackupId !== null ? 'game' : undefined}
+              onRestoreSaves={() => void restoreSavesNow()}
               onCheckAnother={() => { setOpenSession(null); openCheck(); }}
               onAskPhostwood={() => {
                 const artifact = detail.answer?.artifacts[0];
@@ -289,6 +378,9 @@ export function CrashAnswerOverview({
                 });
               }}
             />
+          )}
+          {saveNotice !== null && (
+            <p role="status" className="text-sm text-muted-foreground">{saveNotice}</p>
           )}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setOpenSession(null)}>Close</Button>

@@ -4,13 +4,16 @@ const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
 import {
+  backupSaves,
   getIni,
   getModIni,
   getSaves,
   keepModIniGameVersion,
   listModInis,
   resetModIni,
+  listSaveBackups,
   restoreModIniMine,
+  restoreSaves,
   setIniValue,
   setModIniValue,
   setSaves,
@@ -116,6 +119,48 @@ describe('saves commands', () => {
   it('rejects a change with no setting action', async () => {
     invokeMock.mockResolvedValueOnce({ previous: 'own', setting: {}, saves: savesView });
     await expect(setSaves('inst-1', 'shared')).rejects.toThrow('games_saves_set did not return');
+  });
+
+  const backup = {
+    id: 'backup-1',
+    createdAt: '2026-11-12T21:15:30Z',
+    source: 'C:/Saves',
+    fileCount: 3,
+    bytes: 2_400_000,
+  };
+
+  it('backs the saves up and lists what exists', async () => {
+    invokeMock.mockResolvedValueOnce(backup);
+    await expect(backupSaves('inst-1')).resolves.toEqual(backup);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_saves_backup', { instanceId: 'inst-1' });
+
+    invokeMock.mockResolvedValueOnce([backup]);
+    await expect(listSaveBackups('inst-1')).resolves.toEqual([backup]);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_saves_backups', { instanceId: 'inst-1' });
+  });
+
+  it('restores a backup by id and reports what was kept beside it', async () => {
+    const restored = {
+      backupId: 'backup-1',
+      folder: 'C:/Saves',
+      restored: 3,
+      keptCurrent: ['C:/Saves/Run.ess.before-restore'],
+    };
+    invokeMock.mockResolvedValueOnce(restored);
+    await expect(restoreSaves('inst-1', 'backup-1')).resolves.toEqual(restored);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_saves_restore', {
+      instanceId: 'inst-1',
+      backupId: 'backup-1',
+    });
+  });
+
+  it.each([
+    ['null', null],
+    ['a backup with no id', { ...backup, id: undefined }],
+    ['a backup with a non-numeric size', { ...backup, bytes: '2 MB' }],
+  ])('rejects a backup reply that is %s rather than reading it as a backup', async (_label, reply) => {
+    invokeMock.mockResolvedValueOnce(reply);
+    await expect(backupSaves('inst-1')).rejects.toThrow('games_saves_backup did not return');
   });
 });
 

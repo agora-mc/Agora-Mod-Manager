@@ -18,6 +18,8 @@ const mocks = vi.hoisted(() => ({
   setSetting: vi.fn(),
   pickOpenFile: vi.fn(),
   openExternalUrl: vi.fn(),
+  backupSaves: vi.fn(),
+  restoreSaves: vi.fn(),
 }));
 
 vi.mock('./crashAnswerApi', () => ({
@@ -28,6 +30,11 @@ vi.mock('./crashAnswerApi', () => ({
   revealCrashArtifact: mocks.revealCrashArtifact,
   readCrashArtifact: mocks.readCrashArtifact,
   PHOSTWOOD_ANALYZER_URL: 'https://example.test/analyzer',
+}));
+
+vi.mock('../iniSaves/api', () => ({
+  backupSaves: mocks.backupSaves,
+  restoreSaves: mocks.restoreSaves,
 }));
 
 vi.mock('@/lib/tauri', () => ({
@@ -109,6 +116,19 @@ beforeEach(() => {
   mocks.getSetting.mockResolvedValue(null);
   mocks.setSetting.mockResolvedValue(undefined);
   mocks.getCrashAnswer.mockImplementation(async (sessionId: string) => detail(sessionId));
+  mocks.backupSaves.mockResolvedValue({
+    id: 'backup-1',
+    createdAt: '2026-11-12T21:15:30Z',
+    source: 'D:/Saves',
+    fileCount: 3,
+    bytes: 2_400_000,
+  });
+  mocks.restoreSaves.mockResolvedValue({
+    backupId: 'backup-1',
+    folder: 'D:/Saves',
+    restored: 3,
+    keptCurrent: [],
+  });
 });
 
 describe('the card', () => {
@@ -217,5 +237,50 @@ describe('second opinion', () => {
     await waitFor(() => expect(mocks.readCrashArtifact).toHaveBeenCalledWith('s2', 'log-1'));
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('a crash log'));
     await waitFor(() => expect(mocks.openExternalUrl).toHaveBeenCalledWith('https://example.test/analyzer'));
+  });
+});
+
+describe('backing up saves before a test', () => {
+  it('copies the saves, then says so with a Restore saves button', async () => {
+    mocks.listCrashAnswers.mockResolvedValue(list());
+    render(<CrashAnswerOverview instanceId="inst" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'See what happened' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Test without Example Mod' }));
+
+    await waitFor(() => expect(mocks.backupSaves).toHaveBeenCalledWith('inst'));
+    const note = await screen.findByTestId('crash-save-warning');
+    expect(note).toHaveTextContent(
+      'Agora backed up your saves before this test. You can restore them from here.',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Restore saves' }));
+    await waitFor(() => expect(mocks.restoreSaves).toHaveBeenCalledWith('inst', 'backup-1'));
+    expect(await screen.findByText('Agora put 3 save files back.')).toBeInTheDocument();
+  });
+
+  it('keeps the old wording when no backup could be made, after telling the user', async () => {
+    mocks.listCrashAnswers.mockResolvedValue(list());
+    mocks.backupSaves.mockRejectedValue('this instance has no save folder Agora can find');
+    render(<CrashAnswerOverview instanceId="inst" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'See what happened' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Test without Example Mod' }));
+
+    await waitFor(() => expect(mocks.backupSaves).toHaveBeenCalledWith('inst'));
+    expect(await screen.findByTestId('crash-save-warning')).toHaveTextContent(
+      'Back up your saves before you test, or test on a new game.',
+    );
+    expect(screen.queryByRole('button', { name: 'Restore saves' })).toBeNull();
+  });
+
+  it('shows the backed-up wording when returning to an answer whose test was prepared', async () => {
+    mocks.listCrashAnswers.mockResolvedValue(list());
+    mocks.getSetting.mockResolvedValue('backup-1');
+    render(<CrashAnswerOverview instanceId="inst" />);
+    fireEvent.click(await screen.findByRole('button', { name: 'See what happened' }));
+
+    expect(await screen.findByTestId('crash-save-warning')).toHaveTextContent(
+      'Agora backed up your saves before this test.',
+    );
+    expect(screen.getByRole('button', { name: 'Restore saves' })).toBeInTheDocument();
   });
 });

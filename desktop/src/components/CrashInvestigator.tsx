@@ -997,6 +997,7 @@ export function CrashInvestigator({
               onAskPhostwood={loaded.origin === 'session' || lastText !== null ? () => void askPhostwood() : undefined}
               onShowFile={loaded.sessionId === undefined ? undefined : handleShowFile}
               onTestWithout={(candidate) => { void beginTest(candidate); }}
+              saveBackup={recoverySnapshotId ? 'minecraft' : undefined}
               onAction={handleAction}
             />
 
