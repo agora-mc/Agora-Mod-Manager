@@ -5126,3 +5126,96 @@ A plugin script can run a WebAssembly module it ships, for work too slow or too 
 - **A plain list read never runs the sorter.** Core caches the last notes per list, keyed by the order, the active set, each item's file size and modification time, and the sorter's `dataVersion` from its status hook. A matching read returns the cached notes; otherwise it returns none and an out-of-date flag. The desktop shows the list at once and fetches the notes in the background through a separate call; a newer read ignores a stale result. Sort and Update refresh the cache.
 - **A list can have a plugin-provided sorter.** `rules.sorter` names a hook that returns a whole order plus notes. Core checks that the order is a permutation of the list, and keeps locked and always-loaded items where they are. `rules.sorter.update` optionally names a hook behind an update button (LOOT's masterlist). With that, `rules.loot` and libloot leave core.
 - **Vendored patches** to a third-party library carry a comment saying they might be worth offering upstream, and are not offered without the owner's say.
+
+---
+
+## 31. PLUGIN OVERLAPS AND LOAD ORDER RULES
+
+### 31.1 What this is for
+
+In a Creation Engine game, two plugins that change the same record cannot both win: the one that
+loads later replaces the other's change, silently. Real setups have hundreds of these, and most are
+on purpose (a patch exists to combine two mods). The player needs to see the ones that are not on
+purpose, decide who wins, and have that decision survive every later sort. Agora does this without
+per-mod curation: the game reads the records, core decides what is a real conflict, and the player
+decides the winner. (Owner decision, 2026-11-14: this ships with the crash doctor, not later.)
+
+LOOT's own checks run before launch too (31.6): the order it would choose, its warnings, its
+"incompatible with" and "requires" rules, and its cleaning notes.
+
+### 31.2 Words
+
+- **Record key:** an opaque string naming one record across plugins. For Creation Engine it is the
+  record's FormID resolved to the plugin that first defines it, e.g. `Skyrim.esm:0ABEF6`.
+- **Record label:** how a person reads the key, e.g. `GMST fJumpHeightMin` (type and editor id).
+- **Digest:** a hash of what the record says (its data, decompressed, without fields that change
+  nothing in game such as version-control stamps). Equal digests mean the same change.
+- **Changer:** a plugin that has the record and whose digest differs from the record's previous
+  provider in load order. A plugin whose digest equals its master's copy (an "identical to master"
+  record) is not a changer.
+
+### 31.3 Who does what
+
+- **The game's plugin** reads records. A list may declare `rules.overlaps` (a hook, beside
+  `rules.sorter`) that, given the active items in load order, returns only the record keys that
+  two or more items have, with each item's digest and a label per key:
+  `{ keys: [{ key, label, items: [{ name, digest }] }], notes: [...] }`. It indexes each plugin file
+  once and keeps the index in its file store, keyed by name, size, modification time and its own
+  index version, so a warm run over 300 plugins takes about a second. A file it cannot read is a
+  note naming the file ("could not check"), never an empty result. For Creation Engine this is a
+  WebAssembly module in `packages/official/creation-engine` (§30.13), separate from `loot-sort`.
+- **Core** (game-free) classifies each key in the current order:
+  - the **winner** is the last item that has it;
+  - when every changer's digest is the same, the plugins **agree**: nothing to show;
+  - when the winner lists every other changer as a master, the key is **patched**: shown as
+    resolved, never warned about;
+  - when a user rule (31.4) orders the winner after every other changer, the key is **decided**;
+  - otherwise it is a **conflict**: each other changer **loses** its change to the winner.
+  Core groups conflicts by pair (winner, loser) with a count and up to ten labels, and keeps the
+  result in the same cache as sorter notes (keyed by order, active set, file sizes and times), so a
+  plain list read never runs the hook.
+- **The player** decides, per pair: **let the other one win** (adds a rule and moves it now) or
+  **keep this order** (adds the rule that matches the current order, so the pair is decided).
+  Nothing is ever reordered or rewritten without the player asking.
+
+### 31.4 Load order rules
+
+Core keeps, per instance and list, rules of one kind: **`<item> loads after <other>`**. Locks stay
+as they are. Rules are honoured by every reorder: the masters-only sort, a plugin sorter (handed
+the rules in its request; LOOT receives them as user metadata `after` entries) and a manual move
+(a move that breaks a rule asks first, and the answer can remove the rule). A rule that contradicts
+a master requirement, or that would form a cycle, is refused with the reason. A rule naming an item
+that is no longer in the list is kept and shown as unused, so turning a mod off and on keeps it.
+
+### 31.5 Before launch
+
+The instance check and the launch check (one shared function) report:
+- **Info:** "N conflicts between M pairs of plugins", with the command or button to see them.
+- **Warning,** only for a pair that is new since the last launch (an item added, turned on or
+  moved since the load order the session ledger recorded): "'A' now replaces N changes made by 'B'
+  (e.g. GMST fJumpHeightMin). Keep this order, or let 'B' win." Never a block.
+
+### 31.6 LOOT before launch
+
+When a masterlist has been downloaded, the check runs the sorter with the cached notes and reports:
+- **Warning:** LOOT would move N plugins, with `plugins sort` (and what it would move, on request).
+- LOOT's messages at their own level (warn, error); `say` messages stay in the plugin view.
+- **Warning:** an active plugin LOOT marks as incompatible with another active plugin.
+- **Warning:** an active plugin LOOT says requires a file that is not present.
+- **Cleaning:** the counts LOOT records (identical-to-master records, deleted references, deleted
+  navmeshes) with the cleaning guide. Deleted navmeshes are a warning (a known crash cause), the
+  rest info.
+Without a masterlist, one info line says how to get one, naming the setting when downloads by
+plugins are turned off. Links in LOOT's messages are shown as text plus address, and never rendered
+as HTML.
+
+### 31.7 Where the player sees it
+
+- **CLI:** `agora games instance plugins conflicts <instance> [--plugin <name>] [--json]`;
+  `agora games instance plugins rule add <instance> <item> --after <other>`, `rule list`,
+  `rule remove`; the check and launch lines above.
+- **Desktop, Plugins tab:** each row shows how many changes it wins and loses, and against whom; a
+  Conflicts view lists pairs with their records and the two actions; the check's findings appear
+  where the other pre-launch findings do.
+- **Crash doctor:** a crash whose evidence names a record or plugin that lost a conflict may cite
+  the conflict as a finding (`core.overlap` facts), never as certain.
