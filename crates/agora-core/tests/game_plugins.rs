@@ -2016,14 +2016,25 @@ fn overlaps_are_cached_and_a_plain_read_does_not_run_the_reader() {
     def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
     let h = Harness::with_definition(def);
     let inst = h.instance("overlaps-cache");
-    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
     h.add(&inst, &item);
     h.deploy(&inst);
     h.answer_overlaps(OverlapReply {
         keys: vec![overlap_key(
             "Game:000001",
             "GMST fJumpHeightMin",
-            &[("A.esp", "old"), ("B.esp", "new")],
+            &[
+                ("A.esp", "original"),
+                ("B.esp", "old"),
+                ("C.esp", "new"),
+            ],
         )],
         notes: Vec::new(),
     });
@@ -2031,8 +2042,8 @@ fn overlaps_are_cached_and_a_plain_read_does_not_run_the_reader() {
     let report = game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None)
         .expect("overlaps were checked");
     assert_eq!(report.pairs.len(), 1);
-    assert_eq!(report.pairs[0].winner, "B.esp");
-    assert_eq!(report.pairs[0].loser, "A.esp");
+    assert_eq!(report.pairs[0].winner, "C.esp");
+    assert_eq!(report.pairs[0].loser, "B.esp");
     assert_eq!(h.overlaps_calls(), 1);
 
     let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
