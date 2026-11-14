@@ -8,8 +8,8 @@ use agora_core::crash_engine::{
 };
 use agora_game_api::crash::{
     certainty_claim, AttrValue, Cause, Coverage, CoverageState, CrashPack, Fact, Level, MatchedBy,
-    NextStepKind, Owner, ParserOutput, Producer, Ref, Role, Rule, Scalar, Scope, SessionVerdict,
-    Strength, CRASH_CONTRACT_VERSION,
+    NextStepKind, Owner, ParserLimits, ParserOutput, Producer, Ref, Role, Rule, Scalar, Scope,
+    SessionVerdict, Strength, CRASH_CONTRACT_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -2795,4 +2795,49 @@ fn a_whole_file_match_respects_its_source_and_reports_the_line() {
     assert_eq!(evidence.len(), 1, "{evidence:?}");
     assert_eq!(evidence[0].span.line_start, Some(2));
     assert_eq!(evidence[0].quote.as_deref(), Some("the widget fell over"));
+}
+
+/// A whole-file match quotes the line it landed on. The parsers never hand a line longer than
+/// `max_line_len` to a rule, but the raw text does not have that bound: a long line must not make
+/// the answer carry an unbounded quote.
+#[test]
+fn a_whole_file_match_does_not_copy_an_unbounded_line_into_the_answer() {
+    let rule = json!({
+        "id": "long_line",
+        "version": 1,
+        "when": { "text": { "whole_file": true, "regex": "needle" } },
+        "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+        "text": { "headline": { "en": "A long line matched." } }
+    });
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with("p", "reader", "some_log", Vec::new(), Vec::new());
+    let mut text = "x".repeat(200_000);
+    text.push_str("needle\n");
+    let texts = [ArtifactText {
+        artifact: "crash.log".to_string(),
+        source: None,
+        text,
+    }];
+    let resolver = FakeResolver::new();
+    let inspector = FixedInspector(Inspection::Missing);
+    let evaluated = evaluate(&EvaluateInput {
+        packs: &packs,
+        parsed: std::slice::from_ref(&parsed),
+        texts: &texts,
+        engine_facts: &EngineFacts::new(),
+        runtime_version: None,
+        resolver: &resolver,
+        inspector: &inspector,
+    });
+    assert_eq!(evaluated.findings.len(), 1, "{:?}", evaluated.findings);
+    let quote = evaluated.findings[0].evidence[0]
+        .quote
+        .as_deref()
+        .unwrap_or_default();
+    assert!(
+        quote.len() <= ParserLimits::DEFAULT.max_line_len as usize,
+        "the evidence quote is {} bytes, past the {} byte line limit",
+        quote.len(),
+        ParserLimits::DEFAULT.max_line_len
+    );
 }

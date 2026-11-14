@@ -290,4 +290,25 @@ mod tests {
         assert!(report.contains("## Crash Log"));
         assert!(!report.contains("mod(s) installed"));
     }
+
+    /// The log is shown inside one fenced block. A log line can itself be a fence, and then the
+    /// rest of the log becomes live Markdown: headings, links and instructions a reader trusts.
+    #[test]
+    fn a_crash_log_cannot_close_the_code_fence_it_is_shown_in() {
+        let ctx = CrashReportContext {
+            crash_log: Some(
+                "first invented line\n```\n## Injected heading\nlast invented line".into(),
+            ),
+            ..context()
+        };
+        let report = build_crash_report(None, &ctx);
+        let fences = report
+            .lines()
+            .filter(|line| line.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(
+            fences, 2,
+            "the crash log closed its own code fence and became markup: {report}"
+        );
+    }
 }

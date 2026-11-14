@@ -37,6 +37,10 @@ Details:
 ";
 
 fn community(rows: &[(&str, &str)]) -> Vec<LoadedCrashPack> {
+    community_with_pattern(rows, "shiny example widget fell over")
+}
+
+fn community_with_pattern(rows: &[(&str, &str)], pattern: &str) -> Vec<LoadedCrashPack> {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE crash_signatures (
@@ -51,9 +55,9 @@ fn community(rows: &[(&str, &str)]) -> Vec<LoadedCrashPack> {
             "INSERT INTO crash_signatures
                 (id, name, games_json, regex_pattern, level, cause, text,
                  action_kind, action_content_key, action_label)
-             VALUES (?1, ?1, ?2, 'shiny example widget fell over', 'likely', 'other', ?3,
+             VALUES (?1, ?1, ?2, ?3, 'likely', 'other', ?4,
                      NULL, NULL, NULL)",
-            rusqlite::params![id, games, format!("{id} matched.")],
+            rusqlite::params![id, games, pattern, format!("{id} matched.")],
         )
         .unwrap();
     }
@@ -171,5 +175,22 @@ fn a_minecraft_signature_finds_a_line_in_a_crash_report() {
             .as_deref()
             .is_some_and(|line| line.contains("shiny example widget fell over")),
         "{evidence:?}"
+    );
+}
+
+/// A pattern that matches the empty string matches every artifact without being about anything in
+/// it. The catalog must not turn such a row into a finding on an unrelated crash.
+#[test]
+fn an_empty_matching_signature_does_not_fire_on_every_log() {
+    let output = analyze_loose(community_with_pattern(
+        &[("empty_pattern_widget", r#"["minecraft"]"#)],
+        "^",
+    ));
+    let headlines = headlines(&output);
+    assert!(
+        !headlines
+            .iter()
+            .any(|text| text == "empty_pattern_widget matched."),
+        "a pattern matching the empty string fired on an unrelated log: {headlines:?}"
     );
 }

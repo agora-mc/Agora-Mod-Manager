@@ -857,6 +857,44 @@ class TestCrashSignatureFormat(unittest.TestCase):
             ("likely", "missing_requirement", "install_content", "example-api", "Install Example API"),
         )
 
+    def test_rust_incompatible_regex_is_rejected(self):
+        """The app runs Rust's regex crate, which has no look-around or backreferences.
+
+        A pattern Python accepts but Rust refuses compiles into the catalog and then makes
+        the row unreadable at run time, so the compiler must refuse it here.
+        """
+        _compile.insert_crash_signature(
+            self._conn,
+            self._signature(id="lookahead", regex_pattern="(?=abc)"),
+            self._rejected,
+        )
+        self.assertEqual(self._rejected[0], 1)
+        row = self._conn.execute(
+            "SELECT id FROM crash_signatures WHERE id = ?", ("lookahead",)
+        ).fetchone()
+        self.assertIsNone(row)
+
+    def test_duplicate_id_is_rejected_not_a_crash(self):
+        """Two signature files may carry the same id; the second is skipped, never fatal.
+
+        The app promises one bad row never stops the others, and the nightly compile keeps
+        going. A bare INSERT on the primary key raises IntegrityError and loses the whole
+        catalog instead.
+        """
+        _compile.insert_crash_signature(self._conn, self._signature(id="dupe"), self._rejected)
+        try:
+            _compile.insert_crash_signature(
+                self._conn,
+                self._signature(id="dupe", regex_pattern="Another invented line"),
+                self._rejected,
+            )
+        except _compile.sqlite3.IntegrityError:
+            self.fail("a duplicate id raised instead of being rejected")
+        self.assertEqual(self._rejected[0], 1)
+        rows = self._conn.execute(
+            "SELECT COUNT(*) FROM crash_signatures WHERE id = ?", ("dupe",)
+        ).fetchone()
+        self.assertEqual(rows[0], 1)
 
 
 # ---------------------------------------------------------------------------
