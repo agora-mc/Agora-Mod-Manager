@@ -376,7 +376,7 @@ fn a_manifest_records_ini_keys_so_a_settings_change_names_one() {
     assert_eq!(setting.to.as_deref(), Some("5"));
     assert_eq!(
         agora_core::crash_engine::change::describe(named[0]),
-        "changed uGridsToLoad in user/config.txt from 11 to 5"
+        "changed uGridsToLoad in config.txt from 11 to 5"
     );
 }
 

@@ -203,16 +203,19 @@ pub fn describe(change: &ManifestChange) -> String {
 }
 
 /// One setting by name and both values, e.g. "changed uGridsToLoad in Skyrim.ini from 11 to 5".
-/// The section is not repeated in the sentence; the file and key are what a person looks for.
+/// The section is not repeated in the sentence, and the file is its own name rather than the
+/// instance's mapped path, which is what a person is looking for.
 fn describe_setting(setting: &SettingChange) -> String {
+    let file = setting
+        .file
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&setting.file);
     match (&setting.from, &setting.to) {
-        (Some(from), Some(to)) => format!(
-            "changed {} in {} from {from} to {to}",
-            setting.key, setting.file
-        ),
-        (None, Some(to)) => format!("set {} in {} to {to}", setting.key, setting.file),
-        (Some(from), None) => format!("removed {} from {} (was {from})", setting.key, setting.file),
-        (None, None) => format!("changed {} in {}", setting.key, setting.file),
+        (Some(from), Some(to)) => format!("changed {} in {file} from {from} to {to}", setting.key),
+        (None, Some(to)) => format!("set {} in {file} to {to}", setting.key),
+        (Some(from), None) => format!("removed {} from {file} (was {from})", setting.key),
+        (None, None) => format!("changed {} in {file}", setting.key),
     }
 }
 

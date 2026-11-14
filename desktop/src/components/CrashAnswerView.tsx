@@ -698,12 +698,13 @@ export function describeChange(change: CrashChange): string {
     case 'settings': {
       const setting = change.setting;
       if (setting === undefined) return "changed the instance's settings";
+      const file = setting.file.split(/[\\/]/).pop() ?? setting.file;
       if (setting.from !== undefined && setting.to !== undefined) {
-        return `changed ${setting.key} in ${setting.file} from ${setting.from} to ${setting.to}`;
+        return `changed ${setting.key} in ${file} from ${setting.from} to ${setting.to}`;
       }
-      if (setting.to !== undefined) return `set ${setting.key} in ${setting.file} to ${setting.to}`;
-      if (setting.from !== undefined) return `removed ${setting.key} from ${setting.file} (was ${setting.from})`;
-      return `changed ${setting.key} in ${setting.file}`;
+      if (setting.to !== undefined) return `set ${setting.key} in ${file} to ${setting.to}`;
+      if (setting.from !== undefined) return `removed ${setting.key} from ${file} (was ${setting.from})`;
+      return `changed ${setting.key} in ${file}`;
     }
     default:
       return change.kind.split('_').join(' ');
