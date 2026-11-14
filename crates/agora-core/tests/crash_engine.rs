@@ -297,6 +297,59 @@ fn empty_parser_output_abstains_and_names_nobody() {
     assert_ne!(answer.next.kind, NextStepKind::NothingNeeded);
 }
 
+#[test]
+fn the_same_finding_in_two_files_appears_once_with_evidence_from_both() {
+    let resolver = FakeResolver::new().with("module", "modA.dll", item("mod-a", "Mod A"), None);
+    let packs = vec![pack(
+        "p",
+        vec![root_cause_rule(
+            "same_rule",
+            "known_signature",
+            10,
+            "likely",
+        )],
+    )];
+    let mut log = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    log.artifact = "latest.log".to_string();
+    let mut captured = parsed_with(
+        "p",
+        "parser",
+        "test",
+        vec![frame(0, "modA.dll")],
+        Vec::new(),
+    );
+    captured.artifact = "agora-launch-output.log".to_string();
+    let (evaluated, consensus) = run(
+        &packs,
+        &[log, captured],
+        &EngineFacts::new(),
+        &resolver,
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    let answer = answer_for(
+        SessionVerdict::Crashed {
+            how: MatchedBy::Time,
+        },
+        &evaluated,
+        &consensus,
+    );
+    assert_eq!(answer.findings.len(), 1, "{:#?}", answer.findings);
+    let mut artifacts: Vec<String> = answer.findings[0]
+        .evidence
+        .iter()
+        .map(|evidence| evidence.artifact.clone())
+        .collect();
+    artifacts.sort();
+    assert_eq!(artifacts, ["agora-launch-output.log", "latest.log"]);
+}
+
 fn example(name: &str) -> String {
     let path = match name {
         "minecraft.pack" => {
