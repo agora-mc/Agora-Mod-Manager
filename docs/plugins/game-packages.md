@@ -178,6 +178,30 @@ A plain list of rules is still accepted.
 
 The Creation Engine package does this for Skyrim. Its sorter hook keeps the verified LOOT masterlist in the plugin's blob store and runs libloot as a WebAssembly module, `wasm/loot-sort.wasm`, through `agora.wasm.run` ([`packages/official/creation-engine`](../../packages/official/creation-engine)). Nothing LOOT-related is compiled into Agora or into core, so a community game plugin can provide the same kind of sorter without shipping native code. [WebAssembly modules](README.md#webassembly-modules) covers the sandbox, mounts and limits.
 
+### Providing an overlaps reader
+
+`rules.overlaps` lets your plugin report the records that two or more active plugins change, so Agora can classify them without knowing the game's file format. It gets the sorter's request and answers only the keys the plugins share:
+
+```json
+{
+  "keys": [
+    {
+      "key": "Game:0ABEF6",
+      "label": "GMST fJumpHeightMin",
+      "items": [
+        { "name": "Heavy Boots.esp", "digest": "..." },
+        { "name": "Moon Jump.esp", "digest": "..." }
+      ]
+    }
+  ],
+  "notes": [{ "level": "warn", "text": "could not read Corrupt.esp" }]
+}
+```
+
+`key` is opaque and stable across plugins (for Creation Engine, the FormID resolved to the plugin that first defines it), `label` is how a person reads it, and `digest` is a hash of the record's data. A plugin whose digest equals the previous holder's is not a changer. A file the reader cannot open is a note naming it, never an empty result. Core refuses a reply that names a plugin the list does not load, repeats an item, or gives a key fewer than two items: that is "could not check overlaps", never "no conflicts".
+
+Core decides the winner (the last plugin in load order), whether the plugins agree, whether the winner patches the key by listing every other changer as a master, whether a load-after rule decides it, or whether it is a conflict. Conflicts are grouped by winner and loser with a count and up to ten labels. Agora caches the report beside a sorter's notes, under the same key, so a plain list read never runs the hook. Read records once and keep the index in your own blob store, keyed by name, size, modification time and your index version, so a warm run over a large list is quick.
+
 ## Tools
 
 A tool is a program that works on the instance's mods. By default whatever it writes is kept in a generated layer of its own, so the player can compare or undo it. `output` can instead be `mod`, which imports a folder the tool wrote as a content item.
@@ -238,7 +262,7 @@ Name your script's functions under `behaviours` in the package:
 | `diagnostics` | Launch checks | A list of problems |
 | `prepare_launch` | Launching a game with no `launch` | A launch recipe |
 
-Formats name their own functions: `parse` and `render`. Those are not in `behaviours`; the load order's `format` names them. A list's `rules.entry` names its rule function, and wins over `behaviours.load_order_rules`. A list's `rules.sorter.hook` names its sort function, and `rules.sorter.update` names the function behind the tab's update button; both are owned by the plugin that declared them, like every other behaviour.
+Formats name their own functions: `parse` and `render`. Those are not in `behaviours`; the load order's `format` names them. A list's `rules.entry` names its rule function, and wins over `behaviours.load_order_rules`. A list's `rules.sorter.hook` names its sort function, and `rules.sorter.update` names the function behind the tab's update button; both are owned by the plugin that declared them, like every other behaviour. `rules.overlaps.hook` names its record reader and is owned the same way.
 
 Every hook is called with one object, and its reply is JSON:
 
@@ -252,8 +276,9 @@ Every hook is called with one object, and its reply is JSON:
 | `prepare_launch` | `{ "context": GameContext }` | `LaunchRecipe`, or `null` |
 | `parse` | `{ "context": GameContext, "listId": string, "bytes": [number] }` | `[LoadOrderLine]`, or `null` |
 | `render` | `{ "context": GameContext, "listId": string, "lines": [LoadOrderLine] }` | a string, or `[number]` byte values |
-| `rules.sorter.hook` | `{ "context": GameContext, "listId": string, "options": any, "entries": [SorterEntry], "active": [string], "locked": [string], "implicit": [string] }` | `SorterReply`, or `null` |
+| `rules.sorter.hook` | `{ "context": GameContext, "listId": string, "options": any, "entries": [SorterEntry], "active": [string], "locked": [string], "implicit": [string], "rules": [{ "item": string, "after": string }] }` | `SorterReply`, or `null` |
 | `rules.sorter.update` | the same, plus `"update": boolean` | `SorterStatus`, or `null` |
+| `rules.overlaps.hook` | the same as `rules.sorter.hook`, with `options` from `rules.overlaps` | `OverlapReply`, or `null` |
 
 - `GameInstall` has `id`, `runtime`, `kind` (`base_game`, `add_on` or `tool`), `location`, `volume` and `capabilities`.
 - `RuntimeIdentity` has `game`, `store`, `version` and optional `build`.

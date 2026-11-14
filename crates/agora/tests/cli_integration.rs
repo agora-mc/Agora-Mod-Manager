@@ -388,6 +388,11 @@ const NESTED_COMMANDS: &[&[&str]] = &[
     &["games", "instance", "plugins", "lock"],
     &["games", "instance", "plugins", "unlock"],
     &["games", "instance", "plugins", "check"],
+    &["games", "instance", "plugins", "conflicts"],
+    &["games", "instance", "plugins", "rule"],
+    &["games", "instance", "plugins", "rule", "add"],
+    &["games", "instance", "plugins", "rule", "list"],
+    &["games", "instance", "plugins", "rule", "remove"],
     &["games", "instance", "tools"],
     &["games", "instance", "tools", "list"],
     &["games", "instance", "tools", "run"],
@@ -5549,6 +5554,45 @@ fn games_instance_checks_change_no_database_row() {
     }
 
     assert_eq!(local_state_rows(&fixture.data_dir), before);
+}
+
+#[test]
+fn games_instance_plugins_rule_lists_and_removes_rules() {
+    let fixture = skyrim_fixture("1.6.1170.0", &[]);
+    let id = fixture.instance_id.clone();
+
+    let out = run_agora(
+        &fixture.data_dir,
+        &["games", "instance", "plugins", "rule", "list", &id],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("No load-after rules"));
+
+    let out = run_agora(
+        &fixture.data_dir,
+        &[
+            "games",
+            "instance",
+            "plugins",
+            "rule",
+            "remove",
+            &id,
+            "Skyrim.esm",
+            "--after",
+            "Skyrim.esm",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("No rule says"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

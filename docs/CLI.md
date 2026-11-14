@@ -225,10 +225,16 @@ classified as a base game, add-on or tool (MASTER_SPEC §26.3), and manages pinn
 | `agora games instance plugins disable <instance> <plugin>` | Deactivate a plugin; it stays listed and a redeploy leaves it that way |
 | `agora games instance plugins sort <instance> [--dry-run]` | Sort the list with LOOT's masterlist when one is saved, otherwise by masters alone. Locked and always-loaded plugins do not move, and free plugins only trade places among free slots; `--dry-run` prints the moves and writes nothing. With no saved masterlist it says it sorted by masters only |
 | `agora games instance plugins masterlist <instance>` | Download and verify LOOT's masterlist for the game (through GitHub, checked against the git blob SHA-1). Nothing is downloaded unless you run this, and a failed check leaves the saved copy alone |
-| `agora games instance plugins move <instance> <plugin> (--to N \| --before P \| --after P)` | Move a plugin to a 1-based position, or just before or after another plugin. Locked plugins do not move |
+| `agora games instance plugins move <instance> <plugin> (--to N \| --before P \| --after P) [--break-rule]` | Move a plugin to a 1-based position, or just before or after another plugin. Locked plugins do not move. A move that breaks a load-after rule is refused and names the rule and the command that removes it; `--break-rule` removes that rule instead |
 | `agora games instance plugins lock <instance> <plugin>` | Lock a plugin's place, so sort and move leave it where it is |
 | `agora games instance plugins unlock <instance> <plugin>` | Unlock a plugin's place |
 | `agora games instance plugins check <instance> [--json]` | Print the load order findings (a master that does not come first, a master loop, an unreadable header, a plugin listed twice, too many plugins). A master that loads after its plugin is named with the `plugins sort` command that fixes it. Exits 1 only when a launch would refuse (a missing or inactive master, a master loop, too many plugins); warnings exit 0 |
+| `agora games instance plugins conflicts <instance> [--plugin <name>] [--json]` | List the record changes one active plugin's copy replaces in another's, grouped by the pair. Each pair names the winner and loser, how many changes, and example record labels. Records the plugins agree on, records the winner patches (it lists the other plugin as a master), and records a load-after rule decides are counted rather than warned about. `--plugin` shows only the pairs that name that plugin and what it wins and loses. Exits 1 when the game declares no overlaps reader or the reader fails, because conflicts then could not be checked |
+| `agora games instance plugins conflicts <instance> --let-win <loser> --over <winner>` | Let the plugin that currently loses win: add the `--let-win` rule and move that plugin after the winner now. The move is refused if it breaks another rule |
+| `agora games instance plugins conflicts <instance> --keep <winner> --over <loser>` | Keep the current order: add the rule that makes the winner load after the loser, so a later sort keeps this pair as it is |
+| `agora games instance plugins rule add <instance> <item> --after <other>` | Make `<item>` load after `<other>`. A rule that contradicts a master, or that would make a loop with the rules and masters already in place, is refused with the reason |
+| `agora games instance plugins rule list <instance>` | List the instance's load-after rules, and say when a rule is unused because one of its plugins is no longer in the list |
+| `agora games instance plugins rule remove <instance> <item> --after <other>` | Remove a load-after rule, including an unused one |
 | `agora games instance ini <id> [<file> [<section> [<key> [<value>]]]] [--unset]` | Read and change the game's INI files as the instance keeps them. With no file, lists the game's per-user files for the instance's store, whether the instance has its own copy, and the game's own file. With a file, lists its keys and where they came from: the instance's copy, the game's file while the instance has no copy yet, or nothing. With a section and key, prints the value and exits 1 when it is not set; with a value, sets it; with `--unset`, removes the key. An edit writes only the instance's copy, which is swapped in for the next launch; when the instance has no copy yet it starts from the game's file. The game's own file is never edited. Lines Agora does not change are kept as they are: comments, spacing around `=`, the spelling of keys and sections, line endings, a byte order mark, and lines it cannot parse. Names are case-insensitive. Refused while the game's session is running, or while an earlier session's files have not been put back (`games user-files restore`). `--json` prints the result |
 | `agora games instance saves <id> [own\|shared] [--json]` | Show the instance's save choice, or make it `own` (saves of its own, through the game's own save-folder setting, such as `SLocalSavePath` for Skyrim) or `shared` (the game's shared folder). With no choice, it shows the folder in use, the other folder and its saves, and the setting's value. Switching changes only where the game looks. It never moves, copies or deletes a save file, and it says that the saves in the other folder stay where they are. `own` records the setting's value from before, so `shared` can put it back; `shared` leaves a setting that was changed by hand since, and says so. Refused while the game's session is running |
 | `agora games instance tools list <instance> [--json]` | List each tool the game declares (for example `nemesis` for Skyrim SE), with its current and previous output, and whether that output is `current`, `stale` (an input changed since it was built) or `unknown` (it was imported, so nobody recorded its inputs). A tool with no output says `not built`. A launch and `games instance check` warn about stale and unknown output; they never refuse for it, and say which command rebuilds it |
@@ -261,6 +267,18 @@ plugin, and free plugins only trade places among free slots. A plugin that loads
 master it cannot get past is reported as blocked: the only fix is to move that plugin down below
 the master, which sort does not do. `plugins masterlist` downloads the masterlist, and only when
 you ask for it.
+
+Two plugins that change the same record cannot both win: the one that loads later replaces the
+other's change. `plugins conflicts` shows the pairs where that happens, with how many records and
+an example for each. A record the plugins make identically is not a conflict, nor is one the
+winner patches by listing the other plugin as a master, nor one covered by a rule. The two
+actions add the rule that records your decision, so it survives every later sort:
+`--keep <winner> --over <loser>` keeps the plugin that currently wins, and
+`--let-win <loser> --over <winner>` also moves the losing plugin after the winner now. Rules are
+kept per instance and list by `plugins rule`, and a rule whose plugin leaves the list is kept and
+shown as unused, so turning a mod off and on does not lose the decision. `games instance check`
+counts the conflicts, and warns when a pair is new since the last launch because a plugin was
+added, turned on or moved.
 
 ### Downloads
 

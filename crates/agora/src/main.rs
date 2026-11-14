@@ -762,6 +762,62 @@ impl InstanceToolsCmd {
 }
 
 #[derive(Subcommand)]
+enum PluginRuleCmd {
+    /// Make one plugin load after another.
+    Add {
+        /// Instance ID.
+        instance_id: String,
+        /// Plugin file name, e.g. SkyUI_SE.esp.
+        item: String,
+        /// The plugin it must load after.
+        #[arg(long)]
+        after: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
+    },
+    /// List this instance's load-after rules, including unused ones.
+    List {
+        /// Instance ID.
+        instance_id: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
+    },
+    /// Remove a load-after rule.
+    Remove {
+        /// Instance ID.
+        instance_id: String,
+        /// Plugin file name, e.g. SkyUI_SE.esp.
+        item: String,
+        /// The plugin it must load after.
+        #[arg(long)]
+        after: String,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
+    },
+}
+
+impl PluginRuleCmd {
+    fn instance_id(&self) -> &str {
+        match self {
+            PluginRuleCmd::Add { instance_id, .. }
+            | PluginRuleCmd::List { instance_id, .. }
+            | PluginRuleCmd::Remove { instance_id, .. } => instance_id,
+        }
+    }
+
+    fn list_id(&self) -> Option<String> {
+        match self {
+            PluginRuleCmd::Add { list, .. }
+            | PluginRuleCmd::List { list, .. }
+            | PluginRuleCmd::Remove { list, .. } => list.clone(),
+        }
+    }
+}
+
+#[derive(Subcommand)]
 enum InstancePluginsCmd {
     /// Activate a plugin in an instance's plugin list.
     Enable {
@@ -809,6 +865,9 @@ enum InstancePluginsCmd {
         /// Move to just after this plugin.
         #[arg(long)]
         after: Option<String>,
+        /// Allow the move to remove a load-after rule it would break.
+        #[arg(long)]
+        break_rule: bool,
         /// Load order id; the game's first list when omitted.
         #[arg(long)]
         list: Option<String>,
@@ -848,6 +907,31 @@ enum InstancePluginsCmd {
         /// Load order id; the game's first list when omitted.
         #[arg(long)]
         list: Option<String>,
+    },
+    /// Show the record changes one plugin's changes replace, or another plugin replaces.
+    Conflicts {
+        /// Instance ID.
+        instance_id: String,
+        /// Show only pairs that name this plugin.
+        #[arg(long)]
+        plugin: Option<String>,
+        /// Let this plugin, which currently loses, win over the other.
+        #[arg(long)]
+        let_win: Option<String>,
+        /// Keep the plugin that currently wins over the other.
+        #[arg(long)]
+        keep: Option<String>,
+        /// The other plugin of the pair named by --let-win or --keep.
+        #[arg(long)]
+        over: Option<String>,
+        /// Load order id; the game's first list when omitted.
+        #[arg(long)]
+        list: Option<String>,
+    },
+    /// Keep, add or remove the rules that make one plugin load after another.
+    Rule {
+        #[command(subcommand)]
+        action: PluginRuleCmd,
     },
 }
 
@@ -10029,6 +10113,8 @@ impl InstancePluginsCmd {
                 | InstancePluginsCmd::Unlock { .. }
                 | InstancePluginsCmd::Check { .. }
                 | InstancePluginsCmd::Masterlist { .. }
+                | InstancePluginsCmd::Conflicts { .. }
+                | InstancePluginsCmd::Rule { .. }
         )
     }
 }
@@ -11265,7 +11351,9 @@ fn plugins_load_order_command(
         | InstancePluginsCmd::Lock { instance_id, .. }
         | InstancePluginsCmd::Unlock { instance_id, .. }
         | InstancePluginsCmd::Check { instance_id, .. }
-        | InstancePluginsCmd::Masterlist { instance_id, .. } => instance_id.clone(),
+        | InstancePluginsCmd::Masterlist { instance_id, .. }
+        | InstancePluginsCmd::Conflicts { instance_id, .. } => instance_id.clone(),
+        InstancePluginsCmd::Rule { action } => action.instance_id().to_string(),
         InstancePluginsCmd::Enable { .. } | InstancePluginsCmd::Disable { .. } => {
             fail("not a load order command".to_string())
         }
@@ -11276,7 +11364,9 @@ fn plugins_load_order_command(
         | InstancePluginsCmd::Lock { list, .. }
         | InstancePluginsCmd::Unlock { list, .. }
         | InstancePluginsCmd::Check { list, .. }
-        | InstancePluginsCmd::Masterlist { list, .. } => list.clone(),
+        | InstancePluginsCmd::Masterlist { list, .. }
+        | InstancePluginsCmd::Conflicts { list, .. } => list.clone(),
+        InstancePluginsCmd::Rule { action } => action.list_id(),
         InstancePluginsCmd::Enable { .. } | InstancePluginsCmd::Disable { .. } => None,
     };
     let record = match agora_core::game_instance::get(ctx, &instance_id)? {
@@ -11362,6 +11452,7 @@ fn plugins_load_order_command(
             to,
             before,
             after,
+            break_rule,
             ..
         } => {
             let target = match (to, before, after) {
@@ -11370,14 +11461,26 @@ fn plugins_load_order_command(
                 (None, None, Some(other)) => MoveTarget::After(other),
                 _ => fail("name one target: --to N, --before PLUGIN or --after PLUGIN".to_string()),
             };
-            match load_order::move_plugin_in(
-                ctx,
-                &instance_id,
-                game_def,
-                list_id.as_deref(),
-                &plugin,
-                &target,
-            ) {
+            let result = if break_rule {
+                load_order::move_plugin_in_breaking_rules(
+                    ctx,
+                    &instance_id,
+                    game_def,
+                    list_id.as_deref(),
+                    &plugin,
+                    &target,
+                )
+            } else {
+                load_order::move_plugin_in(
+                    ctx,
+                    &instance_id,
+                    game_def,
+                    list_id.as_deref(),
+                    &plugin,
+                    &target,
+                )
+            };
+            match result {
                 Ok(report) => {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -11389,7 +11492,18 @@ fn plugins_load_order_command(
                     } else {
                         println!("'{}' is already at position {}.", report.plugin, report.to);
                     }
+                    for rule in &report.removed_rules {
+                        println!(
+                            "Removed the rule that '{}' loads after '{}', because the move broke it.",
+                            rule.item, rule.after
+                        );
+                    }
                 }
+                Err(load_order::LoadOrderError::BreaksRule { item, after, .. }) => fail(format!(
+                    "There is a rule that '{item}' loads after '{after}', and this move breaks it. \
+                     Run 'agora games instance plugins rule remove {instance_id} {item} --after {after}' \
+                     to remove the rule, or pass --break-rule."
+                )),
                 Err(e) => fail(e.to_string()),
             }
         }
@@ -11462,11 +11576,356 @@ fn plugins_load_order_command(
                 Err(e) => fail(e.to_string()),
             }
         }
+        InstancePluginsCmd::Conflicts {
+            plugin,
+            let_win,
+            keep,
+            over,
+            ..
+        } => {
+            let action = match (let_win.as_deref(), keep.as_deref(), over.as_deref()) {
+                (None, None, None) => None,
+                (Some(loser), None, Some(winner)) => Some(ConflictAction {
+                    winner: winner.to_string(),
+                    loser: loser.to_string(),
+                    let_loser_win: true,
+                }),
+                (None, Some(winner), Some(loser)) => Some(ConflictAction {
+                    winner: winner.to_string(),
+                    loser: loser.to_string(),
+                    let_loser_win: false,
+                }),
+                _ => fail(
+                    "use either --let-win <loser> --over <winner>, or --keep <winner> --over <loser>"
+                        .to_string(),
+                ),
+            };
+            let report =
+                match load_order::refresh_overlaps(ctx, &instance_id, game_def, list_id.as_deref())
+                {
+                    Ok(report) => report,
+                    Err(e) => fail(overlap_failure_message(e)),
+                };
+            let action_json = match &action {
+                None => None,
+                Some(action) => {
+                    let pair = report.pairs.iter().find(|pair| {
+                        pair.winner.eq_ignore_ascii_case(&action.winner)
+                            && pair.loser.eq_ignore_ascii_case(&action.loser)
+                    });
+                    if pair.is_none() {
+                        fail(format!(
+                            "There is no conflict where '{}' replaces changes made by '{}'.",
+                            action.winner, action.loser
+                        ));
+                    }
+                    let (item, after) = if action.let_loser_win {
+                        (action.loser.as_str(), action.winner.as_str())
+                    } else {
+                        (action.winner.as_str(), action.loser.as_str())
+                    };
+                    let added = match load_order::add_load_after_rule(
+                        ctx,
+                        &instance_id,
+                        game_def,
+                        list_id.as_deref(),
+                        item,
+                        after,
+                    ) {
+                        Ok(added) => added,
+                        Err(e) => fail(e.to_string()),
+                    };
+                    let mut moved = None;
+                    if action.let_loser_win {
+                        match load_order::move_plugin_in(
+                            ctx,
+                            &instance_id,
+                            game_def,
+                            list_id.as_deref(),
+                            &action.loser,
+                            &MoveTarget::After(action.winner.clone()),
+                        ) {
+                            Ok(report) => moved = Some(report),
+                            Err(e) => {
+                                if added {
+                                    let _ = load_order::remove_load_after_rule(
+                                        ctx,
+                                        &instance_id,
+                                        game_def,
+                                        list_id.as_deref(),
+                                        item,
+                                        after,
+                                    );
+                                }
+                                fail(format!(
+                                    "The rule was not kept, because the move failed: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    Some(serde_json::json!({
+                        "rule_added": added,
+                        "rule": { "item": item, "after": after },
+                        "moved": moved,
+                    }))
+                }
+            };
+            // Re-read after the action so the report says what the player now has.
+            let report = if action.is_some() {
+                match load_order::refresh_overlaps(ctx, &instance_id, game_def, list_id.as_deref())
+                {
+                    Ok(report) => report,
+                    Err(e) => fail(overlap_failure_message(e)),
+                }
+            } else {
+                report
+            };
+            if json {
+                let mut out = serde_json::json!({
+                    "status": "ok",
+                    "instance_id": instance_id,
+                    "conflicts": report.conflicts(),
+                    "pairs": report.pairs,
+                    "patched": report.patched,
+                    "decided": report.decided,
+                    "notes": report.notes,
+                });
+                if let Some(action) = action_json {
+                    if let Some(object) = out.as_object_mut() {
+                        object.insert("action".to_string(), action);
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                if let Some(action) = &action {
+                    let item = if action.let_loser_win {
+                        &action.loser
+                    } else {
+                        &action.winner
+                    };
+                    let after = if action.let_loser_win {
+                        &action.winner
+                    } else {
+                        &action.loser
+                    };
+                    println!("Rule set: '{item}' loads after '{after}'.");
+                    if action.let_loser_win {
+                        println!("Moved '{}' after '{}'.", action.loser, action.winner);
+                    }
+                }
+                print_overlap_report(&instance_id, &report, plugin.as_deref());
+            }
+        }
+        InstancePluginsCmd::Rule { action } => match action {
+            PluginRuleCmd::List { .. } => {
+                let views = match load_order::load_after_rule_views(
+                    ctx,
+                    &instance_id,
+                    game_def,
+                    list_id.as_deref(),
+                ) {
+                    Ok(views) => views,
+                    Err(e) => fail(e.to_string()),
+                };
+                if json {
+                    let out = serde_json::json!({
+                        "status": "ok",
+                        "instance_id": instance_id,
+                        "rules": views,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else if views.is_empty() {
+                    println!("No load-after rules are set for instance '{instance_id}'.");
+                } else {
+                    for view in &views {
+                        match &view.unused {
+                            None => println!("'{}' loads after '{}'.", view.item, view.after),
+                            Some(missing) => println!(
+                                "'{}' loads after '{}' (unused: '{missing}' is not in the list).",
+                                view.item, view.after
+                            ),
+                        }
+                    }
+                }
+            }
+            PluginRuleCmd::Add { item, after, .. } => {
+                let added = match load_order::add_load_after_rule(
+                    ctx,
+                    &instance_id,
+                    game_def,
+                    list_id.as_deref(),
+                    &item,
+                    &after,
+                ) {
+                    Ok(added) => added,
+                    Err(e) => fail(e.to_string()),
+                };
+                if json {
+                    let out = serde_json::json!({
+                        "status": "ok",
+                        "instance_id": instance_id,
+                        "changed": added,
+                        "rule": { "item": item, "after": after },
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else if added {
+                    println!("Added rule: '{item}' loads after '{after}'.");
+                } else {
+                    println!("That rule is already set: '{item}' loads after '{after}'.");
+                }
+            }
+            PluginRuleCmd::Remove { item, after, .. } => {
+                let removed = match load_order::remove_load_after_rule(
+                    ctx,
+                    &instance_id,
+                    game_def,
+                    list_id.as_deref(),
+                    &item,
+                    &after,
+                ) {
+                    Ok(removed) => removed,
+                    Err(e) => fail(e.to_string()),
+                };
+                if !removed {
+                    fail(format!(
+                        "No rule says '{item}' loads after '{after}' in instance '{instance_id}'."
+                    ));
+                }
+                if json {
+                    let out = serde_json::json!({
+                        "status": "ok",
+                        "instance_id": instance_id,
+                        "removed": true,
+                        "rule": { "item": item, "after": after },
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                } else {
+                    println!("Removed rule: '{item}' no longer has to load after '{after}'.");
+                }
+            }
+        },
         InstancePluginsCmd::Enable { .. } | InstancePluginsCmd::Disable { .. } => {
             fail("not a load order command".to_string())
         }
     }
     Ok(())
+}
+
+/// One of the two actions a conflict offers.
+struct ConflictAction {
+    winner: String,
+    loser: String,
+    /// True for "let the loser win", which also moves it; false for "keep this order".
+    let_loser_win: bool,
+}
+
+/// A failed overlaps check, in plain words. A hook that cannot run, or a reply core cannot trust,
+/// is "could not check", never "no conflicts".
+fn overlap_failure_message(error: agora_core::game_load_order::LoadOrderError) -> String {
+    use agora_core::game_load_order::LoadOrderError;
+    match error {
+        LoadOrderError::NoOverlaps(list) => format!(
+            "This list ('{list}') declares no overlaps reader, so conflicts cannot be checked."
+        ),
+        other => format!("Conflicts could not be checked: {other}"),
+    }
+}
+
+/// Print one overlaps report. A plugin filter shows only the pairs that name it, and says what it
+/// wins and loses.
+fn print_overlap_report(
+    instance_id: &str,
+    report: &agora_core::game_load_order::OverlapReport,
+    plugin: Option<&str>,
+) {
+    let pairs: Vec<&agora_core::game_load_order::ConflictPair> = match plugin {
+        Some(name) => report
+            .pairs
+            .iter()
+            .filter(|pair| {
+                pair.winner.eq_ignore_ascii_case(name) || pair.loser.eq_ignore_ascii_case(name)
+            })
+            .collect(),
+        None => report.pairs.iter().collect(),
+    };
+    let conflicts: usize = pairs.iter().map(|pair| pair.count).sum();
+    if let Some(name) = plugin {
+        let wins = report.wins_over(name);
+        let loses = report.losers_of(name);
+        if wins.is_empty() && loses.is_empty() {
+            println!("'{name}' neither wins nor loses any record changes.");
+        } else {
+            for (other, count) in &wins {
+                println!(
+                    "'{name}' replaces {} change{} made by '{other}'.",
+                    count,
+                    if *count == 1 { "" } else { "s" }
+                );
+            }
+            for (other, count) in &loses {
+                println!(
+                    "'{name}' loses {} change{} to '{other}'.",
+                    count,
+                    if *count == 1 { "" } else { "s" }
+                );
+            }
+        }
+    }
+    if pairs.is_empty() {
+        println!("No plugin conflicts: every record the active plugins change agrees, is patched, or is decided by your rules.");
+    } else {
+        println!(
+            "{conflicts} conflict{} between {} pair{} of plugins:",
+            if conflicts == 1 { "" } else { "s" },
+            pairs.len(),
+            if pairs.len() == 1 { "" } else { "s" }
+        );
+        for pair in &pairs {
+            let labels: Vec<&str> = pair
+                .labels
+                .iter()
+                .take(agora_core::game_load_order::CONFLICT_LABELS)
+                .map(String::as_str)
+                .collect();
+            if pair.count == 1 && labels.len() == 1 {
+                println!(
+                    "'{}' replaces 1 change made by '{}' ({}).",
+                    pair.winner, pair.loser, labels[0]
+                );
+            } else {
+                println!(
+                    "'{}' replaces {} change{} made by '{}':",
+                    pair.winner,
+                    pair.count,
+                    if pair.count == 1 { "" } else { "s" },
+                    pair.loser
+                );
+                for label in &labels {
+                    println!("  - {label}");
+                }
+                let more = pair.count.saturating_sub(labels.len());
+                if more > 0 {
+                    println!("  ... and {more} more.");
+                }
+            }
+        }
+    }
+    if report.patched > 0 || report.decided > 0 {
+        println!(
+            "{} record{} patched by its winner; {} decided by your rules.",
+            report.patched,
+            if report.patched == 1 { "" } else { "s" },
+            report.decided
+        );
+    }
+    for note in &report.notes {
+        if note.plugin.is_empty() {
+            println!("Note: {}", note.message);
+        } else {
+            println!("Note for '{}': {}", note.plugin, note.message);
+        }
+    }
+    let _ = instance_id;
 }
 
 /// Say what a deploy changed in the instance's plugin list.
