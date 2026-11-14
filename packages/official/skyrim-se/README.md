@@ -4,6 +4,11 @@ Notes on package values checked against real archives.
 
 ## Checked paths
 
+- `skse` required scripts: checked on 2026-11-13 against a real SKSE 2.2.6 install made by
+  Vortex. Its `Data/Scripts` held 62 loose `.pex` files, all dated together: the set in the
+  `skse` framework's `detection.required` list. The SKSE64 archive ships the same Papyrus scripts
+  under `Data/Scripts` (skse.silverlock.org); without them SkyUI, RaceMenu and MCMs see SKSE version
+  0.0.0.0 and their menus break.
 - `pgpatcher`: checked on 2026-11-07 against `PGPatcher-2.3.1.zip` from
   https://github.com/hakasapl/PGPatcher/releases/tag/2.3.1 (SHA-256
   `50e50cb6ccd9c5e052efae641dee2127d101db1778d1f92508074fdddf5749b8`, matching

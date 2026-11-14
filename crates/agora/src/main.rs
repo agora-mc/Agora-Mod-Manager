@@ -6472,6 +6472,8 @@ async fn run_command(
                                 "baseId": base_id,
                                 "framework": repaired.framework,
                                 "name": repaired.name,
+                                "requiredTotal": repaired.required_total,
+                                "restored": repaired.copied.len(),
                                 "copied": repaired.copied,
                                 "alreadyPresent": repaired.already_present,
                                 "missingFromSource": repaired.missing_from_source,
@@ -6480,19 +6482,16 @@ async fn run_command(
                         );
                     } else if repaired.is_complete() {
                         println!(
-                            "Base '{base_id}' now has every file {} needs.",
-                            repaired.name
+                            "Base '{base_id}' now has every file {} needs. Restored {} of {} required script files from the source install.",
+                            repaired.name,
+                            repaired.copied.len(),
+                            repaired.required_total
                         );
-                        if !repaired.copied.is_empty() {
-                            println!("Copied from the source install:");
-                            for file in &repaired.copied {
-                                println!("  - {file}");
-                            }
-                        }
                     } else {
                         println!(
-                            "Base '{base_id}' is still missing files {} needs:",
-                            repaired.name
+                            "Base '{base_id}' restored {} of {} required script files; these are still missing:",
+                            repaired.copied.len(),
+                            repaired.required_total
                         );
                         for file in &repaired.missing_from_source {
                             println!("  - {file}");
@@ -11458,11 +11457,7 @@ fn runtime_finding_lines(findings: &[agora_game_api::RuntimeFileFinding]) -> Vec
                 lines.push(format!("    Repair: {}", finding.repair));
             }
             RuntimeFileProblem::MissingFiles => {
-                lines.push(format!(
-                    "  - {} is installed but some of its files are missing: {}",
-                    finding.rule_name,
-                    finding.found.join(", ")
-                ));
+                lines.push(format!("  - {}", finding.missing_files_sentence()));
                 lines.push(format!("    Repair: {}", finding.repair));
             }
             RuntimeFileProblem::CannotCheck { reason } => {

@@ -100,6 +100,8 @@ export interface FrameworkRepairReply {
   baseId: string;
   framework: string;
   name: string;
+  requiredTotal: number;
+  restored: number;
   copied: string[];
   alreadyPresent: string[];
   missingFromSource: string[];
@@ -204,6 +206,8 @@ function isFrameworkRepairReply(value: unknown): value is FrameworkRepairReply {
     && isStr(value.baseId)
     && isStr(value.framework)
     && isStr(value.name)
+    && isNum(value.requiredTotal)
+    && isNum(value.restored)
     && Array.isArray(value.copied) && value.copied.every(isStr)
     && Array.isArray(value.alreadyPresent) && value.alreadyPresent.every(isStr)
     && Array.isArray(value.missingFromSource) && value.missingFromSource.every(isStr)

@@ -260,16 +260,26 @@ mod tests {
         );
         assert_eq!(def.frameworks[0].game, GameId::new("skyrim-se").unwrap());
         assert_eq!(def.frameworks[0].name, "Skyrim Script Extender");
-        // SKSE's archive ships this Papyrus script beside the loader and DLLs; without it the
+        // SKSE's archive ships this whole Papyrus set beside the loader and DLLs; without it the
         // loader starts but RaceMenu and SkyUI see SKSE version 0.0.0.0.
-        assert_eq!(
-            def.frameworks[0]
-                .detection
-                .as_ref()
-                .expect("SKSE is detectable")
-                .required,
-            vec![RelPath::new("Data/Scripts/SKSE.pex").unwrap()]
-        );
+        let required = &def.frameworks[0]
+            .detection
+            .as_ref()
+            .expect("SKSE is detectable")
+            .required;
+        assert_eq!(required.len(), 62);
+        for name in [
+            "Data/Scripts/skse.pex",
+            "Data/Scripts/actor.pex",
+            "Data/Scripts/form.pex",
+            "Data/Scripts/ui.pex",
+            "Data/Scripts/stringutil.pex",
+        ] {
+            assert!(
+                required.contains(&RelPath::new(name).unwrap()),
+                "{name} is not declared: {required:?}"
+            );
+        }
         assert_eq!(
             def.frameworks[1].id,
             agora_game_api::FrameworkId::new("address-library").unwrap()

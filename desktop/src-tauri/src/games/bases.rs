@@ -511,6 +511,8 @@ pub struct FrameworkRepairReply {
     pub base_id: String,
     pub framework: String,
     pub name: String,
+    pub required_total: usize,
+    pub restored: usize,
     pub copied: Vec<String>,
     pub already_present: Vec<String>,
     pub missing_from_source: Vec<String>,
@@ -556,10 +558,13 @@ pub async fn games_base_repair_framework(
         let repaired =
             game_base::repair_framework(&ctx.paths, &base_id, declared).map_err(base_error)?;
         let complete = repaired.is_complete();
+        let restored = repaired.copied.len();
         Ok(FrameworkRepairReply {
             base_id,
             framework: repaired.framework,
             name: repaired.name,
+            required_total: repaired.required_total,
+            restored,
             copied: repaired.copied,
             already_present: repaired.already_present,
             missing_from_source: repaired.missing_from_source,

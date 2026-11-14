@@ -227,8 +227,8 @@ function FindingCard({ finding, onRepaired }: { finding: CheckFinding; onRepaire
       const reply = await repairBaseFramework(repairBase.baseId, repairBase.framework);
       setRepairNote(
         reply.complete
-          ? `Repaired ${reply.name}: copied ${reply.copied.length} file(s) into the base.`
-          : `The source install does not have ${reply.missingFromSource.join(', ')}. Install ${reply.name} as content in the instance, or reinstall it into the game install, then repair again.`,
+          ? `Repaired ${reply.name}: restored ${reply.restored} of ${reply.requiredTotal} required script files.`
+          : `Restored ${reply.restored} of ${reply.requiredTotal}; the source install does not have ${reply.missingFromSource.join(', ')}. Install ${reply.name} as content in the instance, or reinstall it into the game install, then repair again.`,
       );
       onRepaired();
     } catch (error: unknown) {

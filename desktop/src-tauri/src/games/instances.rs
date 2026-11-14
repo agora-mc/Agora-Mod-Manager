@@ -1365,11 +1365,7 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
                 .to_string(),
         ),
         RuntimeFileProblem::MissingFiles => (
-            format!(
-                "{} is installed but some of its files are missing: {}.",
-                finding.rule_name,
-                finding.found.join(", ")
-            ),
+            format!("{}.", finding.missing_files_sentence()),
             "The framework starts, but scripts or other files it provides are absent, so mods that rely on them can behave as if it is not installed.".to_string(),
         ),
         RuntimeFileProblem::CannotCheck { reason } => (
@@ -1757,6 +1753,7 @@ mod tests {
             expected: "skse64_1_6_1170.dll".into(),
             found: found.into_iter().map(str::to_string).collect(),
             repair: "Install the matching extender.".into(),
+            required_total: None,
             problem: RuntimeFileProblem::WrongVersion,
         }
     }
@@ -1921,11 +1918,11 @@ mod tests {
         assert!(
             shown
                 .detail
-                .contains("installed but some of its files are missing"),
+                .contains("is installed, but 1 of its 1 script files is missing"),
             "{}",
             shown.detail
         );
-        assert!(shown.detail.contains("Data/Scripts/SKSE.pex"));
+        assert!(shown.detail.contains("SKSE.pex"));
     }
 
     #[test]

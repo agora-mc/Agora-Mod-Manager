@@ -2030,3 +2030,107 @@ fn repairing_says_when_the_source_install_lacks_the_files_too() {
         vec!["Data/Scripts/SKSE.pex"]
     );
 }
+
+fn script_paths(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("Data/Scripts/script{index:02}.pex"))
+        .collect()
+}
+
+fn write_scripts(install_dir: &Path, paths: &[String]) {
+    for path in paths {
+        let full = install_dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, b"pex").unwrap();
+    }
+}
+
+#[test]
+fn a_framework_with_no_scripts_reports_every_required_file_missing() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-all-missing"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    let required = script_paths(62);
+    let refs: Vec<&str> = required.iter().map(String::as_str).collect();
+    let framework = framework_with_required("skse64_loader.exe", &refs);
+
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &[&framework],
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let recorded = &outcome.manifest().incomplete_frameworks;
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].missing.len(), 62, "{recorded:?}");
+    assert_eq!(recorded[0].missing, required);
+}
+
+#[test]
+fn repairing_restores_every_script_from_an_install_that_has_them() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-repair-all"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    let required = script_paths(62);
+    let refs: Vec<&str> = required.iter().map(String::as_str).collect();
+    let framework = framework_with_required("skse64_loader.exe", &refs);
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &[&framework],
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+
+    // The scripts arrive in the source install after the base was pinned.
+    write_scripts(&install_dir, &required);
+    let repaired = repair_framework(&paths, &base_id, &framework).unwrap();
+    assert_eq!(repaired.required_total, 62);
+    assert_eq!(repaired.copied.len(), 62);
+    assert!(repaired.is_complete(), "{repaired:?}");
+    for path in &required {
+        assert!(outcome.manifest().location.join(path).is_file(), "{path}");
+    }
+    let text = std::fs::read_to_string(paths.base_manifest_path(&base_id)).unwrap();
+    let manifest: agora_core::game_base::BaseManifest = serde_json::from_str(&text).unwrap();
+    assert!(manifest.incomplete_frameworks.is_empty());
+}
+
+#[test]
+fn repairing_reports_exactly_the_scripts_the_source_install_lacks() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-repair-some"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    let required = script_paths(4);
+    let refs: Vec<&str> = required.iter().map(String::as_str).collect();
+    let framework = framework_with_required("skse64_loader.exe", &refs);
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &[&framework],
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+
+    write_scripts(&install_dir, &required[0..2]);
+    let repaired = repair_framework(&paths, &base_id, &framework).unwrap();
+    assert_eq!(repaired.copied, required[0..2].to_vec());
+    assert_eq!(repaired.missing_from_source, required[2..4].to_vec());
+    assert!(!repaired.is_complete());
+    assert_eq!(repaired.required_total, 4);
+}

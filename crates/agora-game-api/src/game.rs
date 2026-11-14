@@ -839,10 +839,15 @@ pub struct RuntimeFileFinding {
     /// The path this runtime needs, with the version substituted. For a rule that cannot be
     /// checked, the template as written.
     pub expected: String,
-    /// Up to [`RUNTIME_FILE_FINDING_MAX_FOUND`] family files found, by file name.
+    /// Up to [`RUNTIME_FILE_FINDING_MAX_FOUND`] family files found, by file name; or, for
+    /// [`RuntimeFileProblem::MissingFiles`], every declared file that is missing.
     pub found: Vec<String>,
     /// What to do, with `{version}` substituted.
     pub repair: String,
+    /// How many files the framework declared required. Set for missing-file findings, so a long
+    /// list can say "61 of its 61" without counting the short list it prints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_total: Option<usize>,
     pub problem: RuntimeFileProblem,
 }
 
@@ -852,6 +857,33 @@ impl RuntimeFileFinding {
     /// carried as warnings, never refusals.
     pub fn refuses_launch(&self) -> bool {
         matches!(self.problem, RuntimeFileProblem::WrongVersion)
+    }
+
+    /// The missing-file sentence without the repair: a long list names the first three files and
+    /// says how many more. Call it only for [`RuntimeFileProblem::MissingFiles`].
+    pub fn missing_files_sentence(&self) -> String {
+        let total = self.required_total.unwrap_or(self.found.len());
+        let names: Vec<&str> = self
+            .found
+            .iter()
+            .map(|path| path.rsplit('/').next().unwrap_or(path))
+            .collect();
+        let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        let more = names.len().saturating_sub(3);
+        let list = if more > 0 {
+            format!("{shown} and {more} more")
+        } else {
+            shown
+        };
+        let verb = if self.found.len() == 1 { "is" } else { "are" };
+        format!(
+            "{} is installed, but {} of its {} script files {} missing: {}",
+            self.rule_name,
+            self.found.len(),
+            total,
+            verb,
+            list
+        )
     }
 
     /// One line for a person: what is wrong, what was found, and the repair.
@@ -870,12 +902,9 @@ impl RuntimeFileFinding {
                     self.rule_name, self.rule_id, self.expected, found, self.repair
                 )
             }
-            RuntimeFileProblem::MissingFiles => format!(
-                "{} is installed but some of its files are missing: {}. Repair: {}",
-                self.rule_name,
-                self.found.join(", "),
-                self.repair
-            ),
+            RuntimeFileProblem::MissingFiles => {
+                format!("{}. Repair: {}", self.missing_files_sentence(), self.repair)
+            }
             RuntimeFileProblem::CannotCheck { reason } => {
                 format!(
                     "{} ({}) cannot be checked: {reason}",
@@ -958,6 +987,7 @@ pub fn check_runtime_files<S: AsRef<str>>(
             expected,
             found,
             repair: rule.repair.replace("{version}", version),
+            required_total: None,
             problem: RuntimeFileProblem::WrongVersion,
         });
     }
@@ -1039,6 +1069,7 @@ pub fn missing_framework_files<S: AsRef<str>>(
                 "Reinstall {} so all of its files are present.",
                 framework.name
             ),
+            required_total: Some(detection.required.len()),
             problem: RuntimeFileProblem::MissingFiles,
         });
     }
@@ -1072,6 +1103,7 @@ fn cannot_check(rule: &RuntimeFileRule, reason: &str) -> RuntimeFileFinding {
         expected: rule.expected.clone(),
         found: Vec::new(),
         repair: rule.repair.clone(),
+        required_total: None,
         problem: RuntimeFileProblem::CannotCheck {
             reason: reason.to_string(),
         },
@@ -2656,8 +2688,30 @@ mod runtime_file_tests {
         );
         assert_eq!(
             finding.summary(),
-            "Skyrim Script Extender is installed but some of its files are missing: Data/Scripts/SKSE.pex. Repair: Reinstall Skyrim Script Extender so all of its files are present."
+            "Skyrim Script Extender is installed, but 1 of its 1 script files is missing: SKSE.pex. Repair: Reinstall Skyrim Script Extender so all of its files are present."
         );
+    }
+
+    #[test]
+    fn a_long_missing_script_list_names_the_first_three_and_the_rest_as_a_count() {
+        let mut framework = skse_framework();
+        framework.detection = Some(FrameworkDetection {
+            marker: RelPath::new("skse64_loader.exe").unwrap(),
+            required: (0..61)
+                .map(|index| RelPath::new(format!("Data/Scripts/script{index:02}.pex")).unwrap())
+                .collect(),
+            version: Some(FrameworkVersionSource::PeFileVersion),
+        });
+        let frameworks = [framework];
+        let refs: Vec<&FrameworkDefinition> = frameworks.iter().collect();
+        let findings = missing_framework_files(&refs, &["skse64_loader.exe"]);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding.found.len(), 61);
+        assert_eq!(finding.required_total, Some(61));
+        assert!(finding.summary().contains(
+            "Skyrim Script Extender is installed, but 61 of its 61 script files are missing: script00.pex, script01.pex, script02.pex and 58 more."
+        ), "{}", finding.summary());
     }
 
     #[test]

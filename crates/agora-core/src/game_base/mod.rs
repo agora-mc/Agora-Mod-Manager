@@ -1542,6 +1542,8 @@ pub fn remove_base(paths: &AppPaths, base_id: &str) -> Result<(), BaseError> {
 pub struct FrameworkRepair {
     pub framework: String,
     pub name: String,
+    /// How many files the framework declares as required.
+    pub required_total: usize,
     /// Required files copied from the source install into the base in this repair.
     pub copied: Vec<String>,
     /// Required files the base already had (any case).
@@ -1684,6 +1686,7 @@ pub fn repair_framework(
     Ok(FrameworkRepair {
         framework: framework.id.as_str().to_string(),
         name: framework.name.clone(),
+        required_total: detection.required.len(),
         copied,
         already_present,
         missing_from_source,
