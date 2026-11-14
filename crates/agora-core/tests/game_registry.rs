@@ -8,8 +8,9 @@ use agora_core::game_registry::{
 };
 use agora_game_api::{
     DeploymentStrategy, FrameworkDefinition, FrameworkId, GameDefinition, GameId, GamePackage,
-    InstallCapabilities, InstallKind, PackageDefinition, RelPath, StoreId, StoreIdentifier,
-    ToolDefinition, ToolId, ToolOutput, VersionSource,
+    GamePath, IniCheck, InstallCapabilities, InstallKind, PackageDefinition, RelPath, StoreId,
+    StoreIdentifier, ToolDefinition, ToolId, ToolOutput, UserDataLocation, UserFileMapping,
+    UserFileStrategy, VersionSource,
 };
 
 struct TestPackage(PackageDefinition);
@@ -69,6 +70,7 @@ fn dummy_game(id: &str, stores: Vec<(&str, &str)>) -> GameDefinition {
         load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: Vec::new(),
         content_layout: None,
         copy_patterns: Vec::new(),
@@ -451,6 +453,7 @@ fn spike_machine_skyrim_steam_and_gog_identification() {
         load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: Vec::new(),
         content_layout: None,
         copy_patterns: Vec::new(),
@@ -608,6 +611,7 @@ fn unreadable_executable_falls_back_to_store_record_and_nothing_usable_gives_uni
         load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: Vec::new(),
         content_layout: None,
         copy_patterns: Vec::new(),
@@ -954,4 +958,81 @@ fn a_refused_compiled_package_attaches_no_services() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = agora_core::app_paths::AppPaths::from_root(tmp.path().to_path_buf());
     assert_eq!(registry.recover_at_startup(&paths), ["ran"]);
+}
+
+fn game_with_ini_check(check: IniCheck) -> GameDefinition {
+    let mut game = dummy_game("game", vec![("steam", "100")]);
+    game.user_files = vec![UserFileMapping::new(
+        GamePath::UserData {
+            location: UserDataLocation::Documents,
+            path: RelPath::new("My Games/Game/Game.ini").unwrap(),
+        },
+        RelPath::new("user/Game.ini").unwrap(),
+        UserFileStrategy::JournaledSwap,
+    )];
+    game.ini_checks = vec![check];
+    game
+}
+
+fn an_ini_check(file: &str, expect: Option<&str>) -> IniCheck {
+    IniCheck {
+        file: file.into(),
+        section: "General".into(),
+        key: "uGridsToLoad".into(),
+        default: Some("5".into()),
+        expect: expect.map(str::to_string),
+        one_of: Vec::new(),
+        odd: expect.is_some(),
+        at_least: None,
+        at_least_from: None,
+        message: "The value is {value}.".into(),
+        source: "https://example.invalid/rule".into(),
+    }
+}
+
+#[test]
+fn an_ini_check_naming_a_file_the_game_does_not_keep_is_refused() {
+    let mut builder = GameRegistry::builder();
+    let err = builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            make_package(
+                "pkg",
+                vec![game_with_ini_check(an_ini_check(
+                    "user/Other.ini",
+                    Some("5"),
+                ))],
+                vec![],
+                vec![],
+            ),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GameRegistryError::InvalidIniCheck { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_ini_check_with_no_condition_is_refused() {
+    let mut builder = GameRegistry::builder();
+    let err = builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            make_package(
+                "pkg",
+                vec![game_with_ini_check(an_ini_check("user/Game.ini", None))],
+                vec![],
+                vec![],
+            ),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GameRegistryError::InvalidIniCheck { .. }),
+        "{err:?}"
+    );
 }

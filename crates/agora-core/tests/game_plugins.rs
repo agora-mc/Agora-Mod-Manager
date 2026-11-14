@@ -111,6 +111,7 @@ impl GamePackage for TestPackage {
                             item: entry.id.clone(),
                             master: master.clone(),
                             optional: false,
+                            order: true,
                         });
                     }
                 }
@@ -238,6 +239,7 @@ fn definition() -> GameDefinition {
         load_orders: vec![plugin_rule()],
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: vec![LaunchAlternative {
             id: "loader".into(),
             when: Condition::Present(RelPath::new("loader.exe").unwrap()),

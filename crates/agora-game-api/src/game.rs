@@ -275,6 +275,72 @@ impl SaveLocationRule {
     }
 }
 
+/// A declarative check of one key in one of the game's per-user INI files. A value outside the
+/// rule is a warning in the instance and launch checks, never a refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IniCheck {
+    /// The per-user file (an `instance_path`, such as `user/Skyrim.ini`) holding the key.
+    pub file: String,
+    pub section: String,
+    pub key: String,
+    /// The value the key has when the file does not set it. Needed for a numeric rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// The only acceptable value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<String>,
+    /// Acceptable values, when there is more than one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_of: Vec<String>,
+    /// The value must be an odd whole number.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub odd: bool,
+    /// The value must be at least this many.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_least: Option<i64>,
+    /// The value must be at least a minimum computed from another key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_least_from: Option<IniMinimumFrom>,
+    /// One sentence for the player, with `{value}` and `{minimum}` substituted.
+    pub message: String,
+    /// Where the rule comes from, as a URL the player can check.
+    pub source: String,
+}
+
+impl IniCheck {
+    /// Whether the check names any condition at all.
+    pub fn has_condition(&self) -> bool {
+        self.expect.is_some()
+            || !self.one_of.is_empty()
+            || self.odd
+            || self.at_least.is_some()
+            || self.at_least_from.is_some()
+    }
+
+    /// Whether the check needs a whole-number value, so it needs a default when the file is silent.
+    pub fn needs_default(&self) -> bool {
+        self.odd || self.at_least.is_some() || self.at_least_from.is_some()
+    }
+}
+
+/// A minimum computed from another INI key: `(other + add)^2` when `square`, else `other + add`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IniMinimumFrom {
+    pub section: String,
+    pub key: String,
+    /// That key's value when the file does not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Added to the other value.
+    #[serde(default)]
+    pub add: i64,
+    /// Square the sum.
+    #[serde(default)]
+    pub square: bool,
+}
+
 /// Host-resolved roots. Every `path` is relative to its root and checked by core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "root", rename_all = "snake_case")]
@@ -533,6 +599,10 @@ pub struct GameDefinition {
     /// when the game has no such setting; the instance then always shares the game's saves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub save_location: Vec<SaveLocationRule>,
+    /// Checks of individual settings in the game's per-user INI files. Each is a warning the
+    /// instance and launch checks report, never a refusal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ini_checks: Vec<IniCheck>,
     /// The name Mod Organizer 2 gives this game in its `gameName` setting, such as
     /// `Skyrim Special Edition`. An MO2 import maps a setup to the game through it (MASTER_SPEC
     /// §26.10). Absent when no MO2 setup can be matched to this game.
@@ -2989,6 +3059,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: Vec::new(),
         };
@@ -3035,6 +3106,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: Vec::new(),
         };
@@ -3076,6 +3148,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: Vec::new(),
         };
@@ -3113,6 +3186,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: vec!["**/*.dat".into()],
         };

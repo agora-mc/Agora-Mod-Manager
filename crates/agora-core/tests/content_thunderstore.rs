@@ -69,6 +69,7 @@ fn valheim_definition() -> GameDefinition {
         load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: Vec::new(),
         content_layout: Some(ContentLayout {
             data_path: RelPath::default(),

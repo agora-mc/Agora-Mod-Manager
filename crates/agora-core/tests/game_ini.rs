@@ -421,7 +421,10 @@ fn a_bare_file_name_is_accepted_when_it_is_the_only_match() {
     let read = game_ini::read(&h.ctx, "inst-bare", &def, "Skyrim.ini").unwrap();
     assert_eq!(read.instance_path, "user/Skyrim.ini");
     assert_eq!(read.source, IniSource::GameFile);
-    assert_eq!(read.document.get("General", "sLanguage").as_deref(), Some("ENGLISH"));
+    assert_eq!(
+        read.document.get("General", "sLanguage").as_deref(),
+        Some("ENGLISH")
+    );
 
     // A different spelling of the same name still matches; the file name is not a path.
     let upper = game_ini::read(&h.ctx, "inst-bare", &def, "skyrim.INI").unwrap();

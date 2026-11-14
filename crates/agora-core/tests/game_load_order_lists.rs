@@ -262,6 +262,7 @@ fn definition(lists: Vec<LoadOrderDefinition>) -> GameDefinition {
         load_orders: lists,
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: Vec::new(),
         copy_patterns: Vec::new(),
     }
@@ -610,11 +611,13 @@ fn script_rules_with_a_cycle_are_reported_like_creation_engine_cycles() {
                     item: "A.esp".into(),
                     master: "B.esp".into(),
                     optional: false,
+                    order: true,
                 },
                 LoadOrderRule::Requires {
                     item: "B.esp".into(),
                     master: "A.esp".into(),
                     optional: false,
+                    order: true,
                 },
             ],
             ..ScriptHooks::default()

@@ -189,8 +189,14 @@ fn a_light_plugins_full_master_need_not_load_above_it() {
     // https://github.com/Ortham/libloadorder/blob/master/doc/src/load_order_mechanisms.md
     let reply = run(
         vec![
-            ("LightMod.esp".to_string(), plugin_bytes(0x200, &["FullMaster.esp"])),
-            ("FullMaster.esp".to_string(), plugin_bytes(0, &["Skyrim.esm"])),
+            (
+                "LightMod.esp".to_string(),
+                plugin_bytes(0x200, &["FullMaster.esp"]),
+            ),
+            (
+                "FullMaster.esp".to_string(),
+                plugin_bytes(0, &["Skyrim.esm"]),
+            ),
             ("Skyrim.esm".to_string(), plugin_bytes(0x1, &[])),
             ("LightMaster.esl".to_string(), plugin_bytes(0, &[])),
             (

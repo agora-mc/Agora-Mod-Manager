@@ -271,6 +271,7 @@ fn test_definition() -> GameDefinition {
         load_orders: Vec::new(),
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         mo2_game_name: None,
         session: Default::default(),
         launch_alternatives: Vec::new(),

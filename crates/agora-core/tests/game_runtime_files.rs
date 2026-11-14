@@ -20,9 +20,10 @@ use agora_core::game_registry::{
 };
 use agora_game_api::{
     BaseReference, DeploymentStrategy, FrameworkDefinition, FrameworkDetection, FrameworkId,
-    FrameworkVersionSource, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
-    LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath, RuntimeFileProblem,
-    RuntimeFileRule, RuntimeIdentity, StoreId, StoreIdentifier,
+    FrameworkVersionSource, GameDefinition, GameId, GamePackage, GamePath, IniCheck,
+    IniMinimumFrom, InstallId, InstallKind, LaunchRecipe, LaunchValue, LoadOrderDefinition,
+    PackageDefinition, RelPath, RuntimeFileProblem, RuntimeFileRule, RuntimeIdentity, StoreId,
+    StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -133,6 +134,7 @@ fn make_test_definition() -> GameDefinition {
         launch_alternatives: Vec::new(),
         runtime_files: vec![skse_rule()],
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         content_layout: None,
         copy_patterns: Vec::new(),
     }
@@ -711,10 +713,171 @@ fn a_missing_framework_file_points_at_the_base_repair_when_the_install_has_it() 
         missing.repair
     );
     assert!(
-        missing.repair.contains(&format!(
-            "agora games base repair-framework {base_id} skse"
-        )),
+        missing
+            .repair
+            .contains(&format!("agora games base repair-framework {base_id} skse")),
         "{}",
         missing.repair
     );
+}
+
+/// The Skyrim INI rules the official package declares, added to a test definition that has the
+/// per-user file mapping they read.
+fn add_skyrim_ini_checks(def: &mut GameDefinition) {
+    def.user_files = vec![UserFileMapping::new(
+        GamePath::UserData {
+            location: UserDataLocation::Documents,
+            path: RelPath::new("My Games/Skyrim Special Edition/Skyrim.ini").unwrap(),
+        },
+        RelPath::new("user/Skyrim.ini").unwrap(),
+        UserFileStrategy::JournaledSwap,
+    )];
+    def.ini_checks = vec![
+        IniCheck {
+            file: "user/Skyrim.ini".into(),
+            section: "General".into(),
+            key: "uGridsToLoad".into(),
+            default: Some("5".into()),
+            expect: Some("5".into()),
+            one_of: Vec::new(),
+            odd: true,
+            at_least: None,
+            at_least_from: None,
+            message: "uGridsToLoad is {value}; 5 is the default and other values crash.".into(),
+            source: "https://en.uesp.net/wiki/Skyrim_Mod:INI_Files".into(),
+        },
+        IniCheck {
+            file: "user/Skyrim.ini".into(),
+            section: "General".into(),
+            key: "uExterior Cell Buffer".into(),
+            default: Some("36".into()),
+            expect: None,
+            one_of: Vec::new(),
+            odd: false,
+            at_least: None,
+            at_least_from: Some(IniMinimumFrom {
+                section: "General".into(),
+                key: "uGridsToLoad".into(),
+                default: Some("5".into()),
+                add: 1,
+                square: true,
+            }),
+            message: "uExterior Cell Buffer is {value}; it must be at least {minimum}.".into(),
+            source: "https://en.uesp.net/wiki/Skyrim_Mod:INI_Files".into(),
+        },
+    ];
+}
+
+fn write_instance_ini(s: &Setup, body: &str) {
+    let path = s
+        .ctx
+        .paths
+        .instance_dir(&s.instance.instance_id)
+        .unwrap()
+        .join("user")
+        .join("Skyrim.ini");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+fn ini_messages(s: &Setup) -> Vec<String> {
+    launch_checks(&s.ctx, &s.instance, &s.def)
+        .expect("the launch checks run")
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn a_risky_ugrids_value_warns_in_the_check_and_the_launch() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=11\r\nuExterior Cell Buffer=144\r\n",
+    );
+
+    let messages = ini_messages(&s);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("uGridsToLoad is 11")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("source: https://")),
+        "{messages:?}"
+    );
+
+    let prepared = prepare(&s, false, &NoVfs).expect("the launch is prepared");
+    assert!(
+        prepared
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("uGridsToLoad is 11")),
+        "{:?}",
+        prepared.diagnostics
+    );
+}
+
+#[test]
+fn the_default_ugrids_and_buffer_are_quiet() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=5\r\nuExterior Cell Buffer=36\r\n",
+    );
+    assert!(ini_messages(&s).is_empty(), "{:?}", ini_messages(&s));
+}
+
+#[test]
+fn a_buffer_below_the_ugrids_square_warns_with_the_minimum() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=7\r\nuExterior Cell Buffer=36\r\n",
+    );
+    let messages = ini_messages(&s);
+    assert!(
+        messages.iter().any(|message| {
+            message.contains("uExterior Cell Buffer is 36") && message.contains("at least 64")
+        }),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn an_absent_ini_file_is_judged_by_the_declared_defaults() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    // No copy is written: the defaults are 5 and 36, which agree.
+    assert!(ini_messages(&s).is_empty(), "{:?}", ini_messages(&s));
+}
+
+#[test]
+fn an_even_ugrids_value_is_reported_as_well_as_a_non_default_one() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=6\r\nuExterior Cell Buffer=49\r\n",
+    );
+    let messages = ini_messages(&s);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("uGridsToLoad is 6")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_definition_without_ini_checks_reports_none() {
+    let s = setup(&[]);
+    assert!(ini_messages(&s).is_empty());
 }

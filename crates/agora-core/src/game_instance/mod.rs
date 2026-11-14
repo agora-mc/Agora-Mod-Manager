@@ -1331,7 +1331,7 @@ pub fn launch_checks(
     };
     // A package's script can add findings to the same launch checks the page
     // already shows. A failing hook is reported, never silently dropped.
-    let diagnostics = match ctx.games.package_for(&definition.id).cloned() {
+    let mut diagnostics = match ctx.games.package_for(&definition.id).cloned() {
         Some(package) => {
             let mut context = hook_context(ctx, record, definition)?;
             context.load_order = agora_game_api::LoadOrder {
@@ -1362,6 +1362,9 @@ pub fn launch_checks(
         }
         None => Vec::new(),
     };
+    // The game's own INI rules read the instance's copies, so they apply to a pinned or unpinned
+    // instance alike. They are warnings, never a refusal: the player decides.
+    diagnostics.extend(crate::game_ini::check_instance_ini(ctx, id, definition));
     if !pinned {
         return Ok(LaunchChecks {
             runtime,
@@ -1614,7 +1617,7 @@ pub fn prepare_launch_with(
             .map_err(|e| InstanceError::Other(e.to_string()))?;
         answer_before_launch(ctx, id, definition, &options, launcher)?;
     }
-    match record.base {
+    let mut prepared = match record.base {
         BaseReference::Pinned { id: base_id, .. } => {
             let chosen = options.deployment.or(manifest.deployment);
 
@@ -1813,7 +1816,9 @@ pub fn prepare_launch_with(
                 alternative,
             ))
         }
-    }
+    }?;
+    prepared.diagnostics = crate::game_ini::check_instance_ini(ctx, id, definition);
+    Ok(prepared)
 }
 
 /// Deploy a pinned instance on `rung` and resolve its launch from the deployed folder.
@@ -1995,6 +2000,8 @@ fn prepare_deployed(
         runtime_findings: findings,
         load_order_findings,
         generated_findings,
+        // The caller fills this once for every launch shape, after the match.
+        diagnostics: Vec::new(),
     })
 }
 

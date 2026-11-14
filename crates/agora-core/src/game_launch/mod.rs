@@ -108,6 +108,8 @@ pub struct PreparedLaunch {
     pub load_order_findings: Vec<Finding>,
     /// Tool output that is stale or unknown (MASTER_SPEC §26.9). Warnings only, never a refusal.
     pub generated_findings: Vec<crate::game_tools::OutputFinding>,
+    /// The game's INI-setting warnings. Warnings only, never a refusal.
+    pub diagnostics: Vec<agora_game_api::Diagnostic>,
 }
 
 impl PreparedLaunch {
@@ -129,6 +131,7 @@ impl PreparedLaunch {
             runtime_findings: Vec::new(),
             load_order_findings: Vec::new(),
             generated_findings: Vec::new(),
+            diagnostics: Vec::new(),
         }
     }
 }

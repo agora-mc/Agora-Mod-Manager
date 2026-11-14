@@ -693,6 +693,7 @@ mod tests {
             plugin: "SkyUI.esp".to_string(),
             master: "Skyrim.esm".to_string(),
             problem: MasterProblem::Later,
+            movable: true,
         };
         let view = PluginsView::from_order(&order(vec![entry("SkyUI.esp")], vec![finding]));
 
@@ -711,6 +712,7 @@ mod tests {
             plugin: "SkyUI.esp".to_string(),
             master: "Skyrim.esm".to_string(),
             problem: MasterProblem::Missing,
+            movable: false,
         };
         let limit = Finding::ListLevel {
             message: "300 full plugins are active; the game loads at most 254".into(),

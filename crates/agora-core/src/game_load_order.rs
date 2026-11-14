@@ -2305,15 +2305,13 @@ mod tests {
     }
 
     #[test]
-    fn an_order_independent_requirement_keeps_quiet_about_the_list_position_but_not_about_absence() {
+    fn an_order_independent_requirement_keeps_quiet_about_the_list_position_but_not_about_absence()
+    {
         // A light plugin before a full master: the engine loads it later anyway.
         let list = [entry("A.esp", &[]), entry("B.esm", &[])];
-        assert!(script_findings(
-            &list,
-            &[requires_active_only("A.esp", "B.esm")],
-            "plugins"
-        )
-        .is_empty());
+        assert!(
+            script_findings(&list, &[requires_active_only("A.esp", "B.esm")], "plugins").is_empty()
+        );
 
         let mut inactive = entry("B.esm", &[]);
         inactive.active = false;

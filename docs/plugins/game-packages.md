@@ -384,6 +384,7 @@ Each value is a function name in your script. Every field is optional.
 | `launch_alternatives` | list of launch alternatives | optional | Another executable when a condition holds |
 | `runtime_files` | list of runtime file rules | optional | Files a framework must have for this runtime |
 | `save_location` | list of save location rules | optional | How per-instance saves are chosen |
+| `ini_checks` | list of INI checks | optional | Settings the instance and launch checks warn about |
 | `mo2_game_name` | string | optional | The game's name in Mod Organizer 2, for imports |
 | `session` | session rules | optional | Which process ends a session and which exits are normal |
 
@@ -392,6 +393,31 @@ names the game there.
 
 A version source is `{ "kind": "executable", "path": "bin/game.exe" }`, `{ "kind": "store_record" }`
 or `{ "kind": "package_behaviour" }`. Only `executable` needs `path`.
+
+### INI check
+
+An INI check warns about one setting in one of the game's per-user files. It never refuses a
+launch: the player decides. Every check needs a `source` URL so the player can see where the rule
+came from.
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `file` | path | required | The per-user file, as `user_files` names it, such as `user/Skyrim.ini` |
+| `section` | string | required | The section the key is in |
+| `key` | string | required | The key to check |
+| `default` | string | optional for text, required for numeric | The value the game uses when the file does not set it |
+| `expect` | string | optional | The only accepted value |
+| `one_of` | list of strings | optional | The accepted values, when there is more than one |
+| `odd` | boolean | optional | The value must be an odd whole number |
+| `at_least` | integer | optional | The value must be at least this |
+| `at_least_from` | INI minimum | optional | The value must be at least a minimum computed from another key |
+| `message` | string | required | One sentence for the player; `{value}` and `{minimum}` are substituted |
+| `source` | string | required | A URL where the rule comes from |
+| `add` | integer | optional for `at_least_from` | Added to the other key's value |
+| `square` | boolean | optional for `at_least_from` | Square the sum, so the minimum is `(other + add)^2` |
+
+An `at_least_from` object names its own `section`, `key` and optional `default`, plus `add` and
+`square`. A numeric rule needs `default` so an absent key is still judged by the game's value.
 
 ### Content rule and layout
 

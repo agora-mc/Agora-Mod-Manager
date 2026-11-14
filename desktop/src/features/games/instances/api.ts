@@ -67,7 +67,7 @@ export interface InstanceDetail {
   capabilities: InstanceCapabilities;
 }
 
-export type FindingKind = 'framework' | 'load_order' | 'tool' | 'base';
+export type FindingKind = 'framework' | 'load_order' | 'tool' | 'base' | 'setting';
 
 export interface CheckFinding {
   kind: FindingKind;

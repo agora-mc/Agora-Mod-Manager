@@ -885,6 +885,9 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
     for requirement in &checks.requirements {
         findings.push(requirement_finding(requirement));
     }
+    for diagnostic in &checks.diagnostics {
+        findings.push(diagnostic_finding(diagnostic));
+    }
     Ok(InstanceCheck {
         instance_id: instance_id.to_string(),
         checked: pinned,
@@ -987,6 +990,7 @@ fn launch_instance(
     findings.extend(prepared.runtime_findings.iter().map(framework_finding));
     findings.extend(prepared.load_order_findings.iter().map(load_order_finding));
     findings.extend(prepared.generated_findings.iter().map(tool_finding));
+    findings.extend(prepared.diagnostics.iter().map(diagnostic_finding));
     let reply = LaunchReply {
         status: "launched",
         pid: Some(game.pid()),
@@ -1404,8 +1408,15 @@ pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> Che
         ),
         Finding::MasterNotEarlier {
             problem: MasterProblem::Later,
+            movable: true,
             ..
         } => "Open this instance's Plugins tab and choose Sort, then check again.".to_string(),
+        Finding::MasterNotEarlier {
+            problem: MasterProblem::Later,
+            movable: false,
+            ..
+        } => "Open this instance's Plugins tab, unlock the master (or move it above the plugin by hand), then check again; Sort cannot move a locked or always-loaded master."
+            .to_string(),
         Finding::MasterCycle { plugins } => format!(
             "Disable one of {}, because they need one another in a loop; Sort cannot fix a loop.",
             plugins.join(", ")
@@ -1426,6 +1437,19 @@ pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> Che
                 .to_string()
         },
         repair: Some(repair),
+        repair_base: None,
+    }
+}
+
+/// A warning the game's package declared about one of its own settings. It never stops a launch.
+pub fn diagnostic_finding(diagnostic: &agora_game_api::Diagnostic) -> CheckFinding {
+    CheckFinding {
+        kind: "setting",
+        blocks: false,
+        title: "Game setting".to_string(),
+        detail: diagnostic.message.clone(),
+        why: "A setting the game expects differently can crash the game or break saves. This is a warning, and the game still starts.".to_string(),
+        repair: None,
         repair_base: None,
     }
 }
@@ -1746,6 +1770,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_declared_setting_warning_is_a_non_blocking_setting_finding() {
+        let finding = diagnostic_finding(&agora_game_api::Diagnostic {
+            code: "INI_SETTING".into(),
+            message: "uGridsToLoad is 11; set it back to 5. (source: https://example.invalid)"
+                .into(),
+            severity: agora_game_api::DiagnosticSeverity::Warning,
+            repairs: Vec::new(),
+        });
+        assert_eq!(finding.kind, "setting");
+        assert!(!finding.blocks);
+        assert!(finding.detail.contains("uGridsToLoad is 11"));
+    }
+
     fn wrong_version(found: Vec<&str>) -> RuntimeFileFinding {
         RuntimeFileFinding {
             rule_id: "skse".into(),
@@ -1753,6 +1791,7 @@ mod tests {
             expected: "skse64_1_6_1170.dll".into(),
             found: found.into_iter().map(str::to_string).collect(),
             repair: "Install the matching extender.".into(),
+            repair_from_source: false,
             required_total: None,
             problem: RuntimeFileProblem::WrongVersion,
         }
@@ -1949,6 +1988,7 @@ mod tests {
             plugin: "Patch.esp".into(),
             master: "Base.esm".into(),
             problem: agora_core::game_load_order::MasterProblem::Inactive,
+            movable: false,
         });
         let repair = inactive.repair.as_deref().unwrap_or_default();
         assert!(repair.contains("enable 'Base.esm'"), "{repair}");
@@ -1958,6 +1998,7 @@ mod tests {
             plugin: "Patch.esp".into(),
             master: "Base.esm".into(),
             problem: agora_core::game_load_order::MasterProblem::Later,
+            movable: true,
         });
         assert!(
             late.repair

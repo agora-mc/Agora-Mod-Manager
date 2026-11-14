@@ -650,9 +650,10 @@ enum GameInstanceCmd {
         /// Instance ID to undeploy.
         instance_id: String,
     },
-    /// Check the framework files against the game version, and the plugin load order, without
-    /// launching. Exits 1 when a framework was built for another version or the load order would
-    /// stop the game: the same checks a launch makes.
+    /// Check the framework files against the game version, the plugin load order and the game's
+    /// declared INI settings, without launching. Exits 1 when a framework was built for another
+    /// version or the load order would stop the game: the same checks a launch makes. An INI
+    /// setting is only a warning.
     Check {
         /// Instance ID to check.
         instance_id: String,
@@ -7755,6 +7756,11 @@ async fn run_command(
                                 eprintln!("Warning: {}", finding.message);
                             }
                         }
+                        if !json && !prepared.diagnostics.is_empty() {
+                            for diagnostic in &prepared.diagnostics {
+                                eprintln!("Warning: {}", diagnostic.message);
+                            }
+                        }
                         if !json && !prepared.runtime_findings.is_empty() {
                             eprintln!(
                                 "Warning: Launching past {} framework check finding(s):",
@@ -7801,6 +7807,7 @@ async fn run_command(
                                     "runtime_findings": prepared.runtime_findings,
                                     "load_order_findings": prepared.load_order_findings,
                                     "generated_findings": prepared.generated_findings,
+                                    "diagnostics": prepared.diagnostics,
                                     "deployment": prepared.deployment.map(|m| m.as_str()),
                                     "notice": prepared.notice,
                                     "alternative": prepared.alternative,
@@ -7949,6 +7956,7 @@ async fn run_command(
                                     "runtime_findings": prepared.runtime_findings,
                                     "load_order_findings": prepared.load_order_findings,
                                     "generated_findings": prepared.generated_findings,
+                                    "diagnostics": prepared.diagnostics,
                                     "deployment": prepared.deployment.map(|m| m.as_str()),
                                     "notice": prepared.notice,
                                     "processes": exit_report.processes,
@@ -9159,6 +9167,11 @@ async fn run_command(
                         eprintln!("Warning: {}", finding.message);
                     }
                 }
+                if !json && !prepared.diagnostics.is_empty() {
+                    for diagnostic in &prepared.diagnostics {
+                        eprintln!("Warning: {}", diagnostic.message);
+                    }
+                }
                 if !json && !prepared.runtime_findings.is_empty() {
                     eprintln!(
                         "Warning: Launching past {} framework check finding(s):",
@@ -9212,6 +9225,7 @@ async fn run_command(
                             "runtime_findings": prepared.runtime_findings,
                             "load_order_findings": prepared.load_order_findings,
                             "generated_findings": prepared.generated_findings,
+                                    "diagnostics": prepared.diagnostics,
                         });
                         println!("{}", serde_json::to_string_pretty(&out)?);
                     } else {
@@ -9278,6 +9292,7 @@ async fn run_command(
                             "runtime_findings": prepared.runtime_findings,
                             "load_order_findings": prepared.load_order_findings,
                             "generated_findings": prepared.generated_findings,
+                                    "diagnostics": prepared.diagnostics,
                             "processes": exit_report.processes,
                             "relaunched_outside": exit_report.relaunched_outside,
                             "game_writes": ver.game_writes,

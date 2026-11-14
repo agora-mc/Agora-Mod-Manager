@@ -96,6 +96,8 @@ pub enum GameRegistryError {
     SaveLocationUserFileNotFound { game_id: GameId, user_file: RelPath },
     #[error("game {game_id} has an invalid save_location: {reason}")]
     InvalidSaveLocation { game_id: GameId, reason: String },
+    #[error("game {game_id} has an invalid ini_check: {reason}")]
+    InvalidIniCheck { game_id: GameId, reason: String },
     #[error("game {game_id} has an invalid plugin_list: {reason}")]
     InvalidPluginList { game_id: GameId, reason: String },
     #[error("game {game_id} has an invalid load order: {reason}")]
@@ -404,6 +406,58 @@ impl GameRegistryBuilder {
                         reason: "the section and key must be named, and own_value must be one \
                                  line that contains {instance}"
                             .to_string(),
+                    });
+                }
+            }
+        }
+
+        // 7c. An INI check must name a per-user file the game keeps, and it must actually say what
+        // is wrong. A check that cannot fail is a mistake, not a pass.
+        for game in &def.games {
+            for check in &game.ini_checks {
+                let reason = if check.file.trim().is_empty()
+                    || check.section.trim().is_empty()
+                    || check.key.trim().is_empty()
+                {
+                    Some("its file, section and key must be named".to_string())
+                } else if !game
+                    .user_files
+                    .iter()
+                    .any(|user_file| user_file.instance_path.as_str() == check.file)
+                {
+                    Some(format!(
+                        "its file '{}' is not one of the game's user files",
+                        check.file
+                    ))
+                } else if !check.has_condition() {
+                    Some(format!(
+                        "'{}' in [{}] names no condition to check",
+                        check.key, check.section
+                    ))
+                } else if check.needs_default() && check.default.is_none() {
+                    Some(format!(
+                        "'{}' in [{}] needs the game's default value for a numeric check",
+                        check.key, check.section
+                    ))
+                } else if check.message.trim().is_empty() {
+                    Some("it has no message".to_string())
+                } else if !check.source.starts_with("https://")
+                    && !check.source.starts_with("http://")
+                {
+                    Some("its source must be a URL".to_string())
+                } else {
+                    check.at_least_from.as_ref().and_then(|from| {
+                        if from.section.trim().is_empty() || from.key.trim().is_empty() {
+                            Some("at_least_from must name a section and key".to_string())
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(reason) = reason {
+                    return Err(GameRegistryError::InvalidIniCheck {
+                        game_id: game.id.clone(),
+                        reason,
                     });
                 }
             }
@@ -983,6 +1037,7 @@ pub mod test_support {
                 load_orders: Vec::new(),
                 runtime_files: Vec::new(),
                 save_location: Vec::new(),
+                ini_checks: Vec::new(),
                 launch_alternatives: Vec::new(),
                 copy_patterns: Vec::new(),
             }],
