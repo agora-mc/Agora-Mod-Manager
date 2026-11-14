@@ -184,22 +184,23 @@ pub fn clear(paths: &AppPaths, instance_id: &str, generation: Option<&str>) -> L
     }
 }
 
-/// Whether a game might still be using this instance.
-///
-/// The conservative answer: no lease means no game was recorded; a `Running` lease whose process
-/// identity still verifies means the game is alive; a `Starting` lease, a `Running` lease with no
-/// identity, or an unreadable lease cannot prove the game is gone, so it might still be running.
-/// This never clears anything and never fails, so a reader can use it before deciding to close a
-/// session. Game-free: it trusts only the recorded process identity.
-pub fn game_may_be_running(paths: &AppPaths, instance_id: &str) -> bool {
+/// Whether the runtime lease proves the recorded game is gone. Only a `Running` lease whose
+/// process identity no longer verifies is proof; no lease at all is not, because a delegated
+/// launch keeps no process identity and the game may still run. Never clears anything.
+pub fn game_is_provably_gone(paths: &AppPaths, instance_id: &str) -> bool {
     match read(paths, instance_id) {
-        Ok(None) => false,
         Ok(Some(lease)) => match (lease.state, lease.identity) {
-            (RuntimeState::Running, Some(identity)) => process_identity::verify(&identity).is_ok(),
-            (RuntimeState::Running, None) | (RuntimeState::Starting, _) => true,
+            (RuntimeState::Running, Some(identity)) => process_identity::verify(&identity).is_err(),
+            _ => false,
         },
-        Err(_) => true,
+        _ => false,
     }
+}
+
+/// Whether this instance has any runtime record at all, readable or not. An unreadable record
+/// counts as present: it cannot prove the game is gone.
+pub fn game_has_record(paths: &AppPaths, instance_id: &str) -> bool {
+    !matches!(read(paths, instance_id), Ok(None))
 }
 
 /// Establish that no game is using this instance.
@@ -307,33 +308,32 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_stale_lease_means_no_game_is_running() {
+    fn only_a_stale_running_lease_proves_the_game_is_gone() {
         let (paths, _tmp) = paths();
-        assert!(!game_may_be_running(&paths, "demo"));
+        assert!(
+            !game_is_provably_gone(&paths, "demo"),
+            "no lease is not proof"
+        );
 
-        // A live game: this test process has a verifiable identity.
         let identity = process_identity::capture(std::process::id()).unwrap();
+        let generation = publish_starting(&paths, "demo").unwrap();
+        publish_running(&paths, "demo", &generation, identity.clone()).unwrap();
+        assert!(
+            !game_is_provably_gone(&paths, "demo"),
+            "a live game is not gone"
+        );
+
         let stale = crate::process_identity::ProcessIdentity {
             pid: u32::MAX - 2,
-            ..identity.clone()
+            ..identity
         };
-        let generation = publish_starting(&paths, "demo").unwrap();
-        publish_running(&paths, "demo", &generation, identity).unwrap();
-        assert!(game_may_be_running(&paths, "demo"));
-
-        // Once the recorded process is gone, the lease is stale.
         publish_running(&paths, "demo", &generation, stale).unwrap();
-        assert!(!game_may_be_running(&paths, "demo"));
-    }
+        assert!(game_is_provably_gone(&paths, "demo"));
 
-    #[test]
-    fn a_launch_that_never_published_its_game_might_still_be_running() {
-        let (paths, _tmp) = paths();
         publish_starting(&paths, "demo").unwrap();
-        assert!(game_may_be_running(&paths, "demo"));
-
-        let path = lease_path(&paths, "demo").unwrap();
-        fs::write(&path, b"{ this is not a lease").unwrap();
-        assert!(game_may_be_running(&paths, "demo"));
+        assert!(
+            !game_is_provably_gone(&paths, "demo"),
+            "an unfinished launch is not proof"
+        );
     }
 }

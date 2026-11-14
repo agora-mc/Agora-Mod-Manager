@@ -126,7 +126,7 @@ pub fn catch_up(ctx: &agora_core::ctx::Ctx, instance_id: &str) {
     };
     let built_in = agora_game_minecraft::crash::built_in_packs();
     let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
-    let caught = agora_core::crash_live::catch_up(
+    let report = agora_core::crash_live::catch_up(
         ctx,
         instance_id,
         agora_core::crash_live::LivePacks {
@@ -136,11 +136,24 @@ pub fn catch_up(ctx: &agora_core::ctx::Ctx, instance_id: &str) {
             instances: Some(&instances),
         },
     );
-    for session in caught {
+    for session in report.sessions {
         if session.answer.is_some() {
             eprintln!(
                 "[crash] closed session '{}', which was not watched to the end, and checked it for a crash",
                 session.session_id
+            );
+        }
+    }
+    if let Some(user) = report.user_files {
+        if let Some(error) = &user.error {
+            eprintln!(
+                "[crash] the per-user files could not be restored ({error}); run `agora games user-files restore {} {}` once the game has closed",
+                user.game, user.store
+            );
+        } else if user.restored > 0 {
+            eprintln!(
+                "[crash] restored {} per-user file(s); {} changed during the session",
+                user.restored, user.changed
             );
         }
     }

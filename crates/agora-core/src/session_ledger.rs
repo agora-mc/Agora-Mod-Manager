@@ -896,6 +896,42 @@ pub fn finish(
     Ok(Some(judged))
 }
 
+/// Correct a finished session's verdict to `Crashed` after evidence found a crash written inside
+/// its window. The exit code and the session's length are not consulted: a crash artifact is the
+/// evidence, whatever the process said or how long it ran. An open row and a row already marked
+/// crashed are left alone. Returns whether the row changed.
+pub fn mark_crashed(conn: &Connection, session_id: &str, how: MatchedBy) -> anyhow::Result<bool> {
+    let current: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT ended_at, verdict FROM launch_history WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((ended_at, verdict)) = current else {
+        return Ok(false);
+    };
+    if ended_at.is_none() {
+        return Ok(false);
+    }
+    let already = verdict
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<SessionVerdict>(json).ok());
+    if matches!(already, Some(SessionVerdict::Crashed { .. })) {
+        return Ok(false);
+    }
+    let judged = SessionVerdict::Crashed { how };
+    conn.execute(
+        "UPDATE launch_history SET verdict = ?2, outcome = ?3 WHERE session_id = ?1",
+        params![
+            session_id,
+            serde_json::to_string(&judged)?,
+            LaunchResult::from(judged).as_str(),
+        ],
+    )?;
+    Ok(true)
+}
+
 fn write_end(
     conn: &Connection,
     row_id: i64,
@@ -928,11 +964,86 @@ pub struct ClosedSession {
     pub verdict: SessionVerdict,
 }
 
+/// One open session, with what a catch-up needs to decide and close it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSession {
+    pub session_id: String,
+    pub instance_id: String,
+    pub started_at: String,
+    pub owner_pid: Option<u32>,
+    pub owner_start: Option<i64>,
+    pub stop_requested: bool,
+}
+
+/// This instance's open sessions, newest first.
+pub fn open_sessions_for_instance(
+    conn: &Connection,
+    instance_id: &str,
+) -> anyhow::Result<Vec<OpenSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, instance_id, started_at, owner_pid, owner_start, stop_requested
+           FROM launch_history
+          WHERE instance_id = ?1 AND session_id IS NOT NULL AND ended_at IS NULL
+          ORDER BY started_at DESC, id DESC",
+    )?;
+    let rows = stmt
+        .query_map([instance_id], |row| {
+            Ok(OpenSession {
+                session_id: row.get(0)?,
+                instance_id: row.get(1)?,
+                started_at: row.get(2)?,
+                owner_pid: row.get(3)?,
+                owner_start: row.get(4)?,
+                stop_requested: row.get::<_, i64>(5)? != 0,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Close one open session whose owner is gone, as `ClosedUnknown` (or `Stopped` when the player
+/// had pressed Stop). Returns `None` when the row was already closed. This is what a catch-up
+/// calls after it has evidence the game ended.
+pub fn close_unwatched_session(
+    conn: &Connection,
+    session_id: &str,
+    now: &str,
+    why: &str,
+) -> anyhow::Result<Option<ClosedSession>> {
+    let open: Option<(i64, String, bool)> = conn
+        .query_row(
+            "SELECT id, instance_id, stop_requested FROM launch_history
+              WHERE session_id = ?1 AND ended_at IS NULL",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+        )
+        .optional()?;
+    let Some((row_id, instance_id, stop_requested)) = open else {
+        return Ok(None);
+    };
+    let exit = ExitObservation::unavailable(why);
+    let judged = verdict(&VerdictInput {
+        exit: &exit,
+        stop_requested,
+        runtime_ms: 0,
+        normal_exit_codes: &[],
+        artifact: None,
+        froze: false,
+    });
+    write_end(conn, row_id, now, None, &exit, judged)?;
+    Ok(Some(ClosedSession {
+        session_id: session_id.to_string(),
+        instance_id,
+        verdict: judged,
+    }))
+}
+
 /// Close this instance's open sessions whose owner is gone and whose game is not running, as
 /// `ClosedUnknown` (or `Stopped`, when the player had pressed Stop). A session whose game might
 /// still be running is left alone: a gone owner proves nothing about the game.
 /// `owner_alive` decides whether the owner still runs ([`Owner::is_alive`] is the real check);
-/// `game_may_be_running` is [`crate::instance_runtime::game_may_be_running`] in production.
+/// `game_may_be_running` is the caller's "not provably gone" check in production
+/// ([`crate::instance_runtime::game_is_provably_gone`]).
 pub fn close_unwatched_for_instance(
     conn: &Connection,
     instance_id: &str,
@@ -955,7 +1066,8 @@ pub fn close_unwatched_for_instance(
 /// "normal" would be a false claim, so it says what is true: nothing watched how it ended. A
 /// session whose game might still be running is left open.
 /// `owner_alive` decides whether the owner still runs; [`Owner::is_alive`] is the real check.
-/// `game_may_be_running` is [`crate::instance_runtime::game_may_be_running`] in production.
+/// `game_may_be_running` is the caller's "not provably gone" check in production
+/// ([`crate::instance_runtime::game_is_provably_gone`]).
 pub fn close_orphans(
     conn: &Connection,
     now: &str,
@@ -1121,6 +1233,24 @@ pub const KEPT_SESSIONS: usize = HISTORY_LIMIT;
 // The launch path's entry points
 // ---------------------------------------------------------------------------
 
+/// Whether this instance's user-files journal says its game is still running. A game instance has
+/// no runtime lease, so the journal is the record that its game started and has not ended.
+fn user_files_session_running(ctx: &Ctx, instance_id: &str) -> bool {
+    let Ok(Some(record)) = crate::game_instance::get(ctx, instance_id) else {
+        return false;
+    };
+    let Ok(manifest) = crate::game_instance::get_manifest(ctx, instance_id) else {
+        return false;
+    };
+    let Some(store) = crate::game_instance::session_store(&record.base, &manifest) else {
+        return false;
+    };
+    crate::game_user_files::status(ctx, &record.game, &store)
+        .ok()
+        .flatten()
+        .is_some_and(|status| status.running)
+}
+
 /// Open a session for a launch that is about to be reported as started. Returns the session id, or
 /// `None` when nothing could be recorded. Never fails and never panics: a launch is not blocked by
 /// its own bookkeeping. Sessions whose owner is gone are closed first.
@@ -1134,7 +1264,7 @@ pub fn record_launch(
         let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
         let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
         let _ = close_orphans(&conn, &now, &Owner::is_alive, &|instance_id| {
-            crate::instance_runtime::game_may_be_running(&ctx.paths, instance_id)
+            user_files_session_running(ctx, instance_id)
         });
         let manifest = build_manifest(ctx, instance_id, definition, store);
         begin(&conn, instance_id, &now, &manifest, Owner::current()).ok()
@@ -1192,7 +1322,9 @@ pub fn open_minecraft(ctx: &Ctx, instance_id: &str) -> Option<MinecraftSession> 
         let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
         let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
         let _ = close_orphans(&conn, &now, &Owner::is_alive, &|instance_id| {
-            crate::instance_runtime::game_may_be_running(&ctx.paths, instance_id)
+            // A delegated launch keeps no process identity, so no runtime record is not proof
+            // that the game is gone. The explicit catch-up closes it with crash evidence.
+            !crate::instance_runtime::game_is_provably_gone(&ctx.paths, instance_id)
         });
         let manifest_path = ctx.paths.instance_manifest(instance_id).ok()?;
         let manifest = crate::helpers::read_manifest(&manifest_path).ok()?;
@@ -1820,6 +1952,77 @@ mod tests {
             get(&conn, &finished).unwrap().unwrap().verdict,
             Some(SessionVerdict::Normal)
         );
+    }
+
+    #[test]
+    fn a_crash_artifact_makes_a_short_nonzero_exit_a_crash() {
+        let exit = code(1);
+        for runtime_ms in [1, 59_000, 600_000] {
+            let judged = verdict(&VerdictInput {
+                exit: &exit,
+                stop_requested: false,
+                runtime_ms,
+                normal_exit_codes: &NORMAL,
+                artifact: Some(ArtifactEvidence {
+                    bound_by: MatchedBy::Time,
+                }),
+                froze: false,
+            });
+            assert_eq!(
+                judged,
+                SessionVerdict::Crashed {
+                    how: MatchedBy::Time
+                },
+                "runtime {runtime_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_session_is_corrected_to_crashed_when_evidence_finds_one() {
+        let conn = db();
+        let session = begin(
+            &conn,
+            "skyrim",
+            "2026-01-01T00:00:00Z",
+            &big_manifest(0),
+            owner(111),
+        )
+        .unwrap();
+        // Exit 1 after 59 seconds is a start failure until a crash artifact says otherwise.
+        let mut failed = finish_with(code(1));
+        failed.game_runtime_ms = Some(59_000);
+        failed.duration_ms = 59_000;
+        assert_eq!(
+            finish(&conn, &session, &failed).unwrap(),
+            Some(SessionVerdict::FailedToStart)
+        );
+
+        assert!(mark_crashed(&conn, &session, MatchedBy::Time).unwrap());
+        let record = get(&conn, &session).unwrap().unwrap();
+        assert_eq!(
+            record.verdict,
+            Some(SessionVerdict::Crashed {
+                how: MatchedBy::Time
+            })
+        );
+        // A second discovery does not rewrite it.
+        assert!(!mark_crashed(&conn, &session, MatchedBy::Time).unwrap());
+    }
+
+    #[test]
+    fn an_open_session_is_not_corrected_before_it_ends() {
+        let conn = db();
+        let session = begin(
+            &conn,
+            "skyrim",
+            "2026-01-01T00:00:00Z",
+            &big_manifest(0),
+            owner(111),
+        )
+        .unwrap();
+        assert!(!mark_crashed(&conn, &session, MatchedBy::Time).unwrap());
+        assert!(get(&conn, &session).unwrap().unwrap().verdict.is_none());
     }
 
     #[test]

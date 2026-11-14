@@ -1,14 +1,16 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use agora_core::ctx::CoreContext;
+use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_core::game_user_files::{
-    is_session_running, record_process, restore, status, swap_in, Journal, JournaledFile,
+    is_session_running, record_process, restore, restore_finished_for_instance, status, swap_in,
+    Journal, JournaledFile,
 };
 use agora_core::process_identity;
 use agora_game_api::{
-    DeploymentStrategy, GameDefinition, GameId, GamePath, RelPath, StoreId, StoreIdentifier,
-    UserDataLocation, UserFileMapping, UserFileStrategy,
+    DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, PackageDefinition, RelPath,
+    StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -140,6 +142,187 @@ fn test_skyrim_definition() -> GameDefinition {
         content_layout: None,
         copy_patterns: Vec::new(),
     }
+}
+
+struct TestPackage(PackageDefinition);
+
+impl GamePackage for TestPackage {
+    fn definition(&self) -> &PackageDefinition {
+        &self.0
+    }
+}
+
+fn skyrim_registry(def: &GameDefinition) -> Arc<GameRegistry> {
+    let mut builder = GameRegistry::builder();
+    let package = PackageDefinition {
+        id: format!("test.{}", def.id),
+        version: semver::Version::new(0, 1, 0),
+        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+        parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
+        games: vec![def.clone()],
+        frameworks: vec![],
+        tools: vec![],
+    };
+    builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            Arc::new(TestPackage(package)),
+        )
+        .unwrap();
+    Arc::new(builder.build())
+}
+
+/// Swap in the one user file the catch-up tests use, with known player and instance contents.
+fn swap_one_file(harness: &TestHarness, def: &GameDefinition, instance: &str, ctx: &CoreContext) {
+    let real = harness
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(
+        &real,
+        "Player original
+",
+    )
+    .unwrap();
+    let copy = harness.instance_dir(instance).join("user/Plugins.txt");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::write(
+        &copy,
+        "Instance copy
+",
+    )
+    .unwrap();
+    swap_in(ctx, instance, def, &StoreId::steam(), &harness.running_from).unwrap();
+    // The game started and is now gone: its identity replaces the launcher's "starting" mark.
+    record_process(
+        ctx,
+        &def.id,
+        &StoreId::steam(),
+        agora_core::process_identity::ProcessIdentity {
+            pid: u32::MAX - 2,
+            start_time: 5,
+            expected_exe: None,
+            job: None,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn catch_up_restores_a_finished_swap_session() {
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ctx = harness.ctx.clone().with_games(skyrim_registry(&def));
+    swap_one_file(&harness, &def, "instance-a", &ctx);
+
+    let found = restore_finished_for_instance(&ctx, "instance-a")
+        .expect("the finished journal is restored");
+    assert!(found.error.is_none(), "{found:?}");
+    assert!(found.restored >= 1);
+    assert!(
+        !ctx.paths
+            .user_files_journal_path("skyrim-se", "steam")
+            .exists(),
+        "the journal is gone after every file is back"
+    );
+    let real = harness
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    assert_eq!(
+        std::fs::read_to_string(real).unwrap(),
+        "Player original
+"
+    );
+}
+
+#[test]
+fn catch_up_leaves_a_running_swap_session_alone() {
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ctx = harness.ctx.clone().with_games(skyrim_registry(&def));
+    swap_one_file(&harness, &def, "instance-a", &ctx);
+    record_process(
+        &ctx,
+        &def.id,
+        &StoreId::steam(),
+        process_identity::capture(std::process::id()).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        restore_finished_for_instance(&ctx, "instance-a").is_none(),
+        "a game that may still run is not restored over"
+    );
+    assert!(ctx
+        .paths
+        .user_files_journal_path("skyrim-se", "steam")
+        .exists());
+}
+
+#[test]
+fn catch_up_never_calls_a_failed_restore_success() {
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ctx = harness.ctx.clone().with_games(skyrim_registry(&def));
+    swap_one_file(&harness, &def, "instance-a", &ctx);
+    // Without its backup the restore cannot prove the player's original; it must refuse.
+    std::fs::remove_dir_all(ctx.paths.user_files_backup_dir("skyrim-se", "steam")).unwrap();
+
+    let found =
+        restore_finished_for_instance(&ctx, "instance-a").expect("the journal is still reported");
+    assert!(found.error.is_some(), "{found:?}");
+    assert!(ctx
+        .paths
+        .user_files_journal_path("skyrim-se", "steam")
+        .exists());
+}
+
+#[test]
+fn crash_catch_up_restores_user_files_with_no_open_session() {
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ctx = harness.ctx.clone().with_games(skyrim_registry(&def));
+    swap_one_file(&harness, &def, "instance-a", &ctx);
+
+    let host = agora_plugin_host::QuickJsHost::new();
+    let report = agora_core::crash_live::catch_up(
+        &ctx,
+        "instance-a",
+        agora_core::crash_live::LivePacks {
+            packs: &[],
+            built_in: &[],
+            host: &host,
+            instances: None,
+        },
+    );
+    let user = report
+        .user_files
+        .expect("the finished swap session is restored");
+    assert!(user.error.is_none(), "{user:?}");
+    assert!(user.restored >= 1);
+    let real = harness
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    assert_eq!(
+        std::fs::read_to_string(real).unwrap(),
+        "Player original
+"
+    );
+}
+
+#[test]
+fn catch_up_has_nothing_to_do_without_a_journal() {
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ctx = harness.ctx.clone().with_games(skyrim_registry(&def));
+    assert!(restore_finished_for_instance(&ctx, "instance-a").is_none());
 }
 
 // ---------------------------------------------------------------------------

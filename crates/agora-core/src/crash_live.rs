@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
-    Artifact, BuiltInPack, CrashAnswer, Fact, RefMap, RoleRule, SessionVerdict,
+    Artifact, BuiltInPack, CrashAnswer, Fact, MatchedBy, RefMap, RoleRule, SessionVerdict,
 };
 use agora_game_api::GamePath;
 use agora_plugin_api::host::ScriptHost;
@@ -77,6 +77,28 @@ pub struct CaughtUp {
     /// `None` when the session was already answered, or when nothing in the evidence named a crash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<SessionAnswer>,
+}
+
+/// What the catch-up did with this instance's per-user files, when a finished swap session was
+/// still holding them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserFilesCatchUp {
+    pub instance_id: String,
+    pub game: String,
+    pub store: String,
+    pub restored: usize,
+    pub changed: usize,
+    /// Why the files are still swapped in. A journal that exists was not treated as success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Everything one catch-up pass did.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CatchUpReport {
+    pub sessions: Vec<CaughtUp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_files: Option<UserFilesCatchUp>,
 }
 
 /// Store an answer, replacing an earlier one for the same session. The answer is a few KB of
@@ -261,38 +283,103 @@ pub fn diagnose_session(ctx: &Ctx, session_id: &str, live: LivePacks<'_>) -> Opt
 /// diagnosed twice. Closing and diagnosing are best effort, like the ledger itself: a failure
 /// returns fewer entries, never an error that could block the caller. An unknown ending is stored
 /// as an answer only when the evidence names a crash, so a clean unwatched session stays quiet.
-pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> Vec<CaughtUp> {
+pub fn catch_up(ctx: &Ctx, instance_id: &str, live: LivePacks<'_>) -> CatchUpReport {
     let Ok(conn) = crate::db::local_state_connection(&ctx.paths.local_state_db()) else {
-        return Vec::new();
+        return CatchUpReport::default();
     };
     let now = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
-    let closed = session_ledger::close_unwatched_for_instance(
-        &conn,
-        instance_id,
-        &now,
-        &session_ledger::Owner::is_alive,
-        &|instance_id| crate::instance_runtime::game_may_be_running(&ctx.paths, instance_id),
-    )
-    .unwrap_or_default();
+    let open = session_ledger::open_sessions_for_instance(&conn, instance_id).unwrap_or_default();
+    // A stale `Running` lease is proof the game is gone. No lease at all is not: a delegated
+    // launch keeps no process identity, so the game may still be running.
+    let provably_gone = crate::instance_runtime::game_is_provably_gone(&ctx.paths, instance_id);
     let mut caught = Vec::new();
-    for session in closed {
+    for session in open {
+        if let (Some(pid), Some(started)) = (session.owner_pid, session.owner_start) {
+            if session_ledger::Owner::is_alive(pid, started as u64) {
+                continue;
+            }
+        }
+        let mut evidence = None;
+        if !provably_gone {
+            // A recorded launch that is still alive, or was never finished starting, is not ours
+            // to close. Only a launch with no runtime record at all can be ended on positive
+            // evidence: a crash artifact written inside the session. A failure is not evidence.
+            if crate::instance_runtime::game_has_record(&ctx.paths, instance_id) {
+                continue;
+            }
+            let Some(record) = session_ledger::get(&conn, &session.session_id)
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            let mut provisional = record.clone();
+            provisional.ended_at = Some(now.clone());
+            let stored = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                diagnose_record(ctx, &conn, &provisional, &live)
+            }))
+            .unwrap_or_else(|_| Err("the crash analysis panicked".to_string()));
+            match stored {
+                Ok(answer) if answer_finds_a_crash(&answer) => evidence = Some(answer),
+                _ => continue,
+            }
+        }
+        let Some(closed) = session_ledger::close_unwatched_session(
+            &conn,
+            &session.session_id,
+            &now,
+            "Agora was not watching when the game ended, so nothing saw how it ended",
+        )
+        .ok()
+        .flatten() else {
+            continue;
+        };
         // A stored answer belongs to a session that was already diagnosed.
-        let already_answered = answer_for_session(&conn, &session.session_id)
+        let already_answered = answer_for_session(&conn, &closed.session_id)
             .ok()
             .flatten()
             .is_some();
         let answer = if already_answered {
             None
+        } else if let Some(found) = evidence {
+            let session_answer = SessionAnswer {
+                session_id: closed.session_id.clone(),
+                instance_id: closed.instance_id.clone(),
+                created_at: now.clone(),
+                answer: found,
+            };
+            let _ = store_answer(&conn, &session_answer);
+            let _ = session_ledger::mark_crashed(&conn, &closed.session_id, MatchedBy::Time);
+            Some(session_answer)
         } else {
-            diagnose_session_with(ctx, &session.session_id, &live, true)
+            diagnose_session_with(ctx, &closed.session_id, &live, true)
         };
         caught.push(CaughtUp {
-            session_id: session.session_id,
-            instance_id: session.instance_id,
+            session_id: closed.session_id,
+            instance_id: closed.instance_id,
             answer,
         });
     }
-    caught
+    CatchUpReport {
+        sessions: caught,
+        user_files: restore_user_files_if_finished(ctx, instance_id),
+    }
+}
+
+/// Put the player's per-user files back when a finished swap session is not running. The journal
+/// itself names the game and store; only this instance's journal is restored, and a running game
+/// is left alone. A journal that cannot be read, or a restore that fails, is reported as an error
+/// and never as success.
+fn restore_user_files_if_finished(ctx: &Ctx, instance_id: &str) -> Option<UserFilesCatchUp> {
+    let found = crate::game_user_files::restore_finished_for_instance(ctx, instance_id)?;
+    Some(UserFilesCatchUp {
+        instance_id: instance_id.to_string(),
+        game: found.game.as_str().to_string(),
+        store: found.store.as_str().to_string(),
+        restored: found.restored,
+        changed: found.changed,
+        error: found.error,
+    })
 }
 
 fn diagnose_session_with(
@@ -316,6 +403,11 @@ fn diagnose_session_with(
         Ok(answer) => answer,
         Err(why) => StoredAnswer::CouldNotAnalyze { why },
     };
+    // Crash evidence inside the session window is the verdict, whatever the exit code or the
+    // session's length said. Corrections are best effort like every ledger write.
+    if answer_names_a_crash(&answer) {
+        let _ = session_ledger::mark_crashed(&conn, session_id, MatchedBy::Time);
+    }
     // An unwatched session with no crash evidence is not a crash to explain; leave it unanswered
     // rather than storing a lead that would be invented from the verdict.
     if allow_unknown && !answer_names_a_crash(&answer) {
@@ -332,16 +424,21 @@ fn diagnose_session_with(
     Some(session_answer)
 }
 
-/// Whether an answer found something that names a crash. A `NothingToRead` answer did not, and a
-/// `CouldNotAnalyze` is kept: it says why the check failed instead of hiding it.
-fn answer_names_a_crash(answer: &StoredAnswer) -> bool {
+/// Whether an answer actually found a crash: a parsed finding or a named candidate. An empty or
+/// `NothingToRead` answer did not.
+fn answer_finds_a_crash(answer: &StoredAnswer) -> bool {
     match answer {
         StoredAnswer::Analyzed { answer, .. } => {
             !answer.findings.is_empty() || !answer.candidates.is_empty()
         }
-        StoredAnswer::CouldNotAnalyze { .. } => true,
-        StoredAnswer::NothingToRead { .. } => false,
+        StoredAnswer::NothingToRead { .. } | StoredAnswer::CouldNotAnalyze { .. } => false,
     }
+}
+
+/// Whether an answer is worth storing for an unwatched session: found a crash, or failed to check
+/// and says why. `NothingToRead` alone is not a crash to explain.
+fn answer_names_a_crash(answer: &StoredAnswer) -> bool {
+    answer_finds_a_crash(answer) || matches!(answer, StoredAnswer::CouldNotAnalyze { .. })
 }
 
 /// Store "could not analyze" for a session whose packs or host could not even be prepared. This is

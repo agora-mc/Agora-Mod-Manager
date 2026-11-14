@@ -252,7 +252,7 @@ fn abandon_owner(ctx: &CoreContext, session_id: &str) {
     .unwrap();
 }
 
-fn catch_up(ctx: &CoreContext, instance_id: &str) -> Vec<agora_core::crash_live::CaughtUp> {
+fn catch_up(ctx: &CoreContext, instance_id: &str) -> agora_core::crash_live::CatchUpReport {
     let host: Arc<dyn ScriptHost> = Arc::new(agora_plugin_host::QuickJsHost::new());
     let installed = agora_core::crash_live::load_installed_packs(ctx, host.clone()).unwrap();
     let built_in = agora_game_minecraft::crash::built_in_packs();
@@ -276,9 +276,9 @@ fn an_unwatched_session_is_closed_and_diagnosed() {
     abandon_owner(&ctx, &opened.session_id);
 
     let caught = catch_up(&ctx, &instance_id);
-    assert_eq!(caught.len(), 1, "{caught:?}");
+    assert_eq!(caught.sessions.len(), 1, "{caught:?}");
     assert!(
-        caught[0].answer.is_some(),
+        caught.sessions[0].answer.is_some(),
         "the crash report written during the session is diagnosed"
     );
 
@@ -287,7 +287,13 @@ fn an_unwatched_session_is_closed_and_diagnosed() {
         .unwrap()
         .unwrap();
     assert!(record.ended_at.is_some(), "the session is closed");
-    assert_eq!(record.verdict, Some(SessionVerdict::ClosedUnknown));
+    // Crash evidence inside the window decides the verdict, even though nothing watched the end.
+    assert_eq!(
+        record.verdict,
+        Some(SessionVerdict::Crashed {
+            how: agora_game_api::crash::MatchedBy::Time
+        })
+    );
     assert!(
         agora_core::crash_live::answer_for_session(&conn, &opened.session_id)
             .unwrap()
@@ -303,8 +309,8 @@ fn a_finished_session_is_not_diagnosed_twice() {
     abandon_owner(&ctx, &opened.session_id);
 
     let first = catch_up(&ctx, &instance_id);
-    assert_eq!(first.len(), 1);
-    let created_at = first[0]
+    assert_eq!(first.sessions.len(), 1);
+    let created_at = first.sessions[0]
         .answer
         .as_ref()
         .expect("the first catch-up answers")
@@ -313,7 +319,7 @@ fn a_finished_session_is_not_diagnosed_twice() {
 
     let second = catch_up(&ctx, &instance_id);
     assert!(
-        second.is_empty(),
+        second.sessions.is_empty(),
         "an ended session is left alone: {second:?}"
     );
 
@@ -339,7 +345,7 @@ fn a_session_whose_game_might_still_run_stays_open() {
 
     let caught = catch_up(&ctx, &instance_id);
     assert!(
-        caught.is_empty(),
+        caught.sessions.is_empty(),
         "a game that may run keeps its session open"
     );
 
@@ -389,4 +395,65 @@ fn crash_last_closes_an_unwatched_session_and_stores_its_answer() {
         stored.answer,
         agora_core::crash_live::StoredAnswer::Analyzed { .. }
     ));
+}
+
+#[test]
+fn an_unwatched_session_with_no_evidence_stays_open() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let dir = ctx.paths.instance_dir(&instance_id).unwrap();
+    std::fs::remove_file(dir.join("crash-reports").join("crash-example.txt")).unwrap();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    abandon_owner(&ctx, &opened.session_id);
+
+    // No runtime record and no crash report: a delegated game may still be running.
+    let caught = catch_up(&ctx, &instance_id);
+    assert!(
+        caught.sessions.is_empty(),
+        "no evidence means no close: {caught:?}"
+    );
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    assert!(session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap()
+        .ended_at
+        .is_none());
+}
+
+#[test]
+fn a_failed_to_start_verdict_is_corrected_when_the_crash_log_is_found() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let done = session_ledger::SessionFinish {
+        ended_at: chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339(),
+        duration_ms: 59_000,
+        exit: session_ledger::ExitObservation::Code {
+            pid: 4242,
+            image: "javaw".to_string(),
+            code: 1,
+        },
+        game_runtime_ms: Some(59_000),
+        normal_exit_codes: vec![0],
+        artifact: None,
+        froze: false,
+    };
+    assert_eq!(
+        session_ledger::finish(&conn, &opened.session_id, &done).unwrap(),
+        Some(SessionVerdict::FailedToStart)
+    );
+    drop(conn);
+
+    diagnose(&ctx, &opened.session_id);
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let record = session_ledger::get(&conn, &opened.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.verdict,
+        Some(SessionVerdict::Crashed {
+            how: agora_game_api::crash::MatchedBy::Time
+        }),
+        "the crash report written during the session is the verdict, not the short exit"
+    );
 }

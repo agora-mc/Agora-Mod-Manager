@@ -4792,7 +4792,7 @@ fn catch_up_crash_answers(ctx: &agora_core::ctx::Ctx, instance: &str) {
         }
     };
     let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
-    let caught = agora_core::crash_live::catch_up(
+    let report = agora_core::crash_live::catch_up(
         ctx,
         instance,
         agora_core::crash_live::LivePacks {
@@ -4802,13 +4802,33 @@ fn catch_up_crash_answers(ctx: &agora_core::ctx::Ctx, instance: &str) {
             instances: Some(&instances),
         },
     );
-    for session in caught {
+    for session in report.sessions {
         if session.answer.is_some() {
             eprintln!(
                 "Closed session '{}', which was not watched to the end, and checked it for a crash.",
                 session.session_id
             );
         }
+    }
+    report_user_files_catch_up(report.user_files.as_ref());
+}
+
+/// Say what a catch-up did with per-user files, including the command to finish a restore that is
+/// still blocked. Never returns success for a journal that is still swapped in.
+fn report_user_files_catch_up(user: Option<&agora_core::crash_live::UserFilesCatchUp>) {
+    let Some(user) = user else {
+        return;
+    };
+    if let Some(error) = &user.error {
+        eprintln!(
+            "Warning: the per-user files could not be restored ({error}); they are still swapped in. Run `agora games user-files restore {} {}` once the game has closed.",
+            user.game, user.store
+        );
+    } else if user.restored > 0 {
+        eprintln!(
+            "Restored {} per-user file(s); {} changed during the session and were kept in the instance.",
+            user.restored, user.changed
+        );
     }
 }
 
@@ -7183,7 +7203,7 @@ async fn run_command(
                     // A session left open by a previous run is closed and checked before this
                     // launch starts, while no runtime lease for the new launch exists yet.
                     if let Ok(live) = cli_crash::load_live_packs(ctx) {
-                        let _ = agora_core::crash_live::catch_up(
+                        let report = agora_core::crash_live::catch_up(
                             ctx,
                             &instance_id,
                             agora_core::crash_live::LivePacks {
@@ -7193,6 +7213,7 @@ async fn run_command(
                                 instances: None,
                             },
                         );
+                        report_user_files_catch_up(report.user_files.as_ref());
                     }
 
                     // The rung a "yes" to the fallback question started this launch from, so the
@@ -7501,11 +7522,13 @@ async fn run_command(
                             ) {
                                 Ok(l) => l,
                                 Err(e) => {
+                                    // Nothing was spawned, so only a stale journal could be here.
                                     let user_files = report_user_files_restore(
-                                        agora_core::game_user_files::restore(ctx, game_def, &store),
-                                        game_def.id.as_str(),
-                                        store.as_str(),
+                                        ctx,
+                                        game_def,
+                                        &store,
                                         json,
+                                        std::time::Duration::ZERO,
                                     );
                                     if let agora_core::game_instance::InstanceError::VfsUnavailable {
                                 next: Some(next),
@@ -7702,11 +7725,14 @@ async fn run_command(
                                     }
                                 }
                             }
+                            // The game can still be leaving the process table while its crash
+                            // handler finishes; wait for it to be gone, then restore.
                             let user_files = report_user_files_restore(
-                                agora_core::game_user_files::restore(ctx, game_def, &store),
-                                game_def.id.as_str(),
-                                store.as_str(),
+                                ctx,
+                                game_def,
+                                &store,
                                 json,
+                                std::time::Duration::from_secs(10),
                             );
                             let after = base_manifest.as_ref().map(|m| {
                                 agora_core::game_base::verify_base(
@@ -12476,20 +12502,41 @@ fn open_url_in_browser(url: &str) -> anyhow::Result<()> {
 /// Say what happened to the per-user files after a session: a failed restore leaves them swapped
 /// (the journal keeps everything needed), and the user must hear that and how to finish it.
 ///
+/// The game can still be leaving the process table when the watcher returns, so a restore that
+/// refuses because the game is running is retried until `wait` runs out. A journal that still
+/// exists afterwards is never reported as success.
+///
 /// Returns what the launch reports for them: `{restored, changed}`, or `{error}` when the restore
 /// failed. The human line is stdout, so it is printed only without `--json`; the failure warning
 /// is stderr and is printed either way.
 fn report_user_files_restore(
-    result: Result<
-        agora_core::game_user_files::RestoreReport,
-        agora_core::game_user_files::UserFilesError,
-    >,
-    game: &str,
-    store: &str,
+    ctx: &agora_core::ctx::Ctx,
+    game_def: &agora_game_api::GameDefinition,
+    store: &agora_game_api::StoreId,
     json: bool,
+    wait: std::time::Duration,
 ) -> serde_json::Value {
+    use agora_core::game_user_files::{self, UserFilesError};
+    let game = game_def.id.as_str();
+    let store_name = store.as_str();
+    let result = game_user_files::restore_retrying_while_running(ctx, game_def, store, wait);
     match result {
         Ok(report) => {
+            // A journal that is still there was not restored, whatever the call returned.
+            let still_swapped = match game_user_files::status(ctx, &game_def.id, store) {
+                Ok(status) => status.is_some(),
+                Err(_) => true,
+            };
+            if still_swapped {
+                warn_user_files_not_restored(
+                    "the per-user session is still recorded as swapped in",
+                    game,
+                    store_name,
+                );
+                return serde_json::json!({
+                    "error": "the per-user files are still swapped in",
+                });
+            }
             let changed = report.files.iter().filter(|f| f.changed).count();
             if !json && !report.files.is_empty() {
                 println!(
@@ -12499,13 +12546,20 @@ fn report_user_files_restore(
             }
             serde_json::json!({ "restored": report.files.len(), "changed": changed })
         }
+        Err(UserFilesError::NoSession { .. }) => {
+            serde_json::json!({ "restored": 0, "changed": 0 })
+        }
         Err(e) => {
-            eprintln!(
-                "Warning: the per-user files could not be restored ({e}); they are still swapped in.              Run `agora games user-files restore {game} {store}` once the game has closed."
-            );
+            warn_user_files_not_restored(&e.to_string(), game, store_name);
             serde_json::json!({ "error": e.to_string() })
         }
     }
+}
+
+fn warn_user_files_not_restored(reason: &str, game: &str, store: &str) {
+    eprintln!(
+        "Warning: the per-user files could not be restored ({reason}); they are still swapped in.              Run `agora games user-files restore {game} {store}` once the game has closed."
+    );
 }
 
 /// The part of a "Deployed:" line that says what an in-place update kept and removed, starting with
