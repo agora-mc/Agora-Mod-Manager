@@ -11676,6 +11676,13 @@ fn runtime_finding_lines(findings: &[agora_game_api::RuntimeFileFinding]) -> Vec
                 lines.push(format!("  - {}", finding.missing_files_sentence()));
                 lines.push(format!("    Repair: {}", finding.repair));
             }
+            RuntimeFileProblem::Missing => {
+                lines.push(format!(
+                    "  - {} ({}): needs {}, which is missing",
+                    finding.rule_name, finding.rule_id, finding.expected
+                ));
+                lines.push(format!("    Repair: {}", finding.repair));
+            }
             RuntimeFileProblem::CannotCheck { reason } => {
                 lines.push(format!(
                     "  - {} ({}): cannot be checked: {reason}",

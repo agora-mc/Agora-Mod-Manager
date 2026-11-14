@@ -8,7 +8,7 @@ use super::index::{
     class_segments, expand_pattern, matches_segments, matches_value, normalize_index_value,
     normalize_path, normalize_segment, ArchiveIndex, PatternError,
 };
-use super::view::InstanceView;
+use super::view::{InstanceView, LayerOwner};
 use crate::crash_engine::types::{ParsedArtifact, RefResolver, Resolved};
 
 /// What attribution found out about one ref. [`Resolver::resolve`] drops the detail the evaluator's
@@ -66,6 +66,32 @@ impl Resolver {
         let value = reference.value.trim();
         let matched_role = self.matching_role(reference);
         let role = matched_role.map(|rule| rule.role);
+
+        // A changed content item is named by its key, which is not a file. The instance view
+        // already knows which layer owns each key, so the change facts resolve without a ref map.
+        if reference.kind == "content" && !value.is_empty() {
+            let owner = self
+                .view
+                .layers()
+                .iter()
+                .find_map(|layer| match &layer.owner {
+                    LayerOwner::Item { key, name }
+                        if key.eq_ignore_ascii_case(value) || name.eq_ignore_ascii_case(value) =>
+                    {
+                        Some(layer.owner.to_owner())
+                    }
+                    _ => None,
+                });
+            if let Some(owner) = owner {
+                return Attribution {
+                    owner,
+                    role,
+                    also_provided_by: Vec::new(),
+                    via: None,
+                    reason: None,
+                };
+            }
+        }
 
         let maps: Vec<&RefMap> = self
             .ref_maps

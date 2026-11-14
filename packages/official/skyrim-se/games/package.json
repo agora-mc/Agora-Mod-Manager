@@ -343,7 +343,8 @@
           "applies_to": [
             "1.6.*"
           ],
-          "repair": "Install the Address Library build for Skyrim {version} (the versionlib file for that version) into Data/SKSE/Plugins"
+          "repair": "Install the Address Library build for Skyrim {version} (the versionlib file for that version) into Data/SKSE/Plugins: https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+          "when_present": "Data/SKSE/Plugins/*.dll"
         },
         {
           "id": "address-library-se",
@@ -353,7 +354,8 @@
           "applies_to": [
             "1.5.*"
           ],
-          "repair": "Install the Address Library build for Skyrim {version} (the version-*.bin file for that version) into Data/SKSE/Plugins"
+          "repair": "Install the Address Library build for Skyrim {version} (the versionlib file for that version) into Data/SKSE/Plugins: https://www.nexusmods.com/skyrimspecialedition/mods/32444",
+          "when_present": "Data/SKSE/Plugins/*.dll"
         }
       ]
     }

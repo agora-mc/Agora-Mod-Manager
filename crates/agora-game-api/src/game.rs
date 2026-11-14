@@ -885,6 +885,12 @@ pub struct RuntimeFileRule {
     pub applies_to: Vec<String>,
     /// What to do, shown with the finding; `{version}` is substituted.
     pub repair: String,
+    /// A glob over deployed paths that means this runtime file is needed. When the expected path
+    /// is absent but a file matches this, the finding is [`RuntimeFileProblem::Missing`] instead
+    /// of silence; e.g. any `Data/SKSE/Plugins/*.dll` needs the Address Library. Empty means only
+    /// a file of the rule's own family makes it speak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_present: Option<String>,
 }
 
 /// The most family file names one finding lists.
@@ -897,6 +903,8 @@ pub enum RuntimeFileProblem {
     WrongVersion,
     /// The framework's marker is present, but files it declares as required are not.
     MissingFiles,
+    /// Files that need this runtime file are installed, but the expected one is absent.
+    Missing,
     /// The rule cannot be evaluated against this runtime. That is a bad definition, and it is
     /// shown as a finding rather than skipped.
     CannotCheck { reason: String },
@@ -979,6 +987,26 @@ impl RuntimeFileFinding {
             RuntimeFileProblem::MissingFiles => {
                 format!("{}. Repair: {}", self.missing_files_sentence(), self.repair)
             }
+            RuntimeFileProblem::Missing => {
+                let needed_by = if self.found.is_empty() {
+                    "files that need it are installed".to_string()
+                } else {
+                    format!(
+                        "{} installed file(s) need it, such as {}",
+                        self.found.len(),
+                        self.found
+                            .iter()
+                            .take(RUNTIME_FILE_FINDING_MAX_FOUND)
+                            .map(|path| path.rsplit('/').next().unwrap_or(path))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "{} ({}) is missing {}, and {}. Repair: {}",
+                    self.rule_name, self.rule_id, self.expected, needed_by, self.repair
+                )
+            }
             RuntimeFileProblem::CannotCheck { reason } => {
                 format!(
                     "{} ({}) cannot be checked: {reason}",
@@ -1039,6 +1067,35 @@ pub fn check_runtime_files<S: AsRef<str>>(
             .filter(|path| runtime_path_matches(&rule.family, path))
             .collect();
         if family_files.is_empty() {
+            // The framework's own family is absent. If something that needs this runtime file is
+            // installed, say the version file is missing rather than treating it as not installed.
+            let Some(when_present) = rule.when_present.as_deref() else {
+                continue;
+            };
+            let mut needing: Vec<&str> = deployed_paths
+                .iter()
+                .map(AsRef::as_ref)
+                .filter(|path| runtime_path_matches(when_present, path))
+                .collect();
+            if needing.is_empty() {
+                continue;
+            }
+            needing.sort_by_key(|path| fold_path_case(path));
+            needing.dedup_by(|a, b| fold_path_case(a) == fold_path_case(b));
+            findings.push(RuntimeFileFinding {
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
+                expected,
+                found: needing
+                    .iter()
+                    .take(RUNTIME_FILE_FINDING_MAX_FOUND)
+                    .map(|path| path.to_string())
+                    .collect(),
+                repair: rule.repair.replace("{version}", version),
+                repair_from_source: false,
+                required_total: None,
+                problem: RuntimeFileProblem::Missing,
+            });
             continue;
         }
         if deployed_paths
@@ -2688,6 +2745,7 @@ mod runtime_file_tests {
                 applies_to: vec![],
                 repair: "Install the SKSE build for Skyrim {version} from skse.silverlock.org"
                     .into(),
+                when_present: None,
             },
             RuntimeFileRule {
                 id: "address-library".into(),
@@ -2696,6 +2754,7 @@ mod runtime_file_tests {
                 expected: "Data/SKSE/Plugins/versionlib-{1}-{2}-{3}-{4}.bin".into(),
                 applies_to: vec!["1.6.*".into()],
                 repair: "Install the Address Library build for Skyrim {version}".into(),
+                when_present: Some("Data/SKSE/Plugins/*.dll".into()),
             },
             RuntimeFileRule {
                 id: "address-library-se".into(),
@@ -2704,6 +2763,7 @@ mod runtime_file_tests {
                 expected: "Data/SKSE/Plugins/version-{1}-{2}-{3}-{4}.bin".into(),
                 applies_to: vec!["1.5.*".into()],
                 repair: "Install the Address Library build for Skyrim {version}".into(),
+                when_present: Some("Data/SKSE/Plugins/*.dll".into()),
             },
         ]
     }
@@ -2950,6 +3010,7 @@ mod runtime_file_tests {
             expected: "Data/SKSE/Plugins/versionlib-{1}-{2}-{3}-{4}.bin".into(),
             applies_to: vec![],
             repair: "Install it".into(),
+            when_present: None,
         }];
         let findings = check_runtime_files(&rules, "1.6.1179.0", &names);
         assert_eq!(findings.len(), 1);

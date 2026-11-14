@@ -679,7 +679,10 @@ fn diagnose_record(
         .paths
         .instance_dir(&record.instance_id)
         .map_err(|error| format!("the instance folder could not be resolved: {error}"))?;
-    let roots = InstanceRoots { instance_dir };
+    let roots = InstanceRoots {
+        instance_dir,
+        runtime_dir: crash_runtime_root(ctx, &record.instance_id),
+    };
 
     let session = CrashSession {
         session_id: record.session_id.clone(),
@@ -755,7 +758,27 @@ fn diagnose_record(
     };
 
     let changes = previous_changes(conn, record)?;
-    let engine_facts = session_engine_facts(record, &changes);
+    let mut engine_facts = session_engine_facts(record, &changes);
+    // The same runtime-file check the instance and launch checks run, so a crash can say a
+    // framework file the session's plugins needed was missing. A check that could not run is
+    // stated, never silently absent.
+    if let Some(definition) = agora_game_api::GameId::new(&game_id)
+        .ok()
+        .and_then(|game| ctx.games.game(&game))
+    {
+        match crate::game_instance::runtime_findings(ctx, &record.instance_id, definition) {
+            Ok(findings) => {
+                engine_facts.extend(crate::crash_engine::runtime::runtime_file_facts(&findings))
+            }
+            Err(error) => engine_facts.push(
+                crate::crash_engine::runtime::runtime_file_check_failed(&error.to_string()),
+            ),
+        }
+    } else {
+        engine_facts.push(crate::crash_engine::runtime::runtime_file_check_failed(
+            "the game's package is not loaded, so its runtime files could not be checked",
+        ));
+    }
 
     // The same crash's own files may sit in a source folder, so leave them out of the history
     // comparison by their content hash. Hash the whole source file, never the stored copy: a log
@@ -1003,10 +1026,27 @@ fn session_engine_facts(record: &SessionRecord, changes: &[ManifestChange]) -> V
     crate::crash_engine::change::session_facts(verdict, exit_code, runtime_ms, changes)
 }
 
+/// The folder the game ran from: its deployment when it has one, else the pinned base. The
+/// preloader's log lives here, not in the instance's writable layer.
+fn crash_runtime_root(ctx: &Ctx, instance_id: &str) -> Option<PathBuf> {
+    if let Ok(Some(dir)) = crate::game_deploy::deployment_dir(ctx, instance_id) {
+        return Some(dir);
+    }
+    let manifest = crate::game_instance::get_manifest(ctx, instance_id).ok()?;
+    let agora_game_api::BaseReference::Pinned { id, .. } = &manifest.base else {
+        return None;
+    };
+    let text = std::fs::read_to_string(ctx.paths.base_manifest_path(id)).ok()?;
+    let base: crate::game_base::BaseManifest = serde_json::from_str(&text).ok()?;
+    Some(base.location)
+}
+
 /// Resolve the roots a live game's crash sources name. Core resolves the instance and user-data
 /// folders; a root it cannot resolve is reported by collection, never guessed.
 struct InstanceRoots {
     instance_dir: PathBuf,
+    /// The folder the game ran from, when it could be resolved. The preloader writes its log there.
+    runtime_dir: Option<PathBuf>,
 }
 
 impl SourceRoots for InstanceRoots {
@@ -1016,6 +1056,15 @@ impl SourceRoots for InstanceRoots {
                 base: self.instance_dir.clone(),
                 relative: path.as_str().to_string(),
             }),
+            GamePath::Runtime { path } => {
+                let base = self.runtime_dir.clone().ok_or_else(|| {
+                    "the folder the game ran from could not be resolved".to_string()
+                })?;
+                Ok(SourceLocation {
+                    base,
+                    relative: path.as_str().to_string(),
+                })
+            }
             GamePath::UserData { location, path } => {
                 let base = crate::game_user_files::user_data_root(location)
                     .ok_or_else(|| format!("the user data folder for {location:?} is not known"))?;

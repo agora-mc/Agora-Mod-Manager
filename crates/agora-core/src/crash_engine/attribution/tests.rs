@@ -383,6 +383,38 @@ fn also_provided_by_names_an_item_and_falls_back_to_its_key() {
 }
 
 #[test]
+fn a_content_change_key_resolves_to_the_item_that_owns_it() {
+    let view = InstanceView::new(vec![layer(
+        "lib",
+        false,
+        LayerOwner::Item {
+            key: "lib-key".into(),
+            name: "Address Library".into(),
+        },
+        &[],
+    )]);
+    let by_key =
+        resolver(view.clone(), Vec::new(), Vec::new()).attribute(&reference("content", "lib-key"));
+    assert_eq!(
+        by_key.owner,
+        Owner::Item {
+            key: "lib-key".into(),
+            name: "Address Library".into(),
+        }
+    );
+    // A change names the item by its catalog key or its name; both find the same layer.
+    let by_name =
+        resolver(view, Vec::new(), Vec::new()).attribute(&reference("content", "Address Library"));
+    assert_eq!(
+        by_name.owner,
+        Owner::Item {
+            key: "lib-key".into(),
+            name: "Address Library".into(),
+        }
+    );
+}
+
+#[test]
 fn a_turned_off_winner_lets_the_next_one_own() {
     let view = InstanceView::new(vec![
         layer("mod-a", true, item("mod-a"), &["Data/shared.esp"]),

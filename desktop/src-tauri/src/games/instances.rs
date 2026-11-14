@@ -1372,6 +1372,13 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
             format!("{}.", finding.missing_files_sentence()),
             "The framework starts, but scripts or other files it provides are absent, so mods that rely on them can behave as if it is not installed.".to_string(),
         ),
+        RuntimeFileProblem::Missing => (
+            format!(
+                "It needs {}, which is missing. Installed files that use it may fail to load.",
+                finding.expected
+            ),
+            "The framework file for this game version is absent, so plugins that need it can stop loading even though the mod is installed.".to_string(),
+        ),
         RuntimeFileProblem::CannotCheck { reason } => (
             format!("This rule cannot be checked: {reason}."),
             "Agora could not compare this framework with the game, so it cannot say whether they match.".to_string(),

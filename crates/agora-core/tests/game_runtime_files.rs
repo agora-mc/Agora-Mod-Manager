@@ -38,6 +38,7 @@ fn skse_rule() -> RuntimeFileRule {
         expected: "skse64_{1}_{2}_{3}.dll".into(),
         applies_to: vec![],
         repair: "Install the SKSE build for Skyrim {version}".into(),
+        when_present: None,
     }
 }
 
@@ -50,6 +51,7 @@ fn other_framework_rule() -> RuntimeFileRule {
         expected: "other_1.dll".into(),
         applies_to: vec![],
         repair: "Install the Other Framework for this version".into(),
+        when_present: None,
     }
 }
 
@@ -459,6 +461,7 @@ fn a_rule_that_cannot_be_checked_launches_with_a_warning_not_a_refusal() {
         expected: "skse64_{1}_{2}_{5}.dll".into(),
         applies_to: vec![],
         repair: "Fix the game definition".into(),
+        when_present: None,
     }];
     add_root_content(
         &s.ctx,
@@ -656,6 +659,49 @@ fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
             .any(|finding| finding.problem == RuntimeFileProblem::MissingFiles),
         "{:?}",
         prepared.runtime_findings
+    );
+}
+
+#[test]
+fn a_runtime_file_that_installed_plugins_need_is_reported_missing() {
+    let mut s = setup(&["Data/SKSE/Plugins/EngineFixes.dll"]);
+    s.def.runtime_files = vec![RuntimeFileRule {
+        id: "address-library".into(),
+        name: "Address Library for SKSE Plugins".into(),
+        family: "Data/SKSE/Plugins/version*-*.bin".into(),
+        expected: "Data/SKSE/Plugins/versionlib-{1}-{2}-{3}-{4}.bin".into(),
+        applies_to: vec!["1.6.*".into()],
+        repair: "Install the Address Library build for Skyrim {version}".into(),
+        when_present: Some("Data/SKSE/Plugins/*.dll".into()),
+    }];
+
+    let findings = runtime_findings(&s.ctx, &s.instance.instance_id, &s.def).unwrap();
+    let missing = findings
+        .iter()
+        .find(|finding| finding.problem == RuntimeFileProblem::Missing)
+        .expect("the installed SKSE plugin makes the missing library speak");
+    assert_eq!(
+        missing.expected,
+        "Data/SKSE/Plugins/versionlib-1-6-1170-0.bin"
+    );
+    assert!(
+        missing
+            .found
+            .iter()
+            .any(|file| file.ends_with("EngineFixes.dll")),
+        "{:?}",
+        missing.found
+    );
+    assert!(!missing.refuses_launch(), "a missing library only warns");
+
+    let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
+    assert!(
+        checks
+            .runtime
+            .iter()
+            .any(|finding| finding.problem == RuntimeFileProblem::Missing),
+        "{:?}",
+        checks.runtime
     );
 }
 
