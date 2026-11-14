@@ -10,7 +10,9 @@ use agora_core::game_ini::{self, IniError, IniSource};
 use agora_core::game_instance::GameInstanceManifest;
 use agora_core::game_user_files::{record_process, restore, swap_in};
 use agora_core::process_identity;
-use agora_game_api::{BaseReference, GameDefinition, GameId, InstallId, RuntimeIdentity, StoreId};
+use agora_game_api::{
+    BaseReference, GameDefinition, GameId, InstallId, RelPath, RuntimeIdentity, StoreId,
+};
 use tempfile::TempDir;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -407,6 +409,52 @@ fn names_that_would_break_the_file_are_refused_before_anything_is_written() {
         assert!(matches!(err, IniError::Invalid(_)), "{err:?}");
     }
     assert!(!h.copy_of("inst-j").exists());
+}
+
+#[test]
+fn a_bare_file_name_is_accepted_when_it_is_the_only_match() {
+    let h = Harness::new();
+    let def = skyrim();
+    h.make_instance("inst-bare", StoreId::steam());
+    h.write_real(REAL.as_bytes());
+
+    let read = game_ini::read(&h.ctx, "inst-bare", &def, "Skyrim.ini").unwrap();
+    assert_eq!(read.instance_path, "user/Skyrim.ini");
+    assert_eq!(read.source, IniSource::GameFile);
+    assert_eq!(
+        read.document.get("General", "sLanguage").as_deref(),
+        Some("ENGLISH")
+    );
+
+    // A different spelling of the same name still matches; the file name is not a path.
+    let upper = game_ini::read(&h.ctx, "inst-bare", &def, "skyrim.INI").unwrap();
+    assert_eq!(upper.instance_path, "user/Skyrim.ini");
+}
+
+#[test]
+fn an_ambiguous_bare_file_name_lists_every_match() {
+    let h = Harness::new();
+    let mut def = skyrim();
+    h.make_instance("inst-ambiguous", StoreId::steam());
+    let mut second = def
+        .user_files
+        .iter()
+        .find(|m| {
+            m.instance_path.as_str() == "user/Skyrim.ini" && m.applies_to_store(&StoreId::steam())
+        })
+        .expect("the Skyrim SE definition keeps user/Skyrim.ini")
+        .clone();
+    second.instance_path = RelPath::new("other/Skyrim.ini").unwrap();
+    def.user_files.push(second);
+
+    let err = game_ini::read(&h.ctx, "inst-ambiguous", &def, "Skyrim.ini").unwrap_err();
+    match err {
+        IniError::AmbiguousFile { matches, .. } => {
+            assert!(matches.contains("user/Skyrim.ini"), "{matches}");
+            assert!(matches.contains("other/Skyrim.ini"), "{matches}");
+        }
+        other => panic!("expected AmbiguousFile, got {other:?}"),
+    }
 }
 
 #[test]

@@ -90,6 +90,8 @@ CHECKED_TYPES = frozenset(
         "UserFileMapping",
         "UserFileStrategy",
         "SaveLocationRule",
+        "IniCheck",
+        "IniMinimumFrom",
         "FrameworkDefinition",
         "FrameworkDetection",
         "FrameworkVersionSource",

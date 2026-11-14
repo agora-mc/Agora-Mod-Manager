@@ -453,6 +453,133 @@ fn ess_bytes(plugins: &[(&str, bool)]) -> Vec<u8> {
     out
 }
 
+/// The plugin block at the start of an SE save's decompressed body.
+fn se_plugin_block(full: &[&str], light: &[&str]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.push(u8::try_from(full.len()).unwrap());
+    for name in full {
+        payload.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(name.as_bytes());
+    }
+    payload.extend_from_slice(&u16::try_from(light.len()).unwrap().to_le_bytes());
+    for name in light {
+        payload.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(name.as_bytes());
+    }
+    let mut out = vec![0x4e];
+    out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// One LZ4 block made only of literals, which is valid and enough for the parser.
+fn se_lz4_literals(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut extra = bytes.len();
+    let head = extra.min(15);
+    out.push(u8::try_from(head << 4).unwrap());
+    if head == 15 {
+        extra -= 15;
+        while extra >= 255 {
+            out.push(255);
+            extra -= 255;
+        }
+        out.push(u8::try_from(extra).unwrap());
+    }
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// An invented Skyrim SE 1.6 save: the magic, a 79-byte header, a 1x1 screenshot, the decompressed
+/// and compressed sizes, and one LZ4 block. No bytes come from a real save.
+fn se_save_bytes(full: &[&str], light: &[&str]) -> Vec<u8> {
+    let block = se_plugin_block(full, light);
+    let compressed = se_lz4_literals(&block);
+    let mut header = Vec::new();
+    header.extend_from_slice(&12u32.to_le_bytes()); // version
+    header.extend_from_slice(&1u32.to_le_bytes()); // save number
+    header.extend_from_slice(&8u16.to_le_bytes());
+    header.extend_from_slice(b"Prisoner");
+    header.extend_from_slice(&1u32.to_le_bytes()); // level
+    header.extend_from_slice(&6u16.to_le_bytes());
+    header.extend_from_slice(b"Skyrim");
+    header.extend_from_slice(&9u16.to_le_bytes());
+    header.extend_from_slice(b"000.01.33");
+    header.extend_from_slice(&8u16.to_le_bytes());
+    header.extend_from_slice(b"NordRace");
+    header.extend_from_slice(&0u16.to_le_bytes()); // sex
+    header.extend_from_slice(&0f32.to_le_bytes()); // current experience
+    header.extend_from_slice(&100f32.to_le_bytes()); // experience to the next level
+    header.extend_from_slice(&0u64.to_le_bytes()); // file time
+    header.extend_from_slice(&1u32.to_le_bytes()); // screenshot width
+    header.extend_from_slice(&1u32.to_le_bytes()); // screenshot height
+    header.extend_from_slice(&2u16.to_le_bytes()); // screenshot format
+    assert_eq!(header.len(), 79);
+    let mut out = Vec::new();
+    out.extend_from_slice(b"TESV_SAVEGAME");
+    out.extend_from_slice(&u32::try_from(header.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&[0u8; 4]); // the 1x1 RGBA screenshot
+    out.extend_from_slice(&u32::try_from(block.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&u32::try_from(compressed.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&compressed);
+    out
+}
+
+#[test]
+fn an_se_save_is_decompressed_and_its_full_and_light_plugins_are_read() {
+    let diagnostics = run(
+        vec![(
+            "@saves/se.ess".to_string(),
+            se_save_bytes(&["Skyrim.esm", "Update.esm"], &["InventedLight.esl"]),
+        )],
+        Vec::new(),
+        "1.6.1170",
+        &[
+            entry("Skyrim.esm"),
+            entry("Update.esm"),
+            disabled("InventedLight.esl"),
+        ],
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["code"] != "CE_SAVE_PLUGINS_NOT_CHECKED"),
+        "{diagnostics:#?}"
+    );
+    let warned = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "CE_SAVE_NEEDS_INACTIVE_PLUGIN")
+        .unwrap_or_else(|| panic!("expected the save warning, got {diagnostics:#?}"));
+    let text = message(warned);
+    assert!(text.contains("InventedLight.esl"), "{text}");
+    assert!(!text.contains("Skyrim.esm"), "{text}");
+}
+
+#[test]
+fn an_lz4_save_whose_full_and_light_plugins_are_active_says_nothing() {
+    let diagnostics = run(
+        vec![(
+            "@saves/se-clean.ess".to_string(),
+            se_save_bytes(&["Skyrim.esm", "Update.esm"], &["InventedLight.esl"]),
+        )],
+        Vec::new(),
+        "1.6.1170",
+        &[
+            entry("Skyrim.esm"),
+            entry("Update.esm"),
+            entry("InventedLight.esl"),
+        ],
+    );
+    assert!(
+        diagnostics.iter().all(
+            |diagnostic| diagnostic["code"] != "CE_SAVE_NEEDS_INACTIVE_PLUGIN"
+                && diagnostic["code"] != "CE_SAVE_PLUGINS_NOT_CHECKED"
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
 #[test]
 fn a_save_that_needs_a_now_inactive_plugin_is_a_warning_naming_it() {
     let diagnostics = run(

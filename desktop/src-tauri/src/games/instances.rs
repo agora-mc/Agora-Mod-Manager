@@ -865,7 +865,7 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
     let mut findings = Vec::new();
     for finding in &checks.runtime {
         let mut shown = framework_finding(finding);
-        if finding.problem == RuntimeFileProblem::MissingFiles {
+        if finding.repair_from_source {
             if let BaseReference::Pinned { id, .. } = &record.base {
                 shown.repair_base = Some(FrameworkRepairRef {
                     base_id: id.clone(),
@@ -1330,17 +1330,31 @@ fn before_launch_failed(tool: String, name: String, message: String) -> LaunchRe
     }
 }
 
-/// A framework a catalog mod in the instance needs. It never stops a launch: the user may have
-/// installed the mod past exactly this, so the page keeps saying so instead of asking again.
+/// A warning the game's package declared: one of its own setting checks, or something its
+/// `diagnostics` hook reported about a framework plugin. A setting is always a warning; a plugin
+/// diagnostic blocks only when the package marks it an error.
 fn diagnostic_finding(diagnostic: &agora_game_api::Diagnostic) -> CheckFinding {
-    CheckFinding {
-        kind: "diagnostic",
-        blocks: diagnostic.severity == agora_game_api::DiagnosticSeverity::Error,
-        title: "The game's plugin check".to_string(),
-        detail: diagnostic.message.clone(),
-        why: "The game's own plugin reported this while checking the instance.".to_string(),
-        repair: diagnostic.repairs.first().cloned(),
-        repair_base: None,
+    let setting = diagnostic.code == "INI_SETTING" || diagnostic.code == "ERR_INI_CHECK";
+    if setting {
+        CheckFinding {
+            kind: "setting",
+            blocks: false,
+            title: "Game setting".to_string(),
+            detail: diagnostic.message.clone(),
+            why: "A setting the game expects differently can crash the game or break saves. This is a warning, and the game still starts.".to_string(),
+            repair: None,
+            repair_base: None,
+        }
+    } else {
+        CheckFinding {
+            kind: "diagnostic",
+            blocks: diagnostic.severity == agora_game_api::DiagnosticSeverity::Error,
+            title: "The game's plugin check".to_string(),
+            detail: diagnostic.message.clone(),
+            why: "The game's own plugin reported this while checking the instance.".to_string(),
+            repair: diagnostic.repairs.first().cloned(),
+            repair_base: None,
+        }
     }
 }
 
@@ -1393,6 +1407,13 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
             format!("{}.", finding.missing_files_sentence()),
             "The framework starts, but scripts or other files it provides are absent, so mods that rely on them can behave as if it is not installed.".to_string(),
         ),
+        RuntimeFileProblem::Missing => (
+            format!(
+                "It needs {}, which is missing. Installed files that use it may fail to load.",
+                finding.expected
+            ),
+            "The framework file for this game version is absent, so plugins that need it can stop loading even though the mod is installed.".to_string(),
+        ),
         RuntimeFileProblem::CannotCheck { reason } => (
             format!("This rule cannot be checked: {reason}."),
             "Agora could not compare this framework with the game, so it cannot say whether they match.".to_string(),
@@ -1429,8 +1450,15 @@ pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> Che
         ),
         Finding::MasterNotEarlier {
             problem: MasterProblem::Later,
+            movable: true,
             ..
         } => "Open this instance's Plugins tab and choose Sort, then check again.".to_string(),
+        Finding::MasterNotEarlier {
+            problem: MasterProblem::Later,
+            movable: false,
+            ..
+        } => "Open this instance's Plugins tab and unlock the locked plugin (or move the master above the plugin by hand), then check again; Sort cannot move a locked or always-loaded plugin."
+            .to_string(),
         Finding::MasterCycle { plugins } => format!(
             "Disable one of {}, because they need one another in a loop; Sort cannot fix a loop.",
             plugins.join(", ")
@@ -1771,6 +1799,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_declared_setting_warning_is_a_non_blocking_setting_finding() {
+        let finding = diagnostic_finding(&agora_game_api::Diagnostic {
+            code: "INI_SETTING".into(),
+            message: "uGridsToLoad is 11; set it back to 5. (source: https://example.invalid)"
+                .into(),
+            severity: agora_game_api::DiagnosticSeverity::Warning,
+            repairs: Vec::new(),
+        });
+        assert_eq!(finding.kind, "setting");
+        assert!(!finding.blocks);
+        assert!(finding.detail.contains("uGridsToLoad is 11"));
+    }
+
     fn wrong_version(found: Vec<&str>) -> RuntimeFileFinding {
         RuntimeFileFinding {
             rule_id: "skse".into(),
@@ -1778,6 +1820,7 @@ mod tests {
             expected: "skse64_1_6_1170.dll".into(),
             found: found.into_iter().map(str::to_string).collect(),
             repair: "Install the matching extender.".into(),
+            repair_from_source: false,
             required_total: None,
             problem: RuntimeFileProblem::WrongVersion,
         }
@@ -1995,6 +2038,7 @@ mod tests {
             plugin: "Patch.esp".into(),
             master: "Base.esm".into(),
             problem: agora_core::game_load_order::MasterProblem::Inactive,
+            movable: false,
         });
         let repair = inactive.repair.as_deref().unwrap_or_default();
         assert!(repair.contains("enable 'Base.esm'"), "{repair}");
@@ -2004,6 +2048,7 @@ mod tests {
             plugin: "Patch.esp".into(),
             master: "Base.esm".into(),
             problem: agora_core::game_load_order::MasterProblem::Later,
+            movable: true,
         });
         assert!(
             late.repair

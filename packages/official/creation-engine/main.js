@@ -2108,6 +2108,98 @@ export async function parseSkseLog(request) {
   return skseParseLog(request);
 }
 
+// The SKSE plugin preloader writes `d3dx9_42.log`. A line that starts loading a DLL with no later
+// completion line for the same DLL means the preloader began it and never finished, which is worth
+// naming even when the crash log says nothing about a cause.
+const PRELOADER_ATTEMPT = /attempting to load[\t ]+(?:"([^"]+)"|(\S+))/i;
+const PRELOADER_DONE = /(?:loaded|finished loading|successfully loaded)[\t ]+(?:"([^"]+)"|(\S+))/i;
+
+function preloaderFileName(path) {
+  const clean = crashTrim(path).replace(/[\\/]+$/, "");
+  const parts = clean.split(/[\\/]/);
+  return parts.length > 0 ? parts[parts.length - 1] : clean;
+}
+
+function preloaderParseLog(request) {
+  const read = crashReadAllLines(request);
+  if (read.error) throw new Error(read.error);
+  if (read.lines.length === 0) {
+    return {
+      contract: CRASH_CONTRACT,
+      producer: { format: "preloader_log" },
+      facts: [],
+      notes: [{ kind: "wrong_format", message: "the file is empty" }],
+    };
+  }
+
+  const attempts = [];
+  for (let index = 0; index < read.lines.length; index += 1) {
+    const line = read.lines[index];
+    const started = line.match(PRELOADER_ATTEMPT);
+    if (started) {
+      const dll = preloaderFileName(started[1] || started[2] || "");
+      if (dll) attempts.push({ dll: dll, index: index, done: false });
+      continue;
+    }
+    const finished = line.match(PRELOADER_DONE);
+    if (!finished) continue;
+    const dll = preloaderFileName(finished[1] || finished[2] || "").toLowerCase();
+    for (let at = attempts.length - 1; at >= 0; at -= 1) {
+      if (attempts[at].dll.toLowerCase() === dll) {
+        attempts[at].done = true;
+        break;
+      }
+    }
+  }
+
+  if (attempts.length === 0) {
+    return {
+      contract: CRASH_CONTRACT,
+      producer: { format: "preloader_log" },
+      facts: [],
+      notes: [{ kind: "wrong_format", message: "the file has no preloader load attempt" }],
+    };
+  }
+
+  const limits = request.limits;
+  const state = { facts: [], kinds: {}, budgetSpent: false, refsTruncated: false };
+  for (const attempt of attempts) {
+    if (attempt.done) continue;
+    const refs = new Map();
+    crashAddRef(refs, "module", attempt.dll, "mention", limits);
+    crashPushFact(state, limits, {
+      kind: "creation.preloader_load",
+      attrs: { state: "unfinished" },
+      refs: crashRefList(refs, limits, state),
+      span: crashSpan("PRELOADER LOG", attempt.index, attempt.index),
+    });
+  }
+
+  const notes = [];
+  if (read.cut) {
+    notes.push({ kind: "truncated", message: "a line was longer than the read limit and was cut" });
+  }
+  if (read.gap) {
+    notes.push({ kind: "truncated", message: "the kept head and tail are not adjacent" });
+  }
+  if (read.budget || state.budgetSpent) {
+    notes.push({ kind: "budget_spent", message: "the parser reached its fact or line budget" });
+  }
+
+  return {
+    contract: CRASH_CONTRACT,
+    producer: { format: "preloader_log" },
+    facts: state.facts,
+    coverage: [{ kind: "creation.preloader_load", state: "checked" }],
+    notes: notes,
+  };
+}
+
+/// The SKSE plugin preloader's log, `d3dx9_42.log`.
+export async function parsePreloaderLog(request) {
+  return preloaderParseLog(request);
+}
+
 // ---------------------------------------------------------------------------
 // SKSE plugin declarations (MASTER_SPEC §30.11)
 //
@@ -2152,6 +2244,147 @@ const SAVE_VIEW = "@saves";
 const SAVE_HEADER_WINDOW = 8192;
 const SAVE_PLUGIN_NAME = /\.(?:esp|esm|esl)$/i;
 
+const SAVE_MAX_FILE = 32 * 1024 * 1024;
+const SAVE_MAX_UNCOMPRESSED = 64 * 1024 * 1024;
+const SAVE_READ_CHUNK = 1024 * 1024;
+
+/// One LZ4 block (no frame header), as Skyrim SE writes after the save's screenshot. Bounded by
+/// the decompressed size the save states, so a hostile file cannot make the launcher grow without
+/// limit. Source for the block format: https://github.com/lz4/lz4/blob/dev/doc/lz4_Block_format.md
+function saveLz4(bytes, start, end, expected) {
+  const out = new Uint8Array(expected);
+  let at = start;
+  let outAt = 0;
+  while (at < end) {
+    const token = bytes[at];
+    at += 1;
+    let literals = token >>> 4;
+    if (literals === 15) {
+      while (at < end) {
+        const next = bytes[at];
+        at += 1;
+        literals += next;
+        if (next !== 255) break;
+      }
+    }
+    if (outAt + literals > expected || at + literals > end) return null;
+    out.set(bytes.subarray(at, at + literals), outAt);
+    at += literals;
+    outAt += literals;
+    if (at >= end) break;
+    if (at + 2 > end) return null;
+    const offset = bytes[at] | (bytes[at + 1] << 8);
+    at += 2;
+    if (offset === 0 || offset > outAt) return null;
+    let match = (token & 0x0f) + 4;
+    if ((token & 0x0f) === 15) {
+      while (at < end) {
+        const next = bytes[at];
+        at += 1;
+        match += next;
+        if (next !== 255) break;
+      }
+    }
+    if (outAt + match > expected) return null;
+    for (let index = 0; index < match; index += 1) {
+      out[outAt] = out[outAt - offset];
+      outAt += 1;
+    }
+  }
+  return outAt === expected ? out : null;
+}
+
+/// The plugin block at the start of an SE save's decompressed body: a marker byte, the block size,
+/// the full plugin count and names, then the light plugin count and names. Every name is validated
+/// before it is returned, so a wrong guess is refused rather than reported as a plugin list.
+function savePluginBlock(bytes) {
+  if (bytes.length < 6) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let at = 0;
+  at += 1;
+  const size = view.getUint32(at, true);
+  at += 4;
+  if (size === 0 || 5 + size > bytes.length) return null;
+  const fullCount = bytes[at];
+  at += 1;
+  if (fullCount === 0) return null;
+  const plugins = [];
+  const readNames = (count) => {
+    for (let index = 0; index < count; index += 1) {
+      if (at + 2 > bytes.length) return false;
+      const length = view.getUint16(at, true);
+      at += 2;
+      if (length < 5 || at + length > bytes.length) return false;
+      const name = ascii(bytes, at, length);
+      at += length;
+      if (!SAVE_PLUGIN_NAME.test(name)) return false;
+      plugins.push({ name: name, active: true });
+    }
+    return true;
+  };
+  if (!readNames(fullCount)) return null;
+  if (at + 2 > bytes.length) return null;
+  const lightCount = view.getUint16(at, true);
+  at += 2;
+  if (!readNames(lightCount)) return null;
+  return plugins;
+}
+
+/// An SE save: `TESV_SAVEGAME`, header size, the header, a screenshot, then the size of the
+/// decompressed body, the compressed size, and one LZ4 block. The plugin list is in that body.
+/// Layout followed: UESP, "Skyrim Mod:Save File Format"
+/// (https://en.uesp.net/wiki/Skyrim_Mod:Save_File_Format).
+function saveSePluginList(bytes) {
+  if (bytes.length < 17 || ascii(bytes, 0, 13) !== "TESV_SAVEGAME") return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const headerSize = view.getUint32(13, true);
+  const headerEnd = 17 + headerSize;
+  if (headerEnd < 17 || headerEnd + 16 > bytes.length) return null;
+  let at = 17;
+  const u16 = () => {
+    const value = view.getUint16(at, true);
+    at += 2;
+    return value;
+  };
+  const u32 = () => {
+    const value = view.getUint32(at, true);
+    at += 4;
+    return value;
+  };
+  const text = () => {
+    const length = u16();
+    const value = ascii(bytes, at, length);
+    at += length;
+    return value;
+  };
+  u32(); // version
+  u32(); // save number
+  text(); // player name
+  u32(); // level
+  text(); // location
+  text(); // game date
+  text(); // race
+  u16(); // sex
+  at += 4; // current experience
+  at += 4; // experience to the next level
+  at += 8; // file time
+  const width = u32();
+  const height = u32();
+  u16(); // screenshot format
+  if (at > headerEnd || width === 0 || height === 0) return null;
+  const sizes = headerEnd + width * height * 4;
+  if (sizes + 8 > bytes.length) return null;
+  const uncompressed = view.getUint32(sizes, true);
+  const compressed = view.getUint32(sizes + 4, true);
+  if (uncompressed < 6 || compressed === 0 || uncompressed > SAVE_MAX_UNCOMPRESSED) return null;
+  const start = sizes + 8;
+  const end = Math.min(bytes.length, start + compressed);
+  const body = saveLz4(bytes, start, end, uncompressed);
+  return body === null ? null : savePluginBlock(body);
+}
+
+/// The old shape: a plugin count and length-prefixed names with an active byte, found by its shape
+/// in the first bytes. Kept for a save that is not SE's compressed form.
 function savePluginList(bytes) {
   const limit = Math.min(bytes.length, 512);
   for (let start = 12; start < limit; start += 1) {
@@ -2191,6 +2424,21 @@ function savePluginList(bytes) {
   return null;
 }
 
+/// Read a save in chunks; one `game.readBytes` call is capped, the whole file is read within the
+/// hook's read budget. A short read is returned as it is, and the parser refuses it.
+function saveReadAll(path, size) {
+  const out = new Uint8Array(size);
+  let at = 0;
+  while (at < size) {
+    const length = Math.min(SAVE_READ_CHUNK, size - at);
+    const chunk = new Uint8Array(game.readBytes(path, at, length));
+    if (chunk.length === 0) break;
+    out.set(chunk, at);
+    at += chunk.length;
+  }
+  return at === size ? out : out.subarray(0, at);
+}
+
 /// The newest save's active plugins, or why its header could not be read. No saves is not an
 /// error: there is simply nothing to compare.
 function newestSavePlugins() {
@@ -2202,13 +2450,21 @@ function newestSavePlugins() {
   }
   const saves = ((listed && listed.entries) || [])
     .filter((entry) => entry && !entry.dir && /\.ess$/i.test(String(entry.name)))
-    .map((entry) => String(entry.name))
-    .sort((left, right) => right.localeCompare(left, undefined, { numeric: true }));
+    .map((entry) => ({ name: String(entry.name), size: Number(entry.size) || 0 }))
+    .sort((left, right) => right.name.localeCompare(left.name, undefined, { numeric: true }));
   if (saves.length === 0) return { plugins: null, name: null, reason: null };
-  const name = saves[0];
+  const newest = saves[0];
+  const name = newest.name;
+  if (newest.size < 17 || newest.size > SAVE_MAX_FILE) {
+    return {
+      plugins: null,
+      name: name,
+      reason: "its size is outside what Agora reads for a save",
+    };
+  }
   try {
-    const bytes = new Uint8Array(game.readBytes(SAVE_VIEW + "/" + name, 0, SAVE_HEADER_WINDOW));
-    const plugins = savePluginList(bytes);
+    const bytes = saveReadAll(SAVE_VIEW + "/" + name, newest.size);
+    const plugins = saveSePluginList(bytes) || savePluginList(bytes);
     if (plugins === null) {
       return {
         plugins: null,

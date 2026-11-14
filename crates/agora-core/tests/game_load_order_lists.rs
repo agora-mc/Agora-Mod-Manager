@@ -22,7 +22,8 @@ use agora_game_api::{
     DeploymentStrategy, Diagnostic, GameContext, GameDefinition, GameError, GameFuture, GameId,
     GamePackage, GamePath, InstallId, InstallKind, LoadOrderDefinition, LoadOrderFormat,
     LoadOrderLine, LoadOrderRule, LoadOrderRules, LoadOrderRulesReply, PackageDefinition, RelPath,
-    RuntimeIdentity, StoreId, StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
+    RuntimeIdentity, SorterReply, SorterRequest, SorterRule, SorterStatus, StoreId,
+    StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -37,6 +38,8 @@ struct ScriptHooks {
     fail_render: bool,
     /// Where a diagnostics hook records the context core gave it.
     diagnostics: Option<Arc<Mutex<Option<GameContext>>>>,
+    /// Whether the sorter declares an update hook but has no saved data yet.
+    sorter_no_data: bool,
 }
 
 struct TestPackage {
@@ -66,6 +69,44 @@ impl GamePackage for TestPackage {
                 rules: hooks.rules,
                 ..Default::default()
             }))
+        })
+    }
+
+    fn sort_load_order<'a>(
+        &'a self,
+        request: SorterRequest,
+    ) -> GameFuture<'a, Option<SorterReply>> {
+        Box::pin(async move {
+            // With no data the real script hands the list back unchanged. The core must not
+            // mistake that for a sorter that tried and could not fix it.
+            Ok(Some(SorterReply {
+                order: request
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect(),
+                notes: Vec::new(),
+                general: Vec::new(),
+            }))
+        })
+    }
+
+    fn update_sorter<'a>(
+        &'a self,
+        _request: SorterRequest,
+        _update: bool,
+    ) -> GameFuture<'a, Option<SorterStatus>> {
+        let no_data = self.hooks.sorter_no_data;
+        Box::pin(async move {
+            Ok(if no_data {
+                None
+            } else {
+                Some(SorterStatus {
+                    fetched_at: "2026-11-14T00:00:00Z".into(),
+                    source: "test".into(),
+                    data_version: "1".into(),
+                })
+            })
         })
     }
 
@@ -262,6 +303,7 @@ fn definition(lists: Vec<LoadOrderDefinition>) -> GameDefinition {
         load_orders: lists,
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: Vec::new(),
         copy_patterns: Vec::new(),
     }
@@ -598,6 +640,63 @@ fn a_failed_rules_hook_leaves_the_order_and_reports() {
         "{:?}",
         order.findings
     );
+}
+
+#[test]
+fn a_sorter_with_no_masterlist_still_sorts_by_masters() {
+    let mut rule = script_rule("plugins", "Script.txt", "script");
+    rule.rules.sorter = Some(SorterRule {
+        hook: "sort".into(),
+        update: Some("update".into()),
+        update_label: None,
+        options: serde_json::Value::Null,
+    });
+    let h = Harness::with_hooks(
+        vec![rule],
+        ScriptHooks {
+            rules: vec![LoadOrderRule::Requires {
+                item: "A.esp".into(),
+                master: "B.esp".into(),
+                optional: false,
+            }],
+            sorter_no_data: true,
+            ..ScriptHooks::default()
+        },
+    );
+    let inst = h.instance("no-sorter-data");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.write(&inst, "Script.txt", b"A.esp\ttrue\nB.esp\ttrue\n");
+
+    let (report, order) = game_load_order::sort_and_order_in(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        Some("plugins"),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        report.mode,
+        game_load_order::SortMode::Masters,
+        "{report:?}"
+    );
+    assert_eq!(
+        report.message.as_deref(),
+        Some(game_load_order::SORTER_NEEDS_DATA),
+        "{report:?}"
+    );
+    assert_eq!(report.moves.len(), 1, "{report:?}");
+    assert_eq!(report.moves[0].plugin, "B.esp");
+    let names: Vec<String> = order
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    let a = names.iter().position(|name| name == "A.esp").unwrap();
+    let b = names.iter().position(|name| name == "B.esp").unwrap();
+    assert!(b < a, "the master must move above its dependent: {names:?}");
 }
 
 #[test]

@@ -36,11 +36,18 @@ impl LayerOwner {
         }
     }
 
-    /// A stable, short name for `also_provided_by`.
+    /// The name shown for `also_provided_by`: the item's name, or its content key only when the
+    /// item has no name.
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Base => "base".to_string(),
-            Self::Item { key, .. } => key.clone(),
+            Self::Item { key, name } => {
+                if name.trim().is_empty() {
+                    key.clone()
+                } else {
+                    name.clone()
+                }
+            }
             Self::Framework { name } => name.clone(),
             Self::Generated { tool } => tool.clone(),
             Self::Writable => "writable".to_string(),

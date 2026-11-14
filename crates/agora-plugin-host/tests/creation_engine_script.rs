@@ -183,6 +183,48 @@ fn the_script_reads_flags_masters_and_extensions() {
 }
 
 #[test]
+fn a_light_plugin_still_declares_its_master() {
+    // A master below its dependent is wrong whatever the flags; the sorter, not a missing rule,
+    // is what puts it right. LOOT orders a light master above its light dependent too.
+    let reply = run(
+        vec![
+            (
+                "LightMod.esp".to_string(),
+                plugin_bytes(0x200, &["FullMaster.esp"]),
+            ),
+            (
+                "FullMaster.esp".to_string(),
+                plugin_bytes(0, &["Skyrim.esm"]),
+            ),
+            ("Skyrim.esm".to_string(), plugin_bytes(0x1, &[])),
+            ("LightMaster.esl".to_string(), plugin_bytes(0, &[])),
+            (
+                "UsesLightMaster.esp".to_string(),
+                plugin_bytes(0x200, &["LightMaster.esl"]),
+            ),
+        ],
+        &[
+            entry("LightMod.esp"),
+            entry("FullMaster.esp"),
+            entry("Skyrim.esm"),
+            entry("UsesLightMaster.esp"),
+            entry("LightMaster.esl"),
+        ],
+    );
+
+    let rules = reply["rules"].as_array().expect("rules");
+    let rule = |item: &str| {
+        rules
+            .iter()
+            .find(|rule| rule["item"] == item)
+            .unwrap_or_else(|| panic!("no rule for {item}"))
+    };
+    assert_eq!(rule("LightMod.esp")["master"], "FullMaster.esp");
+    assert_eq!(rule("UsesLightMaster.esp")["master"], "LightMaster.esl");
+    assert!(rules.iter().all(|rule| rule.get("order").is_none()));
+}
+
+#[test]
 fn the_script_reports_unreadable_headers_and_the_plugin_limits() {
     let mut files = Vec::new();
     let mut entries = Vec::new();

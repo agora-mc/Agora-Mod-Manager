@@ -345,8 +345,73 @@ fn three_mods_later_position_wins_and_listing_order_does_not_matter() {
     let first_answer = first.attribute(&value);
     let second_answer = second.attribute(&value);
     assert_eq!(first_answer.owner, owner("mod-c"));
-    assert_eq!(first_answer.also_provided_by, ["mod-a", "mod-b"]);
+    assert_eq!(first_answer.also_provided_by, ["mod-a mod", "mod-b mod"]);
     assert_eq!(first_answer, second_answer);
+}
+
+#[test]
+fn also_provided_by_names_an_item_and_falls_back_to_its_key() {
+    let unnamed = LayerOwner::Item {
+        key: "0123456789abcdef".into(),
+        name: String::new(),
+    };
+    let view = InstanceView::new(vec![
+        layer("unnamed", true, unnamed, &["Data/shared.esp"]),
+        layer(
+            "mod-b",
+            true,
+            LayerOwner::Item {
+                key: "fedcba9876543210".into(),
+                name: "Mod B".into(),
+            },
+            &["Data/shared.esp"],
+        ),
+        layer("mod-a", true, item("mod-a"), &["Data/shared.esp"]),
+    ]);
+    let answer = resolver(
+        view,
+        vec![path_map(
+            "file",
+            &["Data/{value}"],
+            NameMatch::Casefold,
+            false,
+        )],
+        Vec::new(),
+    )
+    .attribute(&reference("file", "shared.esp"));
+    assert_eq!(answer.also_provided_by, ["0123456789abcdef", "Mod B"]);
+}
+
+#[test]
+fn a_content_change_key_resolves_to_the_item_that_owns_it() {
+    let view = InstanceView::new(vec![layer(
+        "lib",
+        false,
+        LayerOwner::Item {
+            key: "lib-key".into(),
+            name: "Address Library".into(),
+        },
+        &[],
+    )]);
+    let by_key =
+        resolver(view.clone(), Vec::new(), Vec::new()).attribute(&reference("content", "lib-key"));
+    assert_eq!(
+        by_key.owner,
+        Owner::Item {
+            key: "lib-key".into(),
+            name: "Address Library".into(),
+        }
+    );
+    // A change names the item by its catalog key or its name; both find the same layer.
+    let by_name =
+        resolver(view, Vec::new(), Vec::new()).attribute(&reference("content", "Address Library"));
+    assert_eq!(
+        by_name.owner,
+        Owner::Item {
+            key: "lib-key".into(),
+            name: "Address Library".into(),
+        }
+    );
 }
 
 #[test]
@@ -368,7 +433,7 @@ fn a_turned_off_winner_lets_the_next_one_own() {
     );
     let answer = resolver.attribute(&reference("file", "shared.esp"));
     assert_eq!(answer.owner, owner("mod-b"));
-    assert_eq!(answer.also_provided_by, ["mod-a"]);
+    assert_eq!(answer.also_provided_by, ["mod-a mod"]);
 }
 
 #[test]
@@ -902,7 +967,7 @@ fn two_mods_with_the_same_wildcard_dll_later_position_wins() {
     );
     let answer = resolver.attribute(&reference("module", "x.dll"));
     assert_eq!(answer.owner, owner("mod-b"));
-    assert_eq!(answer.also_provided_by, ["mod-a"]);
+    assert_eq!(answer.also_provided_by, ["mod-a mod"]);
 }
 
 #[test]

@@ -1247,7 +1247,13 @@ fn runtime_check(
     let mut findings =
         crate::game_launch::runtime_findings(definition, &base_manifest.runtime.version, &paths);
     findings.extend(crate::game_frameworks::missing_required_findings(
-        ctx, definition, &paths,
+        ctx,
+        definition,
+        &paths,
+        Some(&crate::game_frameworks::FrameworkRepairSource {
+            base_id: &base_id,
+            source: &base_manifest.source_location,
+        }),
     ));
     Ok((
         findings,
@@ -1325,12 +1331,15 @@ pub fn launch_checks(
     };
     // A package's script can add findings to the same launch checks the page
     // already shows. A failing hook is reported, never silently dropped.
-    let diagnostics = diagnostics_for_orders(
+    let mut diagnostics = diagnostics_for_orders(
         ctx,
         definition,
         hook_context(ctx, record, definition)?,
         &orders,
     );
+    // The game's own INI rules read the instance's copies, so they apply to a pinned or unpinned
+    // instance alike. They are warnings, never a refusal: the player decides.
+    diagnostics.extend(crate::game_ini::check_instance_ini(ctx, id, definition));
     if !pinned {
         return Ok(LaunchChecks {
             runtime,
@@ -1622,7 +1631,7 @@ pub fn prepare_launch_with(
             .map_err(|e| InstanceError::Other(e.to_string()))?;
         answer_before_launch(ctx, id, definition, &options, launcher)?;
     }
-    match record.base {
+    let mut prepared = match record.base {
         BaseReference::Pinned { id: base_id, .. } => {
             let chosen = options.deployment.or(manifest.deployment);
 
@@ -1711,7 +1720,15 @@ pub fn prepare_launch_with(
                     .map(|f| f.path.as_str())
                     .collect();
                 prepared.runtime_findings.extend(
-                    crate::game_frameworks::missing_required_findings(ctx, definition, &base_paths),
+                    crate::game_frameworks::missing_required_findings(
+                        ctx,
+                        definition,
+                        &base_paths,
+                        Some(&crate::game_frameworks::FrameworkRepairSource {
+                            base_id: &base_id,
+                            source: &base_manifest.source_location,
+                        }),
+                    ),
                 );
                 write_launch_notes(ctx, id, &notes)?;
                 Ok(prepared)
@@ -1813,7 +1830,14 @@ pub fn prepare_launch_with(
                 alternative,
             ))
         }
-    }
+    }?;
+    // The game's own INI rules read the instance's copies, so they apply to a pinned or unpinned
+    // instance alike. A launch already carries the game package's diagnostics over its load order;
+    // the INI warnings join them from the same function the check runs.
+    prepared
+        .diagnostics
+        .extend(crate::game_ini::check_instance_ini(ctx, id, definition));
+    Ok(prepared)
 }
 
 /// Deploy a pinned instance on `rung` and resolve its launch from the deployed folder.
@@ -1844,7 +1868,13 @@ fn prepare_deployed(
                 &visible,
             );
             runtime.extend(crate::game_frameworks::missing_required_findings(
-                ctx, definition, &visible,
+                ctx,
+                definition,
+                &visible,
+                Some(&crate::game_frameworks::FrameworkRepairSource {
+                    base_id,
+                    source: &base_manifest.source_location,
+                }),
             ));
             findings = crate::game_launch::refuse_runtime_mismatch(runtime, options.launch_anyway)?;
             Ok::<(), InstanceError>(())

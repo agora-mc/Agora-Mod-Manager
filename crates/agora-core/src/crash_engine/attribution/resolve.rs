@@ -8,7 +8,7 @@ use super::index::{
     class_segments, expand_pattern, matches_segments, matches_value, normalize_index_value,
     normalize_path, normalize_segment, ArchiveIndex, PatternError,
 };
-use super::view::InstanceView;
+use super::view::{InstanceView, LayerOwner};
 use crate::crash_engine::types::{ParsedArtifact, RefResolver, Resolved};
 
 /// What attribution found out about one ref. [`Resolver::resolve`] drops the detail the evaluator's
@@ -17,8 +17,9 @@ use crate::crash_engine::types::{ParsedArtifact, RefResolver, Resolved};
 pub struct Attribution {
     pub owner: Owner,
     pub role: Option<Role>,
-    /// Content keys (or a short layer label) of the other enabled layers that provide the same
-    /// file. Sorted and deduplicated, so it does not depend on listing order.
+    /// Names of the other enabled layers that provide the same file, falling back to a content
+    /// key only when an item has no name (and to a short label for other kinds of layer). Sorted
+    /// and deduplicated, so it does not depend on listing order.
     pub also_provided_by: Vec<String>,
     /// The file the answer came from: the game-relative path, or an archive holding it.
     pub via: Option<String>,
@@ -65,6 +66,32 @@ impl Resolver {
         let value = reference.value.trim();
         let matched_role = self.matching_role(reference);
         let role = matched_role.map(|rule| rule.role);
+
+        // A changed content item is named by its key, which is not a file. The instance view
+        // already knows which layer owns each key, so the change facts resolve without a ref map.
+        if reference.kind == "content" && !value.is_empty() {
+            let owner = self
+                .view
+                .layers()
+                .iter()
+                .find_map(|layer| match &layer.owner {
+                    LayerOwner::Item { key, name }
+                        if key.eq_ignore_ascii_case(value) || name.eq_ignore_ascii_case(value) =>
+                    {
+                        Some(layer.owner.to_owner())
+                    }
+                    _ => None,
+                });
+            if let Some(owner) = owner {
+                return Attribution {
+                    owner,
+                    role,
+                    also_provided_by: Vec::new(),
+                    via: None,
+                    reason: None,
+                };
+            }
+        }
 
         let maps: Vec<&RefMap> = self
             .ref_maps

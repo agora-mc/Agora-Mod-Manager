@@ -101,5 +101,6 @@ pub fn skyrim_definition() -> GameDefinition {
         content_layout: None,
         copy_patterns: Vec::new(),
         save_location,
+        ini_checks: Vec::new(),
     }
 }

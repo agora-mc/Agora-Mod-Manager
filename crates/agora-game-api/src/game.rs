@@ -275,6 +275,72 @@ impl SaveLocationRule {
     }
 }
 
+/// A declarative check of one key in one of the game's per-user INI files. A value outside the
+/// rule is a warning in the instance and launch checks, never a refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IniCheck {
+    /// The per-user file (an `instance_path`, such as `user/Skyrim.ini`) holding the key.
+    pub file: String,
+    pub section: String,
+    pub key: String,
+    /// The value the key has when the file does not set it. Needed for a numeric rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// The only acceptable value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect: Option<String>,
+    /// Acceptable values, when there is more than one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub one_of: Vec<String>,
+    /// The value must be an odd whole number.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub odd: bool,
+    /// The value must be at least this many.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_least: Option<i64>,
+    /// The value must be at least a minimum computed from another key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_least_from: Option<IniMinimumFrom>,
+    /// One sentence for the player, with `{value}` and `{minimum}` substituted.
+    pub message: String,
+    /// Where the rule comes from, as a URL the player can check.
+    pub source: String,
+}
+
+impl IniCheck {
+    /// Whether the check names any condition at all.
+    pub fn has_condition(&self) -> bool {
+        self.expect.is_some()
+            || !self.one_of.is_empty()
+            || self.odd
+            || self.at_least.is_some()
+            || self.at_least_from.is_some()
+    }
+
+    /// Whether the check needs a whole-number value, so it needs a default when the file is silent.
+    pub fn needs_default(&self) -> bool {
+        self.odd || self.at_least.is_some() || self.at_least_from.is_some()
+    }
+}
+
+/// A minimum computed from another INI key: `(other + add)^2` when `square`, else `other + add`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IniMinimumFrom {
+    pub section: String,
+    pub key: String,
+    /// That key's value when the file does not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Added to the other value.
+    #[serde(default)]
+    pub add: i64,
+    /// Square the sum.
+    #[serde(default)]
+    pub square: bool,
+}
+
 /// Host-resolved roots. Every `path` is relative to its root and checked by core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "root", rename_all = "snake_case")]
@@ -533,6 +599,10 @@ pub struct GameDefinition {
     /// when the game has no such setting; the instance then always shares the game's saves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub save_location: Vec<SaveLocationRule>,
+    /// Checks of individual settings in the game's per-user INI files. Each is a warning the
+    /// instance and launch checks report, never a refusal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ini_checks: Vec<IniCheck>,
     /// The name Mod Organizer 2 gives this game in its `gameName` setting, such as
     /// `Skyrim Special Edition`. An MO2 import maps a setup to the game through it (MASTER_SPEC
     /// §26.10). Absent when no MO2 setup can be matched to this game.
@@ -815,6 +885,12 @@ pub struct RuntimeFileRule {
     pub applies_to: Vec<String>,
     /// What to do, shown with the finding; `{version}` is substituted.
     pub repair: String,
+    /// A glob over deployed paths that means this runtime file is needed. When the expected path
+    /// is absent but a file matches this, the finding is [`RuntimeFileProblem::Missing`] instead
+    /// of silence; e.g. any `Data/SKSE/Plugins/*.dll` needs the Address Library. Empty means only
+    /// a file of the rule's own family makes it speak.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_present: Option<String>,
 }
 
 /// The most family file names one finding lists.
@@ -827,6 +903,8 @@ pub enum RuntimeFileProblem {
     WrongVersion,
     /// The framework's marker is present, but files it declares as required are not.
     MissingFiles,
+    /// Files that need this runtime file are installed, but the expected one is absent.
+    Missing,
     /// The rule cannot be evaluated against this runtime. That is a bad definition, and it is
     /// shown as a finding rather than skipped.
     CannotCheck { reason: String },
@@ -844,6 +922,10 @@ pub struct RuntimeFileFinding {
     pub found: Vec<String>,
     /// What to do, with `{version}` substituted.
     pub repair: String,
+    /// Whether the source install has every missing file, so repairing the base can restore them.
+    /// Set only for missing-file findings of a pinned base.
+    #[serde(default)]
+    pub repair_from_source: bool,
     /// How many files the framework declared required. Set for missing-file findings, so a long
     /// list can say "61 of its 61" without counting the short list it prints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -905,6 +987,26 @@ impl RuntimeFileFinding {
             RuntimeFileProblem::MissingFiles => {
                 format!("{}. Repair: {}", self.missing_files_sentence(), self.repair)
             }
+            RuntimeFileProblem::Missing => {
+                let needed_by = if self.found.is_empty() {
+                    "files that need it are installed".to_string()
+                } else {
+                    format!(
+                        "{} installed file(s) need it, such as {}",
+                        self.required_total.unwrap_or(self.found.len()),
+                        self.found
+                            .iter()
+                            .take(RUNTIME_FILE_FINDING_MAX_FOUND)
+                            .map(|path| path.rsplit('/').next().unwrap_or(path))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                format!(
+                    "{} ({}) is missing {}, and {}. Repair: {}",
+                    self.rule_name, self.rule_id, self.expected, needed_by, self.repair
+                )
+            }
             RuntimeFileProblem::CannotCheck { reason } => {
                 format!(
                     "{} ({}) cannot be checked: {reason}",
@@ -965,6 +1067,35 @@ pub fn check_runtime_files<S: AsRef<str>>(
             .filter(|path| runtime_path_matches(&rule.family, path))
             .collect();
         if family_files.is_empty() {
+            // The framework's own family is absent. If something that needs this runtime file is
+            // installed, say the version file is missing rather than treating it as not installed.
+            let Some(when_present) = rule.when_present.as_deref() else {
+                continue;
+            };
+            let mut needing: Vec<&str> = deployed_paths
+                .iter()
+                .map(AsRef::as_ref)
+                .filter(|path| runtime_path_matches(when_present, path))
+                .collect();
+            if needing.is_empty() {
+                continue;
+            }
+            needing.sort_by_key(|path| fold_path_case(path));
+            needing.dedup_by(|a, b| fold_path_case(a) == fold_path_case(b));
+            findings.push(RuntimeFileFinding {
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
+                expected,
+                found: needing
+                    .iter()
+                    .take(RUNTIME_FILE_FINDING_MAX_FOUND)
+                    .map(|path| path.to_string())
+                    .collect(),
+                repair: rule.repair.replace("{version}", version),
+                repair_from_source: false,
+                required_total: Some(needing.len()),
+                problem: RuntimeFileProblem::Missing,
+            });
             continue;
         }
         if deployed_paths
@@ -987,6 +1118,7 @@ pub fn check_runtime_files<S: AsRef<str>>(
             expected,
             found,
             repair: rule.repair.replace("{version}", version),
+            repair_from_source: false,
             required_total: None,
             problem: RuntimeFileProblem::WrongVersion,
         });
@@ -1069,6 +1201,7 @@ pub fn missing_framework_files<S: AsRef<str>>(
                 "Reinstall {} so all of its files are present.",
                 framework.name
             ),
+            repair_from_source: false,
             required_total: Some(detection.required.len()),
             problem: RuntimeFileProblem::MissingFiles,
         });
@@ -1103,6 +1236,7 @@ fn cannot_check(rule: &RuntimeFileRule, reason: &str) -> RuntimeFileFinding {
         expected: rule.expected.clone(),
         found: Vec::new(),
         repair: rule.repair.clone(),
+        repair_from_source: false,
         required_total: None,
         problem: RuntimeFileProblem::CannotCheck {
             reason: reason.to_string(),
@@ -2611,6 +2745,7 @@ mod runtime_file_tests {
                 applies_to: vec![],
                 repair: "Install the SKSE build for Skyrim {version} from skse.silverlock.org"
                     .into(),
+                when_present: None,
             },
             RuntimeFileRule {
                 id: "address-library".into(),
@@ -2619,6 +2754,7 @@ mod runtime_file_tests {
                 expected: "Data/SKSE/Plugins/versionlib-{1}-{2}-{3}-{4}.bin".into(),
                 applies_to: vec!["1.6.*".into()],
                 repair: "Install the Address Library build for Skyrim {version}".into(),
+                when_present: Some("Data/SKSE/Plugins/*.dll".into()),
             },
             RuntimeFileRule {
                 id: "address-library-se".into(),
@@ -2627,6 +2763,7 @@ mod runtime_file_tests {
                 expected: "Data/SKSE/Plugins/version-{1}-{2}-{3}-{4}.bin".into(),
                 applies_to: vec!["1.5.*".into()],
                 repair: "Install the Address Library build for Skyrim {version}".into(),
+                when_present: Some("Data/SKSE/Plugins/*.dll".into()),
             },
         ]
     }
@@ -2873,6 +3010,7 @@ mod runtime_file_tests {
             expected: "Data/SKSE/Plugins/versionlib-{1}-{2}-{3}-{4}.bin".into(),
             applies_to: vec![],
             repair: "Install it".into(),
+            when_present: None,
         }];
         let findings = check_runtime_files(&rules, "1.6.1179.0", &names);
         assert_eq!(findings.len(), 1);
@@ -2969,6 +3107,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: Vec::new(),
         };
@@ -3015,6 +3154,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: Vec::new(),
         };
@@ -3056,6 +3196,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: Vec::new(),
         };
@@ -3093,6 +3234,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: vec!["**/*.dat".into()],
         };

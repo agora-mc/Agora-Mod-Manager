@@ -20,9 +20,10 @@ use agora_core::game_registry::{
 };
 use agora_game_api::{
     BaseReference, DeploymentStrategy, FrameworkDefinition, FrameworkDetection, FrameworkId,
-    FrameworkVersionSource, GameDefinition, GameId, GamePackage, GamePath, InstallId, InstallKind,
-    LaunchRecipe, LaunchValue, LoadOrderDefinition, PackageDefinition, RelPath, RuntimeFileProblem,
-    RuntimeFileRule, RuntimeIdentity, StoreId, StoreIdentifier,
+    FrameworkVersionSource, GameDefinition, GameId, GamePackage, GamePath, IniCheck,
+    IniMinimumFrom, InstallId, InstallKind, LaunchRecipe, LaunchValue, LoadOrderDefinition,
+    PackageDefinition, RelPath, RuntimeFileProblem, RuntimeFileRule, RuntimeIdentity, StoreId,
+    StoreIdentifier, UserDataLocation, UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -37,6 +38,7 @@ fn skse_rule() -> RuntimeFileRule {
         expected: "skse64_{1}_{2}_{3}.dll".into(),
         applies_to: vec![],
         repair: "Install the SKSE build for Skyrim {version}".into(),
+        when_present: None,
     }
 }
 
@@ -49,6 +51,7 @@ fn other_framework_rule() -> RuntimeFileRule {
         expected: "other_1.dll".into(),
         applies_to: vec![],
         repair: "Install the Other Framework for this version".into(),
+        when_present: None,
     }
 }
 
@@ -133,6 +136,7 @@ fn make_test_definition() -> GameDefinition {
         launch_alternatives: Vec::new(),
         runtime_files: vec![skse_rule()],
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         content_layout: None,
         copy_patterns: Vec::new(),
     }
@@ -457,6 +461,7 @@ fn a_rule_that_cannot_be_checked_launches_with_a_warning_not_a_refusal() {
         expected: "skse64_{1}_{2}_{5}.dll".into(),
         applies_to: vec![],
         repair: "Fix the game definition".into(),
+        when_present: None,
     }];
     add_root_content(
         &s.ctx,
@@ -581,7 +586,7 @@ fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
         version: "2.2.6".into(),
         supported_runtimes: Vec::new(),
         required_frameworks: Vec::new(),
-        content: Vec::new(),
+        content: vec!["catalog.skse".into()],
         launch: None,
         detection: Some(FrameworkDetection {
             marker: RelPath::new("skse64_loader.exe").unwrap(),
@@ -617,6 +622,23 @@ fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
     assert_eq!(missing.rule_id, "skse");
     assert_eq!(missing.found, vec!["Data/Scripts/SKSE.pex"]);
     assert!(!missing.refuses_launch(), "a missing file only warns");
+    assert!(
+        !missing.repair_from_source,
+        "the source install lacks the file too: {:?}",
+        missing.repair
+    );
+    assert!(
+        missing
+            .repair
+            .contains("Install Skyrim Script Extender so all of its files are present"),
+        "{}",
+        missing.repair
+    );
+    assert!(
+        missing.repair.contains("catalog.skse"),
+        "the framework's content key is shown: {}",
+        missing.repair
+    );
 
     let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
     assert!(
@@ -638,4 +660,270 @@ fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
         "{:?}",
         prepared.runtime_findings
     );
+}
+
+#[test]
+fn a_runtime_file_that_installed_plugins_need_is_reported_missing() {
+    let mut s = setup(&["Data/SKSE/Plugins/EngineFixes.dll"]);
+    s.def.runtime_files = vec![RuntimeFileRule {
+        id: "address-library".into(),
+        name: "Address Library for SKSE Plugins".into(),
+        family: "Data/SKSE/Plugins/version*-*.bin".into(),
+        expected: "Data/SKSE/Plugins/versionlib-{1}-{2}-{3}-{4}.bin".into(),
+        applies_to: vec!["1.6.*".into()],
+        repair: "Install the Address Library build for Skyrim {version}".into(),
+        when_present: Some("Data/SKSE/Plugins/*.dll".into()),
+    }];
+
+    let findings = runtime_findings(&s.ctx, &s.instance.instance_id, &s.def).unwrap();
+    let missing = findings
+        .iter()
+        .find(|finding| finding.problem == RuntimeFileProblem::Missing)
+        .expect("the installed SKSE plugin makes the missing library speak");
+    assert_eq!(
+        missing.expected,
+        "Data/SKSE/Plugins/versionlib-1-6-1170-0.bin"
+    );
+    assert!(
+        missing
+            .found
+            .iter()
+            .any(|file| file.ends_with("EngineFixes.dll")),
+        "{:?}",
+        missing.found
+    );
+    assert!(!missing.refuses_launch(), "a missing library only warns");
+
+    let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
+    assert!(
+        checks
+            .runtime
+            .iter()
+            .any(|finding| finding.problem == RuntimeFileProblem::Missing),
+        "{:?}",
+        checks.runtime
+    );
+}
+
+#[test]
+fn a_missing_framework_file_points_at_the_base_repair_when_the_install_has_it() {
+    let tmp = TempDir::new().unwrap();
+    let mut def = make_test_definition();
+    def.framework_ids = vec![FrameworkId::new("skse").unwrap()];
+    let framework = FrameworkDefinition {
+        id: FrameworkId::new("skse").unwrap(),
+        game: GameId::new("skyrim-se").unwrap(),
+        name: "Skyrim Script Extender".into(),
+        version: "2.2.6".into(),
+        supported_runtimes: Vec::new(),
+        required_frameworks: Vec::new(),
+        content: Vec::new(),
+        launch: None,
+        detection: Some(FrameworkDetection {
+            marker: RelPath::new("skse64_loader.exe").unwrap(),
+            required: vec![RelPath::new("Data/Scripts/SKSE.pex").unwrap()],
+            version: Some(FrameworkVersionSource::PeFileVersion),
+        }),
+    };
+    let ctx = create_test_context_with(&tmp, &def, vec![framework]);
+    let install = make_install(&tmp, &["skse64_1_6_1170.dll", "skse64_loader.exe"]);
+    let source = install.discovered.location.clone();
+    let instance = create(
+        &ctx,
+        &install,
+        &def,
+        "Copied SKSE",
+        None,
+        BaseMode::Copied,
+        &|_| {},
+    )
+    .expect("create a copied instance");
+    let base_id = match &instance.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        other => panic!("expected a pinned base, got {other:?}"),
+    };
+
+    // The script arrives in the source install after the base was pinned, so the base has kept a
+    // copy without it but a repair can still copy it.
+    std::fs::create_dir_all(source.join("Data/Scripts")).unwrap();
+    std::fs::write(source.join("Data/Scripts/SKSE.pex"), b"pex").unwrap();
+
+    let findings = runtime_findings(&ctx, &instance.instance_id, &def).unwrap();
+    let missing = findings
+        .iter()
+        .find(|finding| finding.problem == RuntimeFileProblem::MissingFiles)
+        .expect("the instance check names the missing framework files");
+    assert!(
+        missing.repair_from_source,
+        "the source install has the file: {:?}",
+        missing.repair
+    );
+    assert!(
+        missing
+            .repair
+            .contains(&format!("agora games base repair-framework {base_id} skse")),
+        "{}",
+        missing.repair
+    );
+}
+
+/// The Skyrim INI rules the official package declares, added to a test definition that has the
+/// per-user file mapping they read.
+fn add_skyrim_ini_checks(def: &mut GameDefinition) {
+    def.user_files = vec![UserFileMapping::new(
+        GamePath::UserData {
+            location: UserDataLocation::Documents,
+            path: RelPath::new("My Games/Skyrim Special Edition/Skyrim.ini").unwrap(),
+        },
+        RelPath::new("user/Skyrim.ini").unwrap(),
+        UserFileStrategy::JournaledSwap,
+    )];
+    def.ini_checks = vec![
+        IniCheck {
+            file: "user/Skyrim.ini".into(),
+            section: "General".into(),
+            key: "uGridsToLoad".into(),
+            default: Some("5".into()),
+            expect: Some("5".into()),
+            one_of: Vec::new(),
+            odd: true,
+            at_least: None,
+            at_least_from: None,
+            message: "uGridsToLoad is {value}; 5 is the default and other values crash.".into(),
+            source: "https://en.uesp.net/wiki/Skyrim_Mod:INI_Files".into(),
+        },
+        IniCheck {
+            file: "user/Skyrim.ini".into(),
+            section: "General".into(),
+            key: "uExterior Cell Buffer".into(),
+            default: Some("36".into()),
+            expect: None,
+            one_of: Vec::new(),
+            odd: false,
+            at_least: None,
+            at_least_from: Some(IniMinimumFrom {
+                section: "General".into(),
+                key: "uGridsToLoad".into(),
+                default: Some("5".into()),
+                add: 1,
+                square: true,
+            }),
+            message: "uExterior Cell Buffer is {value}; it must be at least {minimum}.".into(),
+            source: "https://en.uesp.net/wiki/Skyrim_Mod:INI_Files".into(),
+        },
+    ];
+}
+
+fn write_instance_ini(s: &Setup, body: &str) {
+    let path = s
+        .ctx
+        .paths
+        .instance_dir(&s.instance.instance_id)
+        .unwrap()
+        .join("user")
+        .join("Skyrim.ini");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+}
+
+fn ini_messages(s: &Setup) -> Vec<String> {
+    launch_checks(&s.ctx, &s.instance, &s.def)
+        .expect("the launch checks run")
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+#[test]
+fn a_risky_ugrids_value_warns_in_the_check_and_the_launch() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=11\r\nuExterior Cell Buffer=144\r\n",
+    );
+
+    let messages = ini_messages(&s);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("uGridsToLoad is 11")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("source: https://")),
+        "{messages:?}"
+    );
+
+    let prepared = prepare(&s, false, &NoVfs).expect("the launch is prepared");
+    assert!(
+        prepared
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("uGridsToLoad is 11")),
+        "{:?}",
+        prepared.diagnostics
+    );
+}
+
+#[test]
+fn the_default_ugrids_and_buffer_are_quiet() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=5\r\nuExterior Cell Buffer=36\r\n",
+    );
+    assert!(ini_messages(&s).is_empty(), "{:?}", ini_messages(&s));
+}
+
+#[test]
+fn a_buffer_below_the_ugrids_square_warns_with_the_minimum() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=7\r\nuExterior Cell Buffer=36\r\n",
+    );
+    let messages = ini_messages(&s);
+    assert!(
+        messages.iter().any(|message| {
+            message.contains("uExterior Cell Buffer is 36") && message.contains("at least 64")
+        }),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn an_absent_ini_file_is_judged_by_the_declared_defaults() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    // No copy is written: the defaults are 5 and 36, which agree.
+    assert!(ini_messages(&s).is_empty(), "{:?}", ini_messages(&s));
+}
+
+#[test]
+fn an_even_ugrids_value_is_reported_as_well_as_a_non_default_one() {
+    let mut s = setup(&[]);
+    add_skyrim_ini_checks(&mut s.def);
+    write_instance_ini(
+        &s,
+        "[General]\r\nuGridsToLoad=6\r\nuExterior Cell Buffer=49\r\n",
+    );
+    let messages = ini_messages(&s);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("uGridsToLoad is 6")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn a_definition_without_ini_checks_reports_none() {
+    let s = setup(&[]);
+    assert!(ini_messages(&s).is_empty());
 }

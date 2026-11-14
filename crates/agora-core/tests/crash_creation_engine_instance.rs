@@ -8,12 +8,13 @@ mod dll_fixture;
 
 use agora_core::crash_engine::attribution::{InstanceView, LayerOwner, LayerView, Resolver};
 use agora_core::crash_engine::{
-    analyze, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis, InstanceInspector,
+    analyze, analyze_with_facts, AnalyzeInput, AnalyzeOutput, CrashFile, InstanceAnalysis,
+    InstanceInspector,
 };
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
 use agora_game_api::crash::{
-    CouldNotCheck, CouldNotCheckReason, Family, GameHandle, InspectResult, Level, Owner,
-    SaveRiskLabel,
+    AttrValue, Cause, CouldNotCheck, CouldNotCheckReason, Fact, Family, GameHandle, InspectResult,
+    Level, Owner, Ref, ResolvedRepair, SaveRiskLabel, Scalar,
 };
 use agora_plugin_api::host::{
     ActivationRequest, GameReads, HostBridge, ScriptHost, ScriptReadError,
@@ -598,7 +599,7 @@ fn a_mesh_named_with_the_data_prefix_resolves_to_the_mod_that_wins() {
     assert!(
         top.also_provided_by
             .iter()
-            .any(|key| key == "base-skeleton"),
+            .any(|name| name == "Base Skeleton Mod"),
         "the overridden item is named: {:#?}",
         top.also_provided_by
     );
@@ -707,5 +708,139 @@ PLUGINS:\n\tLight: 0\tRegular: 1\tTotal: 1\n\t[ 0]     Skyrim.esm\n"
             .any(|note| note.subject == "skse_plugin_declaration"),
         "{:#?}",
         output.answer.could_not_check
+    );
+}
+
+fn fact_text(value: &str) -> AttrValue {
+    AttrValue::Scalar(Scalar::Text(value.to_string()))
+}
+
+#[test]
+fn a_missing_address_library_for_this_game_version_is_likely_and_offers_to_turn_it_on() {
+    let running = start();
+    let resolver = Resolver::new(
+        InstanceView::new(vec![
+            LayerView::new(
+                "address-library",
+                false,
+                LayerOwner::Item {
+                    key: "001 - Address Library for SKSE Plugins".to_string(),
+                    name: "001 - Address Library for SKSE Plugins".to_string(),
+                },
+                Vec::new(),
+            ),
+            LayerView::new(
+                "invented-fixes",
+                true,
+                LayerOwner::Item {
+                    key: "invented-fixes-key".to_string(),
+                    name: "Invented Fixes".to_string(),
+                },
+                vec!["Data/SKSE/Plugins/InventedFixes.dll".to_string()],
+            ),
+        ]),
+        running.pack.pack.ref_maps.clone(),
+        running.pack.pack.roles.clone(),
+    );
+    let scope: Arc<dyn GameReads> = Arc::new(OneFile { bytes: Vec::new() });
+    let inspector = InstanceInspector::new(
+        &running.host,
+        std::slice::from_ref(&running.pack),
+        &resolver,
+        scope,
+        GameHandle {
+            id: GAME.to_string(),
+            runtime_version: Some(RUNNING.to_string()),
+        },
+    );
+    let facts = vec![
+        Fact {
+            kind: "core.runtime_file".to_string(),
+            attrs: [
+                ("rule_id".to_string(), fact_text("address-library")),
+                (
+                    "rule_name".to_string(),
+                    fact_text("Address Library for SKSE Plugins"),
+                ),
+                ("problem".to_string(), fact_text("missing")),
+                (
+                    "expected".to_string(),
+                    fact_text("Data/SKSE/Plugins/versionlib-1-6-1170-0.bin"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            refs: Vec::new(),
+            span: None,
+        },
+        Fact {
+            kind: "core.change".to_string(),
+            attrs: [("change".to_string(), fact_text("disabled"))]
+                .into_iter()
+                .collect(),
+            refs: vec![Ref {
+                kind: "content".to_string(),
+                value: "001 - Address Library for SKSE Plugins".to_string(),
+                strength: Default::default(),
+            }],
+            span: None,
+        },
+    ];
+    let preloader =
+        b"[12:00:00] attempting to load \"D:\\Game\\Data\\SKSE\\Plugins\\InventedFixes.dll\"\n"
+            .to_vec();
+    let output = analyze_with_facts(
+        &AnalyzeInput {
+            packs: std::slice::from_ref(&running.pack),
+            files: &[CrashFile::new("d3dx9_42.log", preloader)],
+            runtime_version: Some(RUNNING),
+            host: &running.host,
+            built_in: &[],
+            instance: Some(InstanceAnalysis {
+                game_id: GAME,
+                resolver: &resolver,
+                inspector: &inspector,
+                could_not_check: &[],
+            }),
+        },
+        &facts,
+        &[],
+    )
+    .unwrap();
+
+    let finding = output
+        .answer
+        .findings
+        .iter()
+        .find(|finding| {
+            finding
+                .headline
+                .get("en")
+                .is_some_and(|text| text.contains("Address Library for this game version"))
+        })
+        .unwrap_or_else(|| panic!("no Address Library finding: {:#?}", output.answer.findings));
+    assert_eq!(finding.level, Level::Likely);
+    assert_eq!(finding.cause, Cause::MissingRequirement);
+    assert!(
+        finding.headline["en"].contains("Data/SKSE/Plugins/versionlib-1-6-1170-0.bin"),
+        "{}",
+        finding.headline["en"]
+    );
+    assert!(
+        output.answer.repairs.iter().any(|offer| matches!(
+            &offer.request,
+            ResolvedRepair::EnableContent { key }
+                if key == "001 - Address Library for SKSE Plugins"
+        )),
+        "{:#?}",
+        output.answer.repairs
+    );
+    assert!(
+        output.answer.findings.iter().any(|finding| finding
+            .headline
+            .get("en")
+            .is_some_and(|text| text.contains("Invented Fixes"))),
+        "the plugin the preloader never finished is named: {:#?}",
+        output.answer.findings
     );
 }

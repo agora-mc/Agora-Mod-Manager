@@ -33,6 +33,11 @@ use crate::lock_manager::LockResource;
 pub const DUPLICATES_BY_MASTERS_ONLY: &str =
     "Sorted by masters only. A plugin is listed twice, so the list's sorter was not asked.";
 
+/// What a sort says when its sorter has an update hook but no saved data yet. The masters-only
+/// sort still runs, so a master below its dependent is moved rather than called unfixable.
+pub const SORTER_NEEDS_DATA: &str =
+    "Sorted by masters only. The list's sorter has no masterlist yet; update it for a full sort.";
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadOrderError {
     #[error(transparent)]
@@ -173,6 +178,10 @@ pub enum Finding {
         plugin: String,
         master: String,
         problem: MasterProblem,
+        /// Whether a sort could put the master above the plugin. False when the master is locked
+        /// or always loaded, so a hint that points at `sort` would be a lie.
+        #[serde(default = "default_true")]
+        movable: bool,
     },
     /// Plugins whose masters lead back to one another. The engine cannot order them.
     MasterCycle { plugins: Vec<String> },
@@ -198,6 +207,10 @@ pub enum Finding {
     },
     /// The list's rules hook failed, so its order could not be judged.
     RulesFailed { list: String, reason: String },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Why a master does not come before its plugin.
@@ -237,6 +250,7 @@ impl Finding {
                 plugin,
                 master,
                 problem,
+                ..
             } => match problem {
                 MasterProblem::Missing => format!(
                     "'{plugin}' needs '{master}', which is missing from the list or not installed"
@@ -1116,6 +1130,22 @@ fn rule_prerequisites(
     (prereqs, findings)
 }
 
+/// Whether a sort could put this late master above the item: the master must be free to move, and
+/// there must be a free slot above an item that itself cannot move.
+fn can_move_master(entries: &[LoadOrderEntry], at: usize, master: &str) -> bool {
+    let dependent = &entries[at];
+    if (dependent.implicit || dependent.locked)
+        && !entries[..at]
+            .iter()
+            .any(|entry| !entry.implicit && !entry.locked)
+    {
+        return false;
+    }
+    entries.iter().enumerate().skip(at + 1).any(|(_, entry)| {
+        loads(entry) && key(&entry.name) == master && !entry.implicit && !entry.locked
+    })
+}
+
 /// The findings a script list's rules raise against its current order: missing items, conflicts,
 /// late prerequisites, and cycles. Pure, like [`findings`].
 pub fn script_findings(
@@ -1141,6 +1171,7 @@ pub fn script_findings(
                 plugin: entry.name.clone(),
                 master: master.clone(),
                 problem: master_problem(entries, at, &k),
+                movable: can_move_master(entries, at, &k),
             });
         }
     }
@@ -1959,7 +1990,18 @@ fn sort_inner(
         duplicated |= *count > 1;
     }
 
-    let (moves, blocked) = if rule.rules.sorter.is_some() && !duplicated {
+    // A sorter with an update hook needs its saved data before it can sort. Without it the
+    // script returns the list unchanged, which used to look like a sort that could not move
+    // anything; the masters-only sort is the honest fallback.
+    let sorter_ready = match rule.rules.sorter.as_ref() {
+        None => false,
+        Some(sorter) if sorter.update.is_none() => true,
+        Some(_) => matches!(
+            sorter_status(ctx, instance_id, definition, Some(&rule.id)),
+            Ok(Some(_))
+        ),
+    };
+    let (moves, blocked) = if rule.rules.sorter.is_some() && sorter_ready && !duplicated {
         let reply = call_sorter(ctx, instance_id, definition, rule, &entries)?;
         notes = sorter_notes(&reply)?;
         let moves = apply_sorter_order(&mut entries, &reply.order)?;
@@ -1969,7 +2011,14 @@ fn sort_inner(
         (moves, blocked)
     } else {
         if rule.rules.sorter.is_some() {
-            message = Some(DUPLICATES_BY_MASTERS_ONLY.to_string());
+            message = Some(
+                if duplicated {
+                    DUPLICATES_BY_MASTERS_ONLY
+                } else {
+                    SORTER_NEEDS_DATA
+                }
+                .to_string(),
+            );
         }
         sort_entries(&mut entries)?
     };
@@ -2216,6 +2265,7 @@ mod tests {
                 plugin: "A.esp".into(),
                 master: "B.esm".into(),
                 problem: MasterProblem::Later,
+                movable: true,
             }]
         );
     }
@@ -2231,6 +2281,7 @@ mod tests {
                 plugin: "A.esp".into(),
                 master: "B.esm".into(),
                 problem: MasterProblem::Inactive,
+                movable: false,
             }]
         );
         let missing = [entry("A.esp", &[])];
@@ -2240,6 +2291,7 @@ mod tests {
                 plugin: "A.esp".into(),
                 master: "Gone.esm".into(),
                 problem: MasterProblem::Missing,
+                movable: false,
             }]
         );
     }

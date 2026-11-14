@@ -9,9 +9,12 @@
 //! of keys and sections, line endings, a byte order mark, and lines it cannot parse. Names compare
 //! case-insensitively.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use agora_game_api::{GameDefinition, RelPath, StoreId, UserFileMapping};
+use agora_game_api::{
+    Diagnostic, DiagnosticSeverity, GameDefinition, IniCheck, RelPath, StoreId, UserFileMapping,
+};
 use serde::Serialize;
 
 use crate::ctx::Ctx;
@@ -39,6 +42,15 @@ pub enum IniError {
         store: String,
         file: String,
         known: String,
+    },
+    #[error(
+        "'{file}' matches more than one per-user file of {game} for the '{store}' store: {matches}. Name the path in full."
+    )]
+    AmbiguousFile {
+        game: String,
+        store: String,
+        file: String,
+        matches: String,
     },
     #[error("{0}")]
     Invalid(String),
@@ -487,31 +499,63 @@ fn mapping_for<'a>(
     })
 }
 
-/// The file a name refers to for this store: a valid relative path that the game keeps.
+/// The last component of an instance path, such as `Skyrim.ini`.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The file a name refers to for this store: a valid relative path that the game keeps. A bare file
+/// name is accepted when exactly one of the store's files has it, so `Skyrim.ini` works where
+/// `user/Skyrim.ini` is the only match; an ambiguous name says which paths it could mean.
 fn resolve_file<'a>(
     definition: &'a GameDefinition,
     store: &StoreId,
     file: &str,
 ) -> Result<(RelPath, &'a UserFileMapping), IniError> {
     let rel = RelPath::new(file).map_err(|e| IniError::Invalid(e.to_string()))?;
-    match mapping_for(definition, store, &rel) {
-        Some(mapping) => Ok((rel, mapping)),
-        None => {
-            let known = definition
-                .user_files
+    if let Some(mapping) = mapping_for(definition, store, &rel) {
+        return Ok((rel, mapping));
+    }
+    if !file.contains('/') {
+        let mut matches: Vec<&UserFileMapping> = definition
+            .user_files
+            .iter()
+            .filter(|m| m.applies_to_store(store))
+            .filter(|m| file_name_of(m.instance_path.as_str()).eq_ignore_ascii_case(file))
+            .collect();
+        if matches.len() == 1 {
+            let mapping = matches.remove(0);
+            let rel = RelPath::new(mapping.instance_path.as_str())
+                .map_err(|e| IniError::Invalid(e.to_string()))?;
+            return Ok((rel, mapping));
+        }
+        if matches.len() > 1 {
+            let mut names: Vec<String> = matches
                 .iter()
-                .filter(|m| m.applies_to_store(store))
                 .map(|m| m.instance_path.as_str().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(IniError::NotAGameFile {
+                .collect();
+            names.sort();
+            return Err(IniError::AmbiguousFile {
                 game: definition.id.as_str().to_string(),
                 store: store.as_str().to_string(),
                 file: file.to_string(),
-                known,
-            })
+                matches: names.join(", "),
+            });
         }
     }
+    let known = definition
+        .user_files
+        .iter()
+        .filter(|m| m.applies_to_store(store))
+        .map(|m| m.instance_path.as_str().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(IniError::NotAGameFile {
+        game: definition.id.as_str().to_string(),
+        store: store.as_str().to_string(),
+        file: file.to_string(),
+        known,
+    })
 }
 
 /// The game's per-user files for an instance, and whether each has a copy yet.
@@ -720,6 +764,139 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), IniError> {
     let tmp = path.with_file_name(format!("{name}.agora-tmp"));
     std::fs::write(&tmp, bytes).map_err(write_err)?;
     std::fs::rename(&tmp, path).map_err(write_err)
+}
+
+/// Check the game's declared INI settings against the instance's copies. A value outside a rule is
+/// a warning; a file or value that cannot be read is a warning that says the check did not run,
+/// never a quiet pass.
+pub fn check_instance_ini(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if definition.ini_checks.is_empty() {
+        return out;
+    }
+    let mut reads: HashMap<String, Result<IniRead, IniError>> = HashMap::new();
+    for check in &definition.ini_checks {
+        let entry = reads
+            .entry(check.file.clone())
+            .or_insert_with(|| read(ctx, instance_id, definition, &check.file));
+        let document = match entry {
+            Ok(entry) => &entry.document,
+            Err(error) => {
+                out.push(could_not_check(
+                    check,
+                    format!("the file could not be read: {error}"),
+                ));
+                continue;
+            }
+        };
+        let Some(value) = document
+            .get(&check.section, &check.key)
+            .or_else(|| check.default.clone())
+        else {
+            // The file does not set it and the game's default is not known, so there is nothing
+            // the check can say.
+            continue;
+        };
+        let shown = value.trim().to_string();
+        let mut failed = false;
+        let mut minimum = None;
+        if check
+            .expect
+            .as_deref()
+            .is_some_and(|expect| expect != shown)
+        {
+            failed = true;
+        }
+        if !check.one_of.is_empty() && !check.one_of.iter().any(|allowed| allowed == &shown) {
+            failed = true;
+        }
+        if check.needs_default() {
+            match shown.parse::<i64>() {
+                Ok(number) => {
+                    if check.odd && number % 2 == 0 {
+                        failed = true;
+                    }
+                    if let Some(least) = check.at_least {
+                        minimum = Some(least);
+                        if number < least {
+                            failed = true;
+                        }
+                    }
+                    if let Some(from) = &check.at_least_from {
+                        let Some(base) = document
+                            .get(&from.section, &from.key)
+                            .or_else(|| from.default.clone())
+                        else {
+                            out.push(could_not_check(
+                                check,
+                                format!("'{}' is not set, so the minimum is unknown", from.key),
+                            ));
+                            continue;
+                        };
+                        match base.trim().parse::<i64>() {
+                            Ok(base) => {
+                                let mut least = base.saturating_add(from.add);
+                                if from.square {
+                                    least = least.saturating_mul(least);
+                                }
+                                minimum = Some(least);
+                                if number < least {
+                                    failed = true;
+                                }
+                            }
+                            Err(_) => {
+                                out.push(could_not_check(
+                                    check,
+                                    format!(
+                                        "'{}' holds '{}', which is not a whole number",
+                                        from.key,
+                                        base.trim()
+                                    ),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    out.push(could_not_check(
+                        check,
+                        format!("it holds '{shown}', which is not a whole number"),
+                    ));
+                    continue;
+                }
+            }
+        }
+        if failed {
+            let message = check.message.replace("{value}", &shown).replace(
+                "{minimum}",
+                &minimum.map(|value| value.to_string()).unwrap_or_default(),
+            );
+            out.push(Diagnostic {
+                code: "INI_SETTING".to_string(),
+                message: format!("{message} (source: {})", check.source),
+                severity: DiagnosticSeverity::Warning,
+                repairs: Vec::new(),
+            });
+        }
+    }
+    out
+}
+
+fn could_not_check(check: &IniCheck, detail: String) -> Diagnostic {
+    Diagnostic {
+        code: "ERR_INI_CHECK".to_string(),
+        message: format!(
+            "Could not check [{}] {} in {}: {}.",
+            check.section, check.key, check.file, detail
+        ),
+        severity: DiagnosticSeverity::Warning,
+        repairs: Vec::new(),
+    }
 }
 
 #[cfg(test)]

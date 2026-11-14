@@ -81,6 +81,27 @@
       ],
       "role": "supplementary",
       "privacy": "personal"
+    },
+    {
+      "id": "preloader_log",
+      "where": {
+        "root": "runtime",
+        "path": ""
+      },
+      "match": {
+        "glob": "d3dx9_42.log"
+      },
+      "format": "preloader_log",
+      "bind": [
+        {
+          "time": {
+            "before_s": 2,
+            "after_s": 10
+          }
+        }
+      ],
+      "role": "supplementary",
+      "privacy": "personal"
     }
   ],
   "parsers": [
@@ -149,6 +170,19 @@
       "detect": {
         "all": [
           "(?m)^SKSE64 runtime: initialize "
+        ]
+      }
+    },
+    {
+      "id": "preloader_log",
+      "entry": {
+        "script": {
+          "export": "parsePreloaderLog"
+        }
+      },
+      "detect": {
+        "all": [
+          "(?m)attempting to load[ \t]+\""
         ]
       }
     }
@@ -2842,6 +2876,170 @@
           "en": "The pasted fragment names the file {owner:f}."
         }
       }
+    },
+    {
+      "id": "preloader_started_plugin_never_finished",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "creation.preloader_load",
+          "where": {
+            "state": "unfinished"
+          },
+          "ref": {
+            "kind": "module",
+            "bind": "m"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "root_cause",
+            "level": "possible",
+            "cause": "mod",
+            "candidate": {
+              "owner_of": "m"
+            },
+            "family": "known_signature",
+            "weight": 4
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The SKSE preloader started loading {owner:m} and never logged that it finished. A plugin that stops during startup can stop the game from starting or make it crash."
+        },
+        "why_not_sure": {
+          "en": "The log names the last plugin it started; it does not prove what stopped it."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "SKSE plugin preloader's d3dx9_42.log"
+    },
+    {
+      "id": "address_library_missing_after_disabling",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "fact": {
+              "kind": "core.runtime_file",
+              "where": {
+                "rule_id": {
+                  "in": [
+                    "address-library",
+                    "address-library-se"
+                  ]
+                },
+                "problem": "missing"
+              },
+              "bind": {
+                "expected": "expected"
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "core.change",
+              "where": {
+                "change": "disabled"
+              },
+              "ref": {
+                "kind": "content",
+                "value": {
+                  "glob": "*Address Library*"
+                },
+                "bind": "lib"
+              }
+            }
+          }
+        ]
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "likely",
+            "cause": "missing_requirement"
+          }
+        }
+      ],
+      "repairs": [
+        {
+          "enable_content": {
+            "key": {
+              "owner_of": "lib"
+            }
+          }
+        }
+      ],
+      "actions": [
+        {
+          "kind": "review_mods",
+          "label": {
+            "en": "Review Address Library"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE plugins need the Address Library for this game version, but {expected} is missing; {owner:lib} is switched off. Turn it back on, or install the build for this game version."
+        },
+        "why_not_sure": {
+          "en": "The setup change and the missing file line up; the crash itself could still have another cause."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Address Library for SKSE Plugins, https://www.nexusmods.com/skyrimspecialedition/mods/32444"
+    },
+    {
+      "id": "address_library_missing",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.runtime_file",
+          "where": {
+            "rule_id": {
+              "in": [
+                "address-library",
+                "address-library-se"
+              ]
+            },
+            "problem": "missing"
+          },
+          "bind": {
+            "expected": "expected"
+          }
+        }
+      },
+      "effects": [
+        {
+          "finding": {
+            "scope": "mechanism",
+            "level": "possible",
+            "cause": "missing_requirement"
+          }
+        }
+      ],
+      "actions": [
+        {
+          "kind": "review_mods",
+          "label": {
+            "en": "Review Address Library"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "SKSE plugins are installed, but the Address Library for this game version is missing: {expected}. Plugins that need it may fail to load."
+        },
+        "why_not_sure": {
+          "en": "The expected file is absent; the crash itself was not proven to come from that."
+        }
+      },
+      "next_step": "confirm_experiment",
+      "reference": "Address Library for SKSE Plugins, https://www.nexusmods.com/skyrimspecialedition/mods/32444"
     }
   ]
 }

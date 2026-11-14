@@ -238,6 +238,7 @@ fn definition() -> GameDefinition {
         load_orders: vec![plugin_rule()],
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: vec![LaunchAlternative {
             id: "loader".into(),
             when: Condition::Present(RelPath::new("loader.exe").unwrap()),
@@ -1487,7 +1488,7 @@ fn a_plugin_whose_master_is_missing_refuses_the_launch_until_launch_anyway() {
         "{message}"
     );
     assert!(
-        message.contains("agora games instance plugins sort <instance>"),
+        message.contains("agora games instance plugins check <instance>"),
         "{message}"
     );
 
@@ -1645,12 +1646,14 @@ fn refuse_load_order_refuses_only_the_refusing_kinds() {
         plugin: "A.esp".into(),
         master: "B.esm".into(),
         problem: MasterProblem::Later,
+        movable: true,
     }];
     assert_eq!(refuse_load_order(late.clone(), false).unwrap(), late);
     let missing = vec![Finding::MasterNotEarlier {
         plugin: "A.esp".into(),
         master: "B.esm".into(),
         problem: MasterProblem::Missing,
+        movable: false,
     }];
     assert!(refuse_load_order(missing, false).is_err());
     let full = vec![Finding::ListLevel {

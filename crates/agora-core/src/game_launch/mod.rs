@@ -64,9 +64,9 @@ pub enum LaunchError {
     #[error("frameworks do not match this game's version: {}", describe_runtime_findings(.findings))]
     RuntimeMismatch { findings: Vec<RuntimeFileFinding> },
     /// The plugin list breaks the game's load order rules (MASTER_SPEC §26.6): the game would crash
-    /// or refuse to load. `agora games instance plugins sort <instance>` fixes a master's order.
+    /// or refuse to load. `plugins check` names each change the player can make.
     #[error(
-        "the plugin load order would stop the game: {}. `agora games instance plugins sort <instance>` fixes master order",
+        "the plugin load order would stop the game: {}. Run `agora games instance plugins check <instance>` to see what to change",
         describe_findings(.findings)
     )]
     LoadOrderProblems { findings: Vec<Finding> },
@@ -108,8 +108,9 @@ pub struct PreparedLaunch {
     pub load_order_findings: Vec<Finding>,
     /// Tool output that is stale or unknown (MASTER_SPEC §26.9). Warnings only, never a refusal.
     pub generated_findings: Vec<crate::game_tools::OutputFinding>,
-    /// What the game package's own `diagnostics` hook reported. The same list the instance check
-    /// prints, so a launch does not hide a warning the check shows.
+    /// What the game package's own `diagnostics` hook reported, plus the game's INI-setting
+    /// warnings. The same list the instance check prints, so a launch does not hide a warning the
+    /// check shows. Warnings only, never a refusal.
     pub diagnostics: Vec<agora_game_api::Diagnostic>,
     /// Frameworks the instance's mods need and it does not satisfy. A warning, never a refusal.
     pub requirements: Vec<crate::catalog_install::RequirementFinding>,

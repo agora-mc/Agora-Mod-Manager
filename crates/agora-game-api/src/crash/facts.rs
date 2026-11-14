@@ -201,6 +201,10 @@ pub const ENGINE_FACT_KINDS: &[(&str, &[&str])] = &[
     ),
     ("core.change", &["change", "from_version", "to_version"]),
     (
+        "core.runtime_file",
+        &["rule_id", "rule_name", "problem", "expected", "reason"],
+    ),
+    (
         "core.attribution",
         &["ref_kind", "ref_value", "owner", "also_provided_by", "via"],
     ),

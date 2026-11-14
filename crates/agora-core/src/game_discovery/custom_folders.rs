@@ -510,6 +510,7 @@ mod tests {
             load_orders: Vec::new(),
             runtime_files: Vec::new(),
             save_location: Vec::new(),
+            ini_checks: Vec::new(),
             launch_alternatives: Vec::new(),
             copy_patterns: Vec::new(),
         }

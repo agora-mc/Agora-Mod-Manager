@@ -5254,6 +5254,14 @@ fn skyrim_fixture_with(
     }
 }
 
+/// Run the CLI against the fixture with per-user files redirected into the fixture, so nothing
+/// reads the machine's real saves or Documents. Standard input is not a terminal.
+fn run_fixture(fixture: &VfsFixture, args: &[&str]) -> std::process::Output {
+    let mut cmd = agora_command(&fixture.data_dir, args);
+    cmd.env("AGORA_TEST_USER_DATA_ROOT", &fixture.user_data);
+    run_command(cmd, args)
+}
+
 /// Run the CLI against the fixture with no agora_vfs.dll to be found and per-user files redirected
 /// into the fixture. Standard input is not a terminal, so nothing can be asked.
 fn run_vfs_fixture(fixture: &VfsFixture, args: &[&str]) -> std::process::Output {
@@ -5491,7 +5499,7 @@ fn a_launch_prints_the_plugin_version_warning_the_check_prints() {
     let fixture = skyrim_fixture_with_old_skse_plugin();
     let id = fixture.instance_id.clone();
 
-    let check = run_agora(&fixture.data_dir, &["games", "instance", "check", &id]);
+    let check = run_fixture(&fixture, &["games", "instance", "check", &id]);
     let check_out = String::from_utf8_lossy(&check.stdout);
     assert!(
         check_out.contains("exampleold.dll")

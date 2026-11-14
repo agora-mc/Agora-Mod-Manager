@@ -5,10 +5,11 @@
 //! instance's deployment plan. The version comes from the marker file's own bytes, so it is the
 //! version of the file that will run.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agora_game_api::{
-    fold_path_case, FrameworkDefinition, FrameworkVersionSource, GameDefinition, RuntimeFileFinding,
+    fold_path_case, FrameworkDefinition, FrameworkVersionSource, GameDefinition,
+    RuntimeFileFinding, RuntimeFileProblem,
 };
 
 use crate::ctx::Ctx;
@@ -100,19 +101,67 @@ pub fn framework_status(
     })
 }
 
+/// Where a base's missing framework files can come from: the pinned base and its source install.
+pub struct FrameworkRepairSource<'a> {
+    pub base_id: &'a str,
+    pub source: &'a Path,
+}
+
 /// Frameworks the game declares that are installed but missing files they need, judged over the
 /// files the game will see. Each finding is a warning: the owner decides whether to repair it.
+///
+/// With `repair`, a missing-file finding says what actually fixes it: a base repair when the
+/// source install still has the files, and installing the framework as content otherwise. Without
+/// it the finding keeps the framework's own repair wording.
 pub fn missing_required_findings<S: AsRef<str>>(
     ctx: &Ctx,
     definition: &GameDefinition,
     paths: &[S],
+    repair: Option<&FrameworkRepairSource<'_>>,
 ) -> Vec<RuntimeFileFinding> {
     let frameworks: Vec<&FrameworkDefinition> = definition
         .framework_ids
         .iter()
         .filter_map(|id| ctx.games.framework(&definition.id, id))
         .collect();
-    agora_game_api::missing_framework_files(&frameworks, paths)
+    let mut findings = agora_game_api::missing_framework_files(&frameworks, paths);
+    let Some(repair) = repair else {
+        return findings;
+    };
+    for finding in &mut findings {
+        if finding.problem != RuntimeFileProblem::MissingFiles {
+            continue;
+        }
+        let framework = frameworks
+            .iter()
+            .find(|framework| framework.id.as_str() == finding.rule_id);
+        let from_source = !finding.found.is_empty()
+            && finding
+                .found
+                .iter()
+                .all(|path| repair.source.join(path).is_file());
+        if from_source {
+            finding.repair_from_source = true;
+            finding.repair = format!(
+                "Repair {} in the base from the game install: agora games base repair-framework {} {}.",
+                finding.rule_name, repair.base_id, finding.rule_id
+            );
+        } else {
+            let content = framework.map(|framework| &framework.content);
+            finding.repair = match content {
+                Some(keys) if !keys.is_empty() => format!(
+                    "Install {} so all of its files are present (content: {}).",
+                    finding.rule_name,
+                    keys.join(", ")
+                ),
+                _ => format!(
+                    "Install {} so all of its files are present.",
+                    finding.rule_name
+                ),
+            };
+        }
+    }
+    findings
 }
 
 /// The version of the marker file at `source`, as the manifests write it, or why it cannot be read.

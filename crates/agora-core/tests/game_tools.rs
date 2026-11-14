@@ -297,6 +297,7 @@ fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> Game
         },
         runtime_files: Vec::new(),
         save_location: Vec::new(),
+        ini_checks: Vec::new(),
         launch_alternatives: Vec::new(),
         content_layout: None,
         copy_patterns: Vec::new(),
