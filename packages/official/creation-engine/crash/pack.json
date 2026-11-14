@@ -2507,6 +2507,139 @@
       "reference": "Phostwood js/diagnoses.js:1763 (GPL-3, idea); names from crash/addrlib-names.js"
     },
     {
+      "id": "save_load_fault",
+      "version": 1,
+      "when": {
+        "any": [
+          {
+            "fact": {
+              "kind": "creation.object",
+              "where": {
+                "type": {
+                  "glob": "*BGSLoadGameBuffer*"
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.object",
+              "where": {
+                "type": {
+                  "glob": "*bgs::saveload::LoadRequest*"
+                }
+              }
+            }
+          },
+          {
+            "fact": {
+              "kind": "creation.object",
+              "where": {
+                "type": {
+                  "glob": "*bgs::saveload::Request*"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "supersedes": [
+        "load_subsystem_fault"
+      ],
+      "effects": [
+        {
+          "finding": {
+            "cause": "save",
+            "scope": "mechanism",
+            "level": "likely"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash happened while the game was loading a save. A save made with other mods or other settings can crash when loaded; try an older save or a new game to check."
+        },
+        "why_not_sure": {
+          "en": "The log shows a save being loaded when the game crashed; it does not prove which save or setting is why."
+        }
+      },
+      "next_step": "restore_save",
+      "reference": "Crash Logger POSSIBLE RELEVANT OBJECTS naming BGSLoadGameBuffer; owner's run 2026-11-14"
+    },
+    {
+      "id": "save_load_after_settings_change",
+      "version": 1,
+      "when": {
+        "all": [
+          {
+            "any": [
+              {
+                "fact": {
+                  "kind": "creation.object",
+                  "where": {
+                    "type": {
+                      "glob": "*BGSLoadGameBuffer*"
+                    }
+                  }
+                }
+              },
+              {
+                "fact": {
+                  "kind": "creation.object",
+                  "where": {
+                    "type": {
+                      "glob": "*bgs::saveload::LoadRequest*"
+                    }
+                  }
+                }
+              },
+              {
+                "fact": {
+                  "kind": "creation.object",
+                  "where": {
+                    "type": {
+                      "glob": "*bgs::saveload::Request*"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "fact": {
+              "kind": "core.change",
+              "where": {
+                "change": "settings"
+              }
+            }
+          }
+        ]
+      },
+      "supersedes": [
+        "save_load_fault",
+        "load_subsystem_fault"
+      ],
+      "effects": [
+        {
+          "finding": {
+            "cause": "save",
+            "scope": "mechanism",
+            "level": "likely"
+          }
+        }
+      ],
+      "text": {
+        "headline": {
+          "en": "The crash happened while the game was loading a save, after the instance's settings changed. A save made under the old value may not load under the new one; try an older save or a new game to check."
+        },
+        "why_not_sure": {
+          "en": "The change happened near the crash, but the log shows a load in progress, not which setting is why."
+        }
+      },
+      "next_step": "restore_save",
+      "reference": "Owner's Skyrim save-load run, 2026-11-14; MASTER_SPEC §30.4 change correlation"
+    },
+    {
       "id": "deleted_record_in_use",
       "version": 1,
       "when": {

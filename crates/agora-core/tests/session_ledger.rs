@@ -339,6 +339,48 @@ fn a_launch_records_what_it_ran_with() {
 }
 
 #[test]
+fn a_manifest_records_ini_keys_so_a_settings_change_names_one() {
+    use agora_core::session_ledger::ChangeKind;
+
+    let f = fixture(0);
+    let store = StoreId::new("steam").unwrap();
+    let settings = f
+        .ctx
+        .paths
+        .instance_dir(&f.record.instance_id)
+        .unwrap()
+        .join("user")
+        .join("config.txt");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "[Display]\nuGridsToLoad=11\n").unwrap();
+    let before = session_ledger::build_manifest(&f.ctx, &f.record.instance_id, &f.def, &store);
+    assert_eq!(before.settings.len(), 1, "{:?}", before.settings);
+    assert_eq!(before.settings[0].key, "uGridsToLoad");
+
+    std::fs::write(&settings, "[Display]\nuGridsToLoad=5\n").unwrap();
+    let after = session_ledger::build_manifest(&f.ctx, &f.record.instance_id, &f.def, &store);
+    let changes = session_ledger::diff_manifests(&before, &after);
+    let named: Vec<_> = changes
+        .iter()
+        .filter(|change| change.kind == ChangeKind::Settings)
+        .collect();
+    assert_eq!(named.len(), 1, "{changes:#?}");
+    let setting = named[0]
+        .setting
+        .as_ref()
+        .expect("the changed key is named, not just the file");
+    assert_eq!(setting.file, "user/config.txt");
+    assert_eq!(setting.section, "Display");
+    assert_eq!(setting.key, "uGridsToLoad");
+    assert_eq!(setting.from.as_deref(), Some("11"));
+    assert_eq!(setting.to.as_deref(), Some("5"));
+    assert_eq!(
+        agora_core::crash_engine::change::describe(named[0]),
+        "changed uGridsToLoad in user/config.txt from 11 to 5"
+    );
+}
+
+#[test]
 fn an_empty_mod_list_launches_and_records() {
     let f = fixture(0);
     let launched = launch(&f, &exit_now());
@@ -565,6 +607,7 @@ fn manifest(items: &[&str]) -> agora_core::session_ledger::LaunchManifest {
         load_order: Vec::new(),
         runtime: "test:1.0".to_string(),
         settings_hash: Some("settings".to_string()),
+        settings: Vec::new(),
         unreadable: Vec::new(),
     }
 }

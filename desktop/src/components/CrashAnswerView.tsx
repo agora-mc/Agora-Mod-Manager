@@ -687,8 +687,16 @@ export function describeChange(change: CrashChange): string {
       return `moved ${key} in the load order`;
     case 'load_order':
       return 'changed the load order';
-    case 'settings':
-      return "changed the instance's settings";
+    case 'settings': {
+      const setting = change.setting;
+      if (setting === undefined) return "changed the instance's settings";
+      if (setting.from !== undefined && setting.to !== undefined) {
+        return `changed ${setting.key} in ${setting.file} from ${setting.from} to ${setting.to}`;
+      }
+      if (setting.to !== undefined) return `set ${setting.key} in ${setting.file} to ${setting.to}`;
+      if (setting.from !== undefined) return `removed ${setting.key} from ${setting.file} (was ${setting.from})`;
+      return `changed ${setting.key} in ${setting.file}`;
+    }
     default:
       return change.kind.split('_').join(' ');
   }

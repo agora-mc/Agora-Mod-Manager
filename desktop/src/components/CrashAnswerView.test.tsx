@@ -5,7 +5,7 @@
  */
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { CrashAnswerCard, CrashAnswerView, nextStepLabel } from './CrashAnswerView';
+import { CrashAnswerCard, CrashAnswerView, describeChange, nextStepLabel } from './CrashAnswerView';
 import type {
   CrashAnswer,
   CrashCandidate,
@@ -348,6 +348,27 @@ describe('could not check', () => {
       }),
     });
     expect(screen.queryByTestId('crash-could-not-check')).toBeNull();
+  });
+});
+
+describe('a settings change', () => {
+  it('names the key and both values when the ledger recorded them', () => {
+    expect(
+      describeChange({
+        kind: 'settings',
+        setting: {
+          file: 'Skyrim.ini',
+          section: 'Display',
+          key: 'uGridsToLoad',
+          from: '11',
+          to: '5',
+        },
+      }),
+    ).toBe('changed uGridsToLoad in Skyrim.ini from 11 to 5');
+  });
+
+  it('falls back to the generic words when no key was recorded', () => {
+    expect(describeChange({ kind: 'settings' })).toBe("changed the instance's settings");
   });
 });
 

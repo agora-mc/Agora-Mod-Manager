@@ -183,6 +183,13 @@ export interface CrashChange {
   key?: string;
   from_version?: string;
   to_version?: string;
+  setting?: {
+    file: string;
+    section: string;
+    key: string;
+    from?: string;
+    to?: string;
+  };
 }
 
 export interface CrashAnswerDetail {

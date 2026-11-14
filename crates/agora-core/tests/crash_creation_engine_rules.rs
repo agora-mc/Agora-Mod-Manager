@@ -3,9 +3,11 @@
 //! where it should not. Every log and mod name here is invented; only the game's own module and
 //! plugin names are real, because the roles under test name them.
 
-use agora_core::crash_engine::{analyze, AnalyzeInput, AnalyzeOutput, CrashFile};
+use agora_core::crash_engine::{
+    analyze, analyze_with_history, AnalyzeInput, AnalyzeOutput, CrashFile,
+};
 use agora_core::crash_packs::{load_plugin_packs, LoadedCrashPack};
-use agora_game_api::crash::{Level, Owner};
+use agora_game_api::crash::{Cause, Level, Owner};
 use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
 use agora_plugin_api::manifest::{PluginId, PluginManifest};
 use agora_plugin_api::protocol::{HostRequest, HostResponse, LogLevel};
@@ -578,4 +580,114 @@ fn a_crash_log_and_the_skse_log_together_keep_both_their_clues() {
     assert!(rule_fired(&output, "skse_plugin_address_library_outdated"));
     assert!(names(&output).contains(&"InventedMod.dll".to_string()));
     assert!(names(&output).contains(&"ExampleOld.dll".to_string()));
+}
+
+// -- save-load crashes -------------------------------------------------------------------------
+
+/// A Crash Logger log whose registers name the save-load objects the real run showed, rather than
+/// a resolved frame name. Every name here is invented except the game's own engine types.
+fn save_load_log() -> String {
+    log(
+        "EXCEPTION_ACCESS_VIOLATION",
+        &["SkyrimSE.exe", "SkyrimSE.exe"],
+        &[
+            "\tRCX: (BGSLoadGameBuffer*)",
+            "\tRBP: (TES*)",
+            "\tRSP+590: (BGSSaveLoadManager*)",
+        ],
+        &[],
+    )
+}
+
+#[test]
+fn a_save_load_crash_is_named_as_loading_a_save() {
+    let running = start();
+    let output = run(&running, &save_load_log());
+    assert!(
+        rule_fired(&output, "save_load_fault"),
+        "the objects on the stack are the load, even with no named frame: {:#?}",
+        output.answer.findings
+    );
+    assert_eq!(output.answer.cause, Some(Cause::Save));
+    assert_eq!(output.answer.level, Level::Likely);
+    let headline = output
+        .answer
+        .headline
+        .get("en")
+        .cloned()
+        .unwrap_or_default();
+    assert!(headline.contains("loading a save"), "{headline}");
+    assert!(!headline.contains("could not name one cause"), "{headline}");
+}
+
+#[test]
+fn a_save_load_crash_after_a_settings_change_points_at_the_change() {
+    use agora_core::session_ledger::{ChangeKind, ManifestChange, SettingChange};
+
+    let running = start();
+    let change = ManifestChange {
+        kind: ChangeKind::Settings,
+        key: None,
+        from_version: None,
+        to_version: None,
+        setting: Some(SettingChange {
+            file: "Skyrim.ini".to_string(),
+            section: "Display".to_string(),
+            key: "uGridsToLoad".to_string(),
+            from: Some("11".to_string()),
+            to: Some("5".to_string()),
+        }),
+    };
+    let crash_files = vec![CrashFile::new(
+        "crash-2026-01-01-12-00-00.log",
+        save_load_log().into_bytes(),
+    )];
+    let facts = agora_core::crash_engine::change::session_facts(
+        "crashed",
+        Some(1),
+        None,
+        std::slice::from_ref(&change),
+    );
+    let output = analyze_with_history(
+        &AnalyzeInput {
+            packs: std::slice::from_ref(&running.pack),
+            files: &crash_files,
+            runtime_version: None,
+            host: &running.host,
+            built_in: &[],
+            instance: None,
+        },
+        &facts,
+        std::slice::from_ref(&change),
+        None,
+    )
+    .unwrap();
+
+    assert!(rule_fired(&output, "save_load_after_settings_change"));
+    assert!(
+        !rule_fired(&output, "save_load_fault"),
+        "the pointed rule replaces the general one"
+    );
+    let headline = output
+        .answer
+        .headline
+        .get("en")
+        .cloned()
+        .unwrap_or_default();
+    assert!(headline.contains("settings changed"), "{headline}");
+    let change_finding = output
+        .answer
+        .findings
+        .iter()
+        .find(|finding| finding.source.rule_id.as_deref() == Some("core.change_since_last_good"))
+        .expect("the change is still listed beside the answer");
+    let text = change_finding
+        .headline
+        .get("en")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        text.contains("uGridsToLoad") && text.contains("11") && text.contains("5"),
+        "the change names the key and both values: {text}"
+    );
 }

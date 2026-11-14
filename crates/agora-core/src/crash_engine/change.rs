@@ -6,7 +6,7 @@
 //! changed instead, which is the honest, actionable answer.
 
 use crate::crash_packs::built_in_identity;
-use crate::session_ledger::{ChangeKind, ManifestChange};
+use crate::session_ledger::{ChangeKind, ManifestChange, SettingChange};
 use agora_game_api::crash::{
     AttrValue, Fact, Family, Finding, Level, LocalText, Owner, Ref, Scalar, Scope, Signal,
     SourceAttribution,
@@ -86,6 +86,34 @@ pub fn change_facts(changes: &[ManifestChange]) -> Vec<Fact> {
                     "to_version".to_string(),
                     AttrValue::Scalar(Scalar::Text(to.clone())),
                 );
+            }
+            // A named settings change carries the key and both values, so a rule can point at the
+            // one that moved rather than at "the settings" in general.
+            if let Some(setting) = &change.setting {
+                attrs.insert(
+                    "setting_file".to_string(),
+                    AttrValue::Scalar(Scalar::Text(setting.file.clone())),
+                );
+                attrs.insert(
+                    "setting_section".to_string(),
+                    AttrValue::Scalar(Scalar::Text(setting.section.clone())),
+                );
+                attrs.insert(
+                    "setting_key".to_string(),
+                    AttrValue::Scalar(Scalar::Text(setting.key.clone())),
+                );
+                if let Some(from) = &setting.from {
+                    attrs.insert(
+                        "from_value".to_string(),
+                        AttrValue::Scalar(Scalar::Text(from.clone())),
+                    );
+                }
+                if let Some(to) = &setting.to {
+                    attrs.insert(
+                        "to_value".to_string(),
+                        AttrValue::Scalar(Scalar::Text(to.clone())),
+                    );
+                }
             }
             Fact {
                 kind: "core.change".to_string(),
@@ -167,7 +195,24 @@ pub fn describe(change: &ManifestChange) -> String {
         ChangeKind::Disabled => format!("switched off {key}"),
         ChangeKind::Moved => format!("moved {key} in the load order"),
         ChangeKind::LoadOrder => "changed the load order".to_string(),
-        ChangeKind::Settings => "changed the instance's settings".to_string(),
+        ChangeKind::Settings => match &change.setting {
+            Some(setting) => describe_setting(setting),
+            None => "changed the instance's settings".to_string(),
+        },
+    }
+}
+
+/// One setting by name and both values, e.g. "changed uGridsToLoad in Skyrim.ini from 11 to 5".
+/// The section is not repeated in the sentence; the file and key are what a person looks for.
+fn describe_setting(setting: &SettingChange) -> String {
+    match (&setting.from, &setting.to) {
+        (Some(from), Some(to)) => format!(
+            "changed {} in {} from {from} to {to}",
+            setting.key, setting.file
+        ),
+        (None, Some(to)) => format!("set {} in {} to {to}", setting.key, setting.file),
+        (Some(from), None) => format!("removed {} from {} (was {from})", setting.key, setting.file),
+        (None, None) => format!("changed {} in {}", setting.key, setting.file),
     }
 }
 
