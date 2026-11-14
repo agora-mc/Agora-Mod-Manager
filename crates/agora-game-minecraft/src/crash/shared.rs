@@ -247,10 +247,9 @@ fn jar_name_in(line: &str) -> Option<String> {
         rest.split(']').next()
     } else if let Some(start) = line.find("Failed to read mod file ") {
         Some(&line[start + "Failed to read mod file ".len()..])
-    } else if let Some(start) = line.find("Invalid or corrupt jarfile ") {
-        Some(&line[start + "Invalid or corrupt jarfile ".len()..])
     } else {
-        None
+        line.find("Invalid or corrupt jarfile ")
+            .map(|start| &line[start + "Invalid or corrupt jarfile ".len()..])
     };
     let candidate = named.map(|text| text.trim().trim_matches(['\'', '"', '`']));
     let candidate = candidate.filter(|text| text.to_ascii_lowercase().ends_with(".jar"));
