@@ -46,6 +46,7 @@ struct Harness {
     facts: Facts,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
+    sort_request: Arc<Mutex<Option<SorterRequest>>>,
     overlaps: OverlapsReplySlot,
     overlaps_calls: Arc<AtomicUsize>,
 }
@@ -70,6 +71,7 @@ struct TestPackage {
     facts: Facts,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
+    sort_request: Arc<Mutex<Option<SorterRequest>>>,
     overlaps: OverlapsReplySlot,
     overlaps_calls: Arc<AtomicUsize>,
 }
@@ -132,9 +134,10 @@ impl GamePackage for TestPackage {
     /// The test double answers the sorter hook with whatever a test put in the slot.
     fn sort_load_order<'a>(
         &'a self,
-        _request: SorterRequest,
+        request: SorterRequest,
     ) -> GameFuture<'a, Option<SorterReply>> {
         self.sorter_calls.fetch_add(1, Ordering::SeqCst);
+        *self.sort_request.lock().unwrap() = Some(request);
         let sorter = self.sorter.clone();
         Box::pin(async move { Ok(sorter.lock().unwrap().clone()) })
     }
@@ -357,6 +360,7 @@ impl Harness {
         let facts: Facts = Arc::new(Mutex::new(HashMap::new()));
         let sorter: SorterReplySlot = Arc::new(Mutex::new(None));
         let sorter_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let sort_request: Arc<Mutex<Option<SorterRequest>>> = Arc::new(Mutex::new(None));
         let overlaps: OverlapsReplySlot = Arc::new(Mutex::new(None));
         let overlaps_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let mut builder = GameRegistry::builder();
@@ -370,6 +374,7 @@ impl Harness {
                     facts: facts.clone(),
                     sorter: sorter.clone(),
                     sorter_calls: sorter_calls.clone(),
+                    sort_request: sort_request.clone(),
                     overlaps: overlaps.clone(),
                     overlaps_calls: overlaps_calls.clone(),
                 }),
@@ -388,6 +393,7 @@ impl Harness {
             facts,
             sorter,
             sorter_calls,
+            sort_request,
             overlaps,
             overlaps_calls,
         }
@@ -458,6 +464,10 @@ impl Harness {
 
     fn overlaps_calls(&self) -> usize {
         self.overlaps_calls.load(Ordering::SeqCst)
+    }
+
+    fn last_sort_request(&self) -> Option<SorterRequest> {
+        self.sort_request.lock().unwrap().clone()
     }
 
     fn copy_path(&self, inst: &GameInstanceRecord) -> PathBuf {
@@ -1007,6 +1017,7 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
             facts: Arc::new(Mutex::new(HashMap::new())),
             sorter: Arc::new(Mutex::new(None)),
             sorter_calls: Arc::new(AtomicUsize::new(0)),
+            sort_request: Arc::new(Mutex::new(None)),
             overlaps: Arc::new(Mutex::new(None)),
             overlaps_calls: Arc::new(AtomicUsize::new(0)),
         }),
@@ -2056,4 +2067,263 @@ fn an_overlaps_reply_naming_an_unknown_plugin_is_refused() {
         "{error}"
     );
     assert!(error.to_string().contains("does not load"));
+}
+
+#[test]
+fn a_load_after_rule_is_stored_and_shown_with_its_items() {
+    let h = Harness::new();
+    let inst = h.instance("rule-store");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let list = h.def.load_orders.first().unwrap().id.clone();
+    assert!(game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        "B.esp"
+    )
+    .unwrap());
+    assert!(!game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "a.ESP",
+        "b.esp"
+    )
+    .unwrap());
+    assert_eq!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, &list).unwrap(),
+        [game_load_order::LoadAfterRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }]
+    );
+    assert_eq!(
+        game_load_order::load_after_rule_views(&h.ctx, &inst.instance_id, &h.def, None).unwrap(),
+        [game_load_order::LoadAfterRuleView {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+            unused: None,
+        }]
+    );
+}
+
+#[test]
+fn a_rule_whose_item_left_the_list_is_kept_and_shown_unused() {
+    let h = Harness::new();
+    let inst = h.instance("rule-unused");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "Gone.esp",
+        "A.esp",
+    )
+    .unwrap();
+    let views =
+        game_load_order::load_after_rule_views(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].unused, Some("Gone.esp".to_string()));
+    assert_eq!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .len(),
+        1,
+        "an unused rule is kept"
+    );
+}
+
+#[test]
+fn a_rule_against_itself_is_refused() {
+    let h = Harness::new();
+    let inst = h.instance("rule-self");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        "a.ESP",
+    )
+    .unwrap_err();
+    assert!(matches!(error, LoadOrderError::RuleSelf(_)), "{error}");
+}
+
+#[test]
+fn a_rule_that_contradicts_a_master_is_refused() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-master");
+    let a = plugin_file(0, &["B.esm"]);
+    let b = plugin_file(1, &[]);
+    let item = h.item(
+        "mod",
+        &[("Data/A.esp", a.as_slice()), ("Data/B.esm", b.as_slice())],
+    );
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "B.esm",
+        "A.esp",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::RuleContradictsMaster { .. }),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_rule_that_would_make_a_loop_is_refused() {
+    let h = Harness::new();
+    let inst = h.instance("rule-loop");
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
+    h.add(&inst, &item);
+    h.deploy(&inst);
+
+    for (item, after) in [("A.esp", "B.esp"), ("B.esp", "C.esp")] {
+        game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, item, after)
+            .unwrap();
+    }
+    let error = game_load_order::add_load_after_rule(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "C.esp",
+        "A.esp",
+    )
+    .unwrap_err();
+    assert!(matches!(error, LoadOrderError::RuleCycle { .. }), "{error}");
+}
+
+#[test]
+fn the_masters_only_sort_honours_a_load_after_rule() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-sort");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", "B.esp")
+        .unwrap();
+
+    let (report, order) =
+        game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+    assert_eq!(report.mode, SortMode::Masters);
+    let names: Vec<&str> = order.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["B.esp", "A.esp"]);
+}
+
+#[test]
+fn a_sorter_request_carries_the_users_load_after_rules() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-sorter");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", "B.esp")
+        .unwrap();
+    let current: Vec<String> = h
+        .plugin_names(&inst)
+        .into_iter()
+        .map(|(name, ..)| name)
+        .collect();
+    h.answer_sorting(SorterReply {
+        order: current,
+        ..Default::default()
+    });
+
+    game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+    let request = h.last_sort_request().expect("the sorter was asked");
+    assert_eq!(
+        request.rules,
+        [agora_game_api::UserLoadOrderRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }]
+    );
+}
+
+#[test]
+fn a_move_that_breaks_a_rule_is_refused_unless_it_may_remove_it() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let h = Harness::with_definition(def);
+    let inst = h.instance("rule-move");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    game_load_order::add_load_after_rule(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", "B.esp")
+        .unwrap();
+    game_load_order::sort_and_order(&h.ctx, &inst.instance_id, &h.def, false).unwrap();
+
+    let target = MoveTarget::Before("B.esp".to_string());
+    let error =
+        game_load_order::move_plugin_in(&h.ctx, &inst.instance_id, &h.def, None, "A.esp", &target)
+            .unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::BreaksRule { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .len(),
+        1,
+        "a refused move removes nothing"
+    );
+
+    let report = game_load_order::move_plugin_in_breaking_rules(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        None,
+        "A.esp",
+        &target,
+    )
+    .expect("the move may remove the rule");
+    assert_eq!(
+        report.removed_rules,
+        [game_load_order::LoadAfterRule {
+            item: "A.esp".into(),
+            after: "B.esp".into(),
+        }]
+    );
+    assert!(
+        game_load_order::load_after_rules(&h.ctx, &inst.instance_id, "plugins")
+            .unwrap()
+            .is_empty()
+    );
 }

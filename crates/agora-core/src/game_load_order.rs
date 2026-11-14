@@ -608,6 +608,9 @@ pub struct MoveReport {
     pub from: usize,
     pub to: usize,
     pub written: bool,
+    /// Rules removed because the move broke them and the caller allowed that.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_rules: Vec<LoadAfterRule>,
 }
 
 /// The plugin folder as the game sees it: lowercase file name to the file that holds its bytes.
@@ -839,6 +842,172 @@ fn sorter_request(
         entries,
         sorter.options.clone(),
     )
+}
+
+/// Whether `from` reaches `to` by one or more "must come before" edges.
+fn reaches(before: &HashMap<String, Vec<String>>, from: &str, to: &str) -> bool {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = before.get(from).cloned().unwrap_or_default();
+    while let Some(next) = stack.pop() {
+        if next == to {
+            return true;
+        }
+        if !seen.insert(next.clone()) {
+            continue;
+        }
+        if let Some(more) = before.get(&next) {
+            stack.extend(more.iter().cloned());
+        }
+    }
+    false
+}
+
+/// Add a user's load-after rule (MASTER_SPEC §31.4). Returns whether it was new. A rule that
+/// contradicts a master requirement, or that would make a loop with the rules and masters already
+/// in place, is refused with the reason.
+pub fn add_load_after_rule(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    item: &str,
+    after: &str,
+) -> Result<bool, LoadOrderError> {
+    let rule = rule_of(definition, list_id)?;
+    let item = item.trim();
+    let after = after.trim();
+    if item.is_empty() || after.is_empty() {
+        return Err(LoadOrderError::RulesStore(
+            "a rule needs both an item and the item it loads after".to_string(),
+        ));
+    }
+    if key(item) == key(after) {
+        return Err(LoadOrderError::RuleSelf(item.to_string()));
+    }
+
+    let order = order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let canonical = |name: &str| {
+        order
+            .entries
+            .iter()
+            .find(|entry| key(&entry.name) == key(name))
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| name.to_string())
+    };
+    let item = canonical(item);
+    let after = canonical(after);
+
+    // The game's own rules come first: a rule that asks an item to load after one of its masters
+    // can never hold.
+    if let Some(entry) = order
+        .entries
+        .iter()
+        .find(|entry| key(&entry.name) == key(&after))
+    {
+        if entry.masters.iter().any(|master| key(master) == key(&item)) {
+            return Err(LoadOrderError::RuleContradictsMaster {
+                item: item.clone(),
+                after: after.clone(),
+            });
+        }
+    }
+
+    // "next" maps an item to the items that must come after it, from the masters and the rules
+    // already set. Adding `item loads after after` closes a loop when item already reaches after.
+    let mut next: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in &order.entries {
+        for master in &entry.masters {
+            next.entry(key(master)).or_default().push(key(&entry.name));
+        }
+    }
+    for existing in load_after_rules(ctx, instance_id, &rule.id)? {
+        next.entry(key(&existing.after))
+            .or_default()
+            .push(key(&existing.item));
+    }
+    if reaches(&next, &key(&item), &key(&after)) {
+        return Err(LoadOrderError::RuleCycle {
+            item: item.clone(),
+            after: after.clone(),
+        });
+    }
+
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    let changed = conn
+        .execute(
+            "INSERT OR IGNORE INTO plugin_load_order_rules (instance_id, list_id, item, after_item)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![instance_id, rule.id, item, after],
+        )
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    Ok(changed > 0)
+}
+
+/// Remove a user's load-after rule. Returns whether one was there. A rule naming an item the list
+/// no longer has can still be removed this way.
+pub fn remove_load_after_rule(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    item: &str,
+    after: &str,
+) -> Result<bool, LoadOrderError> {
+    let rule = rule_of(definition, list_id)?;
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    let changed = conn
+        .execute(
+            "DELETE FROM plugin_load_order_rules
+              WHERE instance_id = ?1 AND list_id = ?2 AND item = ?3 AND after_item = ?4",
+            rusqlite::params![instance_id, rule.id, item.trim(), after.trim()],
+        )
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    Ok(changed > 0)
+}
+
+/// The user rules the order does not satisfy. A rule whose item or target is not in the list is
+/// unused and never reported.
+fn broken_rules(entries: &[LoadOrderEntry], rules: &[LoadAfterRule]) -> Vec<LoadAfterRule> {
+    let position = |name: &str| {
+        entries
+            .iter()
+            .position(|entry| key(&entry.name) == key(name))
+    };
+    rules
+        .iter()
+        .filter(|rule| {
+            let (Some(item), Some(after)) = (position(&rule.item), position(&rule.after)) else {
+                return false;
+            };
+            item <= after
+        })
+        .cloned()
+        .collect()
+}
+
+/// Turn the user's rules into prerequisite edges, so the masters-only sort and the blocked check
+/// honour them exactly as they honour a master.
+fn apply_load_after_rules(entries: &mut [LoadOrderEntry], rules: &[LoadAfterRule]) {
+    for rule in rules {
+        let Some(item) = entries
+            .iter_mut()
+            .find(|entry| key(&entry.name) == key(&rule.item))
+        else {
+            continue;
+        };
+        if key(&rule.item) == key(&rule.after) {
+            continue;
+        }
+        if !item
+            .masters
+            .iter()
+            .any(|master| key(master) == key(&rule.after))
+        {
+            item.masters.push(rule.after.clone());
+        }
+    }
 }
 
 /// What a package's sorter and overlaps hooks receive: the list as it stands, the user's rules,
@@ -2511,6 +2680,7 @@ fn sort_inner(
             }
         })?;
     set_prerequisites(&mut entries, &reply.rules, &rule.id);
+    apply_load_after_rules(&mut entries, &load_after_rules(ctx, instance_id, &rule.id)?);
 
     let mut notes = Vec::new();
     let mut mode = SortMode::Masters;
@@ -2587,7 +2757,17 @@ pub fn move_plugin(
     plugin: &str,
     target: &MoveTarget,
 ) -> Result<MoveReport, LoadOrderError> {
-    Ok(move_inner(ctx, instance_id, definition, None, plugin, target, false)?.0)
+    Ok(move_inner(
+        ctx,
+        instance_id,
+        definition,
+        None,
+        plugin,
+        target,
+        false,
+        false,
+    )?
+    .0)
 }
 
 /// [`move_plugin`] for one list; `None` names the game's first list.
@@ -2599,7 +2779,40 @@ pub fn move_plugin_in(
     plugin: &str,
     target: &MoveTarget,
 ) -> Result<MoveReport, LoadOrderError> {
-    Ok(move_inner(ctx, instance_id, definition, list_id, plugin, target, false)?.0)
+    Ok(move_inner(
+        ctx,
+        instance_id,
+        definition,
+        list_id,
+        plugin,
+        target,
+        false,
+        false,
+    )?
+    .0)
+}
+
+/// [`move_plugin_in`], but a move that breaks a load-after rule removes that rule instead of being
+/// refused (the CLI's `--break-rule`).
+pub fn move_plugin_in_breaking_rules(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+    plugin: &str,
+    target: &MoveTarget,
+) -> Result<MoveReport, LoadOrderError> {
+    Ok(move_inner(
+        ctx,
+        instance_id,
+        definition,
+        list_id,
+        plugin,
+        target,
+        true,
+        false,
+    )?
+    .0)
 }
 
 /// [`move_plugin`], then the instance's load order as it stands afterwards. Both read the installed
@@ -2611,7 +2824,16 @@ pub fn move_plugin_and_order(
     plugin: &str,
     target: &MoveTarget,
 ) -> Result<(MoveReport, LoadOrder), LoadOrderError> {
-    let (report, order) = move_inner(ctx, instance_id, definition, None, plugin, target, true)?;
+    let (report, order) = move_inner(
+        ctx,
+        instance_id,
+        definition,
+        None,
+        plugin,
+        target,
+        false,
+        true,
+    )?;
     Ok((report, order.expect("the order was asked for")))
 }
 
@@ -2624,7 +2846,16 @@ pub fn move_plugin_and_order_in(
     plugin: &str,
     target: &MoveTarget,
 ) -> Result<(MoveReport, LoadOrder), LoadOrderError> {
-    let (report, order) = move_inner(ctx, instance_id, definition, list_id, plugin, target, true)?;
+    let (report, order) = move_inner(
+        ctx,
+        instance_id,
+        definition,
+        list_id,
+        plugin,
+        target,
+        false,
+        true,
+    )?;
     Ok((report, order.expect("the order was asked for")))
 }
 
@@ -2635,6 +2866,7 @@ fn move_inner(
     list_id: Option<&str>,
     plugin: &str,
     target: &MoveTarget,
+    break_rule: bool,
     want_order: bool,
 ) -> Result<(MoveReport, Option<LoadOrder>), LoadOrderError> {
     let rule = rule_of(definition, list_id)?;
@@ -2656,6 +2888,28 @@ fn move_inner(
     )?
     .entries;
     let (name, from, to) = move_entry(&mut entries, plugin, target)?;
+    let mut removed_rules = Vec::new();
+    let broken = broken_rules(&entries, &load_after_rules(ctx, instance_id, &rule.id)?);
+    if let Some(first) = broken.first() {
+        if !break_rule {
+            return Err(LoadOrderError::BreaksRule {
+                plugin: name,
+                item: first.item.clone(),
+                after: first.after.clone(),
+            });
+        }
+        for broken in &broken {
+            remove_load_after_rule(
+                ctx,
+                instance_id,
+                definition,
+                Some(rule.id.as_str()),
+                &broken.item,
+                &broken.after,
+            )?;
+            removed_rules.push(broken.clone());
+        }
+    }
     let written = from != to;
     if written {
         write_entries(ctx, instance_id, definition, rule, &entries)?;
@@ -2678,6 +2932,7 @@ fn move_inner(
             from,
             to,
             written,
+            removed_rules,
         },
         order,
     ))
