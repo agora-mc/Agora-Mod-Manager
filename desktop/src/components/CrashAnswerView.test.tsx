@@ -322,6 +322,23 @@ describe('could not check', () => {
     expect(screen.getByText(/core\.memory/)).toBeInTheDocument();
     expect(screen.getByText(/the parser timed out/)).toBeInTheDocument();
   });
+
+  it('leaves a rule branch-limit note out of the player list', () => {
+    renderView({
+      status: 'analyzed',
+      answer: answer({
+        could_not_check: [
+          {
+            reason: 'too_many_matches',
+            subject: 'frame_on_stack',
+            detail: 'the rule matched more than 32 branches',
+            source,
+          },
+        ],
+      }),
+    });
+    expect(screen.queryByTestId('crash-could-not-check')).toBeNull();
+  });
 });
 
 describe('the overview card', () => {

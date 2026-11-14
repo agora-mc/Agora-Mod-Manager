@@ -549,6 +549,35 @@ mod crash {
     }
 
     #[test]
+    fn an_ordinary_full_stack_does_not_exhaust_the_frame_rule() {
+        let mut facts = Vec::new();
+        for index in 0..64u32 {
+            let mut frame = fact(
+                "core.frame",
+                &[("index", number(f64::from(index)))],
+                vec![strong_reference(
+                    "class",
+                    &format!("com.example.mod{index}.Thing"),
+                )],
+            );
+            frame
+                .attrs
+                .insert("actionable_index".to_string(), number(f64::from(index)));
+            facts.push(frame);
+        }
+        let evaluated = evaluate_one(output("minecraft_crash_report", facts));
+        assert!(
+            !evaluated
+                .could_not_check
+                .iter()
+                .any(|note| note.subject == "frame_on_stack"),
+            "{:#?}",
+            evaluated.could_not_check
+        );
+        assert!(signalled(&evaluated, "frame_on_stack"));
+    }
+
+    #[test]
     fn the_loader_naming_a_failed_mod_becomes_a_candidate() {
         let first = evaluate_one(output(
             "minecraft_crash_report",

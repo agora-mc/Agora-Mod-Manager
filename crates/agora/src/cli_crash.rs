@@ -908,11 +908,18 @@ fn print_answer(
         }
     }
 
-    if !answer.could_not_check.is_empty() {
+    // A rule that hit its branch limit is a note for pack authors, not a player-facing check. The
+    // JSON answer still carries it; this list is the one a person reads.
+    let player_checks: Vec<_> = answer
+        .could_not_check
+        .iter()
+        .filter(|check| check.reason != CouldNotCheckReason::TooManyMatches)
+        .collect();
+    if !player_checks.is_empty() {
         println!("Could not check:");
         // Several rules often miss the same thing; say it once, with how many.
         let mut lines: Vec<(String, usize)> = Vec::new();
-        for check in &answer.could_not_check {
+        for check in player_checks {
             let plugin = check
                 .source
                 .as_ref()

@@ -476,7 +476,10 @@ function Changes({ changes }: { changes?: CrashChange[] }) {
 
 function CouldNotCheck({ answer }: { answer: CrashAnswer }) {
   const [open, setOpen] = useState(false);
-  const count = answer.could_not_check.length;
+  // A rule that hit its branch limit is a note for pack authors, not something a player can act
+  // on. The JSON answer keeps it; this list is what a person reads.
+  const checks = answer.could_not_check.filter((check) => check.reason !== 'too_many_matches');
+  const count = checks.length;
   if (count === 0) return null;
   return (
     <section className="rounded-lg border border-border" data-testid="crash-could-not-check">
@@ -494,7 +497,7 @@ function CouldNotCheck({ answer }: { answer: CrashAnswer }) {
       </button>
       {open && (
         <ul className="space-y-1 border-t border-border px-3 py-2 text-xs text-muted-foreground">
-          {answer.could_not_check.map((check, index) => (
+          {checks.map((check, index) => (
             <li key={index}>
               {check.subject}: {check.reason.split('_').join(' ')}
               {check.detail === undefined ? null : `: ${check.detail}`}

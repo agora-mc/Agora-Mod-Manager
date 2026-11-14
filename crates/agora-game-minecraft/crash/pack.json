@@ -783,10 +783,11 @@
     },
     {
       "id": "frame_on_stack",
-      "version": 1,
+      "version": 2,
       "when": {
         "fact": {
           "kind": "core.frame",
+          "where": { "actionable_index": { "lte": 8 } },
           "ref": { "kind": "class", "strength": "exec", "bind": "cls" }
         }
       },

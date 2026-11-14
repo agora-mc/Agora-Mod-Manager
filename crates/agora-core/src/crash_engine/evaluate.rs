@@ -129,14 +129,20 @@ fn annotate_frames(facts: &mut [FactEntry], resolver: &dyn RefResolver) {
                 Some(Role::System | Role::Platform)
             )
         });
-        if dropped {
-            continue;
-        }
+        // Every frame carries the attribute, so a rule testing it never reads a system or
+        // platform frame as "could not check". A dropped frame is -1, which no rule counting
+        // actionable frames will match.
+        let value = if dropped {
+            -1.0
+        } else {
+            let value = actionable as f64;
+            actionable += 1;
+            value
+        };
         facts[index].fact.attrs.insert(
             "actionable_index".to_string(),
-            AttrValue::Scalar(Scalar::Number(actionable as f64)),
+            AttrValue::Scalar(Scalar::Number(value)),
         );
-        actionable += 1;
     }
 }
 

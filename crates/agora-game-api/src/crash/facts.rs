@@ -205,7 +205,8 @@ pub const ENGINE_FACT_KINDS: &[(&str, &[&str])] = &[
 /// Attributes the engine adds to a parser's fact once the pack's roles are known: usable in rules,
 /// refused from a parser. `actionable_index` counts frames after dropping those whose ref has the
 /// role `system` or `platform`, so a top frame inside the game itself or the Java standard library
-/// doesn't count as the place to look. `novel` marks a log line unseen in the last clean session.
+/// doesn't count as the place to look; a dropped frame carries `-1`. `novel` marks a log line
+/// unseen in the last clean session.
 pub const ENGINE_ATTRS: &[(&str, &[&str])] = &[
     ("core.frame", &["actionable_index"]),
     ("core.log_line", &["novel"]),
