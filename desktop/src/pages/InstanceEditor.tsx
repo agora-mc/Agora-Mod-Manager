@@ -3574,8 +3574,8 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                 <input
                   aria-label="Memory allocation"
                   type="range"
-                  min={2048}
-                  max={32768}
+                  min={256}
+                  max={131072}
                   step={1}
                   value={instanceJvmMemory}
                   disabled={recoveryBlocked || instanceMemoryMode === 'auto'}
@@ -3583,9 +3583,22 @@ export function InstanceEditor({ instanceId, onBack, onOpenInstanceEditor, onOpe
                   className="w-full accent-primary"
                 />
                 <span className="flex justify-between text-[11px] text-muted-foreground">
-                  <span>2 GB</span>
-                  <span>32 GB maximum</span>
+                  <span>256 MB</span>
+                  <span>128 GB maximum</span>
                 </span>
+                {instanceMemoryMode === 'manual' && instanceJvmMemory < 2048 && (
+                  <span className="text-xs text-destructive">
+                    Minecraft will likely run out of memory below 2 GB.
+                  </span>
+                )}
+                {instanceMemoryMode === 'manual'
+                  && memoryRecommendation
+                  && instanceJvmMemory > memoryRecommendation.system_ram_mb && (
+                    <span className="text-xs text-destructive">
+                      {formatMemoryMb(instanceJvmMemory)} is more than this machine&apos;s{' '}
+                      {formatMemoryMb(memoryRecommendation.system_ram_mb)}; the game may fail to start.
+                    </span>
+                  )}
                 {instanceMemoryMode === 'auto' && memoryRecommendation && (
                   <span className={memoryRecommendation.insufficient_system_ram ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}>
                     {memoryRecommendation.explanation}

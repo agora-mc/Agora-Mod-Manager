@@ -114,6 +114,37 @@ impl SystemResources {
     }
 }
 
+/// The largest heap `-Xmx` can express in whole megabytes. The JVM parses a size as signed
+/// 64-bit bytes, so a larger MB value cannot be represented.
+pub const JVM_MAX_HEAP_MB: i64 = i64::MAX / (1024 * 1024);
+
+/// Whether a user-chosen heap in MB is one the JVM can be asked for. Zero and negative values
+/// cannot work; the JVM also cannot represent a byte count above `i64::MAX`.
+pub fn memory_mb_is_possible(memory_mb: i64) -> bool {
+    (1..=JVM_MAX_HEAP_MB).contains(&memory_mb)
+}
+
+/// What to warn a user about a heap they chose. Automatic choices stay inside safe bounds on
+/// their own; a manual value is kept and these warnings are the whole protection.
+///
+/// `total_ram_mb` is 0 when the machine's memory could not be detected.
+pub fn memory_warnings(memory_mb: i64, total_ram_mb: u64) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if memory_mb < 2048 {
+        warnings.push(format!(
+            "{} MB is below 2 GB; Minecraft will likely run out of memory.",
+            memory_mb
+        ));
+    }
+    if total_ram_mb > 0 && memory_mb > total_ram_mb as i64 {
+        warnings.push(format!(
+            "{} MB is more than this machine's {} MB of memory; the game may fail to start.",
+            memory_mb, total_ram_mb
+        ));
+    }
+    warnings
+}
+
 /// Safe heap allocation with OS-headroom guardrails.
 ///
 /// Returns the recommended `-Xmx` value in MB. Never exceeds 75% of total RAM.
@@ -265,7 +296,9 @@ pub fn compute_gc_with_pre_touch(
 ) -> GcResult {
     let sys = SystemResources::detect();
     let heap = if requested_heap_mb > 0 {
-        safe_heap_mb(requested_heap_mb, sys.total_ram_mb)
+        // A manual choice is the user's: it is kept as chosen, with warnings elsewhere, rather
+        // than quietly raised to a floor or lowered to a RAM-based cap.
+        requested_heap_mb
     } else {
         // Auto: 4GB default, capped at 75% of system RAM
         safe_heap_mb(4096, sys.total_ram_mb)
@@ -340,6 +373,45 @@ mod tests {
     #[test]
     fn safe_heap_floor_is_2048() {
         assert!(safe_heap_mb(256, 16384) >= 2048);
+    }
+
+    #[test]
+    fn a_manual_heap_is_kept_instead_of_being_raised_to_the_automatic_floor() {
+        let result = compute_gc(21, 200, "", Some(GcProfile::Manual));
+        assert_eq!(result.heap_mb, 200);
+        assert!(result.jvm_args.contains("-Xmx200M"));
+        assert!(result.jvm_args.contains("-Xms200M"));
+    }
+
+    #[test]
+    fn an_automatic_heap_still_uses_the_safe_bounds() {
+        let result = compute_gc(21, 0, "", Some(GcProfile::Manual));
+        assert!(result.heap_mb >= 2048);
+    }
+
+    #[test]
+    fn only_positive_jvm_representable_heaps_are_possible() {
+        assert!(memory_mb_is_possible(1));
+        assert!(memory_mb_is_possible(2048));
+        assert!(memory_mb_is_possible(JVM_MAX_HEAP_MB));
+        assert!(!memory_mb_is_possible(0));
+        assert!(!memory_mb_is_possible(-1));
+        assert!(!memory_mb_is_possible(JVM_MAX_HEAP_MB + 1));
+    }
+
+    #[test]
+    fn warnings_name_a_low_heap_and_one_larger_than_the_machine() {
+        let low = memory_warnings(512, 16384);
+        assert_eq!(low.len(), 1);
+        assert!(low[0].contains("run out of memory"), "{low:?}");
+
+        let high = memory_warnings(32768, 16384);
+        assert_eq!(high.len(), 1);
+        assert!(high[0].contains("more than this machine"), "{high:?}");
+
+        assert!(memory_warnings(4096, 16384).is_empty());
+        // Unknown RAM says nothing about the machine.
+        assert!(memory_warnings(32768, 0).is_empty());
     }
 
     #[test]

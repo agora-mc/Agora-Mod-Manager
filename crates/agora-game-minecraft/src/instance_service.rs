@@ -480,7 +480,15 @@ impl InstanceService {
         memory_mode: &str,
     ) -> LauncherResult<()> {
         let instance_id = self.validate_id(instance_id)?;
-        let memory_mb = memory_mb.clamp(2048, 32768);
+        if !crate::gc::memory_mb_is_possible(memory_mb) {
+            return Err(LauncherError::Generic {
+                code: "ERR_INVALID_JVM_MEMORY".into(),
+                message: format!(
+                    "Heap size must be a positive number of megabytes the JVM can represent (at most {} MB); got {memory_mb} MB.",
+                    crate::gc::JVM_MAX_HEAP_MB
+                ),
+            });
+        }
         let gc_selection = crate::gc::GcSelection::from_input(gc).ok_or_else(|| {
             LauncherError::Generic {
                 code: "ERR_INVALID_JVM_GC".into(),
@@ -2609,6 +2617,55 @@ mod tests {
                 .expect("fixture row should exist");
             assert_eq!(after.jvm_gc, before.jvm_gc);
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_manual_heap_is_kept_and_an_impossible_one_is_rejected() {
+        let (ctx, root) = context();
+        let request = CreateInstanceRequest {
+            name: "Memory Test".into(),
+            instance_id: "memory-test".into(),
+            minecraft_version: "1.21".into(),
+            loader: "vanilla".into(),
+            loader_version: "".into(),
+            jvm_memory_mb: None,
+            jvm_memory_mode: None,
+            jvm_gc: None,
+            jvm_custom_args: None,
+            jvm_always_pre_touch: None,
+            is_modpack: None,
+            pack_icon_url: None,
+            template_id: None,
+        };
+        let row = prepare_row("memory-test", &request);
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        agora_core::db::upsert_instance(&conn, &row).unwrap();
+        drop(conn);
+
+        let service = InstanceService::new(ctx.clone());
+        service
+            .update_jvm("memory-test", 200, "auto", true, "", "manual")
+            .unwrap();
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let stored = agora_core::db::get_instance(&conn, "memory-test")
+            .unwrap()
+            .expect("fixture row should exist");
+        assert_eq!(stored.jvm_memory_mb, 200);
+        drop(conn);
+
+        for impossible in [0, -1, crate::gc::JVM_MAX_HEAP_MB + 1] {
+            let error = service
+                .update_jvm("memory-test", impossible, "auto", true, "", "manual")
+                .unwrap_err();
+            assert_eq!(error.code(), "ERR_INVALID_JVM_MEMORY");
+        }
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+        let after = agora_core::db::get_instance(&conn, "memory-test")
+            .unwrap()
+            .expect("fixture row should exist");
+        assert_eq!(after.jvm_memory_mb, 200, "a rejected value changes nothing");
 
         let _ = std::fs::remove_dir_all(root);
     }

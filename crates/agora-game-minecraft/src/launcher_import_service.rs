@@ -941,10 +941,12 @@ fn sanitize_settings(candidate: &ImportCandidate, preserve: bool) -> LaunchSetti
         .cloned();
 
     LaunchSettingsPreview {
+        // A value the source gives is the user's; only one the JVM cannot express is dropped so
+        // the importer's safe default applies instead.
         memory_mb: candidate
             .settings_preview
             .memory_mb
-            .map(|memory| memory.clamp(2048, 32768)),
+            .filter(|memory| crate::gc::memory_mb_is_possible(*memory)),
         java_path,
         jvm_args: candidate
             .settings_preview
@@ -2902,6 +2904,23 @@ mod tests {
         let c = make_candidate_with_settings(Some(8192), None, vec![]);
         let s = sanitize_settings(&c, true);
         assert_eq!(s.memory_mb, Some(8192));
+    }
+
+    #[test]
+    fn test_sanitize_settings_keeps_a_low_source_value_instead_of_clamping_it() {
+        // The user chose 512 MB in another launcher; it is theirs until they change it.
+        let c = make_candidate_with_settings(Some(512), None, vec![]);
+        let s = sanitize_settings(&c, true);
+        assert_eq!(s.memory_mb, Some(512));
+    }
+
+    #[test]
+    fn test_sanitize_settings_drops_an_impossible_source_value_for_the_default() {
+        for value in [0, -1, i64::MAX] {
+            let c = make_candidate_with_settings(Some(value), None, vec![]);
+            let s = sanitize_settings(&c, true);
+            assert_eq!(s.memory_mb, None, "{value}");
+        }
     }
 
     #[test]

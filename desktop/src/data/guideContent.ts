@@ -1278,7 +1278,7 @@ export const GUIDE_TOPICS: GuideTopic[] = [
         },
         {
           title: 'Set memory sensibly',
-          body: 'More memory is not always faster. We suggest giving Minecraft enough for the pack while leaving a few gigabytes for everything else on your computer. If the game feels slow, more memory is not always the fix. It helps most when the game runs out of memory or the log says it is short.',
+          body: 'More memory is not always faster. We suggest giving Minecraft enough for the pack while leaving a few gigabytes for everything else on your computer. If the game feels slow, more memory is not always the fix. It helps most when the game runs out of memory or the log says it is short. Agora keeps the value you choose and warns when it is below 2 GB or above the memory this computer has.',
           callout: {
             tone: 'tip',
             title: 'Start with the pack recommendation',

@@ -352,7 +352,7 @@ agora instance purge <ENTRY_ID> --yes
 
 `instance loader-version` shows the current loader, the compatible versions for the enabled mods, and the recommendation, then asks before switching. A version outside the compatible list is refused before anything changes. `--yes` skips the question.
 
-`instance java` with no options shows the current settings. `--path` must name an existing file, and `--clear-path` goes back to the global Java setting. `--memory` is in MB; Agora keeps heap sizes between 2048 and 32768 and says so when it adjusts one. Setting memory makes the choice manual, as creation does. `--jvm-args` replaces the instance's arguments.
+`instance java` with no options shows the current settings. `--path` must name an existing file, and `--clear-path` goes back to the global Java setting. `--memory` is in MB and is kept as given; only zero, a negative value, or one the JVM cannot represent is refused. Agora warns below 2048 MB (Minecraft will likely run out of memory) and above the machine's memory. Setting memory makes the choice manual, as creation does. `--jvm-args` replaces the instance's arguments.
 
 `instance wrapper` sets the command the game is launched under, for example a frame-timing overlay. It is checked the way the launcher reads it, so an unmatched quote is refused. An empty command or `--clear` removes it.
 
