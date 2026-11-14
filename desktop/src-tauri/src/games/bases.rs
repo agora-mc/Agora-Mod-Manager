@@ -504,6 +504,72 @@ pub async fn games_base_remove(
     .map_err(task_failed)?
 }
 
+/// What repairing one framework in a base copied and what the source install lacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameworkRepairReply {
+    pub base_id: String,
+    pub framework: String,
+    pub name: String,
+    pub copied: Vec<String>,
+    pub already_present: Vec<String>,
+    pub missing_from_source: Vec<String>,
+    pub complete: bool,
+}
+
+/// Re-capture a framework's declared files from the source install into an existing base. This
+/// is the repair offered beside an incomplete-framework check.
+#[tauri::command]
+pub async fn games_base_repair_framework(
+    app: tauri::AppHandle,
+    base_id: String,
+    framework: String,
+) -> Result<FrameworkRepairReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<FrameworkRepairReply, GamesError> {
+        validate_base_id(&base_id)?;
+        let ctx = crate::core_context(&app)?;
+        let manifest = read_manifest(&ctx, &base_id)?;
+        let definition = ctx.games.game(&manifest.runtime.game).ok_or_else(|| {
+            GamesError::new(
+                GAME_DEFINITION_MISSING,
+                "Agora does not have this game's definition loaded, so it cannot repair the base.",
+            )
+        })?;
+        let framework_id = agora_game_api::FrameworkId::new(framework.as_str()).map_err(|_| {
+            GamesError::new(
+                INVALID_INPUT,
+                format!("'{framework}' is not a framework id."),
+            )
+        })?;
+        let declared = ctx
+            .games
+            .framework(&manifest.runtime.game, &framework_id)
+            .ok_or_else(|| {
+                GamesError::new(
+                    INVALID_INPUT,
+                    format!(
+                        "{} does not declare a framework called '{framework}'.",
+                        definition.name
+                    ),
+                )
+            })?;
+        let repaired =
+            game_base::repair_framework(&ctx.paths, &base_id, declared).map_err(base_error)?;
+        let complete = repaired.is_complete();
+        Ok(FrameworkRepairReply {
+            base_id,
+            framework: repaired.framework,
+            name: repaired.name,
+            copied: repaired.copied,
+            already_present: repaired.already_present,
+            missing_from_source: repaired.missing_from_source,
+            complete,
+        })
+    })
+    .await
+    .map_err(task_failed)?
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -560,6 +626,10 @@ pub fn base_error(error: BaseError) -> GamesError {
         BaseError::NotFound(id) => {
             GamesError::new(BASE_NOT_FOUND, format!("Base {id} was not found. Refresh the list."))
         }
+        BaseError::FrameworkNotInstalled(name) => GamesError::new(
+            BASE_FAILED,
+            format!("{name} is not installed in this base, so there is nothing to repair."),
+        ),
         BaseError::RuntimeUnknown => GamesError::new(
             RUNTIME_UNKNOWN,
             "Agora cannot tell which exact version this install is, so it cannot build a base from it. Rescan installs, then try again.",

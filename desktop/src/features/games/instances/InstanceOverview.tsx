@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { openGameSettings } from '@/lib/settingsSection';
 import { RECOMMENDED_GAME_SETTINGS } from '../settings/gameSettings';
 import { storeName } from '../shared/stores';
+import { repairBaseFramework } from '../bases/api';
 import type { CheckFinding } from './api';
 import {
   checkHeadline,
@@ -96,7 +97,7 @@ export function InstanceOverviewTab({ instanceId, onNavigatePage }: InstanceOver
           {check !== null && check.findings.length > 0 && (
             <ul className="space-y-3" aria-label="Launch check findings">
               {orderFindings(check.findings).map((finding, index) => (
-                <FindingCard key={`${finding.kind}-${index}`} finding={finding} />
+                <FindingCard key={`${finding.kind}-${index}`} finding={finding} onRepaired={session.reload} />
               ))}
             </ul>
           )}
@@ -213,7 +214,30 @@ function AboutItem({ term, testId, children }: { term: string; testId?: string; 
   );
 }
 
-function FindingCard({ finding }: { finding: CheckFinding }) {
+function FindingCard({ finding, onRepaired }: { finding: CheckFinding; onRepaired: () => void }) {
+  const [repairing, setRepairing] = useState(false);
+  const [repairNote, setRepairNote] = useState<string | null>(null);
+  const repairBase = finding.repairBase;
+
+  async function repair() {
+    if (!repairBase) return;
+    setRepairing(true);
+    setRepairNote(null);
+    try {
+      const reply = await repairBaseFramework(repairBase.baseId, repairBase.framework);
+      setRepairNote(
+        reply.complete
+          ? `Repaired ${reply.name}: copied ${reply.copied.length} file(s) into the base.`
+          : `The source install does not have ${reply.missingFromSource.join(', ')}. Install ${reply.name} as content in the instance, or reinstall it into the game install, then repair again.`,
+      );
+      onRepaired();
+    } catch (error: unknown) {
+      setRepairNote(error instanceof Error ? error.message : 'Agora could not repair this base.');
+    } finally {
+      setRepairing(false);
+    }
+  }
+
   return (
     <li
       className={[
@@ -244,6 +268,14 @@ function FindingCard({ finding }: { finding: CheckFinding }) {
           <span className="font-medium">What to do: </span>
           {finding.repair}
         </p>
+      )}
+      {repairBase && (
+        <div className="space-y-1">
+          <Button type="button" variant="outline" size="sm" className="mt-1" disabled={repairing} onClick={() => void repair()}>
+            {repairing ? 'Repairing base…' : `Repair ${repairBase.name} in the base`}
+          </Button>
+          {repairNote !== null && <p className="text-xs text-muted-foreground">{repairNote}</p>}
+        </div>
       )}
       {finding.kind === 'base' && (
         <Button type="button" variant="outline" size="sm" className="mt-1" onClick={() => openGameSettings('bases')}>

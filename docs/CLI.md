@@ -193,6 +193,7 @@ classified as a base game, add-on or tool (MASTER_SPEC §26.3), and manages pinn
 | `agora games base list` | List all pinned bases and their availability. A record that cannot be read is listed as damaged, with its file and the reason |
 | `agora games base verify <base-id> [--full]` | Verify base integrity (quick cheap check by default, full hashes all files) |
 | `agora games base remove <base-id>` | Delete a pinned base and its manifest. A damaged record is removed with its folder in the bases folder, if there is one |
+| `agora games base repair-framework <base-id> <framework-id>` | Copy a framework's declared required files from the base's source install into the base. This repairs a base pinned before the framework declared those files (for example SKSE's `Data/Scripts/SKSE.pex`). Files the source also lacks are named, and the command exits non-zero: install the framework as content in the instance, or reinstall it into the game install, then run it again |
 | `agora games content add <path> [--name N]` | Add a zip, 7z or RAR archive (RAR is read through Windows' own tar) or a folder to the content store |
 | `agora games content list` | List all items in the content store |
 | `agora games content unused` | List items no instance uses, with their size. An unreadable instance manifest is a warning, and removal refuses while one exists |

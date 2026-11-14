@@ -934,6 +934,14 @@ enum BaseCmd {
         /// Base ID to remove.
         base_id: String,
     },
+    /// Copy a framework's declared required files from the source install into an existing base.
+    #[command(name = "repair-framework")]
+    RepairFramework {
+        /// Base ID to repair.
+        base_id: String,
+        /// Framework id, as the game package declares it, e.g. skse.
+        framework: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6421,6 +6429,81 @@ async fn run_command(
                         Err(e) => {
                             anyhow::bail!("{e}");
                         }
+                    }
+                }
+                BaseCmd::RepairFramework { base_id, framework } => {
+                    let manifest_path = ctx.paths.base_manifest_path(&base_id);
+                    if !manifest_path.exists() {
+                        if json {
+                            eprintln!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "error": format!("Base '{base_id}' not found."),
+                                    "exitCode": 1,
+                                }))?
+                            );
+                        } else {
+                            eprintln!("Error: Base '{base_id}' not found.");
+                        }
+                        std::process::exit(1);
+                    }
+                    let manifest: agora_core::game_base::BaseManifest =
+                        serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+                    let game_def = ctx.games.game(&manifest.runtime.game).ok_or_else(|| {
+                        anyhow::anyhow!("Game definition not found for {}", manifest.runtime.game)
+                    })?;
+                    let framework_id = agora_game_api::FrameworkId::new(framework.as_str())
+                        .map_err(|_| anyhow::anyhow!("'{framework}' is not a framework id."))?;
+                    let declared = ctx
+                        .games
+                        .framework(&manifest.runtime.game, &framework_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "{} does not declare a framework called '{framework}'.",
+                                game_def.name
+                            )
+                        })?;
+                    let repaired =
+                        agora_core::game_base::repair_framework(&ctx.paths, &base_id, declared)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "baseId": base_id,
+                                "framework": repaired.framework,
+                                "name": repaired.name,
+                                "copied": repaired.copied,
+                                "alreadyPresent": repaired.already_present,
+                                "missingFromSource": repaired.missing_from_source,
+                                "exitCode": if repaired.is_complete() { 0 } else { 1 },
+                            }))?
+                        );
+                    } else if repaired.is_complete() {
+                        println!(
+                            "Base '{base_id}' now has every file {} needs.",
+                            repaired.name
+                        );
+                        if !repaired.copied.is_empty() {
+                            println!("Copied from the source install:");
+                            for file in &repaired.copied {
+                                println!("  - {file}");
+                            }
+                        }
+                    } else {
+                        println!(
+                            "Base '{base_id}' is still missing files {} needs:",
+                            repaired.name
+                        );
+                        for file in &repaired.missing_from_source {
+                            println!("  - {file}");
+                        }
+                        println!(
+                            "The source install does not have them either. Install {} as content in the instance, or reinstall it into the game install, then run this again.",
+                            repaired.name
+                        );
+                    }
+                    if !repaired.is_complete() {
+                        std::process::exit(1);
                     }
                 }
             },

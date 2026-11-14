@@ -512,6 +512,7 @@ pub fn run() {
             games::bases::games_base_build,
             games::bases::games_base_verify,
             games::bases::games_base_remove,
+            games::bases::games_base_repair_framework,
             games::instances::games_instance_list,
             games::instances::games_instance_get,
             games::instances::games_instance_create,

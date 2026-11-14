@@ -145,6 +145,18 @@ pub struct CheckFinding {
     pub why: String,
     /// What to do about it.
     pub repair: Option<String>,
+    /// For a framework whose base lacks required files: the base and framework a repair would use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_base: Option<FrameworkRepairRef>,
+}
+
+/// The base and framework a `repairBaseFramework` call needs, offered beside the finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameworkRepairRef {
+    pub base_id: String,
+    pub framework: String,
+    pub name: String,
 }
 
 /// An instance's launch checks. A pinned instance is checked; an unpinned one has nothing to check.
@@ -852,7 +864,17 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
         })?;
     let mut findings = Vec::new();
     for finding in &checks.runtime {
-        findings.push(framework_finding(finding));
+        let mut shown = framework_finding(finding);
+        if finding.problem == RuntimeFileProblem::MissingFiles {
+            if let BaseReference::Pinned { id, .. } = &record.base {
+                shown.repair_base = Some(FrameworkRepairRef {
+                    base_id: id.clone(),
+                    framework: finding.rule_id.clone(),
+                    name: finding.rule_name.clone(),
+                });
+            }
+        }
+        findings.push(shown);
     }
     for finding in &checks.load_order {
         findings.push(load_order_finding(finding));
@@ -1312,6 +1334,7 @@ pub fn requirement_finding(
                 Some(entry) => format!("Install {} from \"Browse\".", entry.name),
                 None => format!("Add {} to this instance.", unmet.name),
             }),
+            repair_base: None,
         },
         RequirementFinding::NotChecked { .. } => CheckFinding {
             kind: "framework",
@@ -1320,6 +1343,7 @@ pub fn requirement_finding(
             detail: finding.summary(),
             why: "Agora cannot say whether these mods have what they need.".to_string(),
             repair: None,
+            repair_base: None,
         },
     }
 }
@@ -1360,6 +1384,7 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
         detail,
         why,
         repair: non_empty(&finding.repair),
+        repair_base: None,
     }
 }
 
@@ -1405,6 +1430,7 @@ pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> Che
                 .to_string()
         },
         repair: Some(repair),
+        repair_base: None,
     }
 }
 
@@ -1417,6 +1443,7 @@ pub fn tool_finding(output: &agora_core::game_tools::OutputFinding) -> CheckFind
         why: "Tool output made from older files, or that conflicts with another tool, may not match the mods now installed."
             .to_string(),
         repair: Some("Run the tool again from this instance's Tools tab.".to_string()),
+        repair_base: None,
     }
 }
 
@@ -1434,6 +1461,7 @@ fn base_finding(problem: &BaseProblem, blocks: bool) -> CheckFinding {
         why: "The game's files differ from what Agora recorded when it built the base, so the game may behave oddly or crash."
             .to_string(),
         repair: Some("Verify this base on the game's Bases page in Settings, or launch anyway at your own risk.".to_string()),
+        repair_base: None,
     }
 }
 
@@ -1711,6 +1739,7 @@ mod tests {
             detail: "d".into(),
             why: "w".into(),
             repair: None,
+            repair_base: None,
         }
     }
 

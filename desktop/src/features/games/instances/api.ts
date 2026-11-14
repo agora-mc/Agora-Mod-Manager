@@ -77,6 +77,8 @@ export interface CheckFinding {
   detail: string;
   why: string;
   repair: string | null;
+  /** Present when a base repair would fix this finding. */
+  repairBase?: { baseId: string; framework: string; name: string };
 }
 
 export interface PassedCheck {

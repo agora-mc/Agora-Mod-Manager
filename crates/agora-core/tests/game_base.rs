@@ -4,8 +4,9 @@ use std::time::SystemTime;
 use agora_core::app_paths::AppPaths;
 use agora_core::game_base::{
     build_base, build_base_with_frameworks, evaluate_link_support, get_file_identity, install_size,
-    is_plain_base_id, list_bases, make_base_id, remove_base, sanitize_base_id_part, verify_base,
-    BaseEntry, BaseError, BaseMode, BuildOptions, BuildOutcome, ProblemKind, VerifyDepth,
+    is_plain_base_id, list_bases, make_base_id, remove_base, repair_framework,
+    sanitize_base_id_part, verify_base, BaseEntry, BaseError, BaseMode, BuildOptions, BuildOutcome,
+    ProblemKind, VerifyDepth,
 };
 use agora_core::game_discovery::{DiscoveredInstall, InstallKind};
 use agora_core::game_registry::{IdentifiedInstall, RuntimeResolution};
@@ -1952,4 +1953,80 @@ fn a_framework_missing_a_required_file_is_recorded_as_incomplete() {
     assert_eq!(recorded.len(), 1, "{recorded:?}");
     assert_eq!(recorded[0].framework, "skse");
     assert_eq!(recorded[0].missing, vec!["Data/Scripts/SKSE.pex"]);
+}
+
+#[test]
+fn repairing_a_framework_copies_required_files_into_an_existing_base() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-repair"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    let framework = framework_with_required("skse64_loader.exe", &["Data/Scripts/SKSE.pex"]);
+    let frameworks = [&framework];
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &frameworks,
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+    assert_eq!(outcome.manifest().incomplete_frameworks.len(), 1);
+
+    // The scripts arrive in the source install after the base was pinned.
+    std::fs::create_dir_all(install_dir.join("Data/Scripts")).unwrap();
+    std::fs::write(install_dir.join("Data/Scripts/SKSE.pex"), b"pex").unwrap();
+
+    let repaired = repair_framework(&paths, &base_id, &framework).unwrap();
+    assert_eq!(repaired.copied, vec!["Data/Scripts/SKSE.pex"]);
+    assert!(repaired.is_complete(), "{repaired:?}");
+    assert!(outcome
+        .manifest()
+        .location
+        .join("Data/Scripts/SKSE.pex")
+        .is_file());
+
+    let text = std::fs::read_to_string(paths.base_manifest_path(&base_id)).unwrap();
+    let manifest: agora_core::game_base::BaseManifest = serde_json::from_str(&text).unwrap();
+    assert!(manifest
+        .files
+        .iter()
+        .any(|file| file.path == "Data/Scripts/SKSE.pex"));
+    assert!(manifest.incomplete_frameworks.is_empty());
+}
+
+#[test]
+fn repairing_says_when_the_source_install_lacks_the_files_too() {
+    let tmp = TempDir::new().unwrap();
+    let (paths, install_dir, install) = built(&tmp, Some("framework-repair-missing"));
+    std::fs::write(install_dir.join("skse64_loader.exe"), b"loader").unwrap();
+    let framework = framework_with_required("skse64_loader.exe", &["Data/Scripts/SKSE.pex"]);
+    let frameworks = [&framework];
+    let outcome = build_base_with_frameworks(
+        &paths,
+        &install,
+        &test_definition(),
+        &frameworks,
+        BaseMode::Copied,
+        Some(&tmp.path().join("AgoraBases")),
+        BuildOptions::default(),
+        &|_| {},
+    )
+    .unwrap();
+    let base_id = outcome.manifest().base_id.clone();
+
+    let repaired = repair_framework(&paths, &base_id, &framework).unwrap();
+    assert_eq!(repaired.copied, Vec::<String>::new());
+    assert_eq!(repaired.missing_from_source, vec!["Data/Scripts/SKSE.pex"]);
+    assert!(!repaired.is_complete());
+    let text = std::fs::read_to_string(paths.base_manifest_path(&base_id)).unwrap();
+    let manifest: agora_core::game_base::BaseManifest = serde_json::from_str(&text).unwrap();
+    assert_eq!(manifest.incomplete_frameworks.len(), 1);
+    assert_eq!(
+        manifest.incomplete_frameworks[0].missing,
+        vec!["Data/Scripts/SKSE.pex"]
+    );
 }
