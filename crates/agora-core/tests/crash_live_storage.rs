@@ -261,6 +261,7 @@ fn the_change_summary_survives_a_round_trip() {
             key: Some("acme.sky".to_string()),
             from_version: Some("1.0".to_string()),
             to_version: Some("2.0".to_string()),
+            setting: None,
         }],
         record: None,
         artifact_hashes: Vec::new(),

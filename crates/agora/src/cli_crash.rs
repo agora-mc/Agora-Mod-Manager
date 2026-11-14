@@ -1127,12 +1127,18 @@ fn inspect_words(result: agora_game_api::crash::InspectResult) -> &'static str {
     }
 }
 
-/// The checks a person can read. A rule's branch-limit note stays in the JSON answer for the pack
-/// author; it is not a "could not check" a player should see.
+/// The checks a person can read. A rule's branch-limit note and a fact kind no parser covered are
+/// notes for the pack author; the JSON answer keeps them, but they are not "could not check" a
+/// player can act on.
 fn player_could_not_check(checks: &[CouldNotCheck]) -> Vec<&CouldNotCheck> {
     checks
         .iter()
-        .filter(|check| check.reason != CouldNotCheckReason::TooManyMatches)
+        .filter(|check| {
+            !matches!(
+                check.reason,
+                CouldNotCheckReason::TooManyMatches | CouldNotCheckReason::NotCovered
+            )
+        })
         .collect()
 }
 
@@ -1163,14 +1169,16 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_limit_note_is_not_a_player_facing_check() {
+    fn an_author_note_is_not_a_player_facing_check() {
         let checks = vec![
             check(CouldNotCheckReason::TooManyMatches),
             check(CouldNotCheckReason::NotCovered),
+            check(CouldNotCheckReason::CodeFailed),
         ];
         let shown = player_could_not_check(&checks);
         assert_eq!(shown.len(), 1);
-        assert_eq!(shown[0].reason, CouldNotCheckReason::NotCovered);
+        assert_eq!(shown[0].reason, CouldNotCheckReason::CodeFailed);
         assert!(player_could_not_check(&[check(CouldNotCheckReason::TooManyMatches)]).is_empty());
+        assert!(player_could_not_check(&[check(CouldNotCheckReason::NotCovered)]).is_empty());
     }
 }

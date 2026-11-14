@@ -33,7 +33,7 @@ import {
   type CrashVerdict,
   type SuppliedCrashAnswer,
 } from '../features/games/instances/crashAnswerApi';
-import { CrashAnswerView, ownerKey, ownerName, english } from './CrashAnswerView';
+import { CrashAnswerView, ownerKey, ownerName, english, playerCouldNotCheck } from './CrashAnswerView';
 import { ModBisectPanel } from './ModBisectPanel';
 import { DependencyPrompt } from './DependencyPrompt';
 import { Button } from '@/components/ui/button';
@@ -167,7 +167,7 @@ export function renderAnswerText(answer: CrashAnswer): string {
       lines.push(`- ${english(finding.headline)} (from ${finding.source.plugin_name})`);
     });
   }
-  const playerChecks = answer.could_not_check.filter((check) => check.reason !== 'too_many_matches');
+  const playerChecks = playerCouldNotCheck(answer);
   if (playerChecks.length > 0) {
     lines.push('', 'Could not check:');
     playerChecks.forEach((check) => {

@@ -972,15 +972,24 @@ fn a_whole_file_rule_with_a_source_only_searches_that_sources_files() {
                 == Some("The needle was in the named source.")
         })
         .expect("the rule fired on the source it names");
-    let artifacts: Vec<&str> = finding
+    // The finding also carries the `acme.fault` fact's own evidence from every file it matched.
+    // What the text rule searched is the evidence line holding the needle, so check that line's
+    // artifact, not every line in the merged finding.
+    let searched: Vec<&str> = finding
         .evidence
         .iter()
+        .filter(|evidence| {
+            evidence
+                .quote
+                .as_deref()
+                .is_some_and(|quote| quote.contains("invented needle"))
+        })
         .map(|evidence| evidence.artifact.as_str())
         .collect();
-    assert!(!artifacts.is_empty(), "the rule fired without evidence");
+    assert!(!searched.is_empty(), "the rule fired without evidence");
     assert!(
-        artifacts.iter().all(|artifact| *artifact == "found.txt"),
-        "the rule searched a file its source did not name: {artifacts:?}"
+        searched.iter().all(|artifact| *artifact == "found.txt"),
+        "the rule searched a file its source did not name: {searched:?}"
     );
 }
 

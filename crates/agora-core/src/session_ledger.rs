@@ -190,9 +190,24 @@ pub struct LaunchManifest {
     /// Hash of the instance's own settings files. `None` when they could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_hash: Option<String>,
+    /// The keys the instance's INI files set, recorded so a later settings change can name the key
+    /// and both values instead of saying only "the settings changed". Empty in manifests stored
+    /// before this was kept, which fall back to the generic change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<SettingEntry>,
     /// Parts of the manifest that could not be read, in words.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unreadable: Vec<String>,
+}
+
+/// One key an instance's INI file sets, with the file and section that hold it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingEntry {
+    /// The mapped instance file, as the pack named it.
+    pub file: String,
+    pub section: String,
+    pub key: String,
+    pub value: String,
 }
 
 impl LaunchManifest {
@@ -272,6 +287,22 @@ pub struct ManifestChange {
     pub from_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_version: Option<String>,
+    /// Which INI setting changed, when the manifest recorded keys. A settings change with none
+    /// keeps the generic wording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<SettingChange>,
+}
+
+/// One named setting change: the file and section that hold the key, and both values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingChange {
+    pub file: String,
+    pub section: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 
 /// What differs between the setup that ended normally and the one this session ran.
@@ -302,6 +333,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                 key: Some((*key).to_string()),
                 from_version: None,
                 to_version: item.version.clone(),
+                setting: None,
             }),
             Some(before) => {
                 if before.enabled != item.enabled {
@@ -314,6 +346,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                         key: Some((*key).to_string()),
                         from_version: before.version.clone(),
                         to_version: item.version.clone(),
+                        setting: None,
                     });
                 } else if before.version != item.version || before.hash != item.hash {
                     changes.push(ManifestChange {
@@ -321,6 +354,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                         key: Some((*key).to_string()),
                         from_version: before.version.clone(),
                         to_version: item.version.clone(),
+                        setting: None,
                     });
                 }
             }
@@ -333,6 +367,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                 key: Some((*key).to_string()),
                 from_version: item.version.clone(),
                 to_version: None,
+                setting: None,
             });
         }
     }
@@ -360,6 +395,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                     key: Some((*key).to_string()),
                     from_version: previous_items[*key].version.clone(),
                     to_version: current_items[*key].version.clone(),
+                    setting: None,
                 });
             }
         }
@@ -388,6 +424,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                         key: Some(entry.name.clone()),
                         from_version: None,
                         to_version: None,
+                        setting: None,
                     });
                     named_load_order = true;
                 }
@@ -401,6 +438,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                         key: Some(entry.name.clone()),
                         from_version: None,
                         to_version: None,
+                        setting: None,
                     });
                     named_load_order = true;
                 }
@@ -414,6 +452,7 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
                     key: Some(entry.name.clone()),
                     from_version: None,
                     to_version: None,
+                    setting: None,
                 });
                 named_load_order = true;
             }
@@ -425,21 +464,87 @@ pub fn diff_manifests(previous: &LaunchManifest, current: &LaunchManifest) -> Ve
             key: None,
             from_version: None,
             to_version: None,
+            setting: None,
         });
     }
     if previous.settings_hash != current.settings_hash {
-        changes.push(ManifestChange {
-            kind: ChangeKind::Settings,
-            key: None,
-            from_version: None,
-            to_version: None,
-        });
+        let named = diff_settings(previous, current);
+        if named.is_empty() {
+            changes.push(ManifestChange {
+                kind: ChangeKind::Settings,
+                key: None,
+                from_version: None,
+                to_version: None,
+                setting: None,
+            });
+        } else {
+            changes.extend(named);
+        }
     }
 
     changes.sort_by(|left, right| {
         (left.kind as u8, left.key.as_deref().unwrap_or(""))
             .cmp(&(right.kind as u8, right.key.as_deref().unwrap_or("")))
     });
+    changes
+}
+
+/// Name each INI key that differs. Both manifests must have recorded keys: an older manifest has
+/// none, and guessing "set X to Y" from one side would invent a change. Names compare the way INI
+/// names do, case-insensitively.
+fn diff_settings(previous: &LaunchManifest, current: &LaunchManifest) -> Vec<ManifestChange> {
+    use std::collections::BTreeMap;
+
+    if previous.settings.is_empty() || current.settings.is_empty() {
+        return Vec::new();
+    }
+    let key = |entry: &SettingEntry| {
+        (
+            entry.file.to_ascii_lowercase(),
+            entry.section.to_ascii_lowercase(),
+            entry.key.to_ascii_lowercase(),
+        )
+    };
+    let previous_entries: BTreeMap<_, &SettingEntry> = previous
+        .settings
+        .iter()
+        .map(|entry| (key(entry), entry))
+        .collect();
+    let current_entries: BTreeMap<_, &SettingEntry> = current
+        .settings
+        .iter()
+        .map(|entry| (key(entry), entry))
+        .collect();
+
+    let named = |entry: &SettingEntry, from: Option<&String>, to: Option<&String>| ManifestChange {
+        kind: ChangeKind::Settings,
+        key: None,
+        from_version: None,
+        to_version: None,
+        setting: Some(SettingChange {
+            file: entry.file.clone(),
+            section: entry.section.clone(),
+            key: entry.key.clone(),
+            from: from.cloned(),
+            to: to.cloned(),
+        }),
+    };
+
+    let mut changes = Vec::new();
+    for (identity, entry) in &current_entries {
+        match previous_entries.get(identity) {
+            None => changes.push(named(entry, None, Some(&entry.value))),
+            Some(before) if before.value != entry.value => {
+                changes.push(named(entry, Some(&before.value), Some(&entry.value)))
+            }
+            Some(_) => {}
+        }
+    }
+    for (identity, entry) in &previous_entries {
+        if !current_entries.contains_key(identity) {
+            changes.push(named(entry, Some(&entry.value), None));
+        }
+    }
     changes
 }
 
@@ -696,7 +801,8 @@ pub fn build_manifest(
         manifest.load_orders_hash = Some(sha_hex(b""));
     }
 
-    // Settings: the instance's own copies of the game's per-user files.
+    // Settings: the instance's own copies of the game's per-user files. Their keys are recorded
+    // too, so a later change can say which setting moved and between what values.
     match ctx.paths.instance_dir(instance_id) {
         Ok(dir) => {
             let mut hasher = Sha256::new();
@@ -711,6 +817,9 @@ pub fn build_manifest(
                     manifest.unreadable.push(format!("settings: {e}"));
                     failed = true;
                 }
+                if let Some(entries) = setting_entries(&path, mapping.instance_path.as_str()) {
+                    manifest.settings.extend(entries);
+                }
             }
             if !failed {
                 manifest.settings_hash = Some(hex::encode(hasher.finalize()));
@@ -719,6 +828,45 @@ pub fn build_manifest(
         Err(e) => manifest.unreadable.push(format!("settings: {e}")),
     }
     manifest
+}
+
+/// The most keys one manifest records from the settings files. A file over this is left to the
+/// generic settings change; a manifest must stay bounded.
+const MAX_SETTING_ENTRIES: usize = 4096;
+
+/// Read the keys an instance's INI file sets. A file that is not there, is not a file, or has more
+/// keys than the limit contributes no detail. The hash still records that the file changed.
+fn setting_entries(path: &std::path::Path, file: &str) -> Option<Vec<SettingEntry>> {
+    use std::collections::BTreeMap;
+
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let document = crate::game_ini::IniDocument::parse(&bytes);
+    let entries = document.entries();
+    if entries.len() > MAX_SETTING_ENTRIES {
+        return None;
+    }
+    // The last line for a key wins, the way the INI reader reads it, and the order is fixed.
+    let mut by_key: BTreeMap<(String, String), SettingEntry> = BTreeMap::new();
+    for entry in entries {
+        let entry = SettingEntry {
+            file: file.to_string(),
+            section: entry.section,
+            key: entry.key,
+            value: entry.value,
+        };
+        by_key.insert(
+            (
+                entry.section.to_ascii_lowercase(),
+                entry.key.to_ascii_lowercase(),
+            ),
+            entry,
+        );
+    }
+    Some(by_key.into_values().collect())
 }
 
 /// What a Minecraft launch runs with, from the instance manifest. Minecraft has no deployment
@@ -1738,6 +1886,7 @@ mod tests {
             load_order: Vec::new(),
             runtime: "steam:1.6.1170.0".into(),
             settings_hash: Some(sha_hex(b"settings")),
+            settings: Vec::new(),
             unreadable: vec![],
         }
     }

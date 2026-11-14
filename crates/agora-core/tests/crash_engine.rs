@@ -2818,6 +2818,7 @@ fn a_disabled_plugin_is_named_in_the_change_finding() {
         key: Some("Unofficial Example Patch.esp".to_string()),
         from_version: None,
         to_version: None,
+        setting: None,
     };
     let finding =
         agora_core::crash_engine::change::change_finding(&[change]).expect("a change finding");
@@ -2837,6 +2838,7 @@ fn a_change_since_the_last_good_launch_only_boosts_and_never_accuses_alone() {
         key: Some("mod-a".to_string()),
         from_version: Some("1.0".to_string()),
         to_version: Some("2.0".to_string()),
+        setting: None,
     }];
 
     // A change by itself is boost-only: consensus names nobody.
@@ -2911,12 +2913,14 @@ fn a_change_finding_names_what_changed_and_nothing_invents_a_change_without_one(
             key: Some("mod-b".to_string()),
             from_version: None,
             to_version: Some("1.0".to_string()),
+            setting: None,
         },
         ManifestChange {
             kind: ChangeKind::Settings,
             key: None,
             from_version: None,
             to_version: None,
+            setting: None,
         },
     ])
     .expect("a change is described");

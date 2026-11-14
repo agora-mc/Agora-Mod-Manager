@@ -1325,37 +1325,12 @@ pub fn launch_checks(
     };
     // A package's script can add findings to the same launch checks the page
     // already shows. A failing hook is reported, never silently dropped.
-    let diagnostics = match ctx.games.package_for(&definition.id).cloned() {
-        Some(package) => {
-            let mut context = hook_context(ctx, record, definition)?;
-            context.load_order = agora_game_api::LoadOrder {
-                entries: orders
-                    .iter()
-                    .flat_map(|order| order.entries.iter())
-                    .map(|entry| agora_game_api::LoadOrderEntry {
-                        id: entry.name.clone(),
-                        enabled: entry.active,
-                        locked: entry.locked,
-                        present: entry.present,
-                    })
-                    .collect(),
-                rules: Vec::new(),
-            };
-            match crate::game_registry::block_on_hook(package.diagnostics(context)) {
-                Ok(diagnostics) => diagnostics,
-                Err(error) => vec![agora_game_api::Diagnostic {
-                    code: "ERR_GAME_HOOK_FAILED".to_string(),
-                    message: format!(
-                        "the game's plugin could not run its diagnostics: {}",
-                        error.message
-                    ),
-                    severity: agora_game_api::DiagnosticSeverity::Warning,
-                    repairs: Vec::new(),
-                }],
-            }
-        }
-        None => Vec::new(),
-    };
+    let diagnostics = diagnostics_for_orders(
+        ctx,
+        definition,
+        hook_context(ctx, record, definition)?,
+        &orders,
+    );
     if !pinned {
         return Ok(LaunchChecks {
             runtime,
@@ -1406,6 +1381,45 @@ pub fn launch_checks(
         diagnostics,
         passed,
     })
+}
+
+/// Run the game package's `diagnostics` hook with the instance's load order. `launch_checks` and a
+/// launch both call this one function, so the warnings a check prints and a launch prints come from
+/// the same place. A failing hook is a reported warning, never a failed check or launch.
+pub(crate) fn diagnostics_for_orders(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    mut context: agora_game_api::GameContext,
+    orders: &[crate::game_load_order::LoadOrder],
+) -> Vec<agora_game_api::Diagnostic> {
+    context.load_order = agora_game_api::LoadOrder {
+        entries: orders
+            .iter()
+            .flat_map(|order| order.entries.iter())
+            .map(|entry| agora_game_api::LoadOrderEntry {
+                id: entry.name.clone(),
+                enabled: entry.active,
+                locked: entry.locked,
+                present: entry.present,
+            })
+            .collect(),
+        rules: Vec::new(),
+    };
+    let Some(package) = ctx.games.package_for(&definition.id).cloned() else {
+        return Vec::new();
+    };
+    match crate::game_registry::block_on_hook(package.diagnostics(context)) {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => vec![agora_game_api::Diagnostic {
+            code: "ERR_GAME_HOOK_FAILED".to_string(),
+            message: format!(
+                "the game's plugin could not run its diagnostics: {}",
+                error.message
+            ),
+            severity: agora_game_api::DiagnosticSeverity::Warning,
+            repairs: Vec::new(),
+        }],
+    }
 }
 
 /// The result of a scoped thread. A panic in the thread is raised again here, not turned into a
@@ -1857,6 +1871,18 @@ fn prepare_deployed(
     let generated_findings =
         crate::game_tools::output_findings_with_view(ctx, id, definition, links)
             .map_err(|e| InstanceError::Other(e.to_string()))?;
+    // The same warnings `games instance check` prints, from the same two sources: the game
+    // package's diagnostics hook over this launch's order, and the mods' unmet requirements.
+    let manifest_for_checks = get_manifest(ctx, id)?;
+    let orders = crate::game_load_order::orders_with_view(ctx, id, definition, links)
+        .map_err(|error| InstanceError::Other(error.to_string()))?;
+    let diagnostics = diagnostics_for_orders(
+        ctx,
+        definition,
+        hook_context_from_manifest(id, &manifest_for_checks, definition),
+        &orders,
+    );
+    let requirements = crate::catalog_install::requirement_findings(ctx, id, definition);
 
     let game_dir = crate::game_deploy::deployment_dir(ctx, id)?
         .ok_or_else(|| InstanceError::Other("deployed game directory not found".into()))?;
@@ -1975,6 +2001,8 @@ fn prepare_deployed(
         runtime_findings: findings,
         load_order_findings,
         generated_findings,
+        diagnostics,
+        requirements,
     })
 }
 

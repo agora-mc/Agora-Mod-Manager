@@ -5,7 +5,7 @@
  */
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { CrashAnswerCard, CrashAnswerView, nextStepLabel } from './CrashAnswerView';
+import { CrashAnswerCard, CrashAnswerView, describeChange, nextStepLabel } from './CrashAnswerView';
 import type {
   CrashAnswer,
   CrashCandidate,
@@ -318,7 +318,7 @@ describe('could not check', () => {
       status: 'analyzed',
       answer: answer({
         could_not_check: [
-          { reason: 'not_covered', subject: 'core.memory', source },
+          { reason: 'version_unknown', subject: 'core.memory', source },
           { reason: 'code_failed', subject: 'loose_log', detail: 'the parser timed out', source },
         ],
       }),
@@ -333,7 +333,7 @@ describe('could not check', () => {
     expect(screen.getByText(/the parser timed out/)).toBeInTheDocument();
   });
 
-  it('leaves a rule branch-limit note out of the player list', () => {
+  it('leaves an author note out of the player list', () => {
     renderView({
       status: 'analyzed',
       answer: answer({
@@ -344,10 +344,37 @@ describe('could not check', () => {
             detail: 'the rule matched more than 32 branches',
             source,
           },
+          {
+            reason: 'not_covered',
+            subject: 'creation.object',
+            detail: 'no parser looked for it (4 rules)',
+            source,
+          },
         ],
       }),
     });
     expect(screen.queryByTestId('crash-could-not-check')).toBeNull();
+  });
+});
+
+describe('a settings change', () => {
+  it('names the key and both values when the ledger recorded them', () => {
+    expect(
+      describeChange({
+        kind: 'settings',
+        setting: {
+          file: 'Skyrim.ini',
+          section: 'Display',
+          key: 'uGridsToLoad',
+          from: '11',
+          to: '5',
+        },
+      }),
+    ).toBe('changed uGridsToLoad in Skyrim.ini from 11 to 5');
+  });
+
+  it('falls back to the generic words when no key was recorded', () => {
+    expect(describeChange({ kind: 'settings' })).toBe("changed the instance's settings");
   });
 });
 

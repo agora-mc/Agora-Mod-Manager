@@ -339,6 +339,48 @@ fn a_launch_records_what_it_ran_with() {
 }
 
 #[test]
+fn a_manifest_records_ini_keys_so_a_settings_change_names_one() {
+    use agora_core::session_ledger::ChangeKind;
+
+    let f = fixture(0);
+    let store = StoreId::new("steam").unwrap();
+    let settings = f
+        .ctx
+        .paths
+        .instance_dir(&f.record.instance_id)
+        .unwrap()
+        .join("user")
+        .join("config.txt");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "[Display]\nuGridsToLoad=11\n").unwrap();
+    let before = session_ledger::build_manifest(&f.ctx, &f.record.instance_id, &f.def, &store);
+    assert_eq!(before.settings.len(), 1, "{:?}", before.settings);
+    assert_eq!(before.settings[0].key, "uGridsToLoad");
+
+    std::fs::write(&settings, "[Display]\nuGridsToLoad=5\n").unwrap();
+    let after = session_ledger::build_manifest(&f.ctx, &f.record.instance_id, &f.def, &store);
+    let changes = session_ledger::diff_manifests(&before, &after);
+    let named: Vec<_> = changes
+        .iter()
+        .filter(|change| change.kind == ChangeKind::Settings)
+        .collect();
+    assert_eq!(named.len(), 1, "{changes:#?}");
+    let setting = named[0]
+        .setting
+        .as_ref()
+        .expect("the changed key is named, not just the file");
+    assert_eq!(setting.file, "user/config.txt");
+    assert_eq!(setting.section, "Display");
+    assert_eq!(setting.key, "uGridsToLoad");
+    assert_eq!(setting.from.as_deref(), Some("11"));
+    assert_eq!(setting.to.as_deref(), Some("5"));
+    assert_eq!(
+        agora_core::crash_engine::change::describe(named[0]),
+        "changed uGridsToLoad in config.txt from 11 to 5"
+    );
+}
+
+#[test]
 fn an_empty_mod_list_launches_and_records() {
     let f = fixture(0);
     let launched = launch(&f, &exit_now());
@@ -535,6 +577,67 @@ fn live_pack() -> agora_game_api::crash::BuiltInPack {
         }
 }
 
+/// A pack whose supplementary log names a load the game refused. The fact is core's own
+/// `core.load_verdict`, so the decision to answer a clean session is game-free.
+fn refusal_pack() -> agora_game_api::crash::BuiltInPack {
+    agora_game_api::crash::BuiltInPack {
+        file: "test/crash/refusal-pack.json".to_string(),
+        json: serde_json::json!({
+            "contract": 1,
+            "games": ["test-game"],
+            "sources": [{
+                "id": "startup_log",
+                "where": { "root": "instance", "path": "logs" },
+                "match": { "glob": "startup-*.txt" },
+                "format": "probe",
+                "bind": [{ "time": { "before_s": 3600, "after_s": 3600 } }],
+                "role": "supplementary"
+            }],
+            "parsers": [{
+                "id": "probe",
+                "detect": { "all": ["(?m)^REFUSED$"] },
+                "entry": { "generic": { "name": "text_sections", "config": {
+                    "producer": { "format": "probe_log" },
+                    "sections": [{
+                        "id": "load",
+                        "header": "^REFUSED$",
+                        "kind": "core.load_verdict",
+                        "lines": [{
+                            "pattern": "^(?P<outcome>refused) (?P<module>\\S+) (?P<reason>\\S+)$",
+                            "attrs": { "outcome": "outcome", "reason": "reason" },
+                            "refs": [{ "kind": "module", "value": "module", "strength": "mention" }]
+                        }]
+                    }]
+                } } }
+            }],
+            "rules": [{
+                "id": "refused_plugin",
+                "version": 1,
+                "when": { "fact": { "kind": "core.load_verdict", "where": { "outcome": "refused" }, "ref": { "kind": "module", "bind": "d" } } },
+                "effects": [{ "finding": { "cause": "version_mismatch", "scope": "mechanism", "level": "possible" } }],
+                "text": { "headline": { "en": "The game refused to load {d} because it is built for another game version. Update it or turn it off." } }
+            }]
+        })
+        .to_string(),
+        parsers: Vec::new(),
+    }
+}
+
+fn write_startup_log(f: &Fixture) {
+    let logs = f
+        .ctx
+        .paths
+        .instance_dir(&f.record.instance_id)
+        .unwrap()
+        .join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("startup-1.txt"),
+        "REFUSED\nrefused ExampleStartup.dll different_game_version\n",
+    )
+    .unwrap();
+}
+
 fn write_log(f: &Fixture) {
     let dir = f.ctx.paths.instance_dir(&f.record.instance_id).unwrap();
     let logs = dir.join("logs");
@@ -565,6 +668,7 @@ fn manifest(items: &[&str]) -> agora_core::session_ledger::LaunchManifest {
         load_order: Vec::new(),
         runtime: "test:1.0".to_string(),
         settings_hash: Some("settings".to_string()),
+        settings: Vec::new(),
         unreadable: Vec::new(),
     }
 }
@@ -581,18 +685,22 @@ fn start_session(f: &Fixture, started: &str, items: &[&str]) -> String {
 }
 
 fn end_session(f: &Fixture, id: &str, ended: &str, code: u32) {
+    end_session_after(f, id, ended, code, 60_000);
+}
+
+fn end_session_after(f: &Fixture, id: &str, ended: &str, code: u32, runtime_ms: u64) {
     session_ledger::finish(
         &ledger(f),
         id,
         &session_ledger::SessionFinish {
             ended_at: ended.to_string(),
-            duration_ms: 60_000,
+            duration_ms: runtime_ms as i64,
             exit: session_ledger::ExitObservation::Code {
                 pid: 4242,
                 image: "Game.exe".to_string(),
                 code,
             },
-            game_runtime_ms: Some(60_000),
+            game_runtime_ms: Some(runtime_ms),
             normal_exit_codes: vec![0],
             artifact: None,
             froze: false,
@@ -606,15 +714,23 @@ fn now_minus(seconds: i64) -> String {
 }
 
 fn diagnose(f: &Fixture, session: &str) -> Option<agora_core::crash_live::SessionAnswer> {
+    let built_in = [live_pack()];
+    diagnose_with(f, session, &built_in)
+}
+
+fn diagnose_with(
+    f: &Fixture,
+    session: &str,
+    built_in: &[agora_game_api::crash::BuiltInPack],
+) -> Option<agora_core::crash_live::SessionAnswer> {
     let host = agora_plugin_host::QuickJsHost::new();
     let packs: Vec<agora_core::crash_packs::LoadedCrashPack> = Vec::new();
-    let built_in = [live_pack()];
     agora_core::crash_live::diagnose_session(
         &f.ctx,
         session,
         agora_core::crash_live::LivePacks {
             packs: &packs,
-            built_in: &built_in,
+            built_in,
             host: &host,
             instances: None,
         },
@@ -712,12 +828,126 @@ fn a_log_locked_before_the_copy_is_reported_as_unreadable_not_as_no_log() {
 }
 
 #[test]
+fn a_long_nonzero_session_with_a_crash_log_is_crashed_and_answered() {
+    let f = fixture(1);
+    write_log(&f);
+    let id = start_session(&f, &now_minus(2_400), &["mod-a"]);
+    // 38 minutes and exit code 1: the ledger cannot call this a crash on the code alone, so the
+    // verdict starts as ClosedUnknown. A log inside the window still has to become the answer.
+    end_session_after(&f, &id, &now_minus(1), 1, 38 * 60 * 1_000);
+    assert_eq!(
+        session_ledger::get(&ledger(&f), &id)
+            .unwrap()
+            .unwrap()
+            .verdict,
+        Some(SessionVerdict::ClosedUnknown),
+        "the race this reproduces: no artifact was known when the verdict was written"
+    );
+
+    let answer = diagnose(&f, &id).expect("the crash log inside the window is an answer");
+    assert!(
+        matches!(
+            answer.answer,
+            agora_core::crash_live::StoredAnswer::Analyzed { .. }
+        ),
+        "{:?}",
+        answer.answer
+    );
+    assert!(
+        !headlines(&stored(&f, &id).answer).is_empty(),
+        "the log's finding reaches the stored answer"
+    );
+    assert!(
+        matches!(
+            session_ledger::get(&ledger(&f), &id)
+                .unwrap()
+                .unwrap()
+                .verdict,
+            Some(SessionVerdict::Crashed { .. })
+        ),
+        "a bound crash log corrects the verdict whatever the exit code said"
+    );
+}
+
+#[test]
+fn a_long_nonzero_session_with_no_crash_log_stores_a_reason() {
+    let f = fixture(1);
+    let id = start_session(&f, &now_minus(2_400), &["mod-a"]);
+    end_session_after(&f, &id, &now_minus(1), 1, 38 * 60 * 1_000);
+
+    let answer = diagnose(&f, &id).expect("an abnormal ending never gets a blank row");
+    match answer.answer {
+        agora_core::crash_live::StoredAnswer::CouldNotAnalyze { why } => {
+            assert!(why.contains("exit code 1"), "{why}");
+            assert!(why.contains("no crash log"), "{why}");
+        }
+        other => panic!("expected a stored reason, got {other:?}"),
+    }
+    assert_eq!(
+        session_ledger::get(&ledger(&f), &id)
+            .unwrap()
+            .unwrap()
+            .verdict,
+        Some(SessionVerdict::ClosedUnknown),
+        "no evidence says it was a crash, so the verdict is not invented"
+    );
+}
+
+#[test]
 fn a_normal_exit_stores_no_answer_at_all() {
     let f = fixture(1);
     let id = start_session(&f, &now_minus(30), &["mod-a"]);
     end_session(&f, &id, &now_minus(1), 0);
 
     assert!(diagnose(&f, &id).is_none());
+    assert!(agora_core::crash_live::answer_for_session(&ledger(&f), &id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_clean_session_that_refused_a_plugin_gets_a_normal_answer() {
+    let f = fixture(1);
+    write_startup_log(&f);
+    let id = start_session(&f, &now_minus(120), &["mod-a"]);
+    end_session_after(&f, &id, &now_minus(1), 0, 100_000);
+
+    let built_in = [refusal_pack()];
+    let answer = diagnose_with(&f, &id, &built_in).expect("a refused plugin is worth an answer");
+    let agora_core::crash_live::StoredAnswer::Analyzed { answer, .. } = answer.answer else {
+        panic!("expected an analyzed answer, got a different one");
+    };
+    assert_eq!(
+        answer.verdict,
+        SessionVerdict::Normal,
+        "the process exited normally; the answer explains a refusal, not a crash"
+    );
+    assert!(answer.candidates.is_empty(), "nobody is accused of a crash");
+    let headline = answer.headline.get("en").cloned().unwrap_or_default();
+    assert!(headline.contains("refused to load"), "{headline}");
+    assert!(headline.contains("ExampleStartup.dll"), "{headline}");
+    assert!(
+        headline.contains("Update it or turn it off"),
+        "the answer says what to do: {headline}"
+    );
+    assert_eq!(
+        session_ledger::get(&ledger(&f), &id)
+            .unwrap()
+            .unwrap()
+            .verdict,
+        Some(SessionVerdict::Normal),
+        "a refusal at startup does not rewrite a clean exit as a crash"
+    );
+}
+
+#[test]
+fn an_ordinary_clean_session_with_no_refusal_gets_no_answer() {
+    let f = fixture(1);
+    let id = start_session(&f, &now_minus(120), &["mod-a"]);
+    end_session_after(&f, &id, &now_minus(1), 0, 100_000);
+
+    let built_in = [refusal_pack()];
+    assert!(diagnose_with(&f, &id, &built_in).is_none());
     assert!(agora_core::crash_live::answer_for_session(&ledger(&f), &id)
         .unwrap()
         .is_none());

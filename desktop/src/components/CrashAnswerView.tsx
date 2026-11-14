@@ -479,11 +479,19 @@ function Changes({ changes }: { changes?: CrashChange[] }) {
   );
 }
 
+/**
+ * The checks a player can act on. A rule that hit its branch limit, or asked for a fact no parser
+ * looked for, is a note for pack authors: the JSON answer keeps it, this list does not.
+ */
+export function playerCouldNotCheck(answer: CrashAnswer): CrashAnswer['could_not_check'] {
+  return answer.could_not_check.filter(
+    (check) => check.reason !== 'too_many_matches' && check.reason !== 'not_covered',
+  );
+}
+
 function CouldNotCheck({ answer }: { answer: CrashAnswer }) {
   const [open, setOpen] = useState(false);
-  // A rule that hit its branch limit is a note for pack authors, not something a player can act
-  // on. The JSON answer keeps it; this list is what a person reads.
-  const checks = answer.could_not_check.filter((check) => check.reason !== 'too_many_matches');
+  const checks = playerCouldNotCheck(answer);
   const count = checks.length;
   if (count === 0) return null;
   return (
@@ -687,8 +695,17 @@ export function describeChange(change: CrashChange): string {
       return `moved ${key} in the load order`;
     case 'load_order':
       return 'changed the load order';
-    case 'settings':
-      return "changed the instance's settings";
+    case 'settings': {
+      const setting = change.setting;
+      if (setting === undefined) return "changed the instance's settings";
+      const file = setting.file.split(/[\\/]/).pop() ?? setting.file;
+      if (setting.from !== undefined && setting.to !== undefined) {
+        return `changed ${setting.key} in ${file} from ${setting.from} to ${setting.to}`;
+      }
+      if (setting.to !== undefined) return `set ${setting.key} in ${file} to ${setting.to}`;
+      if (setting.from !== undefined) return `removed ${setting.key} from ${file} (was ${setting.from})`;
+      return `changed ${setting.key} in ${file}`;
+    }
     default:
       return change.kind.split('_').join(' ');
   }

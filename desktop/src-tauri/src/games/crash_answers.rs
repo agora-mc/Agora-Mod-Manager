@@ -554,6 +554,7 @@ mod tests {
                     key: Some("acme.example".to_string()),
                     from_version: None,
                     to_version: Some("2.1".to_string()),
+                    setting: None,
                 }],
                 record: None,
                 artifact_hashes: Vec::new(),

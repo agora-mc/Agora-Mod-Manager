@@ -212,7 +212,7 @@ const INSTANCE_EXITED_EVENT = 'games-instance-exited';
 
 const DEPLOYMENTS: readonly string[] = ['virtual', 'links', 'copies'];
 const LAUNCH_STATUSES: readonly string[] = ['launched', 'refused', 'vfs_unavailable', 'before_launch_needed', 'before_launch_failed'];
-const FINDING_KINDS: readonly string[] = ['framework', 'load_order', 'tool', 'base'];
+const FINDING_KINDS: readonly string[] = ['framework', 'load_order', 'tool', 'base', 'diagnostic'];
 const CHECK_STATUSES: readonly string[] = ['ok', 'warnings', 'findings'];
 
 /** The sentence a page shows for a rejected command. A rejection that is not ours is said plainly. */

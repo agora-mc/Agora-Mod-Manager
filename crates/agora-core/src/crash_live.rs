@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
-    Artifact, BuiltInPack, CrashAnswer, Fact, MatchedBy, RefMap, RoleRule, SessionVerdict,
-    SourceRole,
+    Artifact, AttrValue, BuiltInPack, CrashAnswer, Fact, MatchedBy, RefMap, RoleRule, Scalar,
+    SessionVerdict, SourceRole,
 };
 use agora_game_api::GamePath;
 use agora_plugin_api::host::ScriptHost;
@@ -487,7 +487,18 @@ fn diagnose_session_with(
 ) -> Option<SessionAnswer> {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
     let record = session_ledger::get(&conn, session_id).ok().flatten()?;
+    // A long session that exits non-zero is judged `ClosedUnknown` only because no artifact was
+    // known when the verdict was written. Losing that race must not lose the crash: the evidence
+    // is looked at here, and a log inside the window turns it into `Crashed`.
+    let nonzero = is_unexplained_nonzero_exit(&record);
+    // A clean exit is normally not a crash to explain. It is still worth an answer when the
+    // evidence says the game refused a plugin at startup, which the player may have exited on or
+    // played past. The cheap parser-only look runs before any evidence is copied or stored.
+    let clean = matches!(record.verdict, Some(SessionVerdict::Normal));
+    let startup_refusal = clean && has_refused_load(ctx, &record, live);
     let diagnosable = diagnoses(record.verdict)
+        || nonzero
+        || startup_refusal
         || (allow_unknown && record.verdict == Some(SessionVerdict::ClosedUnknown));
     if !diagnosable || record.ended_at.is_none() {
         return None;
@@ -496,23 +507,46 @@ fn diagnose_session_with(
         diagnose_record(ctx, &conn, &record, live)
     }))
     .unwrap_or_else(|_| Err("the crash analysis panicked".to_string()));
-    let (answer, crash_artifact) = match stored {
-        Ok(diagnosed) => (diagnosed.answer, diagnosed.crash_artifact),
-        Err(why) => (StoredAnswer::CouldNotAnalyze { why }, None),
+    let (answer, crash_artifact, found_refusal) = match stored {
+        Ok(diagnosed) => (
+            diagnosed.answer,
+            diagnosed.crash_artifact,
+            diagnosed.startup_refusal,
+        ),
+        Err(why) => (StoredAnswer::CouldNotAnalyze { why }, None, false),
     };
+    // A clean exit with nothing refused at startup is an ordinary session: no answer.
+    if clean && !found_refusal {
+        return None;
+    }
     // Crash evidence inside the session window is the verdict, whatever the exit code or the
     // session's length said. A bound artifact from a primary source is enough on its own; the
     // rules do not have to recognize the log. Corrections are best effort like every ledger write.
-    if let Some(how) = crash_artifact {
-        let _ = session_ledger::mark_crashed(&conn, session_id, how);
-    } else if answer_finds_a_crash(&answer) {
-        let _ = session_ledger::mark_crashed(&conn, session_id, MatchedBy::Time);
+    // A clean exit stays clean: a refused plugin is a problem, not a crash.
+    let found_crash = crash_artifact.is_some() || answer_finds_a_crash(&answer);
+    if !clean {
+        if let Some(how) = crash_artifact {
+            let _ = session_ledger::mark_crashed(&conn, session_id, how);
+        } else if answer_finds_a_crash(&answer) {
+            let _ = session_ledger::mark_crashed(&conn, session_id, MatchedBy::Time);
+        }
     }
     // An unwatched session with no crash evidence is not a crash to explain; leave it unanswered
     // rather than storing a lead that would be invented from the verdict.
-    if allow_unknown && crash_artifact.is_none() && !answer_finds_a_crash(&answer) {
+    if allow_unknown && !found_crash {
         return None;
     }
+    // A non-zero exit with nothing to read still gets a stored reason. A blank row would read as
+    // "nothing happened", which is not what an unobserved abnormal ending means.
+    let answer = if clean {
+        clean_exit_answer(answer)
+    } else if nonzero && !found_crash {
+        StoredAnswer::CouldNotAnalyze {
+            why: no_crash_evidence_reason(&record),
+        }
+    } else {
+        answer
+    };
     let created_at = chrono::DateTime::<chrono::Utc>::from(ctx.clock.now()).to_rfc3339();
     let session_answer = SessionAnswer {
         session_id: record.session_id.clone(),
@@ -535,12 +569,145 @@ fn answer_finds_a_crash(answer: &StoredAnswer) -> bool {
     }
 }
 
+/// The answer for a clean exit: the verdict stays `Normal`, and nobody is a crash suspect. The
+/// findings (a refused plugin, say) still name what is wrong and what to do about it.
+fn clean_exit_answer(answer: StoredAnswer) -> StoredAnswer {
+    match answer {
+        StoredAnswer::Analyzed {
+            answer,
+            files,
+            changes,
+            record,
+            artifact_hashes,
+        } => {
+            let mut answer = *answer;
+            answer.verdict = SessionVerdict::Normal;
+            answer.candidates.clear();
+            StoredAnswer::Analyzed {
+                answer: Box::new(answer),
+                files,
+                changes,
+                record,
+                artifact_hashes,
+            }
+        }
+        other => other,
+    }
+}
+
+/// A `core.load_verdict` fact saying the game refused a load. The kind is core's own vocabulary,
+/// so this decision is game-free; the pack decides which log line produces it.
+fn is_refused_load(fact: &Fact) -> bool {
+    fact.kind == "core.load_verdict"
+        && matches!(
+            fact.attrs.get("outcome"),
+            Some(AttrValue::Scalar(Scalar::Text(outcome))) if outcome == "refused"
+        )
+}
+
+/// Whether a clean session's evidence names a refused load. This is a parser-only look: the full
+/// diagnosis, with its evidence copy and history, runs only when it finds one, so an ordinary
+/// clean session stores and copies nothing.
+fn has_refused_load(ctx: &Ctx, record: &SessionRecord, live: &LivePacks<'_>) -> bool {
+    let Ok(resolved) = crate::crash_engine::instance_view::resolve_crash_instance(
+        ctx,
+        &record.instance_id,
+        live.instances,
+    ) else {
+        return false;
+    };
+    let built_in_report = load_built_in_packs(live.built_in);
+    let mut packs: Vec<LoadedCrashPack> = live.packs.to_vec();
+    packs.extend(built_in_report.packs);
+    packs.retain(|pack| {
+        pack.pack.games.is_empty() || pack.pack.games.iter().any(|game| game == &resolved.game_id)
+    });
+    if packs.is_empty() {
+        return false;
+    }
+    let Ok(window) = record_window(record) else {
+        return false;
+    };
+    let pid = match &record.exit {
+        Some(ExitObservation::Code { pid, .. }) => Some(*pid),
+        _ => None,
+    };
+    let Ok(instance_dir) = ctx.paths.instance_dir(&record.instance_id) else {
+        return false;
+    };
+    let roots = InstanceRoots { instance_dir };
+    let session = CrashSession {
+        session_id: record.session_id.clone(),
+        pid,
+        working_dir: None,
+        window,
+    };
+    let specs: Vec<SourceSpec<'_>> = packs
+        .iter()
+        .flat_map(|pack| {
+            pack.pack.sources.iter().map(|source| SourceSpec {
+                plugin_id: &pack.plugin_id,
+                source,
+            })
+        })
+        .collect();
+    let facts = NoArtifactFacts;
+    let collection = collect_sources(
+        &specs,
+        &roots,
+        &facts as &dyn ArtifactFacts,
+        &session,
+        CollectionLimits::default(),
+    );
+    let files = bound_files_for_probe(&collection);
+    if files.is_empty() {
+        return false;
+    }
+    let Ok(output) = crate::crash_engine::analyze(&AnalyzeInput {
+        packs: &packs,
+        files: &files,
+        runtime_version: resolved.runtime_version.as_deref(),
+        host: live.host,
+        built_in: live.built_in,
+        instance: None,
+    }) else {
+        return false;
+    };
+    output
+        .parsed
+        .iter()
+        .flat_map(|artifact| &artifact.output.facts)
+        .any(is_refused_load)
+}
+
+/// The bound files as parser input, read where they are. Folders and files over one parser read
+/// are left out; this probe only needs the small startup log.
+fn bound_files_for_probe(collection: &SourceCollection) -> Vec<CrashFile> {
+    let max = agora_game_api::crash::ParserLimits::DEFAULT.max_total_read_bytes;
+    collection
+        .bound
+        .iter()
+        .filter(|found| found.unit == agora_game_api::crash::ArtifactUnit::File)
+        .filter(|found| found.size <= max)
+        .filter_map(|found| {
+            let bytes = std::fs::read(&found.path).ok()?;
+            Some(CrashFile {
+                name: found.name.clone(),
+                bytes,
+                origin: crate::crash_engine::CrashFileOrigin::Collected,
+                source: Some(found.source_id.clone()),
+            })
+        })
+        .collect()
+}
+
 /// Store "could not analyze" for a session whose packs or host could not even be prepared. This is
 /// still an answer, never a silent absence. Returns `None` for a session Agora does not diagnose.
 pub fn record_could_not_analyze(ctx: &Ctx, session_id: &str, why: String) -> Option<SessionAnswer> {
     let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
     let record = session_ledger::get(&conn, session_id).ok().flatten()?;
-    if !diagnoses(record.verdict) || record.ended_at.is_none() {
+    let needed = diagnoses(record.verdict) || is_unexplained_nonzero_exit(&record);
+    if !needed || record.ended_at.is_none() {
         return None;
     }
     let stored = SessionAnswer {
@@ -551,6 +718,38 @@ pub fn record_could_not_analyze(ctx: &Ctx, session_id: &str, why: String) -> Opt
     };
     let _ = store_answer(&conn, &stored);
     Some(stored)
+}
+
+/// A session that exited non-zero but was judged `ClosedUnknown`: a long session whose crash log
+/// was not known when the verdict was written. The evidence is the only thing that can promote it
+/// to `Crashed`, and it must still be looked at.
+fn is_unexplained_nonzero_exit(record: &SessionRecord) -> bool {
+    matches!(record.verdict, Some(SessionVerdict::ClosedUnknown))
+        && matches!(
+            &record.exit,
+            Some(ExitObservation::Code { code, .. }) if *code != 0
+        )
+}
+
+/// The stored reason a non-zero ending with no crash evidence gets. It is a reason, never a
+/// verdict and never silence.
+fn no_crash_evidence_reason(record: &SessionRecord) -> String {
+    let how = match &record.exit {
+        Some(ExitObservation::Code { code, .. }) => format!("exit code {code}"),
+        Some(ExitObservation::Unavailable { reason }) => {
+            format!("an exit Agora could not observe ({reason})")
+        }
+        None => "no recorded exit".to_string(),
+    };
+    let ran = record_window(record)
+        .ok()
+        .and_then(|window| window.ended.duration_since(window.started).ok())
+        .map(|elapsed| format!(" after {} second(s)", elapsed.as_secs()))
+        .unwrap_or_default();
+    format!(
+        "The game ended with {how}{ran}, but no crash log or other crash evidence was written \
+         inside the session. There is no crash to explain."
+    )
 }
 
 /// Only a session that crashed, failed to start or froze has a crash to explain. A normal or
@@ -572,6 +771,8 @@ struct Diagnosed {
     crash_artifact: Option<MatchedBy>,
     /// A log whose last lines say the game stopped normally.
     normal_stop: bool,
+    /// A load the evidence says the game refused at startup, even when the session ended cleanly.
+    startup_refusal: bool,
 }
 
 /// The first artifact bound from a `primary` source. That declaration is the pack's way of saying
@@ -667,6 +868,7 @@ fn diagnose_record(
             },
             crash_artifact: None,
             normal_stop: false,
+            startup_refusal: false,
         });
     }
 
@@ -726,6 +928,7 @@ fn diagnose_record(
             },
             crash_artifact,
             normal_stop,
+            startup_refusal: false,
         });
     }
 
@@ -755,7 +958,12 @@ fn diagnose_record(
     };
 
     let changes = previous_changes(conn, record)?;
-    let engine_facts = session_engine_facts(record, &changes);
+    // A bound crash log is the verdict, whatever the exit code said when the session was closed.
+    // The rules must see `crashed`, or a resolved save-load frame would still be capped as unknown.
+    let effective_verdict = crash_artifact
+        .map(|how| SessionVerdict::Crashed { how })
+        .or(record.verdict);
+    let engine_facts = session_engine_facts(record, effective_verdict, &changes);
 
     // The same crash's own files may sit in a source folder, so leave them out of the history
     // comparison by their content hash. Hash the whole source file, never the stored copy: a log
@@ -837,6 +1045,11 @@ fn diagnose_record(
         bucket: crate::crash_engine::history::parsed_bucket(&output.parsed),
         at_unix_ms,
     };
+    let startup_refusal = output
+        .parsed
+        .iter()
+        .flat_map(|artifact| &artifact.output.facts)
+        .any(is_refused_load);
 
     Ok(Diagnosed {
         answer: StoredAnswer::Analyzed {
@@ -848,6 +1061,7 @@ fn diagnose_record(
         },
         crash_artifact,
         normal_stop,
+        startup_refusal,
     })
 }
 
@@ -983,8 +1197,12 @@ fn previous_changes(
         .unwrap_or_default())
 }
 
-fn session_engine_facts(record: &SessionRecord, changes: &[ManifestChange]) -> Vec<Fact> {
-    let verdict = match record.verdict {
+fn session_engine_facts(
+    record: &SessionRecord,
+    verdict: Option<SessionVerdict>,
+    changes: &[ManifestChange],
+) -> Vec<Fact> {
+    let verdict = match verdict {
         Some(SessionVerdict::Crashed { .. }) => "crashed",
         Some(SessionVerdict::FailedToStart) => "failed_to_start",
         Some(SessionVerdict::Froze) => "froze",

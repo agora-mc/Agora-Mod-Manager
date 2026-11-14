@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use agora_core::ctx::CoreContext;
 use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_core::game_user_files::{
-    is_session_running, record_process, restore, restore_finished_for_instance, status, swap_in,
-    Journal, JournaledFile,
+    is_session_running, record_process, restore, restore_failure_message,
+    restore_finished_for_instance, restore_retrying_while_running, status, swap_in, Journal,
+    JournaledFile,
 };
 use agora_core::process_identity;
 use agora_game_api::{
@@ -315,6 +316,88 @@ fn crash_catch_up_restores_user_files_with_no_open_session() {
         "Player original
 "
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_sharing_violation_is_retried_until_the_holder_lets_go() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ctx = harness.ctx.clone().with_games(skyrim_registry(&def));
+    swap_one_file(&harness, &def, "instance-a", &ctx);
+    let real = harness
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    // An invented holder keeps the file open with no sharing, the way a crashing game (or its
+    // crash handler) can while it finishes. It lets go after a moment; the restore must wait.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&real)
+        .unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+
+    let report = restore_retrying_while_running(
+        &ctx,
+        &def,
+        &StoreId::steam(),
+        std::time::Duration::from_secs(10),
+    )
+    .expect("a transient sharing violation is waited out, not called a failure");
+    release.join().unwrap();
+    assert!(!report.files.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "Player original\n",
+        "the player's file is back once the holder lets go"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_file_held_past_the_limit_names_the_exact_command() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let harness = TestHarness::new();
+    let def = test_skyrim_definition();
+    let ctx = harness.ctx.clone().with_games(skyrim_registry(&def));
+    swap_one_file(&harness, &def, "instance-a", &ctx);
+    let real = harness
+        .local_dir()
+        .join("Skyrim Special Edition")
+        .join("Plugins.txt");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&real)
+        .unwrap();
+
+    let error = restore_retrying_while_running(
+        &ctx,
+        &def,
+        &StoreId::steam(),
+        std::time::Duration::from_millis(250),
+    )
+    .expect_err("a file still held at the limit is reported, never called restored");
+    let message = restore_failure_message(&error.to_string(), "skyrim-se", "steam");
+    assert!(message.contains("could not be restored"), "{message}");
+    assert!(
+        message.contains("agora games user-files restore skyrim-se steam"),
+        "the message gives the exact command: {message}"
+    );
+    assert!(
+        ctx.paths
+            .user_files_journal_path("skyrim-se", "steam")
+            .exists(),
+        "the journal is left so a later catch-up can finish the restore"
+    );
+    drop(held);
 }
 
 #[test]
