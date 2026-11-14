@@ -1241,7 +1241,7 @@ fn shuffled_input_gives_byte_identical_serialized_output() {
 }
 
 #[test]
-fn justified_abstention_names_nobody_and_starts_a_bisect() {
+fn a_likely_finding_is_the_answer_and_does_not_start_a_bisect() {
     let resolver = FakeResolver::new().with(
         "module",
         "hook.dll",
@@ -1305,8 +1305,12 @@ fn justified_abstention_names_nobody_and_starts_a_bisect() {
         &consensus,
     );
     assert!(answer.candidates.is_empty());
-    assert_eq!(answer.next.kind, NextStepKind::Bisect);
-    assert_ne!(english(&answer.headline), "");
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(answer.next.kind, NextStepKind::SecondOpinion);
+    assert_eq!(
+        english(&answer.headline),
+        "The game read a bad pointer in its own code."
+    );
 }
 
 #[test]
@@ -2604,6 +2608,86 @@ fn a_non_mod_cause_reaches_the_answer_when_nobody_is_named() {
     assert!(answer.candidates.is_empty());
     assert_eq!(answer.cause, Some(Cause::Memory));
     assert_eq!(answer.findings[0].cause, Cause::Memory);
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(english(&answer.headline), "The game ran out of memory.");
+}
+
+#[test]
+fn a_failed_start_says_content_never_loaded() {
+    use agora_core::crash_engine::change::session_facts;
+
+    let failed = session_facts("failed_to_start", Some(1), Some(300), &[]);
+    let session = failed
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .expect("a session fact");
+    assert_eq!(
+        session.attrs.get("content_loaded"),
+        Some(&AttrValue::Scalar(Scalar::Bool(false)))
+    );
+
+    let crashed = session_facts("crashed", Some(1), Some(30_000), &[]);
+    let session = crashed
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .expect("a session fact");
+    assert_eq!(
+        session.attrs.get("content_loaded"),
+        Some(&AttrValue::Scalar(Scalar::Bool(true)))
+    );
+
+    let unknown = session_facts("closed_unknown", None, None, &[]);
+    let session = unknown
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .expect("a session fact");
+    assert!(!session.attrs.contains_key("content_loaded"));
+}
+
+#[test]
+fn a_likely_setting_finding_is_the_headline_and_never_starts_a_bisect() {
+    use agora_core::crash_engine::change::session_facts;
+
+    let rule = json!({
+        "id": "jvm_startup",
+        "version": 1,
+        "when": { "fact": { "kind": "core.exception", "where": { "category": "managed" } } },
+        "effects": [{ "finding": { "scope": "environment", "level": "likely", "cause": "setting" } }],
+        "text": {
+            "headline": { "en": "Java could not start because of its settings." },
+            "why_not_sure": { "en": "No mod had loaded when the JVM stopped." }
+        },
+        "next_step": "bisect"
+    });
+    let exception = Fact {
+        kind: "core.exception".to_string(),
+        attrs: [("category".to_string(), text_attr("managed"))]
+            .into_iter()
+            .collect(),
+        refs: Vec::new(),
+        span: None,
+    };
+    let packs = vec![pack("p", vec![rule])];
+    let parsed = parsed_with("p", "parser", "test", vec![exception], Vec::new());
+    let engine_facts = session_facts("failed_to_start", Some(1), Some(300), &[]);
+    let (evaluated, consensus) = run(
+        &packs,
+        std::slice::from_ref(&parsed),
+        &engine_facts,
+        &FakeResolver::new(),
+        &FixedInspector(Inspection::Missing),
+        Some("1.0"),
+    );
+    assert_eq!(evaluated.content_loaded, Some(false));
+    let answer = answer_for(SessionVerdict::FailedToStart, &evaluated, &consensus);
+    assert!(answer.candidates.is_empty());
+    assert_eq!(answer.level, Level::Likely);
+    assert_eq!(answer.cause, Some(Cause::Setting));
+    assert_eq!(
+        english(&answer.headline),
+        "Java could not start because of its settings."
+    );
+    assert_ne!(answer.next.kind, NextStepKind::Bisect);
 }
 
 #[test]

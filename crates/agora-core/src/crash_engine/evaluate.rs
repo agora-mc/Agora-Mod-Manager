@@ -50,6 +50,9 @@ pub struct EvaluateOutput {
     pub next_steps: Vec<NextStepKind>,
     /// The role of each candidate owner, for consensus's demotion rule.
     pub roles: BTreeMap<String, Role>,
+    /// Whether content loaded this session, from the engine's `core.session` fact. `None` when the
+    /// engine could not say (a loose file, or an unknown ending).
+    pub content_loaded: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1648,6 +1651,16 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
     next_steps.sort_by_key(|kind| next_step_rank(*kind));
     next_steps.dedup();
 
+    let content_loaded = input
+        .engine_facts
+        .iter()
+        .find(|fact| fact.kind == "core.session")
+        .and_then(|fact| fact.attrs.get("content_loaded"))
+        .and_then(|value| match value {
+            AttrValue::Scalar(Scalar::Bool(loaded)) => Some(*loaded),
+            _ => None,
+        });
+
     EvaluateOutput {
         signals,
         findings: clean_findings(findings),
@@ -1659,6 +1672,7 @@ pub fn evaluate(input: &EvaluateInput<'_>) -> EvaluateOutput {
         actions,
         next_steps,
         roles,
+        content_loaded,
     }
 }
 

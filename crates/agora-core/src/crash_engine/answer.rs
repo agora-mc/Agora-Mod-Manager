@@ -58,16 +58,20 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         if let Some(trust) = trust_cap {
             cap = cap.min(trust);
         }
-        cap = cap.min(level);
+        if closed_unknown {
+            cap = cap.min(Level::Possible);
+        }
+        if not_a_crash {
+            cap = cap.min(Level::NotSure);
+        }
         if let Some(owner) = &finding.candidate {
             match candidate_levels.get(&owner_key(owner)) {
                 Some(candidate_level) => cap = cap.min(*candidate_level),
                 None => cap = cap.min(Level::Possible),
             }
         } else if finding.scope == Scope::RootCause {
-            cap = cap.min(Level::Possible);
-        }
-        if finding.scope == Scope::RootCause && abstained {
+            // A root cause that names nobody cannot be stronger than possible: consensus could
+            // not weigh it.
             cap = cap.min(Level::Possible);
         }
         finding.level = finding.level.min(cap);
@@ -76,21 +80,61 @@ pub fn answer(input: &AnswerInput<'_>) -> CrashAnswer {
         findings.retain(|finding| finding.candidate.is_none());
     }
     let findings = clean_findings(findings);
+
+    // A finding that accuses nobody is a complete answer in its own right. When it is stronger
+    // than the top suspect (or the only thing there is), the headline, level and cause follow it:
+    // a headline may never contradict the strongest finding.
+    let top_candidate_level = candidates.first().map_or(Level::NotSure, |top| top.level);
+    let strongest = findings
+        .iter()
+        .filter(|finding| finding.level > Level::NotSure)
+        .min_by_key(|finding| {
+            (
+                std::cmp::Reverse(finding.level),
+                scope_rank(finding.scope),
+                std::cmp::Reverse(finding.cause),
+            )
+        });
+    let finding_wins = strongest
+        .is_some_and(|finding| candidates.is_empty() || finding.level > top_candidate_level);
+    if finding_wins {
+        if let Some(finding) = strongest {
+            level = level.max(finding.level);
+        }
+    }
     let cause = if not_a_crash {
         None
+    } else if finding_wins {
+        strongest.map(|finding| finding.cause)
     } else {
         top_cause(&candidates, &findings)
     };
 
-    let headline = headline(
-        input.verdict,
-        &candidates,
-        level,
-        abstained,
-        not_a_crash,
-        closed_unknown,
-    );
-    let next = next_step(input, not_a_crash, abstained, &candidates);
+    let headline = match strongest.filter(|_| finding_wins) {
+        Some(finding) if closed_unknown => english(&format!(
+            "The game ended, and Agora cannot tell whether this was a crash. {}",
+            finding
+                .headline
+                .get("en")
+                .map(String::as_str)
+                .unwrap_or_default()
+        )),
+        Some(finding) => finding.headline.clone(),
+        None => headline(
+            input.verdict,
+            &candidates,
+            level,
+            abstained,
+            not_a_crash,
+            closed_unknown,
+        ),
+    };
+    let strongest_level = findings
+        .iter()
+        .map(|finding| finding.level)
+        .max()
+        .unwrap_or(Level::NotSure);
+    let next = next_step(input, not_a_crash, abstained, &candidates, strongest_level);
     let repairs = if not_a_crash {
         Vec::new()
     } else {
@@ -211,6 +255,7 @@ fn next_step(
     not_a_crash: bool,
     abstained: bool,
     candidates: &[agora_game_api::crash::Candidate],
+    strongest_finding: Level,
 ) -> NextStep {
     if not_a_crash {
         return NextStep {
@@ -224,32 +269,53 @@ fn next_step(
             keys.insert(key);
         }
     }
+    // A bisect is only useful when nothing is at least likely, and never when no mod loaded: there
+    // is nothing to halve. Prefer whatever non-bisect step a rule offered.
+    let bisect_is_wrong =
+        strongest_finding >= Level::Likely || input.evaluated.content_loaded == Some(false);
+    let preferred = input
+        .evaluated
+        .next_steps
+        .iter()
+        .copied()
+        .find(|kind| *kind != NextStepKind::Bisect);
     let kind = if candidates.is_empty() {
-        input
+        let offered = input
             .evaluated
             .next_steps
             .first()
             .copied()
-            .unwrap_or(NextStepKind::Bisect)
+            .unwrap_or(NextStepKind::Bisect);
+        if offered == NextStepKind::Bisect && bisect_is_wrong {
+            preferred.unwrap_or(NextStepKind::SecondOpinion)
+        } else {
+            offered
+        }
     } else if abstained {
-        NextStepKind::Bisect
+        if bisect_is_wrong {
+            preferred.unwrap_or(NextStepKind::SecondOpinion)
+        } else {
+            NextStepKind::Bisect
+        }
     } else {
-        match input.evaluated.next_steps.first().copied() {
+        let offered = match input.evaluated.next_steps.first().copied() {
             Some(NextStepKind::NothingNeeded) | None => NextStepKind::ConfirmExperiment,
             Some(kind) => kind,
+        };
+        if offered == NextStepKind::Bisect && bisect_is_wrong {
+            preferred.unwrap_or(NextStepKind::SecondOpinion)
+        } else {
+            offered
         }
     };
-    let keys: Vec<String> = if matches!(
-        kind,
-        NextStepKind::ConfirmExperiment | NextStepKind::ApplyRepair
-    ) {
-        candidates
+    let keys: Vec<String> = match kind {
+        NextStepKind::ConfirmExperiment | NextStepKind::ApplyRepair => candidates
             .first()
             .and_then(|candidate| owner_content_key(&candidate.owner))
             .into_iter()
-            .collect()
-    } else {
-        keys.into_iter().collect()
+            .collect(),
+        NextStepKind::Bisect => keys.into_iter().collect(),
+        _ => Vec::new(),
     };
     NextStep { kind, keys }
 }

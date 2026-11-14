@@ -176,7 +176,8 @@ pub const CORE_FACT_KINDS: &[(&str, &[&str])] = &[
 /// any other; a parser that emits one is refused. This is why rules need no special operators for
 /// history, changes or ownership.
 ///
-/// - `core.session`: how this session ended.
+/// - `core.session`: how this session ended. `content_loaded` is `false` when the verdict is a
+///   failed start, `true` when it ran, and absent when the ending is unknown.
 /// - `core.history`: how often this bucket has happened.
 /// - `core.change`: one per content item changed since the last good launch. `change` is `added`,
 ///   `removed` or `updated`; the item is in `refs` under kind `content`.
@@ -186,7 +187,10 @@ pub const CORE_FACT_KINDS: &[(&str, &[&str])] = &[
 ///   instance without making the rule unanchored.
 pub const ENGINE_FACT_KINDS: &[(&str, &[&str])] = &[
     ("core.instance", &["game"]),
-    ("core.session", &["verdict", "exit_code", "runtime_ms"]),
+    (
+        "core.session",
+        &["verdict", "exit_code", "runtime_ms", "content_loaded"],
+    ),
     (
         "core.history",
         &[

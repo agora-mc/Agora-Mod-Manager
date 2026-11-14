@@ -332,10 +332,17 @@ pub(crate) fn jvm_problem(
         || lower.contains("the system is out of physical ram or swap space")
         || lower.contains("could not reserve enough space for")
         || lower.contains("invalid maximum heap size")
+        || lower.contains("invalid initial heap size")
+        || lower.contains("initial heap size set to a larger value")
         || lower.contains("too small maximum heap")
         || lower.contains("specified size exceeds the maximum representable size")
     {
         ("memory_startup", None)
+    } else if lower.contains("unrecognized vm option") || lower.starts_with("unrecognized option:")
+    {
+        ("vm_option", None)
+    } else if lower.contains("could not find or load main class") {
+        ("main_class", None)
     } else if lower.contains("pixel format not accelerated")
         || lower.contains("glx: failed to create context")
         || lower.contains("couldn't set pixel format")

@@ -42,6 +42,18 @@ pub fn session_facts(
             AttrValue::Scalar(Scalar::Number(ms as f64)),
         );
     }
+    // A failed start is the one verdict that says the process died before anything could load.
+    // An unknown ending says nothing either way, so it carries no attribute.
+    if let Some(loaded) = match verdict {
+        "failed_to_start" => Some(false),
+        "crashed" | "froze" | "stopped" | "normal" => Some(true),
+        _ => None,
+    } {
+        attrs.insert(
+            "content_loaded".to_string(),
+            AttrValue::Scalar(Scalar::Bool(loaded)),
+        );
+    }
     let mut facts = vec![Fact {
         kind: "core.session".to_string(),
         attrs,

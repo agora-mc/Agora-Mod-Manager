@@ -1022,6 +1022,28 @@ A detailed walkthrough of the error:\n\
         );
         assert!(find(&memory, "minecraft.jvm_problem", "kind", "memory_startup").is_some());
 
+        let heap_conflict = run_ok(
+            "latest_log",
+            b"Error occurred during initialization of VM\n\
+Initial heap size set to a larger value than the maximum heap size\n",
+        );
+        assert!(find(
+            &heap_conflict,
+            "minecraft.jvm_problem",
+            "kind",
+            "memory_startup"
+        )
+        .is_some());
+
+        let bad_option = run_ok("latest_log", b"Unrecognized VM option 'UseExampleGC'\n");
+        assert!(find(&bad_option, "minecraft.jvm_problem", "kind", "vm_option").is_some());
+
+        let bad_main = run_ok(
+            "latest_log",
+            b"Error: Could not find or load main class example.launch.Main\n",
+        );
+        assert!(find(&bad_main, "minecraft.jvm_problem", "kind", "main_class").is_some());
+
         let ids = run_ok(
             "latest_log",
             b"[01:02:03] [main/ERROR]: maximum id range exceeded\n",
@@ -1188,9 +1210,19 @@ mod actions {
                 "{rule}"
             );
         }
-        assert!(actions("out_of_memory")
-            .iter()
-            .any(|action| action.kind == ActionKind::OpenJvmSettings));
+        for rule in [
+            "out_of_memory",
+            "jvm_memory_startup",
+            "jvm_startup_setting",
+            "unsupported_class_version",
+        ] {
+            assert!(
+                actions(rule)
+                    .iter()
+                    .any(|action| action.kind == ActionKind::OpenJvmSettings),
+                "{rule}"
+            );
+        }
         for rule in ["mixin_apply_failed", "mixin_failed_crash_report"] {
             assert!(
                 actions(rule)

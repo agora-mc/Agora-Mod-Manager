@@ -684,6 +684,8 @@ mod crash {
         for (kind, rule) in [
             ("native_library", "missing_native_library"),
             ("memory_startup", "jvm_memory_startup"),
+            ("vm_option", "jvm_startup_setting"),
+            ("main_class", "jvm_startup_setting"),
             ("graphics", "graphics_driver_problem"),
             ("id_limit", "registry_limit"),
         ] {
@@ -724,6 +726,45 @@ mod crash {
             )],
         ));
         assert!(fired(&driver, "graphics_driver_frame"));
+    }
+
+    #[test]
+    fn a_jvm_startup_error_is_a_setting_and_offers_the_settings_action() {
+        use agora_game_api::crash::{ActionKind, Cause, Level, NextStepKind};
+
+        for (kind, rule) in [
+            ("memory_startup", "jvm_memory_startup"),
+            ("vm_option", "jvm_startup_setting"),
+            ("main_class", "jvm_startup_setting"),
+        ] {
+            let evaluated = evaluate_one(output(
+                "minecraft_latest_log",
+                vec![fact(
+                    "minecraft.jvm_problem",
+                    &[("kind", text(kind)), ("message", text("a message"))],
+                    Vec::new(),
+                )],
+            ));
+            let found = evaluated
+                .findings
+                .iter()
+                .find(|finding| finding.source.rule_id.as_deref() == Some(rule))
+                .unwrap_or_else(|| panic!("{kind}: {rule} did not fire"));
+            assert_eq!(found.cause, Cause::Setting, "{kind}");
+            assert_eq!(found.level, Level::Likely, "{kind}");
+            assert!(
+                evaluated.next_steps.contains(&NextStepKind::NothingNeeded),
+                "{kind}: {:?}",
+                evaluated.next_steps
+            );
+            assert!(
+                evaluated.actions.iter().any(|offer| {
+                    offer.action.kind == ActionKind::OpenJvmSettings
+                        && offer.source.rule_id.as_deref() == Some(rule)
+                }),
+                "{kind}: no settings action"
+            );
+        }
     }
 
     #[test]
