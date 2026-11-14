@@ -212,7 +212,7 @@ pub fn generate_args_for_java(
     // which the JVM refuses to start with.
     let custom_sets_max = manual_sets_max_heap(manual_args);
     let custom_sets_initial = manual_sets_initial_heap(manual_args);
-    if true {
+    if !custom_sets_max {
         parts.push(format!("-Xmx{}M", heap_mb));
     }
     // Without a custom maximum, Agora's own maximum is safe to pair with its initial heap.
