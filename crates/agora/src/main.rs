@@ -4847,8 +4847,8 @@ fn report_user_files_catch_up(user: Option<&agora_core::crash_live::UserFilesCat
     };
     if let Some(error) = &user.error {
         eprintln!(
-            "Warning: the per-user files could not be restored ({error}); they are still swapped in. Run `agora games user-files restore {} {}` once the game has closed.",
-            user.game, user.store
+            "Warning: {}",
+            agora_core::game_user_files::restore_failure_message(error, &user.game, &user.store)
         );
     } else if user.restored > 0 {
         eprintln!(
@@ -12772,7 +12772,8 @@ fn report_user_files_restore(
 
 fn warn_user_files_not_restored(reason: &str, game: &str, store: &str) {
     eprintln!(
-        "Warning: the per-user files could not be restored ({reason}); they are still swapped in.              Run `agora games user-files restore {game} {store}` once the game has closed."
+        "Warning: {}",
+        agora_core::game_user_files::restore_failure_message(reason, game, store)
     );
 }
 

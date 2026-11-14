@@ -796,7 +796,8 @@ pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<Fin
 
 /// Restore user files, retrying while the game is still leaving the process table. A game that
 /// stays alive for the whole `timeout` gets the normal `CannotRestoreRunning` refusal, so a
-/// journal is never silently left swapped in.
+/// journal is never silently left swapped in. A Windows sharing violation is retried too: the
+/// crashing game or a crash handler can still hold a file after its process is gone.
 pub fn restore_retrying_while_running(
     ctx: &Ctx,
     definition: &GameDefinition,
@@ -806,21 +807,69 @@ pub fn restore_retrying_while_running(
     retry_while_running(timeout, || restore(ctx, definition, store))
 }
 
+/// The exact command that finishes a restore a launch or catch-up could not run.
+pub fn restore_instruction(game: &str, store: &str) -> String {
+    format!("agora games user-files restore {game} {store}")
+}
+
+/// What a person is told when a restore did not finish. It names the error, says the files are
+/// still the instance's, and gives the exact command. Never success.
+pub fn restore_failure_message(reason: &str, game: &str, store: &str) -> String {
+    format!(
+        "the per-user files could not be restored ({reason}); they are still swapped in. Run `{}` once the game has closed.",
+        restore_instruction(game, store)
+    )
+}
+
+/// How many times a sharing violation is retried before the file is called locked for good. The
+/// deadline still bounds the whole wait; this keeps a permanently held file from using all of it.
+const SHARING_RETRIES: u32 = 50;
+
 fn retry_while_running<T>(
     timeout: std::time::Duration,
     mut attempt: impl FnMut() -> Result<T, UserFilesError>,
 ) -> Result<T, UserFilesError> {
     let deadline = std::time::Instant::now() + timeout;
+    let mut sharing_retries = 0;
     loop {
         match attempt() {
-            Err(UserFilesError::CannotRestoreRunning { .. })
-                if std::time::Instant::now() < deadline =>
-            {
+            Err(error) if std::time::Instant::now() < deadline && retryable_restore(&error) => {
+                if sharing_violation(&error) {
+                    sharing_retries += 1;
+                    if sharing_retries > SHARING_RETRIES {
+                        return Err(error);
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             other => return other,
         }
     }
+}
+
+/// A session still being torn down can answer "running"; a file still held can answer with a
+/// Windows sharing violation. Both are worth another look before the restore is called failed.
+fn retryable_restore(error: &UserFilesError) -> bool {
+    matches!(error, UserFilesError::CannotRestoreRunning { .. }) || sharing_violation(error)
+}
+
+fn sharing_violation(error: &UserFilesError) -> bool {
+    let source = match error {
+        UserFilesError::Io(source) | UserFilesError::Write { source, .. } => source,
+        _ => return false,
+    };
+    is_sharing_violation(source)
+}
+
+#[cfg(windows)]
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+    matches!(error.raw_os_error(), Some(32) | Some(33))
+}
+
+#[cfg(not(windows))]
+fn is_sharing_violation(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Clear the "starting" mark of a launch that will never spawn. The caller then restores its
