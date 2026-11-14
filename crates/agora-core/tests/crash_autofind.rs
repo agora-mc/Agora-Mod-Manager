@@ -569,3 +569,27 @@ fn a_confirmed_fix_boosts_the_same_bucket_and_never_invents_a_suspect() {
         "memory alone must never create a candidate"
     );
 }
+
+#[test]
+fn a_stored_log_result_that_cannot_be_decoded_is_an_unreadable_crash_not_a_missing_one() {
+    let fixture = Fixture::new();
+    fixture
+        .conn
+        .execute(
+            "INSERT INTO crash_log_results
+                 (instance_id, content_hash, source_id, plugin_id, name, relative_path,
+                  analyzed_at, record_json)
+             VALUES ('inst', 'invented-hash', 'logs', ?1, 'invented.txt',
+                     '/invented/invented.txt', '2026-01-01T00:00:00Z', '{not json')",
+            [PLUGIN],
+        )
+        .unwrap();
+
+    let stored = load_recorded(&fixture.conn, "inst", &[]).unwrap();
+    assert_eq!(
+        stored.len(),
+        1,
+        "a row exists, so the crash must still be counted even when its record cannot be decoded"
+    );
+    assert!(!stored[0].record.readable);
+}

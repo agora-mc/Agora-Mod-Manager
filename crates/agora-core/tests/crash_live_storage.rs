@@ -1,11 +1,13 @@
 //! Storing, reading back and trimming the crash answer attached to a session. No game runs.
 
 use agora_core::crash_live::{
-    answer_for_session, answers_for_instance, latest_answer, store_answer, SessionAnswer,
-    StoredAnswer,
+    answer_for_session, answers_for_instance, latest_answer, store_answer, suspects_for_test,
+    SessionAnswer, StoredAnswer,
 };
 use agora_core::session_ledger::{ChangeKind, ManifestChange};
-use agora_game_api::crash::{CrashAnswer, Level, NextStepKind, SessionVerdict};
+use agora_game_api::crash::{
+    Candidate, Cause, CrashAnswer, Level, NextStep, NextStepKind, Owner, SessionVerdict,
+};
 use rusqlite::Connection;
 
 fn db() -> Connection {
@@ -201,4 +203,79 @@ fn the_change_summary_survives_a_round_trip() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].key.as_deref(), Some("acme.sky"));
     assert_eq!(changes[0].to_version.as_deref(), Some("2.0"));
+}
+
+#[test]
+fn one_unreadable_stored_answer_does_not_hide_the_others() {
+    let conn = db();
+    insert_session(&conn, "good", "inst", "2026-01-01T00:00:00Z");
+    insert_session(&conn, "bad", "inst", "2026-01-01T01:00:00Z");
+    store_answer(
+        &conn,
+        &answer("good", "inst", "2026-01-01T00:01:00Z", "kept"),
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_answers (session_id, instance_id, created_at, answer_json)
+         VALUES ('bad', 'inst', '2026-01-01T01:01:00Z', '{not json')",
+        [],
+    )
+    .unwrap();
+
+    let answers = answers_for_instance(&conn, "inst")
+        .expect("one unreadable answer must not make the whole crash list fail");
+    assert_eq!(
+        answers.len(),
+        2,
+        "both crashes are stored; one just cannot be decoded"
+    );
+    assert!(answers.iter().any(|stored| stored.session_id == "good"));
+}
+
+#[test]
+fn a_suspect_the_instance_no_longer_lists_is_not_offered_as_a_test() {
+    let mut text = agora_game_api::crash::LocalText::new();
+    text.insert("en".to_string(), "Invented answer".to_string());
+    let answer = CrashAnswer {
+        contract: agora_game_api::crash::CRASH_CONTRACT_VERSION,
+        verdict: SessionVerdict::Crashed {
+            how: agora_game_api::crash::MatchedBy::ExitStatus,
+        },
+        headline: text,
+        level: Level::Likely,
+        candidates: vec![Candidate {
+            owner: Owner::Item {
+                key: "jar:gone.jar:abc".to_string(),
+                name: "Gone Mod".to_string(),
+            },
+            level: Level::Possible,
+            score: 9,
+            cause: Cause::Mod,
+            role: None,
+            families: Vec::new(),
+            sources: Vec::new(),
+            also_provided_by: Vec::new(),
+            save_risk: None,
+        }],
+        findings: Vec::new(),
+        inspections: Vec::new(),
+        could_not_check: Vec::new(),
+        trust_notes: Vec::new(),
+        next: NextStep {
+            kind: NextStepKind::ConfirmExperiment,
+            keys: Vec::new(),
+        },
+        repairs: Vec::new(),
+        actions: Vec::new(),
+        artifacts: Vec::new(),
+        cause: Some(Cause::Mod),
+    };
+    let view = agora_core::crash_engine::attribution::InstanceView::new(Vec::new());
+
+    let suspects = suspects_for_test(&answer, Some(&view));
+    assert!(
+        suspects.is_empty(),
+        "an item the instance no longer lists has no file to disable, so it must not be \
+         offered with its display name in place of a file: {suspects:?}"
+    );
 }

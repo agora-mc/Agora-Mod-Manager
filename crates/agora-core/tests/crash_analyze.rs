@@ -3,7 +3,10 @@
 //! Every log and every name here is invented for these tests. Nothing is copied from a real crash
 //! file.
 
-use agora_core::crash_engine::{analyze, AnalyzeInput, CrashFile, RefResolver};
+use agora_core::crash_engine::{
+    analyze, AnalyzeInput, CrashFile, Inspection, InspectionOutcome, InspectionRequest, Inspector,
+    InstanceAnalysis, RefResolver, Resolved,
+};
 use agora_core::crash_packs::{LoadedCrashPack, ParserFailureKind};
 use agora_game_api::crash::{CrashAnswer, Level, MatchedBy, Owner, ParserLimits, SessionVerdict};
 use agora_plugin_api::host::{ActivationRequest, HostBridge, ScriptHost};
@@ -914,4 +917,110 @@ fn a_verified_official_plugin_reads_before_a_community_one_whatever_its_id() {
     assert_eq!(report.read_by.as_ref().unwrap().plugin_id, "acme.alpha");
     assert_eq!(report.also_recognised_by.len(), 1);
     assert_eq!(report.also_recognised_by[0].plugin_id, "acme.zeta");
+}
+
+struct NoResolver;
+
+impl RefResolver for NoResolver {
+    fn resolve(&self, _reference: &agora_game_api::crash::Ref) -> Resolved {
+        Resolved {
+            owner: agora_game_api::crash::Owner::Unknown,
+            role: None,
+        }
+    }
+}
+
+struct NoInspector;
+
+impl Inspector for NoInspector {
+    fn inspect(&self, _request: &InspectionRequest<'_>) -> InspectionOutcome {
+        Inspection::Missing.into()
+    }
+}
+
+/// A pack for a game supplies the parsers that read that game's evidence. With game `game-a`
+/// behind the instance, a parser belonging to `game-b` must never read the file: otherwise the
+/// other game's facts can make this game's rules accuse something the file never said.
+#[test]
+fn an_instance_never_reads_a_file_with_another_games_parser() {
+    let alpha_pack = r#"{
+  "contract": 1,
+  "games": ["game-a"],
+  "rules": [
+    {
+      "id": "alpha_reads_foreign_line",
+      "version": 1,
+      "when": {
+        "fact": {
+          "kind": "core.log_line",
+          "where": {
+            "section": "foreign",
+            "text": { "regex": "shiny example widget" }
+          }
+        }
+      },
+      "effects": [{ "finding": { "scope": "mechanism", "level": "possible" } }],
+      "text": { "headline": { "en": "A foreign parser fed this rule." } }
+    }
+  ]
+}"#;
+    let beta_pack = r#"{
+  "contract": 1,
+  "games": ["game-b"],
+  "parsers": [
+    {
+      "id": "beta_reader",
+      "entry": { "generic": { "name": "text_sections", "config": {
+        "sections": [
+          {
+            "id": "foreign",
+            "header": "^== B-THING ==$",
+            "lines": [
+              {
+                "pattern": "^claim (?P<section>[^ ]+) (?P<text>.+)$",
+                "kind": "core.log_line",
+                "attrs": { "section": "section", "text": "text" }
+              }
+            ]
+          }
+        ]
+      } } },
+      "detect": { "all": ["(?m)^== B-THING ==$"] }
+    }
+  ]
+}"#;
+    let (_alpha_dir, alpha) = plugin_folder("acme.alpha", "Alpha rules", alpha_pack, None);
+    let (_beta_dir, beta) = plugin_folder("acme.beta", "Beta rules", beta_pack, None);
+    let host = idle_host();
+    let resolver = NoResolver;
+    let inspector = NoInspector;
+    let instance = InstanceAnalysis {
+        game_id: "game-a",
+        resolver: &resolver,
+        inspector: &inspector,
+        could_not_check: &[],
+    };
+    let output = analyze(&AnalyzeInput {
+        packs: &[alpha, beta],
+        files: &[file(
+            "foreign.txt",
+            "== B-THING ==\nclaim foreign the shiny example widget fell over\n",
+        )],
+        runtime_version: None,
+        host: &host,
+        built_in: &[],
+        instance: Some(instance),
+    })
+    .unwrap();
+
+    let headlines: Vec<&str> = output
+        .answer
+        .findings
+        .iter()
+        .filter_map(|finding| finding.headline.get("en").map(String::as_str))
+        .collect();
+    assert!(
+        !headlines.contains(&"A foreign parser fed this rule."),
+        "another game's parser read the file: {headlines:?}"
+    );
 }
