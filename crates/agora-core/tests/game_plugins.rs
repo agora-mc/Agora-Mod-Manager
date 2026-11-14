@@ -2327,3 +2327,127 @@ fn a_move_that_breaks_a_rule_is_refused_unless_it_may_remove_it() {
             .is_empty()
     );
 }
+
+#[test]
+fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_launch() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-check");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_overlaps(OverlapReply {
+        keys: vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "new")],
+        )],
+        notes: Vec::new(),
+    });
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+
+    // No recorded session yet: the count is known, but nothing can be "new since" it.
+    let findings =
+        game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order.clone()]);
+    assert!(findings
+        .iter()
+        .all(|f| !matches!(f, game_load_order::Finding::OverlapNew { .. })));
+    assert!(
+        findings.iter().any(|f| matches!(
+            f,
+            game_load_order::Finding::OverlapsInfo {
+                conflicts: 1,
+                pairs: 1,
+                ..
+            }
+        )),
+        "{findings:?}"
+    );
+
+    // A recorded session where A was off makes the pair new.
+    let conn = agora_core::db::local_state_connection(&h.ctx.paths.local_state_db()).unwrap();
+    let manifest = agora_core::session_ledger::LaunchManifest {
+        load_order: vec![
+            agora_core::session_ledger::LoadOrderEntry {
+                list: "plugins".into(),
+                name: "A.esp".into(),
+                active: false,
+            },
+            agora_core::session_ledger::LoadOrderEntry {
+                list: "plugins".into(),
+                name: "B.esp".into(),
+                active: true,
+            },
+        ],
+        ..Default::default()
+    };
+    agora_core::session_ledger::begin(
+        &conn,
+        &inst.instance_id,
+        "2026-01-01T00:00:00Z",
+        &manifest,
+        agora_core::session_ledger::Owner { pid: 1, started: 0 },
+    )
+    .unwrap();
+    drop(conn);
+
+    let findings = game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order]);
+    let warning = findings
+        .iter()
+        .find_map(|f| match f {
+            game_load_order::Finding::OverlapNew {
+                winner,
+                loser,
+                count,
+                label,
+            } => Some((winner.clone(), loser.clone(), *count, label.clone())),
+            _ => None,
+        })
+        .expect("a new pair is warned about");
+    assert_eq!(warning.0, "B.esp");
+    assert_eq!(warning.1, "A.esp");
+    assert_eq!(warning.2, 1);
+    assert_eq!(warning.3, Some("GMST fJumpHeightMin".to_string()));
+    let message = findings
+        .iter()
+        .find(|f| matches!(f, game_load_order::Finding::OverlapNew { .. }))
+        .unwrap()
+        .message();
+    assert!(
+        message.contains("now replaces 1 change made by 'A.esp'"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Keep this order, or let 'A.esp' win"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_failed_overlaps_reader_is_reported_as_could_not_check() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-check-failure");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_overlaps("the reader timed out");
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+
+    let findings = game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order]);
+    assert!(
+        findings
+            .iter()
+            .any(|f| matches!(f, game_load_order::Finding::OverlapsUnchecked { .. })),
+        "{findings:?}"
+    );
+    let message = findings
+        .iter()
+        .find(|f| matches!(f, game_load_order::Finding::OverlapsUnchecked { .. }))
+        .unwrap()
+        .message();
+    assert!(message.contains("could not be checked"), "{message}");
+    assert!(message.contains("timed out"), "{message}");
+}

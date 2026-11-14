@@ -230,6 +230,24 @@ pub enum Finding {
     },
     /// The list's rules hook failed, so its order could not be judged.
     RulesFailed { list: String, reason: String },
+    /// How many record changes the active plugins' later copies replace (MASTER_SPEC §31.5).
+    OverlapsInfo {
+        instance: String,
+        conflicts: usize,
+        pairs: usize,
+    },
+    /// A conflict pair that is new since the load order the last session recorded.
+    OverlapNew {
+        winner: String,
+        loser: String,
+        count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// The overlaps reader failed, so overlaps could not be checked.
+    OverlapsUnchecked { list: String, reason: String },
+    /// Something the overlaps reader said about a file it could not read, or about the list.
+    OverlapNote { level: NoteLevel, text: String },
 }
 
 /// Why a master does not come before its plugin.
@@ -258,7 +276,11 @@ impl Finding {
             Finding::DuplicateListing { .. }
             | Finding::MissingRuleItem { .. }
             | Finding::RuleConflict { .. }
-            | Finding::RulesFailed { .. } => false,
+            | Finding::RulesFailed { .. }
+            | Finding::OverlapsInfo { .. }
+            | Finding::OverlapNew { .. }
+            | Finding::OverlapsUnchecked { .. }
+            | Finding::OverlapNote { .. } => false,
         }
     }
 
@@ -297,6 +319,41 @@ impl Finding {
             Finding::RulesFailed { list, reason } => {
                 format!("the '{list}' load order's rules could not be read: {reason}")
             }
+            Finding::OverlapsInfo {
+                instance,
+                conflicts,
+                pairs,
+            } => format!(
+                "Info: {conflicts} conflict{} between {pairs} pair{} of plugins. Run \
+                 'agora games instance plugins conflicts {instance}' to see them.",
+                if *conflicts == 1 { "" } else { "s" },
+                if *pairs == 1 { "" } else { "s" },
+            ),
+            Finding::OverlapNew {
+                winner,
+                loser,
+                count,
+                label,
+            } => match label {
+                Some(label) => format!(
+                    "Warning: '{winner}' now replaces {count} change{} made by '{loser}' (e.g. \
+                     {label}). Keep this order, or let '{loser}' win.",
+                    if *count == 1 { "" } else { "s" },
+                ),
+                None => format!(
+                    "Warning: '{winner}' now replaces {count} change{} made by '{loser}'. Keep \
+                     this order, or let '{loser}' win.",
+                    if *count == 1 { "" } else { "s" },
+                ),
+            },
+            Finding::OverlapsUnchecked { reason, .. } => {
+                format!("Warning: overlaps could not be checked: {reason}")
+            }
+            Finding::OverlapNote { level, text } => match level {
+                NoteLevel::Error => format!("Error from the overlaps reader: {text}"),
+                NoteLevel::Warn => format!("Warning from the overlaps reader: {text}"),
+                NoteLevel::Info => format!("Info from the overlaps reader: {text}"),
+            },
         }
     }
 }
@@ -1388,6 +1445,112 @@ pub fn refresh_overlaps(
         &report,
     );
     Ok(report)
+}
+
+/// Whether a conflict pair is new since the load order the last session recorded: one of its
+/// plugins was added, turned on, or moved. A session with no recorded entries for the list is not
+/// a baseline, so no pair is reported as new against it.
+fn pair_is_new_since(
+    pair: &ConflictPair,
+    current: &[LoadOrderEntry],
+    previous: &[crate::session_ledger::LoadOrderEntry],
+) -> bool {
+    if previous.is_empty() {
+        return false;
+    }
+    let previous_by_name: HashMap<String, (usize, bool)> = previous
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (key(&entry.name), (position, entry.active)))
+        .collect();
+    let current_by_name: HashMap<String, (usize, bool)> = current
+        .iter()
+        .filter(|entry| !entry.implicit)
+        .enumerate()
+        .map(|(position, entry)| (key(&entry.name), (position, entry.active)))
+        .collect();
+    [&pair.winner, &pair.loser].into_iter().any(|name| {
+        let Some((position, active)) = current_by_name.get(&key(name)) else {
+            return false;
+        };
+        match previous_by_name.get(&key(name)) {
+            None => true,
+            Some((before, was_active)) => (!*was_active && *active) || before != position,
+        }
+    })
+}
+
+/// The overlaps findings the instance check reports (MASTER_SPEC §31.5): the count of conflicts,
+/// and a warning for each pair that is new since the load order the last session recorded. A hook
+/// that fails or returns a reply core cannot trust is "could not check", never "no conflicts".
+pub fn overlap_findings(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    orders: &[LoadOrder],
+) -> Vec<Finding> {
+    let previous = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .ok()
+        .and_then(|conn| {
+            crate::session_ledger::latest_manifest(&conn, instance_id)
+                .ok()
+                .flatten()
+        });
+    let mut out = Vec::new();
+    for rule in &definition.load_orders {
+        if rule.rules.overlaps.is_none() {
+            continue;
+        }
+        let report = match refresh_overlaps(ctx, instance_id, definition, Some(&rule.id)) {
+            Ok(report) => report,
+            Err(error) => {
+                out.push(Finding::OverlapsUnchecked {
+                    list: rule.id.clone(),
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+        for note in &report.notes {
+            out.push(Finding::OverlapNote {
+                level: note.level,
+                text: note.message.clone(),
+            });
+        }
+        if report.pairs.is_empty() {
+            continue;
+        }
+        out.push(Finding::OverlapsInfo {
+            instance: instance_id.to_string(),
+            conflicts: report.conflicts(),
+            pairs: report.pairs.len(),
+        });
+        let Some(manifest) = &previous else {
+            continue;
+        };
+        let previous_entries: Vec<crate::session_ledger::LoadOrderEntry> = manifest
+            .load_order
+            .iter()
+            .filter(|entry| entry.list == rule.id)
+            .cloned()
+            .collect();
+        let current: &[LoadOrderEntry] = orders
+            .iter()
+            .find(|order| order.list_id == rule.id)
+            .map(|order| order.entries.as_slice())
+            .unwrap_or(&[]);
+        for pair in &report.pairs {
+            if pair_is_new_since(pair, current, &previous_entries) {
+                out.push(Finding::OverlapNew {
+                    winner: pair.winner.clone(),
+                    loser: pair.loser.clone(),
+                    count: pair.count,
+                    label: pair.labels.first().cloned(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Ask the sorter for its notes now, cache them for the list as it stands, and return them. The
