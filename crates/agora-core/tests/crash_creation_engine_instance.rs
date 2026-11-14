@@ -598,7 +598,7 @@ fn a_mesh_named_with_the_data_prefix_resolves_to_the_mod_that_wins() {
     assert!(
         top.also_provided_by
             .iter()
-            .any(|key| key == "base-skeleton"),
+            .any(|name| name == "Base Skeleton Mod"),
         "the overridden item is named: {:#?}",
         top.also_provided_by
     );
