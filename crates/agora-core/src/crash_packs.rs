@@ -285,11 +285,39 @@ impl CommunitySignature {
     }
 }
 
+/// The columns signature format v2 stores. A table missing any of them predates v2.
+const COMMUNITY_SIGNATURE_COLUMNS: [&str; 10] = [
+    "id",
+    "name",
+    "games_json",
+    "regex_pattern",
+    "level",
+    "cause",
+    "text",
+    "action_kind",
+    "action_content_key",
+    "action_label",
+];
+
+/// Whether `crash_signatures` has every column format v2 needs. A table from before v2 is a
+/// catalog with no community pack, not a fault: upgrading the catalog adds them.
+fn community_table_has_v2_columns(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let mut statement = conn.prepare("PRAGMA table_info(crash_signatures)")?;
+    let columns: std::collections::BTreeSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    Ok(COMMUNITY_SIGNATURE_COLUMNS
+        .iter()
+        .all(|needed| columns.contains(*needed)))
+}
+
 /// Read the community signatures from an already-open, verified `registry.db` and make one loaded
 /// pack from the rows that convert and lint clean.
 ///
 /// A missing table means the catalog predates community signatures (or has none), so the pack is
-/// simply absent. A row that fails is reported with its id and never stops the others.
+/// simply absent. A table without the v2 columns is the same thing: an older catalog is silently
+/// a catalog with no community pack, never a raw SQLite error shown to the player. A row that
+/// fails is reported with its id and never stops the others.
 pub fn load_community_pack(conn: &Connection) -> CrashPackReport {
     let mut report = CrashPackReport::default();
     let table: Option<String> = match conn
@@ -314,6 +342,22 @@ pub fn load_community_pack(conn: &Connection) -> CrashPackReport {
     };
     if table.is_none() {
         return report;
+    }
+    match community_table_has_v2_columns(conn) {
+        Ok(true) => {}
+        // An older catalog has no community pack. The player is not shown an error for a catalog
+        // that simply does not carry this feature yet.
+        Ok(false) => return report,
+        Err(error) => {
+            report.problems.push(PackProblem::new(
+                COMMUNITY_PACK_PLUGIN_ID,
+                COMMUNITY_PACK_FILE,
+                "",
+                "unreadable",
+                format!("could not read the catalog's crash signature columns: {error}"),
+            ));
+            return report;
+        }
     }
 
     let mut statement = match conn.prepare(
@@ -2136,6 +2180,30 @@ mod tests {
     #[test]
     fn a_catalog_without_the_table_has_no_community_pack() {
         let conn = Connection::open_in_memory().unwrap();
+        let report = load_community_pack(&conn);
+        assert!(report.packs.is_empty());
+        assert!(report.is_clean(), "{:#?}", report.problems);
+    }
+
+    /// A catalog written before signature format v2 has the table but not its columns. That is a
+    /// catalog with no community pack, never an error the player can see.
+    #[test]
+    fn an_older_table_without_v2_columns_has_no_community_pack() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE crash_signatures (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                games_json TEXT NOT NULL,
+                regex_pattern TEXT,
+                level TEXT,
+                cause TEXT,
+                text TEXT
+            );
+            INSERT INTO crash_signatures (id, name, games_json, regex_pattern, text)
+            VALUES ('old_signature', 'Old signature', '[\"skyrim-se\"]', 'Anything', 'It happened.');",
+        )
+        .unwrap();
         let report = load_community_pack(&conn);
         assert!(report.packs.is_empty());
         assert!(report.is_clean(), "{:#?}", report.problems);
