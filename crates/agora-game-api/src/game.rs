@@ -844,6 +844,10 @@ pub struct RuntimeFileFinding {
     pub found: Vec<String>,
     /// What to do, with `{version}` substituted.
     pub repair: String,
+    /// Whether the source install has every missing file, so repairing the base can restore them.
+    /// Set only for missing-file findings of a pinned base.
+    #[serde(default)]
+    pub repair_from_source: bool,
     /// How many files the framework declared required. Set for missing-file findings, so a long
     /// list can say "61 of its 61" without counting the short list it prints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -987,6 +991,7 @@ pub fn check_runtime_files<S: AsRef<str>>(
             expected,
             found,
             repair: rule.repair.replace("{version}", version),
+            repair_from_source: false,
             required_total: None,
             problem: RuntimeFileProblem::WrongVersion,
         });
@@ -1069,6 +1074,7 @@ pub fn missing_framework_files<S: AsRef<str>>(
                 "Reinstall {} so all of its files are present.",
                 framework.name
             ),
+            repair_from_source: false,
             required_total: Some(detection.required.len()),
             problem: RuntimeFileProblem::MissingFiles,
         });
@@ -1103,6 +1109,7 @@ fn cannot_check(rule: &RuntimeFileRule, reason: &str) -> RuntimeFileFinding {
         expected: rule.expected.clone(),
         found: Vec::new(),
         repair: rule.repair.clone(),
+        repair_from_source: false,
         required_total: None,
         problem: RuntimeFileProblem::CannotCheck {
             reason: reason.to_string(),

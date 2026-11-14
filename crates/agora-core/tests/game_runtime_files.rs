@@ -581,7 +581,7 @@ fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
         version: "2.2.6".into(),
         supported_runtimes: Vec::new(),
         required_frameworks: Vec::new(),
-        content: Vec::new(),
+        content: vec!["catalog.skse".into()],
         launch: None,
         detection: Some(FrameworkDetection {
             marker: RelPath::new("skse64_loader.exe").unwrap(),
@@ -617,6 +617,23 @@ fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
     assert_eq!(missing.rule_id, "skse");
     assert_eq!(missing.found, vec!["Data/Scripts/SKSE.pex"]);
     assert!(!missing.refuses_launch(), "a missing file only warns");
+    assert!(
+        !missing.repair_from_source,
+        "the source install lacks the file too: {:?}",
+        missing.repair
+    );
+    assert!(
+        missing
+            .repair
+            .contains("Install Skyrim Script Extender so all of its files are present"),
+        "{}",
+        missing.repair
+    );
+    assert!(
+        missing.repair.contains("catalog.skse"),
+        "the framework's content key is shown: {}",
+        missing.repair
+    );
 
     let checks = launch_checks(&s.ctx, &s.instance, &s.def).expect("the launch checks run");
     assert!(
@@ -637,5 +654,67 @@ fn an_installed_framework_missing_a_required_file_warns_in_check_and_launch() {
             .any(|finding| finding.problem == RuntimeFileProblem::MissingFiles),
         "{:?}",
         prepared.runtime_findings
+    );
+}
+
+#[test]
+fn a_missing_framework_file_points_at_the_base_repair_when_the_install_has_it() {
+    let tmp = TempDir::new().unwrap();
+    let mut def = make_test_definition();
+    def.framework_ids = vec![FrameworkId::new("skse").unwrap()];
+    let framework = FrameworkDefinition {
+        id: FrameworkId::new("skse").unwrap(),
+        game: GameId::new("skyrim-se").unwrap(),
+        name: "Skyrim Script Extender".into(),
+        version: "2.2.6".into(),
+        supported_runtimes: Vec::new(),
+        required_frameworks: Vec::new(),
+        content: Vec::new(),
+        launch: None,
+        detection: Some(FrameworkDetection {
+            marker: RelPath::new("skse64_loader.exe").unwrap(),
+            required: vec![RelPath::new("Data/Scripts/SKSE.pex").unwrap()],
+            version: Some(FrameworkVersionSource::PeFileVersion),
+        }),
+    };
+    let ctx = create_test_context_with(&tmp, &def, vec![framework]);
+    let install = make_install(&tmp, &["skse64_1_6_1170.dll", "skse64_loader.exe"]);
+    let source = install.discovered.location.clone();
+    let instance = create(
+        &ctx,
+        &install,
+        &def,
+        "Copied SKSE",
+        None,
+        BaseMode::Copied,
+        &|_| {},
+    )
+    .expect("create a copied instance");
+    let base_id = match &instance.base {
+        BaseReference::Pinned { id, .. } => id.clone(),
+        other => panic!("expected a pinned base, got {other:?}"),
+    };
+
+    // The script arrives in the source install after the base was pinned, so the base has kept a
+    // copy without it but a repair can still copy it.
+    std::fs::create_dir_all(source.join("Data/Scripts")).unwrap();
+    std::fs::write(source.join("Data/Scripts/SKSE.pex"), b"pex").unwrap();
+
+    let findings = runtime_findings(&ctx, &instance.instance_id, &def).unwrap();
+    let missing = findings
+        .iter()
+        .find(|finding| finding.problem == RuntimeFileProblem::MissingFiles)
+        .expect("the instance check names the missing framework files");
+    assert!(
+        missing.repair_from_source,
+        "the source install has the file: {:?}",
+        missing.repair
+    );
+    assert!(
+        missing.repair.contains(&format!(
+            "agora games base repair-framework {base_id} skse"
+        )),
+        "{}",
+        missing.repair
     );
 }

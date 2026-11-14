@@ -1247,7 +1247,13 @@ fn runtime_check(
     let mut findings =
         crate::game_launch::runtime_findings(definition, &base_manifest.runtime.version, &paths);
     findings.extend(crate::game_frameworks::missing_required_findings(
-        ctx, definition, &paths,
+        ctx,
+        definition,
+        &paths,
+        Some(&crate::game_frameworks::FrameworkRepairSource {
+            base_id: &base_id,
+            source: &base_manifest.source_location,
+        }),
     ));
     Ok((
         findings,
@@ -1697,7 +1703,15 @@ pub fn prepare_launch_with(
                     .map(|f| f.path.as_str())
                     .collect();
                 prepared.runtime_findings.extend(
-                    crate::game_frameworks::missing_required_findings(ctx, definition, &base_paths),
+                    crate::game_frameworks::missing_required_findings(
+                        ctx,
+                        definition,
+                        &base_paths,
+                        Some(&crate::game_frameworks::FrameworkRepairSource {
+                            base_id: &base_id,
+                            source: &base_manifest.source_location,
+                        }),
+                    ),
                 );
                 write_launch_notes(ctx, id, &notes)?;
                 Ok(prepared)
@@ -1830,7 +1844,13 @@ fn prepare_deployed(
                 &visible,
             );
             runtime.extend(crate::game_frameworks::missing_required_findings(
-                ctx, definition, &visible,
+                ctx,
+                definition,
+                &visible,
+                Some(&crate::game_frameworks::FrameworkRepairSource {
+                    base_id,
+                    source: &base_manifest.source_location,
+                }),
             ));
             findings = crate::game_launch::refuse_runtime_mismatch(runtime, options.launch_anyway)?;
             Ok::<(), InstanceError>(())

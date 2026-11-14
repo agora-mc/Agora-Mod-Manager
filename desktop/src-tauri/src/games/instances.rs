@@ -865,7 +865,7 @@ fn check_instance(app: &tauri::AppHandle, instance_id: &str) -> Result<InstanceC
     let mut findings = Vec::new();
     for finding in &checks.runtime {
         let mut shown = framework_finding(finding);
-        if finding.problem == RuntimeFileProblem::MissingFiles {
+        if finding.repair_from_source {
             if let BaseReference::Pinned { id, .. } = &record.base {
                 shown.repair_base = Some(FrameworkRepairRef {
                     base_id: id.clone(),
