@@ -689,6 +689,10 @@ pub struct LoadOrderRules {
     /// one is sorted by its plugins' masters alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sorter: Option<SorterRule>,
+    /// A plugin-provided reader that reports the records several active plugins change
+    /// (MASTER_SPEC §31.3). A list without one cannot check overlaps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlaps: Option<OverlapsRule>,
 }
 
 impl LoadOrderRules {
@@ -713,6 +717,26 @@ pub struct SorterRule {
     /// Free data handed to both hooks, e.g. the sources a sorter downloads from.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub options: serde_json::Value,
+}
+
+/// A list's plugin-provided overlaps reader (MASTER_SPEC §31.3). It gets the same request the
+/// sorter does and answers which record keys two or more active items change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapsRule {
+    /// The script function that returns the overlapping record keys plus notes.
+    pub hook: String,
+    /// Free data handed to the hook, like a sorter's `options`.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub options: serde_json::Value,
+}
+
+/// A user rule handed to a sorter (MASTER_SPEC §31.4): `item` loads after `after`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserLoadOrderRule {
+    pub item: String,
+    pub after: String,
 }
 
 /// One item a sorter was asked about.
@@ -740,6 +764,9 @@ pub struct SorterRequest {
     pub active: Vec<String>,
     pub locked: Vec<String>,
     pub implicit: Vec<String>,
+    /// The user's load-after rules for this list (MASTER_SPEC §31.4), so a sorter can honour them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<UserLoadOrderRule>,
 }
 
 /// One note a sorter returns about an item.
@@ -766,6 +793,38 @@ pub struct SorterReply {
     /// Notes about the list as a whole, with no item.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub general: Vec<SorterNote>,
+}
+
+/// One plugin's copy of a record, as an overlaps reader reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapItem {
+    pub name: String,
+    /// A hash of the record's data; equal digests mean the same change.
+    pub digest: String,
+}
+
+/// One record key that two or more active items have (MASTER_SPEC §31.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapKey {
+    /// Opaque and stable, e.g. an engine's resolved FormID.
+    pub key: String,
+    /// How a person reads the key, e.g. its type and editor id.
+    #[serde(default)]
+    pub label: String,
+    pub items: Vec<OverlapItem>,
+}
+
+/// What a `rules.overlaps.hook` answers (MASTER_SPEC §31.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapReply {
+    /// Only keys that two or more active items have. Core refuses anything else, because a
+    /// reply it cannot trust must read as "could not check", never as "no conflicts".
+    pub keys: Vec<OverlapKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<SorterNote>,
 }
 
 /// What a sorter's update (or status) hook answers, for the tab's status line.

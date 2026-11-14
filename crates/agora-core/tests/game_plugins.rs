@@ -24,11 +24,12 @@ use agora_core::game_registry::{
     GameRegistry, GameRegistryError, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_game_api::{
-    Condition, DeploymentStrategy, GameContext, GameDefinition, GameFuture, GameId, GamePackage,
-    GamePath, InstallId, InstallKind, LaunchAlternative, LaunchRecipe, LoadOrderDefinition,
-    LoadOrderFormat, LoadOrderRule, LoadOrderRulesReply, PackageDefinition, RelPath,
-    RuntimeIdentity, SorterNote, SorterReply, SorterRequest, SorterRule, StoreId, StoreIdentifier,
-    UserDataLocation, UserFileMapping, UserFileStrategy,
+    Condition, DeploymentStrategy, GameContext, GameDefinition, GameError, GameFuture, GameId,
+    GamePackage, GamePath, InstallId, InstallKind, LaunchAlternative, LaunchRecipe,
+    LoadOrderDefinition, LoadOrderFormat, LoadOrderRule, LoadOrderRulesReply, OverlapKey,
+    OverlapReply, OverlapsRule, PackageDefinition, RelPath, RuntimeIdentity, SorterNote,
+    SorterReply, SorterRequest, SorterRule, StoreId, StoreIdentifier, UserDataLocation,
+    UserFileMapping, UserFileStrategy,
 };
 use tempfile::TempDir;
 
@@ -45,6 +46,8 @@ struct Harness {
     facts: Facts,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
+    overlaps: OverlapsReplySlot,
+    overlaps_calls: Arc<AtomicUsize>,
 }
 
 impl Drop for Harness {
@@ -67,9 +70,12 @@ struct TestPackage {
     facts: Facts,
     sorter: SorterReplySlot,
     sorter_calls: Arc<AtomicUsize>,
+    overlaps: OverlapsReplySlot,
+    overlaps_calls: Arc<AtomicUsize>,
 }
 
 type SorterReplySlot = Arc<Mutex<Option<SorterReply>>>;
+type OverlapsReplySlot = Arc<Mutex<Option<Result<OverlapReply, String>>>>;
 
 impl GamePackage for TestPackage {
     fn definition(&self) -> &PackageDefinition {
@@ -132,6 +138,26 @@ impl GamePackage for TestPackage {
         let sorter = self.sorter.clone();
         Box::pin(async move { Ok(sorter.lock().unwrap().clone()) })
     }
+
+    /// The test double answers the overlaps hook with whatever a test put in the slot.
+    fn find_overlaps<'a>(
+        &'a self,
+        _request: SorterRequest,
+    ) -> GameFuture<'a, Option<OverlapReply>> {
+        self.overlaps_calls.fetch_add(1, Ordering::SeqCst);
+        let overlaps = self.overlaps.clone();
+        Box::pin(async move {
+            let answer = overlaps.lock().unwrap().clone();
+            match answer {
+                None => Ok(None),
+                Some(Ok(reply)) => Ok(Some(reply)),
+                Some(Err(message)) => Err(GameError {
+                    code: "ERR_TEST_OVERLAPS".into(),
+                    message,
+                }),
+            }
+        })
+    }
 }
 
 fn package_of(def: &GameDefinition) -> PackageDefinition {
@@ -172,6 +198,7 @@ fn plugin_rule() -> LoadOrderDefinition {
             implicit: Vec::new(),
             implicit_list_file: None,
             sorter: None,
+            overlaps: None,
         },
         intro: None,
         item_heading: None,
@@ -184,6 +211,27 @@ fn sorter_rule() -> SorterRule {
         update: None,
         update_label: None,
         options: serde_json::Value::Null,
+    }
+}
+
+fn overlaps_rule() -> OverlapsRule {
+    OverlapsRule {
+        hook: "overlaps".into(),
+        options: serde_json::Value::Null,
+    }
+}
+
+fn overlap_key(key: &str, label: &str, items: &[(&str, &str)]) -> OverlapKey {
+    OverlapKey {
+        key: key.into(),
+        label: label.into(),
+        items: items
+            .iter()
+            .map(|(name, digest)| agora_game_api::OverlapItem {
+                name: (*name).into(),
+                digest: (*digest).into(),
+            })
+            .collect(),
     }
 }
 
@@ -309,6 +357,8 @@ impl Harness {
         let facts: Facts = Arc::new(Mutex::new(HashMap::new()));
         let sorter: SorterReplySlot = Arc::new(Mutex::new(None));
         let sorter_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let overlaps: OverlapsReplySlot = Arc::new(Mutex::new(None));
+        let overlaps_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let mut builder = GameRegistry::builder();
         builder
             .add(
@@ -320,6 +370,8 @@ impl Harness {
                     facts: facts.clone(),
                     sorter: sorter.clone(),
                     sorter_calls: sorter_calls.clone(),
+                    overlaps: overlaps.clone(),
+                    overlaps_calls: overlaps_calls.clone(),
                 }),
             )
             .expect("register test package");
@@ -336,6 +388,8 @@ impl Harness {
             facts,
             sorter,
             sorter_calls,
+            overlaps,
+            overlaps_calls,
         }
     }
 
@@ -391,6 +445,19 @@ impl Harness {
 
     fn reset_sorter_calls(&self) {
         self.sorter_calls.store(0, Ordering::SeqCst);
+    }
+
+    /// What the test double's overlaps reader answers on the next call.
+    fn answer_overlaps(&self, reply: OverlapReply) {
+        *self.overlaps.lock().unwrap() = Some(Ok(reply));
+    }
+
+    fn fail_overlaps(&self, reason: &str) {
+        *self.overlaps.lock().unwrap() = Some(Err(reason.to_string()));
+    }
+
+    fn overlaps_calls(&self) -> usize {
+        self.overlaps_calls.load(Ordering::SeqCst)
     }
 
     fn copy_path(&self, inst: &GameInstanceRecord) -> PathBuf {
@@ -940,6 +1007,8 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
             facts: Arc::new(Mutex::new(HashMap::new())),
             sorter: Arc::new(Mutex::new(None)),
             sorter_calls: Arc::new(AtomicUsize::new(0)),
+            overlaps: Arc::new(Mutex::new(None)),
+            overlaps_calls: Arc::new(AtomicUsize::new(0)),
         }),
     )
 }
@@ -1908,4 +1977,83 @@ fn a_plain_list_read_marks_uncached_notes_out_of_date() {
     assert!(order.notes.is_empty());
     assert!(order.notes_out_of_date);
     assert_eq!(h.sorter_calls(), 0, "a plain read ran the sorter");
+}
+
+#[test]
+fn overlaps_are_cached_and_a_plain_read_does_not_run_the_reader() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-cache");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_overlaps(OverlapReply {
+        keys: vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "new")],
+        )],
+        notes: Vec::new(),
+    });
+
+    let report = game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None)
+        .expect("overlaps were checked");
+    assert_eq!(report.pairs.len(), 1);
+    assert_eq!(report.pairs[0].winner, "B.esp");
+    assert_eq!(report.pairs[0].loser, "A.esp");
+    assert_eq!(h.overlaps_calls(), 1);
+
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    assert_eq!(order.overlaps.as_ref().map(|r| r.pairs.len()), Some(1));
+    assert!(!order.overlaps_out_of_date);
+    assert_eq!(h.overlaps_calls(), 1, "a plain read ran the reader");
+}
+
+#[test]
+fn an_overlaps_reader_failure_says_could_not_check_not_no_conflicts() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-failure");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_overlaps("the reader could not open a plugin file");
+
+    let error =
+        game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None).unwrap_err();
+    assert!(matches!(error, LoadOrderError::Overlaps { .. }), "{error}");
+    assert!(error.to_string().contains("could not open"));
+
+    let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    assert!(order.overlaps.is_none());
+    assert!(order.overlaps_out_of_date);
+}
+
+#[test]
+fn an_overlaps_reply_naming_an_unknown_plugin_is_refused() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("overlaps-malformed");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_overlaps(OverlapReply {
+        keys: vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("NotLoaded.esp", "new")],
+        )],
+        notes: Vec::new(),
+    });
+
+    let error =
+        game_load_order::refresh_overlaps(&h.ctx, &inst.instance_id, &h.def, None).unwrap_err();
+    assert!(
+        matches!(error, LoadOrderError::OverlapsReply { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("does not load"));
 }

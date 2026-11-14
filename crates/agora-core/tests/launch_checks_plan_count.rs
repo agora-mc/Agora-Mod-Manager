@@ -179,6 +179,7 @@ fn definition(tools: &[ToolDefinition]) -> GameDefinition {
                 implicit: Vec::new(),
                 implicit_list_file: None,
                 sorter: None,
+                overlaps: None,
             },
 
             intro: None,

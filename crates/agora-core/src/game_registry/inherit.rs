@@ -353,6 +353,14 @@ fn record_script_slots(
         {
             owners.insert(script_key(game, list, "sorter"), plugin.to_string());
         }
+        if rules
+            .and_then(|rules| rules.get("overlaps"))
+            .and_then(|overlaps| overlaps.get("hook"))
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            owners.insert(script_key(game, list, "overlaps"), plugin.to_string());
+        }
     }
 }
 

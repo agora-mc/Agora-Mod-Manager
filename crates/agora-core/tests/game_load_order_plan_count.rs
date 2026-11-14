@@ -107,6 +107,7 @@ fn definition() -> GameDefinition {
                 implicit: vec![],
                 implicit_list_file: None,
                 sorter: None,
+                overlaps: None,
             },
 
             intro: None,

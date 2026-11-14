@@ -287,6 +287,7 @@ fn deploy_and_launch_timings() {
                 implicit: vec![],
                 implicit_list_file: None,
                 sorter: None,
+                overlaps: None,
             },
 
             intro: None,
@@ -561,6 +562,7 @@ fn tools_tab_timings() {
             implicit: vec![],
             implicit_list_file: None,
             sorter: None,
+            overlaps: None,
         },
 
         intro: None,

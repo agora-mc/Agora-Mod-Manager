@@ -165,6 +165,16 @@ pub trait GamePackage: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Report the record keys that two or more active items change (MASTER_SPEC §31.3). It gets
+    /// the sorter's request shape. `None` means the package has no overlaps reader for this list;
+    /// core reports that rather than treating it as "no conflicts".
+    fn find_overlaps<'a>(
+        &'a self,
+        _request: SorterRequest,
+    ) -> GameFuture<'a, Option<OverlapReply>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Update what a sorter keeps, or report it, for the tab's status line and update button
     /// (MASTER_SPEC §30.13). `update` false only reads the current status.
     fn update_sorter<'a>(

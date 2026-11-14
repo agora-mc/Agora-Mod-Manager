@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use agora_game_api::{
     fold_path_case, glob_match, GameContext, GameDefinition, GamePackage, ListFinding,
-    LoadOrderDefinition, LoadOrderLine, LoadOrderRule, LoadOrderRulesReply, SorterEntry,
-    SorterReply, SorterRequest, SorterStatus,
+    LoadOrderDefinition, LoadOrderLine, LoadOrderRule, LoadOrderRulesReply, OverlapReply,
+    SorterEntry, SorterReply, SorterRequest, SorterStatus, UserLoadOrderRule,
 };
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,30 @@ pub enum LoadOrderError {
     SorterNote { reason: String },
     #[error("the list's sorter update failed: {reason}")]
     SorterUpdate { reason: String },
+    #[error("load order '{0}' declares no overlaps hook, so overlaps cannot be checked")]
+    NoOverlaps(String),
+    #[error("the list's overlaps reader failed: {reason}")]
+    Overlaps { list: String, reason: String },
+    #[error("the list's overlaps reader did not answer, though the list declares one")]
+    NoOverlapsReply(String),
+    #[error("the list's overlaps reader returned a reply Agora cannot use: {reason}")]
+    OverlapsReply { reason: String },
+    #[error("the load order rules could not be read: {0}")]
+    RulesStore(String),
+    #[error("a rule cannot make '{0}' load after itself")]
+    RuleSelf(String),
+    #[error("'{item}' cannot load after '{after}': '{after}' needs '{item}' as a master")]
+    RuleContradictsMaster { item: String, after: String },
+    #[error(
+        "'{item}' cannot load after '{after}': that would make a loop with the rules already set"
+    )]
+    RuleCycle { item: String, after: String },
+    #[error("moving '{plugin}' there breaks the rule that '{item}' loads after '{after}'")]
+    BreaksRule {
+        plugin: String,
+        item: String,
+        after: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +169,14 @@ pub struct LoadOrder {
     /// plain read.
     #[serde(default)]
     pub notes_out_of_date: bool,
+    /// The saved overlaps report, when the list declares an overlaps reader and one was computed
+    /// for this exact order. A plain read never runs the reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlaps: Option<OverlapReport>,
+    /// True when the list declares an overlaps reader but no report matches this order, so the
+    /// caller asks for one in the background.
+    #[serde(default)]
+    pub overlaps_out_of_date: bool,
 }
 
 /// How important a sorter's message is.
@@ -316,6 +348,134 @@ pub enum SortMode {
     Masters,
 }
 
+/// One load-after rule a user set for an instance's list (MASTER_SPEC §31.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadAfterRule {
+    pub item: String,
+    pub after: String,
+}
+
+/// A rule as the list shows it: whether both items are still in the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadAfterRuleView {
+    pub item: String,
+    pub after: String,
+    /// The item or its target that the list no longer has. `None` when the rule is in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unused: Option<String>,
+}
+
+/// One pair of plugins where the winner replaces changes the loser made (MASTER_SPEC §31.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictPair {
+    pub winner: String,
+    pub loser: String,
+    /// How many record changes the winner replaces.
+    pub count: usize,
+    /// Up to [`CONFLICT_LABELS`] record labels that explain the pair.
+    pub labels: Vec<String>,
+}
+
+/// How many record labels one pair lists.
+pub const CONFLICT_LABELS: usize = 10;
+
+/// The classification of one list's overlaps (MASTER_SPEC §31.3). A list with no conflicts still
+/// has a report: `pairs` is empty and `patched`/`decided` say what was resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlapReport {
+    /// Conflicts grouped by (winner, loser), in the order the first one was found.
+    pub pairs: Vec<ConflictPair>,
+    /// Keys the winner patches because it lists every other changer as a master.
+    pub patched: usize,
+    /// Keys a load-after rule already decides.
+    pub decided: usize,
+    /// What the reader said about the files it could not read, or about the list as a whole.
+    pub notes: Vec<PluginNote>,
+}
+
+impl OverlapReport {
+    /// The number of record changes the winners replace, over every pair.
+    pub fn conflicts(&self) -> usize {
+        self.pairs.iter().map(|pair| pair.count).sum()
+    }
+
+    /// The plugins that lose changes, each with how many.
+    pub fn losers_of(&self, plugin: &str) -> Vec<(String, usize)> {
+        let wanted = key(plugin);
+        self.pairs
+            .iter()
+            .filter(|pair| key(&pair.loser) == wanted)
+            .map(|pair| (pair.winner.clone(), pair.count))
+            .collect()
+    }
+
+    /// The plugins this plugin wins changes from, each with how many.
+    pub fn wins_over(&self, plugin: &str) -> Vec<(String, usize)> {
+        let wanted = key(plugin);
+        self.pairs
+            .iter()
+            .filter(|pair| key(&pair.winner) == wanted)
+            .map(|pair| (pair.loser.clone(), pair.count))
+            .collect()
+    }
+}
+
+/// The last report an overlaps reader gave for one list, with what it was computed from.
+#[derive(Default)]
+struct OverlapsCache {
+    entries: Mutex<HashMap<(String, String), CachedOverlaps>>,
+}
+
+#[derive(Clone)]
+struct CachedOverlaps {
+    fingerprint: String,
+    data_version: String,
+    report: OverlapReport,
+}
+
+impl OverlapsCache {
+    fn lookup(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: &str,
+        data_version: &str,
+    ) -> Option<OverlapReport> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries
+            .get(&(game.to_string(), list.to_string()))
+            .filter(|cached| {
+                cached.fingerprint == fingerprint && cached.data_version == data_version
+            })
+            .map(|cached| cached.report.clone())
+    }
+
+    fn store(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: String,
+        data_version: String,
+        report: OverlapReport,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries.insert(
+            (game.to_string(), list.to_string()),
+            CachedOverlaps {
+                fingerprint,
+                data_version,
+                report,
+            },
+        );
+    }
+}
+
 /// The last notes a sorter gave for one list, with what they were computed from.
 #[derive(Default)]
 struct SorterNotesCache {
@@ -485,7 +645,10 @@ pub fn list_by_id<'a>(
 
 /// Whether a list reads the game's files: a script hook, a sorter, or a list of folders.
 fn list_needs_plan(rule: &LoadOrderDefinition) -> bool {
-    rule.rules.kind == "script" || rule.rules.sorter.is_some() || rule.items.folders
+    rule.rules.kind == "script"
+        || rule.rules.sorter.is_some()
+        || rule.rules.overlaps.is_some()
+        || rule.items.folders
 }
 
 /// Whether any list needs a deployment plan at all.
@@ -594,7 +757,68 @@ pub(crate) fn call_load_order_rules(
     })
 }
 
-/// What a package's sorter hooks receive: the list as it stands, plus the rule's free options.
+/// The load-after rules the user set for one instance's list, in the order they were added.
+pub fn load_after_rules(
+    ctx: &Ctx,
+    instance_id: &str,
+    list_id: &str,
+) -> Result<Vec<LoadAfterRule>, LoadOrderError> {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT item, after_item FROM plugin_load_order_rules
+              WHERE instance_id = ?1 AND list_id = ?2
+              ORDER BY id",
+        )
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![instance_id, list_id], |row| {
+            Ok(LoadAfterRule {
+                item: row.get(0)?,
+                after: row.get(1)?,
+            })
+        })
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LoadOrderError::RulesStore(error.to_string()))
+}
+
+/// The rules as the list shows them, naming the item that left the list when a rule is unused.
+pub fn load_after_rule_views(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Vec<LoadAfterRuleView>, LoadOrderError> {
+    let rule = rule_of(definition, list_id)?;
+    let rules = load_after_rules(ctx, instance_id, &rule.id)?;
+    let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let names: HashSet<String> = listed
+        .entries
+        .iter()
+        .map(|entry| key(&entry.name))
+        .chain(rule.rules.implicit.iter().map(|name| key(name)))
+        .collect();
+    Ok(rules
+        .into_iter()
+        .map(|rule| {
+            let unused = if !names.contains(&key(&rule.item)) {
+                Some(rule.item.clone())
+            } else if !names.contains(&key(&rule.after)) {
+                Some(rule.after.clone())
+            } else {
+                None
+            };
+            LoadAfterRuleView {
+                item: rule.item,
+                after: rule.after,
+                unused,
+            }
+        })
+        .collect())
+}
+
 fn sorter_request(
     ctx: &Ctx,
     instance_id: &str,
@@ -607,11 +831,31 @@ fn sorter_request(
         .sorter
         .as_ref()
         .ok_or_else(|| LoadOrderError::NoSort(rule.id.clone()))?;
+    hook_request(
+        ctx,
+        instance_id,
+        definition,
+        rule,
+        entries,
+        sorter.options.clone(),
+    )
+}
+
+/// What a package's sorter and overlaps hooks receive: the list as it stands, the user's rules,
+/// plus the hook's free options.
+fn hook_request(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+    options: serde_json::Value,
+) -> Result<SorterRequest, LoadOrderError> {
     let context = hook_context(ctx, instance_id, definition, rule, entries)?;
     Ok(SorterRequest {
         context,
         list_id: rule.id.clone(),
-        options: sorter.options.clone(),
+        options,
         entries: entries
             .iter()
             .map(|entry| SorterEntry {
@@ -636,6 +880,13 @@ fn sorter_request(
             .iter()
             .filter(|entry| entry.implicit)
             .map(|entry| entry.name.clone())
+            .collect(),
+        rules: load_after_rules(ctx, instance_id, &rule.id)?
+            .into_iter()
+            .map(|rule| UserLoadOrderRule {
+                item: rule.item,
+                after: rule.after,
+            })
             .collect(),
     })
 }
@@ -681,6 +932,293 @@ fn sorter_notes(reply: &SorterReply) -> Result<Vec<PluginNote>, LoadOrderError> 
         });
     }
     Ok(notes)
+}
+
+/// An overlaps reply's notes as the list shows them, with the same strict level check as a
+/// sorter's.
+fn overlaps_notes(reply: &OverlapReply) -> Result<Vec<PluginNote>, LoadOrderError> {
+    let mut notes = Vec::new();
+    for note in &reply.notes {
+        let level = match note.level.as_str() {
+            "error" => NoteLevel::Error,
+            "warn" => NoteLevel::Warn,
+            "info" => NoteLevel::Info,
+            other => {
+                return Err(LoadOrderError::OverlapsReply {
+                    reason: format!("`{other}` is not error, warn or info"),
+                })
+            }
+        };
+        notes.push(PluginNote {
+            plugin: note.item.clone(),
+            level,
+            message: note.text.clone(),
+        });
+    }
+    Ok(notes)
+}
+
+/// Ask the package's overlaps reader about the list. A failure is an error, never "no conflicts".
+fn call_overlaps(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+) -> Result<OverlapReply, LoadOrderError> {
+    let overlaps = rule
+        .rules
+        .overlaps
+        .as_ref()
+        .ok_or_else(|| LoadOrderError::NoOverlaps(rule.id.clone()))?;
+    let package = package_of(ctx, definition)?;
+    let request = hook_request(
+        ctx,
+        instance_id,
+        definition,
+        rule,
+        entries,
+        overlaps.options.clone(),
+    )?;
+    let result = block_on_hook(package.find_overlaps(request)).map_err(|error| {
+        LoadOrderError::Overlaps {
+            list: rule.id.clone(),
+            reason: error.message,
+        }
+    })?;
+    result.ok_or_else(|| LoadOrderError::NoOverlapsReply(rule.id.clone()))
+}
+
+/// Classify one overlaps reply against the current order and the user's load-after rules
+/// (MASTER_SPEC §31.3). A reply that names an item the list does not load, repeats an item, or
+/// names a key with fewer than two items is refused: it is a reply core cannot trust.
+pub fn classify_overlaps(
+    entries: &[LoadOrderEntry],
+    reply: &OverlapReply,
+    rules: &[LoadAfterRule],
+) -> Result<OverlapReport, LoadOrderError> {
+    let mut positions: HashMap<String, (usize, &LoadOrderEntry)> = HashMap::new();
+    for (position, entry) in entries.iter().enumerate().filter(|(_, e)| loads(e)) {
+        positions.insert(key(&entry.name), (position, entry));
+    }
+
+    let mut report = OverlapReport {
+        notes: overlaps_notes(reply)?,
+        ..OverlapReport::default()
+    };
+    let mut seen_keys: HashSet<String> = HashSet::new();
+
+    for key_entry in &reply.keys {
+        if key_entry.key.trim().is_empty() {
+            return Err(LoadOrderError::OverlapsReply {
+                reason: "a record key is empty".to_string(),
+            });
+        }
+        if !seen_keys.insert(key_entry.key.clone()) {
+            return Err(LoadOrderError::OverlapsReply {
+                reason: format!("record key '{}' is reported twice", key_entry.key),
+            });
+        }
+        if key_entry.items.len() < 2 {
+            return Err(LoadOrderError::OverlapsReply {
+                reason: format!(
+                    "record key '{}' names {} item(s), but an overlap needs two",
+                    key_entry.key,
+                    key_entry.items.len()
+                ),
+            });
+        }
+        let mut holders: Vec<(usize, &str, &str, &LoadOrderEntry)> = Vec::new();
+        let mut seen_items: HashSet<String> = HashSet::new();
+        for item in &key_entry.items {
+            if item.name.trim().is_empty() || item.digest.trim().is_empty() {
+                return Err(LoadOrderError::OverlapsReply {
+                    reason: format!(
+                        "record key '{}' has an item without a name or digest",
+                        key_entry.key
+                    ),
+                });
+            }
+            let item_key = key(&item.name);
+            if !seen_items.insert(item_key.clone()) {
+                return Err(LoadOrderError::OverlapsReply {
+                    reason: format!("record key '{}' names '{}' twice", key_entry.key, item.name),
+                });
+            }
+            let Some((position, entry)) = positions.get(&item_key) else {
+                return Err(LoadOrderError::OverlapsReply {
+                    reason: format!(
+                        "record key '{}' names '{}', which the list does not load",
+                        key_entry.key, item.name
+                    ),
+                });
+            };
+            holders.push((*position, item.name.as_str(), item.digest.as_str(), entry));
+        }
+        holders.sort_by_key(|(position, ..)| *position);
+
+        // A plugin whose digest equals the previous holder's is not a changer.
+        let mut changers: Vec<(usize, &str, &str, &LoadOrderEntry)> = Vec::new();
+        for (index, holder) in holders.iter().enumerate() {
+            if index == 0 || holder.2 != holders[index - 1].2 {
+                changers.push(*holder);
+            }
+        }
+        if changers.len() < 2 {
+            continue;
+        }
+        let final_digest = holders.last().expect("an overlap has items").2;
+        if changers.iter().all(|changer| changer.2 == final_digest) {
+            continue;
+        }
+        let (_, winner_name, _, winner) = *holders.last().expect("an overlap has items");
+        let others: Vec<&(usize, &str, &str, &LoadOrderEntry)> = changers
+            .iter()
+            .filter(|changer| key(changer.1) != key(winner_name))
+            .collect();
+        if others.is_empty() {
+            continue;
+        }
+        let patched = others.iter().all(|changer| {
+            winner
+                .masters
+                .iter()
+                .any(|master| key(master) == key(changer.1))
+        });
+        if patched {
+            report.patched += 1;
+            continue;
+        }
+        let decided = others.iter().all(|changer| {
+            rules.iter().any(|rule| {
+                key(&rule.item) == key(winner_name) && key(&rule.after) == key(changer.1)
+            })
+        });
+        if decided {
+            report.decided += 1;
+            continue;
+        }
+        let label = if key_entry.label.trim().is_empty() {
+            key_entry.key.clone()
+        } else {
+            key_entry.label.clone()
+        };
+        for changer in others
+            .iter()
+            .filter(|changer| key(changer.1) != key(winner_name))
+            .filter(|changer| changer.2 != final_digest)
+        {
+            match report.pairs.iter_mut().find(|pair| {
+                key(&pair.winner) == key(winner_name) && key(&pair.loser) == key(changer.1)
+            }) {
+                Some(pair) => {
+                    pair.count += 1;
+                    if pair.labels.len() < CONFLICT_LABELS
+                        && !pair.labels.iter().any(|existing| existing == &label)
+                    {
+                        pair.labels.push(label.clone());
+                    }
+                }
+                None => report.pairs.push(ConflictPair {
+                    winner: winner_name.to_string(),
+                    loser: changer.1.to_string(),
+                    count: 1,
+                    labels: vec![label.clone()],
+                }),
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// What an overlaps report is computed from: the same fingerprint as the sorter's notes, plus the
+/// user's load-after rules, because adding a rule can turn a conflict into a decided one.
+fn overlaps_fingerprint(
+    entries: &[LoadOrderEntry],
+    installed: &Installed,
+    rules: &[LoadAfterRule],
+) -> String {
+    let mut out = sorter_fingerprint(entries, installed);
+    out.push_str("|rules|");
+    let mut ordered: Vec<(String, String)> = rules
+        .iter()
+        .map(|rule| (key(&rule.item), key(&rule.after)))
+        .collect();
+    ordered.sort();
+    for (item, after) in ordered {
+        out.push_str(&item);
+        out.push('>');
+        out.push_str(&after);
+        out.push(';');
+    }
+    out
+}
+
+fn cache_overlaps(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+    installed: &Installed,
+    rules: &[LoadAfterRule],
+    report: &OverlapReport,
+) {
+    let cache = ctx.extensions.get_or_insert_with(OverlapsCache::default);
+    cache.store(
+        definition.id.as_str(),
+        &rule.id,
+        overlaps_fingerprint(entries, installed, rules),
+        sorter_data_version(ctx, instance_id, definition, rule),
+        report.clone(),
+    );
+}
+
+/// Ask the overlaps reader now, cache the report for the list as it stands, and return it.
+pub fn refresh_overlaps(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<OverlapReport, LoadOrderError> {
+    let rule = rule_of(definition, list_id)?;
+    if rule.rules.overlaps.is_none() {
+        return Err(LoadOrderError::NoOverlaps(rule.id.clone()));
+    }
+    let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let listed = game_plugins::list_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let (installed, names) = installed_files(ctx, instance_id, definition, rule, links.as_ref())?;
+    let mut entries = build_order(
+        rule,
+        &listed.entries,
+        Some(&installed),
+        &names,
+        listed.exists,
+    )
+    .entries;
+    if rule.rules.kind == "script" {
+        let reply = call_load_order_rules(ctx, instance_id, definition, rule, &entries).map_err(
+            |reason| LoadOrderError::Overlaps {
+                list: rule.id.clone(),
+                reason: format!("the list's rules could not be read: {reason}"),
+            },
+        )?;
+        set_prerequisites(&mut entries, &reply.rules, &rule.id);
+    }
+    let rules = load_after_rules(ctx, instance_id, &rule.id)?;
+    let reply = call_overlaps(ctx, instance_id, definition, rule, &entries)?;
+    let report = classify_overlaps(&entries, &reply, &rules)?;
+    cache_overlaps(
+        ctx,
+        instance_id,
+        definition,
+        rule,
+        &entries,
+        &installed,
+        &rules,
+        &report,
+    );
+    Ok(report)
 }
 
 /// Ask the sorter for its notes now, cache them for the list as it stands, and return them. The
@@ -889,6 +1427,8 @@ pub fn build_order(
         findings,
         notes: Vec::new(),
         notes_out_of_date: false,
+        overlaps: None,
+        overlaps_out_of_date: false,
     }
 }
 
@@ -1719,6 +2259,9 @@ fn order_of_with_view(
             Ok(reply) => {
                 let findings = apply_reply(&mut order.entries, &reply, &rule.id);
                 order.findings.extend(findings);
+                // Keep the rule edges on the entries, so an overlaps classification can tell a
+                // patched key (the winner lists every other changer as a master).
+                set_prerequisites(&mut order.entries, &reply.rules, &rule.id);
             }
             Err(reason) => order.findings.push(Finding::RulesFailed {
                 list: rule.id.clone(),
@@ -1740,6 +2283,27 @@ fn order_of_with_view(
         ) {
             Some(notes) => order.notes = notes,
             None => order.notes_out_of_date = true,
+        }
+    }
+    // A plain read never runs the overlaps reader either. It shows the report the last check or
+    // sort saved for this exact order, and says it is out of date when nothing matches.
+    if rule.rules.overlaps.is_some() {
+        match load_after_rules(ctx, instance_id, &rule.id) {
+            Ok(rules) => {
+                let fingerprint = overlaps_fingerprint(&order.entries, &installed, &rules);
+                let data_version = sorter_data_version(ctx, instance_id, definition, rule);
+                let cache = ctx.extensions.get_or_insert_with(OverlapsCache::default);
+                match cache.lookup(
+                    definition.id.as_str(),
+                    &rule.id,
+                    &fingerprint,
+                    &data_version,
+                ) {
+                    Some(report) => order.overlaps = Some(report),
+                    None => order.overlaps_out_of_date = true,
+                }
+            }
+            Err(_) => order.overlaps_out_of_date = true,
         }
     }
     Ok(order)
@@ -2192,6 +2756,7 @@ mod tests {
                 implicit: vec!["Skyrim.esm".into(), "Dawnguard.esm".into()],
                 implicit_list_file: Some(agora_game_api::RelPath::new("Skyrim.ccc").unwrap()),
                 sorter: None,
+                overlaps: None,
             },
             intro: Some("Read this list from the top down.".into()),
             item_heading: Some("Plugin".into()),
@@ -2569,5 +3134,213 @@ mod tests {
         let (moves, blocked) = sort_entries(&mut single).unwrap();
         assert!(moves.is_empty() && blocked.is_empty());
         assert_eq!(names(&single), ["Only.esp"]);
+    }
+
+    fn overlap_item(name: &str, digest: &str) -> agora_game_api::OverlapItem {
+        agora_game_api::OverlapItem {
+            name: name.to_string(),
+            digest: digest.to_string(),
+        }
+    }
+
+    fn overlap_key(key: &str, label: &str, items: &[(&str, &str)]) -> agora_game_api::OverlapKey {
+        agora_game_api::OverlapKey {
+            key: key.to_string(),
+            label: label.to_string(),
+            items: items
+                .iter()
+                .map(|(name, digest)| overlap_item(name, digest))
+                .collect(),
+        }
+    }
+
+    fn overlap_reply(keys: Vec<agora_game_api::OverlapKey>) -> agora_game_api::OverlapReply {
+        agora_game_api::OverlapReply {
+            keys,
+            notes: Vec::new(),
+        }
+    }
+
+    fn after(item: &str, after: &str) -> LoadAfterRule {
+        LoadAfterRule {
+            item: item.to_string(),
+            after: after.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_last_provider_wins_and_each_other_changer_loses_its_change() {
+        let list = [
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "middle"), ("C.esp", "new")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(
+            report.pairs,
+            [
+                ConflictPair {
+                    winner: "C.esp".into(),
+                    loser: "A.esp".into(),
+                    count: 1,
+                    labels: vec!["GMST fJumpHeightMin".into()],
+                },
+                ConflictPair {
+                    winner: "C.esp".into(),
+                    loser: "B.esp".into(),
+                    count: 1,
+                    labels: vec!["GMST fJumpHeightMin".into()],
+                },
+            ]
+        );
+        assert_eq!(report.conflicts(), 2);
+    }
+
+    #[test]
+    fn an_item_whose_digest_equals_the_previous_holder_is_not_a_changer() {
+        let list = [
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "new"), ("C.esp", "new")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.pairs[0].winner, "C.esp");
+        assert_eq!(report.pairs[0].loser, "A.esp");
+    }
+
+    #[test]
+    fn when_every_plugin_agrees_there_is_nothing_to_show() {
+        let list = [entry("A.esp", &[]), entry("B.esp", &[])];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "same"), ("B.esp", "same")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert!(report.pairs.is_empty());
+        assert_eq!(report.patched, 0);
+        assert_eq!(report.decided, 0);
+    }
+
+    #[test]
+    fn a_winner_that_lists_every_other_changer_as_a_master_is_patched() {
+        let list = [entry("A.esp", &[]), entry("Patch.esp", &["A.esp"])];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("Patch.esp", "new")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert!(report.pairs.is_empty());
+        assert_eq!(report.patched, 1);
+    }
+
+    #[test]
+    fn a_rule_that_orders_the_winner_after_every_other_changer_decides_it() {
+        let list = [
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "middle"), ("C.esp", "new")],
+        )]);
+        let rules = [after("C.esp", "A.esp"), after("C.esp", "B.esp")];
+        let report = classify_overlaps(&list, &reply, &rules).unwrap();
+        assert!(report.pairs.is_empty());
+        assert_eq!(report.decided, 1);
+    }
+
+    #[test]
+    fn a_rule_for_one_loser_does_not_decide_a_pair_that_has_another() {
+        let list = [
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "middle"), ("C.esp", "new")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[after("C.esp", "A.esp")]).unwrap();
+        assert_eq!(report.decided, 0);
+        assert_eq!(report.pairs.len(), 2);
+        assert_eq!(
+            report.pairs[0].labels,
+            vec!["GMST fJumpHeightMin".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_overlaps_reply_is_an_empty_report_not_a_failure() {
+        let list = [entry("A.esp", &[])];
+        let report = classify_overlaps(&list, &overlap_reply(Vec::new()), &[]).unwrap();
+        assert_eq!(report, OverlapReport::default());
+    }
+
+    #[test]
+    fn a_malformed_overlaps_reply_is_refused_and_says_why() {
+        let list = [entry("A.esp", &[]), entry("B.esp", &[])];
+        for (keys, reason) in [
+            (
+                vec![overlap_key("Game:1", "", &[("A.esp", "x")])],
+                "an overlap needs two",
+            ),
+            (
+                vec![overlap_key(
+                    "Game:1",
+                    "",
+                    &[("A.esp", "x"), ("Gone.esp", "y")],
+                )],
+                "which the list does not load",
+            ),
+            (
+                vec![overlap_key("Game:1", "", &[("A.esp", "x"), ("a.ESP", "y")])],
+                "twice",
+            ),
+            (
+                vec![overlap_key("", "", &[("A.esp", "x"), ("B.esp", "y")])],
+                "a record key is empty",
+            ),
+        ] {
+            let error = classify_overlaps(&list, &overlap_reply(keys), &[]).unwrap_err();
+            assert!(
+                error.to_string().contains(reason),
+                "unexpected error: {error}"
+            );
+            assert!(matches!(error, LoadOrderError::OverlapsReply { .. }));
+        }
+    }
+
+    #[test]
+    fn conflicts_group_by_pair_and_list_at_most_ten_labels() {
+        let list = [entry("A.esp", &[]), entry("B.esp", &[])];
+        let keys: Vec<_> = (0..12)
+            .map(|index| {
+                overlap_key(
+                    &format!("Game:{index}"),
+                    &format!("Record {index}"),
+                    &[("A.esp", "old"), ("B.esp", "new")],
+                )
+            })
+            .collect();
+        let report = classify_overlaps(&list, &overlap_reply(keys), &[]).unwrap();
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.pairs[0].count, 12);
+        assert_eq!(report.pairs[0].labels.len(), CONFLICT_LABELS);
     }
 }
