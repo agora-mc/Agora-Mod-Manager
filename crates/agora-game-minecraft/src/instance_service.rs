@@ -2643,6 +2643,37 @@ mod tests {
             assert_eq!(after.jvm_gc, before.jvm_gc);
         }
 
+        // A manual heap is the user's: it is kept as chosen, and only an impossible size is
+        // refused. The row is read through the service, which owns this table's access.
+        service
+            .update_jvm("gc-invalid", 200, "auto", true, "", "manual")
+            .unwrap();
+        assert_eq!(
+            service
+                .get("gc-invalid")
+                .unwrap()
+                .unwrap()
+                .row
+                .jvm_memory_mb,
+            200
+        );
+        for impossible in [0, -1, crate::gc::JVM_MAX_HEAP_MB + 1] {
+            let error = service
+                .update_jvm("gc-invalid", impossible, "auto", true, "", "manual")
+                .unwrap_err();
+            assert_eq!(error.code(), "ERR_INVALID_JVM_MEMORY");
+        }
+        assert_eq!(
+            service
+                .get("gc-invalid")
+                .unwrap()
+                .unwrap()
+                .row
+                .jvm_memory_mb,
+            200,
+            "a rejected value changes nothing"
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2666,55 +2697,6 @@ mod tests {
             resolve_loader_version("fabric", "0.0.0", ""),
             Err(LauncherError::UnsupportedLoader)
         ));
-    }
-
-    #[test]
-    fn a_manual_heap_is_kept_and_an_impossible_one_is_rejected() {
-        let (ctx, root) = context();
-        let request = CreateInstanceRequest {
-            name: "Memory Test".into(),
-            instance_id: "memory-test".into(),
-            minecraft_version: "1.21".into(),
-            loader: "vanilla".into(),
-            loader_version: "".into(),
-            jvm_memory_mb: None,
-            jvm_memory_mode: None,
-            jvm_gc: None,
-            jvm_custom_args: None,
-            jvm_always_pre_touch: None,
-            is_modpack: None,
-            pack_icon_url: None,
-            template_id: None,
-        };
-        let row = prepare_row("memory-test", &request);
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        agora_core::db::upsert_instance(&conn, &row).unwrap();
-        drop(conn);
-
-        let service = InstanceService::new(ctx.clone());
-        service
-            .update_jvm("memory-test", 200, "auto", true, "", "manual")
-            .unwrap();
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        let stored = agora_core::db::get_instance(&conn, "memory-test")
-            .unwrap()
-            .expect("fixture row should exist");
-        assert_eq!(stored.jvm_memory_mb, 200);
-        drop(conn);
-
-        for impossible in [0, -1, crate::gc::JVM_MAX_HEAP_MB + 1] {
-            let error = service
-                .update_jvm("memory-test", impossible, "auto", true, "", "manual")
-                .unwrap_err();
-            assert_eq!(error.code(), "ERR_INVALID_JVM_MEMORY");
-        }
-        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
-        let after = agora_core::db::get_instance(&conn, "memory-test")
-            .unwrap()
-            .expect("fixture row should exist");
-        assert_eq!(after.jvm_memory_mb, 200, "a rejected value changes nothing");
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

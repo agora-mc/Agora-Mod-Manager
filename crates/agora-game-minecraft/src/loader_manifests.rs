@@ -540,7 +540,7 @@ impl LoaderCatalog {
             .into_iter()
             .filter(|entry| entry.release_channel == LoaderReleaseChannel::Stable)
             .max_by(|left, right| {
-                agora_core::version_match::compare_versions(
+                crate::loader_compatibility::compare_loader_versions(
                     &left.loader_version,
                     &right.loader_version,
                 )
