@@ -183,6 +183,46 @@ fn the_script_reads_flags_masters_and_extensions() {
 }
 
 #[test]
+fn a_light_plugins_full_master_need_not_load_above_it() {
+    // The game moves every light plugin to the end of the load order, so a full master always
+    // loads first; only another light master can still come after it. Source:
+    // https://github.com/Ortham/libloadorder/blob/master/doc/src/load_order_mechanisms.md
+    let reply = run(
+        vec![
+            ("LightMod.esp".to_string(), plugin_bytes(0x200, &["FullMaster.esp"])),
+            ("FullMaster.esp".to_string(), plugin_bytes(0, &["Skyrim.esm"])),
+            ("Skyrim.esm".to_string(), plugin_bytes(0x1, &[])),
+            ("LightMaster.esl".to_string(), plugin_bytes(0, &[])),
+            (
+                "UsesLightMaster.esp".to_string(),
+                plugin_bytes(0x200, &["LightMaster.esl"]),
+            ),
+        ],
+        &[
+            entry("LightMod.esp"),
+            entry("FullMaster.esp"),
+            entry("Skyrim.esm"),
+            entry("UsesLightMaster.esp"),
+            entry("LightMaster.esl"),
+        ],
+    );
+
+    let rules = reply["rules"].as_array().expect("rules");
+    let rule = |item: &str| {
+        rules
+            .iter()
+            .find(|rule| rule["item"] == item)
+            .unwrap_or_else(|| panic!("no rule for {item}"))
+    };
+    assert_eq!(rule("LightMod.esp")["order"], serde_json::json!(false));
+    assert_eq!(rule("LightMod.esp")["master"], "FullMaster.esp");
+    assert!(rule("FullMaster.esp").get("order").is_none());
+    // A light master is still moved to the light section, and among light plugins the list order
+    // is what the game keeps, so this one must load above its dependent.
+    assert!(rule("UsesLightMaster.esp").get("order").is_none());
+}
+
+#[test]
 fn the_script_reports_unreadable_headers_and_the_plugin_limits() {
     let mut files = Vec::new();
     let mut entries = Vec::new();

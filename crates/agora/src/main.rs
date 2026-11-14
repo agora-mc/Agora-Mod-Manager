@@ -11111,23 +11111,42 @@ fn print_load_order_findings(findings: &[agora_core::game_load_order::Finding]) 
 }
 
 /// The line that says how to fix a late master, when the findings have one. The game can start
-/// with a plugin before its master, but the plugin's references may resolve wrongly, and
-/// `plugins sort` moves the master up.
+/// with a plugin before its master, but the plugin's references may resolve wrongly. Point at
+/// `plugins sort` only when it could actually move the master; a locked or always-loaded master
+/// has to be unlocked or moved by hand.
 fn sort_hint(
     instance_id: &str,
     findings: &[agora_core::game_load_order::Finding],
 ) -> Option<String> {
-    let late = findings.iter().any(|f| {
-        matches!(
-            f,
-            agora_core::game_load_order::Finding::MasterNotEarlier { .. }
-        )
-    });
-    late.then(|| {
-        format!(
-            "Warning: a plugin loads before its master. 'agora games instance plugins sort {instance_id}' fixes the order, since the plugin's references may resolve wrongly until it does."
-        )
-    })
+    use agora_core::game_load_order::{Finding, MasterProblem};
+    let mut movable = false;
+    let mut stuck = false;
+    for finding in findings {
+        if let Finding::MasterNotEarlier {
+            problem: MasterProblem::Later,
+            movable: can_move,
+            ..
+        } = finding
+        {
+            if *can_move {
+                movable = true;
+            } else {
+                stuck = true;
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    if movable {
+        lines.push(format!(
+            "Warning: a plugin loads before its master. 'agora games instance plugins sort {instance_id}' moves the master up, since the plugin's references may resolve wrongly until it does."
+        ));
+    }
+    if stuck {
+        lines.push(format!(
+            "Warning: a plugin loads before its master, and that master is locked or always loaded, so 'agora games instance plugins sort {instance_id}' cannot move it. Unlock the master, or move it above the plugin by hand."
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// What to do about a launch the plugin load order refuses. An inactive master is enabled;
@@ -11139,9 +11158,13 @@ fn launch_refusal_hint(
     use agora_core::game_load_order::{Finding, MasterProblem};
     let mut inactive: Vec<&str> = Vec::new();
     let mut late = false;
+    let mut stuck = false;
     for finding in findings {
         if let Finding::MasterNotEarlier {
-            master, problem, ..
+            master,
+            problem,
+            movable,
+            ..
         } = finding
         {
             match problem {
@@ -11150,7 +11173,13 @@ fn launch_refusal_hint(
                         inactive.push(master);
                     }
                 }
-                MasterProblem::Later => late = true,
+                MasterProblem::Later => {
+                    if *movable {
+                        late = true;
+                    } else {
+                        stuck = true;
+                    }
+                }
                 MasterProblem::Missing => {}
             }
         }
@@ -11164,6 +11193,11 @@ fn launch_refusal_hint(
     if late {
         hints.push(format!(
             "Run 'agora games instance plugins sort {instance_id}' to put a late master above its plugin."
+        ));
+    }
+    if stuck {
+        hints.push(format!(
+            "The late master above is locked or always loaded, so 'agora games instance plugins sort {instance_id}' cannot move it: unlock it, or move it by hand."
         ));
     }
     if hints.is_empty() {
@@ -13075,6 +13109,7 @@ mod tests {
             plugin: "Patch.esp".into(),
             master: "Base.esm".into(),
             problem: MasterProblem::Inactive,
+            movable: false,
         }];
         let hint = launch_refusal_hint("skyrim", &findings);
         assert!(hint.contains("plugins enable skyrim Base.esm"), "{hint}");
@@ -13088,6 +13123,7 @@ mod tests {
             plugin: "Patch.esp".into(),
             master: "Base.esm".into(),
             problem: MasterProblem::Later,
+            movable: true,
         }];
         let hint = launch_refusal_hint("skyrim", &findings);
         assert!(hint.contains("plugins sort skyrim"), "{hint}");

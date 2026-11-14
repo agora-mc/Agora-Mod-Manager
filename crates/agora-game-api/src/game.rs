@@ -2544,6 +2544,11 @@ pub enum LoadOrderRule {
         /// The rule applies only when both items are in the list, and says nothing otherwise.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         optional: bool,
+        /// Whether the master must also load above the item. A game may say `false` when the
+        /// engine loads the item in a later pass (Creation Engine light plugins load after every
+        /// full plugin), so the master only has to be installed and active. Defaults to `true`.
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        order: bool,
     },
     Conflicts {
         first: String,
@@ -2552,6 +2557,14 @@ pub enum LoadOrderRule {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         optional: bool,
     },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl LoadOrderRule {

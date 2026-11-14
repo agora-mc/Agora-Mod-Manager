@@ -141,6 +141,7 @@ export function creationEngineRules(args) {
   const rules = [];
   const badges = {};
   const findings = [];
+  const headers = new Map();
   let full = 0;
   let light = 0;
 
@@ -155,6 +156,7 @@ export function creationEngineRules(args) {
       });
       continue;
     }
+    headers.set(name.toLowerCase(), header);
     const marks = [];
     if (header.master) marks.push("Master");
     if (header.light) marks.push("Light");
@@ -165,8 +167,23 @@ export function creationEngineRules(args) {
     } else {
       full += 1;
     }
+  }
+
+  for (const entry of entries) {
+    const name = String(entry.id);
+    if (!entry.present || !entry.enabled) continue;
+    const header = headers.get(name.toLowerCase());
+    if (!header) continue;
     for (const master of header.masters) {
-      rules.push({ kind: "requires", item: name, master: master });
+      // Light plugins load amongst the others but the game then moves every one of them to the
+      // end of the load order, so a light plugin always loads after every full plugin. Only a
+      // light master can still come after it; a full master need not be above it in the list.
+      // Source: https://github.com/Ortham/libloadorder/blob/master/doc/src/load_order_mechanisms.md
+      const masterHeader = headers.get(String(master).toLowerCase());
+      const order = !(header.light && masterHeader && !masterHeader.light);
+      const rule = { kind: "requires", item: name, master: master };
+      if (!order) rule.order = false;
+      rules.push(rule);
     }
   }
 

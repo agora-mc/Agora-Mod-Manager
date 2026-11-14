@@ -64,9 +64,9 @@ pub enum LaunchError {
     #[error("frameworks do not match this game's version: {}", describe_runtime_findings(.findings))]
     RuntimeMismatch { findings: Vec<RuntimeFileFinding> },
     /// The plugin list breaks the game's load order rules (MASTER_SPEC §26.6): the game would crash
-    /// or refuse to load. `agora games instance plugins sort <instance>` fixes a master's order.
+    /// or refuse to load. `plugins check` names each change the player can make.
     #[error(
-        "the plugin load order would stop the game: {}. `agora games instance plugins sort <instance>` fixes master order",
+        "the plugin load order would stop the game: {}. Run `agora games instance plugins check <instance>` to see what to change",
         describe_findings(.findings)
     )]
     LoadOrderProblems { findings: Vec<Finding> },

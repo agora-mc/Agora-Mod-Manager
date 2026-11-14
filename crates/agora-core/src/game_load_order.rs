@@ -173,6 +173,10 @@ pub enum Finding {
         plugin: String,
         master: String,
         problem: MasterProblem,
+        /// Whether a sort could put the master above the plugin. False when the master is locked
+        /// or always loaded, so a hint that points at `sort` would be a lie.
+        #[serde(default = "default_true")]
+        movable: bool,
     },
     /// Plugins whose masters lead back to one another. The engine cannot order them.
     MasterCycle { plugins: Vec<String> },
@@ -198,6 +202,10 @@ pub enum Finding {
     },
     /// The list's rules hook failed, so its order could not be judged.
     RulesFailed { list: String, reason: String },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Why a master does not come before its plugin.
@@ -237,6 +245,7 @@ impl Finding {
                 plugin,
                 master,
                 problem,
+                ..
             } => match problem {
                 MasterProblem::Missing => format!(
                     "'{plugin}' needs '{master}', which is missing from the list or not installed"
@@ -1034,17 +1043,33 @@ pub fn apply_reply(
 // items and conflicts (which are not an ordering) are findings of their own.
 // ---------------------------------------------------------------------------
 
+struct RuleEdges {
+    /// Master edges that must come before the item, for sorting and cycle detection.
+    ordered: HashMap<String, Vec<String>>,
+    /// Requirements whose master only has to be installed and active: the engine loads the item
+    /// in a later pass, so its position in the list does not matter.
+    presence_only: HashMap<String, Vec<String>>,
+}
+
 fn rule_prerequisites(
     entries: &[LoadOrderEntry],
     rules: &[LoadOrderRule],
     list: &str,
-) -> (HashMap<String, Vec<String>>, Vec<Finding>) {
+) -> (RuleEdges, Vec<Finding>) {
     let known = |name: &str| entries.iter().any(|entry| key(&entry.name) == key(name));
-    let mut prereqs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut edges = RuleEdges {
+        ordered: HashMap::new(),
+        presence_only: HashMap::new(),
+    };
     let mut findings = Vec::new();
     for rule in rules {
         match rule {
-            LoadOrderRule::Requires { item, master, .. } => {
+            LoadOrderRule::Requires {
+                item,
+                master,
+                order,
+                ..
+            } => {
                 // A missing master is reported as a missing master below, in the words players
                 // know, so only an absent *item* is a rule that cannot be applied.
                 if rule.optional() && !(known(item) && known(master)) {
@@ -1058,9 +1083,14 @@ fn rule_prerequisites(
                     });
                     continue;
                 }
-                let edges = prereqs.entry(key(item)).or_default();
-                if !edges.iter().any(|edge| key(edge) == key(master)) {
-                    edges.push(master.clone());
+                let map = if *order {
+                    &mut edges.ordered
+                } else {
+                    &mut edges.presence_only
+                };
+                let masters = map.entry(key(item)).or_default();
+                if !masters.iter().any(|edge| key(edge) == key(master)) {
+                    masters.push(master.clone());
                 }
             }
             LoadOrderRule::Before { first, second, .. } => {
@@ -1078,9 +1108,9 @@ fn rule_prerequisites(
                     }
                 }
                 if both {
-                    let edges = prereqs.entry(key(second)).or_default();
-                    if !edges.iter().any(|edge| key(edge) == key(first)) {
-                        edges.push(first.clone());
+                    let masters = edges.ordered.entry(key(second)).or_default();
+                    if !masters.iter().any(|edge| key(edge) == key(first)) {
+                        masters.push(first.clone());
                     }
                 }
             }
@@ -1113,7 +1143,23 @@ fn rule_prerequisites(
             }
         }
     }
-    (prereqs, findings)
+    (edges, findings)
+}
+
+/// Whether a sort could put this late master above the item: the master must be free to move, and
+/// there must be a free slot above an item that itself cannot move.
+fn can_move_master(entries: &[LoadOrderEntry], at: usize, master: &str) -> bool {
+    let dependent = &entries[at];
+    if (dependent.implicit || dependent.locked)
+        && !entries[..at]
+            .iter()
+            .any(|entry| !entry.implicit && !entry.locked)
+    {
+        return false;
+    }
+    entries.iter().enumerate().skip(at + 1).any(|(_, entry)| {
+        loads(entry) && key(&entry.name) == master && !entry.implicit && !entry.locked
+    })
 }
 
 /// The findings a script list's rules raise against its current order: missing items, conflicts,
@@ -1123,16 +1169,14 @@ pub fn script_findings(
     rules: &[LoadOrderRule],
     list: &str,
 ) -> Vec<Finding> {
-    let (prereqs, mut out) = rule_prerequisites(entries, rules, list);
+    let (edges, mut out) = rule_prerequisites(entries, rules, list);
     for (at, entry) in entries.iter().enumerate() {
         if !loads(entry) {
             continue;
         }
-        let Some(masters) = prereqs.get(&key(&entry.name)) else {
-            continue;
-        };
+        let item = key(&entry.name);
         let mut reported: HashSet<String> = HashSet::new();
-        for master in masters {
+        for master in edges.ordered.get(&item).into_iter().flatten() {
             let k = key(master);
             if !reported.insert(k.clone()) || master_loads_before(entries, at, &k) {
                 continue;
@@ -1141,13 +1185,34 @@ pub fn script_findings(
                 plugin: entry.name.clone(),
                 master: master.clone(),
                 problem: master_problem(entries, at, &k),
+                movable: can_move_master(entries, at, &k),
             });
+        }
+        // An order-independent requirement still needs its master installed and active.
+        for master in edges.presence_only.get(&item).into_iter().flatten() {
+            let k = key(master);
+            if !reported.insert(k.clone()) || master_loads_before(entries, at, &k) {
+                continue;
+            }
+            let problem = master_problem(entries, at, &k);
+            if problem != MasterProblem::Later {
+                out.push(Finding::MasterNotEarlier {
+                    plugin: entry.name.clone(),
+                    master: master.clone(),
+                    problem,
+                    movable: false,
+                });
+            }
         }
     }
 
     let mut scratch = entries.to_vec();
     for entry in &mut scratch {
-        entry.masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
+        entry.masters = edges
+            .ordered
+            .get(&key(&entry.name))
+            .cloned()
+            .unwrap_or_default();
     }
     for group in cycle_groups(&scratch) {
         out.push(Finding::MasterCycle {
@@ -1160,11 +1225,15 @@ pub fn script_findings(
     out
 }
 
-/// Put the rules' prerequisite edges onto the entries, so sorting can see them.
+/// Put the rules' ordering edges onto the entries, so sorting can see them.
 pub fn set_prerequisites(entries: &mut [LoadOrderEntry], rules: &[LoadOrderRule], list: &str) {
-    let (prereqs, _) = rule_prerequisites(entries, rules, list);
+    let (edges, _) = rule_prerequisites(entries, rules, list);
     for entry in entries.iter_mut() {
-        entry.masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
+        entry.masters = edges
+            .ordered
+            .get(&key(&entry.name))
+            .cloned()
+            .unwrap_or_default();
     }
 }
 
@@ -1176,10 +1245,14 @@ pub fn script_sort(
     rules: &[LoadOrderRule],
     list: &str,
 ) -> Result<(Vec<SortMove>, Vec<Blocked>), LoadOrderError> {
-    let (prereqs, _) = rule_prerequisites(entries, rules, list);
+    let (edges, _) = rule_prerequisites(entries, rules, list);
     let mut scratch = entries.to_vec();
     for entry in &mut scratch {
-        entry.masters = prereqs.get(&key(&entry.name)).cloned().unwrap_or_default();
+        entry.masters = edges
+            .ordered
+            .get(&key(&entry.name))
+            .cloned()
+            .unwrap_or_default();
     }
     let (moves, blocked) = sort_entries(&mut scratch)?;
     for entry in &mut scratch {
@@ -2155,6 +2228,16 @@ mod tests {
             item: item.into(),
             master: master.into(),
             optional: false,
+            order: true,
+        }
+    }
+
+    fn requires_active_only(item: &str, master: &str) -> LoadOrderRule {
+        LoadOrderRule::Requires {
+            item: item.into(),
+            master: master.into(),
+            optional: false,
+            order: false,
         }
     }
 
@@ -2216,8 +2299,51 @@ mod tests {
                 plugin: "A.esp".into(),
                 master: "B.esm".into(),
                 problem: MasterProblem::Later,
+                movable: true,
             }]
         );
+    }
+
+    #[test]
+    fn an_order_independent_requirement_keeps_quiet_about_the_list_position_but_not_about_absence() {
+        // A light plugin before a full master: the engine loads it later anyway.
+        let list = [entry("A.esp", &[]), entry("B.esm", &[])];
+        assert!(script_findings(
+            &list,
+            &[requires_active_only("A.esp", "B.esm")],
+            "plugins"
+        )
+        .is_empty());
+
+        let mut inactive = entry("B.esm", &[]);
+        inactive.active = false;
+        let inactive_list = [entry("A.esp", &[]), inactive];
+        assert!(matches!(
+            script_findings(
+                &inactive_list,
+                &[requires_active_only("A.esp", "B.esm")],
+                "plugins"
+            )
+            .as_slice(),
+            [Finding::MasterNotEarlier {
+                problem: MasterProblem::Inactive,
+                ..
+            }]
+        ));
+
+        let missing = [entry("A.esp", &[])];
+        assert!(matches!(
+            script_findings(
+                &missing,
+                &[requires_active_only("A.esp", "Gone.esm")],
+                "plugins"
+            )
+            .as_slice(),
+            [Finding::MasterNotEarlier {
+                problem: MasterProblem::Missing,
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -2231,6 +2357,7 @@ mod tests {
                 plugin: "A.esp".into(),
                 master: "B.esm".into(),
                 problem: MasterProblem::Inactive,
+                movable: false,
             }]
         );
         let missing = [entry("A.esp", &[])];
@@ -2240,6 +2367,7 @@ mod tests {
                 plugin: "A.esp".into(),
                 master: "Gone.esm".into(),
                 problem: MasterProblem::Missing,
+                movable: false,
             }]
         );
     }
