@@ -110,6 +110,11 @@ struct RawOptions {
     mounts: Vec<RawMount>,
     #[serde(default)]
     limits: Option<RawLimits>,
+    /// Leave the raw `stdout` and `stderr` byte arrays out of the answer, so a
+    /// large text reply never has to cross the script boundary twice. The text
+    /// fields are always present.
+    #[serde(default)]
+    text_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +250,7 @@ fn run_inner(
             format!("the module options are not valid: {e}"),
         )
     })?;
+    let text_only = options.text_only.unwrap_or(false);
     let stdin = options.stdin.map(RawBytes::into_bytes).unwrap_or_default();
     let mounts = validate_mounts(options.mounts, game_reads.as_ref(), stored_blobs.as_ref())?;
     let (memory_limit, timeout, stage_limits) = limits(options.limits)?;
@@ -342,6 +348,7 @@ fn run_inner(
         remaining,
         data_root,
         slots,
+        text_only,
     ));
     // Dropping a runtime waits for its `spawn_blocking` tasks. A compile the
     // deadline abandoned must not hold the call open, so shut the runtime down
@@ -408,6 +415,7 @@ async fn execute<S: StdinStream + 'static>(
     remaining: Duration,
     data_root: &Path,
     slots: Arc<Semaphore>,
+    text_only: bool,
 ) -> Result<WasmRunResult, WasmError> {
     let engine = engine(data_root);
     start_ticker(&engine);
@@ -547,10 +555,17 @@ async fn execute<S: StdinStream + 'static>(
         }
     };
 
+    let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
+    let stderr_text = String::from_utf8_lossy(&stderr).into_owned();
+    let (stdout, stderr) = if text_only {
+        (Vec::new(), Vec::new())
+    } else {
+        (stdout, stderr)
+    };
     Ok(WasmRunResult {
         exit_code,
-        stdout_text: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr_text: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_text,
+        stderr_text,
         stdout,
         stderr,
     })
@@ -971,6 +986,7 @@ mod tests {
             limit,
             data.path(),
             Arc::new(Semaphore::new(1)),
+            false,
         ));
         let elapsed = started.elapsed();
         assert!(

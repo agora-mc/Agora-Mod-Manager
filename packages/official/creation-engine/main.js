@@ -3145,15 +3145,17 @@ export async function lootSort(args) {
   }
   const stored = [status.masterlistKey];
   if (status.preludeKey) stored.push(status.preludeKey);
+  const request = {
+    game_type: options.game_type,
+    data: "/data",
+    load_order: entries.names,
+    active: entries.active,
+    masterlist: "/input/" + status.masterlistKey,
+    prelude: status.preludeKey ? "/input/" + status.preludeKey : null,
+  };
+  if (Array.isArray(args && args.rules) && args.rules.length) request.rules = args.rules;
   const result = wasm.run("wasm/loot-sort.wasm", {
-    stdin: JSON.stringify({
-      game_type: options.game_type,
-      data: "/data",
-      load_order: entries.names,
-      active: entries.active,
-      masterlist: "/input/" + status.masterlistKey,
-      prelude: status.preludeKey ? "/input/" + status.preludeKey : null,
-    }),
+    stdin: JSON.stringify(request),
     mounts: [
       {
         guest: "/data",
@@ -3185,4 +3187,263 @@ export async function lootSort(args) {
     general.push({ level: message.level, text: message.text });
   }
   return { order: reply.order || [], notes: notes, general: general };
+}
+
+// ---------------------------------------------------------------------------
+// Record overlaps (MASTER_SPEC §31.3)
+//
+// wasm/plugin-records.wasm reads the active plugin files and reports the record
+// keys that two or more of them have. This script keeps each file's index in
+// the plugin's own file store, split into small blobs so a large master never
+// has to travel through the script in one piece.
+//
+// A warm call sends the saved indexes and asks for the overlaps. A plugin with
+// no saved index is returned as `stale`; this script indexes it alone, saves
+// it, and asks again. A file that cannot be read is a note naming it, and the
+// other files are still checked.
+// ---------------------------------------------------------------------------
+
+const OVERLAPS_INDEX_KEY = "overlaps.index";
+
+function overlapsEntries(args) {
+  const entries = (args && args.entries) || [];
+  const names = [];
+  const seen = new Set();
+  for (const entry of entries) {
+    if (!entry.present) continue;
+    if (!entry.active && !entry.implicit) continue;
+    if (seen.has(entry.name)) continue;
+    seen.add(entry.name);
+    names.push(entry.name);
+  }
+  if (entries.length === 0) {
+    for (const name of ((args && args.active) || []).concat((args && args.implicit) || [])) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      names.push(name);
+    }
+  }
+  return { names: names };
+}
+
+const RECORDS_DATA_MOUNT = {
+  guest: "/data",
+  view: { folder: "Data", patterns: ["*.esm", "*.esl", "*.esp"] },
+};
+
+/// Decode base64 into bytes without building a second string or an array of
+/// character codes, so a large part never doubles the script's memory.
+function base64ToBytes(text) {
+  let characters = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 61) break; // '='
+    if (code === 10 || code === 13 || code === 32 || code === 9) continue;
+    characters += 1;
+  }
+  const out = new Uint8Array(Math.floor((characters * 6) / 8));
+  let buffer = 0;
+  let bits = 0;
+  let written = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (code === 61) break;
+    if (code === 10 || code === 13 || code === 32 || code === 9) continue;
+    let value;
+    if (code >= 65 && code <= 90) value = code - 65;
+    else if (code >= 97 && code <= 122) value = code - 71;
+    else if (code >= 48 && code <= 57) value = code + 4;
+    else if (code === 43) value = 62;
+    else if (code === 47) value = 63;
+    else throw new Error("the records module sent bytes that are not base64");
+    buffer = (buffer << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[written] = (buffer >> bits) & 0xff;
+      written += 1;
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  return out.subarray(0, written);
+}
+
+function recordsReply(result) {
+  if (result.exitCode !== 0) {
+    let message = result.stderrText || "the records module did not finish";
+    try {
+      const failure = JSON.parse(result.stdoutText);
+      if (failure && failure.error) message = failure.error;
+    } catch (error) {
+      // Not its JSON error reply; the stderr text is the best we have.
+    }
+    throw new Error(message);
+  }
+  try {
+    return JSON.parse(result.stdoutText);
+  } catch (error) {
+    throw new Error("the records module sent an answer Agora cannot read");
+  }
+}
+
+function runRecords(request, stored) {
+  const mounts = [RECORDS_DATA_MOUNT];
+  if (stored && stored.length) mounts.push({ guest: "/index", stored: stored });
+  return recordsReply(
+    wasm.run("wasm/plugin-records.wasm", {
+      stdin: JSON.stringify(request),
+      mounts: mounts,
+      limits: { timeoutMs: 120000 },
+      textOnly: true,
+    }),
+  );
+}
+
+/// One index part is small enough to cross the script boundary, and one stored
+/// blob is small enough for `storage.putBytes` to turn into a byte array.
+const RECORDS_PART_BYTES = 4 * 1024 * 1024;
+const RECORDS_BLOB_BYTES = 512 * 1024;
+/// Keys per overlap page. Small enough that the script's object graph for one
+/// page is far below its memory limit while the whole set is assembled.
+const OVERLAPS_PAGE = 10000;
+
+/// Index one file in parts and keep every part in the plugin's own store.
+async function indexRecordFile(name, previous) {
+  let from = 0;
+  let notes = [];
+  let entry = null;
+  const chunks = [];
+  for (let part = 0; part < 64; part += 1) {
+    const reply = runRecords(
+      { mode: "index", plugins: [name], from: from, length: RECORDS_PART_BYTES },
+      [],
+    );
+    notes = reply.notes || [];
+    const built = (reply.indexes || [])[0];
+    if (!built) return { notes: notes };
+    const bytes = base64ToBytes(built.bytes);
+    if (bytes.length === 0 && Number(built.total) > from) {
+      throw new Error("the records module returned an empty part for " + name);
+    }
+    for (let offset = 0; offset < bytes.length; offset += RECORDS_BLOB_BYTES) {
+      const piece = bytes.subarray(offset, Math.min(offset + RECORDS_BLOB_BYTES, bytes.length));
+      const chunkKey = built.key + "." + chunks.length;
+      await storage.putBytes(chunkKey, piece);
+      chunks.push(chunkKey);
+    }
+    entry = {
+      key: built.key,
+      size: built.size,
+      modified: built.modified,
+      version: built.version,
+      chunks: chunks,
+    };
+    from += bytes.length;
+    if (from >= Number(built.total)) break;
+  }
+  if (!entry || chunks.length === 0) {
+    throw new Error("the records module returned no index for " + name);
+  }
+  const old = previous && Array.isArray(previous.chunks) ? previous.chunks : [];
+  for (const chunk of old) {
+    if (chunks.includes(chunk)) continue;
+    try {
+      await storage.deleteBytes(chunk);
+    } catch (error) {
+      // An old chunk that cannot be removed is wasted space, not a wrong answer.
+    }
+  }
+  return { entry: entry, notes: notes };
+}
+
+function overlapNotes(notes) {
+  return (notes || []).map((note) => ({
+    item: note.item || "",
+    level: note.level || "warn",
+    text: note.text || "the records module reported a problem",
+  }));
+}
+
+/// The records shared by the active plugins, in load order (MASTER_SPEC §31.3).
+export async function overlaps(args) {
+  const names = overlapsEntries(args).names;
+  if (names.length < 2) return { keys: [], notes: [] };
+
+  const saved = await storage.get(OVERLAPS_INDEX_KEY);
+  const files = (saved && saved.files) || {};
+  const notes = [];
+  const failed = new Set();
+  const addNotes = (incoming) => {
+    for (const note of overlapNotes(incoming)) {
+      if (notes.some((seen) => seen.item === note.item && seen.text === note.text)) continue;
+      notes.push(note);
+    }
+  };
+
+  for (const name of names) {
+    const entry = files[name];
+    if (entry && Array.isArray(entry.chunks) && entry.chunks.length) continue;
+    const indexed = await indexRecordFile(name, entry);
+    addNotes(indexed.notes);
+    if (indexed.entry) files[name] = indexed.entry;
+    else failed.add(name);
+  }
+  if (Object.keys(files).length) await storage.set(OVERLAPS_INDEX_KEY, { files });
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const checked = names.filter((name) => !failed.has(name));
+    const cached = [];
+    const stored = [];
+    for (const name of checked) {
+      const entry = files[name];
+      if (!entry || !Array.isArray(entry.chunks)) continue;
+      cached.push({ name: name, chunks: entry.chunks });
+      for (const chunk of entry.chunks) stored.push(chunk);
+    }
+    const keys = [];
+    let offset = 0;
+    let stale = [];
+    while (true) {
+      const reply = runRecords(
+        { mode: "overlaps", plugins: checked, cached: cached, offset: offset, limit: OVERLAPS_PAGE },
+        stored,
+      );
+      addNotes(reply.notes);
+      for (const built of reply.indexes || []) {
+        const indexed = await indexRecordFile(built.name, files[built.name]);
+        if (indexed.entry) files[built.name] = indexed.entry;
+        addNotes(indexed.notes);
+      }
+      if (reply.indexes && reply.indexes.length) {
+        await storage.set(OVERLAPS_INDEX_KEY, { files: files });
+      }
+      stale = reply.stale || [];
+      if (stale.length) break;
+      const page = reply.keys || [];
+      for (const key of page) keys.push(key);
+      offset += page.length;
+      if (page.length === 0 || offset >= Number(reply.total)) {
+        return { keys: keys, notes: notes };
+      }
+    }
+    let progressed = false;
+    for (const name of stale) {
+      const indexed = await indexRecordFile(name, files[name]);
+      addNotes(indexed.notes);
+      if (indexed.entry) {
+        files[name] = indexed.entry;
+        progressed = true;
+      } else {
+        failed.add(name);
+        progressed = true;
+      }
+    }
+    await storage.set(OVERLAPS_INDEX_KEY, { files: files });
+    if (!progressed) break;
+    if (attempt === 2) {
+      throw new Error("the plugin records could not be re-indexed: " + stale.join(", "));
+    }
+  }
+  // The files that could not be read were named in a note, and the rest were checked.
+  return { keys: [], notes: notes };
 }

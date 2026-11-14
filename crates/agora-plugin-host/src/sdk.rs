@@ -126,6 +126,7 @@ const wasm = {
     const payload = { mounts };
     if (opts.stdin !== undefined) payload.stdin = encode(opts.stdin);
     if (opts.limits) payload.limits = opts.limits;
+    if (opts.textOnly) payload.textOnly = true;
     return JSON.parse(__agora_wasm_run(module, JSON.stringify(payload)));
   },
 };

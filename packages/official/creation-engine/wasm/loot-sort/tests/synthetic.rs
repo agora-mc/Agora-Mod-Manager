@@ -335,3 +335,49 @@ fn inline_yaml_removes_the_need_for_yaml_paths() {
     let reply = run_request(&request).unwrap();
     assert_eq!(order_of(&reply), ["A.esp"]);
 }
+
+#[test]
+fn an_instance_rule_overrides_the_alphabetical_tie_break() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["A.esp", "B.esp"] {
+        write_plugin(&data, name, &[]);
+    }
+    let masterlist = dir.path().join("masterlist.yaml");
+    std::fs::write(&masterlist, "plugins: []\n").unwrap();
+    let order = ["A.esp", "B.esp"];
+
+    let plain = request(&data, &order, &order, &masterlist, None);
+    let reply = run_request(&plain).unwrap();
+    let default_order = order_of(&reply);
+    assert!(
+        position(&default_order, "A.esp") < position(&default_order, "B.esp"),
+        "{default_order:?}"
+    );
+
+    let rules = json_object(&[("item", quote("A.esp")), ("after", quote("B.esp"))]);
+    let names: Vec<String> = order.iter().map(|name| (*name).to_string()).collect();
+    let with_rule = json_object(&[
+        ("game_type", quote("SkyrimSE")),
+        ("data", quote(&data.to_string_lossy())),
+        ("load_order", format_array(&names)),
+        ("active", format_array(&names)),
+        ("masterlist", quote(&masterlist.to_string_lossy())),
+        ("prelude", "null".to_string()),
+        ("rules", format!("[{rules}]")),
+    ]);
+    let reply = run_request(&with_rule).unwrap();
+    let ruled = order_of(&reply);
+    assert!(
+        position(&ruled, "B.esp") < position(&ruled, "A.esp"),
+        "the rule must keep A.esp after B.esp: {ruled:?}"
+    );
+}
+
+#[test]
+fn a_rule_without_an_after_is_refused() {
+    let request = "{\"game_type\":\"SkyrimSE\",\"data\":\".\",\"load_order\":[],\"active\":[],\"masterlist\":\"m.yaml\",\"rules\":[{\"item\":\"A.esp\"}]}";
+    let error = run_request(request).unwrap_err();
+    assert!(error.contains("'after'"), "{error}");
+}
