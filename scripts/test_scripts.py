@@ -4176,28 +4176,29 @@ class TestGenAddrlibNames(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "checkout"
             self._checkout(root)
-            out = Path(temporary) / "names.json"
-            result = gan.generate(root, out, out.with_suffix(".js"))
+            out = Path(temporary) / "names.js"
+            result = gan.generate(root, out)
 
-            table = json.loads(out.read_text(encoding="utf-8"))
-            self.assertEqual(table["source"]["repo"], "https://example.test/invented")
-            self.assertEqual(table["source"]["commit"], "deadbeef")
-            self.assertEqual(table["source"]["licence"], "MIT")
-            self.assertEqual(table["se"]["100"], "Thing::Go")
-            self.assertEqual(table["ae"]["200"], "Thing::Go")
-            self.assertEqual(table["se"]["101"], "ExampleThing::GetValue")
-            self.assertEqual(table["se"]["102"], "ExampleThing::MakeVariant")
-            self.assertEqual(table["se"]["109"], "ExampleThing::Holder::value")
-            self.assertEqual(table["se"]["108"], "First::One")
-            self.assertEqual(table["ae"]["208"], "First::One")
-            self.assertEqual(table["ae"]["103"], "ExampleThing::AeOnly")
-            self.assertNotIn("103", table["se"])
-            self.assertNotIn("104", table["se"])
-            self.assertNotIn("104", table["ae"])
-            self.assertNotIn("105", table["se"])
-            self.assertNotIn("106", table["ae"])
-            self.assertNotIn("999", table["se"])
-            self.assertNotIn("999", table["ae"])
+            js = out.read_text(encoding="utf-8")
+            self.assertIn("// Source: https://example.test/invented at deadbeef", js)
+            self.assertIn("// Licence: MIT", js)
+            self.assertIn("export const SE_NAMES", js)
+            se, ae = js.split("export const AE_NAMES")
+            self.assertIn('"100": "Thing::Go"', se)
+            self.assertIn('"200": "Thing::Go"', ae)
+            self.assertIn('"101": "ExampleThing::GetValue"', se)
+            self.assertIn('"102": "ExampleThing::MakeVariant"', se)
+            self.assertIn('"109": "ExampleThing::Holder::value"', se)
+            self.assertIn('"108": "First::One"', se)
+            self.assertIn('"208": "First::One"', ae)
+            self.assertIn('"103": "ExampleThing::AeOnly"', ae)
+            self.assertNotIn('"103"', se)
+            self.assertNotIn('"104"', se)
+            self.assertNotIn('"104"', ae)
+            self.assertNotIn('"105"', se)
+            self.assertNotIn('"106"', ae)
+            self.assertNotIn('"999"', se)
+            self.assertNotIn('"999"', ae)
             self.assertEqual(result["conflicts"], 2)
             self.assertTrue(any("offset table" in shape for shape in result["unparsed"]))
             self.assertTrue(
@@ -4206,30 +4207,23 @@ class TestGenAddrlibNames(unittest.TestCase):
             self.assertTrue(
                 any("REL::ID with no single runtime" in shape for shape in result["unparsed"])
             )
-            js = out.with_suffix(".js").read_text(encoding="utf-8")
-            self.assertIn("export const SE_NAMES", js)
-            self.assertIn('"100": "Thing::Go"', js)
 
     def test_a_rerun_on_the_same_checkout_is_byte_identical(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "checkout"
             self._checkout(root)
-            first = Path(temporary) / "one.json"
-            second = Path(temporary) / "two.json"
-            gan.generate(root, first, first.with_suffix(".js"))
-            gan.generate(root, second, second.with_suffix(".js"))
+            first = Path(temporary) / "one.js"
+            second = Path(temporary) / "two.js"
+            gan.generate(root, first)
+            gan.generate(root, second)
             self.assertEqual(first.read_bytes(), second.read_bytes())
-            self.assertEqual(
-                first.with_suffix(".js").read_bytes(),
-                second.with_suffix(".js").read_bytes(),
-            )
 
     def test_missing_source_metadata_is_an_error(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "checkout"
             root.mkdir()
             with self.assertRaises(gan.GenerationError):
-                gan.generate(root, Path(temporary) / "names.json")
+                gan.generate(root, Path(temporary) / "names.js")
 
 
 if __name__ == "__main__":

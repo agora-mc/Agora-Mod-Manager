@@ -2436,7 +2436,7 @@
         }
       },
       "next_step": "restore_save",
-      "reference": "Phostwood js/diagnoses.js:1763 (GPL-3, idea); names from crash/addrlib-names.json"
+      "reference": "Phostwood js/diagnoses.js:1763 (GPL-3, idea); names from crash/addrlib-names.js"
     },
     {
       "id": "load_subsystem_fault",
@@ -2503,7 +2503,7 @@
         }
       },
       "next_step": "restore_save",
-      "reference": "Phostwood js/diagnoses.js:1763 (GPL-3, idea); names from crash/addrlib-names.json"
+      "reference": "Phostwood js/diagnoses.js:1763 (GPL-3, idea); names from crash/addrlib-names.js"
     },
     {
       "id": "deleted_record_in_use",
