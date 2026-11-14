@@ -7226,7 +7226,8 @@ async fn run_command(
                                     );
                                     print_load_order_findings(&findings);
                                     eprintln!(
-                                        "Run 'agora games instance plugins sort {instance_id}' to fix master order, or pass --launch-anyway to start the game anyway."
+                                        "{}",
+                                        launch_refusal_hint(&instance_id, &findings)
                                     );
                                 }
                                 std::process::exit(1);
@@ -10882,6 +10883,53 @@ fn sort_hint(
     })
 }
 
+/// What to do about a launch the plugin load order refuses. An inactive master is enabled;
+/// only a master that is merely out of order is sorted.
+fn launch_refusal_hint(
+    instance_id: &str,
+    findings: &[agora_core::game_load_order::Finding],
+) -> String {
+    use agora_core::game_load_order::{Finding, MasterProblem};
+    let mut inactive: Vec<&str> = Vec::new();
+    let mut late = false;
+    for finding in findings {
+        if let Finding::MasterNotEarlier {
+            master, problem, ..
+        } = finding
+        {
+            match problem {
+                MasterProblem::Inactive => {
+                    if !inactive.contains(&master.as_str()) {
+                        inactive.push(master);
+                    }
+                }
+                MasterProblem::Later => late = true,
+                MasterProblem::Missing => {}
+            }
+        }
+    }
+    let mut hints = Vec::new();
+    for master in inactive {
+        hints.push(format!(
+            "Run 'agora games instance plugins enable {instance_id} {master}' to enable the inactive master."
+        ));
+    }
+    if late {
+        hints.push(format!(
+            "Run 'agora games instance plugins sort {instance_id}' to put a late master above its plugin."
+        ));
+    }
+    if hints.is_empty() {
+        hints.push(format!(
+            "Run 'agora games instance plugins check {instance_id}' for the full list."
+        ));
+    }
+    format!(
+        "{} Or pass --launch-anyway to start the game anyway.",
+        hints.join(" ")
+    )
+}
+
 /// The instance's effective load order, one plugin per line: position, state, the master and
 /// the game's badges for it, the lock, who put the line there, and the name.
 fn print_load_order(instance_id: &str, order: &agora_core::game_load_order::LoadOrder) {
@@ -12716,6 +12764,7 @@ mod tests {
     use super::describe_loadout_change;
     use super::exit_code_from_error;
     use super::exit_code_from_launcher_error;
+    use super::launch_refusal_hint;
     use super::Cli;
     use super::Commands;
     use super::LoadoutCmd;
@@ -12737,6 +12786,35 @@ mod tests {
         SourceType,
     };
     use clap::Parser;
+
+    #[test]
+    fn an_inactive_master_hint_names_the_plugin_and_the_enable_command() {
+        use agora_core::game_load_order::{Finding, MasterProblem};
+        let findings = vec![Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: MasterProblem::Inactive,
+        }];
+        let hint = launch_refusal_hint("skyrim", &findings);
+        assert!(
+            hint.contains("plugins enable skyrim Base.esm"),
+            "{hint}"
+        );
+        assert!(!hint.contains("plugins sort"), "{hint}");
+    }
+
+    #[test]
+    fn a_late_master_keeps_the_sort_hint() {
+        use agora_core::game_load_order::{Finding, MasterProblem};
+        let findings = vec![Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: MasterProblem::Later,
+        }];
+        let hint = launch_refusal_hint("skyrim", &findings);
+        assert!(hint.contains("plugins sort skyrim"), "{hint}");
+        assert!(!hint.contains("plugins enable"), "{hint}");
+    }
 
     #[test]
     fn inventory_command_parses_instance_id() {

@@ -1356,7 +1356,34 @@ pub fn framework_finding(finding: &RuntimeFileFinding) -> CheckFinding {
 }
 
 pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> CheckFinding {
+    use agora_core::game_load_order::{Finding, MasterProblem};
     let blocks = finding.refuses_launch();
+    let repair = match finding {
+        Finding::MasterNotEarlier {
+            master,
+            problem: MasterProblem::Inactive,
+            ..
+        } => format!(
+            "Open this instance's Plugins tab and enable '{master}', then check again. Sorting cannot enable an inactive master."
+        ),
+        Finding::MasterNotEarlier {
+            master,
+            problem: MasterProblem::Missing,
+            ..
+        } => format!(
+            "Install '{master}', or disable the plugin that needs it. Sorting cannot add a missing master."
+        ),
+        Finding::MasterNotEarlier {
+            problem: MasterProblem::Later,
+            ..
+        } => "Open this instance's Plugins tab and choose Sort, then check again.".to_string(),
+        Finding::MasterCycle { plugins } => format!(
+            "Disable one of {}, because they need one another in a loop; Sort cannot fix a loop.",
+            plugins.join(", ")
+        ),
+        _ => "Open this instance's Plugins tab and review the problem, then check again."
+            .to_string(),
+    };
     CheckFinding {
         kind: "load_order",
         blocks,
@@ -1369,9 +1396,7 @@ pub fn load_order_finding(finding: &agora_core::game_load_order::Finding) -> Che
             "The game may still load these plugins, but the order can cause odd behaviour."
                 .to_string()
         },
-        repair: Some(
-            "Open this instance's Plugins tab and choose Sort, then check again.".to_string(),
-        ),
+        repair: Some(repair),
     }
 }
 
@@ -1860,6 +1885,29 @@ mod tests {
             "a header that cannot be read is a warning"
         );
         assert_eq!(unreadable.kind, "load_order");
+    }
+
+    #[test]
+    fn an_inactive_master_repair_says_to_enable_it_not_sort() {
+        let inactive = load_order_finding(&Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: agora_core::game_load_order::MasterProblem::Inactive,
+        });
+        let repair = inactive.repair.as_deref().unwrap_or_default();
+        assert!(repair.contains("enable 'Base.esm'"), "{repair}");
+        assert!(!repair.contains("choose Sort"), "{repair}");
+
+        let late = load_order_finding(&Finding::MasterNotEarlier {
+            plugin: "Patch.esp".into(),
+            master: "Base.esm".into(),
+            problem: agora_core::game_load_order::MasterProblem::Later,
+        });
+        assert!(
+            late.repair.as_deref().unwrap_or_default().contains("choose Sort"),
+            "{:?}",
+            late.repair
+        );
     }
 
     #[test]
