@@ -112,6 +112,53 @@ pub struct SuppliedCrashAnswer {
     pub reason: Option<String>,
 }
 
+/// Close this instance's sessions nobody watched to the end and diagnose the evidence written
+/// since they started. Best effort: a failure to load the packs is reported to the log and never
+/// turned into a missing answer.
+pub fn catch_up(ctx: &agora_core::ctx::Ctx, instance_id: &str) {
+    let host: Arc<dyn ScriptHost> = Arc::new(agora_plugin_host::QuickJsHost::new());
+    let installed = match agora_core::crash_live::load_installed_packs(ctx, host.clone()) {
+        Ok(installed) => installed,
+        Err(error) => {
+            eprintln!("[crash] unwatched sessions were not checked: {error}");
+            return;
+        }
+    };
+    let built_in = agora_game_minecraft::crash::built_in_packs();
+    let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
+    let report = agora_core::crash_live::catch_up(
+        ctx,
+        instance_id,
+        agora_core::crash_live::LivePacks {
+            packs: &installed.packs,
+            built_in: &built_in,
+            host: host.as_ref(),
+            instances: Some(&instances),
+        },
+    );
+    for session in report.sessions {
+        if session.answer.is_some() {
+            eprintln!(
+                "[crash] closed session '{}', which was not watched to the end, and checked it for a crash",
+                session.session_id
+            );
+        }
+    }
+    if let Some(user) = report.user_files {
+        if let Some(error) = &user.error {
+            eprintln!(
+                "[crash] the per-user files could not be restored ({error}); run `agora games user-files restore {} {}` once the game has closed",
+                user.game, user.store
+            );
+        } else if user.restored > 0 {
+            eprintln!(
+                "[crash] restored {} per-user file(s); {} changed during the session",
+                user.restored, user.changed
+            );
+        }
+    }
+}
+
 /// The stored answer for one session.
 #[tauri::command]
 pub async fn get_crash_answer(
@@ -122,6 +169,10 @@ pub async fn get_crash_answer(
     blocking(move || {
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
             .map_err(core_failed)?;
+        let record = session_ledger::get(&conn, &session_id).map_err(core_failed)?;
+        if let Some(record) = &record {
+            catch_up(&ctx, &record.instance_id);
+        }
         let stored = answer_for_session(&conn, &session_id)
             .map_err(core_failed)?
             .ok_or_else(|| {
@@ -130,7 +181,6 @@ pub async fn get_crash_answer(
                     "Agora has no stored answer for that crash.",
                 )
             })?;
-        let record = session_ledger::get(&conn, &session_id).map_err(core_failed)?;
         Ok(detail(stored, record))
     })
     .await
@@ -144,6 +194,7 @@ pub async fn list_crash_answers(
 ) -> Result<CrashAnswerList, GamesError> {
     let ctx = crate::core_context(&app)?;
     blocking(move || {
+        catch_up(&ctx, &instance_id);
         let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db())
             .map_err(core_failed)?;
         let answers = answers_for_instance(&conn, &instance_id)

@@ -478,6 +478,14 @@ pub async fn launch_instance(
         health_scan_token,
         quick_play: None,
     };
+    {
+        let catch_ctx = ctx.clone();
+        let catch_instance = sanitized.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::games::crash_answers::catch_up(&catch_ctx, &catch_instance);
+        })
+        .await;
+    }
     let state_for_monitor = state.inner().clone();
     let launch_result = agora_game_minecraft::launch_service::LaunchService::new(ctx.clone())
         .launch(request, &progress)
@@ -729,6 +737,14 @@ pub async fn launch_instance_with_recovery(
         health_scan_token,
         quick_play: None,
     };
+    {
+        let catch_ctx = ctx.clone();
+        let catch_instance = request.instance_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::games::crash_answers::catch_up(&catch_ctx, &catch_instance);
+        })
+        .await;
+    }
     let task = tokio::spawn(async move {
         agora_game_minecraft::launch_service::LaunchService::new(ctx)
             .launch_with_recovery(request, action, &progress)
@@ -829,6 +845,14 @@ pub async fn launch_instance_direct(
         health_scan_token,
         quick_play,
     };
+    {
+        let catch_ctx = ctx.clone();
+        let catch_instance = request.instance_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::games::crash_answers::catch_up(&catch_ctx, &catch_instance);
+        })
+        .await;
+    }
     let task = tokio::spawn(async move {
         agora_game_minecraft::launch_service::LaunchService::new(ctx)
             .launch(request, &progress)

@@ -729,6 +729,100 @@ pub fn restore(
     restore_journal_internal(ctx, definition, &journal)
 }
 
+/// What a catch-up did with the per-user files of one finished session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FinishedRestore {
+    pub game: GameId,
+    pub store: StoreId,
+    pub instance_id: String,
+    pub restored: usize,
+    pub changed: usize,
+    /// Why the journal is still swapped in. `None` means it was restored and removed.
+    pub error: Option<String>,
+}
+
+/// Put back the user files of this instance's finished swap session, if there is one and its game
+/// is not running. A running game is left alone, and a journal that cannot be read or restored is
+/// reported rather than called success. Game-free: the journal itself names the game and store.
+pub fn restore_finished_for_instance(ctx: &Ctx, instance_id: &str) -> Option<FinishedRestore> {
+    let root = ctx.paths.user_files_root();
+    let entries = std::fs::read_dir(&root).ok()?;
+    for entry in entries.flatten() {
+        if !entry.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let journal_path = entry.path().join("journal.json");
+        let Ok(text) = std::fs::read_to_string(&journal_path) else {
+            continue;
+        };
+        let Ok(journal) = serde_json::from_str::<Journal>(&text) else {
+            continue;
+        };
+        if journal.instance_id != instance_id {
+            continue;
+        }
+        let report = |error: Option<String>, restored: usize, changed: usize| FinishedRestore {
+            game: journal.game.clone(),
+            store: journal.store.clone(),
+            instance_id: journal.instance_id.clone(),
+            restored,
+            changed,
+            error,
+        };
+        if is_session_running(&journal) {
+            return None;
+        }
+        let Some(definition) = ctx.games.game(&journal.game) else {
+            return Some(report(
+                Some(format!(
+                    "the game '{}' is not registered, so its user files could not be restored",
+                    journal.game
+                )),
+                0,
+                0,
+            ));
+        };
+        return Some(match restore(ctx, definition, &journal.store) {
+            Ok(found) => report(
+                None,
+                found.files.len(),
+                found.files.iter().filter(|file| file.changed).count(),
+            ),
+            Err(error) => report(Some(error.to_string()), 0, 0),
+        });
+    }
+    None
+}
+
+/// Restore user files, retrying while the game is still leaving the process table. A game that
+/// stays alive for the whole `timeout` gets the normal `CannotRestoreRunning` refusal, so a
+/// journal is never silently left swapped in.
+pub fn restore_retrying_while_running(
+    ctx: &Ctx,
+    definition: &GameDefinition,
+    store: &StoreId,
+    timeout: std::time::Duration,
+) -> Result<RestoreReport, UserFilesError> {
+    retry_while_running(timeout, || restore(ctx, definition, store))
+}
+
+fn retry_while_running<T>(
+    timeout: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<T, UserFilesError>,
+) -> Result<T, UserFilesError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match attempt() {
+            Err(UserFilesError::CannotRestoreRunning { .. })
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Clear the "starting" mark of a launch that will never spawn. The caller then restores its
 /// files; a launch that failed must not leave the session counting as running.
 pub fn finish_starting(ctx: &Ctx, game: &GameId, store: &StoreId) -> Result<(), UserFilesError> {
