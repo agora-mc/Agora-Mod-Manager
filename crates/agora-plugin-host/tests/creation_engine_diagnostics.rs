@@ -677,10 +677,7 @@ fn an_oversized_plugin_block_names_the_decode_limit() {
 fn a_save_over_the_read_limit_names_that_limit() {
     const LIMIT: u64 = 128 * 1024 * 1024;
     let diagnostics = run_with_listed_sizes(
-        vec![(
-            "@saves/enormous.ess".to_string(),
-            b"TESV_SAVEGAME".to_vec(),
-        )],
+        vec![("@saves/enormous.ess".to_string(), b"TESV_SAVEGAME".to_vec())],
         vec![("@saves/enormous.ess".to_string(), LIMIT + 1)],
         Vec::new(),
         "1.6.1170",
