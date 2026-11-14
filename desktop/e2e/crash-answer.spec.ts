@@ -148,7 +148,7 @@ const answer = {
   ],
   inspections: [],
   could_not_check: [
-    { reason: 'not_covered', subject: 'core.memory', source },
+    { reason: 'version_unknown', subject: 'core.memory', source },
     { reason: 'code_failed', subject: 'crash_logger', detail: 'the parser timed out', source },
   ],
   trust_notes: [
