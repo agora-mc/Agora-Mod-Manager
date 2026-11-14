@@ -318,7 +318,7 @@ describe('could not check', () => {
       status: 'analyzed',
       answer: answer({
         could_not_check: [
-          { reason: 'not_covered', subject: 'core.memory', source },
+          { reason: 'version_unknown', subject: 'core.memory', source },
           { reason: 'code_failed', subject: 'loose_log', detail: 'the parser timed out', source },
         ],
       }),
@@ -333,7 +333,7 @@ describe('could not check', () => {
     expect(screen.getByText(/the parser timed out/)).toBeInTheDocument();
   });
 
-  it('leaves a rule branch-limit note out of the player list', () => {
+  it('leaves an author note out of the player list', () => {
     renderView({
       status: 'analyzed',
       answer: answer({
@@ -342,6 +342,12 @@ describe('could not check', () => {
             reason: 'too_many_matches',
             subject: 'frame_on_stack',
             detail: 'the rule matched more than 32 branches',
+            source,
+          },
+          {
+            reason: 'not_covered',
+            subject: 'creation.object',
+            detail: 'no parser looked for it (4 rules)',
             source,
           },
         ],
