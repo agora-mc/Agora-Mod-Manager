@@ -180,7 +180,7 @@ The Creation Engine package does this for Skyrim. Its sorter hook keeps the veri
 
 ### Providing an overlaps reader
 
-`rules.overlaps` lets your plugin report the records that two or more active plugins change, so Agora can classify them without knowing the game's file format. It gets the sorter's request and answers only the keys the plugins share:
+The optional `overlaps` rule lets your plugin report the records that two or more active plugins change, so Agora can classify them without knowing the game's file format. A list without one cannot check overlaps. It gets the sorter's request and answers only the keys the plugins share:
 
 ```json
 {

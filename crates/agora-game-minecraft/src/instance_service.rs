@@ -3954,6 +3954,9 @@ $#
                 // Stored manifests of what each launch ran with; deleted and restored with the
                 // instance like its history rows.
                 "launch_manifests",
+                // The load-after rules a player set for one of the instance's lists (MASTER_SPEC
+                // §31.4). They belong to the instance and go with it.
+                "plugin_load_order_rules",
                 // The crash answer attached to one session; deleted and restored with the
                 // instance because it never exists without one.
                 "session_answers",

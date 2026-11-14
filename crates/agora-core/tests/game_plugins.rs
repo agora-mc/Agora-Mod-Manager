@@ -2348,20 +2348,19 @@ fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_la
     let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
 
     // No recorded session yet: the count is known, but nothing can be "new since" it.
-    let findings =
-        game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order.clone()]);
+    let findings = game_load_order::overlap_findings(
+        &h.ctx,
+        &inst.instance_id,
+        &h.def,
+        std::slice::from_ref(&order),
+    );
     assert!(findings
         .iter()
-        .all(|f| !matches!(f, game_load_order::Finding::OverlapNew { .. })));
+        .all(|f| !f.message().contains("now replaces")));
     assert!(
-        findings.iter().any(|f| matches!(
-            f,
-            game_load_order::Finding::OverlapsInfo {
-                conflicts: 1,
-                pairs: 1,
-                ..
-            }
-        )),
+        findings
+            .iter()
+            .any(|f| f.message().starts_with("Info: 1 conflict between 1 pair")),
         "{findings:?}"
     );
 
@@ -2395,32 +2394,17 @@ fn the_check_reports_conflicts_and_warns_only_about_a_pair_new_since_the_last_la
     let findings = game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order]);
     let warning = findings
         .iter()
-        .find_map(|f| match f {
-            game_load_order::Finding::OverlapNew {
-                winner,
-                loser,
-                count,
-                label,
-            } => Some((winner.clone(), loser.clone(), *count, label.clone())),
-            _ => None,
-        })
+        .find(|f| f.message().contains("now replaces"))
         .expect("a new pair is warned about");
-    assert_eq!(warning.0, "B.esp");
-    assert_eq!(warning.1, "A.esp");
-    assert_eq!(warning.2, 1);
-    assert_eq!(warning.3, Some("GMST fJumpHeightMin".to_string()));
-    let message = findings
-        .iter()
-        .find(|f| matches!(f, game_load_order::Finding::OverlapNew { .. }))
-        .unwrap()
-        .message();
-    assert!(
-        message.contains("now replaces 1 change made by 'A.esp'"),
-        "{message}"
-    );
-    assert!(
-        message.contains("Keep this order, or let 'A.esp' win"),
-        "{message}"
+    assert_eq!(
+        warning,
+        &game_load_order::Finding::ListLevel {
+            message: "Warning: 'B.esp' now replaces 1 change made by 'A.esp' (e.g. GMST \
+                      fJumpHeightMin). Keep this order, or let 'A.esp' win."
+                .to_string(),
+            items: vec!["B.esp".into(), "A.esp".into()],
+            refuses: false,
+        }
     );
 }
 
@@ -2437,17 +2421,11 @@ fn a_failed_overlaps_reader_is_reported_as_could_not_check() {
     let order = game_load_order::order_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
 
     let findings = game_load_order::overlap_findings(&h.ctx, &inst.instance_id, &h.def, &[order]);
-    assert!(
-        findings
-            .iter()
-            .any(|f| matches!(f, game_load_order::Finding::OverlapsUnchecked { .. })),
-        "{findings:?}"
-    );
     let message = findings
         .iter()
-        .find(|f| matches!(f, game_load_order::Finding::OverlapsUnchecked { .. }))
-        .unwrap()
-        .message();
+        .map(game_load_order::Finding::message)
+        .find(|message| message.contains("overlaps could not be checked"))
+        .expect("a failed reader is reported, not a clean list");
     assert!(message.contains("could not be checked"), "{message}");
     assert!(message.contains("timed out"), "{message}");
 }

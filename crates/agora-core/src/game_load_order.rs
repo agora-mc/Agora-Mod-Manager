@@ -230,24 +230,6 @@ pub enum Finding {
     },
     /// The list's rules hook failed, so its order could not be judged.
     RulesFailed { list: String, reason: String },
-    /// How many record changes the active plugins' later copies replace (MASTER_SPEC §31.5).
-    OverlapsInfo {
-        instance: String,
-        conflicts: usize,
-        pairs: usize,
-    },
-    /// A conflict pair that is new since the load order the last session recorded.
-    OverlapNew {
-        winner: String,
-        loser: String,
-        count: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        label: Option<String>,
-    },
-    /// The overlaps reader failed, so overlaps could not be checked.
-    OverlapsUnchecked { list: String, reason: String },
-    /// Something the overlaps reader said about a file it could not read, or about the list.
-    OverlapNote { level: NoteLevel, text: String },
 }
 
 /// Why a master does not come before its plugin.
@@ -276,11 +258,7 @@ impl Finding {
             Finding::DuplicateListing { .. }
             | Finding::MissingRuleItem { .. }
             | Finding::RuleConflict { .. }
-            | Finding::RulesFailed { .. }
-            | Finding::OverlapsInfo { .. }
-            | Finding::OverlapNew { .. }
-            | Finding::OverlapsUnchecked { .. }
-            | Finding::OverlapNote { .. } => false,
+            | Finding::RulesFailed { .. } => false,
         }
     }
 
@@ -319,41 +297,6 @@ impl Finding {
             Finding::RulesFailed { list, reason } => {
                 format!("the '{list}' load order's rules could not be read: {reason}")
             }
-            Finding::OverlapsInfo {
-                instance,
-                conflicts,
-                pairs,
-            } => format!(
-                "Info: {conflicts} conflict{} between {pairs} pair{} of plugins. Run \
-                 'agora games instance plugins conflicts {instance}' to see them.",
-                if *conflicts == 1 { "" } else { "s" },
-                if *pairs == 1 { "" } else { "s" },
-            ),
-            Finding::OverlapNew {
-                winner,
-                loser,
-                count,
-                label,
-            } => match label {
-                Some(label) => format!(
-                    "Warning: '{winner}' now replaces {count} change{} made by '{loser}' (e.g. \
-                     {label}). Keep this order, or let '{loser}' win.",
-                    if *count == 1 { "" } else { "s" },
-                ),
-                None => format!(
-                    "Warning: '{winner}' now replaces {count} change{} made by '{loser}'. Keep \
-                     this order, or let '{loser}' win.",
-                    if *count == 1 { "" } else { "s" },
-                ),
-            },
-            Finding::OverlapsUnchecked { reason, .. } => {
-                format!("Warning: overlaps could not be checked: {reason}")
-            }
-            Finding::OverlapNote { level, text } => match level {
-                NoteLevel::Error => format!("Error from the overlaps reader: {text}"),
-                NoteLevel::Warn => format!("Warning from the overlaps reader: {text}"),
-                NoteLevel::Info => format!("Info from the overlaps reader: {text}"),
-            },
         }
     }
 }
@@ -1382,22 +1325,14 @@ fn overlaps_fingerprint(
 
 fn cache_overlaps(
     ctx: &Ctx,
-    instance_id: &str,
-    definition: &GameDefinition,
-    rule: &LoadOrderDefinition,
-    entries: &[LoadOrderEntry],
-    installed: &Installed,
-    rules: &[LoadAfterRule],
+    game: &str,
+    list: &str,
+    fingerprint: String,
+    data_version: String,
     report: &OverlapReport,
 ) {
     let cache = ctx.extensions.get_or_insert_with(OverlapsCache::default);
-    cache.store(
-        definition.id.as_str(),
-        &rule.id,
-        overlaps_fingerprint(entries, installed, rules),
-        sorter_data_version(ctx, instance_id, definition, rule),
-        report.clone(),
-    );
+    cache.store(game, list, fingerprint, data_version, report.clone());
 }
 
 /// Ask the overlaps reader now, cache the report for the list as it stands, and return it.
@@ -1436,12 +1371,10 @@ pub fn refresh_overlaps(
     let report = classify_overlaps(&entries, &reply, &rules)?;
     cache_overlaps(
         ctx,
-        instance_id,
-        definition,
-        rule,
-        &entries,
-        &installed,
-        &rules,
+        definition.id.as_str(),
+        &rule.id,
+        overlaps_fingerprint(&entries, &installed, &rules),
+        sorter_data_version(ctx, instance_id, definition, rule),
         &report,
     );
     Ok(report)
@@ -1504,26 +1437,44 @@ pub fn overlap_findings(
         let report = match refresh_overlaps(ctx, instance_id, definition, Some(&rule.id)) {
             Ok(report) => report,
             Err(error) => {
-                out.push(Finding::OverlapsUnchecked {
-                    list: rule.id.clone(),
-                    reason: error.to_string(),
+                out.push(Finding::ListLevel {
+                    message: format!("Warning: overlaps could not be checked: {error}"),
+                    items: Vec::new(),
+                    refuses: false,
                 });
                 continue;
             }
         };
         for note in &report.notes {
-            out.push(Finding::OverlapNote {
-                level: note.level,
-                text: note.message.clone(),
+            let level = match note.level {
+                NoteLevel::Error => "Error",
+                NoteLevel::Warn => "Warning",
+                NoteLevel::Info => "Info",
+            };
+            out.push(Finding::ListLevel {
+                message: format!("{level} from the overlaps reader: {}", note.message),
+                items: if note.plugin.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![note.plugin.clone()]
+                },
+                refuses: false,
             });
         }
         if report.pairs.is_empty() {
             continue;
         }
-        out.push(Finding::OverlapsInfo {
-            instance: instance_id.to_string(),
-            conflicts: report.conflicts(),
-            pairs: report.pairs.len(),
+        out.push(Finding::ListLevel {
+            message: format!(
+                "Info: {} conflict{} between {} pair{} of plugins. Run \
+                 'agora games instance plugins conflicts {instance_id}' to see them.",
+                report.conflicts(),
+                if report.conflicts() == 1 { "" } else { "s" },
+                report.pairs.len(),
+                if report.pairs.len() == 1 { "" } else { "s" },
+            ),
+            items: Vec::new(),
+            refuses: false,
         });
         let Some(manifest) = &previous else {
             continue;
@@ -1541,11 +1492,23 @@ pub fn overlap_findings(
             .unwrap_or(&[]);
         for pair in &report.pairs {
             if pair_is_new_since(pair, current, &previous_entries) {
-                out.push(Finding::OverlapNew {
-                    winner: pair.winner.clone(),
-                    loser: pair.loser.clone(),
-                    count: pair.count,
-                    label: pair.labels.first().cloned(),
+                let label = pair
+                    .labels
+                    .first()
+                    .map(|label| format!(" (e.g. {label})"))
+                    .unwrap_or_default();
+                out.push(Finding::ListLevel {
+                    message: format!(
+                        "Warning: '{}' now replaces {} change{} made by '{}'{label}. Keep this \
+                         order, or let '{}' win.",
+                        pair.winner,
+                        pair.count,
+                        if pair.count == 1 { "" } else { "s" },
+                        pair.loser,
+                        pair.loser,
+                    ),
+                    items: vec![pair.winner.clone(), pair.loser.clone()],
+                    refuses: false,
                 });
             }
         }
@@ -3022,6 +2985,9 @@ pub fn move_plugin_and_order_in(
     Ok((report, order.expect("the order was asked for")))
 }
 
+// The public wrappers each name one combination of the two options, so their signatures stay
+// small; this one carries both without a builder of its own.
+#[allow(clippy::too_many_arguments)]
 fn move_inner(
     ctx: &Ctx,
     instance_id: &str,
@@ -3649,6 +3615,44 @@ mod tests {
         assert!(report.pairs.is_empty());
         assert_eq!(report.patched, 0);
         assert_eq!(report.decided, 0);
+    }
+
+    #[test]
+    fn a_reply_that_leaves_out_agreeing_keys_reports_only_the_conflict() {
+        // The reader returns only keys with two or more changing digests. A key every plugin
+        // copies identically is simply absent, which is not a failure and not a conflict.
+        let list = [entry("A.esp", &[]), entry("B.esp", &[])];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "old"), ("B.esp", "new")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(report.pairs.len(), 1);
+        assert_eq!(report.pairs[0].winner, "B.esp");
+        assert_eq!(report.pairs[0].loser, "A.esp");
+    }
+
+    #[test]
+    fn the_earlier_holder_is_the_loser_when_a_later_plugin_changes_the_record() {
+        // The narrowed reply includes the earlier holder and the plugin that changes it, in load
+        // order. Without a master relationship, the earlier holder's change is lost.
+        let list = [entry("Base.esm", &[]), entry("Mod.esp", &[])];
+        let reply = overlap_reply(vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("Base.esm", "base"), ("Mod.esp", "changed")],
+        )]);
+        let report = classify_overlaps(&list, &reply, &[]).unwrap();
+        assert_eq!(
+            report.pairs,
+            [ConflictPair {
+                winner: "Mod.esp".into(),
+                loser: "Base.esm".into(),
+                count: 1,
+                labels: vec!["GMST fJumpHeightMin".into()],
+            }]
+        );
     }
 
     #[test]
