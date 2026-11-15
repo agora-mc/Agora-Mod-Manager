@@ -725,3 +725,75 @@ fn status_reads_the_saved_copy_without_downloading() {
     assert!(status["fetchedAt"].is_string(), "{status}");
     host.deactivate(&id).ok();
 }
+
+/// CRC-32 (IEEE), so a cleaning record can name the invented plugin's real checksum.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+#[test]
+fn loot_messages_show_links_as_text_and_cleaning_shows_its_counts() {
+    let (_dir, host, id, bridge) = engine();
+    let data = data_folder();
+    let crc = crc32(&plugin_bytes(&[]));
+    let masterlist = "plugins:
+  - name: 'A.esp'
+    msg:
+      - type: warn
+        content: 'Read [the guide](https://example.test/guide) before you sort.'
+    dirty:
+      - crc: __CRC__
+        util: 'Example cleaner'
+        itm: 2
+        udr: 3
+        nav: 1
+        detail: 'A cleaning guide is available [here](https://example.test/clean).'
+"
+    .replace("__CRC__", &format!("{crc:#010x}"));
+    serve_masterlist(&bridge, "loot/test", "v1", "deadbeef", &masterlist);
+    invoke(
+        &host,
+        &id,
+        "lootUpdate",
+        update_args(),
+        data.path(),
+        &bridge,
+    );
+
+    let reply = invoke(&host, &id, "lootSort", sort_args(), data.path(), &bridge);
+    let notes = reply["notes"].as_array().expect("notes");
+    let warning = notes
+        .iter()
+        .find(|note| note["item"] == "A.esp" && note["level"] == "warn")
+        .expect("the warning message is kept");
+    assert_eq!(
+        warning["text"],
+        serde_json::json!("Read the guide (https://example.test/guide) before you sort.")
+    );
+
+    let checks = reply["checks"].as_array().expect("checks");
+    let cleaning = checks
+        .iter()
+        .find(|check| {
+            check["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("identical-to-master"))
+        })
+        .expect("the cleaning counts are a check");
+    let text = cleaning["text"].as_str().unwrap();
+    assert!(text.contains("2 identical-to-master records"), "{text}");
+    assert!(text.contains("3 deleted references"), "{text}");
+    assert!(text.contains("1 deleted navmesh"), "{text}");
+    assert!(text.contains("here (https://example.test/clean)"), "{text}");
+    assert!(!text.contains("]("), "{text}");
+    assert_eq!(cleaning["level"], serde_json::json!("warn"));
+    host.deactivate(&id).ok();
+}

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use agora_game_api::{
     fold_path_case, glob_match, GameContext, GameDefinition, GamePackage, ListFinding,
     LoadOrderDefinition, LoadOrderLine, LoadOrderRule, LoadOrderRulesReply, OverlapReply,
-    SorterEntry, SorterReply, SorterRequest, SorterStatus, UserLoadOrderRule,
+    SorterEntry, SorterNote, SorterReply, SorterRequest, SorterStatus, UserLoadOrderRule,
 };
 use serde::{Deserialize, Serialize};
 
@@ -225,6 +225,13 @@ pub enum Finding {
         items: Vec<String>,
         refuses: bool,
     },
+    /// LOOT would move these plugins to reach the order it recommends (MASTER_SPEC §31.6). A
+    /// warning: the check never reorders anything itself.
+    SorterMoves {
+        list: String,
+        instance: String,
+        moves: Vec<SortMove>,
+    },
     /// A script rule names an item the list does not have, so the rule cannot be applied.
     MissingRuleItem {
         list: String,
@@ -271,7 +278,8 @@ impl Finding {
             Finding::DuplicateListing { .. }
             | Finding::MissingRuleItem { .. }
             | Finding::RuleConflict { .. }
-            | Finding::RulesFailed { .. } => false,
+            | Finding::RulesFailed { .. }
+            | Finding::SorterMoves { .. } => false,
         }
     }
 
@@ -311,6 +319,14 @@ impl Finding {
             Finding::RulesFailed { list, reason } => {
                 format!("the '{list}' load order's rules could not be read: {reason}")
             }
+            Finding::SorterMoves {
+                moves, instance, ..
+            } => format!(
+                "Warning: LOOT would move {} plugin{}. Run 'agora games instance plugins sort \
+                 {instance}' to apply them.",
+                moves.len(),
+                if moves.len() == 1 { "" } else { "s" },
+            ),
         }
     }
 }
@@ -408,6 +424,10 @@ pub struct OverlapReport {
     pub patched: usize,
     /// Changer pairs a load-after rule already decides.
     pub decided: usize,
+    /// The pairs a load-after rule decides, so a plugin filter can say what it loses by the
+    /// player's choice rather than "neither wins nor loses".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decided_pairs: Vec<ConflictPair>,
     /// Changer pairs between the game's own always-loaded files, which nobody can reorder.
     #[serde(default)]
     pub implicit_pairs: usize,
@@ -438,6 +458,26 @@ impl OverlapReport {
             .iter()
             .filter(|pair| key(&pair.winner) == wanted)
             .map(|pair| (pair.loser.clone(), pair.count))
+            .collect()
+    }
+
+    /// The plugins a load-after rule lets this plugin win over, each with how many changes.
+    pub fn decided_wins_over(&self, plugin: &str) -> Vec<(String, usize)> {
+        let wanted = key(plugin);
+        self.decided_pairs
+            .iter()
+            .filter(|pair| key(&pair.winner) == wanted)
+            .map(|pair| (pair.loser.clone(), pair.count))
+            .collect()
+    }
+
+    /// The plugins a load-after rule makes this plugin lose to, each with how many changes.
+    pub fn decided_losers_of(&self, plugin: &str) -> Vec<(String, usize)> {
+        let wanted = key(plugin);
+        self.decided_pairs
+            .iter()
+            .filter(|pair| key(&pair.loser) == wanted)
+            .map(|pair| (pair.winner.clone(), pair.count))
             .collect()
     }
 }
@@ -549,6 +589,64 @@ impl SorterNotesCache {
                 fingerprint,
                 data_version,
                 notes,
+            },
+        );
+    }
+}
+
+/// The last LOOT check a sorter gave for one list, with what it was computed from. A check runs
+/// the sorter, which is expensive, so a plain list read and a second check for the same order reuse
+/// this; it is emptied by a change to the order, the files or the sorter's data.
+#[derive(Default)]
+struct SorterCheckCache {
+    entries: Mutex<HashMap<(String, String), CachedSorterCheck>>,
+}
+
+#[derive(Clone)]
+struct CachedSorterCheck {
+    fingerprint: String,
+    data_version: String,
+    findings: Vec<Finding>,
+}
+
+impl SorterCheckCache {
+    fn lookup(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: &str,
+        data_version: &str,
+    ) -> Option<Vec<Finding>> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries
+            .get(&(game.to_string(), list.to_string()))
+            .filter(|cached| {
+                cached.fingerprint == fingerprint && cached.data_version == data_version
+            })
+            .map(|cached| cached.findings.clone())
+    }
+
+    fn store(
+        &self,
+        game: &str,
+        list: &str,
+        fingerprint: String,
+        data_version: String,
+        findings: Vec<Finding>,
+    ) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        entries.insert(
+            (game.to_string(), list.to_string()),
+            CachedSorterCheck {
+                fingerprint,
+                data_version,
+                findings,
             },
         );
     }
@@ -1114,17 +1212,13 @@ fn call_sorter(
 /// guessing its severity would be inventing an answer.
 fn sorter_notes(reply: &SorterReply) -> Result<Vec<PluginNote>, LoadOrderError> {
     let mut notes = Vec::new();
-    for note in reply.notes.iter().chain(reply.general.iter()) {
-        let level = match note.level.as_str() {
-            "error" => NoteLevel::Error,
-            "warn" => NoteLevel::Warn,
-            "info" => NoteLevel::Info,
-            other => {
-                return Err(LoadOrderError::SorterNote {
-                    reason: format!("`{other}` is not error, warn or info"),
-                })
-            }
-        };
+    for note in reply
+        .notes
+        .iter()
+        .chain(reply.general.iter())
+        .chain(reply.checks.iter())
+    {
+        let level = note_level(&note.level)?;
         notes.push(PluginNote {
             plugin: note.item.clone(),
             level,
@@ -1291,34 +1385,42 @@ pub fn classify_overlaps(
                 key(&rule.item) == key(winner_name) && key(&rule.after) == key(changer.1)
             }) {
                 report.decided += 1;
+                record_pair(&mut report.decided_pairs, winner_name, changer.1, &label);
                 continue;
             }
             if winner.implicit && changer.3.implicit {
                 report.implicit_pairs += 1;
                 continue;
             }
-            match report.pairs.iter_mut().find(|pair| {
-                key(&pair.winner) == key(winner_name) && key(&pair.loser) == key(changer.1)
-            }) {
-                Some(pair) => {
-                    pair.count += 1;
-                    if pair.labels.len() < CONFLICT_LABELS
-                        && !pair.labels.iter().any(|existing| existing == &label)
-                    {
-                        pair.labels.push(label.clone());
-                    }
-                }
-                None => report.pairs.push(ConflictPair {
-                    winner: winner_name.to_string(),
-                    loser: changer.1.to_string(),
-                    count: 1,
-                    labels: vec![label.clone()],
-                    new_since_last_launch: false,
-                }),
-            }
+            record_pair(&mut report.pairs, winner_name, changer.1, &label);
         }
     }
     Ok(report)
+}
+
+/// Add one changer pair to a list, merging a repeat of the same pair and keeping up to
+/// [`CONFLICT_LABELS`] labels.
+fn record_pair(pairs: &mut Vec<ConflictPair>, winner: &str, loser: &str, label: &str) {
+    match pairs
+        .iter_mut()
+        .find(|pair| key(&pair.winner) == key(winner) && key(&pair.loser) == key(loser))
+    {
+        Some(pair) => {
+            pair.count += 1;
+            if pair.labels.len() < CONFLICT_LABELS
+                && !pair.labels.iter().any(|existing| existing == label)
+            {
+                pair.labels.push(label.to_string());
+            }
+        }
+        None => pairs.push(ConflictPair {
+            winner: winner.to_string(),
+            loser: loser.to_string(),
+            count: 1,
+            labels: vec![label.to_string()],
+            new_since_last_launch: false,
+        }),
+    }
 }
 
 /// Whether `winner` lists `changer` among its masters, directly or through its masters' masters.
@@ -1511,6 +1613,10 @@ pub fn overlap_findings(
         if rule.rules.overlaps.is_none() {
             continue;
         }
+        // A one-list check passes only that list's order; do not report another list's overlaps.
+        if !orders.iter().any(|order| order.list_id == rule.id) {
+            continue;
+        }
         let report = match refresh_overlaps(ctx, instance_id, definition, Some(&rule.id)) {
             Ok(report) => report,
             Err(error) => {
@@ -1598,6 +1704,215 @@ pub fn overlap_findings(
     out
 }
 
+/// Every pre-launch load-order finding for the instance's lists: each list's own findings, the
+/// overlaps report (MASTER_SPEC §31.5) and LOOT's checks (§31.6). The instance check, the launch
+/// and `plugins check` all use this one function, so they cannot print different lines.
+pub(crate) fn instance_findings(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    orders: &[LoadOrder],
+    links: Option<&DeploymentPlan>,
+) -> Vec<Finding> {
+    let mut out: Vec<Finding> = orders
+        .iter()
+        .flat_map(|order| order.findings.iter().cloned())
+        .collect();
+    out.extend(overlap_findings(ctx, instance_id, definition, orders));
+    out.extend(sorter_findings(ctx, instance_id, definition, orders, links));
+    out
+}
+
+/// The LOOT findings for the lists the caller read (MASTER_SPEC §31.6). A sorter with a saved
+/// masterlist is asked for its order and checks; the answer is cached like the sorter notes, so a
+/// plain list read never runs it. A missing masterlist, a failed sorter and an answer core cannot
+/// use are all reported as "could not check", never as a clean list.
+fn sorter_findings(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    orders: &[LoadOrder],
+    links: Option<&DeploymentPlan>,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for rule in &definition.load_orders {
+        let Some(sorter) = rule.rules.sorter.as_ref() else {
+            continue;
+        };
+        // A one-list check passes only that list's order; do not report another list's LOOT lines.
+        let Some(order) = orders.iter().find(|order| order.list_id == rule.id) else {
+            continue;
+        };
+        let status = match sorter_status(ctx, instance_id, definition, Some(&rule.id)) {
+            Ok(status) => status,
+            Err(error) => {
+                out.push(could_not_check(format!(
+                    "LOOT's status could not be read: {error}"
+                )));
+                continue;
+            }
+        };
+        if sorter.update.is_some() && status.is_none() {
+            out.push(no_masterlist_finding(ctx, instance_id));
+            continue;
+        }
+        let installed = match installed_files(ctx, instance_id, definition, rule, links) {
+            Ok((installed, _)) => installed,
+            Err(error) => {
+                out.push(could_not_check(format!(
+                    "LOOT could not be checked: {error}"
+                )));
+                continue;
+            }
+        };
+        // The cached findings name the instance in their message, so the key names it too; two
+        // instances of one game must not read each other's "run sort <instance>" line.
+        let fingerprint = format!(
+            "{instance_id}|{}",
+            sorter_fingerprint(&order.entries, &installed)
+        );
+        let data_version = status
+            .as_ref()
+            .map(|status| status.data_version.clone())
+            .unwrap_or_default();
+        let cache = ctx.extensions.get_or_insert_with(SorterCheckCache::default);
+        if let Some(findings) = cache.lookup(
+            definition.id.as_str(),
+            &rule.id,
+            &fingerprint,
+            &data_version,
+        ) {
+            out.extend(findings);
+            continue;
+        }
+        let reply = match call_sorter(ctx, instance_id, definition, rule, &order.entries) {
+            Ok(reply) => reply,
+            Err(error) => {
+                out.push(could_not_check(format!(
+                    "LOOT could not be checked: {error}"
+                )));
+                continue;
+            }
+        };
+        let findings = match sorter_reply_findings(instance_id, rule, &order.entries, &reply) {
+            Ok(findings) => findings,
+            Err(error) => {
+                out.push(could_not_check(format!(
+                    "LOOT's answer could not be used: {error}"
+                )));
+                continue;
+            }
+        };
+        cache.store(
+            definition.id.as_str(),
+            &rule.id,
+            fingerprint,
+            data_version,
+            findings.clone(),
+        );
+        out.extend(findings);
+    }
+    out
+}
+
+/// A "could not check" finding. A failure is never shown as "nothing found".
+fn could_not_check(message: String) -> Finding {
+    Finding::ListLevel {
+        message: format!("Warning: {message}"),
+        items: Vec::new(),
+        refuses: false,
+    }
+}
+
+/// The one line a list with no downloaded masterlist gets, naming the setting when plugin network
+/// access is off (MASTER_SPEC §31.6).
+fn no_masterlist_finding(ctx: &Ctx, instance_id: &str) -> Finding {
+    let mut message = format!(
+        "Info: No LOOT masterlist is saved yet. Run 'agora games instance plugins masterlist \
+         {instance_id}' to download one."
+    );
+    if plugin_network_enabled(ctx) == Some(false) {
+        message.push_str(
+            " Plugin network access is turned off in Settings; turn on 'network_plugins_enabled' \
+             (with Lockdown Mode off) to let it download.",
+        );
+    }
+    Finding::ListLevel {
+        message,
+        items: Vec::new(),
+        refuses: false,
+    }
+}
+
+/// Whether plugin JavaScript may reach the network. `None` when the settings store cannot be read,
+/// so the caller does not claim a setting is off without evidence.
+fn plugin_network_enabled(ctx: &Ctx) -> Option<bool> {
+    let conn = crate::db::local_state_connection(&ctx.paths.local_state_db()).ok()?;
+    Some(crate::db::is_network_enabled(
+        &conn,
+        "network_plugins_enabled",
+    ))
+}
+
+/// The findings a sorter's reply makes: the moves it would make, its own messages at their level
+/// (an `info` message stays in the plugin view), and its checks at their level.
+fn sorter_reply_findings(
+    instance_id: &str,
+    rule: &LoadOrderDefinition,
+    entries: &[LoadOrderEntry],
+    reply: &SorterReply,
+) -> Result<Vec<Finding>, LoadOrderError> {
+    let mut out = Vec::new();
+    let mut sorted = entries.to_vec();
+    let moves = apply_sorter_order(&mut sorted, &reply.order)?;
+    if !moves.is_empty() {
+        out.push(Finding::SorterMoves {
+            list: rule.id.clone(),
+            instance: instance_id.to_string(),
+            moves,
+        });
+    }
+    for note in reply.notes.iter().chain(reply.general.iter()) {
+        let level = note_level(&note.level)?;
+        if level != NoteLevel::Info {
+            out.push(note_finding(level, note));
+        }
+    }
+    for note in &reply.checks {
+        let level = note_level(&note.level)?;
+        out.push(note_finding(level, note));
+    }
+    Ok(out)
+}
+
+fn note_level(level: &str) -> Result<NoteLevel, LoadOrderError> {
+    match level {
+        "error" => Ok(NoteLevel::Error),
+        "warn" => Ok(NoteLevel::Warn),
+        "info" => Ok(NoteLevel::Info),
+        other => Err(LoadOrderError::SorterNote {
+            reason: format!("`{other}` is not error, warn or info"),
+        }),
+    }
+}
+
+fn note_finding(level: NoteLevel, note: &SorterNote) -> Finding {
+    let prefix = match level {
+        NoteLevel::Error => "Error",
+        NoteLevel::Warn => "Warning",
+        NoteLevel::Info => "Info",
+    };
+    Finding::ListLevel {
+        message: format!("{prefix}: {}", note.text),
+        items: if note.item.is_empty() {
+            Vec::new()
+        } else {
+            vec![note.item.clone()]
+        },
+        refuses: false,
+    }
+}
+
 /// Ask the sorter for its notes now, cache them for the list as it stands, and return them. The
 /// desktop calls this in the background when a plain read says the notes are out of date.
 pub fn refresh_sorter_notes(
@@ -1673,9 +1988,18 @@ fn sorter_update(
     let package = package_of(ctx, definition)?;
     let request = sorter_request(ctx, instance_id, definition, rule, &[])?;
     let status = block_on_hook(package.update_sorter(request, update)).map_err(|error| {
-        LoadOrderError::SorterUpdate {
-            reason: error.message,
+        let mut reason = error.message;
+        // The network gate names only the request kind. When it is the masterlist download that
+        // was refused, say which setting turns plugin downloads back on (MASTER_SPEC §31.6).
+        if update && reason.contains("turned off in Settings") {
+            reason.push_str(
+                " Turn on 'network_plugins_enabled' in Settings (with Lockdown Mode off) to \
+                 download the masterlist.",
+            );
+        } else if update && reason.contains("Lockdown Mode is on") {
+            reason.push_str(" Turn off Lockdown Mode in Settings to download the masterlist.");
         }
+        LoadOrderError::SorterUpdate { reason }
     })?;
     // A successful update changes the sorter's data, so its saved notes are stale. Refresh them
     // now (the user already waited for the download); a notes failure does not undo the update.
@@ -2767,14 +3091,31 @@ pub fn check(
     Ok(order_of(ctx, instance_id, definition)?.findings)
 }
 
-/// [`check`] for one list; `None` names the game's first list.
+/// [`check`] for one list; `None` names the game's first list. It includes the overlaps report and
+/// LOOT's checks, so the plugin check prints the same lines as the instance check and a launch.
 pub fn check_in(
     ctx: &Ctx,
     instance_id: &str,
     definition: &GameDefinition,
     list_id: Option<&str>,
 ) -> Result<Vec<Finding>, LoadOrderError> {
-    Ok(order_of_with_view(ctx, instance_id, definition, list_id, None, true)?.findings)
+    let rule = rule_of(definition, list_id)?;
+    let links = plan_for_order_in(ctx, instance_id, definition, Some(&rule.id))?;
+    let order = order_of_with_view(
+        ctx,
+        instance_id,
+        definition,
+        Some(&rule.id),
+        links.as_ref(),
+        true,
+    )?;
+    Ok(instance_findings(
+        ctx,
+        instance_id,
+        definition,
+        std::slice::from_ref(&order),
+        links.as_ref(),
+    ))
 }
 
 /// The findings against every list the game keeps. A game with no lists has none.
@@ -2785,24 +3126,6 @@ pub fn check_all(
 ) -> Result<Vec<Finding>, LoadOrderError> {
     orders(ctx, instance_id, definition)
         .map(|all| all.into_iter().flat_map(|order| order.findings).collect())
-}
-
-/// [`check_all`], reading `links` instead of planning again.
-pub(crate) fn check_all_with_view(
-    ctx: &Ctx,
-    instance_id: &str,
-    definition: &GameDefinition,
-    links: Option<&DeploymentPlan>,
-) -> Result<Vec<Finding>, LoadOrderError> {
-    definition
-        .load_orders
-        .iter()
-        .map(|rule| {
-            order_of_with_view(ctx, instance_id, definition, Some(&rule.id), links, true)
-                .map(|order| order.findings)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|all| all.into_iter().flatten().collect())
 }
 
 fn write_entries(
@@ -3951,6 +4274,24 @@ mod tests {
         )]);
         let report = classify_overlaps(&list, &reply, &[after("C.esp", "A.esp")]).unwrap();
         assert_eq!(report.decided, 1);
+        assert_eq!(
+            report.decided_pairs,
+            [ConflictPair {
+                winner: "C.esp".into(),
+                loser: "A.esp".into(),
+                count: 1,
+                labels: vec!["GMST fJumpHeightMin".into()],
+                new_since_last_launch: false,
+            }]
+        );
+        assert_eq!(
+            report.decided_losers_of("A.esp"),
+            [("C.esp".to_string(), 1)]
+        );
+        assert_eq!(
+            report.decided_wins_over("C.esp"),
+            [("A.esp".to_string(), 1)]
+        );
         assert_eq!(
             report.pairs,
             [ConflictPair {

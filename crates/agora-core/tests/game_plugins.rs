@@ -50,6 +50,7 @@ struct Harness {
     sort_request: Arc<Mutex<Option<SorterRequest>>>,
     overlaps: OverlapsReplySlot,
     overlaps_calls: Arc<AtomicUsize>,
+    update_fail: Arc<Mutex<Option<String>>>,
 }
 
 impl Drop for Harness {
@@ -76,6 +77,7 @@ struct TestPackage {
     sort_request: Arc<Mutex<Option<SorterRequest>>>,
     overlaps: OverlapsReplySlot,
     overlaps_calls: Arc<AtomicUsize>,
+    update_fail: Arc<Mutex<Option<String>>>,
 }
 
 type SorterReplySlot = Arc<Mutex<Option<SorterReply>>>;
@@ -149,6 +151,24 @@ impl GamePackage for TestPackage {
         *self.sort_request.lock().unwrap() = Some(request);
         let sorter = self.sorter.clone();
         Box::pin(async move { Ok(sorter.lock().unwrap().clone()) })
+    }
+
+    /// The test double's update hook fails with whatever a test put in the slot.
+    fn update_sorter<'a>(
+        &'a self,
+        _request: SorterRequest,
+        _update: bool,
+    ) -> GameFuture<'a, Option<agora_game_api::SorterStatus>> {
+        let failure = self.update_fail.lock().unwrap().clone();
+        Box::pin(async move {
+            match failure {
+                Some(message) => Err(GameError {
+                    code: "ERR_TEST_UPDATE".into(),
+                    message,
+                }),
+                None => Ok(None),
+            }
+        })
     }
 
     /// The test double answers the overlaps hook with whatever a test put in the slot.
@@ -374,6 +394,7 @@ impl Harness {
         let sort_request: Arc<Mutex<Option<SorterRequest>>> = Arc::new(Mutex::new(None));
         let overlaps: OverlapsReplySlot = Arc::new(Mutex::new(None));
         let overlaps_calls: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let update_fail: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let mut builder = GameRegistry::builder();
         builder
             .add(
@@ -389,6 +410,7 @@ impl Harness {
                     sort_request: sort_request.clone(),
                     overlaps: overlaps.clone(),
                     overlaps_calls: overlaps_calls.clone(),
+                    update_fail: update_fail.clone(),
                 }),
             )
             .expect("register test package");
@@ -409,6 +431,7 @@ impl Harness {
             sort_request,
             overlaps,
             overlaps_calls,
+            update_fail,
         }
     }
 
@@ -471,6 +494,10 @@ impl Harness {
     }
 
     /// What the test double's overlaps reader answers on the next call.
+    fn fail_update(&self, message: &str) {
+        *self.update_fail.lock().unwrap() = Some(message.to_string());
+    }
+
     fn answer_overlaps(&self, reply: OverlapReply) {
         *self.overlaps.lock().unwrap() = Some(Ok(reply));
     }
@@ -1038,6 +1065,7 @@ fn register(def: &GameDefinition) -> Result<(), GameRegistryError> {
             sort_request: Arc::new(Mutex::new(None)),
             overlaps: Arc::new(Mutex::new(None)),
             overlaps_calls: Arc::new(AtomicUsize::new(0)),
+            update_fail: Arc::new(Mutex::new(None)),
         }),
     )
 }
@@ -1899,6 +1927,7 @@ fn a_sorter_order_is_applied_and_written() {
             level: "info".into(),
             text: "the list is up to date".into(),
         }],
+        checks: Vec::new(),
     });
 
     let (report, order) =
@@ -1941,6 +1970,7 @@ fn reading_a_list_does_not_call_the_sorter_when_notes_are_cached() {
         order: vec!["A.esp".into()],
         notes: vec![note.clone()],
         general: Vec::new(),
+        checks: Vec::new(),
     });
     game_load_order::refresh_sorter_notes(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
     h.reset_sorter_calls();
@@ -1970,6 +2000,7 @@ fn changing_an_item_makes_cached_notes_stale() {
             text: "a saved note".into(),
         }],
         general: Vec::new(),
+        checks: Vec::new(),
     });
     game_load_order::refresh_sorter_notes(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
 
@@ -2008,6 +2039,236 @@ fn a_plain_list_read_marks_uncached_notes_out_of_date() {
     assert!(order.notes.is_empty());
     assert!(order.notes_out_of_date);
     assert_eq!(h.sorter_calls(), 0, "a plain read ran the sorter");
+}
+
+#[test]
+fn the_check_reports_loot_moves_and_checks_but_not_its_say_messages() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("loot-check");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_sorting(SorterReply {
+        order: vec!["B.esp".into(), "A.esp".into()],
+        notes: vec![
+            SorterNote {
+                item: "A.esp".into(),
+                level: "warn".into(),
+                text: "a warning from LOOT".into(),
+            },
+            SorterNote {
+                item: String::new(),
+                level: "info".into(),
+                text: "a say message for the plugin view".into(),
+            },
+        ],
+        general: vec![SorterNote {
+            item: String::new(),
+            level: "error".into(),
+            text: "an error from LOOT".into(),
+        }],
+        checks: vec![
+            SorterNote {
+                item: "A.esp".into(),
+                level: "info".into(),
+                text: "LOOT records 2 identical-to-master records in 'A.esp'.".into(),
+            },
+            SorterNote {
+                item: "A.esp".into(),
+                level: "warn".into(),
+                text: "LOOT marks 'A.esp' as incompatible with 'B.esp', which is active too."
+                    .into(),
+            },
+        ],
+    });
+
+    let findings = game_load_order::check_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    let messages: Vec<String> = findings.iter().map(|f| f.message()).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("LOOT would move 2 plugins")
+                && m.contains("agora games instance plugins sort")),
+        "{messages:?}"
+    );
+    assert!(
+        messages.contains(&"Warning: a warning from LOOT".to_string()),
+        "{messages:?}"
+    );
+    assert!(
+        messages.contains(&"Error: an error from LOOT".to_string()),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("Info: LOOT records 2 identical-to-master records")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.starts_with("Warning: LOOT marks 'A.esp' as incompatible")),
+        "{messages:?}"
+    );
+    assert!(
+        !messages.iter().any(|m| m.contains("a say message")),
+        "an info message must stay in the plugin view: {messages:?}"
+    );
+    let moves = findings.iter().find_map(|f| match f {
+        game_load_order::Finding::SorterMoves { moves, .. } => Some(moves),
+        _ => None,
+    });
+    assert_eq!(moves.map(Vec::len), Some(2), "{findings:?}");
+    assert_eq!(h.sorter_calls(), 1);
+
+    // The same order asks for the same check from the cache, not the sorter again.
+    let again = game_load_order::check_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    assert_eq!(again.len(), findings.len());
+    assert_eq!(h.sorter_calls(), 1, "the cached check ran the sorter again");
+}
+
+#[test]
+fn a_sorter_with_no_masterlist_says_how_to_get_one_and_names_the_setting() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    let mut rule = sorter_rule();
+    rule.update = Some("update".into());
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(rule);
+    let h = Harness::with_definition(def);
+    let inst = h.instance("loot-no-masterlist");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    {
+        let conn = agora_core::db::local_state_connection(&h.ctx.paths.local_state_db()).unwrap();
+        agora_core::db::set_setting(&conn, "network_plugins_enabled", &serde_json::json!(false))
+            .unwrap();
+    }
+
+    let findings = game_load_order::check_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    let info = findings
+        .iter()
+        .map(|f| f.message())
+        .find(|m| m.starts_with("Info: No LOOT masterlist is saved yet"))
+        .expect("the missing masterlist is reported");
+    assert!(info.contains("plugins masterlist"), "{info}");
+    assert!(info.contains("network_plugins_enabled"), "{info}");
+    assert_eq!(
+        h.sorter_calls(),
+        0,
+        "a missing masterlist must not run the sorter"
+    );
+}
+
+#[test]
+fn a_failed_sorter_is_reported_as_could_not_check() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.kind = "script".into();
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(sorter_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("loot-failure");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    // The fake sorter has no reply, which the package reports as "no answer", never "clean".
+    let findings = game_load_order::check_in(&h.ctx, &inst.instance_id, &h.def, None).unwrap();
+    let message = findings
+        .iter()
+        .map(|f| f.message())
+        .find(|m| m.contains("could not be checked"))
+        .expect("a failed sorter is reported");
+    assert!(message.starts_with("Warning:"), "{message}");
+}
+
+#[test]
+fn a_masterlist_update_error_names_the_setting_that_turned_it_off() {
+    let mut def = definition();
+    let mut rule = sorter_rule();
+    rule.update = Some("update".into());
+    def.load_orders.first_mut().unwrap().rules.sorter = Some(rule);
+    let h = Harness::with_definition(def);
+    let inst = h.instance("update-fail");
+    let item = h.item("mod", &[("Data/A.esp", b"a")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_update("This kind of request is turned off in Settings (attempted: Plugin).");
+
+    let error = game_load_order::update_sorter(&h.ctx, &inst.instance_id, &h.def, None)
+        .expect_err("the update fails");
+    let message = error.to_string();
+    assert!(message.contains("turned off in Settings"), "{message}");
+    assert!(message.contains("network_plugins_enabled"), "{message}");
+}
+
+#[test]
+fn a_launch_says_when_overlaps_could_not_be_checked() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("launch-overlaps-fail");
+    let item = h.item("mod", &[("Data/A.esp", b"a"), ("Data/B.esp", b"b")]);
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.fail_overlaps("the reader timed out");
+
+    let prepared = h.prepare(&inst, false).expect("the launch prepares");
+    let line = prepared
+        .load_order_findings
+        .iter()
+        .map(agora_core::game_load_order::Finding::message)
+        .find(|line| line.contains("overlaps could not be checked"))
+        .expect("a launch says the overlaps could not be checked");
+    assert!(line.contains("timed out"), "{line}");
+}
+
+#[test]
+fn a_launch_reports_the_overlaps_line_the_check_reports() {
+    let mut def = definition();
+    def.load_orders.first_mut().unwrap().rules.overlaps = Some(overlaps_rule());
+    let h = Harness::with_definition(def);
+    let inst = h.instance("launch-overlaps");
+    let item = h.item(
+        "mod",
+        &[
+            ("Data/A.esp", b"a"),
+            ("Data/B.esp", b"b"),
+            ("Data/C.esp", b"c"),
+        ],
+    );
+    h.add(&inst, &item);
+    h.deploy(&inst);
+    h.answer_overlaps(OverlapReply {
+        keys: vec![overlap_key(
+            "Game:000001",
+            "GMST fJumpHeightMin",
+            &[("A.esp", "original"), ("B.esp", "old"), ("C.esp", "new")],
+        )],
+        notes: Vec::new(),
+    });
+
+    let checks =
+        agora_core::game_instance::launch_checks(&h.ctx, &inst, &h.def).expect("the check runs");
+    let check_line = checks
+        .load_order
+        .iter()
+        .map(agora_core::game_load_order::Finding::message)
+        .find(|line| line.starts_with("Info: 1 conflict between 1 pair"))
+        .expect("the check prints the overlaps line");
+
+    let prepared = h.prepare(&inst, false).expect("the launch prepares");
+    assert!(
+        prepared
+            .load_order_findings
+            .iter()
+            .map(agora_core::game_load_order::Finding::message)
+            .any(|line| line == check_line),
+        "the launch did not print the check's overlaps line: {:?}",
+        prepared.load_order_findings
+    );
 }
 
 #[test]

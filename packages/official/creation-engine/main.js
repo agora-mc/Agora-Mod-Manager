@@ -3480,16 +3480,94 @@ export async function lootSort(args) {
   }
   const reply = JSON.parse(result.stdoutText);
   const notes = [];
+  const checks = [];
   for (const plugin of reply.plugins || []) {
     for (const message of plugin.messages || []) {
-      notes.push({ item: plugin.name, level: message.level, text: message.text });
+      notes.push({ item: plugin.name, level: message.level, text: plainLinks(message.text) });
+    }
+    for (const cleaning of plugin.cleaning || []) {
+      const counts = cleaningCounts(cleaning);
+      if (!counts) continue;
+      const guide = cleaning.detail ? " " + plainLinks(cleaning.detail) : "";
+      checks.push({
+        item: plugin.name,
+        level: cleaning.deleted_navmeshes > 0 ? "warn" : "info",
+        text: "LOOT records " + counts + " in '" + plugin.name + "'." + guide,
+      });
+    }
+    for (const other of plugin.incompatible || []) {
+      checks.push({
+        item: plugin.name,
+        level: "warn",
+        text:
+          "LOOT marks '" +
+          plugin.name +
+          "' as incompatible with '" +
+          other +
+          "', which is active too.",
+      });
+    }
+    for (const file of plugin.requires || []) {
+      checks.push({
+        item: plugin.name,
+        level: "warn",
+        text: "LOOT says '" + plugin.name + "' requires '" + file + "', which is not present.",
+      });
     }
   }
   const general = [];
   for (const message of reply.general || []) {
-    general.push({ level: message.level, text: message.text });
+    general.push({ level: message.level, text: plainLinks(message.text) });
   }
-  return { order: reply.order || [], notes: notes, general: general };
+  return { order: reply.order || [], notes: notes, general: general, checks: checks };
+}
+
+/// A LOOT message may carry CommonMark links. The check and the plugin list show plain text, so a
+/// link becomes `text (address)`; it is never rendered as HTML.
+function plainLinks(text) {
+  let out = "";
+  let index = 0;
+  while (index < text.length) {
+    const open = text.indexOf("[", index);
+    if (open < 0) {
+      out += text.slice(index);
+      break;
+    }
+    const middle = text.indexOf("](", open + 1);
+    if (middle < 0) {
+      out += text.slice(index);
+      break;
+    }
+    const close = text.indexOf(")", middle + 2);
+    if (close < 0) {
+      out += text.slice(index);
+      break;
+    }
+    out += text.slice(index, open);
+    out += text.slice(open + 1, middle) + " (" + text.slice(middle + 2, close) + ")";
+    index = close + 1;
+  }
+  return out;
+}
+
+/// The cleaning counts LOOT records, in words, or an empty string when it records none.
+function cleaningCounts(cleaning) {
+  const parts = [];
+  const itm = Number(cleaning.itm) || 0;
+  const references = Number(cleaning.deleted_references) || 0;
+  const navmeshes = Number(cleaning.deleted_navmeshes) || 0;
+  if (itm > 0) {
+    parts.push(itm + (itm === 1 ? " identical-to-master record" : " identical-to-master records"));
+  }
+  if (references > 0) {
+    parts.push(references + (references === 1 ? " deleted reference" : " deleted references"));
+  }
+  if (navmeshes > 0) {
+    parts.push(navmeshes + (navmeshes === 1 ? " deleted navmesh" : " deleted navmeshes"));
+  }
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0];
+  return parts.slice(0, -1).join(", ") + " and " + parts[parts.length - 1];
 }
 
 // ---------------------------------------------------------------------------
