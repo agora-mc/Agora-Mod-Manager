@@ -27,12 +27,68 @@ export interface PluginRow {
   masters: string[];
 }
 
+export type FindingLevel = 'finding' | 'warning' | 'info';
+
 export interface PluginFinding {
   message: string;
   /** Whether a launch refuses to start because of this finding. The others are warnings. */
   refusesLaunch: boolean;
+  /** `finding` stops launch, `warning` is something to read, `info` changes nothing. */
+  level: FindingLevel;
   /** The plugins the finding is about. Empty for a limit on the whole list. */
   plugins: string[];
+}
+
+/** One pair of plugins where the winner replaces changes the loser made (MASTER_SPEC §31.3). */
+export interface ConflictPair {
+  winner: string;
+  loser: string;
+  /** How many record changes the winner replaces. */
+  count: number;
+  /** Up to ten record labels that explain the pair. */
+  labels: string[];
+  /** Whether one of the pair's items was added, turned on or moved since the last launch. */
+  newSinceLastLaunch: boolean;
+}
+
+/** One list's classified overlaps, as the conflicts card shows them. */
+export interface OverlapsView {
+  pairs: ConflictPair[];
+  /** Changer pairs the winner patches because it masters the changer. */
+  patched: number;
+  /** Changer pairs a load-after rule already decides. */
+  decided: number;
+  /** Changer pairs between the game's own always-loaded files. */
+  implicitPairs: number;
+  /** What the reader said about files it could not read, or about the list itself. */
+  notes: PluginFinding[];
+}
+
+/** One load-after rule as the rules section shows it. */
+export interface RuleView {
+  item: string;
+  after: string;
+  /** The item or its target that the list no longer has. `null` while the rule is in use. */
+  unused: string | null;
+}
+
+/** A saved rule change and the conflicts read again. */
+export interface RuleChange {
+  /** For an add, whether the rule was new; for a remove, whether one was there. */
+  changed: boolean;
+  rules: RuleView[];
+  overlaps: OverlapsView | null;
+  /** Why the conflicts could not be read again after the rule was saved. */
+  overlapsError: string | null;
+}
+
+/** What one of the conflicts card's actions left behind. */
+export interface ConflictActionChange {
+  rules: RuleView[];
+  plugins: PluginsView;
+  overlaps: OverlapsView | null;
+  /** Why the conflicts could not be read again after the action was saved. */
+  overlapsError: string | null;
 }
 
 export interface MasterlistView {
@@ -82,6 +138,12 @@ export interface PluginsView {
   notesOutOfDate: boolean;
   /** What the list's sorter last saved, when it has saved something. */
   masterlist: MasterlistView | null;
+  /** Whether this list declares an overlaps reader, so the tab can show conflicts at all. */
+  hasOverlapsReader: boolean;
+  /** The saved conflicts report for this exact order, when one was computed. */
+  overlaps: OverlapsView | null;
+  /** True when no saved report matches this order; the tab asks for one in the background. */
+  overlapsOutOfDate: boolean;
 }
 
 /** The sorter's notes, fetched in the background after a read said they were stale. */
@@ -171,11 +233,63 @@ function isPluginRow(value: unknown): value is PluginRow {
     && isStringArray(value.masters);
 }
 
+function isFindingLevel(value: unknown): value is FindingLevel {
+  return value === 'finding' || value === 'warning' || value === 'info';
+}
+
 function isPluginFinding(value: unknown): value is PluginFinding {
   if (!isObject(value)) return false;
   return typeof value.message === 'string'
     && typeof value.refusesLaunch === 'boolean'
+    && isFindingLevel(value.level)
     && isStringArray(value.plugins);
+}
+
+function isConflictPair(value: unknown): value is ConflictPair {
+  return isObject(value)
+    && typeof value.winner === 'string'
+    && typeof value.loser === 'string'
+    && typeof value.count === 'number'
+    && isStringArray(value.labels)
+    && typeof value.newSinceLastLaunch === 'boolean';
+}
+
+function isOverlapsView(value: unknown): value is OverlapsView {
+  return isObject(value)
+    && Array.isArray(value.pairs)
+    && value.pairs.every(isConflictPair)
+    && typeof value.patched === 'number'
+    && typeof value.decided === 'number'
+    && typeof value.implicitPairs === 'number'
+    && Array.isArray(value.notes)
+    && value.notes.every(isPluginFinding);
+}
+
+function isRuleView(value: unknown): value is RuleView {
+  return isObject(value)
+    && typeof value.item === 'string'
+    && typeof value.after === 'string'
+    && (value.unused === null || typeof value.unused === 'string');
+}
+
+function isRuleViewArray(value: unknown): value is RuleView[] {
+  return Array.isArray(value) && value.every(isRuleView);
+}
+
+function isRuleChange(value: unknown): value is RuleChange {
+  return isObject(value)
+    && typeof value.changed === 'boolean'
+    && isRuleViewArray(value.rules)
+    && (value.overlaps === null || isOverlapsView(value.overlaps))
+    && (value.overlapsError === null || typeof value.overlapsError === 'string');
+}
+
+function isConflictActionChange(value: unknown): value is ConflictActionChange {
+  return isObject(value)
+    && isRuleViewArray(value.rules)
+    && isPluginsView(value.plugins)
+    && (value.overlaps === null || isOverlapsView(value.overlaps))
+    && (value.overlapsError === null || typeof value.overlapsError === 'string');
 }
 
 function isMasterlistView(value: unknown): value is MasterlistView {
@@ -201,7 +315,10 @@ function isPluginsView(value: unknown): value is PluginsView {
     && Array.isArray(value.notes)
     && value.notes.every(isPluginFinding)
     && typeof value.notesOutOfDate === 'boolean'
-    && (value.masterlist === null || isMasterlistView(value.masterlist));
+    && (value.masterlist === null || isMasterlistView(value.masterlist))
+    && typeof value.hasOverlapsReader === 'boolean'
+    && (value.overlaps === null || isOverlapsView(value.overlaps))
+    && typeof value.overlapsOutOfDate === 'boolean';
 }
 
 function isLoadOrderListsView(value: unknown): value is LoadOrderListsView {
@@ -281,9 +398,25 @@ export async function setGamePluginLocked(instanceId: string, plugin: string, lo
   return checkedReply('games_plugins_set_locked', reply, isPluginChange);
 }
 
-/** Move a plugin to a 1-based position that counts the always-loaded plugins. */
-export async function moveGamePlugin(instanceId: string, plugin: string, to: number, listId?: string): Promise<MoveChange> {
-  const reply = await invoke<unknown>('games_plugins_move', { instanceId, plugin, to, listId: listId ?? null });
+/**
+ * Move a plugin to a 1-based position that counts the always-loaded plugins. A move that breaks a
+ * load order rule rejects with `BREAKS_RULE` and the rule in `details` unless `breakRule` is set,
+ * which removes that rule instead.
+ */
+export async function moveGamePlugin(
+  instanceId: string,
+  plugin: string,
+  to: number,
+  listId?: string,
+  breakRule?: boolean,
+): Promise<MoveChange> {
+  const reply = await invoke<unknown>('games_plugins_move', {
+    instanceId,
+    plugin,
+    to,
+    breakRule: breakRule ?? false,
+    listId: listId ?? null,
+  });
   return checkedReply('games_plugins_move', reply, isMoveChange);
 }
 
@@ -304,6 +437,72 @@ function isSorterNotesView(value: unknown): value is SorterNotesView {
 export async function refreshSorterNotes(instanceId: string, listId?: string): Promise<SorterNotesView> {
   const reply = await invoke<unknown>('games_plugins_sorter_notes', { instanceId, listId: listId ?? null });
   return checkedReply('games_plugins_sorter_notes', reply, isSorterNotesView);
+}
+
+/** Read this list's conflicts now. A reader that fails rejects: never "no conflicts". */
+export async function refreshOverlaps(instanceId: string, listId?: string): Promise<OverlapsView> {
+  const reply = await invoke<unknown>('games_plugins_conflicts', { instanceId, listId: listId ?? null });
+  return checkedReply('games_plugins_conflicts', reply, isOverlapsView);
+}
+
+/** Every load-after rule this instance's list has, including the unused ones. */
+export async function listLoadOrderRules(instanceId: string, listId?: string): Promise<RuleView[]> {
+  const reply = await invoke<unknown>('games_plugins_rules', { instanceId, listId: listId ?? null });
+  return checkedReply(
+    'games_plugins_rules',
+    reply,
+    (value): value is { rules: RuleView[] } => isObject(value) && isRuleViewArray(value.rules),
+  ).rules;
+}
+
+/** Add "item loads after after", refusing a rule that contradicts a master or makes a loop. */
+export async function addLoadOrderRule(
+  instanceId: string,
+  item: string,
+  after: string,
+  listId?: string,
+): Promise<RuleChange> {
+  const reply = await invoke<unknown>('games_plugins_rule_add', {
+    instanceId,
+    item,
+    after,
+    listId: listId ?? null,
+  });
+  return checkedReply('games_plugins_rule_add', reply, isRuleChange);
+}
+
+/** Remove "item loads after after". A rule whose item left the list can still be removed. */
+export async function removeLoadOrderRule(
+  instanceId: string,
+  item: string,
+  after: string,
+  listId?: string,
+): Promise<RuleChange> {
+  const reply = await invoke<unknown>('games_plugins_rule_remove', {
+    instanceId,
+    item,
+    after,
+    listId: listId ?? null,
+  });
+  return checkedReply('games_plugins_rule_remove', reply, isRuleChange);
+}
+
+/** Let the loser win (rule and move) or keep this order (rule only). */
+export async function applyConflictAction(
+  instanceId: string,
+  winner: string,
+  loser: string,
+  letLoserWin: boolean,
+  listId?: string,
+): Promise<ConflictActionChange> {
+  const reply = await invoke<unknown>('games_plugins_conflict_action', {
+    instanceId,
+    winner,
+    loser,
+    letLoserWin,
+    listId: listId ?? null,
+  });
+  return checkedReply('games_plugins_conflict_action', reply, isConflictActionChange);
 }
 
 /** Run the list's sorter update hook. */
