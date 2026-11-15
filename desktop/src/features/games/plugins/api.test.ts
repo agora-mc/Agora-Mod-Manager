@@ -4,11 +4,16 @@ const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 
 import {
+  addLoadOrderRule,
+  applyConflictAction,
   checkGamePlugins,
   describeFailure,
   listGamePlugins,
   listLoadOrderLists,
+  listLoadOrderRules,
   moveGamePlugin,
+  refreshOverlaps,
+  removeLoadOrderRule,
   setGamePluginActive,
   setGamePluginLocked,
   sortGamePlugins,
@@ -44,6 +49,23 @@ const view: PluginsView = {
   notes: [],
   notesOutOfDate: false,
   masterlist: null,
+  hasOverlapsReader: false,
+  overlaps: null,
+  overlapsOutOfDate: false,
+};
+
+const overlaps = {
+  pairs: [{
+    winner: 'Heavy Boots.esp',
+    loser: 'Moon Jump.esp',
+    count: 1,
+    labels: ['GMST fJumpHeightMin'],
+    newSinceLastLaunch: true,
+  }],
+  patched: 1,
+  decided: 0,
+  implicitPairs: 2,
+  notes: [],
 };
 
 describe('load order lists', () => {
@@ -81,7 +103,28 @@ describe('plugin commands', () => {
       plugins: view,
     });
     await moveGamePlugin('inst-1', 'SkyUI.esp', 2);
-    expect(invokeMock).toHaveBeenCalledWith('games_plugins_move', { instanceId: 'inst-1', plugin: 'SkyUI.esp', to: 2, listId: null });
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_move', {
+      instanceId: 'inst-1',
+      plugin: 'SkyUI.esp',
+      to: 2,
+      breakRule: false,
+      listId: null,
+    });
+  });
+
+  it('asks the backend to remove a rule only when the user agreed to break it', async () => {
+    invokeMock.mockResolvedValueOnce({
+      report: { plugin: 'SkyUI.esp', from: 3, to: 2, written: true },
+      plugins: view,
+    });
+    await moveGamePlugin('inst-1', 'SkyUI.esp', 2, undefined, true);
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_move', {
+      instanceId: 'inst-1',
+      plugin: 'SkyUI.esp',
+      to: 2,
+      breakRule: true,
+      listId: null,
+    });
   });
 
   it('sends a sort as a dry run or for real, as it is asked', async () => {
@@ -132,9 +175,53 @@ describe('plugin commands', () => {
   it('reads a check into its status and findings', async () => {
     invokeMock.mockResolvedValueOnce({
       status: 'findings',
-      findings: [{ message: 'Skyrim.esm is missing', refusesLaunch: true, plugins: ['SkyUI.esp'] }],
+      findings: [{ message: 'Skyrim.esm is missing', refusesLaunch: true, level: 'finding', plugins: ['SkyUI.esp'] }],
     });
     await expect(checkGamePlugins('inst-1')).resolves.toMatchObject({ status: 'findings' });
+  });
+
+  it('reads conflicts, rules and the two actions with the arguments the backend takes', async () => {
+    invokeMock.mockResolvedValueOnce(overlaps);
+    await expect(refreshOverlaps('inst-1')).resolves.toEqual(overlaps);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_conflicts', { instanceId: 'inst-1', listId: null });
+
+    const rules = [{ item: 'Heavy Boots.esp', after: 'Moon Jump.esp', unused: null }];
+    invokeMock.mockResolvedValueOnce({ rules });
+    await expect(listLoadOrderRules('inst-1')).resolves.toEqual(rules);
+    expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_rules', { instanceId: 'inst-1', listId: null });
+
+    invokeMock.mockResolvedValueOnce({ changed: true, rules, overlaps, overlapsError: null });
+    await expect(addLoadOrderRule('inst-1', 'Heavy Boots.esp', 'Moon Jump.esp')).resolves.toMatchObject({ changed: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_rule_add', {
+      instanceId: 'inst-1',
+      item: 'Heavy Boots.esp',
+      after: 'Moon Jump.esp',
+      listId: null,
+    });
+
+    invokeMock.mockResolvedValueOnce({ changed: true, rules: [], overlaps, overlapsError: null });
+    await expect(removeLoadOrderRule('inst-1', 'Heavy Boots.esp', 'Moon Jump.esp')).resolves.toMatchObject({ changed: true });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_rule_remove', {
+      instanceId: 'inst-1',
+      item: 'Heavy Boots.esp',
+      after: 'Moon Jump.esp',
+      listId: null,
+    });
+
+    invokeMock.mockResolvedValueOnce({ rules, plugins: view, overlaps, overlapsError: null });
+    await expect(applyConflictAction('inst-1', 'Heavy Boots.esp', 'Moon Jump.esp', true)).resolves.toMatchObject({ plugins: view });
+    expect(invokeMock).toHaveBeenLastCalledWith('games_plugins_conflict_action', {
+      instanceId: 'inst-1',
+      winner: 'Heavy Boots.esp',
+      loser: 'Moon Jump.esp',
+      letLoserWin: true,
+      listId: null,
+    });
+  });
+
+  it('rejects a conflicts reply that is not a report, never reading it as "no conflicts"', async () => {
+    invokeMock.mockResolvedValueOnce(null);
+    await expect(refreshOverlaps('inst-1')).rejects.toThrow('games_plugins_conflicts did not return');
   });
 
   it.each([

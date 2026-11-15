@@ -105,6 +105,14 @@ pub struct PluginsView {
     pub notes_out_of_date: bool,
     /// What the list's sorter last saved, when it has saved something.
     pub masterlist: Option<MasterlistView>,
+    /// Whether this list declares an overlaps reader, so the tab can show conflicts at all.
+    pub has_overlaps_reader: bool,
+    /// The saved conflicts report for this exact order, when one was computed. A plain read never
+    /// runs the reader, so this can lag the list by one check.
+    pub overlaps: Option<OverlapsView>,
+    /// True when the list declares an overlaps reader but no report matches this order; the tab
+    /// asks for one in the background.
+    pub overlaps_out_of_date: bool,
 }
 
 /// What the list's sorter last saved, for the tab's "Masterlist from <date>" line.
@@ -154,8 +162,79 @@ pub struct PluginFinding {
     pub message: String,
     /// Whether a launch refuses to start for this finding. The others are warnings.
     pub refuses_launch: bool,
+    /// `finding` when a launch refuses, `warning` for something to read, `info` for a note that
+    /// changes nothing. The tab titles the whole card from this.
+    pub level: String,
     /// The plugins the finding is about. Empty for a limit that applies to the whole list.
     pub plugins: Vec<String>,
+}
+
+/// One pair of plugins where the winner replaces changes the loser made (MASTER_SPEC §31.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictPairView {
+    pub winner: String,
+    pub loser: String,
+    /// How many record changes the winner replaces.
+    pub count: usize,
+    /// Up to ten record labels that explain the pair.
+    pub labels: Vec<String>,
+    /// Whether one of the pair's items was added, turned on or moved since the last launch.
+    pub new_since_last_launch: bool,
+}
+
+/// One list's classified overlaps, as the conflicts card shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlapsView {
+    pub pairs: Vec<ConflictPairView>,
+    /// Changer pairs the winner patches because it masters the changer.
+    pub patched: usize,
+    /// Changer pairs a load-after rule already decides.
+    pub decided: usize,
+    /// Changer pairs between the game's own always-loaded files.
+    pub implicit_pairs: usize,
+    /// What the reader said about files it could not read, or about the list itself.
+    pub notes: Vec<PluginFinding>,
+}
+
+fn overlaps_view(report: &agora_core::game_load_order::OverlapReport) -> OverlapsView {
+    OverlapsView {
+        pairs: report
+            .pairs
+            .iter()
+            .map(|pair| ConflictPairView {
+                winner: pair.winner.clone(),
+                loser: pair.loser.clone(),
+                count: pair.count,
+                labels: pair.labels.clone(),
+                new_since_last_launch: pair.new_since_last_launch,
+            })
+            .collect(),
+        patched: report.patched,
+        decided: report.decided,
+        implicit_pairs: report.implicit_pairs,
+        notes: report.notes.iter().map(note_view).collect(),
+    }
+}
+
+/// One load-after rule as the rules section shows it, naming the item that left the list when the
+/// rule is unused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleView {
+    pub item: String,
+    pub after: String,
+    /// The item or its target that the list no longer has. `None` while the rule is in use.
+    pub unused: Option<String>,
+}
+
+fn rule_view(rule: &agora_core::game_load_order::LoadAfterRuleView) -> RuleView {
+    RuleView {
+        item: rule.item.clone(),
+        after: rule.after.clone(),
+        unused: rule.unused.clone(),
+    }
 }
 
 impl PluginsView {
@@ -176,6 +255,9 @@ impl PluginsView {
             notes: Vec::new(),
             notes_out_of_date: false,
             masterlist: None,
+            has_overlaps_reader: false,
+            overlaps: None,
+            overlaps_out_of_date: false,
         }
     }
 
@@ -201,6 +283,9 @@ impl PluginsView {
             notes: order.notes.iter().map(note_view).collect(),
             notes_out_of_date: order.notes_out_of_date,
             masterlist: None,
+            has_overlaps_reader: false,
+            overlaps: order.overlaps.as_ref().map(overlaps_view),
+            overlaps_out_of_date: order.overlaps_out_of_date,
         }
     }
 }
@@ -215,6 +300,7 @@ fn fill_sorter(
     list_id: Option<&str>,
 ) -> Result<(), GamesError> {
     let rule = load_order::list_by_id(definition, list_id).map_err(core_failed)?;
+    view.has_overlaps_reader = rule.rules.overlaps.is_some();
     if let Some(sorter) = rule.rules.sorter.as_ref() {
         view.has_sorter_update = sorter.update.is_some();
         view.sorter_update_label = sorter.update_label.clone();
@@ -245,6 +331,12 @@ fn note_view(note: &agora_core::game_load_order::PluginNote) -> PluginFinding {
     PluginFinding {
         message: note.message.clone(),
         refuses_launch: false,
+        level: match note.level {
+            agora_core::game_load_order::NoteLevel::Info => "info",
+            agora_core::game_load_order::NoteLevel::Warn
+            | agora_core::game_load_order::NoteLevel::Error => "warning",
+        }
+        .to_string(),
         plugins: if note.plugin.is_empty() {
             Vec::new()
         } else {
@@ -264,9 +356,19 @@ fn finding_view(finding: &Finding) -> PluginFinding {
         Finding::ListLevel { items, .. } => items.clone(),
         Finding::RulesFailed { .. } => Vec::new(),
     };
+    let refuses = finding.refuses_launch();
+    let level = if refuses {
+        "finding"
+    } else if matches!(finding, Finding::ListLevel { message, .. } if message.starts_with("Info: "))
+    {
+        "info"
+    } else {
+        "warning"
+    };
     PluginFinding {
         message: finding.message(),
-        refuses_launch: finding.refuses_launch(),
+        refuses_launch: refuses,
+        level: level.to_string(),
         plugins,
     }
 }
@@ -457,6 +559,265 @@ pub async fn games_plugins_sorter_notes(
     .await
 }
 
+/// Read one list's conflicts now, filling the cache a later plain read uses. A reader that fails
+/// or answers something core cannot trust is an error, never an empty "no conflicts".
+#[tauri::command]
+pub async fn games_plugins_conflicts(
+    app: tauri::AppHandle,
+    instance_id: String,
+    list_id: Option<String>,
+) -> Result<OverlapsView, GamesError> {
+    run_blocking(app, "Reading the plugins' records", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let report =
+            load_order::refresh_overlaps(&ctx, &instance_id, definition, list_id.as_deref())
+                .map_err(core_failed)?;
+        Ok(overlaps_view(&report))
+    })
+    .await
+}
+
+/// Every load-after rule this instance's list has, with unused rules naming the missing item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RulesView {
+    pub rules: Vec<RuleView>,
+}
+
+fn rule_views(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> Result<Vec<RuleView>, GamesError> {
+    let views = load_order::load_after_rule_views(ctx, instance_id, definition, list_id)
+        .map_err(core_failed)?;
+    Ok(views.iter().map(rule_view).collect())
+}
+
+/// The instance's load order rules, for the collapsed rules section.
+#[tauri::command]
+pub async fn games_plugins_rules(
+    app: tauri::AppHandle,
+    instance_id: String,
+    list_id: Option<String>,
+) -> Result<RulesView, GamesError> {
+    run_blocking(app, "Reading your load order rules", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        Ok(RulesView {
+            rules: rule_views(&ctx, &instance_id, definition, list_id.as_deref())?,
+        })
+    })
+    .await
+}
+
+/// A saved rule change: the rules as they now stand, and conflicts read again when the list has
+/// a reader. A reader that fails does not turn a saved change into a failure; `overlaps_error`
+/// says why the card cannot be updated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleChange {
+    /// For an add, whether the rule was new; for a remove, whether one was there.
+    pub changed: bool,
+    pub rules: Vec<RuleView>,
+    pub overlaps: Option<OverlapsView>,
+    pub overlaps_error: Option<String>,
+}
+
+fn refreshed_overlaps(
+    ctx: &Ctx,
+    instance_id: &str,
+    definition: &GameDefinition,
+    list_id: Option<&str>,
+) -> (Option<OverlapsView>, Option<String>) {
+    let reader = load_order::list_by_id(definition, list_id)
+        .map(|rule| rule.rules.overlaps.is_some())
+        .unwrap_or(false);
+    if !reader {
+        return (None, None);
+    }
+    match load_order::refresh_overlaps(ctx, instance_id, definition, list_id) {
+        Ok(report) => (Some(overlaps_view(&report)), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+/// Add "item loads after after". A rule that contradicts a master or would make a loop is refused
+/// by core, with the reason.
+#[tauri::command]
+pub async fn games_plugins_rule_add(
+    app: tauri::AppHandle,
+    instance_id: String,
+    item: String,
+    after: String,
+    list_id: Option<String>,
+) -> Result<RuleChange, GamesError> {
+    run_blocking(app, "Adding the rule", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let changed = load_order::add_load_after_rule(
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+            &item,
+            &after,
+        )
+        .map_err(core_failed)?;
+        let rules = rule_views(&ctx, &instance_id, definition, list_id.as_deref())?;
+        let (overlaps, overlaps_error) =
+            refreshed_overlaps(&ctx, &instance_id, definition, list_id.as_deref());
+        Ok(RuleChange {
+            changed,
+            rules,
+            overlaps,
+            overlaps_error,
+        })
+    })
+    .await
+}
+
+/// Remove "item loads after after". A rule whose item left the list can still be removed.
+#[tauri::command]
+pub async fn games_plugins_rule_remove(
+    app: tauri::AppHandle,
+    instance_id: String,
+    item: String,
+    after: String,
+    list_id: Option<String>,
+) -> Result<RuleChange, GamesError> {
+    run_blocking(app, "Removing the rule", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let removed = load_order::remove_load_after_rule(
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+            &item,
+            &after,
+        )
+        .map_err(core_failed)?;
+        if !removed {
+            return Err(GamesError::new(
+                "NO_SUCH_RULE",
+                format!("No rule says '{item}' loads after '{after}'."),
+            ));
+        }
+        let rules = rule_views(&ctx, &instance_id, definition, list_id.as_deref())?;
+        let (overlaps, overlaps_error) =
+            refreshed_overlaps(&ctx, &instance_id, definition, list_id.as_deref());
+        Ok(RuleChange {
+            changed: true,
+            rules,
+            overlaps,
+            overlaps_error,
+        })
+    })
+    .await
+}
+
+/// What one of the conflicts card's two actions left behind: the new order, the rules, and the
+/// conflicts read again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictActionChange {
+    pub rules: Vec<RuleView>,
+    pub plugins: PluginsView,
+    pub overlaps: Option<OverlapsView>,
+    pub overlaps_error: Option<String>,
+}
+
+/// Let the loser win (add the rule and move it after the winner), or keep this order (add the
+/// rule only). The pair must still be in the current report; a reply that names a stale pair is
+/// refused rather than writing a rule nobody asked for.
+#[tauri::command]
+pub async fn games_plugins_conflict_action(
+    app: tauri::AppHandle,
+    instance_id: String,
+    winner: String,
+    loser: String,
+    let_loser_win: bool,
+    list_id: Option<String>,
+) -> Result<ConflictActionChange, GamesError> {
+    run_blocking(app, "Changing the plugin conflict", move |ctx| {
+        game_definition!(&ctx, &instance_id, definition);
+        let report =
+            load_order::refresh_overlaps(&ctx, &instance_id, definition, list_id.as_deref())
+                .map_err(core_failed)?;
+        let exists = report.pairs.iter().any(|pair| {
+            pair.winner.eq_ignore_ascii_case(&winner) && pair.loser.eq_ignore_ascii_case(&loser)
+        });
+        if !exists {
+            return Err(GamesError::new(
+                "NO_SUCH_CONFLICT",
+                format!(
+                    "There is no conflict where '{winner}' replaces changes made by '{loser}'."
+                ),
+            ));
+        }
+        let (item, after) = if let_loser_win {
+            (loser.as_str(), winner.as_str())
+        } else {
+            (winner.as_str(), loser.as_str())
+        };
+        let added = load_order::add_load_after_rule(
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+            item,
+            after,
+        )
+        .map_err(core_failed)?;
+        if let_loser_win {
+            if let Err(error) = load_order::move_plugin_in(
+                &ctx,
+                &instance_id,
+                definition,
+                list_id.as_deref(),
+                &loser,
+                &MoveTarget::After(winner.clone()),
+            ) {
+                // A move that was refused leaves the order as it was; do not keep a rule that
+                // only made sense with the move.
+                if added {
+                    let _ = load_order::remove_load_after_rule(
+                        &ctx,
+                        &instance_id,
+                        definition,
+                        list_id.as_deref(),
+                        item,
+                        after,
+                    );
+                }
+                return Err(GamesError::new(
+                    CORE_FAILED,
+                    format!("The rule was not kept, because the move failed: {error}"),
+                ));
+            }
+        }
+        let order = load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref())
+            .map_err(core_failed)?;
+        let mut view = PluginsView::from_order(&order);
+        fill_sorter(
+            &mut view,
+            &ctx,
+            &instance_id,
+            definition,
+            list_id.as_deref(),
+        )?;
+        let rules = rule_views(&ctx, &instance_id, definition, list_id.as_deref())?;
+        let (overlaps, overlaps_error) =
+            refreshed_overlaps(&ctx, &instance_id, definition, list_id.as_deref());
+        Ok(ConflictActionChange {
+            rules,
+            plugins: view,
+            overlaps,
+            overlaps_error,
+        })
+    })
+    .await
+}
+
 /// Turn a plugin on or off in the instance's list. Refused while the game is running.
 #[tauri::command]
 pub async fn games_plugins_set_active(
@@ -530,20 +891,36 @@ pub async fn games_plugins_move(
     instance_id: String,
     plugin: String,
     to: usize,
+    break_rule: Option<bool>,
     list_id: Option<String>,
 ) -> Result<MoveChange, GamesError> {
     run_blocking(app, "Moving the plugin", move |ctx| {
         game_definition!(&ctx, &instance_id, definition);
-        // One deployment plan serves the move and the order it returns.
-        let (report, order) = load_order::move_plugin_and_order_in(
-            &ctx,
-            &instance_id,
-            definition,
-            list_id.as_deref(),
-            &plugin,
-            &MoveTarget::Position(to),
-        )
-        .map_err(core_failed)?;
+        let (report, order) = if break_rule.unwrap_or(false) {
+            let report = load_order::move_plugin_in_breaking_rules(
+                &ctx,
+                &instance_id,
+                definition,
+                list_id.as_deref(),
+                &plugin,
+                &MoveTarget::Position(to),
+            )
+            .map_err(move_failed)?;
+            let order = load_order::order_in(&ctx, &instance_id, definition, list_id.as_deref())
+                .map_err(core_failed)?;
+            (report, order)
+        } else {
+            // One deployment plan serves the move and the order it returns.
+            load_order::move_plugin_and_order_in(
+                &ctx,
+                &instance_id,
+                definition,
+                list_id.as_deref(),
+                &plugin,
+                &MoveTarget::Position(to),
+            )
+            .map_err(move_failed)?
+        };
         let mut view = PluginsView::from_order(&order);
         fill_sorter(
             &mut view,
@@ -558,6 +935,18 @@ pub async fn games_plugins_move(
         })
     })
     .await
+}
+
+/// A move that breaks a rule is a question, not a failure: the details carry the rule so the tab
+/// can ask before changing anything.
+fn move_failed(error: agora_core::game_load_order::LoadOrderError) -> GamesError {
+    if let agora_core::game_load_order::LoadOrderError::BreaksRule { item, after, .. } = &error {
+        return GamesError::new("BREAKS_RULE", error.to_string()).with_details(serde_json::json!({
+            "item": item,
+            "after": after,
+        }));
+    }
+    core_failed(error)
 }
 
 /// Sort the list so every master comes before the plugins that need it, by the game's master
@@ -819,6 +1208,75 @@ mod tests {
     fn a_running_game_is_refused_with_the_reason_core_gives() {
         let error = core_failed(PluginListError::InstanceRunning("abc".to_string()));
         assert!(error.message.contains("close the game"));
+    }
+
+    #[test]
+    fn a_conflict_pair_keeps_its_new_flag_and_labels_for_the_card() {
+        let report = agora_core::game_load_order::OverlapReport {
+            pairs: vec![agora_core::game_load_order::ConflictPair {
+                winner: "Heavy Boots.esp".into(),
+                loser: "Moon Jump.esp".into(),
+                count: 1,
+                labels: vec!["GMST fJumpHeightMin".into()],
+                new_since_last_launch: true,
+            }],
+            patched: 2,
+            decided: 1,
+            implicit_pairs: 3,
+            notes: Vec::new(),
+        };
+        let view = overlaps_view(&report);
+        assert_eq!(view.pairs.len(), 1);
+        assert!(view.pairs[0].new_since_last_launch);
+        assert_eq!(view.pairs[0].winner, "Heavy Boots.esp");
+        assert_eq!(view.pairs[0].labels, vec!["GMST fJumpHeightMin"]);
+        assert_eq!((view.patched, view.decided, view.implicit_pairs), (2, 1, 3));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["pairs"][0]["newSinceLastLaunch"], true);
+        assert_eq!(json["implicitPairs"], 3);
+    }
+
+    #[test]
+    fn a_sorter_note_keeps_its_level_so_the_card_can_be_titled_honestly() {
+        let info = agora_core::game_load_order::PluginNote {
+            plugin: String::new(),
+            level: agora_core::game_load_order::NoteLevel::Info,
+            message: "Nothing to change.".into(),
+        };
+        let warn = agora_core::game_load_order::PluginNote {
+            plugin: "SkyUI.esp".into(),
+            level: agora_core::game_load_order::NoteLevel::Warn,
+            message: "A master is missing.".into(),
+        };
+        assert_eq!(note_view(&info).level, "info");
+        assert_eq!(note_view(&warn).level, "warning");
+        assert_eq!(note_view(&warn).plugins, vec!["SkyUI.esp".to_string()]);
+    }
+
+    #[test]
+    fn an_info_finding_is_not_a_warning_and_still_names_no_plugin() {
+        let info = Finding::ListLevel {
+            message: "Info: 2 conflicts between 1 pair of plugins.".into(),
+            items: Vec::new(),
+            refuses: false,
+        };
+        let view = finding_view(&info);
+        assert_eq!(view.level, "info");
+        assert!(!view.refuses_launch);
+        assert!(view.plugins.is_empty());
+    }
+
+    #[test]
+    fn a_move_that_breaks_a_rule_carries_the_rule_as_details() {
+        let error = move_failed(agora_core::game_load_order::LoadOrderError::BreaksRule {
+            plugin: "Heavy Boots.esp".into(),
+            item: "Heavy Boots.esp".into(),
+            after: "Moon Jump.esp".into(),
+        });
+        assert_eq!(error.code, "BREAKS_RULE");
+        let details = error.details.expect("the rule is in the details");
+        assert_eq!(details["item"], "Heavy Boots.esp");
+        assert_eq!(details["after"], "Moon Jump.esp");
     }
 
     /// Read-only check against a real MO2 import. Run by hand:

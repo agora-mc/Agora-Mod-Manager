@@ -97,6 +97,7 @@ const requiem = plugin({ position: 4, name: 'Requiem.esp', active: false, master
 const orderFinding = {
   message: "'SkyUI.esp' loads before its master 'Skyrim.esm'.",
   refusesLaunch: false,
+  level: 'warning',
   plugins: ['SkyUI.esp'],
 };
 
@@ -116,6 +117,9 @@ const listed = {
   notes: [],
   notesOutOfDate: false,
   masterlist: { fetchedAt: '2026-01-02T03:04:05Z', source: 'https://api.github.com/repos/loot/skyrimse/contents/masterlist.yaml?ref=v0.29' },
+  hasOverlapsReader: false,
+  overlaps: null,
+  overlapsOutOfDate: false,
 };
 
 async function openPage(
@@ -300,7 +304,7 @@ test.describe('Plugins tab', () => {
 
   test('a list with no plugins yet says what to do', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasSorterUpdate: true, sorterUpdateLabel: 'Update masterlist', rulesApply: true, listExists: true, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null },
+      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasSorterUpdate: true, sorterUpdateLabel: 'Update masterlist', rulesApply: true, listExists: true, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null, hasOverlapsReader: false, overlaps: null, overlapsOutOfDate: false },
     });
 
     await expect(page.getByText("No plugins are in this instance's list yet.")).toBeVisible();
@@ -309,7 +313,7 @@ test.describe('Plugins tab', () => {
 
   test('an instance with no list yet is told when one appears', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasSorterUpdate: true, sorterUpdateLabel: 'Update masterlist', rulesApply: true, listExists: false, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null },
+      games_plugins_list: { supported: true, listId: 'plugins', listName: 'Plugins', rulesKind: 'script', intro: null, itemHeading: null, hasSorterUpdate: true, sorterUpdateLabel: 'Update masterlist', rulesApply: true, listExists: false, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null, hasOverlapsReader: false, overlaps: null, overlapsOutOfDate: false },
     });
 
     await expect(page.getByText('This instance has no plugin list yet.')).toBeVisible();
@@ -332,6 +336,9 @@ test.describe('Plugins tab', () => {
       notes: [],
       notesOutOfDate: false,
       masterlist: null,
+      hasOverlapsReader: false,
+      overlaps: null,
+      overlapsOutOfDate: false,
     };
     await openPage(page, 'plugins', {
       games_plugins_lists: { lists: [{ id: 'mods', name: 'Mods', rulesKind: 'none' }] },
@@ -351,7 +358,7 @@ test.describe('Plugins tab', () => {
   test('a game with no load order lists has no load-order tab', async ({ page }) => {
     await openPage(page, 'plugins', {
       games_plugins_lists: { lists: [] },
-      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, listExists: false, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null },
+      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, listExists: false, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null, hasOverlapsReader: false, overlaps: null, overlapsOutOfDate: false },
     });
 
     const pages = page.getByRole('navigation', { name: 'Instance pages' });
@@ -362,7 +369,7 @@ test.describe('Plugins tab', () => {
 
   test('a game with no plugin list says so instead of showing an empty list', async ({ page }) => {
     await openPage(page, 'plugins', {
-      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, listExists: false, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null },
+      games_plugins_list: { supported: false, listId: '', listName: '', rulesKind: '', intro: null, itemHeading: null, hasSorterUpdate: false, sorterUpdateLabel: null, rulesApply: false, listExists: false, rows: [], findings: [], notes: [], notesOutOfDate: false, masterlist: null, hasOverlapsReader: false, overlaps: null, overlapsOutOfDate: false },
     });
 
     await expect(page.getByText('This game does not keep a plugin list')).toBeVisible();
