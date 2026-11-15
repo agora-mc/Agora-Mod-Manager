@@ -4599,9 +4599,9 @@ least one tracer from another family use it.**
 | **5. Plugin API 0.2** | Game packages, family parents, new capabilities, `GameTarget` providers, `nxm://` routing, published game-definition spec; the Minecraft package reaches core only through `GameHost`. Done 2026-10-31 (§26.11, as built): official plugins (signed `official_plugins` pins, Blocked on mismatch, registered first; Skyrim ships as `packages/official/skyrim-se/`), script consent per plugin (`plugin_script_consent`, migration 20), and the emergency stop replacing the global `plugins_enabled` switch. Accepted residuals are listed there. Not yet: the rest of this row | The tracers become finished support written as plugins: Valheim (BepInEx) and Satisfactory (Unreal), then CK3 (Paradox, Microsoft Store) and Cyberpunk (REDengine). The Minecraft package's `agora-core` budget is zero, so nothing a compiled package does is beyond a community one. |
 | **6. Breadth** | Linux overlayfs backend and Proton; Vortex import; Wabbajack recognition; companion-process scripts when a package needs them | Each backed by a real run, like everything above. |
 
-**Phase 4 status (2026-11-01): not done.** Most of its machinery is built and was exercised on the
-spike machine; the Skyrim catalog does not exist, and several of its done-when clauses have no real
-run behind them yet.
+**Phase 4 status (updated 2026-11-15): nearly done.** The machinery is built and was exercised on the
+spike machine and in real Skyrim runs (2026-11-13/14, a 40-plugin SKSE instance broken on purpose and
+repaired); one done-when clause still has no real run behind it (Pandora, below).
 
 *Done:*
 - **Tools on the real path** (§26.9): the real-path view, 32-bit programs, the full-copy swap and the
@@ -4611,8 +4611,15 @@ run behind them yet.
   `skseDependency` evaluated when the instance is known.
 - **The VFS DLLs ship:** `agora_vfs.dll` and its 32-bit twin are staged and bundled
   (`scripts/stage_vfs_files.py`, `desktop/src-tauri/tauri.bundle-vfs.conf.json`).
-- **LOOT sorting through libloot** (`libloot` 0.29.7 in `agora-core`): the Plugins tab sorts, previews
-  the moves, and writes nothing until applied; the masterlist is downloaded only when asked.
+- **LOOT sorting through libloot** (`libloot` 0.29.7, run as the Creation Engine plugin's WebAssembly
+  module, §30.13): the Plugins tab sorts, previews the moves, and writes nothing until applied; the
+  masterlist is downloaded only when asked. Its checks also run before launch (§31.6).
+- **A curated Skyrim catalog** (`registry/games/skyrim-se/mods/`): SKSE, Address Library, SkyUI,
+  Community Shaders, PGPatcher and Skyrim Together. Three install from a `github_release` with the
+  hash GitHub publishes; three are Nexus pages (`manual_link`), reported as not verified because
+  Nexus publishes no checksum Agora can read.
+- **Timed on the 84 GB setup** (2026-11-01, release CLI): the full MO2 import 23.5 min → 391 s, a LOOT
+  sort 2.5 s, a first link deploy 140 s.
 - **User tools whose output is captured as a mod:** DynDOLOD, TexGen and PGPatcher are declared with a
   mod output in `packages/official/skyrim-se/games/package.json`, and a player can add a tool of
   their own with an output folder (`game_user_tools.rs`). The output is imported as a content item
@@ -4621,14 +4628,10 @@ run behind them yet.
   `github_release` and `direct_hash` into a game instance).
 
 *Not done:*
-- **There is no curated Skyrim catalog.** The compiler reads `registry/games/<game>/<kind>/`, but
-  that folder does not exist, so the catalog tab has nothing to install. §26.8 says Skyrim support
-  "is not complete until curated Skyrim mods install from the catalog", so by the spec's own words
-  Skyrim support is not complete, and the last clause of this phase's done-when is unmet.
+- **No `direct_hash` entry** in the Skyrim catalog yet (the done-when names one); CurseForge-style
+  pinned URLs need an API key, and Nexus files carry no published hash.
 - **Pandora Behaviour Engine has never been run for real** (§26.9, *Still to confirm on a real run*):
   it is not on the spike machine, and downloading or running it needs the user's permission.
-- **The 84 GB import has not been re-timed** since the speed work, and **a real LOOT sort has not
-  been timed on a large setup.**
 - **The rollback-bytes test is `#[ignore]`.** `real_injection_rollback_changes_the_bytes_the_game_reads`
   (`crates/agora-core/tests/game_tools.rs`) needs `agora_vfs.dll` and `AGORA_VFS_DLL`, so a default
   test run does not check that rolling back changes the bytes the game reads. That clause of the
