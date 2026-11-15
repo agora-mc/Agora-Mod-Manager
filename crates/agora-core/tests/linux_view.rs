@@ -310,7 +310,10 @@ fn ran(outcome: ViewOutcome) -> Option<ViewRun> {
     match outcome {
         ViewOutcome::Ran(run) => Some(run),
         ViewOutcome::SteppedDown(step_down) => {
-            if std::env::var_os(KNOWN_RESTRICTED_ENV).is_some() {
+            let namespaces = step_down.reason.contains("user namespace")
+                || step_down.reason.contains("uid")
+                || step_down.reason.contains("gid");
+            if namespaces && std::env::var_os(KNOWN_RESTRICTED_ENV).is_some() {
                 eprintln!(
                     "SKIPPED on a host marked known-restricted by {KNOWN_RESTRICTED_ENV}: {}",
                     step_down.reason
