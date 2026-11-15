@@ -388,6 +388,10 @@ pub struct ConflictPair {
     pub count: usize,
     /// Up to [`CONFLICT_LABELS`] record labels that explain the pair.
     pub labels: Vec<String>,
+    /// Whether one of the pair's items was added, turned on or moved since the last recorded
+    /// launch (MASTER_SPEC §31.5). A session with no recorded entries is not a baseline.
+    #[serde(default)]
+    pub new_since_last_launch: bool,
 }
 
 /// How many record labels one pair lists.
@@ -1309,6 +1313,7 @@ pub fn classify_overlaps(
                     loser: changer.1.to_string(),
                     count: 1,
                     labels: vec![label.clone()],
+                    new_since_last_launch: false,
                 }),
             }
         }
@@ -1407,7 +1412,8 @@ pub fn refresh_overlaps(
     }
     let rules = load_after_rules(ctx, instance_id, &rule.id)?;
     let reply = call_overlaps(ctx, instance_id, definition, rule, &entries)?;
-    let report = classify_overlaps(&entries, &reply, &rules)?;
+    let mut report = classify_overlaps(&entries, &reply, &rules)?;
+    mark_new_pairs(ctx, instance_id, &rule.id, &mut report, &entries);
     cache_overlaps(
         ctx,
         definition.id.as_str(),
@@ -1417,6 +1423,38 @@ pub fn refresh_overlaps(
         &report,
     );
     Ok(report)
+}
+
+/// Mark each pair whose winner or loser was added, turned on or moved since the last recorded
+/// launch, so the conflicts list can put those first (MASTER_SPEC §31.5). A failed read of the
+/// ledger means no baseline, never a made-up "new".
+fn mark_new_pairs(
+    ctx: &Ctx,
+    instance_id: &str,
+    list_id: &str,
+    report: &mut OverlapReport,
+    current: &[LoadOrderEntry],
+) {
+    let previous: Vec<crate::session_ledger::LoadOrderEntry> =
+        crate::db::local_state_connection(&ctx.paths.local_state_db())
+            .ok()
+            .and_then(|conn| {
+                crate::session_ledger::latest_manifest(&conn, instance_id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|manifest| {
+                manifest
+                    .load_order
+                    .into_iter()
+                    .filter(|entry| entry.list == list_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+    for pair in &mut report.pairs {
+        let is_new = pair_is_new_since(pair, current, &previous);
+        pair.new_since_last_launch = is_new;
+    }
 }
 
 /// Whether a conflict pair is new since the load order the last session recorded: one of its
@@ -3661,12 +3699,14 @@ mod tests {
                     loser: "A.esp".into(),
                     count: 1,
                     labels: vec!["GMST fJumpHeightMin".into()],
+                    new_since_last_launch: false,
                 },
                 ConflictPair {
                     winner: "C.esp".into(),
                     loser: "B.esp".into(),
                     count: 1,
                     labels: vec!["GMST fJumpHeightMin".into()],
+                    new_since_last_launch: false,
                 },
             ]
         );
@@ -3716,6 +3756,7 @@ mod tests {
                 loser: "A.esp".into(),
                 count: 1,
                 labels: vec!["GMST fJumpHeightMin".into()],
+                new_since_last_launch: false,
             }]
         );
     }
@@ -3805,6 +3846,7 @@ mod tests {
                 loser: "C.esp".into(),
                 count: 1,
                 labels: vec!["GMST fJumpHeightMin".into()],
+                new_since_last_launch: false,
             }]
         );
     }
@@ -3878,6 +3920,7 @@ mod tests {
                 loser: "Dawnguard.esm".into(),
                 count: 1,
                 labels: vec!["GMST fJumpHeightMin".into()],
+                new_since_last_launch: false,
             }]
         );
     }
@@ -3909,6 +3952,7 @@ mod tests {
                 loser: "B.esp".into(),
                 count: 1,
                 labels: vec!["GMST fJumpHeightMin".into()],
+                new_since_last_launch: false,
             }]
         );
     }
@@ -4001,5 +4045,69 @@ mod tests {
         assert_eq!(report.pairs.len(), 1);
         assert_eq!(report.pairs[0].count, 12);
         assert_eq!(report.pairs[0].labels.len(), CONFLICT_LABELS);
+    }
+
+    fn session_entry(name: &str, active: bool) -> crate::session_ledger::LoadOrderEntry {
+        crate::session_ledger::LoadOrderEntry {
+            list: "plugins".into(),
+            name: name.to_string(),
+            active,
+        }
+    }
+
+    #[test]
+    fn a_pair_is_new_when_its_loser_was_added_turned_on_or_moved() {
+        let pair = ConflictPair {
+            winner: "C.esp".into(),
+            loser: "B.esp".into(),
+            count: 1,
+            labels: vec!["GMST fJumpHeightMin".into()],
+            new_since_last_launch: false,
+        };
+        let current = [
+            entry("A.esp", &[]),
+            entry("B.esp", &[]),
+            entry("C.esp", &[]),
+        ];
+        let previous = [
+            session_entry("A.esp", true),
+            session_entry("B.esp", true),
+            session_entry("C.esp", true),
+        ];
+        // The same order and active set: nothing happened since the last launch.
+        assert!(!pair_is_new_since(&pair, &current, &previous));
+
+        // B was turned off before the last launch and is on now.
+        let off_before = [
+            session_entry("A.esp", true),
+            session_entry("B.esp", false),
+            session_entry("C.esp", true),
+        ];
+        assert!(pair_is_new_since(&pair, &current, &off_before));
+
+        // B was not in the last launch's list at all.
+        let without_b = [session_entry("A.esp", true), session_entry("C.esp", true)];
+        assert!(pair_is_new_since(&pair, &current, &without_b));
+
+        // Both were listed, but B sat above A last time.
+        let moved = [
+            session_entry("B.esp", true),
+            session_entry("A.esp", true),
+            session_entry("C.esp", true),
+        ];
+        assert!(pair_is_new_since(&pair, &current, &moved));
+    }
+
+    #[test]
+    fn no_recorded_launch_is_not_a_baseline_so_nothing_is_new() {
+        let pair = ConflictPair {
+            winner: "C.esp".into(),
+            loser: "B.esp".into(),
+            count: 1,
+            labels: vec!["GMST fJumpHeightMin".into()],
+            new_since_last_launch: false,
+        };
+        let current = [entry("B.esp", &[]), entry("C.esp", &[])];
+        assert!(!pair_is_new_since(&pair, &current, &[]));
     }
 }
