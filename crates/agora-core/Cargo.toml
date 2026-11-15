@@ -118,6 +118,8 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# The Vortex import tests build an invented store in the same format Vortex uses.
+rusty-leveldb = "4.0.2"
 # Test-only. The shipped dependency graph keeps the JS engine out of core —
 # core holds `dyn ScriptHost` — but the end-to-end tests are only meaningful
 # against the runtime that actually ships.
