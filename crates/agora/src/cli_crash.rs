@@ -165,7 +165,18 @@ fn no_evidence_reason(
     evidence: &agora_core::crash_live::InstanceEvidence,
 ) -> String {
     let mut why = format!("No crash evidence found for '{instance_id}'.");
-    if !evidence.collection.problems.is_empty() {
+    let unreadable: Vec<_> = evidence
+        .collection
+        .folders
+        .iter()
+        .filter(|folder| {
+            matches!(
+                folder.state,
+                agora_core::crash_engine::evidence::FolderState::Unreadable
+            )
+        })
+        .collect();
+    if !evidence.collection.problems.is_empty() || !unreadable.is_empty() {
         why.push_str(" Could not check:");
         for problem in &evidence.collection.problems {
             why.push_str(&format!(
@@ -174,10 +185,21 @@ fn no_evidence_reason(
                 problem.source_id, problem.plugin_id, problem.detail
             ));
         }
+        for folder in unreadable {
+            let detail = folder
+                .detail
+                .as_deref()
+                .unwrap_or("the folder could not be read");
+            why.push_str(&format!(
+                "
+  - {} (from {}): {detail}",
+                folder.source_id, folder.plugin_id
+            ));
+        }
     } else if evidence.collection.folders.is_empty() {
         why.push_str(" No crash pack source named a folder to search.");
     } else {
-        why.push_str(" Every folder the game's crash packs name was missing, empty or unreadable.");
+        why.push_str(" Every folder the game's crash packs name was missing or empty.");
     }
     why
 }
