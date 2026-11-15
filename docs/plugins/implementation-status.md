@@ -46,8 +46,15 @@ only for a plugin the user allowed it for (asked at install, off until then), th
   another package with `parents` / `extends`, which is how the official Skyrim package is built on
   the Creation Engine base. A game can provide its own load-order sorter: the Creation Engine
   package runs LOOT's libloot as a WebAssembly module through `agora.wasm.run`, so no LOOT code is
-  compiled into Agora or core. Exercised by `crates/agora-plugin-host/tests/creation_engine_sorter.rs`
-  and the game-package tests. Author guide: [`game-packages.md`](game-packages.md).
+  compiled into Agora or core. Its plugin list can also declare load-after rules, and an
+  `overlaps` reader lets core find the records that two plugins both change without knowing the
+  format (MASTER_SPEC §31). Exercised by
+  `crates/agora-plugin-host/tests/creation_engine_sorter.rs` and the game-package tests. Author
+  guide: [`game-packages.md`](game-packages.md).
+- **Crash Doctor packs.** A plugin can contribute crash packs (`crash:contribute`): sources,
+  parsers, inspectors, ref maps, roles, save risk and rules. Minecraft's built-in pack and the
+  community signatures run through the same engine, and `agora crash analyze` runs it on loose
+  files for any supported game. Author guide: [`README.md`](README.md#crash-packs).
 - Author-hosted updates: a plugin ships an `agora-plugin-update.json` naming its update URL and
   Ed25519 keys, which are pinned when the user agrees to install and read only from the database
   afterwards. Updates come from a signed, author-hosted document; the package is authenticated by

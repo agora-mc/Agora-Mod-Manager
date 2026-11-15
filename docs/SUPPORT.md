@@ -44,7 +44,7 @@ Also record which `v*` release the binary came from, or the Git commit for a sou
 | Crash report | The instance's `crash-reports/`, or a JVM `hs_err_pid*.log` at the instance root | Game crashes and fatal JVM failures |
 | Plugin log | `<root>/plugins/logs/<PLUGIN-ID>.log`, or `agora plugin log <ID>` | What one plugin did, and its errors |
 
-The game-log and crash-report rows describe Minecraft. `agora log` and `agora crash` cover Minecraft instances; for another game, include the log or crash file the game itself writes, and the output of `agora games instance check <INSTANCE>`.
+The game-log and crash-report rows describe Minecraft. `agora log` shares Minecraft logs and crash reports. `agora crash` works for any game whose plugin brings a crash pack: `agora --json crash last <INSTANCE>` reads the stored answer, and `agora crash analyze <FILE> --instance <INSTANCE>` diagnoses a crash file you have. `crash investigate` collects the Minecraft layout automatically; for another game, name the file with `--file`, and include the output of `agora games instance check <INSTANCE>`.
 
 List an instance's logs and crash reports:
 
@@ -66,6 +66,7 @@ Agora doesn't generate a support archive. Build a small folder by hand and revie
    agora --output json registry status
    agora --output json health <INSTANCE>
    agora crash list <INSTANCE>
+   agora --output json crash last <INSTANCE>
    ```
 
 3. Add only the relevant `latest.log`, `debug.log`, crash report, or JVM fatal-error log, with personal data removed.

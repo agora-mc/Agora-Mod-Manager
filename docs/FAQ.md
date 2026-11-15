@@ -89,6 +89,10 @@ Some catalog entries cannot be downloaded by Agora itself. **Get from nexusmods.
 
 Yes, for games that keep a plugin list such as Skyrim. On the instance's **Plugins** tab, choose **Sort…**; Agora shows the moves first and writes nothing until you choose **Apply**. Sorting uses LOOT's masterlist when one has been saved, so choose **Update masterlist** first. Locked and always-loaded plugins stay where they are.
 
+### Does the Crash Doctor work for other games?
+
+Yes. A game's plugin can bring crash rules, and Agora runs the same local analysis it uses for Minecraft. It never says a mod is certainly the cause: it says how sure it is ("possible", "likely" or "very likely") and names the plugin behind each finding. If you have a crash file from somewhere else, the CLI can read it too: `agora crash analyze <FILE> --instance <ID>`. See [When the game crashes](https://agoramc.com/docs/guides/crash-recovery).
+
 ### Can the community add games?
 
 Yes. A game is a plugin, and anyone can write one with Agora's game package format. See [Adding a game to Agora](./plugins/game-packages.md). Official plugins are the ones Agora's signed catalog vouches for; community plugins get no special access, and you approve what each one may do when you install it.

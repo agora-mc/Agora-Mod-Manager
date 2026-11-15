@@ -45,7 +45,8 @@ Agora supports two launch modes. Direct launch runs Minecraft inside Agora and g
 - Curated and optional Modrinth discovery with instance-aware compatibility labels.
 - Dependency-aware install plans with one review before files change.
 - Loader compatibility evidence, recommended signed versions, compatible alternatives, and manual candidates when a capability cannot be verified.
-- Health checks, Crash Doctor with guided mod bisect, snapshots, Last Known Good recovery, loadouts, and lockfiles.
+- Health checks and a Crash Doctor for Minecraft and other supported games, with guided mod bisect, snapshots, Last Known Good recovery, loadouts, and lockfiles.
+- Game instances for other games: pinned bases, framework and plugin load-order checks before launch, plugin conflict review with load-after rules, tools, and Mod Organizer 2 import.
 - Imports from supported packs and launcher profiles, plus `.mrpack` and Agora pack export.
 - Surgical pack updates that keep the mods you added and ask before overwriting a file you edited.
 - Minecraft version migration that reports which mods have a build for the target before moving anything.
