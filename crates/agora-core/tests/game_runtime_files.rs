@@ -160,6 +160,17 @@ fn create_test_context_with(
     def: &GameDefinition,
     frameworks: Vec<FrameworkDefinition>,
 ) -> CoreContext {
+    // These tests read INI files the user keeps under Documents. On a machine where that
+    // location cannot be resolved (a bare Linux account has no XDG user dirs, for one), the
+    // check reports that it could not run. Point the test at its own root so the check is
+    // hermetic; the value is process-wide, so set it once (the tests run in threads).
+    static USER_DATA_ROOT: std::sync::Once = std::sync::Once::new();
+    USER_DATA_ROOT.call_once(|| {
+        std::env::set_var(
+            "AGORA_TEST_USER_DATA_ROOT",
+            std::env::temp_dir().join("agora-game-runtime-files-user-data"),
+        );
+    });
     let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
     agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
     let mut builder = GameRegistry::builder();

@@ -593,13 +593,18 @@ pub fn read(
     let store = store_of(ctx, instance_id)?;
     let (rel, mapping) = resolve_file(definition, &store, file)?;
     let copy = join_rel(&instance_dir(ctx, instance_id)?, rel.as_str());
-    let game_file = game_file_of(mapping)?;
     let (document, source) = if copy.exists() {
         (load(&copy)?, IniSource::Copy)
-    } else if game_file.exists() {
-        (load(&game_file)?, IniSource::GameFile)
     } else {
-        (IniDocument::default(), IniSource::Nothing)
+        // Only a missing copy needs the game's own file, so a user-data location that cannot be
+        // resolved must not stop the instance's copy from being checked. On a machine with no
+        // resolvable Documents folder (a bare Linux account, for one) the copy is all there is.
+        let game_file = game_file_of(mapping)?;
+        if game_file.exists() {
+            (load(&game_file)?, IniSource::GameFile)
+        } else {
+            (IniDocument::default(), IniSource::Nothing)
+        }
     };
     Ok(IniRead {
         instance_path: rel.as_str().to_string(),
