@@ -338,8 +338,10 @@ fn engine() -> (tempfile::TempDir, QuickJsHost, PluginId, Arc<FakeBridge>) {
     .expect("the base plugin's script is in the repository");
     let module = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../packages/official/creation-engine/wasm/plugin-records.wasm");
-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    let dir = tempfile::Builder::new().tempdir_in(&scratch).unwrap();
+    // The system temp dir, not the repository's target: copying the module there works for an
+    // unprivileged user on every filesystem, while a checkout on a network-style mount (a WSL
+    // drvfs view of D:, say) refuses `fs::copy` from a non-root user.
+    let dir = tempfile::Builder::new().tempdir().unwrap();
     std::fs::write(dir.path().join("main.js"), source).unwrap();
     std::fs::create_dir_all(dir.path().join("wasm")).unwrap();
     std::fs::copy(module, dir.path().join("wasm/plugin-records.wasm"))
