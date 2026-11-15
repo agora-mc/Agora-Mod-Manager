@@ -31,7 +31,13 @@
         }
       ],
       "deployment": "virtual_file_system",
-      "content_rules": [],
+      "content_rules": [
+        {
+          "kind": "Pandora Behaviour Engine",
+          "match": { "marker": "Pandora Behaviour Engine+.exe" },
+          "mount": "Data/Pandora Behaviour Engine+"
+        }
+      ],
       "content_layout": {
         "data_path": "Data",
         "data_markers": [

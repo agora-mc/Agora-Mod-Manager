@@ -1,0 +1,20 @@
+{
+  "id": "pandora",
+  "name": "Pandora Behaviour Engine+",
+  "content_type": "mod",
+  "author": "Monitor221hz",
+  "license": "GPL-3.0",
+  "game": "skyrim-se",
+  "download_strategy": "github_release",
+  "source_identifier": "Monitor221hz/Pandora-Behaviour-Engine-Plus",
+  "page_url": "https://github.com/Monitor221hz/Pandora-Behaviour-Engine-Plus/releases",
+  "description": "Builds Skyrim's animation behaviour files for animation mods, in place of Nemesis. Run it from the instance's Tools after adding or removing animation mods.",
+  "game_compatibility": [
+    {
+      "stores": ["steam", "gog"],
+      "game_versions": ["1.5.*", "1.6.*", "1.7.*"],
+      "asset": "Pandora_Behaviour_Engine_v*-beta.zip"
+    }
+  ],
+  "curator_note": "Installs the self-contained build (it runs without .NET installed); the *_win-*_net.zip assets need the .NET runtime and are not this entry. Every release so far is tagged -beta, and v5.0.0-beta is the one the project calls its stable release. The archive keeps its files at the top level, so the Skyrim package places it in Data/Pandora Behaviour Engine+, where the instance's pandora tool expects it."
+}

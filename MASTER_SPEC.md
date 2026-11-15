@@ -4636,9 +4636,9 @@ least one tracer from another family use it.**
 | **5. Plugin API 0.2** | Game packages, family parents, new capabilities, `GameTarget` providers, `nxm://` routing, published game-definition spec; the Minecraft package reaches core only through `GameHost`. Done 2026-10-31 (§26.11, as built): official plugins (signed `official_plugins` pins, Blocked on mismatch, registered first; Skyrim ships as `packages/official/skyrim-se/`), script consent per plugin (`plugin_script_consent`, migration 20), and the emergency stop replacing the global `plugins_enabled` switch. Accepted residuals are listed there. Not yet: the rest of this row | The tracers become finished support written as plugins: Valheim (BepInEx) and Satisfactory (Unreal), then CK3 (Paradox, Microsoft Store) and Cyberpunk (REDengine). The Minecraft package's `agora-core` budget is zero, so nothing a compiled package does is beyond a community one. |
 | **6. Breadth** | Linux overlayfs backend and Proton; Vortex import; Wabbajack recognition; companion-process scripts when a package needs them | Each backed by a real run, like everything above. |
 
-**Phase 4 status (updated 2026-11-15): nearly done.** The machinery is built and was exercised on the
+**Phase 4 status (updated 2026-11-15): done, but for a `direct_hash` entry.** The machinery is built and was exercised on the
 spike machine and in real Skyrim runs (2026-11-13/14, a 40-plugin SKSE instance broken on purpose and
-repaired); one done-when clause still has no real run behind it (Pandora, below).
+repaired); Pandora's real run is done too (below).
 
 *Done:*
 - **Tools on the real path** (§26.9): the real-path view, 32-bit programs, the full-copy swap and the
@@ -4655,6 +4655,11 @@ repaired); one done-when clause still has no real run behind it (Pandora, below)
   Community Shaders, PGPatcher and Skyrim Together. Three install from a `github_release` with the
   hash GitHub publishes; three are Nexus pages (`manual_link`), reported as not verified because
   Nexus publishes no checksum Agora can read.
+- **Pandora Behaviour Engine+ ran for real** (2026-11-15, v5.0.0-beta, curated as a
+  `github_release` with GitHub's published hash): installed by the Skyrim package's placement rule
+  into `Data/Pandora Behaviour Engine+`, run from the instance's tools with `--output`, `--tesv`
+  and `--auto_close` (checked against its `CommandLineParser.cs`); its 205 written files were
+  captured under the VFS as generation 1, the real install untouched.
 - **Timed on the 84 GB setup** (2026-11-01, release CLI): the full MO2 import 23.5 min → 391 s, a LOOT
   sort 2.5 s, a first link deploy 140 s.
 - **User tools whose output is captured as a mod:** DynDOLOD, TexGen and PGPatcher are declared with a
@@ -4667,8 +4672,7 @@ repaired); one done-when clause still has no real run behind it (Pandora, below)
 *Not done:*
 - **No `direct_hash` entry** in the Skyrim catalog yet (the done-when names one); CurseForge-style
   pinned URLs need an API key, and Nexus files carry no published hash.
-- **Pandora Behaviour Engine has never been run for real** (§26.9, *Still to confirm on a real run*):
-  it is not on the spike machine, and downloading or running it needs the user's permission.
+
 - **The rollback-bytes test is `#[ignore]`.** `real_injection_rollback_changes_the_bytes_the_game_reads`
   (`crates/agora-core/tests/game_tools.rs`) needs `agora_vfs.dll` and `AGORA_VFS_DLL`, so a default
   test run does not check that rolling back changes the bytes the game reads. That clause of the
