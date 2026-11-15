@@ -5173,7 +5173,16 @@ fn skyrim_fixture_with(
         )
         .unwrap();
     } else {
-        std::fs::write(install_dir.join("SkyrimSE.exe"), b"fake game binary").unwrap();
+        // A working script rather than a plain file: the launch tests spawn this executable and
+        // wait for it, and on Unix a file needs the executable bit and a valid format to start.
+        // It exits at once, as the cmd.exe copy does on Windows.
+        let game = install_dir.join("SkyrimSE.exe");
+        std::fs::write(&game, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&game, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
     std::fs::write(install_dir.join("Data").join("Skyrim.esm"), b"ESM").unwrap();
     for extra in extra_files {
