@@ -168,7 +168,7 @@ fn create_test_context_with(
     USER_DATA_ROOT.call_once(|| {
         std::env::set_var(
             "AGORA_TEST_USER_DATA_ROOT",
-            std::env::temp_dir().join("agora-game-runtime-files-user-data"),
+            std::env::temp_dir().join("agora-runtime-files-user-data"),
         );
     });
     let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
