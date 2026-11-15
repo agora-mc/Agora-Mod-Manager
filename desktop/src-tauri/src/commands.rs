@@ -2157,8 +2157,7 @@ pub async fn investigate_instance_evidence(
             .into_iter()
             .next()
             .and_then(|record| record.verdict);
-        let verdict =
-            session_verdict.or_else(|| answer.as_ref().map(|answer| answer.verdict.clone()));
+        let verdict = session_verdict.or_else(|| answer.as_ref().map(|answer| answer.verdict));
         let view = crash_instance_view(&ctx, &instance_id)?;
         let suspects = answer
             .as_ref()
