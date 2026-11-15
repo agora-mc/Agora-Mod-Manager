@@ -3775,6 +3775,30 @@ marker is rebuilt from scratch, never trusted. A one-mod change on that instance
 A farm whose `game` folder is missing is rebuilt. It used to be harvested as if every file had been
 deleted, which deleted the instance's writable files.
 
+**Linux (designed 2026-11-15; Phase 6).** Steam starts the game, so the view has to exist inside
+the process tree Steam starts. The player sets the game's Steam launch options once to
+`agora games wrap %command%` (Agora shows the exact text and checks it is there); this is how other
+Linux mod managers do it (Limo, Eidos). The wrapper:
+- finds the instance: the one `agora games instance launch` asked for in the last two minutes
+  (a short-lived pending-launch record), else the game's default instance, else it runs the game
+  untouched and says why;
+- enters a new user and mount namespace (its own uid mapped), and mounts an overlay over the
+  game's install folder there only: lower layers are a link tree of the instance's content (the
+  existing links deployment, so the lower-layer count and option length stay small) over the
+  pinned base, the upper layer is the instance's writable layer (copy-up gives write isolation).
+  Kernel overlayfs with `userxattr` (Linux 5.11+, probed with a test mount, not trusted by
+  version), else `fuse-overlayfs` when installed, else the links or copies deployment with the
+  step-down announced, as on Windows;
+- bind-mounts the instance's per-user files over the game's own inside the Proton prefix
+  (`steamapps/compatdata/<appid>/pfx/drive_c/users/steamuser/...`), so nothing is swapped and
+  nothing needs restoring after a crash;
+- opens the session, runs the command, waits, finishes the session and diagnoses it, as
+  `games instance launch --wait` does on Windows.
+`agora games instance launch` on Linux records the pending launch and asks Steam to start the game
+(`steam://rungameid/<appid>`). Launching through Proton is **not yet tested on real hardware**: the
+CLI and the desktop say so on every Linux launch until a real run on a Linux PC or Steam Deck
+removes the warning (owner decision, 2026-11-15). Deployment and the namespace are tested in WSL.
+
 ### 26.6 Content, Frameworks and Compatibility
 
 **The content store** is content-addressed and immutable: an archive is extracted once, each file
@@ -4078,6 +4102,19 @@ Most people who will try this already have a setup. Import has to be good.
   Not measured yet: no Vortex-managed Skyrim was available (FINDINGS, *Not measured*).
 - **Wabbajack** lists are MO2 setups with a stock-game folder and import as MO2, with the stock game
   recognised as a base.
+
+- **Vortex (designed 2026-11-15; Phase 6).** Vortex keeps its state in a LevelDB store
+  (`%APPDATA%\Vortex\state.v2`; keys are state paths joined with `###`, values are JSON) and
+  writes `vortex.deployment.json` (which mod supplied each deployed file) into each game's mod
+  folder. Agora reads a copy of the store, never the live one, and refuses while Vortex is running
+  (the store's `LOCK`), saying to close Vortex. Read with the pure-Rust `rusty-leveldb`. What is
+  imported, as for MO2: each Vortex profile becomes an instance; each mod's staging folder
+  (`settings.mods.installPath` per game, default `{USERDATA}/{GAME}/mods`) is copied into the
+  content store as it is on disk, with its name, version and Nexus ids; enabled state per profile;
+  the plugin list from the profile's `plugins.txt` / `loadorder.txt`. Vortex orders mods by rules,
+  not by a list, so the layer order is taken from the deployment manifest (the mod that supplied a
+  file wins it) with Vortex's rules as the tie-breaker, and any file the manifest and the rules
+  disagree on is reported. Downloads are not copied; they are referenced when their hashes match.
 
 ### 26.11 Game Support Packages and the Plugin System
 
