@@ -1538,6 +1538,39 @@ fn crash_investigate_finds_a_game_instances_pack_declared_logs() {
         !names.contains(&"crash-2025-01-01-000000.log"),
         "a log outside the window must not be read as this crash: {parsed}"
     );
+
+    // Every limit has an override: --since widens the window to include the same old log.
+    let wider = run_fixture(
+        &fixture,
+        &["crash", "investigate", &id, "--json", "--since", "4h"],
+    );
+    assert!(
+        wider.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wider.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&wider.stdout).unwrap();
+    let names: Vec<&str> = parsed["files"]
+        .as_array()
+        .expect("files are an array")
+        .iter()
+        .filter_map(|file| file["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"crash-2025-01-01-000000.log"),
+        "--since 4h must search the older log too: {parsed}"
+    );
+
+    let bad = run_fixture(
+        &fixture,
+        &["crash", "investigate", &id, "--since", "not-a-time"],
+    );
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("--since 'not-a-time'"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
 }
 
 fn invented_crash_logger_log() -> String {

@@ -57,11 +57,12 @@ pub async fn investigate(
     ctx: &agora_core::ctx::Ctx,
     instance_id: &str,
     explicit: &[PathBuf],
+    since: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
     let live = load_live_packs(ctx)?;
     let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
-    let window = agora_core::crash_live::investigation_window(ctx, instance_id);
+    let window = investigation_window(ctx, instance_id, since)?;
     let session = agora_core::crash_engine::evidence::CrashSession {
         session_id: format!("investigate-{instance_id}"),
         pid: None,
@@ -156,6 +157,70 @@ pub async fn investigate(
         anyhow::bail!("No crash file could be read.");
     }
     Ok(())
+}
+
+/// The window `crash investigate` searches with. Without `--since` this is core's choice (the
+/// newest session's span, or the last hour); with it, the caller's start and now.
+fn investigation_window(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+    since: Option<&str>,
+) -> anyhow::Result<agora_core::crash_engine::evidence::SessionWindow> {
+    let Some(text) = since else {
+        return Ok(agora_core::crash_live::investigation_window(
+            ctx,
+            instance_id,
+        ));
+    };
+    let now = ctx.clock.now();
+    let started = if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text) {
+        time.with_timezone(&chrono::Utc).into()
+    } else if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        let Some(midnight) = date.and_hms_opt(0, 0, 0) else {
+            anyhow::bail!("--since '{text}' is not a duration or an RFC 3339 time");
+        };
+        midnight.and_utc().into()
+    } else if let Some(elapsed) = parse_duration(text) {
+        now.checked_sub(elapsed)
+            .ok_or_else(|| anyhow::anyhow!("--since '{text}' is too far in the past"))?
+    } else {
+        anyhow::bail!("--since '{text}' is not a duration or an RFC 3339 time");
+    };
+    if started > now {
+        anyhow::bail!("--since '{text}' is in the future, so there is nothing to search yet.");
+    }
+    Ok(agora_core::crash_engine::evidence::SessionWindow::new(
+        started, now,
+    ))
+}
+
+fn parse_duration(text: &str) -> Option<std::time::Duration> {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut seconds: u64 = 0;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let amount: u64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let unit = rest.chars().next()?;
+        let multiplier = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 60 * 60,
+            'd' => 24 * 60 * 60,
+            _ => return None,
+        };
+        seconds = seconds.checked_add(amount.checked_mul(multiplier)?)?;
+        rest = &rest[unit.len_utf8()..];
+    }
+    Some(std::time::Duration::from_secs(seconds))
 }
 
 /// Why the search found nothing, in the terms the brief asks for: a folder that could not be
