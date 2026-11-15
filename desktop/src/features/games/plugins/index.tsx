@@ -5,7 +5,18 @@
  */
 
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ArrowDown, ArrowUp, CheckCircle2, Download, Lock, RefreshCw, Unlock } from 'lucide-react';
+import {
+  AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Download,
+  Lock,
+  RefreshCw,
+  Unlock,
+} from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { formatError, getSetting, setSetting } from '@/lib/tauri';
@@ -17,20 +28,29 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { isGamesError } from '../shared/types';
 import {
+  applyConflictAction,
   checkGamePlugins,
   describeFailure,
   listGamePlugins,
   listLoadOrderLists,
+  listLoadOrderRules,
   moveGamePlugin,
+  refreshOverlaps,
   refreshSorterNotes,
+  removeLoadOrderRule,
   setGamePluginActive,
   setGamePluginLocked,
   sortGamePlugins,
   updateGameMasterlist,
+  type ConflictPair,
+  type OverlapsView,
   type PluginChange,
   type PluginFinding,
   type PluginRow,
+  type RuleChange,
+  type RuleView,
   type LoadOrderListRow,
   type PluginsView,
   type SortReport,
@@ -56,6 +76,20 @@ interface NetworkAccess {
   lockdown: 'on' | 'off';
 }
 
+/** What an action on a conflict left behind, with its way back. */
+interface ConflictNotice {
+  text: string;
+  undo: () => Promise<void>;
+}
+
+/** A move that a load order rule refuses, waiting for the player to allow it. */
+interface MoveConfirm {
+  row: PluginRow;
+  to: number;
+  item: string;
+  after: string;
+}
+
 export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const [load, setLoad] = useState<Load>({ status: 'loading' });
   const [busy, setBusy] = useState<string | null>(null);
@@ -65,10 +99,22 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const [lists, setLists] = useState<LoadOrderListRow[] | null>(null);
   const [listId, setListId] = useState<string | null>(null);
   const [networkAccess, setNetworkAccess] = useState<NetworkAccess | null>(null);
+  const [rules, setRules] = useState<RuleView[] | null>(null);
+  const [rulesError, setRulesError] = useState<string | null>(null);
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const [overlapsError, setOverlapsError] = useState<string | null>(null);
+  const [conflictFilter, setConflictFilter] = useState<string | null>(null);
+  const [expandedPair, setExpandedPair] = useState<string | null>(null);
+  const [conflictNotice, setConflictNotice] = useState<ConflictNotice | null>(null);
+  const [moveConfirm, setMoveConfirm] = useState<MoveConfirm | null>(null);
   // Counts the reads, so a reply for an instance the tab no longer shows is dropped.
   const requestId = useRef(0);
   // Counts the background notes fetches, so a result for a view that has since changed is dropped.
   const notesRequestId = useRef(0);
+  // The same for conflicts and rules, fetched without blocking the list.
+  const overlapsRequestId = useRef(0);
+  const rulesRequestId = useRef(0);
+  const conflictsCardRef = useRef<HTMLDivElement | null>(null);
 
   /** Fetch the sorter's notes without blocking the list; a newer read or change wins. */
   const loadSorterNotes = useCallback((id: string | null) => {
@@ -87,23 +133,72 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
       });
   }, [instanceId]);
 
+  /** Ask the reader for this list's conflicts without blocking the list; a newer read wins. */
+  const loadConflicts = useCallback((id: string | null) => {
+    const ticket = ++overlapsRequestId.current;
+    setOverlapsError(null);
+    refreshOverlaps(instanceId, id ?? undefined)
+      .then((report) => {
+        if (ticket !== overlapsRequestId.current) return;
+        setLoad((current) =>
+          current.status === 'loaded'
+            ? { status: 'loaded', view: { ...current.view, overlaps: report, overlapsOutOfDate: false } }
+            : current,
+        );
+      })
+      .catch((failure: unknown) => {
+        if (ticket !== overlapsRequestId.current) return;
+        // A reader that fails is "could not check", never "no conflicts".
+        setOverlapsError(describeFailure(failure));
+        setLoad((current) =>
+          current.status === 'loaded'
+            ? { status: 'loaded', view: { ...current.view, overlaps: null, overlapsOutOfDate: false } }
+            : current,
+        );
+      });
+  }, [instanceId]);
+
+  /** Read the load order rules; the count in the section heading comes from here. */
+  const loadRules = useCallback((id: string | null) => {
+    const ticket = ++rulesRequestId.current;
+    setRulesError(null);
+    listLoadOrderRules(instanceId, id ?? undefined)
+      .then((next) => {
+        if (ticket === rulesRequestId.current) setRules(next);
+      })
+      .catch((failure: unknown) => {
+        if (ticket !== rulesRequestId.current) return;
+        setRules(null);
+        setRulesError(describeFailure(failure));
+      });
+  }, [instanceId]);
+
   const fetchList = useCallback((id: string | null) => {
     const request = ++requestId.current;
     notesRequestId.current++;
+    overlapsRequestId.current++;
+    rulesRequestId.current++;
     setLoad({ status: 'loading' });
     setError(null);
     setNotice(null);
     setSortPreview(null);
+    setOverlapsError(null);
+    setRules(null);
+    setRulesError(null);
+    setConflictFilter(null);
+    setConflictNotice(null);
+    setExpandedPair(null);
     listGamePlugins(instanceId, id ?? undefined)
       .then((view) => {
         if (request !== requestId.current) return;
         setLoad({ status: 'loaded', view });
         if (view.notesOutOfDate) loadSorterNotes(id);
+        if (view.hasOverlapsReader && (view.overlapsOutOfDate || view.overlaps === null)) loadConflicts(id);
       })
       .catch((failure: unknown) => {
         if (request === requestId.current) setLoad({ status: 'failed', message: describeFailure(failure) });
       });
-  }, [instanceId, loadSorterNotes]);
+  }, [instanceId, loadConflicts, loadSorterNotes]);
 
   useEffect(() => {
     let current = true;
@@ -125,6 +220,8 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
       current = false;
       requestId.current++;
       notesRequestId.current++;
+      overlapsRequestId.current++;
+      rulesRequestId.current++;
     };
   }, [instanceId]);
 
@@ -132,6 +229,11 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
     if (lists === null) return;
     fetchList(listId);
   }, [fetchList, listId, lists]);
+
+  useEffect(() => {
+    if (lists === null) return;
+    loadRules(listId);
+  }, [listId, lists, loadRules]);
 
   const view = load.status === 'loaded' ? load.view : null;
   const allFindings = view ? [...view.findings, ...view.notes] : [];
@@ -177,8 +279,27 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
 
   const showView = (next: PluginsView) => {
     notesRequestId.current++;
+    overlapsRequestId.current++;
     setLoad({ status: 'loaded', view: next });
     if (next.notesOutOfDate) loadSorterNotes(listId);
+    if (next.hasOverlapsReader && (next.overlapsOutOfDate || next.overlaps === null)) loadConflicts(listId);
+  };
+
+  /** Show what a saved rule change left behind, including a reader that could not be run again. */
+  const applyRuleChange = (change: RuleChange, message: string) => {
+    setRules(change.rules);
+    if (change.overlaps !== null) {
+      overlapsRequestId.current++;
+      setOverlapsError(null);
+      setLoad((current) =>
+        current.status === 'loaded'
+          ? { status: 'loaded', view: { ...current.view, overlaps: change.overlaps, overlapsOutOfDate: false } }
+          : current,
+      );
+    } else {
+      setOverlapsError(change.overlapsError);
+    }
+    setNotice(message);
   };
 
   /** A saved change: show the list, or say it was saved and reload it when the re-read failed. */
@@ -212,19 +333,137 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
       },
     );
 
-  const movePlugin = (row: PluginRow, to: number) =>
+  /** Move a plugin, or ask first when a load order rule is in the way. */
+  const moveTo = async (row: PluginRow, to: number, breakRule: boolean) => {
+    setBusy(`move:${row.name}`);
+    setError(null);
+    setNotice(null);
+    setConflictNotice(null);
+    try {
+      const change = await moveGamePlugin(instanceId, row.name, to, listId ?? undefined, breakRule);
+      showView(change.plugins);
+      setNotice(
+        change.report.written
+          ? `${row.name} moved to position ${change.report.to}.`
+          : `${row.name} is already at position ${row.position}.`,
+      );
+    } catch (failure: unknown) {
+      if (isGamesError(failure) && failure.code === 'BREAKS_RULE') {
+        const details = failure.details as { item?: unknown; after?: unknown } | undefined;
+        if (typeof details?.item === 'string' && typeof details?.after === 'string') {
+          setMoveConfirm({ row, to, item: details.item, after: details.after });
+          return;
+        }
+      }
+      setError(describeFailure(failure));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const movePlugin = (row: PluginRow, to: number) => {
+    void moveTo(row, to, false);
+  };
+
+  const conflictKey = (pair: ConflictPair) => `${pair.winner}\u0000${pair.loser}`;
+
+  /** Let the loser win, or keep this order, and remember how to put it back. */
+  const runConflictAction = async (pair: ConflictPair, letLoserWin: boolean) => {
+    const previous = view?.rows.find((row) => row.name.toLowerCase() === pair.loser.toLowerCase())?.position;
+    setBusy(`conflict:${conflictKey(pair)}`);
+    setError(null);
+    setNotice(null);
+    setConflictNotice(null);
+    try {
+      const change = await applyConflictAction(
+        instanceId,
+        pair.winner,
+        pair.loser,
+        letLoserWin,
+        listId ?? undefined,
+      );
+      notesRequestId.current++;
+      overlapsRequestId.current++;
+      setLoad((current) =>
+        current.status === 'loaded'
+          ? {
+              status: 'loaded',
+              view: { ...change.plugins, overlaps: change.overlaps, overlapsOutOfDate: false },
+            }
+          : current,
+      );
+      setRules(change.rules);
+      setOverlapsError(change.overlapsError);
+      const item = letLoserWin ? pair.loser : pair.winner;
+      const after = letLoserWin ? pair.winner : pair.loser;
+      const undo = async () => {
+        setBusy('conflict-undo');
+        setError(null);
+        setNotice(null);
+        try {
+          const removed = await removeLoadOrderRule(instanceId, item, after, listId ?? undefined);
+          setRules(removed.rules);
+          let next: PluginsView | null = null;
+          if (letLoserWin && previous !== undefined) {
+            const moved = await moveGamePlugin(instanceId, pair.loser, previous, listId ?? undefined);
+            next = moved.plugins;
+          }
+          if (next !== null) {
+            setLoad({
+              status: 'loaded',
+              view: { ...next, overlaps: removed.overlaps, overlapsOutOfDate: false },
+            });
+          } else {
+            setLoad((current) =>
+              current.status === 'loaded'
+                ? {
+                    status: 'loaded',
+                    view: { ...current.view, overlaps: removed.overlaps, overlapsOutOfDate: false },
+                  }
+                : current,
+            );
+          }
+          setOverlapsError(removed.overlapsError);
+          setConflictNotice(null);
+          setNotice(
+            letLoserWin
+              ? `Put ${pair.loser} back and removed the rule.`
+              : `Removed the rule that ${pair.winner} loads after ${pair.loser}.`,
+          );
+          // The move back has changed the order, so read the conflicts that order now has.
+          if (letLoserWin) loadConflicts(listId);
+        } catch (failure: unknown) {
+          setError(describeFailure(failure));
+        } finally {
+          setBusy(null);
+        }
+      };
+      setConflictNotice({
+        text: letLoserWin
+          ? `Let ${pair.loser} win. It now loads after ${pair.winner}.`
+          : `Kept this order: ${pair.loser} loads before ${pair.winner}.`,
+        undo,
+      });
+    } catch (failure: unknown) {
+      setError(describeFailure(failure));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const removeRule = (rule: RuleView) =>
     run(
-      `move:${row.name}`,
-      () => moveGamePlugin(instanceId, row.name, to, listId ?? undefined),
-      (change) => {
-        showView(change.plugins);
-        setNotice(
-          change.report.written
-            ? `${row.name} moved to position ${change.report.to}.`
-            : `${row.name} is already at position ${row.position}.`,
-        );
-      },
+      `rule:${rule.item}:${rule.after}`,
+      () => removeLoadOrderRule(instanceId, rule.item, rule.after, listId ?? undefined),
+      (change) => applyRuleChange(change, `Removed the rule that ${rule.item} loads after ${rule.after}.`),
     );
+
+  /** Badge click: narrow the conflicts card to this plugin and bring it into view. */
+  const showConflictsFor = (name: string) => {
+    setConflictFilter(name);
+    setExpandedPair(null);
+    conflictsCardRef.current?.scrollIntoView?.({ block: 'start' });
+  };
 
   const checkAgain = () =>
     run('check', () => checkGamePlugins(instanceId, listId ?? undefined), (result) => {
@@ -301,6 +540,12 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
   const networkOff = networkAccess?.network === 'off';
   const updateBlocked = lockdownOn || networkOff;
   const showNetworkGate = showTable && view.hasSorterUpdate && networkAccess !== null && updateBlocked;
+  const findingsTitle = allFindings.some((finding) => finding.level !== 'info')
+    ? 'Problems with the load order'
+    : 'Notes on the load order';
+  const ruleCount = rules?.length ?? 0;
+  const showConflicts = view.hasOverlapsReader;
+  const overlaps = view.overlaps;
 
   return (
     <section className="space-y-4" aria-labelledby="plugins-heading" data-testid="plugins-tab">
@@ -392,12 +637,78 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
 
       {allFindings.length > 0 && (
         <div className="space-y-2 rounded-xl border border-border bg-card p-4" data-testid="plugins-findings">
-          <h3 className="text-sm font-semibold">Problems with the load order</h3>
+          <h3 className="text-sm font-semibold">{findingsTitle}</h3>
           <ul className="space-y-2">
             {allFindings.map((finding, index) => (
               <FindingItem key={index} finding={finding} />
             ))}
           </ul>
+        </div>
+      )}
+
+      {showConflicts && (
+        <div
+          ref={conflictsCardRef}
+          className="space-y-3 rounded-xl border border-border bg-card p-4"
+          data-testid="plugins-conflicts"
+          data-state={
+            overlapsError !== null
+              ? 'failed'
+              : overlaps === null
+                ? 'reading'
+                : overlaps.pairs.length > 0
+                  ? 'pairs'
+                  : 'none'
+          }
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <h3 className="text-sm font-semibold">Plugins that override each other</h3>
+            {conflictFilter !== null && (
+              <button
+                type="button"
+                onClick={() => setConflictFilter(null)}
+                className="rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+              >
+                Showing {conflictFilter} · Show all
+              </button>
+            )}
+          </div>
+
+          {overlapsError !== null ? (
+            <p className="text-sm text-muted-foreground" data-testid="plugins-conflicts-error">
+              Could not check: {overlapsError}
+            </p>
+          ) : overlaps === null ? (
+            <p className="text-sm text-muted-foreground">
+              Reading your plugins&apos; records. The first time takes a few seconds.
+            </p>
+          ) : (
+            <ConflictsReport
+              report={overlaps}
+              filter={conflictFilter}
+              expandedPair={expandedPair}
+              onTogglePair={(pair) =>
+                setExpandedPair((current) => (current === conflictKey(pair) ? null : conflictKey(pair)))
+              }
+              disabled={anyBusy}
+              onKeepOrder={(pair) => void runConflictAction(pair, false)}
+              onLetLose={(pair) => void runConflictAction(pair, true)}
+            />
+          )}
+
+          {conflictNotice !== null && (
+            <div className="flex flex-wrap items-center gap-2 text-sm" data-testid="plugins-conflict-notice">
+              <span className="text-muted-foreground">{conflictNotice.text}</span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void conflictNotice.undo()}
+                disabled={anyBusy}
+              >
+                Undo
+              </Button>
+            </div>
+          )}
         </div>
       )}
 
@@ -434,16 +745,90 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
                   above={view.rows[index - 1]}
                   below={view.rows[index + 1]}
                   findings={allFindings.filter((finding) => finding.plugins.includes(row.name))}
+                  conflictCounts={conflictCounts(overlaps, row.name)}
                   disabled={anyBusy}
                   onToggleActive={() => toggleActive(row)}
                   onToggleLock={() => toggleLock(row)}
                   onMove={(to) => movePlugin(row, to)}
+                  onShowConflicts={() => showConflictsFor(row.name)}
                 />
               ))}
             </tbody>
           </table>
         </div>
       )}
+
+      {rulesError !== null && (
+        <p role="alert" className="text-sm text-muted-foreground" data-testid="plugins-rules-error">
+          Your load order rules could not be read: {rulesError}
+        </p>
+      )}
+
+      {rules !== null && rules.length > 0 && (
+        <section className="rounded-xl border border-border bg-card p-4" data-testid="plugins-rules">
+          <button
+            type="button"
+            aria-expanded={rulesOpen}
+            onClick={() => setRulesOpen((open) => !open)}
+            className="flex w-full items-center gap-2 text-left text-sm font-semibold"
+          >
+            {rulesOpen ? <ChevronDown aria-hidden /> : <ChevronRight aria-hidden />}
+            Your load order rules ({ruleCount})
+          </button>
+          {rulesOpen && (
+            <ul className="mt-3 space-y-2">
+              {rules.map((rule) => (
+                <li key={`${rule.item}\u0000${rule.after}`} className="flex flex-wrap items-start justify-between gap-2 text-sm">
+                  <div>
+                    <span>
+                      {rule.item} loads after {rule.after}
+                    </span>
+                    {rule.unused !== null && (
+                      <p className="text-xs text-muted-foreground" data-testid="rule-unused">
+                        Unused: {rule.unused} is not in the list right now.
+                      </p>
+                    )}
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void removeRule(rule)}
+                    disabled={anyBusy}
+                  >
+                    Remove
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      <Dialog open={moveConfirm !== null} onOpenChange={(open) => { if (!open) setMoveConfirm(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Move {moveConfirm?.row.name}</DialogTitle>
+            <DialogDescription>
+              This breaks your rule &apos;{moveConfirm?.item} loads after {moveConfirm?.after}&apos;.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMoveConfirm(null)} disabled={anyBusy}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                const waiting = moveConfirm;
+                setMoveConfirm(null);
+                if (waiting !== null) void moveTo(waiting.row, waiting.to, true);
+              }}
+              disabled={anyBusy}
+            >
+              Move and remove the rule
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={sortPreview !== null} onOpenChange={(open) => { if (!open) setSortPreview(null); }}>
         <DialogContent>
@@ -453,6 +838,7 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
               Free plugins are put in the order the list's sorter recommends, or below their masters when the sorter
               has nothing saved. Nothing is written until you apply. Locked and always-loaded plugins stay where they
               are.
+              {ruleCount > 0 && ` Your ${ruleCount} load order ${ruleCount === 1 ? 'rule is' : 'rules are'} kept.`}
             </DialogDescription>
           </DialogHeader>
           {sortPreview?.message && (
@@ -511,6 +897,152 @@ function formatDate(value: string): string {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString();
 }
 
+const pairKey = (pair: ConflictPair) => `${pair.winner}\u0000${pair.loser}`;
+
+/** How many record changes this plugin wins and loses, from the pairs already classified. */
+function conflictCounts(report: OverlapsView | null, name: string): { wins: number; loses: number } {
+  if (report === null) return { wins: 0, loses: 0 };
+  const wanted = name.toLowerCase();
+  let wins = 0;
+  let loses = 0;
+  for (const pair of report.pairs) {
+    if (pair.winner.toLowerCase() === wanted) wins += pair.count;
+    if (pair.loser.toLowerCase() === wanted) loses += pair.count;
+  }
+  return { wins, loses };
+}
+
+interface ConflictsReportProps {
+  report: OverlapsView;
+  filter: string | null;
+  expandedPair: string | null;
+  onTogglePair: (pair: ConflictPair) => void;
+  disabled: boolean;
+  onKeepOrder: (pair: ConflictPair) => void;
+  onLetLose: (pair: ConflictPair) => void;
+}
+
+function ConflictsReport({
+  report,
+  filter,
+  expandedPair,
+  onTogglePair,
+  disabled,
+  onKeepOrder,
+  onLetLose,
+}: ConflictsReportProps) {
+  const wanted = filter?.toLowerCase() ?? null;
+  const pairs = report.pairs
+    .filter(
+      (pair) =>
+        wanted === null || pair.winner.toLowerCase() === wanted || pair.loser.toLowerCase() === wanted,
+    )
+    .sort(
+      (a, b) =>
+        Number(b.newSinceLastLaunch) - Number(a.newSinceLastLaunch)
+        || b.count - a.count
+        || a.winner.localeCompare(b.winner)
+        || a.loser.localeCompare(b.loser),
+    );
+  const footer: string[] = [];
+  if (report.patched > 0) {
+    footer.push(`${report.patched} ${report.patched === 1 ? 'pair is' : 'pairs are'} handled by a patch.`);
+  }
+  if (report.implicitPairs > 0) {
+    footer.push(
+      `${report.implicitPairs} ${report.implicitPairs === 1 ? 'is' : 'are'} between the game's own files, which can't be reordered.`,
+    );
+  }
+  if (report.decided > 0) {
+    footer.push(`${report.decided} decided by you.`);
+  }
+
+  if (pairs.length === 0) {
+    if (filter !== null) {
+      return <p className="text-sm text-muted-foreground">{filter} wins and loses no record changes.</p>;
+    }
+    const resolved: string[] = [];
+    if (report.patched > 0) {
+      resolved.push(`${report.patched} ${report.patched === 1 ? 'overlap is' : 'overlaps are'} handled by a patch.`);
+    }
+    if (report.implicitPairs > 0) {
+      resolved.push(`${report.implicitPairs} ${report.implicitPairs === 1 ? 'is' : 'are'} between the game's own files.`);
+    }
+    if (report.decided > 0) {
+      resolved.push(`${report.decided} ${report.decided === 1 ? 'is' : 'are'} decided by you.`);
+    }
+    return (
+      <div className="space-y-1 text-sm">
+        <p>No conflicts.{resolved.length > 0 ? ` ${resolved.join(' ')}` : ''}</p>
+        {report.notes.map((note, index) => (
+          <p key={index} className="text-xs text-muted-foreground">
+            {note.plugins.length > 0 ? `${note.plugins.join(', ')}: ` : ''}
+            {note.message}
+          </p>
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <ul className="divide-y divide-border">
+        {pairs.map((pair) => {
+          const open = expandedPair === pairKey(pair);
+          const more = pair.count - pair.labels.length;
+          return (
+            <li key={pairKey(pair)} className="py-2 first:pt-0 last:pb-0" data-testid="conflict-pair">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <button
+                    type="button"
+                    aria-expanded={open}
+                    aria-label={`${open ? 'Hide' : 'Show'} the records where ${pair.winner} wins over ${pair.loser}`}
+                    onClick={() => onTogglePair(pair)}
+                    className="text-muted-foreground hover:text-foreground"
+                  >
+                    {open ? <ChevronDown aria-hidden /> : <ChevronRight aria-hidden />}
+                  </button>
+                  {pair.newSinceLastLaunch && <Badge variant="secondary">New</Badge>}
+                  <span>
+                    <strong>{pair.winner}</strong> wins over <strong>{pair.loser}</strong> ·{' '}
+                    {pair.count} {pair.count === 1 ? 'record' : 'records'}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  <Button variant="secondary" size="sm" onClick={() => onKeepOrder(pair)} disabled={disabled}>
+                    Keep this order
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => onLetLose(pair)} disabled={disabled}>
+                    Let {pair.loser} win
+                  </Button>
+                </div>
+              </div>
+              {open && (
+                <div className="mt-2 space-y-1 pl-7 text-xs text-muted-foreground">
+                  <ul className="space-y-0.5">
+                    {pair.labels.map((label) => (
+                      <li key={label}>{label}</li>
+                    ))}
+                  </ul>
+                  {more > 0 && <p>and {more} more</p>}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      {footer.length > 0 && <p className="text-xs text-muted-foreground">{footer.join(' ')}</p>}
+      {report.notes.map((note, index) => (
+        <p key={index} className="text-xs text-muted-foreground">
+          {note.plugins.length > 0 ? `${note.plugins.join(', ')}: ` : ''}
+          {note.message}
+        </p>
+      ))}
+    </div>
+  );
+}
+
 function EmptyNote({ children }: { children: ReactNode }) {
   return (
     <p className="rounded-xl border border-dashed border-border bg-card/60 p-4 text-sm text-muted-foreground">{children}</p>
@@ -527,8 +1059,12 @@ function FindingItem({ finding }: { finding: PluginFinding }) {
       )}
       <div className="space-y-1">
         <div className="flex flex-wrap items-center gap-2">
-          <Badge variant={finding.refusesLaunch ? 'destructive' : 'secondary'}>
-            {finding.refusesLaunch ? 'Stops launch' : 'Warning'}
+          <Badge
+            variant={
+              finding.refusesLaunch ? 'destructive' : finding.level === 'info' ? 'outline' : 'secondary'
+            }
+          >
+            {finding.refusesLaunch ? 'Stops launch' : finding.level === 'info' ? 'Info' : 'Warning'}
           </Badge>
           <span>{finding.message}</span>
         </div>
@@ -545,13 +1081,26 @@ interface PluginRowViewProps {
   above: PluginRow | undefined;
   below: PluginRow | undefined;
   findings: PluginFinding[];
+  conflictCounts: { wins: number; loses: number };
   disabled: boolean;
   onToggleActive: () => void;
   onToggleLock: () => void;
   onMove: (to: number) => void;
+  onShowConflicts: () => void;
 }
 
-function PluginRowView({ row, above, below, findings, disabled, onToggleActive, onToggleLock, onMove }: PluginRowViewProps) {
+function PluginRowView({
+  row,
+  above,
+  below,
+  findings,
+  conflictCounts,
+  disabled,
+  onToggleActive,
+  onToggleLock,
+  onMove,
+  onShowConflicts,
+}: PluginRowViewProps) {
   // The game's always-loaded plugins sit at the top and cannot be moved or locked.
   const movable = !row.implicit && !row.locked;
   const canMoveUp = movable && above !== undefined && !above.implicit;
@@ -580,6 +1129,19 @@ function PluginRowView({ row, above, below, findings, disabled, onToggleActive, 
           {row.badges.map((badge) => (
             <Badge key={badge} variant="outline">{badge}</Badge>
           ))}
+          {(conflictCounts.wins > 0 || conflictCounts.loses > 0) && (
+            <button
+              type="button"
+              data-testid="plugin-conflict-badge"
+              onClick={onShowConflicts}
+              className="text-xs text-muted-foreground hover:text-foreground hover:underline"
+              title="See the record changes this plugin wins and loses"
+            >
+              {conflictCounts.wins > 0 && `Wins ${conflictCounts.wins}`}
+              {conflictCounts.wins > 0 && conflictCounts.loses > 0 && ' · '}
+              {conflictCounts.loses > 0 && `Loses ${conflictCounts.loses}`}
+            </button>
+          )}
         </div>
         {row.masters.length > 0 && (
           <p className="mt-1 text-xs text-muted-foreground">Needs {row.masters.join(', ')}</p>

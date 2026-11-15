@@ -33,6 +33,9 @@ function view(overrides: Record<string, unknown> = {}) {
     notes: [],
     notesOutOfDate: false,
     masterlist: null,
+    hasOverlapsReader: false,
+    overlaps: null,
+    overlapsOutOfDate: false,
     ...overrides,
   };
 }
@@ -63,6 +66,7 @@ describe('load order lists', () => {
     replies.get_setting = (args) =>
       args.key === 'network_plugins_enabled' ? false : args.key === 'network_lockdown_enabled' ? false : null;
     replies.set_setting = () => null;
+    replies.games_plugins_rules = () => ({ rules: [] });
     route();
   });
 
@@ -120,7 +124,7 @@ describe('load order lists', () => {
     expect(screen.queryAllByText('A note from the sorter')).toHaveLength(0);
 
     resolveNotes({
-      notes: [{ message: 'A note from the sorter', refusesLaunch: false, plugins: ['SkyUI.esp'] }],
+      notes: [{ message: 'A note from the sorter', refusesLaunch: false, level: 'warning', plugins: ['SkyUI.esp'] }],
       notesOutOfDate: false,
     });
     expect(await screen.findAllByText('A note from the sorter')).not.toHaveLength(0);
@@ -157,6 +161,7 @@ describe('the network gate beside the sorter update', () => {
     replies.games_plugins_lists = () => ({ lists: [{ id: 'plugins', name: 'Plugins', rulesKind: 'script' }] });
     replies.games_plugins_list = () => view({ rows: [row] });
     replies.set_setting = () => null;
+    replies.games_plugins_rules = () => ({ rules: [] });
     route();
   });
 
@@ -260,3 +265,312 @@ describe('the network gate beside the sorter update', () => {
   });
 });
 
+describe('conflicts card and load order rules', () => {
+  const heavy = { ...row, position: 1, name: 'Heavy Boots.esp' };
+  const moon = { ...row, position: 2, name: 'Moon Jump.esp' };
+  const rock = { ...row, position: 3, name: 'Rock.esp' };
+
+  const pair = (
+    winner: string,
+    loser: string,
+    count: number,
+    labels: string[],
+    newSinceLastLaunch = false,
+  ) => ({ winner, loser, count, labels, newSinceLastLaunch });
+
+  const report = (overrides: Record<string, unknown> = {}) => ({
+    pairs: [pair('Heavy Boots.esp', 'Moon Jump.esp', 1, ['GMST fJumpHeightMin'], true)],
+    patched: 2,
+    decided: 0,
+    implicitPairs: 1,
+    notes: [],
+    ...overrides,
+  });
+
+  const rule = (item: string, after: string, unused: string | null = null) => ({ item, after, unused });
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    replies = {};
+    replies.games_plugins_lists = () => ({ lists: [{ id: 'plugins', name: 'Plugins', rulesKind: 'script' }] });
+    replies.games_plugins_list = () => view({ rows: [heavy, moon, rock] });
+    replies.games_plugins_rules = () => ({ rules: [] });
+    replies.get_setting = () => false;
+    replies.set_setting = () => null;
+    route();
+  });
+
+  it('says it is reading records the first time, and never calls that no conflicts', async () => {
+    let resolveOverlaps!: (value: unknown) => void;
+    replies.games_plugins_list = () => view({
+      rows: [heavy, moon, rock],
+      hasOverlapsReader: true,
+      overlaps: null,
+      overlapsOutOfDate: true,
+    });
+    replies.games_plugins_conflicts = () => new Promise((resolve) => { resolveOverlaps = resolve; });
+    mountTab();
+
+    const card = await screen.findByTestId('plugins-conflicts');
+    expect(card).toHaveAttribute('data-state', 'reading');
+    expect(within(card).getByText("Reading your plugins' records. The first time takes a few seconds.")).toBeInTheDocument();
+    expect(within(card).queryByText(/No conflicts/)).toBeNull();
+
+    resolveOverlaps(report());
+    expect(await within(card).findByText(/Heavy Boots\.esp/)).toBeInTheDocument();
+    expect(card).toHaveAttribute('data-state', 'pairs');
+  });
+
+  it('shows one muted line with the reason when the records cannot be read', async () => {
+    replies.games_plugins_list = () => view({
+      rows: [heavy, moon, rock],
+      hasOverlapsReader: true,
+      overlaps: null,
+      overlapsOutOfDate: true,
+    });
+    replies.games_plugins_conflicts = () => Promise.reject({
+      code: 'core_failed',
+      message: 'the reader timed out',
+    });
+    mountTab();
+
+    const card = await screen.findByTestId('plugins-conflicts');
+    expect(await within(card).findByText('Could not check: the reader timed out')).toBeInTheDocument();
+    expect(card).toHaveAttribute('data-state', 'failed');
+    expect(within(card).queryByText(/No conflicts/)).toBeNull();
+  });
+
+  it('says no conflicts and what a patch and the game own files already handle', async () => {
+    replies.games_plugins_list = () => view({
+      rows: [heavy, moon, rock],
+      hasOverlapsReader: true,
+      overlaps: report({ pairs: [] }),
+      overlapsOutOfDate: false,
+    });
+    mountTab();
+
+    const card = await screen.findByTestId('plugins-conflicts');
+    expect(card).toHaveAttribute('data-state', 'none');
+    expect(within(card).getByText(/No conflicts\. 2 overlaps are handled by a patch\. 1 is between the game's own files\./)).toBeInTheDocument();
+  });
+
+  it('lists pairs with their records, a New badge, the footer, and a filter chip', async () => {
+    replies.games_plugins_list = () => view({
+      rows: [heavy, moon, rock],
+      hasOverlapsReader: true,
+      overlaps: report({
+        pairs: [
+          pair('Rock.esp', 'Moon Jump.esp', 3, ['GMST fJumpHeightMin', 'MISC RockWeight']),
+          pair('Heavy Boots.esp', 'Moon Jump.esp', 1, ['GMST fJumpHeightMin'], true),
+        ],
+      }),
+      overlapsOutOfDate: false,
+    });
+    mountTab();
+
+    const card = await screen.findByTestId('plugins-conflicts');
+    const pairs = within(card).getAllByTestId('conflict-pair');
+    expect(pairs[0]).toHaveTextContent('Heavy Boots.esp wins over Moon Jump.esp · 1 record');
+    expect(pairs[0]).toHaveTextContent('New');
+    expect(pairs[1]).toHaveTextContent('Rock.esp wins over Moon Jump.esp · 3 records');
+    expect(card).toHaveTextContent('2 pairs are handled by a patch.');
+    expect(card).toHaveTextContent("1 is between the game's own files, which can't be reordered.");
+
+    fireEvent.click(within(pairs[1]).getByRole('button', { name: /Show the records/ }));
+    expect(within(pairs[1]).getByText('MISC RockWeight')).toBeInTheDocument();
+
+    // The badge narrows the card and a chip clears it.
+    const badge = screen.getAllByTestId('plugin-conflict-badge')[0];
+    fireEvent.click(badge);
+    expect(screen.getByRole('button', { name: /Showing Heavy Boots\.esp · Show all/ })).toBeInTheDocument();
+    expect(within(card).getAllByTestId('conflict-pair')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: /Showing Heavy Boots\.esp · Show all/ }));
+    expect(within(card).getAllByTestId('conflict-pair')).toHaveLength(2);
+  });
+
+  it('keeps the order, says what happened, and removes the rule on Undo', async () => {
+    const before = report();
+    const after = report({ pairs: [], decided: 1 });
+    replies.games_plugins_list = () => view({
+      rows: [heavy, moon, rock],
+      hasOverlapsReader: true,
+      overlaps: before,
+      overlapsOutOfDate: false,
+    });
+    replies.games_plugins_rules = () => ({ rules: [rule('Heavy Boots.esp', 'Moon Jump.esp')] });
+    replies.games_plugins_conflict_action = (args) => {
+      expect(args).toMatchObject({ winner: 'Heavy Boots.esp', loser: 'Moon Jump.esp', letLoserWin: false });
+      return {
+        rules: [rule('Heavy Boots.esp', 'Moon Jump.esp')],
+        plugins: view({ rows: [heavy, moon, rock], hasOverlapsReader: true, overlaps: after, overlapsOutOfDate: false }),
+        overlaps: after,
+        overlapsError: null,
+      };
+    };
+    replies.games_plugins_rule_remove = (args) => {
+      expect(args).toMatchObject({ item: 'Heavy Boots.esp', after: 'Moon Jump.esp' });
+      return { changed: true, rules: [], overlaps: before, overlapsError: null };
+    };
+    mountTab();
+
+    const card = await screen.findByTestId('plugins-conflicts');
+    fireEvent.click(within(card).getByRole('button', { name: 'Keep this order' }));
+
+    const conflictNotice = await screen.findByTestId('plugins-conflict-notice');
+    expect(conflictNotice).toHaveTextContent('Kept this order: Moon Jump.esp loads before Heavy Boots.esp.');
+    fireEvent.click(within(conflictNotice).getByRole('button', { name: 'Undo' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Removed the rule that Heavy Boots.esp loads after Moon Jump.esp.',
+    );
+    expect(screen.queryByTestId('plugins-conflict-notice')).toBeNull();
+  });
+
+  it('lets the loser win with a rule and a move, and Undo moves it back', async () => {
+    const before = report();
+    const after = report({ pairs: [], decided: 1 });
+    const movedRows = [
+      { ...heavy, position: 1 },
+      { ...moon, position: 2 },
+      { ...rock, position: 3 },
+    ];
+    replies.games_plugins_list = () => view({
+      rows: [{ ...moon, position: 1 }, { ...heavy, position: 2 }, rock],
+      hasOverlapsReader: true,
+      overlaps: before,
+      overlapsOutOfDate: false,
+    });
+    replies.games_plugins_conflict_action = () => ({
+      rules: [rule('Moon Jump.esp', 'Heavy Boots.esp')],
+      plugins: view({ rows: movedRows, hasOverlapsReader: true, overlaps: after, overlapsOutOfDate: false }),
+      overlaps: after,
+      overlapsError: null,
+    });
+    replies.games_plugins_rule_remove = () => ({ changed: true, rules: [], overlaps: null, overlapsError: null });
+    replies.games_plugins_move = (args) => {
+      expect(args).toMatchObject({ plugin: 'Moon Jump.esp', to: 1, breakRule: false });
+      return {
+        report: { plugin: 'Moon Jump.esp', from: 2, to: 1, written: true },
+        plugins: view({ rows: [{ ...moon, position: 1 }, { ...heavy, position: 2 }, rock] }),
+      };
+    };
+    replies.games_plugins_conflicts = () => before;
+    mountTab();
+
+    const card = await screen.findByTestId('plugins-conflicts');
+    fireEvent.click(within(card).getByRole('button', { name: /Let Moon Jump\.esp win/ }));
+
+    const conflictNotice = await screen.findByTestId('plugins-conflict-notice');
+    expect(conflictNotice).toHaveTextContent('Let Moon Jump.esp win. It now loads after Heavy Boots.esp.');
+    fireEvent.click(within(conflictNotice).getByRole('button', { name: 'Undo' }));
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Put Moon Jump.esp back and removed the rule.');
+    expect(invokeMock).toHaveBeenCalledWith('games_plugins_move', {
+      instanceId: 'inst-1',
+      plugin: 'Moon Jump.esp',
+      to: 1,
+      breakRule: false,
+      listId: 'plugins',
+    });
+  });
+
+  it('lists the rules, names the unused one, and removes a rule', async () => {
+    const inUse = rule('Heavy Boots.esp', 'Moon Jump.esp');
+    const unused = rule('Rock.esp', 'Gone.esp', 'Gone.esp');
+    replies.games_plugins_rules = () => ({ rules: [inUse, unused] });
+    replies.games_plugins_rule_remove = () => ({
+      changed: true,
+      rules: [unused],
+      overlaps: null,
+      overlapsError: null,
+    });
+    mountTab();
+
+    const section = await screen.findByTestId('plugins-rules');
+    const toggle = within(section).getByRole('button', { name: /Your load order rules \(2\)/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(within(section).getByText('Heavy Boots.esp loads after Moon Jump.esp')).toBeInTheDocument();
+    expect(within(section).getByTestId('rule-unused')).toHaveTextContent(
+      'Unused: Gone.esp is not in the list right now.',
+    );
+
+    fireEvent.click(within(section).getAllByRole('button', { name: 'Remove' })[0]);
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Removed the rule that Heavy Boots.esp loads after Moon Jump.esp.',
+    );
+    expect(screen.queryByText('Heavy Boots.esp loads after Moon Jump.esp')).toBeNull();
+  });
+
+  it('asks before a move that breaks a rule, and only then removes it', async () => {
+    let calls = 0;
+    replies.games_plugins_move = (args) => {
+      calls += 1;
+      if (calls < 3) {
+        expect(args).toMatchObject({ breakRule: false });
+        return Promise.reject({
+          code: 'BREAKS_RULE',
+          message: "moving 'Moon Jump.esp' there breaks the rule that 'Heavy Boots.esp' loads after 'Moon Jump.esp'",
+          details: { item: 'Heavy Boots.esp', after: 'Moon Jump.esp' },
+        });
+      }
+      expect(args).toMatchObject({ breakRule: true });
+      return {
+        report: { plugin: 'Moon Jump.esp', from: 2, to: 1, written: true },
+        plugins: view({ rows: [{ ...moon, position: 1 }, { ...heavy, position: 2 }, rock] }),
+      };
+    };
+    mountTab();
+
+    await screen.findByText('Moon Jump.esp');
+    fireEvent.click(screen.getByRole('button', { name: 'Move Moon Jump.esp up' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Move Moon Jump.esp' });
+    expect(dialog).toHaveTextContent("This breaks your rule 'Heavy Boots.esp loads after Moon Jump.esp'.");
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(calls).toBe(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move Moon Jump.esp up' }));
+    const again = await screen.findByRole('dialog', { name: 'Move Moon Jump.esp' });
+    fireEvent.click(within(again).getByRole('button', { name: 'Move and remove the rule' }));
+    expect(await screen.findByRole('status')).toHaveTextContent('Moon Jump.esp moved to position 1.');
+    expect(calls).toBe(3);
+  });
+
+  it('tells the sort dialog how many rules it keeps', async () => {
+    replies.games_plugins_rules = () => ({ rules: [rule('Heavy Boots.esp', 'Moon Jump.esp')] });
+    replies.games_plugins_sort = () => ({
+      report: { moves: [], blocked: [], written: false, mode: 'masters', message: null },
+      plugins: view({ rows: [heavy, moon, rock] }),
+    });
+    mountTab();
+
+    await screen.findByRole('button', { name: 'Sort…' });
+    await waitFor(() => expect(screen.getByTestId('plugins-rules')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Sort…' }));
+    expect(await screen.findByRole('dialog', { name: 'Sort plugins' })).toHaveTextContent(
+      'Your 1 load order rule is kept.',
+    );
+  });
+
+  it('titles the findings card notes when nothing in it is a warning', async () => {
+    replies.games_plugins_list = () => view({
+      rows: [heavy],
+      notes: [{ message: 'A note from the sorter', refusesLaunch: false, level: 'info', plugins: [] }],
+    });
+    mountTab();
+    expect(await screen.findByRole('heading', { name: 'Notes on the load order' })).toBeInTheDocument();
+    expect(screen.getByText('Info')).toBeInTheDocument();
+  });
+
+  it('keeps the problems title when a warning is present', async () => {
+    replies.games_plugins_list = () => view({
+      rows: [heavy],
+      notes: [{ message: 'A note from the sorter', refusesLaunch: false, level: 'warning', plugins: [] }],
+    });
+    mountTab();
+    expect(await screen.findByRole('heading', { name: 'Problems with the load order' })).toBeInTheDocument();
+    expect(screen.getByText('Warning')).toBeInTheDocument();
+  });
+});
