@@ -1161,13 +1161,16 @@ enum InstanceCmd {
         loader: String,
         #[arg(short = 'V', long, default_value = "", help = "Loader version")]
         loader_version: String,
-        #[arg(long)]
+        #[arg(long, help = "Heap size in MB; makes the memory choice manual")]
         jvm_memory_mb: Option<i64>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Garbage collector: auto (default), low_latency, high_efficiency or manual"
+        )]
         jvm_gc: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Extra JVM arguments, as one string")]
         jvm_custom_args: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Pre-touch the heap when the game starts: true or false")]
         jvm_always_pre_touch: Option<bool>,
         #[arg(
             long = "template",
@@ -13640,6 +13643,38 @@ mod tests {
         let hint = launch_refusal_hint("skyrim", &findings);
         assert!(hint.contains("plugins sort skyrim"), "{hint}");
         assert!(!hint.contains("plugins enable"), "{hint}");
+    }
+
+    #[test]
+    fn every_cli_leaf_command_is_documented() {
+        use clap::CommandFactory;
+
+        fn collect(cmd: &clap::Command, path: &mut Vec<String>, leaves: &mut Vec<String>) {
+            let subcommands: Vec<_> = cmd
+                .get_subcommands()
+                .filter(|sub| sub.get_name() != "help")
+                .collect();
+            if subcommands.is_empty() && !path.is_empty() {
+                leaves.push(path.join(" "));
+            }
+            for sub in subcommands {
+                path.push(sub.get_name().to_string());
+                collect(sub, path, leaves);
+                path.pop();
+            }
+        }
+
+        let mut leaves = Vec::new();
+        collect(&Cli::command(), &mut Vec::new(), &mut leaves);
+        let docs = include_str!("../../../docs/CLI.md");
+        let missing: Vec<_> = leaves
+            .iter()
+            .filter(|leaf| !docs.contains(&format!("agora {leaf}")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/CLI.md does not document these CLI leaf commands: {missing:?}"
+        );
     }
 
     #[test]
