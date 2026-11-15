@@ -77,6 +77,10 @@ quick-xml = "0.39"
 # instead of trusting timestamps and size.
 same-file = "1"
 
+# Reading a Vortex state store (MASTER_SPEC §26.10): LevelDB, pure Rust, MIT.
+# Only the Vortex importer opens it, and only a scratch copy.
+rusty-leveldb = "4.0.2"
+
 # Directory junctions for shared folders on Windows. `std`'s symlink_dir needs
 # Developer Mode or elevation and, when it fails, callers silently fall back to
 # copying — which for a *shared* folder means two trees that drift apart with no
