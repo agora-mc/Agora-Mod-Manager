@@ -573,10 +573,6 @@ pub struct GameDefinition {
     #[serde(default)]
     pub launch: Option<LaunchRecipe>,
     #[serde(default)]
-    pub log_paths: Vec<GamePath>,
-    #[serde(default)]
-    pub crash_paths: Vec<GamePath>,
-    #[serde(default)]
     pub user_files: Vec<UserFileMapping>,
     #[serde(default)]
     pub save_paths: Vec<GamePath>,
@@ -3156,8 +3152,6 @@ mod tests {
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
-            log_paths: vec![],
-            crash_paths: vec![],
             user_files: vec![],
             save_paths: vec![],
             linked_archive_patterns: vec![
@@ -3208,8 +3202,6 @@ mod tests {
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
-            log_paths: vec![],
-            crash_paths: vec![],
             user_files: vec![],
             save_paths: vec![],
             linked_archive_patterns: vec![],
@@ -3250,8 +3242,6 @@ mod tests {
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
-            log_paths: vec![],
-            crash_paths: vec![],
             user_files: vec![],
             save_paths: vec![],
             linked_archive_patterns: vec![],
@@ -3288,8 +3278,6 @@ mod tests {
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
-            log_paths: vec![],
-            crash_paths: vec![],
             user_files: vec![],
             save_paths: vec![],
             linked_archive_patterns: vec![],

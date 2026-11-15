@@ -188,6 +188,42 @@ describe('live default loader failure semantics (SOL-2 BLOCKER 4/D)', () => {
     expect(data.snapshots.status).toBe('error');
   });
 
+  it('a captured launch output is a crash when the live verdict says so', async () => {
+    const captured = {
+      ...investigation,
+      evidence: {
+        ...investigation.evidence,
+        sources: [
+          {
+            meta: {
+              basename: 'agora-launch-output.log',
+              kind: 'LatestLog',
+              size_bytes: 120,
+              truncated: false,
+              stale: false,
+              supplementary: true,
+              modified_at: null,
+              line_count: 2,
+            },
+            text: 'Error occurred during initialization of VM: Initial heap size set to a larger value than the maximum heap size',
+          },
+        ],
+        failure_category: 'CrashReport',
+      },
+      failure_category: 'CrashReport',
+      // The live path stored this session as a crash; its only evidence is the launch output.
+      verdict: { kind: 'crashed', how: 'exit_status' },
+    } as unknown as CrashInvestigation;
+    mocks.investigateInstanceEvidence.mockResolvedValue(captured);
+
+    const data = await defaultLiveLoad('inst-1');
+    expect(data.crashEvidence.status).toBe('ok');
+    if (data.crashEvidence.status === 'ok') {
+      expect(data.crashEvidence.value).not.toBeNull();
+      expect(data.crashEvidence.value?.incidentLabel).toContain('Crash evidence');
+    }
+  });
+
   it('investigateInstanceEvidence failure keeps crash evidence unavailable', async () => {
     mocks.investigateInstanceEvidence.mockRejectedValue(new Error('evidence down'));
     const data = await defaultLiveLoad('inst-1');

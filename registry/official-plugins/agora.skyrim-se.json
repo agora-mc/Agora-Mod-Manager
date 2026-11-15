@@ -9,8 +9,8 @@
   "current": {
     "version": "0.1.0",
     "package_url": "https://github.com/agora-mc/Agora-Mod-Manager/releases/download/official-skyrim-se-v0.1.0/skyrim-se-0.1.0.zip",
-    "sha256": "a802f07e62d9dc6df76189b612996ce109c15b3a26d2e0ae5f8ade2ffa10b7e0",
-    "tree_sha256": "529611bf6404f81e723bbf28f1dd4ca36a238ba23e7744d9fe95a01f4c834016",
-    "size": 23984
+    "sha256": "1f2a718345d16068db66173db927073e3b1969ca850fde7c68d8d06c65c8f507",
+    "tree_sha256": "a539ce02c4a9f4c047a3f90b00b7f3eb199daa5b45673b862d29d3d7aedb185c",
+    "size": 23936
   }
 }

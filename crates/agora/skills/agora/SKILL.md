@@ -108,8 +108,9 @@ If the catalog is missing or stale, `agora registry sync` downloads and verifies
 2. Ask Agora first: `agora --json crash last <ID>` prints the newest answer it stored for that
    instance; `agora crash show <SESSION>` prints one by session id.
 3. If there is no stored answer, or the crash came from somewhere else:
-   - `agora --json crash investigate <ID>` collects the instance's recent evidence. Its automatic
-     sweep knows Minecraft's folders; for another game, name the file with `--file`.
+   - `agora --json crash investigate <ID>` collects the instance's recent evidence through the
+     crash packs' declared sources, for any supported game. Add `--file` when the log came from
+     somewhere else.
    - `agora --json crash analyze <FILE> --instance <ID>` diagnoses a crash report or log you were
      given, for any supported game. `--plugin-dir` adds a development crash pack; `--allow-code`
      is needed only for code in such a folder. `--paste` reads a pasted fragment, says it is a

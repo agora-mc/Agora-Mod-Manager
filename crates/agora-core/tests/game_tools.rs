@@ -284,8 +284,6 @@ fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> Game
                 path: RelPath::default(),
             },
         }),
-        log_paths: vec![],
-        crash_paths: vec![],
         user_files: mappings,
         save_paths: vec![],
         linked_archive_patterns: vec![],

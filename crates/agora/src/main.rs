@@ -1946,6 +1946,10 @@ enum CrashCmd {
         /// Add an explicit diagnostic text file. May be repeated.
         #[arg(long = "file")]
         files: Vec<PathBuf>,
+        /// Search from an RFC 3339 time, or this long before now (for example `90m`, `2h`, `1d`).
+        /// Without it, the newest session's window is used, or the last hour.
+        #[arg(long, value_name = "TIME")]
+        since: Option<String>,
     },
     /// Diagnose crash files against an instance, or on their own when none is named.
     Analyze {
@@ -5120,8 +5124,12 @@ async fn run_crash_command(
         CrashCmd::Patterns { instance } => {
             cli_crash::run_patterns(ctx, &instance, json)?;
         }
-        CrashCmd::Investigate { instance, files } => {
-            cli_crash::investigate(ctx, &instance, &files, json).await?;
+        CrashCmd::Investigate {
+            instance,
+            files,
+            since,
+        } => {
+            cli_crash::investigate(ctx, &instance, &files, since.as_deref(), json).await?;
         }
     }
     Ok(())

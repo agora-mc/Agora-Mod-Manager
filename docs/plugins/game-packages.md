@@ -342,12 +342,13 @@ Each behaviour runs in the plugin that wrote it. A hook inherited from the base 
 
 ## Crash evidence
 
-A game tells the Crash Doctor where its logs and crash files are with `log_paths` and `crash_paths`,
-and which exits are a normal quit with `session.normal_exit_codes`. The analysis itself comes from
-**crash packs**: JSON files contributed under `contributions.crashPacks` (the `crash:contribute`
+The Crash Doctor searches the folders a **crash pack's `sources`** name, the same sources the live
+diagnosis uses, so `crash investigate` needs no file name for any game whose plugin brings a pack.
+A pack is a JSON file contributed under `contributions.crashPacks` (the `crash:contribute`
 capability), with sources, parsers, inspectors, ref maps, roles, save risk and rules. A game plugin
 can ship one for its own game the same way any plugin does; the format is in
-[Community plugins](README.md#crash-packs).
+[Community plugins](README.md#crash-packs). A game also declares which exits are a normal quit with
+`session.normal_exit_codes`.
 
 ## Known gaps
 
@@ -355,7 +356,6 @@ Tell us about others: finding them is the point of this stage.
 
 - **Per-instance saves** work only for games whose save folder is set in an INI file. For other games, instances share saves.
 - **A framework left in the real game folder** by another mod manager isn't detected. A framework counts when it's content in the instance.
-- **Crash paths are declared, not used yet.** `log_paths` and `crash_paths` list where a game keeps its logs and crash files, but `crash investigate` still collects the Minecraft layout; name a file with `--file`, or use `crash analyze --instance`, which reads the packs' own sources.
 
 ## Every field
 
@@ -404,8 +404,6 @@ Each value is a function name in your script. Every field is optional.
 | `framework_ids` | list of strings | optional | Framework ids the game may use; may be empty |
 | `tool_ids` | list of strings | optional | Tool ids the game may use; may be empty |
 | `launch` | launch recipe | optional | How to launch it; leave it out when `prepare_launch` supplies one |
-| `log_paths` | list of game paths | optional | Where its logs are; may be empty |
-| `crash_paths` | list of game paths | optional | Where crash evidence is; may be empty |
 | `user_files` | list of user file mappings | optional | Per-user files kept in the instance; may be empty |
 | `save_paths` | list of game paths | optional | Where its saves are; may be empty |
 | `linked_archive_patterns` | list of globs | optional | Archives linked rather than copied; may be empty |

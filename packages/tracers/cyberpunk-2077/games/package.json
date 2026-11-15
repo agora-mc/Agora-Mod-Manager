@@ -82,17 +82,6 @@
           "path": ""
         }
       },
-      "log_paths": [
-        {
-          "root": "runtime",
-          "path": "r6/logs"
-        },
-        {
-          "root": "runtime",
-          "path": "red4ext/logs"
-        }
-      ],
-      "crash_paths": [],
       "user_files": [
         {
           "source": {

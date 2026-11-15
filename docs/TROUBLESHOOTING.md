@@ -94,7 +94,7 @@ agora games instance tools list <INSTANCE>
 
 `games instance check` names a framework built for another game version, a plugin load order a launch would refuse, and stale or unknown tool output, and says which command rebuilds the tool. `games instance plugins check` prints the load-order findings. `games instance plugins conflicts` shows pairs of plugins that change the same record, and the command to keep the current order (`--keep`) or let the other one win (`--let-win`); a rule added there survives a later sort. `games instance tools list` shows each tool's output state.
 
-`agora log` shares Minecraft logs and crash reports. `agora crash` works for any game whose plugin brings a crash pack: `agora --json crash last <INSTANCE>` reads the answer Agora stored, and `agora crash analyze <FILE> --instance <INSTANCE>` diagnoses a crash file you have. `crash investigate` collects recent evidence automatically for Minecraft; for another game, name the file with `--file`.
+`agora log` shares Minecraft logs and crash reports. `agora crash` works for any game whose plugin brings a crash pack: `agora --json crash last <INSTANCE>` reads the answer Agora stored, and `agora crash analyze <FILE> --instance <INSTANCE>` diagnoses a crash file you have. `crash investigate` collects recent evidence automatically through the crash packs' declared sources, for any supported game; name a file with `--file` when it came from elsewhere.
 
 `agora plugin log <ID>` reads a plugin's own log. Plugin packages are under `<root>/plugins/installed/`, their logs under `<root>/plugins/logs/`, and a plugin's saved data is in `local_state.db`; `agora paths` prints the root. A failed install leaves the previous package in place and names the reason.
 

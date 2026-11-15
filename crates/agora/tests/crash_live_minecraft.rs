@@ -241,6 +241,69 @@ fn a_live_session_reads_the_captured_launch_output_when_no_report_was_written() 
     }
 }
 
+/// A JVM that refuses to start writes no crash report, only the captured launch output. The live
+/// diagnosis must still store a crash answer, and the same file must count as the board's evidence.
+#[test]
+fn a_jvm_startup_failure_is_a_crash_answered_from_the_captured_output() {
+    let (_tmp, ctx, instance_id) = fixture();
+    let dir = ctx.paths.instance_dir(&instance_id).unwrap();
+    std::fs::remove_file(dir.join("crash-reports").join("crash-example.txt")).unwrap();
+    let opened = session_ledger::open_minecraft(&ctx, &instance_id).expect("a session is opened");
+    let logs = dir.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("agora-launch-output.log"),
+        "# Agora captured Java output (sanitized, last 200 lines)
+         # exit_code=1
+         # runtime_ms=1200
+         [stderr] Error occurred during initialization of VM
+         [stderr] Initial heap size set to a larger value than the maximum heap size
+",
+    )
+    .unwrap();
+    let verdict = session_ledger::finish_minecraft(
+        &ctx,
+        &opened.session_id,
+        4242,
+        &LaunchOutcome::Crash,
+        1_200,
+    )
+    .expect("the session is closed");
+    assert!(
+        matches!(verdict, SessionVerdict::Crashed { .. }),
+        "{verdict:?}"
+    );
+
+    diagnose(&ctx, &opened.session_id);
+
+    let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).unwrap();
+    let stored = agora_core::crash_live::answer_for_session(&conn, &opened.session_id)
+        .unwrap()
+        .expect("a crash answer is stored");
+    match stored.answer {
+        agora_core::crash_live::StoredAnswer::Analyzed { answer, files, .. } => {
+            assert!(
+                matches!(answer.verdict, SessionVerdict::Crashed { .. }),
+                "the answer keeps the live verdict: {answer:?}"
+            );
+            assert!(
+                files
+                    .iter()
+                    .any(|file| file.name == "agora-launch-output.log"),
+                "the captured output was read: {files:?}"
+            );
+            assert!(
+                answer.findings.iter().any(|finding| finding
+                    .headline
+                    .get("en")
+                    .is_some_and(|text| text.contains("memory settings"))),
+                "the JVM memory finding is in the answer: {answer:?}"
+            );
+        }
+        other => panic!("expected an analyzed answer, got {other:?}"),
+    }
+}
+
 /// Open a session whose owner process is gone, as a CLI or desktop that closed mid-session would
 /// leave it. The game is not running: this fixture writes no runtime lease.
 fn abandon_owner(ctx: &CoreContext, session_id: &str) {

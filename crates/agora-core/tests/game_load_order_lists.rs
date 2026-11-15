@@ -296,8 +296,6 @@ fn definition(lists: Vec<LoadOrderDefinition>) -> GameDefinition {
                 path: RelPath::default(),
             },
         }),
-        log_paths: vec![],
-        crash_paths: vec![],
         user_files,
         save_paths: vec![],
         linked_archive_patterns: vec![],

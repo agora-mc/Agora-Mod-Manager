@@ -51,57 +51,59 @@ pub fn load_live_packs(ctx: &agora_core::ctx::Ctx) -> anyhow::Result<LivePacks> 
 }
 
 /// Collect the instance's recent evidence and diagnose it with the same engine `crash analyze`
-/// uses. Evidence collection is unchanged; the diagnosis is the engine's answer, not the old
-/// signature scanner's.
+/// uses. The search is core's one evidence search, the same one the live diagnosis runs, so it
+/// follows the crash packs' sources for any game instead of only Minecraft's folders.
 pub async fn investigate(
     ctx: &agora_core::ctx::Ctx,
     instance_id: &str,
     explicit: &[PathBuf],
+    since: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let instance_dir = ctx
-        .paths
-        .instance_dir(instance_id)
-        .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
-    let evidence = agora_core::crash_evidence::CrashEvidenceService::new().collect_since(
-        &instance_dir,
+    let live = load_live_packs(ctx)?;
+    let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
+    let window = investigation_window(ctx, instance_id, since)?;
+    let session = agora_core::crash_engine::evidence::CrashSession {
+        session_id: format!("investigate-{instance_id}"),
+        pid: None,
+        working_dir: None,
+        window,
+    };
+    let evidence = agora_core::crash_live::collect_instance_evidence(
+        ctx,
+        instance_id,
+        &agora_core::crash_live::LivePacks {
+            packs: &live.packs,
+            built_in: &live.built_in,
+            host: live.host.as_ref(),
+            instances: Some(&instances),
+        },
+        &session,
         explicit,
-        None,
-    );
-    if evidence.sources.is_empty() {
-        anyhow::bail!("No crash evidence found for '{instance_id}'.");
+    )
+    .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
+    if evidence.game_packs().next().is_none() {
+        anyhow::bail!(
+            "No crash pack applies to the game '{}', so Agora cannot tell which folders to search. Install the game's plugin, or name a file with --file.",
+            evidence.resolved.game_id
+        );
+    }
+    let files = evidence.files();
+    if files.is_empty() {
+        anyhow::bail!("{}", no_evidence_reason(instance_id, &evidence));
     }
     if !json {
-        for (index, source) in evidence.sources.iter().enumerate() {
-            let role = if index == evidence.primary_index {
+        for line in evidence.lines() {
+            let role = if line.primary {
                 "primary"
             } else {
                 "supporting"
             };
-            let truncated = if source.meta.truncated {
-                ", truncated"
-            } else {
-                ""
-            };
-            println!("Evidence: {} ({role}{truncated})", source.meta.basename);
+            println!("Evidence: {} ({role})", line.basename);
         }
     }
 
-    let live = load_live_packs(ctx)?;
-    let mut packs = live.packs.clone();
-    packs.extend(agora_core::crash_packs::load_built_in_packs(&live.built_in).packs);
-    let resolved = agora_core::crash_engine::instance_view::resolve_crash_instance(
-        ctx,
-        instance_id,
-        Some(&agora_game_minecraft::installed_content::MinecraftInstanceProvider),
-    )?;
-    let game_packs: Vec<&LoadedCrashPack> = packs
-        .iter()
-        .filter(|pack| {
-            pack.pack.games.is_empty()
-                || pack.pack.games.iter().any(|game| game == &resolved.game_id)
-        })
-        .collect();
+    let game_packs: Vec<&LoadedCrashPack> = evidence.game_packs().collect();
     let ref_maps: Vec<agora_game_api::crash::RefMap> = game_packs
         .iter()
         .flat_map(|pack| pack.pack.ref_maps.iter().cloned())
@@ -110,14 +112,15 @@ pub async fn investigate(
         .iter()
         .flat_map(|pack| pack.pack.roles.iter().cloned())
         .collect();
-    let resolver = Resolver::new(resolved.view, ref_maps, roles);
+    let resolved = &evidence.resolved;
+    let resolver = Resolver::new(resolved.view.clone(), ref_maps, roles);
     let scope = Arc::new(
         agora_core::game_script::instance_reads(ctx, instance_id)
             .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?,
     );
     let inspector = InstanceInspector::new(
         live.host.as_ref(),
-        &packs,
+        &evidence.packs,
         &resolver,
         scope,
         GameHandle {
@@ -131,18 +134,8 @@ pub async fn investigate(
         inspector: &inspector,
         could_not_check: &resolved.could_not_check,
     };
-    let files: Vec<CrashFile> = evidence
-        .sources
-        .iter()
-        .map(|source| CrashFile {
-            name: source.meta.basename.clone(),
-            bytes: source.text.as_bytes().to_vec(),
-            origin: agora_core::crash_engine::CrashFileOrigin::Collected,
-            source: None,
-        })
-        .collect();
     let output = analyze(&AnalyzeInput {
-        packs: &packs,
+        packs: &evidence.packs,
         files: &files,
         runtime_version: resolved.runtime_version.as_deref(),
         host: live.host.as_ref(),
@@ -164,6 +157,116 @@ pub async fn investigate(
         anyhow::bail!("No crash file could be read.");
     }
     Ok(())
+}
+
+/// The window `crash investigate` searches with. Without `--since` this is core's choice (the
+/// newest session's span, or the last hour); with it, the caller's start and now.
+fn investigation_window(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+    since: Option<&str>,
+) -> anyhow::Result<agora_core::crash_engine::evidence::SessionWindow> {
+    let Some(text) = since else {
+        return Ok(agora_core::crash_live::investigation_window(
+            ctx,
+            instance_id,
+        ));
+    };
+    let now = ctx.clock.now();
+    let started = if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text) {
+        time.with_timezone(&chrono::Utc).into()
+    } else if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        let Some(midnight) = date.and_hms_opt(0, 0, 0) else {
+            anyhow::bail!("--since '{text}' is not a duration or an RFC 3339 time");
+        };
+        midnight.and_utc().into()
+    } else if let Some(elapsed) = parse_duration(text) {
+        now.checked_sub(elapsed)
+            .ok_or_else(|| anyhow::anyhow!("--since '{text}' is too far in the past"))?
+    } else {
+        anyhow::bail!("--since '{text}' is not a duration or an RFC 3339 time");
+    };
+    if started > now {
+        anyhow::bail!("--since '{text}' is in the future, so there is nothing to search yet.");
+    }
+    Ok(agora_core::crash_engine::evidence::SessionWindow::new(
+        started, now,
+    ))
+}
+
+fn parse_duration(text: &str) -> Option<std::time::Duration> {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut seconds: u64 = 0;
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        let amount: u64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let unit = rest.chars().next()?;
+        let multiplier = match unit {
+            's' => 1,
+            'm' => 60,
+            'h' => 60 * 60,
+            'd' => 24 * 60 * 60,
+            _ => return None,
+        };
+        seconds = seconds.checked_add(amount.checked_mul(multiplier)?)?;
+        rest = &rest[unit.len_utf8()..];
+    }
+    Some(std::time::Duration::from_secs(seconds))
+}
+
+/// Why the search found nothing, in the terms the brief asks for: a folder that could not be
+/// looked at is "could not check" and names its plugin, never a clean "nothing found".
+fn no_evidence_reason(
+    instance_id: &str,
+    evidence: &agora_core::crash_live::InstanceEvidence,
+) -> String {
+    let mut why = format!("No crash evidence found for '{instance_id}'.");
+    let unreadable: Vec<_> = evidence
+        .collection
+        .folders
+        .iter()
+        .filter(|folder| {
+            matches!(
+                folder.state,
+                agora_core::crash_engine::evidence::FolderState::Unreadable
+            )
+        })
+        .collect();
+    if !evidence.collection.problems.is_empty() || !unreadable.is_empty() {
+        why.push_str(" Could not check:");
+        for problem in &evidence.collection.problems {
+            why.push_str(&format!(
+                "
+  - {} (from {}): {}",
+                problem.source_id, problem.plugin_id, problem.detail
+            ));
+        }
+        for folder in unreadable {
+            let detail = folder
+                .detail
+                .as_deref()
+                .unwrap_or("the folder could not be read");
+            why.push_str(&format!(
+                "
+  - {} (from {}): {detail}",
+                folder.source_id, folder.plugin_id
+            ));
+        }
+    } else if evidence.collection.folders.is_empty() {
+        why.push_str(" No crash pack source named a folder to search.");
+    } else {
+        why.push_str(" Every folder the game's crash packs name was missing or empty.");
+    }
+    why
 }
 
 pub struct AnalyzeArgs {

@@ -439,8 +439,6 @@ mod tests {
             "Data/meshes/actors/character/behaviors/0_master.hkx"
         );
         assert_eq!(pandora.required_magic[0].magic, "57e0e05710c0c010");
-        assert!(game.log_paths.is_empty());
-        assert!(game.crash_paths.is_empty());
         assert!(game.save_paths.is_empty());
     }
 

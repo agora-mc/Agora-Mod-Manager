@@ -59,8 +59,6 @@ fn definition() -> GameDefinition {
                 path: RelPath::default(),
             },
         }),
-        log_paths: vec![],
-        crash_paths: vec![],
         // One per-user file, so a launch has a session journal for Stop to read.
         user_files: vec![UserFileMapping {
             source: GamePath::UserData {

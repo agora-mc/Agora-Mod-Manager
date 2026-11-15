@@ -73,7 +73,7 @@ that names a mod the player does not have says nothing instead of reporting a mi
   <https://support.cdprojektred.com/en/cyberpunk/pc/sp-technical/issue/1706/where-are-my-game-saves-located>.
 - Settings: `%LOCALAPPDATA%\CD Projekt Red\Cyberpunk 2077\UserSettings.json`, journaled-swapped
   per instance: <https://steamcommunity.com/sharedfiles/filedetails/?id=2316174052>.
-- Crash paths are not declared yet.
+- Crash evidence: `r6/logs/*.log` and `red4ext/logs/*.log` are declared as crash-pack sources, so `crash investigate` finds them without a file name.
 
 `red4ext/**`, `bin/x64/plugins/**`, `mods/**` and `r6/scripts/**` stay excluded from the base:
 a base is never polluted with mods or frameworks. Framework detection reads the merged view, so a

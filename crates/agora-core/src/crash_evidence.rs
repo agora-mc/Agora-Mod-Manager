@@ -138,6 +138,17 @@ pub struct CollectedEvidence {
     pub failure_category: FailureCategory,
 }
 
+/// One automatic evidence file a caller already found, in the order it should be considered.
+/// Another search (a crash pack's `sources`) supplies these; [`CrashEvidenceService`] applies the
+/// same reading, truncation, staleness and categorization rules to them as to its own candidates.
+#[derive(Debug, Clone)]
+pub struct EvidenceCandidate {
+    pub path: PathBuf,
+    pub kind: EvidenceSourceKind,
+    pub supplementary: bool,
+    pub modified_at: SystemTime,
+}
+
 // ---------------------------------------------------------------------------
 // CrashEvidenceService
 // ---------------------------------------------------------------------------
@@ -202,16 +213,9 @@ impl CrashEvidenceService {
         // 1. Discover automatic sources and select the newest useful source as
         // the primary. Older automatic files are included only when they are
         // plausibly from the same launch window.
-        struct Candidate {
-            path: PathBuf,
-            kind: EvidenceSourceKind,
-            supplementary: bool,
-            modified_at: SystemTime,
-        }
-
-        let mut automatic: Vec<Candidate> = Vec::new();
+        let mut automatic: Vec<EvidenceCandidate> = Vec::new();
         if let Some((path, modified_at)) = find_newest_file(&crash_reports_dir, "txt") {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path,
                 kind: EvidenceSourceKind::CrashReport,
                 supplementary: false,
@@ -221,7 +225,7 @@ impl CrashEvidenceService {
 
         let latest_log = logs_dir.join("latest.log");
         if let Some(modified_at) = file_modified_at(&latest_log) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path: latest_log,
                 kind: EvidenceSourceKind::LatestLog,
                 supplementary: false,
@@ -231,7 +235,7 @@ impl CrashEvidenceService {
 
         let debug_log = logs_dir.join("debug.log");
         if let Some(modified_at) = file_modified_at(&debug_log) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path: debug_log,
                 kind: EvidenceSourceKind::DebugLog,
                 supplementary: false,
@@ -240,7 +244,7 @@ impl CrashEvidenceService {
         }
 
         if let Some((hs_path, modified_at)) = find_hs_err_file(instance_dir) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path: hs_path,
                 kind: EvidenceSourceKind::JvmFatalErrorLog,
                 supplementary: false,
@@ -249,7 +253,7 @@ impl CrashEvidenceService {
         }
 
         if let Some((path, modified_at)) = failed_launch_output(&logs_dir) {
-            automatic.push(Candidate {
+            automatic.push(EvidenceCandidate {
                 path,
                 kind: EvidenceSourceKind::LaunchOutput,
                 supplementary: false,
@@ -294,7 +298,7 @@ impl CrashEvidenceService {
                 })
                 .then_with(|| right.modified_at.cmp(&left.modified_at))
         });
-        let mut candidates: Vec<Candidate> = automatic
+        let candidates: Vec<EvidenceCandidate> = automatic
             .into_iter()
             .enumerate()
             .map(|(index, mut candidate)| {
@@ -302,6 +306,26 @@ impl CrashEvidenceService {
                 candidate
             })
             .collect();
+        self.assemble(&candidates, explicit_files)
+    }
+
+    /// Assemble a collected set from candidates another search found (a crash pack's `sources`),
+    /// plus explicit files. The caller has already ordered and marked the candidates; this applies
+    /// the same size, truncation, staleness and categorization rules as [`Self::collect_since`].
+    pub fn collect_candidates(
+        &self,
+        candidates: &[EvidenceCandidate],
+        explicit_files: &[PathBuf],
+    ) -> CollectedEvidence {
+        self.assemble(candidates, explicit_files)
+    }
+
+    fn assemble(
+        &self,
+        candidates: &[EvidenceCandidate],
+        explicit_files: &[PathBuf],
+    ) -> CollectedEvidence {
+        let mut candidates = candidates.to_vec();
 
         // Explicit user-added files
         for ef in explicit_files {
@@ -318,7 +342,7 @@ impl CrashEvidenceService {
             if candidates.iter().any(|c| c.path == resolved) {
                 continue;
             }
-            candidates.push(Candidate {
+            candidates.push(EvidenceCandidate {
                 path: resolved,
                 kind: EvidenceSourceKind::UserAdded,
                 supplementary: !candidates.is_empty(),
@@ -326,7 +350,7 @@ impl CrashEvidenceService {
             });
         }
 
-        // 3. Read each candidate with bounds
+        // Read each candidate with bounds
         let mut sources: Vec<EvidenceSource> = Vec::new();
         let mut primary_index: usize = 0;
         let mut aggregate: u64 = 0;

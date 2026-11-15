@@ -1477,6 +1477,238 @@ fn crash_investigate_accepts_explicit_text_evidence() {
     );
 }
 
+/// A game instance whose crash packs declare where its evidence lives: `crash investigate` must
+/// find it without a `--file`, and must not read a log older than the window. Every name here is
+/// invented.
+#[test]
+fn crash_investigate_finds_a_game_instances_pack_declared_logs() {
+    let fixture = skyrim_fixture("1.6.1170.0", &[]);
+    let id = fixture.instance_id.clone();
+    let skse_dir = fixture
+        .user_data
+        .join("documents")
+        .join("My Games")
+        .join("Skyrim Special Edition")
+        .join("SKSE");
+    std::fs::create_dir_all(&skse_dir).unwrap();
+
+    let crash = skse_dir.join("crash-2026-01-01-120000.log");
+    std::fs::write(&crash, invented_crash_logger_log()).unwrap();
+    std::fs::write(
+        skse_dir.join("skse64.log"),
+        "SKSE64 runtime: initialize (version = 2.2.6 01064920 0011223344556677)
+         imagebase = 00007FF712340000
+         checking plugin InventedPlugin.dll
+         plugin InventedPlugin.dll (00000001 InventedPlugin 01000000) loaded correctly (handle 1)
+",
+    )
+    .unwrap();
+
+    // Older than the search window: a stale log is not this crash's evidence.
+    let old = skse_dir.join("crash-2025-01-01-000000.log");
+    std::fs::write(&old, invented_crash_logger_log()).unwrap();
+    let old_file = std::fs::File::options().write(true).open(&old).unwrap();
+    old_file
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 60 * 60))
+        .unwrap();
+    drop(old_file);
+
+    let output = run_fixture(&fixture, &["crash", "investigate", &id, "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let names: Vec<&str> = parsed["files"]
+        .as_array()
+        .expect("files are an array")
+        .iter()
+        .filter_map(|file| file["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"crash-2026-01-01-120000.log"),
+        "the Crash Logger log the pack declares was not found: {parsed}"
+    );
+    assert!(
+        names.contains(&"skse64.log"),
+        "the SKSE log the pack declares was not found: {parsed}"
+    );
+    assert!(
+        !names.contains(&"crash-2025-01-01-000000.log"),
+        "a log outside the window must not be read as this crash: {parsed}"
+    );
+
+    // Every limit has an override: --since widens the window to include the same old log.
+    let wider = run_fixture(
+        &fixture,
+        &["crash", "investigate", &id, "--json", "--since", "4h"],
+    );
+    assert!(
+        wider.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wider.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&wider.stdout).unwrap();
+    let names: Vec<&str> = parsed["files"]
+        .as_array()
+        .expect("files are an array")
+        .iter()
+        .filter_map(|file| file["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"crash-2025-01-01-000000.log"),
+        "--since 4h must search the older log too: {parsed}"
+    );
+
+    let bad = run_fixture(
+        &fixture,
+        &["crash", "investigate", &id, "--since", "not-a-time"],
+    );
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("--since 'not-a-time'"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+/// A crash pack may name a whole folder as its source. `crash investigate` must read the files
+/// inside it, not quietly report nothing because no single file matched.
+#[test]
+fn crash_investigate_reads_a_folder_unit_source() {
+    let (_tmp, data_dir) = temp_data_dir();
+    run_agora(&data_dir, &["paths"]);
+    create_vanilla_instance(&data_dir, "crash-folder", "1.21");
+    install_folder_crash_pack(&data_dir);
+    let inner = data_dir.join("instances/crash-folder/event-logs/case-1/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(
+        inner.join("evidence.log"),
+        "invented evidence in a folder source
+",
+    )
+    .unwrap();
+
+    let output = run_agora_json(&data_dir, &["crash", "investigate", "crash-folder"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed = assert_json_stdout(&output);
+    let names: Vec<&str> = parsed["files"]
+        .as_array()
+        .expect("files are an array")
+        .iter()
+        .filter_map(|file| file["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"inner/evidence.log"),
+        "the file inside the folder source was not read: {parsed}"
+    );
+}
+
+/// Register a development crash pack whose one source is a folder, in the data root the CLI opens.
+fn install_folder_crash_pack(data_dir: &Path) {
+    use agora_core::plugins::store::{self, PluginSource};
+    use agora_plugin_api::capability::{Capability, CapabilitySet};
+    use agora_plugin_api::manifest::PluginManifest;
+
+    let folder = data_dir.join("folder-pack-plugin");
+    std::fs::create_dir_all(folder.join("crash")).unwrap();
+    std::fs::write(
+        folder.join("agora-plugin.json"),
+        r#"{
+  "manifest": 1,
+  "id": "acme.folders",
+  "name": "Acme folder evidence",
+  "version": "1.0.0",
+  "license": "MIT",
+  "apiRange": ">=0.1, <0.2",
+  "capabilities": { "required": ["crash:contribute"] },
+  "contributions": { "crashPacks": [{ "path": "crash/pack.json" }] }
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("crash/pack.json"),
+        r#"{
+  "contract": 1,
+  "games": ["minecraft"],
+  "sources": [{
+    "id": "event_cases",
+    "where": { "root": "instance", "path": "event-logs" },
+    "match": { "glob": "case-*" },
+    "unit": "folder",
+    "format": "folder_evidence",
+    "bind": [{ "time": { "before_s": 5, "after_s": 30 } }]
+  }],
+  "parsers": [{
+    "id": "folder_evidence",
+    "detect": { "all": ["(?m)^invented evidence"] },
+    "entry": { "generic": { "name": "text_sections", "config": {
+      "sections": [{
+        "id": "evidence",
+        "header": "^invented evidence",
+        "lines": [{
+          "pattern": "^(?P<text>invented evidence.*)$",
+          "kind": "core.log_line",
+          "attrs": { "text": "text" }
+        }]
+      }]
+    } } }
+  }]
+}"#,
+    )
+    .unwrap();
+    let paths = agora_core::app_paths::AppPaths::from_root(data_dir.to_path_buf());
+    let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+    let manifest =
+        PluginManifest::parse(&std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap())
+            .unwrap();
+    let mut granted = CapabilitySet::new();
+    granted.insert(Capability::CrashContribute);
+    store::upsert(
+        &conn,
+        &manifest,
+        &granted,
+        &PluginSource::Development {
+            path: folder.clone(),
+        },
+        &folder,
+        true,
+        "2026-01-01T00:00:00Z",
+    )
+    .unwrap();
+}
+
+fn invented_crash_logger_log() -> String {
+    "CRASH TIME: 2026-01-01 12:00:00
+     Skyrim SSE v1.6.1170
+     CrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00
+     
+     Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 InventedGame.exe+001000
+     
+     SYSTEM SPECS:
+     	OS: Invented OS
+     	CPU: Invented CPU
+     	GPU #1: Invented GPU
+     	PHYSICAL MEMORY: 8.00 GB/16.00 GB
+     
+     PROBABLE CALL STACK:
+     	[ 0] 0x7FF700000000 InventedGame.exe+001000
+     	[ 1] 0x7FF700001000 InventedPlugin.dll+001000
+     
+     MODULES:
+     	InventedGame.exe 0x7FF700000000
+     
+     SKSE PLUGINS:
+     	InventedPlugin.dll v1.0.0
+"
+    .to_string()
+}
+
 fn write_crash_analyze_fixtures(root: &Path) -> (PathBuf, PathBuf) {
     let plugin = root.join("analyze-plugin");
     std::fs::create_dir_all(plugin.join("crash")).unwrap();
