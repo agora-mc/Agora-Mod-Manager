@@ -242,8 +242,11 @@ snapshot first, and `template delete` asks unless given `--yes`.
   lock, and never opens the live store (it reads a copy). Mods are copied from the staging folder
   as they are on disk; downloads are not copied. The layer order comes from
   `vortex.deployment.json`, with Vortex's rules as the tie-breaker, and every file where the two
-  disagree is reported. Show the plan before importing; a second import of the same profile needs
-  `--name`.
+  disagree is reported; with no manifest (a purged deployment), the rules alone decide and the
+  plan says where it looked. A profile with local game settings brings its INIs; local saves are
+  copied under Documents only with `--copy-saves`. If scan says the game folder is a real install
+  Agora has not added, import with `--add-folder` (or run `agora games folder add <path>` first).
+  Show the plan before importing; a second import of the same profile needs `--name`.
 
 ## Finding and installing content
 

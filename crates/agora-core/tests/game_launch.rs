@@ -20,6 +20,7 @@ use tempfile::TempDir;
 fn make_test_definition(recipe: Option<LaunchRecipe>) -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("test-game").unwrap(),
         extends: None,

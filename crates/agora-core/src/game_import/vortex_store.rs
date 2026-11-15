@@ -25,6 +25,12 @@ use rusty_leveldb::{LdbIterator, Options, DB};
 use serde_json::{Map, Value};
 
 /// The store's own file name under Vortex's user-data folder.
+///
+/// Vortex's current `LevelPersist.ts` opens this folder through DuckDB's `level_pivot`, which
+/// *attaches the LevelDB folder itself* (`:69` `attachDatabase(persistPath, alias)`) rather than
+/// replacing it; its own comment says repair is "not applicable to DuckDB/level_pivot" (`:58`).
+/// The files on disk are still LevelDB (`.ldb` tables, a manifest and a log), so a LevelDB reader
+/// reads them.
 pub const STORE_DIR_NAME: &str = "state.v2";
 /// The file LevelDB locks while a process has the store open.
 pub const LOCK_FILE_NAME: &str = "LOCK";

@@ -261,6 +261,7 @@ fn definition(tools: &[ToolDefinition], user_files: bool, plugins: bool) -> Game
     }
     GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new(GAME).unwrap(),
         extends: None,

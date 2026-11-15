@@ -10,10 +10,12 @@ import { useEffect, useRef, useState } from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { BackButton } from '@/components/ui/back-button';
+import { Switch } from '@/components/ui/switch';
 import { useConfirm } from '@/components/ui/confirm';
 import { formatBytes } from '@/components/installed-content/contentTableState';
 import { plural } from '@/features/library/format';
 import { formatError } from '@/lib/tauri';
+import { addGameFolder } from '../discovery/api';
 import {
   importVortexProfile,
   scanVortex,
@@ -70,6 +72,9 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
   const [scan, setScan] = useState<ScanState>({ status: 'loading' });
   const [selected, setSelected] = useState<{ game: VortexScanGame; profile: VortexScanProfile } | null>(null);
   const [instanceName, setInstanceName] = useState('');
+  const [copySaves, setCopySaves] = useState(false);
+  const [addingFolder, setAddingFolder] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
   const [plan, setPlan] = useState<PlanState>({ status: 'idle' });
   const [run, setRun] = useState<RunState>({ status: 'idle' });
   const mounted = useRef(true);
@@ -101,10 +106,25 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** Add Vortex's game folder through the same path the Settings folder list uses, then re-read. */
+  const addFolder = async (path: string) => {
+    setAddingFolder(true);
+    setAddError(null);
+    try {
+      await addGameFolder(path);
+      load();
+    } catch (error) {
+      if (mounted.current) setAddError(formatError(error));
+    } finally {
+      if (mounted.current) setAddingFolder(false);
+    }
+  };
+
   const choose = async (game: VortexScanGame, profile: VortexScanProfile) => {
     if (!game.game) return;
     setSelected({ game, profile });
     setInstanceName('');
+    setCopySaves(false);
     setRun({ status: 'idle' });
     setPlan({ status: 'busy' });
     try {
@@ -115,6 +135,8 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
         name: null,
         dryRun: true,
         install: null,
+        addFolder: false,
+        copySaves,
       });
       if (!mounted.current) return;
       if (reply.kind !== 'plan') throw new Error('The preview did not return a plan.');
@@ -142,6 +164,8 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
         name: newName === current.instanceName ? null : newName,
         dryRun: false,
         install: null,
+        addFolder: false,
+        copySaves,
       });
       if (!mounted.current) return;
       if (reply.kind !== 'run') throw new Error('The import did not return a report.');
@@ -182,6 +206,15 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
           </p>
           {result.pluginsWritten !== null && (
             <p className="text-sm text-muted-foreground">Plugin list: {result.pluginsWritten} lines written.</p>
+          )}
+          {result.inisCopied.length > 0 && (
+            <p className="text-sm text-muted-foreground">INIs copied: {result.inisCopied.join(', ')}.</p>
+          )}
+          {result.savesCopied > 0 && (
+            <p className="text-sm text-muted-foreground">
+              Saves copied: {result.savesCopied}
+              {result.savesSkippedExisting > 0 ? ` (${result.savesSkippedExisting} already there, left alone)` : ''}.
+            </p>
           )}
         </div>
         {result.duplicates.length > 0 && (
@@ -287,7 +320,7 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
               <p className="text-sm text-muted-foreground">
                 {current.manifest.found
                   ? `Deployment manifest: ${current.manifest.files} files, ${current.manifest.matched} matched an imported mod.`
-                  : 'No deployment manifest was found; the order comes from Vortex’s rules alone.'}
+                  : `No deployment manifest was found; the order comes from Vortex’s rules alone. Looked in ${current.manifest.searched.join(', ')}.`}
               </p>
               {current.manifest.damaged && (
                 <p className="text-sm text-foreground">The manifest could not be used: {current.manifest.damaged}</p>
@@ -320,6 +353,29 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
                     {note}
                   </p>
                 ))}
+              </div>
+            )}
+
+            {(current.localSettings || current.localSaves) && (
+              <div className={STEP_CARD} data-testid="vortex-plan-profile-files">
+                <h4 className="text-sm font-semibold">The profile’s own files</h4>
+                {current.localSettings && (
+                  <p className="text-sm text-muted-foreground">
+                    INIs: {current.inis.length > 0 ? current.inis.join(', ') : 'none found in the profile folder'}
+                  </p>
+                )}
+                {current.localSaves && (
+                  <div className="space-y-2">
+                    <p className="text-sm text-muted-foreground">
+                      Saves: {current.saves.files} file(s), {formatBytes(current.saves.bytes)}. They are copied only when
+                      you ask, as MO2’s import does.
+                    </p>
+                    <label className="flex items-center gap-2 text-sm">
+                      <Switch checked={copySaves} onCheckedChange={setCopySaves} />
+                      Copy the profile’s saves into the new instance
+                    </label>
+                  </div>
+                )}
               </div>
             )}
 
@@ -399,6 +455,29 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
                   {game.staging ? ` · ${game.staging}` : ''}
                 </p>
                 {game.reason && <p className="mt-1 text-sm text-muted-foreground">{game.reason}</p>}
+                {game.detection && <p className="mt-1 text-sm text-muted-foreground">{game.detection}</p>}
+                {game.manifestFound ? (
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    Deployment manifest: {game.manifestFiles} files.
+                  </p>
+                ) : (
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    No deployment manifest found; the order comes from Vortex’s rules alone.
+                  </p>
+                )}
+                {game.needsFolderAdd && game.discoveredPath && (
+                  <div className="mt-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={addingFolder}
+                      onClick={() => void addFolder(game.discoveredPath as string)}
+                    >
+                      Add this folder to Agora
+                    </Button>
+                    {addError && <p className="mt-1 text-sm text-foreground" role="alert">{addError}</p>}
+                  </div>
+                )}
               </div>
               {game.supported && game.game && game.profiles.length > 0 && (
                 <div className="flex flex-wrap gap-2">

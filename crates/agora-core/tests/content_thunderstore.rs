@@ -30,6 +30,7 @@ impl GamePackage for ValheimPackage {
 fn valheim_definition() -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("valheim").unwrap(),
         extends: None,

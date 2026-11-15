@@ -12,6 +12,9 @@
     {
       "id": "cyberpunk-2077",
       "name": "Cyberpunk 2077",
+      "import_ids": {
+        "vortex": "cyberpunk2077"
+      },
       "stores": [
         {
           "store": "gog",

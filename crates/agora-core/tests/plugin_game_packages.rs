@@ -20,6 +20,7 @@ fn dummy_package_def(game_id: &str) -> PackageDefinition {
         behaviours: None,
         games: vec![GameDefinition {
             mo2_game_name: None,
+            import_ids: Default::default(),
             session: Default::default(),
             id: GameId::new(game_id).unwrap(),
             extends: None,

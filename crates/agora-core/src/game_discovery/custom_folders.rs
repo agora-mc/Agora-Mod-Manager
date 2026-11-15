@@ -486,6 +486,7 @@ mod tests {
     fn game(id: &str, name: &str, executable: &str) -> GameDefinition {
         GameDefinition {
             mo2_game_name: None,
+            import_ids: Default::default(),
             session: Default::default(),
             id: GameId::new(id).expect("valid game id"),
             extends: None,

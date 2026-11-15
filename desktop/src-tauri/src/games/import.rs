@@ -717,6 +717,12 @@ pub struct VortexImportRequest {
     pub dry_run: bool,
     #[serde(default)]
     pub install: Option<String>,
+    /// Add Vortex's game folder to Agora before importing (the `games_add_folder` path).
+    #[serde(default)]
+    pub add_folder: bool,
+    /// Copy the profile's own saves into the instance.
+    #[serde(default)]
+    pub copy_saves: bool,
 }
 
 /// What `games_import_vortex` answered: the plan for a dry run, or the report of an import.
@@ -755,8 +761,12 @@ pub async fn games_import_vortex(
                 .install
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty()),
+            add_folder: request.add_folder,
+            copy_saves: request.copy_saves,
         };
         let inventory = installed_games(&ctx);
+        let inventory =
+            vortex::prepare_inventory(&ctx, &inventory, &core_request).map_err(import_failed)?;
         if request.dry_run {
             let plan = vortex::plan(&ctx, &inventory, &core_request).map_err(import_failed)?;
             return Ok(VortexImportReply::Plan(Box::new(VortexPlanDto::from(
@@ -802,6 +812,10 @@ pub struct VortexPlanDto {
     pub order: Vec<String>,
     pub disagreements: Vec<VortexDisagreementDto>,
     pub plugins: VortexPluginsDto,
+    pub local_settings: bool,
+    pub inis: Vec<String>,
+    pub local_saves: bool,
+    pub saves: SavesDto,
     pub problems: Vec<ProblemDto>,
     pub warnings: Vec<String>,
 }
@@ -830,6 +844,7 @@ pub struct VortexManifestDto {
     pub files: usize,
     pub matched: usize,
     pub damaged: Option<String>,
+    pub searched: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -887,6 +902,12 @@ impl From<&VortexPlan> for VortexPlanDto {
                 files: plan.manifest.files,
                 matched: plan.manifest.matched,
                 damaged: plan.manifest.damaged.clone(),
+                searched: plan
+                    .manifest
+                    .searched
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
             },
             order: plan.order.clone(),
             disagreements: plan
@@ -903,6 +924,15 @@ impl From<&VortexPlan> for VortexPlanDto {
                 listed: plan.plugins.lines.len(),
                 active: plan.plugins.active,
                 notes: plan.plugins.notes.clone(),
+            },
+            local_settings: plan.local_settings,
+            inis: plan.inis.iter().map(|ini| ini.name.clone()).collect(),
+            local_saves: plan.local_saves,
+            saves: SavesDto {
+                local: plan.saves.local,
+                files: plan.saves.files,
+                bytes: plan.saves.bytes,
+                note: plan.saves.note.clone(),
             },
             problems: plan
                 .problems
@@ -930,6 +960,10 @@ pub struct VortexRunDto {
     pub duplicates: Vec<String>,
     pub plugins_written: Option<usize>,
     pub plugin_findings: Vec<String>,
+    pub inis_copied: Vec<String>,
+    pub saves_copied: usize,
+    pub saves_skipped_existing: usize,
+    pub saves_folder: Option<String>,
     pub next_steps: Vec<String>,
 }
 
@@ -944,6 +978,13 @@ impl From<&VortexRunReport> for VortexRunDto {
             duplicates: report.duplicates.clone(),
             plugins_written: report.plugins_written,
             plugin_findings: report.plugin_findings.clone(),
+            inis_copied: report.inis_copied.clone(),
+            saves_copied: report.saves_copied,
+            saves_skipped_existing: report.saves_skipped_existing,
+            saves_folder: report
+                .saves_folder
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             next_steps: report.next_steps.clone(),
         }
     }

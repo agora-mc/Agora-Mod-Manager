@@ -154,6 +154,7 @@ pub fn game_package() -> Arc<dyn GamePackage> {
                 behaviours: None,
                 games: vec![GameDefinition {
                     mo2_game_name: None,
+                    import_ids: Default::default(),
                     session: Default::default(),
                     id: GameId::minecraft(),
                     extends: None,

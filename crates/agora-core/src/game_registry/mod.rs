@@ -104,6 +104,14 @@ pub enum GameRegistryError {
     InvalidLoadOrder { game_id: GameId, reason: String },
     #[error("game {game_id} has an invalid launch alternative: {reason}")]
     InvalidLaunchAlternative { game_id: GameId, reason: String },
+    #[error("game {game_id} has an invalid import id: {reason}")]
+    InvalidImportId { game_id: GameId, reason: String },
+    #[error("import id {import_id} for {manager} is already claimed by game {claimed_by}")]
+    ImportIdAlreadyClaimed {
+        manager: String,
+        import_id: String,
+        claimed_by: GameId,
+    },
 }
 
 /// Whether a condition is a `present` with nothing to look for, which would silently never match.
@@ -234,6 +242,58 @@ impl GameRegistryBuilder {
                     });
                 }
                 new_store_claims.insert(key, game.id.clone());
+            }
+        }
+
+        // 4b. Import ids are real, and name one game each. A manager that names two games
+        // would make an import pick one without telling the user.
+        for game in &def.games {
+            for (manager, import_id) in &game.import_ids {
+                if manager.trim().is_empty() || manager.trim() != manager {
+                    return Err(GameRegistryError::InvalidImportId {
+                        game_id: game.id.clone(),
+                        reason: format!(
+                            "the manager name '{manager}' is empty or has surrounding space"
+                        ),
+                    });
+                }
+                if import_id.trim().is_empty() || import_id.trim() != import_id {
+                    return Err(GameRegistryError::InvalidImportId {
+                        game_id: game.id.clone(),
+                        reason: format!(
+                            "the {manager} id '{import_id}' is empty or has surrounding space"
+                        ),
+                    });
+                }
+                for (other_id, (_, other)) in &self.games {
+                    for (other_manager, other_import) in &other.import_ids {
+                        if other_manager.eq_ignore_ascii_case(manager)
+                            && other_import.eq_ignore_ascii_case(import_id)
+                        {
+                            return Err(GameRegistryError::ImportIdAlreadyClaimed {
+                                manager: manager.clone(),
+                                import_id: import_id.clone(),
+                                claimed_by: other_id.clone(),
+                            });
+                        }
+                    }
+                }
+                for other in &def.games {
+                    if other.id == game.id {
+                        continue;
+                    }
+                    for (other_manager, other_import) in &other.import_ids {
+                        if other_manager.eq_ignore_ascii_case(manager)
+                            && other_import.eq_ignore_ascii_case(import_id)
+                        {
+                            return Err(GameRegistryError::ImportIdAlreadyClaimed {
+                                manager: manager.clone(),
+                                import_id: import_id.clone(),
+                                claimed_by: other.id.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -1015,6 +1075,7 @@ pub mod test_support {
             behaviours: None,
             games: vec![GameDefinition {
                 mo2_game_name: None,
+                import_ids: Default::default(),
                 session: Default::default(),
                 id: GameId::new(game_id).expect("valid game id"),
                 extends: None,

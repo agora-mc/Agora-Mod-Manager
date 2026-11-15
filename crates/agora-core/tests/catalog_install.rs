@@ -273,6 +273,7 @@ fn test_definition() -> GameDefinition {
         save_location: Vec::new(),
         ini_checks: Vec::new(),
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         launch_alternatives: Vec::new(),
         content_layout: Some(ContentLayout {

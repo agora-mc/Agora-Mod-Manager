@@ -93,6 +93,18 @@ pub enum ImportError {
     NoVortexProfile { profile: String, game: String },
     #[error("the staging folder Vortex names for {game} is not there: {path}")]
     NoStaging { game: String, path: PathBuf },
+    #[error("Vortex never discovered a game folder for {game}; discover the game in Vortex, or add its folder in Agora first")]
+    VortexFolderMissing { game: String },
+    #[error("Vortex's game folder is a real {game} install at {path}, but Agora has not added it. Run `agora games folder add \"{}\"`, or import with --add-folder", path.display())]
+    VortexFolderNotAdded { game: String, path: PathBuf },
+    #[error("Vortex's game folder for {game} is {path}, which Agora cannot use: {reason}")]
+    VortexFolderNotGame {
+        game: String,
+        path: PathBuf,
+        reason: String,
+    },
+    #[error("Agora could not add Vortex's game folder: {0}")]
+    FolderAdd(String),
     #[error("the store cannot say where {game}'s staging folder is: {reason}")]
     BadStagingPath { game: String, reason: String },
     #[error(transparent)]

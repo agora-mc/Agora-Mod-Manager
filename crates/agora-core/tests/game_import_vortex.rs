@@ -19,7 +19,7 @@ use agora_core::game_registry::{
 use agora_game_api::{
     ContentLayout, GameDefinition, GameId, GamePackage, InstallId, InstallKind,
     LoadOrderDefinition, LoadOrderFormat, LoadOrderItems, LoadOrderRules, PackageDefinition,
-    RelPath, RuntimeIdentity, StoreId,
+    RelPath, RuntimeIdentity, StoreId, VersionSource,
 };
 use rusty_leveldb::{Options, DB};
 use tempfile::TempDir;
@@ -63,6 +63,10 @@ fn write(path: &Path, bytes: &[u8]) {
 fn skyrim_like() -> GameDefinition {
     let mut def = common::skyrim_definition();
     def.mo2_game_name = Some("Skyrim Special Edition".into());
+    def.import_ids.insert("vortex".into(), VORTEX_GAME.into());
+    def.version_sources = vec![VersionSource::Executable {
+        path: RelPath::new("Game.exe").unwrap(),
+    }];
     def.content_layout = Some(ContentLayout {
         data_path: RelPath::new("Data").unwrap(),
         data_markers: vec![],
@@ -205,8 +209,21 @@ fn build_setup(tmp: &Path, game_dir: &Path) -> (PathBuf, PathBuf) {
   "mod-gamma": {{"id":"mod-gamma","state":"installed","installationPath":"Gamma Folder","attributes":{{"name":"Gamma Mod","version":"3.0","modId":103,"fileId":13}},"rules":[{{"type":"after","reference":{{"id":"mod-alpha"}}}}]}}
 }}}}"#
     );
+    // The profile keeps its own game settings and saves, as the real setup does.
+    write(
+        &profile.join("Skyrim.ini"),
+        b"[General]\r\nsLocalTest=1\r\n",
+    );
+    write(
+        &profile.join("SkyrimPrefs.ini"),
+        b"[Display]\r\niSize H=1080\r\n",
+    );
+    write(
+        &profile.join("SkyrimCustom.ini"),
+        b"[Custom]\r\nsCustom=2\r\n",
+    );
     let profiles = format!(
-        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":false}}}}}}}}"#
+        r#"{{"p1":{{"id":"p1","gameId":"{VORTEX_GAME}","name":"Main","modState":{{"mod-alpha":{{"enabled":true}},"mod-beta":{{"enabled":true}},"mod-gamma":{{"enabled":false}}}},"features":{{"local_game_settings":true,"local_saves":true}}}}}}"#
     );
     write_store(
         &store,
@@ -265,6 +282,17 @@ fn fixture() -> Fixture {
     let game_dir = tmp.path().join("game");
     std::fs::create_dir_all(&game_dir).unwrap();
     let (store, staging) = build_setup(tmp.path(), &game_dir);
+    // Vortex keeps a profile's local saves under the game's shared save folder, in a folder named
+    // after the profile id.
+    let rule = def
+        .save_location
+        .iter()
+        .find(|rule| rule.applies_to_store(&StoreId::steam()))
+        .expect("the test game has a save-location rule");
+    let saves = agora_core::game_saves::shared_folder(rule)
+        .unwrap()
+        .join("p1");
+    write(&saves.join("Save1.ess"), b"SAVE ONE");
 
     let inventory = GameInventory {
         installs: vec![install_of(&game_dir)],
@@ -288,6 +316,8 @@ fn request(f: &Fixture, name: Option<&str>) -> VortexRequest {
         profile: "Main".into(),
         name: name.map(str::to_string),
         install: None,
+        add_folder: false,
+        copy_saves: false,
     }
 }
 
@@ -342,12 +372,14 @@ fn a_game_vortex_discovered_but_agora_does_not_support_is_listed_as_unsupported(
 
     let report = vortex::scan(&f.ctx, &f.inventory, &f.store).expect("the store scans");
     let game = &report.games[0];
-    assert!(!game.supported);
+    // The package still names this Vortex id, so the game is supported; the folder is what failed.
+    assert!(game.supported);
+    assert!(!game.needs_folder_add);
     assert!(game
         .reason
         .as_deref()
         .unwrap_or_default()
-        .contains("not an install"));
+        .contains("does not hold"));
 }
 
 #[test]
@@ -442,4 +474,293 @@ fn a_locked_store_is_refused_with_close_vortex() {
     assert!(text.contains("Vortex is running"), "{text}");
     assert!(text.contains("Close Vortex"), "{text}");
     drop(held);
+}
+
+#[test]
+fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
+    let f = fixture();
+    let mut empty = f.inventory.clone();
+    empty.installs.clear();
+    empty.unsupported.clear();
+
+    let scan = vortex::scan(&f.ctx, &empty, &f.store).expect("the store scans");
+    let game = &scan.games[0];
+    assert!(game.supported, "{game:?}");
+    assert!(game.needs_folder_add, "{game:?}");
+    assert!(game.install.is_none());
+    assert!(game.reason.is_none());
+    assert!(game
+        .detection
+        .as_deref()
+        .unwrap_or_default()
+        .contains("has not added"));
+
+    let mut request = request(&f, None);
+    request.add_folder = true;
+    let inventory =
+        vortex::prepare_inventory(&f.ctx, &empty, &request).expect("the folder is added");
+    assert!(inventory
+        .installs
+        .iter()
+        .any(|install| install.game == GameId::new(GAME).unwrap()));
+    let plan = vortex::plan(&f.ctx, &inventory, &request).expect("the plan is made");
+    assert_eq!(plan.mods.len(), 3);
+}
+
+#[test]
+fn a_missing_manifest_falls_back_to_vortex_rules_and_says_where_it_looked() {
+    let f = fixture();
+    std::fs::remove_file(f._tmp.path().join("game/Data/vortex.deployment.json")).unwrap();
+    let plan = vortex::plan(&f.ctx, &f.inventory, &request(&f, None)).expect("the plan is made");
+    assert!(!plan.manifest.found);
+    assert!(plan
+        .manifest
+        .searched
+        .iter()
+        .any(|path| path.ends_with("Data/vortex.deployment.json")
+            || path.ends_with("Data\\vortex.deployment.json")));
+    assert!(plan
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("rules alone") && warning.contains("looked in")));
+    let place = |id: &str| plan.order.iter().position(|m| m == id).unwrap();
+    // A rule chain: Alpha before Gamma before Beta.
+    assert!(place("mod-alpha") < place("mod-gamma"));
+    assert!(place("mod-gamma") < place("mod-beta"));
+}
+
+#[test]
+fn the_profiles_inis_are_planned_and_saves_counted() {
+    let f = fixture();
+    let plan = vortex::plan(&f.ctx, &f.inventory, &request(&f, None)).expect("the plan is made");
+    assert!(plan.local_settings);
+    let names: Vec<&str> = plan.inis.iter().map(|ini| ini.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Skyrim.ini", "SkyrimPrefs.ini", "SkyrimCustom.ini"]
+    );
+    assert!(plan.local_saves);
+    assert_eq!(plan.saves.files, 1);
+}
+
+#[test]
+fn copy_saves_copies_the_profiles_saves_and_inis() {
+    let f = fixture();
+    let mut request = request(&f, None);
+    request.copy_saves = true;
+    let report = vortex::run(&f.ctx, &f.inventory, &request, Default::default(), &|_| {})
+        .expect("the import runs");
+    assert_eq!(report.inis_copied.len(), 3);
+    assert_eq!(report.saves_copied, 1);
+    let folder = report
+        .saves_folder
+        .as_ref()
+        .expect("the instance has its own saves");
+    assert!(folder.join("Save1.ess").is_file());
+}
+
+// ---------------------------------------------------------------------------
+// A Cyberpunk-shaped game: its default deploy target is the game root, not `Data`, and a
+// manifest entry's `target` is the subfolder Vortex placed the file in.
+// ---------------------------------------------------------------------------
+
+const CYBERPUNK: &str = "cyberpunk-2077";
+const CYBERPUNK_VORTEX_ID: &str = "cyberpunk2077";
+
+fn cyberpunk_like() -> GameDefinition {
+    let mut def = common::skyrim_definition();
+    def.mo2_game_name = None;
+    def.id = GameId::new(CYBERPUNK).unwrap();
+    def.name = "Cyberpunk 2077".into();
+    def.import_ids
+        .insert("vortex".into(), CYBERPUNK_VORTEX_ID.into());
+    def.version_sources = vec![VersionSource::Executable {
+        path: RelPath::new("bin/x64/Cyberpunk2077.exe").unwrap(),
+    }];
+    def.content_layout = Some(ContentLayout {
+        data_path: RelPath::default(),
+        data_markers: vec![],
+        root_markers: vec![],
+        thunderstore_bepinex: false,
+    });
+    def.load_orders = vec![];
+    def.save_location = vec![];
+    def.user_files = vec![];
+    def.save_paths = vec![];
+    def
+}
+
+fn cyberpunk_install(dir: &Path) -> IdentifiedInstall {
+    let store_id = StoreId::gog();
+    let runtime = RuntimeIdentity {
+        game: GameId::new(CYBERPUNK).unwrap(),
+        store: store_id.clone(),
+        version: "2.21".into(),
+        build: None,
+    };
+    let volume = agora_core::game_discovery::volume::VolumeDetector::new().get_volume_info(dir);
+    let discovered = DiscoveredInstall {
+        store: store_id,
+        product: "1423049311".into(),
+        name: "Cyberpunk 2077".into(),
+        kind: InstallKind::BaseGame,
+        parent_product: None,
+        location: dir.to_path_buf(),
+        store_version: Some(runtime.version.clone()),
+        store_build: None,
+        executables: vec!["bin/x64/Cyberpunk2077.exe".into()],
+        capabilities: InstallCapabilities {
+            executables_readable: true,
+            accepts_new_files: true,
+            relocatable: true,
+        },
+        volume,
+    };
+    IdentifiedInstall {
+        game: runtime.game.clone(),
+        install_id: InstallId::new("gog:1423049311").unwrap(),
+        discovered,
+        add_ons: vec![],
+        runtime: RuntimeResolution::Identified {
+            runtime,
+            source: "executable".into(),
+        },
+    }
+}
+
+struct CyberpunkFixture {
+    _lock: MutexGuard<'static, ()>,
+    _tmp: TempDir,
+    _user_data: TempDir,
+    ctx: CoreContext,
+    inventory: GameInventory,
+    store: PathBuf,
+}
+
+fn cyberpunk_fixture() -> CyberpunkFixture {
+    let lock = USER_DATA.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let user_data = TempDir::new().unwrap();
+    std::env::set_var("AGORA_TEST_USER_DATA_ROOT", user_data.path());
+
+    let def = cyberpunk_like();
+    let pkg = PackageDefinition {
+        id: format!("test.{CYBERPUNK}"),
+        version: semver::Version::new(0, 1, 0),
+        api_range: semver::VersionReq::parse(">=0.1, <0.2").unwrap(),
+        parents: vec![],
+        game_templates: std::collections::BTreeMap::new(),
+        behaviours: None,
+        games: vec![def],
+        frameworks: vec![],
+        tools: vec![],
+    };
+    let mut builder = GameRegistry::builder();
+    builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            Arc::new(TestPackage(pkg)),
+        )
+        .expect("register the test package");
+    let registry = Arc::new(builder.build());
+
+    let ctx = CoreContext::for_testing(tmp.path().join("app_data"));
+    agora_core::db::init_local_state_db(&ctx.paths.local_state_db()).unwrap();
+    let ctx = ctx.with_games(registry);
+
+    let game_dir = tmp.path().join("game");
+    std::fs::create_dir_all(&game_dir).unwrap();
+    write(&game_dir.join("bin/x64/Cyberpunk2077.exe"), b"EXE");
+    std::fs::copy(
+        r"C:\Windows\System32\cmd.exe",
+        game_dir.join("bin/x64/Cyberpunk2077.exe"),
+    )
+    .unwrap();
+    let store = tmp.path().join("Vortex").join("state.v2");
+    std::fs::create_dir_all(&store).unwrap();
+    let staging = tmp
+        .path()
+        .join("Vortex")
+        .join(CYBERPUNK_VORTEX_ID)
+        .join("mods");
+    write(
+        &staging.join("Mod Folder/archive/pc/mod/foo.archive"),
+        b"ARCHIVE",
+    );
+    // The default manifest sits at the game root; `target` says where the file went.
+    write(
+        &game_dir.join("vortex.deployment.json"),
+        br#"{
+  "version": 1,
+  "instance": "test-instance",
+  "files": [
+    { "relPath": "foo.archive", "source": "Mod Folder", "target": "archive/pc/mod", "time": 1 }
+  ]
+}"#,
+    );
+    let mods = format!(
+        r#"{{"{CYBERPUNK_VORTEX_ID}":{{"cpmod":{{"id":"cpmod","state":"installed","installationPath":"Mod Folder","attributes":{{"name":"Archive Mod","version":"1.0"}}}}}}}}"#
+    );
+    let profiles = format!(
+        r#"{{"p1":{{"id":"p1","gameId":"{CYBERPUNK_VORTEX_ID}","name":"Main","modState":{{"cpmod":{{"enabled":true}}}}}}}}"#
+    );
+    write_store(
+        &store,
+        &[
+            ("persistent###mods", mods),
+            ("persistent###profiles", profiles),
+            (
+                &format!("settings###mods###installPath###{CYBERPUNK_VORTEX_ID}"),
+                "\"{USERDATA}/{GAME}/mods\"".to_string(),
+            ),
+            (
+                &format!("settings###gameMode###discovered###{CYBERPUNK_VORTEX_ID}"),
+                format!(
+                    r#"{{"path":"{}"}}"#,
+                    game_dir.to_string_lossy().replace('\\', "/")
+                ),
+            ),
+        ],
+    );
+    let inventory = GameInventory {
+        installs: vec![cyberpunk_install(&game_dir)],
+        unsupported: vec![],
+    };
+    CyberpunkFixture {
+        _lock: lock,
+        _tmp: tmp,
+        _user_data: user_data,
+        ctx,
+        inventory,
+        store,
+    }
+}
+
+#[test]
+fn a_manifest_at_the_game_root_is_found_and_its_target_subfolder_is_honoured() {
+    let f = cyberpunk_fixture();
+    let scan = vortex::scan(&f.ctx, &f.inventory, &f.store).expect("the store scans");
+    let game = &scan.games[0];
+    assert!(game.supported, "{game:?}");
+    assert_eq!(game.install.as_deref(), Some("gog:1423049311"));
+    assert!(game.manifest_found, "{game:?}");
+    assert_eq!(game.manifest_files, 1);
+    assert!(!game.needs_folder_add);
+
+    let request = VortexRequest {
+        store: f.store.clone(),
+        game: GameId::new(CYBERPUNK).unwrap(),
+        profile: "Main".into(),
+        name: None,
+        install: None,
+        add_folder: false,
+        copy_saves: false,
+    };
+    let plan = vortex::plan(&f.ctx, &f.inventory, &request).expect("the plan is made");
+    assert!(plan.manifest.found);
+    assert_eq!(plan.manifest.matched, 1);
+    assert_eq!(plan.order, vec!["cpmod"]);
+    assert!(plan.manifest.path.ends_with("vortex.deployment.json"));
 }

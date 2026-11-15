@@ -43,6 +43,7 @@ fn make_package(
 fn dummy_game(id: &str, stores: Vec<(&str, &str)>) -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new(id).unwrap(),
         extends: None,
@@ -418,6 +419,7 @@ fn spike_machine_skyrim_steam_and_gog_identification() {
     let mut builder = GameRegistry::builder();
     let skyrim_def = GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("skyrim-se").unwrap(),
         extends: None,
@@ -582,6 +584,7 @@ fn unreadable_executable_falls_back_to_store_record_and_nothing_usable_gives_uni
     let mut builder = GameRegistry::builder();
     let game = GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("test-game").unwrap(),
         extends: None,
@@ -1033,6 +1036,56 @@ fn an_ini_check_with_no_condition_is_refused() {
         .unwrap_err();
     assert!(
         matches!(err, GameRegistryError::InvalidIniCheck { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_import_id_claimed_by_two_games_is_refused() {
+    let mut first = dummy_game("import-game-a", vec![]);
+    first.import_ids.insert("vortex".into(), "shared-id".into());
+    let mut second = dummy_game("import-game-b", vec![]);
+    second
+        .import_ids
+        .insert("vortex".into(), "shared-id".into());
+    let mut builder = GameRegistry::builder();
+    builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "first".into(),
+            },
+            make_package("import-first", vec![first], vec![], vec![]),
+        )
+        .expect("the first game registers");
+    let err = builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "second".into(),
+            },
+            make_package("import-second", vec![second], vec![], vec![]),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GameRegistryError::ImportIdAlreadyClaimed { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_empty_import_id_is_refused() {
+    let mut game = dummy_game("import-empty", vec![]);
+    game.import_ids.insert("vortex".into(), " ".into());
+    let mut builder = GameRegistry::builder();
+    let err = builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            make_package("import-empty-pkg", vec![game], vec![], vec![]),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GameRegistryError::InvalidImportId { .. }),
         "{err:?}"
     );
 }

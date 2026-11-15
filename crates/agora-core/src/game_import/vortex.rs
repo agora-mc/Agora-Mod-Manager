@@ -37,13 +37,14 @@ use agora_game_api::{fold_path_case, BaseReference, GameDefinition, GameId, RelP
 use super::vortex_store::{self, VortexStore};
 use super::{
     abandon_half_made_instance, find_import_of_kind, mo2, ImportError, ImportPhase, ImportProgress,
-    PluginLinePlan, PluginPlan, Problem, RunOptions,
+    IniPlan, PluginLinePlan, PluginPlan, Problem, RunOptions, SavesPlan,
 };
 use crate::content_store::{self, ContentSource, VortexProvenance};
 use crate::ctx::Ctx;
 use crate::game_base::{BaseMode, BuildOptions, BuildOutcome};
 use crate::game_deploy;
-use crate::game_instance::{self, GameInstanceManifest};
+use crate::game_ini;
+use crate::game_instance::{self, GameInstanceManifest, SavesChoice};
 use crate::game_load_order;
 use crate::game_plugins;
 use crate::game_registry::{GameInventory, IdentifiedInstall, RuntimeResolution};
@@ -82,6 +83,12 @@ pub struct VortexProfile {
     /// Whether each mod is enabled in this profile. A mod the profile does not mention is absent
     /// here and is imported disabled.
     pub enabled: BTreeMap<String, bool>,
+    /// `features.local_game_settings`: the profile keeps its own copies of the game's INI files
+    /// (`extensions/local-gamesettings/src/index.ts:290`, feature id at `:174`).
+    pub local_settings: bool,
+    /// `features.local_saves`: the profile keeps its own saves
+    /// (`extensions/gamebryo-savegame-management/src/index.ts:645`).
+    pub local_saves: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,7 +216,16 @@ pub fn parse_state(store: &VortexStore) -> Result<VortexState, ImportError> {
                         enabled.insert(mod_id.clone(), on);
                     }
                 }
-                profiles.push(VortexProfile { id, name, enabled });
+                let features = profile.get("features").and_then(Value::as_object);
+                let local_settings = feature_on(features, "local_game_settings");
+                let local_saves = feature_on(features, "local_saves");
+                profiles.push(VortexProfile {
+                    id,
+                    name,
+                    enabled,
+                    local_settings,
+                    local_saves,
+                });
             }
         }
         profiles.sort_by(|a, b| {
@@ -308,6 +324,15 @@ fn parse_mod(mod_id: &str, object: &Map<String, Value>) -> Option<VortexMod> {
         state,
         rules,
     })
+}
+
+/// A profile feature is on only when it is the boolean `true`; any other value is off, as Vortex
+/// reads it (`getSafe(profile, ["features", id], false)`).
+fn feature_on(features: Option<&Map<String, Value>>, id: &str) -> bool {
+    features
+        .and_then(|f| get_ci(f, id))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn get_ci<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
@@ -413,19 +438,32 @@ pub struct VortexScan {
 pub struct VortexScanGame {
     /// Vortex's own game id.
     pub vortex_game: String,
-    /// The Agora game the discovered folder belongs to, when one is found.
+    /// The Agora game whose package names this Vortex id in `import_ids.vortex`.
     pub game: Option<GameId>,
     pub game_name: Option<String>,
+    /// Whether an Agora package maps this Vortex game. A supported game whose folder Agora has
+    /// not added yet is still supported; `needs_folder_add` says so.
     pub supported: bool,
-    /// Why it is not supported, in the user's words.
+    /// Why it cannot be imported yet, in the user's words.
     pub reason: Option<String>,
     pub discovered_path: Option<PathBuf>,
+    /// The Agora install id, when the game folder is already one Agora lists.
+    pub install: Option<String>,
+    /// The folder is a real install of the game, but Agora has not added it.
+    pub needs_folder_add: bool,
+    /// What checking the folder found: a real install, or why it is not one.
+    pub detection: Option<String>,
     pub staging: Option<PathBuf>,
     pub staging_error: Option<String>,
+    /// Whether the staging folder has Vortex's `__vortex_staging_folder` marker.
+    pub staging_marker: bool,
     pub mods: usize,
     pub profiles: Vec<VortexScanProfile>,
-    /// `vortex.deployment.json` in the game's mod folder, when the game folder is known.
+    /// A `vortex.deployment*.json` was found in the game's deploy folder(s).
     pub manifest_found: bool,
+    pub manifest_files: usize,
+    /// Every place the manifest was looked for, so "not found" says where.
+    pub manifest_searched: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -437,6 +475,8 @@ pub struct VortexScanProfile {
     pub mods_total: usize,
     pub plugins_txt: bool,
     pub loadorder_txt: bool,
+    pub local_settings: bool,
+    pub local_saves: bool,
 }
 
 /// Scan the store: which games and profiles an import could bring, and which games Agora cannot
@@ -451,34 +491,60 @@ pub fn scan(
     let mut games = Vec::new();
     let mut warnings = state.warnings.clone();
     for game in &state.games {
-        let matched = match_game(ctx, inventory, game);
-        let supported = matched.is_some();
-        let (game_id, game_name, reason) = match &matched {
-            Some((definition, _)) => (Some(definition.id.clone()), Some(definition.name.clone()), None),
-            None => (
-                None,
-                None,
-                Some(match &game.discovered_path {
-                    Some(path) => format!(
-                        "Vortex's game folder for {} is {}, which is not an install of a game Agora supports",
-                        game.id,
-                        path.display()
-                    ),
-                    None => format!(
-                        "Vortex never discovered a game folder for {}, so Agora cannot tell which game it is",
+        let definition = definition_for_vortex(ctx, &game.id);
+        let mut reason = None;
+        let mut install_id = None;
+        let mut needs_folder_add = false;
+        let mut detection = None;
+        let mut manifest = ManifestSearch::default();
+        let mut staging_marker = false;
+
+        if definition.is_none() {
+            reason = Some(format!(
+                "no Agora game package names Vortex's '{}' game id; add `import_ids.vortex` to the game's definition",
+                game.id
+            ));
+        } else if let Some(def) = &definition {
+            match &game.discovered_path {
+                None => {
+                    reason = Some(format!(
+                        "Vortex never discovered a game folder for {}, so Agora cannot check it",
                         game.id
-                    ),
-                }),
-            ),
-        };
-        let manifest_found = matched
-            .as_ref()
-            .and_then(|(definition, install)| {
-                manifest_path(definition, &install.discovered.location)
-            })
-            .is_some_and(|path| path.is_file());
-        let staging = game.staging.clone().ok();
-        let staging_error = game.staging.clone().err();
+                    ));
+                }
+                Some(path) => match folder_state(ctx, inventory, def, path) {
+                    FolderState::Installed(install) => {
+                        install_id = Some(install.install_id.as_str().to_string());
+                    }
+                    FolderState::NeedsAdd { why } => {
+                        needs_folder_add = true;
+                        detection = Some(why);
+                    }
+                    FolderState::NotThisGame { why } => {
+                        reason = Some(why);
+                        detection = Some("not an install Agora can import".to_string());
+                    }
+                },
+            }
+            if let Some(path) = &game.discovered_path {
+                manifest = find_manifests(def, path);
+            }
+        }
+        if let Some(damaged) = &manifest.damaged {
+            warnings.push(format!(
+                "a deployment manifest could not be read: {damaged}"
+            ));
+        }
+        if let Ok(staging) = &game.staging {
+            staging_marker = staging.join(VORTEX_STAGING_MARKER).is_file();
+            if !staging_marker && staging.is_dir() {
+                warnings.push(format!(
+                    "the staging folder {} has no {} marker; it may not be the folder Vortex uses",
+                    staging.display(),
+                    VORTEX_STAGING_MARKER
+                ));
+            }
+        }
 
         let mut profiles = Vec::new();
         for profile in &game.profiles {
@@ -495,6 +561,8 @@ pub fn scan(
                 mods_total: game.mods.len(),
                 plugins_txt,
                 loadorder_txt,
+                local_settings: profile.local_settings,
+                local_saves: profile.local_saves,
             });
         }
         if game.staging.is_err() {
@@ -505,16 +573,22 @@ pub fn scan(
         }
         games.push(VortexScanGame {
             vortex_game: game.id.clone(),
-            game: game_id,
-            game_name,
-            supported,
+            game: definition.as_ref().map(|def| def.id.clone()),
+            game_name: definition.as_ref().map(|def| def.name.clone()),
+            supported: definition.is_some(),
             reason,
             discovered_path: game.discovered_path.clone(),
-            staging,
-            staging_error,
+            install: install_id,
+            needs_folder_add,
+            detection,
+            staging: game.staging.clone().ok(),
+            staging_error: game.staging.clone().err(),
+            staging_marker,
             mods: game.mods.len(),
             profiles,
-            manifest_found,
+            manifest_found: manifest.found,
+            manifest_files: manifest.files,
+            manifest_searched: manifest.searched,
         });
     }
     Ok(VortexScan {
@@ -524,25 +598,136 @@ pub fn scan(
     })
 }
 
-/// The Agora game and install a Vortex game belongs to: the install at the folder Vortex
-/// discovered. A game folder that no install matches is not supported on this machine.
-fn match_game<'a>(
-    ctx: &Ctx,
-    inventory: &'a GameInventory,
-    game: &VortexGame,
-) -> Option<(GameDefinition, &'a IdentifiedInstall)> {
-    let discovered = game.discovered_path.as_ref()?;
-    let wanted = normalise_path(discovered);
-    let install = inventory
-        .installs
-        .iter()
-        .find(|install| normalise_path(&install.discovered.location) == wanted)?;
-    let definition = ctx.games.game(&install.game)?;
-    Some((definition.clone(), install))
+/// The Agora game whose package names this Vortex id, if any. The mapping lives in the game package
+/// (`import_ids.vortex`), so core never carries a table of game ids.
+fn definition_for_vortex<'a>(ctx: &'a Ctx, vortex_game: &str) -> Option<&'a GameDefinition> {
+    ctx.games.games().find(|definition| {
+        definition.import_ids.iter().any(|(manager, id)| {
+            manager.eq_ignore_ascii_case("vortex") && id.eq_ignore_ascii_case(vortex_game)
+        })
+    })
 }
 
-/// The folder a game's content mounts at, from its content layout. Vortex writes the manifest into
-/// that folder: `vortex.deployment.json` lives in the deploy target (`activationStore.ts:37-46`).
+enum FolderState<'a> {
+    Installed(&'a IdentifiedInstall),
+    NeedsAdd { why: String },
+    NotThisGame { why: String },
+}
+
+/// What the folder Vortex discovered is for this game. The check is the package's own: its
+/// executable must be in the folder (`GameRegistry::games_with_executable_in`).
+fn folder_state<'a>(
+    ctx: &Ctx,
+    inventory: &'a GameInventory,
+    definition: &GameDefinition,
+    path: &Path,
+) -> FolderState<'a> {
+    if !path.is_dir() {
+        return FolderState::NotThisGame {
+            why: format!(
+                "Vortex's folder for {} is {}, which is not there",
+                definition.name,
+                path.display()
+            ),
+        };
+    }
+    let in_folder = ctx.games.games_with_executable_in(path);
+    if !in_folder.iter().any(|id| id == &definition.id) {
+        let names: Vec<String> = in_folder
+            .iter()
+            .filter_map(|id| ctx.games.game(id).map(|game| game.name.clone()))
+            .collect();
+        let executable = definition
+            .version_sources
+            .iter()
+            .find_map(|source| match source {
+                agora_game_api::VersionSource::Executable { path } => Some(path.as_str()),
+                _ => None,
+            })
+            .unwrap_or("its executable");
+        return FolderState::NotThisGame {
+            why: if names.is_empty() {
+                format!(
+                    "{} does not hold {} ({}), so Agora cannot import it as {}",
+                    path.display(),
+                    executable,
+                    definition.name,
+                    definition.name
+                )
+            } else {
+                format!(
+                    "{} holds {}, not {}; Vortex's folder and the game do not match",
+                    path.display(),
+                    names.join(", "),
+                    definition.name
+                )
+            },
+        };
+    }
+    if let Some(install) = inventory.installs.iter().find(|install| {
+        install.game == definition.id
+            && normalise_path(&install.discovered.location) == normalise_path(path)
+    }) {
+        return FolderState::Installed(install);
+    }
+    FolderState::NeedsAdd {
+        why: format!(
+            "{} is a real {} install, but Agora has not added it; run `agora games folder add \"{}\"`, or import with --add-folder",
+            path.display(),
+            definition.name,
+            path.display()
+        ),
+    }
+}
+
+/// Add Vortex's game folder to Agora when the request asks for it, then read the install list
+/// again. Otherwise the inventory is passed through unchanged.
+pub fn prepare_inventory(
+    ctx: &Ctx,
+    inventory: &GameInventory,
+    request: &VortexRequest,
+) -> Result<GameInventory, ImportError> {
+    if !request.add_folder {
+        return Ok(inventory.clone());
+    }
+    let state = read_state(&request.store)?;
+    let (definition, game) = state
+        .games
+        .iter()
+        .find_map(|game| {
+            let definition = definition_for_vortex(ctx, &game.id)?;
+            (definition.id == request.game).then_some((definition, game))
+        })
+        .ok_or_else(|| ImportError::NoVortexGame(request.game.as_str().to_string()))?;
+    let Some(path) = &game.discovered_path else {
+        return Err(ImportError::VortexFolderMissing {
+            game: definition.name.clone(),
+        });
+    };
+    match crate::game_discovery::custom_folders::add_folder(
+        &ctx.paths,
+        &ctx.games,
+        &path.to_string_lossy(),
+    ) {
+        Ok(_) => {}
+        Err(error) => {
+            let already = matches!(
+                &error,
+                crate::error::LauncherError::Generic { code, .. }
+                    if code == crate::game_discovery::custom_folders::ERR_FOLDER_DUPLICATE
+                        || code == crate::game_discovery::custom_folders::ERR_FOLDER_INSIDE_INSTALL
+            );
+            if !already {
+                return Err(ImportError::FolderAdd(error.to_string()));
+            }
+        }
+    }
+    Ok(crate::game_registry::installed_games(ctx))
+}
+
+/// The folder a game's content mounts at, from its content layout. Vortex writes the default
+/// manifest into the deploy target (`..._util_activationStore.ts:37-46`): the game root when the
+/// layout has no data path (Cyberpunk), and `Data` for the Creation Engine games.
 fn data_mount(def: &GameDefinition) -> String {
     def.content_layout
         .as_ref()
@@ -550,15 +735,96 @@ fn data_mount(def: &GameDefinition) -> String {
         .unwrap_or_else(|| "Data".to_string())
 }
 
-fn manifest_path(def: &GameDefinition, install: &Path) -> Option<PathBuf> {
-    let mount = data_mount(def);
-    let folder = if mount.is_empty() {
-        install.to_path_buf()
-    } else {
-        install.join(&mount)
-    };
-    Some(folder.join("vortex.deployment.json"))
+/// The `IDeployedFile.target` subfolder: where a file was placed under the deploy target
+/// (`deployedFilePath.ts` joins `target`, then `relPath`).
+fn join_target(target: Option<&str>, rel_path: &str) -> String {
+    match target.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(target) => format!(
+            "{}/{}",
+            target.replace('\\', "/").trim_end_matches('/'),
+            rel_path
+        ),
+        None => rel_path.to_string(),
+    }
 }
+
+/// The folders Vortex may have deployed into for this game: the game root, and its data mount.
+fn manifest_folders(def: &GameDefinition, install: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![install.to_path_buf()];
+    let mount = data_mount(def);
+    if !mount.is_empty() {
+        roots.push(install.join(&mount));
+    }
+    roots
+}
+
+/// The candidate manifest files in one folder: the default `vortex.deployment.json` and any
+/// `vortex.deployment.<mod type>.json` (`..._util_activationStore.ts:37-46`).
+fn manifest_files_in(folder: &Path) -> Vec<PathBuf> {
+    // The default is always a candidate, found or not, so "not found" can say where it looked.
+    let mut files = vec![folder.join("vortex.deployment.json")];
+    if let Ok(entries) = std::fs::read_dir(folder) {
+        let mut typed: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            let lower = name.to_ascii_lowercase();
+                            // `vortex.deployment.<type>.json`, not the default itself (which also
+                            // starts and ends the same way).
+                            lower != "vortex.deployment.json"
+                                && lower.starts_with("vortex.deployment.")
+                                && lower.ends_with(".json")
+                        })
+            })
+            .collect();
+        typed.sort();
+        files.extend(typed);
+    }
+    files
+}
+
+#[derive(Debug, Default)]
+struct ManifestSearch {
+    found: bool,
+    files: usize,
+    entries: Vec<ManifestEntry>,
+    searched: Vec<PathBuf>,
+    damaged: Option<String>,
+}
+
+/// Read every deployment manifest the game's deploy folders hold. A missing one is not an error
+/// (`found: false`), and `searched` says where we looked.
+fn find_manifests(def: &GameDefinition, install: &Path) -> ManifestSearch {
+    let mut search = ManifestSearch::default();
+    for folder in manifest_folders(def, install) {
+        let candidates = manifest_files_in(&folder);
+        for path in candidates {
+            search.searched.push(path.clone());
+            if !path.is_file() {
+                continue;
+            }
+            search.found = true;
+            let read = read_manifest(&path);
+            search.files += read.files;
+            if let Some(damaged) = read.damaged {
+                if search.damaged.is_none() {
+                    search.damaged = Some(format!("{}: {damaged}", path.display()));
+                }
+            }
+            search.entries.extend(read.entries);
+        }
+    }
+    search.searched.sort();
+    search.searched.dedup();
+    search
+}
+
+const VORTEX_STAGING_MARKER: &str = "__vortex_staging_folder";
 
 fn normalise_path(path: &Path) -> String {
     fold_path_case(
@@ -573,12 +839,134 @@ fn normalise_path(path: &Path) -> String {
 /// Vortex's per-profile data lives under `<userData>/<game>/profiles/<profileId>`. Absent files are
 /// reported, never treated as an empty plugin list.
 fn plugin_files(store_source: &Path, game_id: &str, profile_id: &str) -> (PathBuf, PathBuf) {
+    let dir = profile_folder(store_source, game_id, profile_id);
+    (dir.join("plugins.txt"), dir.join("loadorder.txt"))
+}
+
+/// A profile's own folder: `<userData>/<gameId>/profiles/<profileId>/`
+/// (`extensions/local-gamesettings/src/util/gameSupport.ts:83-85`). It holds the plugin files,
+/// empty userlist, and the INIs a profile with `local_game_settings` keeps.
+fn profile_folder(store_source: &Path, game_id: &str, profile_id: &str) -> PathBuf {
     let user_data = store_source
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    let dir = user_data.join(game_id).join("profiles").join(profile_id);
-    (dir.join("plugins.txt"), dir.join("loadorder.txt"))
+    user_data.join(game_id).join("profiles").join(profile_id)
+}
+
+/// A profile's own INI copies, as the game defines its per-user INI files. Vortex names the files
+/// by their base name in the profile folder (`copyGameSettings` at
+/// `extensions/local-gamesettings/src/index.ts:17-19`), and only keeps them when the profile has
+/// `local_game_settings` (`:290`).
+fn plan_inis(
+    def: &GameDefinition,
+    store: &StoreId,
+    profile_dir: &Path,
+    local: bool,
+    warnings: &mut Vec<String>,
+) -> Vec<IniPlan> {
+    if !local {
+        return Vec::new();
+    }
+    if !profile_dir.is_dir() {
+        warnings.push(format!(
+            "the profile keeps its own game settings, but its folder is not there: {}",
+            profile_dir.display()
+        ));
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for mapping in def.user_files.iter().filter(|m| m.applies_to_store(store)) {
+        let instance_path = mapping.instance_path.as_str();
+        if !instance_path.to_ascii_lowercase().ends_with(".ini") {
+            continue;
+        }
+        let name = instance_path.rsplit('/').next().unwrap_or(instance_path);
+        let from = profile_dir.join(name);
+        if from.is_file() {
+            out.push(IniPlan {
+                name: name.to_string(),
+                instance_path: instance_path.to_string(),
+                from,
+            });
+        } else {
+            warnings.push(format!(
+                "the profile's own {name} was not in {}; that INI is not copied",
+                profile_dir.display()
+            ));
+        }
+    }
+    out
+}
+
+/// A profile's own saves. Vortex keeps them under the game's shared save folder, in a folder named
+/// after the profile id (`extensions/gamebryo-savegame-management/src/util/profileSavePath.ts:8-20`),
+/// not in the profile folder. Only the count is read here; the files are copied with --copy-saves.
+fn plan_saves(
+    def: &GameDefinition,
+    store: &StoreId,
+    profile_id: &str,
+    local: bool,
+) -> Result<SavesPlan, ImportError> {
+    if !local {
+        return Ok(SavesPlan {
+            local: false,
+            files: 0,
+            bytes: 0,
+            from: None,
+            to: None,
+            note: "the profile shares the game's saves".into(),
+        });
+    }
+    let Some(rule) = def
+        .save_location
+        .iter()
+        .find(|rule| rule.applies_to_store(store))
+    else {
+        return Ok(SavesPlan {
+            local: true,
+            files: 0,
+            bytes: 0,
+            from: None,
+            to: None,
+            note: "the game has no save-folder setting for this store, so the saves stay shared"
+                .into(),
+        });
+    };
+    let base = crate::game_saves::shared_folder(rule).map_err(|error| ImportError::Unreadable {
+        path: PathBuf::new(),
+        reason: format!("the game's save folder cannot be resolved: {error}"),
+    })?;
+    let from = base.join(profile_id);
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    match std::fs::read_dir(&from) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        files += 1;
+                        bytes += meta.len();
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ImportError::Unreadable {
+                path: from,
+                reason: format!("the profile's own saves cannot be read: {error}"),
+            })
+        }
+    }
+    Ok(SavesPlan {
+        local: true,
+        files,
+        bytes,
+        from: Some(from),
+        to: None,
+        note: String::new(),
+    })
 }
 
 fn plugin_files_found(
@@ -608,6 +996,10 @@ pub struct VortexRequest {
     /// The install to import onto, by install id. `None` uses the install at the game folder
     /// Vortex discovered.
     pub install: Option<String>,
+    /// Add Vortex's game folder to Agora (the `games folder add` path) before importing.
+    pub add_folder: bool,
+    /// Copy the profile's own saves into the instance. INIs are copied with their profile.
+    pub copy_saves: bool,
 }
 
 /// A mod folder the profile lists, and what reading it found.
@@ -640,6 +1032,7 @@ pub struct PlannedMod {
 /// What the deployment manifest says, as far as the import can use it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestPlan {
+    /// The first place a manifest was found, or the first place looked when none was.
     pub path: PathBuf,
     pub found: bool,
     /// Entries the manifest lists.
@@ -648,6 +1041,8 @@ pub struct ManifestPlan {
     pub matched: usize,
     /// Why the manifest cannot be used, when it exists but cannot be read.
     pub damaged: Option<String>,
+    /// Every file looked for, so a missing manifest says where.
+    pub searched: Vec<PathBuf>,
 }
 
 /// One file the manifest and Vortex's ordering rules name different winners for.
@@ -687,6 +1082,12 @@ pub struct VortexPlan {
     pub order: Vec<String>,
     pub disagreements: Vec<OrderDisagreement>,
     pub plugins: PluginPlan,
+    /// The profile keeps its own copies of the game's INI files.
+    pub local_settings: bool,
+    pub inis: Vec<IniPlan>,
+    /// The profile keeps its own saves.
+    pub local_saves: bool,
+    pub saves: SavesPlan,
     pub problems: Vec<Problem>,
     pub warnings: Vec<String>,
 }
@@ -731,27 +1132,33 @@ pub fn plan(
     let mods = plan_mods(game, profile, &staging, &mut problems);
     let enabled = mods.iter().filter(|m| m.enabled).count();
 
-    let manifest_location = manifest_path(&definition, &install.discovered.location);
-    let manifest_read = manifest_location
-        .as_deref()
-        .map(read_manifest)
-        .unwrap_or_default();
+    let manifest_search = find_manifests(&definition, &install.discovered.location);
     let mut manifest = ManifestPlan {
-        path: manifest_location.unwrap_or_default(),
-        found: manifest_read.found,
-        files: manifest_read.files,
+        path: manifest_search
+            .searched
+            .first()
+            .cloned()
+            .unwrap_or_else(|| install.discovered.location.join("vortex.deployment.json")),
+        found: manifest_search.found,
+        files: manifest_search.files,
         matched: 0,
-        damaged: manifest_read.damaged.clone(),
+        damaged: manifest_search.damaged.clone(),
+        searched: manifest_search.searched.clone(),
     };
     if let Some(reason) = &manifest.damaged {
         warnings.push(format!(
-            "the deployment manifest could not be used, so the layer order comes from Vortex's rules alone: {reason}"
+            "a deployment manifest could not be used, so the layer order may come from Vortex's rules alone: {reason}"
         ));
     }
     if !manifest.found {
+        let looked: Vec<String> = manifest
+            .searched
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
         warnings.push(format!(
-            "no deployment manifest at {}; the layer order comes from Vortex's rules alone. If Vortex has not deployed this game yet, deploy it once before importing so every file's supplier is known",
-            manifest.path.display()
+            "no deployment manifest was found (looked in {}); the layer order comes from Vortex's rules alone. A purged Vortex deployment is the usual reason: deploy once in Vortex before importing if you want every file's supplier known",
+            looked.join(", ")
         ));
     }
 
@@ -760,7 +1167,7 @@ pub fn plan(
         .map(|m| (m.mod_id.clone(), m.file_set.clone()))
         .collect();
     let (manifest_winners, owners, unmatched) =
-        match_manifest(game, &manifest_read.entries, &folded_sets);
+        match_manifest(game, &manifest_search.entries, &folded_sets);
     manifest.matched = manifest_winners.len();
     if unmatched > 0 {
         warnings.push(format!(
@@ -794,6 +1201,20 @@ pub fn plan(
         &base_data,
         &mut warnings,
     );
+    let profile_dir = profile_folder(&state.source, &game.id, &profile.id);
+    let inis = plan_inis(
+        &definition,
+        &install.discovered.store,
+        &profile_dir,
+        profile.local_settings,
+        &mut warnings,
+    );
+    let saves = plan_saves(
+        &definition,
+        &install.discovered.store,
+        &profile.id,
+        profile.local_saves,
+    )?;
 
     if request.name.is_none() {
         if let Some(instance) = find_import_of_kind(ctx, "vortex", &request.store, &profile.name)? {
@@ -827,6 +1248,10 @@ pub fn plan(
         order,
         disagreements,
         plugins,
+        local_settings: profile.local_settings,
+        inis,
+        local_saves: profile.local_saves,
+        saves,
         problems,
         warnings,
     })
@@ -838,17 +1263,13 @@ fn match_for_request<'a>(
     state: &'a VortexState,
     request: &VortexRequest,
 ) -> Result<(&'a VortexGame, GameDefinition, &'a IdentifiedInstall), ImportError> {
-    let matched: Vec<(&VortexGame, GameDefinition, &IdentifiedInstall)> = state
+    let (game, definition) = state
         .games
         .iter()
-        .filter_map(|game| {
-            match_game(ctx, inventory, game)
-                .map(|(definition, install)| (game, definition, install))
+        .find_map(|game| {
+            let definition = definition_for_vortex(ctx, &game.id)?;
+            (definition.id == request.game).then_some((game, definition))
         })
-        .collect();
-    let (game, definition, install) = matched
-        .into_iter()
-        .find(|(_, definition, _)| definition.id == request.game)
         .ok_or_else(|| ImportError::NoVortexGame(request.game.as_str().to_string()))?;
 
     let install = match request.install.as_deref() {
@@ -872,7 +1293,30 @@ fn match_for_request<'a>(
             }
             found
         }
-        None => install,
+        None => {
+            let path =
+                game.discovered_path
+                    .as_ref()
+                    .ok_or_else(|| ImportError::VortexFolderMissing {
+                        game: definition.name.clone(),
+                    })?;
+            match folder_state(ctx, inventory, definition, path) {
+                FolderState::Installed(install) => install,
+                FolderState::NeedsAdd { .. } => {
+                    return Err(ImportError::VortexFolderNotAdded {
+                        game: definition.name.clone(),
+                        path: path.clone(),
+                    })
+                }
+                FolderState::NotThisGame { why } => {
+                    return Err(ImportError::VortexFolderNotGame {
+                        game: definition.name.clone(),
+                        path: path.clone(),
+                        reason: why,
+                    })
+                }
+            }
+        }
     };
     if let RuntimeResolution::Unidentified { reasons } = &install.runtime {
         return Err(ImportError::Unidentified {
@@ -880,7 +1324,7 @@ fn match_for_request<'a>(
             reasons: reasons.join("; "),
         });
     }
-    Ok((game, definition, install))
+    Ok((game, definition.clone(), install))
 }
 
 fn plan_mods(
@@ -998,7 +1442,6 @@ fn provenance(entry: &VortexMod) -> VortexProvenance {
 
 #[derive(Debug, Default)]
 struct ManifestRead {
-    found: bool,
     entries: Vec<ManifestEntry>,
     files: usize,
     damaged: Option<String>,
@@ -1008,6 +1451,24 @@ struct ManifestRead {
 struct ManifestEntry {
     rel_path: String,
     source: Option<String>,
+    /// The mod's subfolder under the deploy target, when mods are not merged
+    /// (`IDeploymentMethod.ts:59-64`).
+    target: Option<String>,
+}
+
+impl ManifestEntry {
+    /// The paths this entry could name inside a mod: the deployed path (`target/relPath`) and the
+    /// plain `relPath` (some mods already carry the target folder).
+    fn candidates(&self) -> Vec<String> {
+        let rel = self.rel_path.trim_matches('/').to_string();
+        let with_target = join_target(self.target.as_deref(), &rel);
+        let mut out = vec![fold_path_case(&with_target)];
+        let plain = fold_path_case(&rel);
+        if !out.contains(&plain) {
+            out.push(plain);
+        }
+        out
+    }
 }
 
 /// Read `vortex.deployment.json`. A missing file is not an error (`found: false`); one that cannot
@@ -1020,7 +1481,6 @@ fn read_manifest(path: &Path) -> ManifestRead {
         }
         Err(error) => {
             return ManifestRead {
-                found: true,
                 damaged: Some(error.to_string()),
                 ..ManifestRead::default()
             }
@@ -1030,7 +1490,6 @@ fn read_manifest(path: &Path) -> ManifestRead {
         Ok(value) => value,
         Err(error) => {
             return ManifestRead {
-                found: true,
                 damaged: Some(format!("it is not JSON: {error}")),
                 ..ManifestRead::default()
             }
@@ -1038,7 +1497,6 @@ fn read_manifest(path: &Path) -> ManifestRead {
     };
     let Some(files) = value.get("files").and_then(Value::as_array) else {
         return ManifestRead {
-            found: true,
             damaged: Some("it has no 'files' list".into()),
             ..ManifestRead::default()
         };
@@ -1057,10 +1515,13 @@ fn read_manifest(path: &Path) -> ManifestRead {
                 .get("source")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            target: file
+                .get("target")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         });
     }
     ManifestRead {
-        found: true,
         files: entries.len(),
         entries,
         damaged: None,
@@ -1092,7 +1553,6 @@ fn match_manifest(
     let mut winners = BTreeMap::new();
     let mut unmatched = 0usize;
     for entry in entries {
-        let rel = fold_path_case(entry.rel_path.trim_matches('/'));
         let Some(source) = entry.source.as_deref() else {
             unmatched += 1;
             continue;
@@ -1101,10 +1561,14 @@ fn match_manifest(
             unmatched += 1;
             continue;
         };
-        if !mod_sets.get(winner).is_some_and(|set| set.contains(&rel)) {
+        let Some(set) = mod_sets.get(winner) else {
             unmatched += 1;
             continue;
-        }
+        };
+        let Some(rel) = entry.candidates().into_iter().find(|rel| set.contains(rel)) else {
+            unmatched += 1;
+            continue;
+        };
         // A file has one supplier, and the manifest is the deployed state.
         winners.insert(rel, winner.clone());
     }
@@ -1456,6 +1920,11 @@ pub struct VortexRunReport {
     pub duplicates: Vec<String>,
     pub plugins_written: Option<usize>,
     pub plugin_findings: Vec<String>,
+    /// The profile's own INI files copied into the instance.
+    pub inis_copied: Vec<String>,
+    pub saves_copied: usize,
+    pub saves_skipped_existing: usize,
+    pub saves_folder: Option<PathBuf>,
     pub next_steps: Vec<String>,
 }
 
@@ -1494,6 +1963,10 @@ pub fn run(
         duplicates: Vec::new(),
         plugins_written: None,
         plugin_findings: Vec::new(),
+        inis_copied: Vec::new(),
+        saves_copied: 0,
+        saves_skipped_existing: 0,
+        saves_folder: None,
         next_steps: Vec::new(),
     };
 
@@ -1654,6 +2127,61 @@ pub fn run(
                     .split("; ")
                     .map(str::to_string)
                     .collect();
+            }
+        }
+
+        // The profile's own INIs, when it keeps local game settings.
+        for ini in &plan.inis {
+            let bytes = std::fs::read(&ini.from)?;
+            let dest = game_ini::join_rel(
+                &ctx.paths
+                    .instance_dir(&instance_id)
+                    .map_err(|e| ImportError::Other(e.to_string()))?,
+                &ini.instance_path,
+            );
+            game_ini::write_atomic(&dest, &bytes)?;
+            report.inis_copied.push(ini.name.clone());
+        }
+
+        // The profile's own saves: the instance uses its own, and --copy-saves copies the files.
+        if plan.local_saves {
+            if let Some(rule) = crate::game_saves::rule_for(&def, &install.discovered.store) {
+                crate::game_saves::set_choice_inner(
+                    ctx,
+                    &instance_id,
+                    &def,
+                    SavesChoice::Own,
+                    request.copy_saves,
+                )?;
+                let folder = crate::game_saves::own_folder(rule, &instance_id)?;
+                report.saves_folder = Some(folder.clone());
+                if request.copy_saves {
+                    if let Some(from) = &plan.saves.from {
+                        for entry in std::fs::read_dir(from)?.flatten() {
+                            if !entry.path().is_file() {
+                                continue;
+                            }
+                            let dest = folder.join(entry.file_name());
+                            if dest.exists() {
+                                report.saves_skipped_existing += 1;
+                                continue;
+                            }
+                            std::fs::copy(entry.path(), &dest)?;
+                            report.saves_copied += 1;
+                        }
+                    }
+                } else if plan.saves.files > 0 {
+                    report.next_steps.push(format!(
+                        "{} save file(s) were not copied (they are under Documents, which needs --copy-saves). To copy them by hand, copy the files in {} into {}",
+                        plan.saves.files,
+                        plan.saves
+                            .from
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        folder.display()
+                    ));
+                }
             }
         }
         Ok(())

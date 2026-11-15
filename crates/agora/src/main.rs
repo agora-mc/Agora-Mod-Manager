@@ -568,6 +568,13 @@ enum ImportCmd {
         /// Vortex discovered.
         #[arg(long, value_name = "INSTALL_ID")]
         install: Option<String>,
+        /// Add Vortex's game folder to Agora first (the `games folder add` path), when it is a
+        /// real install Agora does not know yet.
+        #[arg(long)]
+        add_folder: bool,
+        /// Copy the profile's own saves into the instance's own save folder under Documents.
+        #[arg(long)]
+        copy_saves: bool,
     },
 }
 
@@ -9808,6 +9815,8 @@ fn run_games_import(
             name,
             dry_run,
             install,
+            add_folder,
+            copy_saves,
         } => {
             let store = resolve_vortex_store(store)?;
             let inventory = agora_core::game_registry::installed_games(ctx);
@@ -9838,7 +9847,11 @@ fn run_games_import(
                 profile,
                 name,
                 install,
+                add_folder,
+                copy_saves,
             };
+            let inventory =
+                agora_core::game_import::vortex::prepare_inventory(ctx, &inventory, &request)?;
             if dry_run {
                 let plan = agora_core::game_import::vortex::plan(ctx, &inventory, &request)?;
                 if json {
@@ -10128,14 +10141,42 @@ fn print_vortex_scan(report: &agora_core::game_import::vortex::VortexScan) {
         if let Some(reason) = &game.reason {
             println!("  why not: {reason}");
         }
+        if let Some(detection) = &game.detection {
+            println!("  detection: {detection}");
+        }
+        if game.needs_folder_add {
+            println!(
+                "  add it first with `agora games folder add \"{}\"`, or import with --add-folder",
+                game.discovered_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
         println!(
             "  deployment manifest: {}",
             if game.manifest_found {
-                "found"
+                format!("{} file(s)", game.manifest_files)
             } else {
-                "not found"
+                let looked: Vec<String> = game
+                    .manifest_searched
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                format!("not found (looked in {})", looked.join(", "))
             }
         );
+        if let Some(staging) = &game.staging {
+            println!(
+                "  staging marker: {}",
+                if game.staging_marker {
+                    "present"
+                } else {
+                    "__vortex_staging_folder not found"
+                }
+            );
+            let _ = staging;
+        }
         if game.profiles.is_empty() {
             println!("  profiles: none");
         }
@@ -10146,9 +10187,15 @@ fn print_vortex_scan(report: &agora_core::game_import::vortex::VortexScan) {
                 (false, true) => "loadorder.txt",
                 (false, false) => "no plugin list",
             };
+            let own = match (profile.local_settings, profile.local_saves) {
+                (true, true) => "own INIs and saves",
+                (true, false) => "own INIs",
+                (false, true) => "own saves",
+                (false, false) => "shared settings and saves",
+            };
             println!(
-                "  profile \"{}\": {} enabled of {} mods, {}",
-                profile.name, profile.mods_enabled, profile.mods_total, plugin_note
+                "  profile \"{}\": {} enabled of {} mods, {}, {}",
+                profile.name, profile.mods_enabled, profile.mods_total, plugin_note, own
             );
         }
     }
@@ -10215,6 +10262,18 @@ fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
     if let Some(reason) = &plan.manifest.damaged {
         println!("    cannot be used: {reason}");
     }
+    if !plan.manifest.found {
+        let looked: Vec<String> = plan
+            .manifest
+            .searched
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        println!(
+            "    the order comes from Vortex's rules alone; looked in {}",
+            looked.join(", ")
+        );
+    }
     let names: Vec<String> = plan
         .order
         .iter()
@@ -10251,6 +10310,31 @@ fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
     }
     for note in &plan.plugins.notes {
         println!("  note: {note}");
+    }
+    if plan.local_settings {
+        let names: Vec<&str> = plan.inis.iter().map(|ini| ini.name.as_str()).collect();
+        println!(
+            "  INIs (the profile's own): {}",
+            if names.is_empty() {
+                "none found in its folder".to_string()
+            } else {
+                names.join(", ")
+            }
+        );
+    } else {
+        println!("  INIs: shared with the game");
+    }
+    if plan.local_saves {
+        println!(
+            "  saves (the profile's own): {} file(s), {}; copied only with --copy-saves",
+            plan.saves.files,
+            human_gb(plan.saves.bytes)
+        );
+        if !plan.saves.note.is_empty() {
+            println!("    {}", plan.saves.note);
+        }
+    } else {
+        println!("  saves: shared with the game");
     }
     for problem in &plan.problems {
         println!("  problem: {}: {}", problem.entry, problem.reason);
@@ -10293,6 +10377,15 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
     }
     for finding in &report.plugin_findings {
         println!("  plugin order: {finding}");
+    }
+    if !report.inis_copied.is_empty() {
+        println!("  INIs copied: {}", report.inis_copied.join(", "));
+    }
+    if report.saves_copied > 0 || report.saves_skipped_existing > 0 {
+        println!(
+            "  saves copied: {} ({} already there, left alone)",
+            report.saves_copied, report.saves_skipped_existing
+        );
     }
     for step in &report.next_steps {
         println!("  next: {step}");

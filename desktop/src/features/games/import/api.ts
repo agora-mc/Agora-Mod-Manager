@@ -209,6 +209,8 @@ export interface VortexScanProfile {
   modsTotal: number;
   pluginsTxt: boolean;
   loadorderTxt: boolean;
+  localSettings: boolean;
+  localSaves: boolean;
 }
 
 export interface VortexScanGame {
@@ -218,11 +220,17 @@ export interface VortexScanGame {
   supported: boolean;
   reason: string | null;
   discoveredPath: string | null;
+  install: string | null;
+  needsFolderAdd: boolean;
+  detection: string | null;
   staging: string | null;
   stagingError: string | null;
+  stagingMarker: boolean;
   mods: number;
   profiles: VortexScanProfile[];
   manifestFound: boolean;
+  manifestFiles: number;
+  manifestSearched: string[];
 }
 
 export interface VortexScanReply {
@@ -257,10 +265,21 @@ export interface VortexPlanDto {
   modsDisabled: number;
   files: number;
   bytes: number;
-  manifest: { path: string; found: boolean; files: number; matched: number; damaged: string | null };
+  manifest: {
+    path: string;
+    found: boolean;
+    files: number;
+    matched: number;
+    damaged: string | null;
+    searched: string[];
+  };
   order: string[];
   disagreements: { file: string; manifestSupplied: string; rulesSupply: string }[];
   plugins: { kept: boolean; listed: number; active: number; notes: string[] };
+  localSettings: boolean;
+  inis: string[];
+  localSaves: boolean;
+  saves: { local: boolean; files: number; bytes: number; note: string };
   problems: Problem[];
   warnings: string[];
 }
@@ -274,6 +293,10 @@ export interface VortexRunDto {
   duplicates: string[];
   pluginsWritten: number | null;
   pluginFindings: string[];
+  inisCopied: string[];
+  savesCopied: number;
+  savesSkippedExisting: number;
+  savesFolder: string | null;
   nextSteps: string[];
 }
 
@@ -289,6 +312,8 @@ export interface VortexImportRequest {
   name: string | null;
   dryRun: boolean;
   install: string | null;
+  addFolder: boolean;
+  copySaves: boolean;
 }
 
 function isVortexScanGame(value: unknown): value is VortexScanGame {
