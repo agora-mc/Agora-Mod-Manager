@@ -130,6 +130,12 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+      # The Linux game-view tests (MASTER_SPEC §26.5) need unprivileged user namespaces.
+      # Ubuntu 24.04 restricts them through AppArmor; allow them instead of marking the
+      # host restricted, so the tests run for real and fail with the reason if this fails.
+      - name: Allow unprivileged user namespaces (Linux view)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Core unit and integration tests
         run: cargo test -p agora-core --lib --tests
       - name: Game contract and Minecraft package tests
