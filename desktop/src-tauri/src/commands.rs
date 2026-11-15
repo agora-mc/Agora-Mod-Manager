@@ -2143,6 +2143,22 @@ pub async fn investigate_instance_evidence(
         })?;
         let evidence = found.collected();
         let answer = latest_analyzed_answer(&ctx, &instance_id)?;
+        let conn = agora_core::db::local_state_connection(&ctx.paths.local_state_db()).map_err(
+            |error| LauncherError::Generic {
+                code: "ERR_LOCAL_STATE_FAILED".into(),
+                message: error.to_string(),
+            },
+        )?;
+        let session_verdict = agora_core::session_ledger::list(&conn, &instance_id, 1)
+            .map_err(|error| LauncherError::Generic {
+                code: "ERR_SESSION_LEDGER".into(),
+                message: error.to_string(),
+            })?
+            .into_iter()
+            .next()
+            .and_then(|record| record.verdict);
+        let verdict =
+            session_verdict.or_else(|| answer.as_ref().map(|answer| answer.verdict.clone()));
         let view = crash_instance_view(&ctx, &instance_id)?;
         let suspects = answer
             .as_ref()
@@ -2152,6 +2168,7 @@ pub async fn investigate_instance_evidence(
             failure_category: evidence.failure_category.clone(),
             evidence,
             suspects,
+            verdict,
         })
     })
     .await

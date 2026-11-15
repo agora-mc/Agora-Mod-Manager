@@ -1346,6 +1346,14 @@ export interface CrashEvidenceSource {
   text: string;
 }
 
+export type CrashInvestigationVerdict =
+  | { kind: 'crashed'; how?: string }
+  | { kind: 'failed_to_start' }
+  | { kind: 'froze' }
+  | { kind: 'stopped' }
+  | { kind: 'normal' }
+  | { kind: 'closed_unknown' };
+
 export interface CrashInvestigation {
   evidence: {
     sources: CrashEvidenceSource[];
@@ -1357,6 +1365,9 @@ export interface CrashInvestigation {
   };
   suspects: SuspectScore[];
   failure_category: 'CrashReport' | 'Oom' | 'JvmFatal' | 'NoEvidence';
+  /** The live verdict for the newest session. A crash the live path stored stays a crash here,
+   * even when its only evidence is a supplementary log (a JVM that refused to start, say). */
+  verdict?: CrashInvestigationVerdict | null;
 }
 
 export const investigateInstanceEvidence = (instanceId: string) =>

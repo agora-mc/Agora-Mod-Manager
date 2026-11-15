@@ -263,6 +263,11 @@ pub struct CrashInvestigation {
     pub evidence: crate::crash_evidence::CollectedEvidence,
     pub suspects: Vec<SuspectScore>,
     pub failure_category: crate::crash_evidence::FailureCategory,
+    /// The live verdict for the newest session, when one is recorded. The board shows a crash
+    /// from this verdict even when the only evidence is a supplementary log, such as the output of
+    /// a JVM that refused to start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<agora_game_api::crash::SessionVerdict>,
 }
 
 // ---------------------------------------------------------------------------
