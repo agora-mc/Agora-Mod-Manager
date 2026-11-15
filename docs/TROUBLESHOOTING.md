@@ -88,12 +88,13 @@ agora games instance list
 agora games instance check <INSTANCE>
 agora games instance plugins <INSTANCE>
 agora games instance plugins check <INSTANCE>
+agora games instance plugins conflicts <INSTANCE>
 agora games instance tools list <INSTANCE>
 ```
 
-`games instance check` names a framework built for another game version, a plugin load order a launch would refuse, and stale or unknown tool output, and says which command rebuilds the tool. `games instance plugins check` prints the load-order findings. `games instance tools list` shows each tool's output state.
+`games instance check` names a framework built for another game version, a plugin load order a launch would refuse, and stale or unknown tool output, and says which command rebuilds the tool. `games instance plugins check` prints the load-order findings. `games instance plugins conflicts` shows pairs of plugins that change the same record, and the command to keep the current order (`--keep`) or let the other one win (`--let-win`); a rule added there survives a later sort. `games instance tools list` shows each tool's output state.
 
-`agora log` and `agora crash` cover Minecraft. For another game, use the game's own log or crash file and the findings from `games instance check`.
+`agora log` shares Minecraft logs and crash reports. `agora crash` works for any game whose plugin brings a crash pack: `agora --json crash last <INSTANCE>` reads the answer Agora stored, and `agora crash analyze <FILE> --instance <INSTANCE>` diagnoses a crash file you have. `crash investigate` collects recent evidence automatically for Minecraft; for another game, name the file with `--file`.
 
 `agora plugin log <ID>` reads a plugin's own log. Plugin packages are under `<root>/plugins/installed/`, their logs under `<root>/plugins/logs/`, and a plugin's saved data is in `local_state.db`; `agora paths` prints the root. A failed install leaves the previous package in place and names the reason.
 
@@ -146,11 +147,13 @@ Check the plan for the target instance, the selected files, dependencies, what g
 ```bash
 agora crash list <INSTANCE>
 agora crash inspect <INSTANCE> <FILE>
+agora --json crash last <INSTANCE>
 agora crash investigate <INSTANCE>
 agora crash investigate <INSTANCE> --file extra-log.txt
+agora --json crash analyze <FILE> --instance <INSTANCE>
 ```
 
-`crash investigate` ranks suspects from recent logs. If none stands out, bisect:
+`crash last` prints the newest answer Agora stored for the instance; `crash analyze` reads a crash file or log from any supported game, and `--instance` lets it attribute names to installed mods. `crash investigate` ranks suspects from recent logs. An answer says how sure it is ("possible", "likely" or "very likely") and names the plugin behind each finding; "could not check" means the evidence was unreadable, not clean. If no mod stands out, bisect:
 
 ```bash
 agora bisect start <INSTANCE>

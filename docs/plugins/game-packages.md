@@ -340,13 +340,22 @@ A package's `frameworks` and `tools` come along from its parents the same way. A
 
 Each behaviour runs in the plugin that wrote it. A hook inherited from the base runs with the base plugin's entrypoint and grants; a hook the child overrides runs with the child's.
 
+## Crash evidence
+
+A game tells the Crash Doctor where its logs and crash files are with `log_paths` and `crash_paths`,
+and which exits are a normal quit with `session.normal_exit_codes`. The analysis itself comes from
+**crash packs**: JSON files contributed under `contributions.crashPacks` (the `crash:contribute`
+capability), with sources, parsers, inspectors, ref maps, roles, save risk and rules. A game plugin
+can ship one for its own game the same way any plugin does; the format is in
+[Community plugins](README.md#crash-packs).
+
 ## Known gaps
 
 Tell us about others: finding them is the point of this stage.
 
 - **Per-instance saves** work only for games whose save folder is set in an INI file. For other games, instances share saves.
 - **A framework left in the real game folder** by another mod manager isn't detected. A framework counts when it's content in the instance.
-- **Crash Doctor rules** have a contract and an engine, but no guide yet.
+- **Crash paths are declared, not used yet.** `log_paths` and `crash_paths` list where a game keeps its logs and crash files, but `crash investigate` still collects the Minecraft layout; name a file with `--file`, or use `crash analyze --instance`, which reads the packs' own sources.
 
 ## Every field
 

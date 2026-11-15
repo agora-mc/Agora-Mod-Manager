@@ -66,7 +66,7 @@ A feature change isn't finished until its documentation has been checked.
 
 1. Update the in-app guide when a user-visible workflow, label, warning, or recovery action changes. This updates the website's Help & guide too.
 2. Update the desktop troubleshooting page and FAQ when a fix, label, or answer they mention changes.
-3. Update `docs/CLI.md` and the CLI help when a command, flag, output shape, or exit code changes.
+3. Update `docs/CLI.md` and the CLI help when a command, flag, output shape, or exit code changes. A test walks the command tree and fails when a leaf command is missing from `docs/CLI.md`.
 4. Update the hand-written pages in `web/src/app/docs/` when installation, first run, or the screenshot tour changes.
 5. Give any new markdown page a rule in `DOC_CATEGORIES`.
 6. Update operator documents when workflows, variables, signing, or governance state change.
