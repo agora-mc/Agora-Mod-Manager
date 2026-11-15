@@ -666,7 +666,7 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 use agora_core::game_import::vortex::{
-    self, VortexPlan, VortexRunReport, VortexScan, VortexRequest,
+    self, VortexPlan, VortexRequest, VortexRunReport, VortexScan,
 };
 use agora_core::game_import::vortex_store;
 use agora_game_api::GameId;
@@ -699,12 +699,7 @@ pub async fn games_import_vortex_scan(
         vortex::scan(&ctx, &inventory, &store).map_err(core_failed)
     })
     .await
-    .map_err(|_| {
-        GamesError::new(
-            TASK_FAILED,
-            "Reading the Vortex store did not finish.",
-        )
-    })?
+    .map_err(|_| GamesError::new(TASK_FAILED, "Reading the Vortex store did not finish."))?
 }
 
 /// One Vortex import request. `dry_run` plans and reports; otherwise the profile is imported.
@@ -764,7 +759,9 @@ pub async fn games_import_vortex(
         let inventory = installed_games(&ctx);
         if request.dry_run {
             let plan = vortex::plan(&ctx, &inventory, &core_request).map_err(import_failed)?;
-            return Ok(VortexImportReply::Plan(Box::new(VortexPlanDto::from(&plan))));
+            return Ok(VortexImportReply::Plan(Box::new(VortexPlanDto::from(
+                &plan,
+            ))));
         }
         let report = vortex::run(
             &ctx,
@@ -774,7 +771,9 @@ pub async fn games_import_vortex(
             &|_| {},
         )
         .map_err(import_failed)?;
-        Ok(VortexImportReply::Run(Box::new(VortexRunDto::from(&report))))
+        Ok(VortexImportReply::Run(Box::new(VortexRunDto::from(
+            &report,
+        ))))
     })
     .await
     .map_err(|_| GamesError::new(TASK_FAILED, "Importing the Vortex profile did not finish."))?
