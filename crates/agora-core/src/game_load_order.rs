@@ -2693,7 +2693,13 @@ fn order_of_with_view(
                     &fingerprint,
                     &data_version,
                 ) {
-                    Some(report) => order.overlaps = Some(report),
+                    Some(mut report) => {
+                        // The report is cached by order, but "new since the last launch" also
+                        // depends on the session ledger, which changes at each launch. Recompute
+                        // those flags here so a launch never leaves a stale badge on screen.
+                        mark_new_pairs(ctx, instance_id, &rule.id, &mut report, &order.entries);
+                        order.overlaps = Some(report);
+                    }
                     None => order.overlaps_out_of_date = true,
                 }
             }
