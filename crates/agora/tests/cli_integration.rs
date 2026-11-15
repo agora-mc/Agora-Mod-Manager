@@ -1477,6 +1477,95 @@ fn crash_investigate_accepts_explicit_text_evidence() {
     );
 }
 
+/// A game instance whose crash packs declare where its evidence lives: `crash investigate` must
+/// find it without a `--file`, and must not read a log older than the window. Every name here is
+/// invented.
+#[test]
+fn crash_investigate_finds_a_game_instances_pack_declared_logs() {
+    let fixture = skyrim_fixture("1.6.1170.0", &[]);
+    let id = fixture.instance_id.clone();
+    let skse_dir = fixture
+        .user_data
+        .join("documents")
+        .join("My Games")
+        .join("Skyrim Special Edition")
+        .join("SKSE");
+    std::fs::create_dir_all(&skse_dir).unwrap();
+
+    let crash = skse_dir.join("crash-2026-01-01-120000.log");
+    std::fs::write(&crash, invented_crash_logger_log()).unwrap();
+    std::fs::write(
+        skse_dir.join("skse64.log"),
+        "SKSE64 runtime: initialize (version = 2.2.6 01064920 0011223344556677)
+         imagebase = 00007FF712340000
+         checking plugin InventedPlugin.dll
+         plugin InventedPlugin.dll (00000001 InventedPlugin 01000000) loaded correctly (handle 1)
+",
+    )
+    .unwrap();
+
+    // Older than the search window: a stale log is not this crash's evidence.
+    let old = skse_dir.join("crash-2025-01-01-000000.log");
+    std::fs::write(&old, invented_crash_logger_log()).unwrap();
+    let old_file = std::fs::File::options().write(true).open(&old).unwrap();
+    old_file
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 60 * 60))
+        .unwrap();
+    drop(old_file);
+
+    let output = run_fixture(&fixture, &["crash", "investigate", &id, "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let names: Vec<&str> = parsed["files"]
+        .as_array()
+        .expect("files are an array")
+        .iter()
+        .filter_map(|file| file["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"crash-2026-01-01-120000.log"),
+        "the Crash Logger log the pack declares was not found: {parsed}"
+    );
+    assert!(
+        names.contains(&"skse64.log"),
+        "the SKSE log the pack declares was not found: {parsed}"
+    );
+    assert!(
+        !names.contains(&"crash-2025-01-01-000000.log"),
+        "a log outside the window must not be read as this crash: {parsed}"
+    );
+}
+
+fn invented_crash_logger_log() -> String {
+    "CRASH TIME: 2026-01-01 12:00:00
+     Skyrim SSE v1.6.1170
+     CrashLoggerSSE v1-16-0-0 Jan  1 2026 00:00:00
+     
+     Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF700001000 InventedGame.exe+001000
+     
+     SYSTEM SPECS:
+     	OS: Invented OS
+     	CPU: Invented CPU
+     	GPU #1: Invented GPU
+     	PHYSICAL MEMORY: 8.00 GB/16.00 GB
+     
+     PROBABLE CALL STACK:
+     	[ 0] 0x7FF700000000 InventedGame.exe+001000
+     	[ 1] 0x7FF700001000 InventedPlugin.dll+001000
+     
+     MODULES:
+     	InventedGame.exe 0x7FF700000000
+     
+     SKSE PLUGINS:
+     	InventedPlugin.dll v1.0.0
+"
+    .to_string()
+}
+
 fn write_crash_analyze_fixtures(root: &Path) -> (PathBuf, PathBuf) {
     let plugin = root.join("analyze-plugin");
     std::fs::create_dir_all(plugin.join("crash")).unwrap();
