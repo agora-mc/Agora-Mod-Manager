@@ -473,11 +473,22 @@ fn merged_view_and_write_isolation() {
     );
 
     // The delete is a whiteout in the upper layer; the lower and base files are untouched.
-    assert!(
-        fixture.writable().join("delete_me.txt").exists(),
-        "a delete must leave a whiteout in the writable layer"
-    );
+    let whiteout = std::fs::symlink_metadata(fixture.writable().join("delete_me.txt"))
+        .expect("a delete must leave a whiteout in the writable layer");
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if whiteout.file_type().is_char_device() {
+        assert_eq!(whiteout.rdev(), 0, "the whiteout must be device 0:0");
+    } else {
+        assert!(
+            whiteout.file_type().is_file() && whiteout.len() == 0,
+            "the upper entry is neither a char-device whiteout nor an empty marker: {whiteout:?}"
+        );
+    }
     assert_eq!(read(&lower.join("delete_me.txt")), b"mod delete");
+    assert_eq!(
+        read(&fixture.base_location.join("delete_me.txt")),
+        b"base delete"
+    );
     assert_eq!(read(&lower.join("base_only.txt")), b"base only");
     assert_eq!(read(&lower.join("mod_file.txt")), lower_before);
     assert_eq!(
