@@ -232,6 +232,12 @@ export function InstancePluginsTab({ instanceId }: InstancePluginsTabProps) {
 
   useEffect(() => {
     if (lists === null) return;
+    // A game with no load order list has no rules to read, and asking would be an error.
+    if (listId === null) {
+      setRules(null);
+      setRulesError(null);
+      return;
+    }
     loadRules(listId);
   }, [listId, lists, loadRules]);
 
