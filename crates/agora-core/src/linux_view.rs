@@ -86,6 +86,9 @@ impl OverlayMechanism {
 pub struct ViewRun {
     pub mechanism: OverlayMechanism,
     pub status: ExitStatus,
+    /// The process id of the command Steam asked Agora to run. It is the command's own process,
+    /// which for Steam is the launcher that waits for the game, not the game itself.
+    pub pid: u32,
 }
 
 /// The view could not be mounted, and nothing ran. The caller uses `next` and says why.
@@ -437,7 +440,11 @@ mod linux_impl {
                             // gone, so nothing else needs that group.
                             unsafe { nix::libc::kill(-child.as_raw(), nix::libc::SIGKILL) };
                         }
-                        Ok(ViewOutcome::Ran(ViewRun { mechanism, status }))
+                        Ok(ViewOutcome::Ran(ViewRun {
+                            mechanism,
+                            status,
+                            pid: child.as_raw() as u32,
+                        }))
                     }
                     Ok(Message::StepDown(reason)) => Ok(ViewOutcome::SteppedDown(StepDown {
                         reason,

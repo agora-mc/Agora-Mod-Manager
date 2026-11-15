@@ -234,11 +234,44 @@ pub fn paths_eq_case_insensitive(a: &Path, b: &Path) -> bool {
     a_comps == b_comps
 }
 
-/// Resolve a `GamePath` targeting `UserData` to its absolute host path.
-pub fn resolve_user_file_source(source: &GamePath) -> Result<PathBuf, UserFilesError> {
+/// The Windows user folder a `UserDataLocation` names, inside a Proton prefix. Proton's default
+/// user is `steamuser`; a prefix that names another single user folder uses that one instead.
+pub fn user_data_root_in_prefix(prefix: &Path, location: &UserDataLocation) -> PathBuf {
+    let users = prefix.join("drive_c").join("users");
+    let user = if users.join("steamuser").is_dir() {
+        users.join("steamuser")
+    } else {
+        std::fs::read_dir(&users)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| path.is_dir() && !path.ends_with("Public"))
+            })
+            .unwrap_or_else(|| users.join("steamuser"))
+    };
+    match location {
+        UserDataLocation::Documents => user.join("Documents"),
+        UserDataLocation::RoamingAppData => user.join("AppData").join("Roaming"),
+        UserDataLocation::LocalAppData => user.join("AppData").join("Local"),
+        UserDataLocation::Home => user,
+    }
+}
+
+/// Resolve a `GamePath` targeting `UserData` to its absolute host path. A Proton prefix, when
+/// given, replaces the Linux home folders with the prefix's Windows ones.
+pub fn resolve_user_file_source_in(
+    prefix: Option<&Path>,
+    source: &GamePath,
+) -> Result<PathBuf, UserFilesError> {
     match source {
         GamePath::UserData { location, path } => {
-            let Some(base) = user_data_root(location) else {
+            let base = match prefix {
+                Some(prefix) => Some(user_data_root_in_prefix(prefix, location)),
+                None => user_data_root(location),
+            };
+            let Some(base) = base else {
                 return Err(UserFilesError::UserDataNotFound(location.clone()));
             };
             let rel = path.as_str();
@@ -252,6 +285,11 @@ pub fn resolve_user_file_source(source: &GamePath) -> Result<PathBuf, UserFilesE
             "unsupported user file source root: {other:?}"
         ))),
     }
+}
+
+/// Resolve a `GamePath` targeting `UserData` to its absolute host path.
+pub fn resolve_user_file_source(source: &GamePath) -> Result<PathBuf, UserFilesError> {
+    resolve_user_file_source_in(None, source)
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -486,6 +524,9 @@ pub fn swap_in(
         .paths
         .user_files_backup_dir(definition.id.as_str(), store.as_str());
     std::fs::create_dir_all(&backup_dir)?;
+    // A Windows game run through Proton keeps its user folders in the prefix, not in the
+    // Linux home folder. `None` on every other platform, store and native Linux game.
+    let prefix = crate::game_instance::proton_prefix(ctx, instance_id);
 
     // 3. Settle the mappings before anything else. Two mappings for one real file, or two that
     // share one instance path, cannot be swapped and restored unambiguously: the journal is looked
@@ -497,7 +538,7 @@ pub fn swap_in(
     let mut instance_to_real: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for m in &applicable_mappings {
-        let real_path = resolve_user_file_source(&m.source)?;
+        let real_path = resolve_user_file_source_in(prefix.as_deref(), &m.source)?;
         let real_key = fold_path_case(&real_path.to_string_lossy());
         let instance_key = fold_path_case(m.instance_path.as_str());
         if let Some(other) = real_to_instance.get(&real_key) {
@@ -927,6 +968,7 @@ fn restore_journal_internal(
         .map_err(|e| UserFilesError::Other(e.to_string()))?;
 
     // 2. Applicable mappings for this store
+    let prefix = crate::game_instance::proton_prefix(ctx, &journal.instance_id);
     let applicable_mappings: Vec<&UserFileMapping> = definition
         .user_files
         .iter()
@@ -966,7 +1008,7 @@ fn restore_journal_internal(
             )));
         };
 
-        let derived_real_path = resolve_user_file_source(&mapping.source)?;
+        let derived_real_path = resolve_user_file_source_in(prefix.as_deref(), &mapping.source)?;
         if !paths_eq_case_insensitive(&file.real_path, &derived_real_path) {
             return Err(UserFilesError::Other(format!(
                 "journal entry real_path '{:?}' differs from derived real_path '{:?}'",

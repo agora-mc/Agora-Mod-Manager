@@ -18,6 +18,7 @@ import {
 import { useInstanceSession } from './instanceSession';
 import type { GameInstancePage } from '@/lib/useDestination';
 import { CrashAnswerOverview } from './CrashAnswerPanel';
+import { SteamLaunchPanel } from './SteamLaunchPanel';
 
 interface InstanceOverviewTabProps {
   gameId: string;
@@ -60,6 +61,9 @@ export function InstanceOverviewTab({ instanceId, onNavigatePage }: InstanceOver
 
   return (
     <div className="@container">
+      <div className="mb-6">
+        <SteamLaunchPanel instanceId={instanceId} />
+      </div>
       <div className="mb-6">
         <CrashAnswerOverview
           instanceId={instanceId}

@@ -639,6 +639,7 @@ fn has_refused_load(ctx: &Ctx, record: &SessionRecord, live: &LivePacks<'_>) -> 
     let roots = InstanceRoots {
         instance_dir,
         runtime_dir: None,
+        proton_prefix: crate::game_instance::proton_prefix(ctx, &record.instance_id),
     };
     let session = CrashSession {
         session_id: record.session_id.clone(),
@@ -888,6 +889,7 @@ fn diagnose_record(
     let roots = InstanceRoots {
         instance_dir,
         runtime_dir: crash_runtime_root(ctx, &record.instance_id),
+        proton_prefix: crate::game_instance::proton_prefix(ctx, &record.instance_id),
     };
 
     let session = CrashSession {
@@ -1269,6 +1271,8 @@ struct InstanceRoots {
     instance_dir: PathBuf,
     /// The folder the game ran from, when it could be resolved. The preloader writes its log there.
     runtime_dir: Option<PathBuf>,
+    /// The Proton prefix the game's Windows user folders live in, when it runs through Proton.
+    proton_prefix: Option<PathBuf>,
 }
 
 impl SourceRoots for InstanceRoots {
@@ -1288,8 +1292,14 @@ impl SourceRoots for InstanceRoots {
                 })
             }
             GamePath::UserData { location, path } => {
-                let base = crate::game_user_files::user_data_root(location)
-                    .ok_or_else(|| format!("the user data folder for {location:?} is not known"))?;
+                let base = match &self.proton_prefix {
+                    Some(prefix) => {
+                        crate::game_user_files::user_data_root_in_prefix(prefix, location)
+                    }
+                    None => crate::game_user_files::user_data_root(location).ok_or_else(|| {
+                        format!("the user data folder for {location:?} is not known")
+                    })?,
+                };
                 Ok(SourceLocation {
                     base,
                     relative: path.as_str().to_string(),

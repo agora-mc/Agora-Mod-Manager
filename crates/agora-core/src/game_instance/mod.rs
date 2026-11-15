@@ -690,6 +690,36 @@ pub(crate) fn session_store(
     }
 }
 
+/// The Proton prefix an instance's game runs in, when it is a Steam game on Linux whose prefix
+/// exists. `None` on every other platform, for another store, or for a native Linux game: a
+/// caller must then use the normal user folders.
+pub fn proton_prefix(ctx: &Ctx, id: &str) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let manifest = get_manifest(ctx, id).ok()?;
+    let (location, product) = match &manifest.base {
+        BaseReference::Pinned { id: base_id, .. } => {
+            let text = std::fs::read_to_string(ctx.paths.base_manifest_path(base_id)).ok()?;
+            let base: crate::game_base::BaseManifest = serde_json::from_str(&text).ok()?;
+            (base.source_location, base.source_product?)
+        }
+        BaseReference::Unpinned { install, .. } => {
+            let (store, product) = install.as_str().split_once(':')?;
+            if store != "steam" {
+                return None;
+            }
+            let report = crate::game_discovery::discover_with_folders(&ctx.paths);
+            let found = report.installs.iter().find(|discovered| {
+                crate::game_registry::make_install_id(&discovered.store, &discovered.product)
+                    == *install
+            })?;
+            (found.location.clone(), product.to_string())
+        }
+    };
+    crate::game_discovery::steam::proton_prefix(&location, &product)
+}
+
 /// Delete a generic game instance, moving its folder to Recently deleted so it can be restored.
 /// Refuses Minecraft instances and folders outside `<instances_root>`.
 pub fn delete(ctx: &Ctx, id: &str) -> Result<DeleteOutcome, InstanceError> {

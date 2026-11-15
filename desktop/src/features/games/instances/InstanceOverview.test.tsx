@@ -35,6 +35,7 @@ vi.mock('./api', async (importOriginal) => {
     ...actual,
     getGameInstance: vi.fn(),
     checkGameInstance: vi.fn(),
+    getSteamLaunchInfo: vi.fn(async () => ({ supported: false })),
     setGameInstanceDeployment: vi.fn(),
     onInstanceExited: vi.fn(() => Promise.resolve(() => undefined)),
   };

@@ -455,6 +455,60 @@ pub async fn games_instance_set_deployment(
     blocking(move || set_deployment(&app, &instance_id, &mode)).await
 }
 
+/// The Steam launch-options status the Linux instance page shows: whether the Agora wrapper is
+/// in the game's launch options, and the exact text to paste when it is not. On other platforms
+/// `supported` is false and the page shows nothing.
+#[derive(Debug, Clone, Serialize)]
+pub struct SteamLaunchInfo {
+    pub supported: bool,
+    pub app_id: Option<String>,
+    pub expected: String,
+    pub configured: Option<String>,
+    pub wrapper_present: bool,
+    pub files: Vec<String>,
+    pub problems: Vec<String>,
+    pub note: String,
+}
+
+#[tauri::command]
+pub async fn games_instance_steam_status(
+    app: tauri::AppHandle,
+    instance_id: String,
+) -> Result<SteamLaunchInfo, GamesError> {
+    blocking(move || {
+        if !cfg!(target_os = "linux") {
+            return Ok(SteamLaunchInfo {
+                supported: false,
+                app_id: None,
+                expected: agora_core::game_wrap::PROTON_UNTESTED.to_string(),
+                configured: None,
+                wrapper_present: false,
+                files: Vec::new(),
+                problems: Vec::new(),
+                note: String::new(),
+            });
+        }
+        let ctx = crate::core_context(&app)?;
+        let status = agora_core::game_wrap::launch_status(&ctx, &instance_id)
+            .map_err(|error| GamesError::new(CORE_FAILED, error.to_string()))?;
+        Ok(SteamLaunchInfo {
+            supported: true,
+            app_id: Some(status.app_id),
+            expected: status.expected,
+            configured: status.configured,
+            wrapper_present: status.wrapper_present,
+            files: status
+                .files
+                .iter()
+                .map(|file| file.display().to_string())
+                .collect(),
+            problems: status.problems,
+            note: agora_core::game_wrap::PROTON_UNTESTED.to_string(),
+        })
+    })
+    .await
+}
+
 /// Launch an instance. `deployment` runs this launch only (`None` uses the instance's choice);
 /// `launch_anyway` starts the game past the checks that would stop it.
 #[tauri::command]

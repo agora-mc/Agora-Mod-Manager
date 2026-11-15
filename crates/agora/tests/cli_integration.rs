@@ -5699,6 +5699,53 @@ fn games_instance_plugins_rule_lists_and_removes_rules() {
 }
 
 #[test]
+fn games_instance_default_remembers_an_instance_and_refuses_an_unknown_one() {
+    let fixture = skyrim_fixture("1.6.1170.0", &[]);
+    let id = fixture.instance_id.clone();
+
+    let set = run_agora_json(&fixture.data_dir, &["games", "instance", "default", &id]);
+    assert_eq!(
+        set.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&set.stdout).unwrap();
+    assert_eq!(json["status"], "default");
+    assert_eq!(json["instance_id"], id);
+
+    let unknown = run_agora(
+        &fixture.data_dir,
+        &["games", "instance", "default", "no-such-instance"],
+    );
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("not found"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+}
+
+#[test]
+fn games_wrap_runs_the_command_untouched_when_the_view_is_not_available() {
+    let fixture = skyrim_fixture("1.6.1170.0", &[]);
+    let out = if cfg!(windows) {
+        run_agora(&fixture.data_dir, &["games", "wrap", "cmd", "/c", "exit 7"])
+    } else {
+        run_agora(
+            &fixture.data_dir,
+            &["games", "wrap", "/bin/sh", "-c", "exit 7"],
+        )
+    };
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn games_instance_check_lists_a_rule_it_cannot_check_but_exits_zero() {
     // A three-part version cannot fill the Address Library rule's {4}: a definition-side
     // finding, listed as a warning. It does not fail the check.

@@ -33,8 +33,19 @@ impl SteamAdapter {
     }
 
     pub fn discover_system(volume_detector: &VolumeDetector) -> DiscoveryReport {
-        let root = crate::game_discovery::platform::find_steam_root();
-        Self::new(root).discover_with_detector(volume_detector)
+        let roots = crate::game_discovery::platform::find_steam_roots();
+        let mut report = DiscoveryReport::new();
+        for root in roots {
+            let found = Self::new(Some(root)).discover_with_detector(volume_detector);
+            report.combine(found);
+        }
+        // The same library can be named by two roots (a symlinked `~/.steam/steam` and
+        // `~/.local/share/Steam`), so keep the first install for each store product.
+        let mut seen = HashSet::new();
+        report
+            .installs
+            .retain(|install| seen.insert((install.store.clone(), install.product.clone())));
+        report
     }
 
     pub fn discover_from(root: &Path, volume_detector: &VolumeDetector) -> DiscoveryReport {

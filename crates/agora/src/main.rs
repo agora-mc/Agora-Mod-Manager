@@ -454,6 +454,12 @@ enum GamesCmd {
         #[command(subcommand)]
         action: CatalogCmd,
     },
+    /// Run a game through an instance from Steam's launch options (Linux, Proton).
+    Wrap {
+        /// The command Steam supplies as %command%, with its arguments.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Manage game instances.
     Instance {
         #[command(subcommand)]
@@ -584,6 +590,12 @@ enum GameInstanceCmd {
     },
     /// List all game instances, Minecraft included.
     List,
+    /// Make an instance the game's default, so `agora games wrap` picks it when Steam starts the
+    /// game without a pending launch.
+    Default {
+        /// Instance ID to make the default for its game.
+        instance_id: String,
+    },
     /// Launch a game instance.
     Launch {
         /// Instance ID to launch.
@@ -6376,6 +6388,40 @@ async fn run_command(
                     print_discovery_report(&report);
                 }
             }
+            GamesCmd::Wrap { command } => {
+                let packs = cli_crash::load_live_packs(ctx)?;
+                let live = agora_core::crash_live::LivePacks {
+                    packs: &packs.packs,
+                    built_in: &packs.built_in,
+                    host: packs.host.as_ref(),
+                    instances: None,
+                };
+                let outcome = agora_core::game_wrap::wrap(ctx, &live, &command)?;
+                match &outcome {
+                    agora_core::game_wrap::WrapOutcome::Ran {
+                        instance_id,
+                        mechanism,
+                        ..
+                    } => {
+                        if !json {
+                            eprintln!(
+                                "agora games wrap: ran instance '{instance_id}' through {mechanism}."
+                            );
+                        }
+                    }
+                    agora_core::game_wrap::WrapOutcome::PassedThrough { reason, .. } => {
+                        if json {
+                            let out = serde_json::json!({
+                                "status": "passed_through",
+                                "reason": reason,
+                                "exitCode": outcome.exit_code(),
+                            });
+                            eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                        }
+                    }
+                }
+                std::process::exit(outcome.exit_code());
+            }
             GamesCmd::List => {
                 let inventory = agora_core::game_registry::installed_games(ctx);
                 if json {
@@ -7188,6 +7234,35 @@ async fn run_command(
                 ContentCmd::Fomod { action } => run_fomod_command(ctx, action, json)?,
             },
             GamesCmd::Instance { action } => match action {
+                GameInstanceCmd::Default { instance_id } => {
+                    match agora_core::game_wrap::set_default_instance(ctx, &instance_id) {
+                        Ok(()) => {
+                            if json {
+                                let out = serde_json::json!({
+                                    "status": "default",
+                                    "instance_id": instance_id,
+                                });
+                                println!("{}", serde_json::to_string_pretty(&out)?);
+                            } else {
+                                println!(
+                                    "Instance '{instance_id}' is now the default for its game; `agora games wrap` picks it when Steam starts the game."
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if json {
+                                let out = serde_json::json!({
+                                    "error": e.to_string(),
+                                    "exitCode": 1,
+                                });
+                                eprintln!("{}", serde_json::to_string_pretty(&out)?);
+                            } else {
+                                eprintln!("Error: {e}");
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 GameInstanceCmd::Create {
                     install_id,
                     name,
@@ -7390,6 +7465,10 @@ async fn run_command(
                     fall_back,
                     skip_before_launch,
                 } => {
+                    #[cfg(target_os = "linux")]
+                    if let Some(code) = cli_linux_launch(ctx, &instance_id, json)? {
+                        std::process::exit(code);
+                    }
                     let on_vfs_failure = if fall_back {
                         agora_core::game_instance::VfsFailure::FallBack
                     } else {
@@ -9953,6 +10032,88 @@ fn print_mo2_run(report: &agora_core::game_import::Mo2RunReport) {
         println!("  next: {step}");
     }
     println!("The setup at {} was only read.", plan.setup.display());
+}
+
+/// `games instance launch` on Linux: Steam starts the game, so Agora records what it asked for
+/// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance
+/// returns `None` and the ordinary launch path runs it.
+#[cfg(target_os = "linux")]
+fn cli_linux_launch(
+    ctx: &agora_core::ctx::Ctx,
+    instance_id: &str,
+    json: bool,
+) -> anyhow::Result<Option<i32>> {
+    use agora_core::game_wrap::WrapError;
+
+    let status = match agora_core::game_wrap::start_via_steam(ctx, instance_id) {
+        Ok(status) => status,
+        Err(WrapError::NotSteam(_)) => return Ok(None),
+        Err(error) => {
+            if json {
+                let out = serde_json::json!({
+                    "status": "error",
+                    "error": error.to_string(),
+                    "exitCode": 1,
+                });
+                eprintln!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                eprintln!("Error: {error}");
+            }
+            return Ok(Some(1));
+        }
+    };
+
+    if json {
+        let out = serde_json::json!({
+            "status": "launching",
+            "instance_id": instance_id,
+            "app_id": status.app_id,
+            "configured": status.configured,
+            "wrapper_present": status.wrapper_present,
+            "launch_options_text": status.expected,
+            "launch_options_files": status.files,
+            "problems": status.problems,
+            "note": agora_core::game_wrap::PROTON_UNTESTED,
+            "exitCode": 0,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("{}", agora_core::game_wrap::PROTON_UNTESTED);
+        println!(
+            "Asked Steam to start app {}. Agora recorded instance '{}' for the next two minutes.",
+            status.app_id, instance_id
+        );
+        print_linux_launch_options(&status);
+    }
+    Ok(Some(0))
+}
+
+#[cfg(target_os = "linux")]
+fn print_linux_launch_options(status: &agora_core::game_discovery::steam::SteamLaunchStatus) {
+    if status.wrapper_present {
+        println!(
+            "Steam's launch options already run the wrapper: {}",
+            status.configured.as_deref().unwrap_or_default()
+        );
+        return;
+    }
+    println!();
+    println!("Steam's launch options for this game do not run Agora yet.");
+    println!("Paste this into the game's Properties -> Launch Options:");
+    println!("  {}", agora_core::game_discovery::steam::WRAPPER_TEXT);
+    if status.files.is_empty() {
+        println!(
+            "Steam's userdata folder was not found, so Agora could not read the current value."
+        );
+    } else {
+        println!("Agora looked in:");
+        for file in &status.files {
+            println!("  {}", file.display());
+        }
+    }
+    for problem in &status.problems {
+        println!("  could not read {problem}");
+    }
 }
 
 fn print_discovery_report(report: &agora_core::game_discovery::DiscoveryReport) {

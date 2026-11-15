@@ -12,7 +12,7 @@ I have a degree in game development and computer science. Using my experience, I
 
 ## Platforms and Signing
 
-Windows is tested and signed, I don't have macOS or Linux right now so they are not officially tested, releases are provided for your convenience but are not guaranteed to be functional.
+Windows is tested and signed. I don't have macOS or Linux right now, so they are not officially tested, and releases are provided for your convenience but are not guaranteed to be functional. Linux builds run games on Steam through Proton with `agora games wrap %command%`; that path has not been tested on real hardware yet.
 
 ## Download and documentation
 
