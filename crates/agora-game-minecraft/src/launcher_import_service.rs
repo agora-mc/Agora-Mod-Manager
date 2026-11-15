@@ -2607,14 +2607,16 @@ mod tests {
 
     use super::*;
     use crate::launcher_import::{ContentInventory, LaunchStrategy};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A fresh temp directory for one test. The random component matters:
+    /// `%TEMP%` is shared, and a name built from the process id and a
+    /// process-local counter collides with a leftover directory once Windows
+    /// reuses that pid, which made these tests fail beside their neighbours.
     fn test_tmp(label: &str) -> PathBuf {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
             "agora-launcher-import-{label}-{}-{}",
             std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            uuid::Uuid::new_v4()
         ))
     }
 
