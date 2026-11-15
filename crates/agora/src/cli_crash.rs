@@ -51,57 +51,58 @@ pub fn load_live_packs(ctx: &agora_core::ctx::Ctx) -> anyhow::Result<LivePacks> 
 }
 
 /// Collect the instance's recent evidence and diagnose it with the same engine `crash analyze`
-/// uses. Evidence collection is unchanged; the diagnosis is the engine's answer, not the old
-/// signature scanner's.
+/// uses. The search is core's one evidence search, the same one the live diagnosis runs, so it
+/// follows the crash packs' sources for any game instead of only Minecraft's folders.
 pub async fn investigate(
     ctx: &agora_core::ctx::Ctx,
     instance_id: &str,
     explicit: &[PathBuf],
     json: bool,
 ) -> anyhow::Result<()> {
-    let instance_dir = ctx
-        .paths
-        .instance_dir(instance_id)
-        .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
-    let evidence = agora_core::crash_evidence::CrashEvidenceService::new().collect_since(
-        &instance_dir,
+    let live = load_live_packs(ctx)?;
+    let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
+    let window = agora_core::crash_live::investigation_window(ctx, instance_id);
+    let session = agora_core::crash_engine::evidence::CrashSession {
+        session_id: format!("investigate-{instance_id}"),
+        pid: None,
+        working_dir: None,
+        window,
+    };
+    let evidence = agora_core::crash_live::collect_instance_evidence(
+        ctx,
+        instance_id,
+        &agora_core::crash_live::LivePacks {
+            packs: &live.packs,
+            built_in: &live.built_in,
+            host: live.host.as_ref(),
+            instances: Some(&instances),
+        },
+        &session,
         explicit,
-        None,
-    );
-    if evidence.sources.is_empty() {
-        anyhow::bail!("No crash evidence found for '{instance_id}'.");
+    )
+    .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?;
+    if evidence.game_packs().next().is_none() {
+        anyhow::bail!(
+            "No crash pack applies to the game '{}', so Agora cannot tell which folders to search. Install the game's plugin, or name a file with --file.",
+            evidence.resolved.game_id
+        );
+    }
+    let files = evidence.files();
+    if files.is_empty() {
+        anyhow::bail!("{}", no_evidence_reason(instance_id, &evidence));
     }
     if !json {
-        for (index, source) in evidence.sources.iter().enumerate() {
-            let role = if index == evidence.primary_index {
+        for line in evidence.lines() {
+            let role = if line.primary {
                 "primary"
             } else {
                 "supporting"
             };
-            let truncated = if source.meta.truncated {
-                ", truncated"
-            } else {
-                ""
-            };
-            println!("Evidence: {} ({role}{truncated})", source.meta.basename);
+            println!("Evidence: {} ({role})", line.basename);
         }
     }
 
-    let live = load_live_packs(ctx)?;
-    let mut packs = live.packs.clone();
-    packs.extend(agora_core::crash_packs::load_built_in_packs(&live.built_in).packs);
-    let resolved = agora_core::crash_engine::instance_view::resolve_crash_instance(
-        ctx,
-        instance_id,
-        Some(&agora_game_minecraft::installed_content::MinecraftInstanceProvider),
-    )?;
-    let game_packs: Vec<&LoadedCrashPack> = packs
-        .iter()
-        .filter(|pack| {
-            pack.pack.games.is_empty()
-                || pack.pack.games.iter().any(|game| game == &resolved.game_id)
-        })
-        .collect();
+    let game_packs: Vec<&LoadedCrashPack> = evidence.game_packs().collect();
     let ref_maps: Vec<agora_game_api::crash::RefMap> = game_packs
         .iter()
         .flat_map(|pack| pack.pack.ref_maps.iter().cloned())
@@ -110,14 +111,15 @@ pub async fn investigate(
         .iter()
         .flat_map(|pack| pack.pack.roles.iter().cloned())
         .collect();
-    let resolver = Resolver::new(resolved.view, ref_maps, roles);
+    let resolved = &evidence.resolved;
+    let resolver = Resolver::new(resolved.view.clone(), ref_maps, roles);
     let scope = Arc::new(
         agora_core::game_script::instance_reads(ctx, instance_id)
             .map_err(|error| anyhow::anyhow!("Could not read instance '{instance_id}': {error}"))?,
     );
     let inspector = InstanceInspector::new(
         live.host.as_ref(),
-        &packs,
+        &evidence.packs,
         &resolver,
         scope,
         GameHandle {
@@ -131,18 +133,8 @@ pub async fn investigate(
         inspector: &inspector,
         could_not_check: &resolved.could_not_check,
     };
-    let files: Vec<CrashFile> = evidence
-        .sources
-        .iter()
-        .map(|source| CrashFile {
-            name: source.meta.basename.clone(),
-            bytes: source.text.as_bytes().to_vec(),
-            origin: agora_core::crash_engine::CrashFileOrigin::Collected,
-            source: None,
-        })
-        .collect();
     let output = analyze(&AnalyzeInput {
-        packs: &packs,
+        packs: &evidence.packs,
         files: &files,
         runtime_version: resolved.runtime_version.as_deref(),
         host: live.host.as_ref(),
@@ -164,6 +156,30 @@ pub async fn investigate(
         anyhow::bail!("No crash file could be read.");
     }
     Ok(())
+}
+
+/// Why the search found nothing, in the terms the brief asks for: a folder that could not be
+/// looked at is "could not check" and names its plugin, never a clean "nothing found".
+fn no_evidence_reason(
+    instance_id: &str,
+    evidence: &agora_core::crash_live::InstanceEvidence,
+) -> String {
+    let mut why = format!("No crash evidence found for '{instance_id}'.");
+    if !evidence.collection.problems.is_empty() {
+        why.push_str(" Could not check:");
+        for problem in &evidence.collection.problems {
+            why.push_str(&format!(
+                "
+  - {} (from {}): {}",
+                problem.source_id, problem.plugin_id, problem.detail
+            ));
+        }
+    } else if evidence.collection.folders.is_empty() {
+        why.push_str(" No crash pack source named a folder to search.");
+    } else {
+        why.push_str(" Every folder the game's crash packs name was missing, empty or unreadable.");
+    }
+    why
 }
 
 pub struct AnalyzeArgs {

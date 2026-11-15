@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use agora_game_api::crash::{
@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::crash_engine::attribution::Resolver;
 use crate::crash_engine::evidence::{
     collect_sources, ArtifactFacts, CollectionLimits, CopiedSession, CopyLimits, CrashSession,
-    EvidenceStore, NoArtifactFacts, RetentionLimits, SessionWindow, SourceCollection,
-    SourceLocation, SourceRoots, SourceSpec, EVIDENCE_STORE_DIR,
+    EvidenceStore, FoundArtifact, NoArtifactFacts, RetentionLimits, SessionWindow,
+    SourceCollection, SourceLocation, SourceRoots, SourceSpec, EVIDENCE_STORE_DIR,
 };
 use crate::crash_engine::{
     analyze_with_history, history::LocalConfirmation, history::RecordedCrash, AnalyzeInput,
@@ -294,6 +294,280 @@ pub struct LivePacks<'a> {
     /// The game package that owns this instance system, when core does not read it itself. A
     /// Minecraft session needs this; a generic game instance leaves it `None`.
     pub instances: Option<&'a dyn crate::crash_engine::instance_view::ExtraInstanceProvider>,
+}
+
+/// How far back `crash investigate` looks when the instance has no recorded session to take a
+/// window from.
+pub const INVESTIGATION_RECENT_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+
+/// The window `crash investigate` searches with: the newest recorded session's span, or a recent
+/// span when the instance has no session yet. The live diagnosis uses the same [`SessionWindow`]
+/// and the same pack sources; this only decides which span an unwatched search covers.
+pub fn investigation_window(ctx: &Ctx, instance_id: &str) -> SessionWindow {
+    let now = ctx.clock.now();
+    let latest = crate::db::local_state_connection(&ctx.paths.local_state_db())
+        .ok()
+        .and_then(|conn| crate::session_ledger::list(&conn, instance_id, 1).ok())
+        .and_then(|mut sessions| sessions.pop());
+    if let Some(record) = latest {
+        if let Ok(started) = parse_time(&record.started_at) {
+            let ended = record
+                .ended_at
+                .as_deref()
+                .and_then(|text| parse_time(text).ok())
+                .unwrap_or(now);
+            return SessionWindow::new(started, ended.max(started));
+        }
+    }
+    SessionWindow::new(
+        now.checked_sub(INVESTIGATION_RECENT_WINDOW).unwrap_or(now),
+        now,
+    )
+}
+
+/// The evidence one instance's packs name for a window, found the one way the live diagnosis and
+/// `crash investigate` both search. It holds no game knowledge: the folders, formats and binds all
+/// come from the packs.
+pub struct InstanceEvidence {
+    pub resolved: crate::crash_engine::instance_view::ResolvedCrashInstance,
+    /// Every pack that may read this evidence: the installed packs plus the built-ins, unfiltered,
+    /// because the analyzer and its inspectors take the whole set.
+    pub packs: Vec<LoadedCrashPack>,
+    pub window: SessionWindow,
+    pub collection: SourceCollection,
+    /// The explicit files the caller named, resolved and safe to read as text.
+    pub explicit: Vec<PathBuf>,
+}
+
+/// One evidence file as `crash investigate` lists it.
+#[derive(Debug, Clone)]
+pub struct InstanceEvidenceLine {
+    pub basename: String,
+    pub primary: bool,
+}
+
+impl InstanceEvidence {
+    /// The packs that apply to this instance's game, in the same order the live path uses.
+    pub fn game_packs(&self) -> impl Iterator<Item = &LoadedCrashPack> {
+        let game_id = self.resolved.game_id.as_str();
+        self.packs.iter().filter(move |pack| {
+            pack.pack.games.is_empty() || pack.pack.games.iter().any(|game| game == game_id)
+        })
+    }
+
+    /// Whether a found artifact came from a source the pack marks `primary`.
+    fn is_primary(&self, found: &FoundArtifact) -> bool {
+        self.game_packs().any(|pack| {
+            pack.plugin_id == found.plugin_id
+                && pack.pack.sources.iter().any(|source| {
+                    source.id == found.source_id && source.role == SourceRole::Primary
+                })
+        })
+    }
+
+    /// Bound files, primary first, newest first, then explicit files. The first primary source is
+    /// the crash log; any other is supporting evidence.
+    fn ordered_bound(&self) -> Vec<(bool, &FoundArtifact)> {
+        let mut files: Vec<(bool, &FoundArtifact)> = self
+            .collection
+            .bound
+            .iter()
+            .filter(|found| found.unit == agora_game_api::crash::ArtifactUnit::File)
+            .map(|found| (self.is_primary(found), found))
+            .collect();
+        files.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.modified.cmp(&left.1.modified))
+                .then_with(|| left.1.name.cmp(&right.1.name))
+        });
+        files
+    }
+
+    /// The evidence lines `crash investigate` prints, in reading order.
+    pub fn lines(&self) -> Vec<InstanceEvidenceLine> {
+        let mut primary_seen = false;
+        let mut lines: Vec<InstanceEvidenceLine> = self
+            .ordered_bound()
+            .into_iter()
+            .map(|(primary_source, found)| {
+                let primary = primary_source && !primary_seen;
+                if primary {
+                    primary_seen = true;
+                }
+                InstanceEvidenceLine {
+                    basename: found.name.clone(),
+                    primary,
+                }
+            })
+            .collect();
+        for path in &self.explicit {
+            lines.push(InstanceEvidenceLine {
+                basename: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                primary: lines.is_empty(),
+            });
+        }
+        lines
+    }
+
+    /// The same evidence in the older [`crate::crash_evidence::CollectedEvidence`] shape the
+    /// desktop's crash board reads. The pack's `primary` role becomes the crash-log kind and
+    /// everything else a supporting log; no game's names are involved.
+    pub fn collected(&self) -> crate::crash_evidence::CollectedEvidence {
+        use crate::crash_evidence::{CrashEvidenceService, EvidenceCandidate, EvidenceSourceKind};
+        let mut primary_seen = false;
+        let candidates: Vec<EvidenceCandidate> = self
+            .ordered_bound()
+            .into_iter()
+            .map(|(primary_source, found)| {
+                let primary = primary_source && !primary_seen;
+                if primary {
+                    primary_seen = true;
+                }
+                EvidenceCandidate {
+                    path: found.path.clone(),
+                    kind: if primary {
+                        EvidenceSourceKind::CrashReport
+                    } else {
+                        EvidenceSourceKind::LatestLog
+                    },
+                    supplementary: !primary,
+                    modified_at: found.modified.unwrap_or(std::time::UNIX_EPOCH),
+                }
+            })
+            .collect();
+        CrashEvidenceService::new().collect_candidates(&candidates, &self.explicit)
+    }
+
+    /// The bound and explicit files as whole-file analyzer inputs, read where they are. A file
+    /// larger than the live path's copy limit is read as its head and tail, exactly as the store
+    /// would keep it.
+    pub fn files(&self) -> Vec<crate::crash_engine::CrashFile> {
+        use crate::crash_engine::CrashFile;
+        let mut files: Vec<CrashFile> = self
+            .ordered_bound()
+            .into_iter()
+            .filter_map(|(_, found)| {
+                let bytes = read_for_parsing(&found.path)?;
+                Some(CrashFile {
+                    name: found.name.clone(),
+                    bytes,
+                    origin: crate::crash_engine::CrashFileOrigin::Collected,
+                    source: Some(found.source_id.clone()),
+                })
+            })
+            .collect();
+        for path in &self.explicit {
+            let Some(bytes) = read_for_parsing(path) else {
+                continue;
+            };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            files.push(CrashFile {
+                name,
+                bytes,
+                origin: crate::crash_engine::CrashFileOrigin::File,
+                source: None,
+            });
+        }
+        files
+    }
+}
+
+/// Search the folders the applicable packs name for the evidence of one window, plus the files the
+/// caller named. This is the one search the live diagnosis and `crash investigate` both use.
+pub fn collect_instance_evidence(
+    ctx: &Ctx,
+    instance_id: &str,
+    live: &LivePacks<'_>,
+    session: &CrashSession,
+    explicit_files: &[PathBuf],
+) -> Result<InstanceEvidence, String> {
+    let resolved = crate::crash_engine::instance_view::resolve_crash_instance(
+        ctx,
+        instance_id,
+        live.instances,
+    )
+    .map_err(|error| format!("the instance could not be read: {error}"))?;
+    let game_id = resolved.game_id.clone();
+
+    let built_in_report = load_built_in_packs(live.built_in);
+    let mut packs: Vec<LoadedCrashPack> = live.packs.to_vec();
+    packs.extend(built_in_report.packs);
+
+    let instance_dir = ctx
+        .paths
+        .instance_dir(instance_id)
+        .map_err(|error| format!("the instance folder could not be resolved: {error}"))?;
+    let roots = InstanceRoots {
+        instance_dir,
+        runtime_dir: crash_runtime_root(ctx, instance_id),
+    };
+    let specs: Vec<SourceSpec<'_>> = packs
+        .iter()
+        .filter(|pack| {
+            pack.pack.games.is_empty() || pack.pack.games.iter().any(|game| game == &game_id)
+        })
+        .flat_map(|pack| {
+            pack.pack.sources.iter().map(|source| SourceSpec {
+                plugin_id: &pack.plugin_id,
+                source,
+            })
+        })
+        .collect();
+    let facts = NoArtifactFacts;
+    let collection = collect_sources(
+        &specs,
+        &roots,
+        &facts as &dyn ArtifactFacts,
+        session,
+        CollectionLimits::default(),
+    );
+    let explicit = explicit_files
+        .iter()
+        .filter_map(|path| {
+            let resolved = std::fs::canonicalize(path).ok()?;
+            (resolved.is_file()
+                && crate::crash_evidence::CrashEvidenceService::is_safe_text_path(&resolved))
+            .then_some(resolved)
+        })
+        .collect();
+
+    Ok(InstanceEvidence {
+        resolved,
+        packs,
+        window: session.window,
+        collection,
+        explicit,
+    })
+}
+
+/// Read a file the way the live path's copy would keep it, without writing a copy: whole up to the
+/// copy limit, else its head and tail.
+fn read_for_parsing(path: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let limits = CopyLimits::default();
+    let size = std::fs::metadata(path).ok()?.len();
+    if size <= limits.max_file_bytes {
+        return std::fs::read(path).ok();
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; limits.head_bytes as usize];
+    let read = file.read(&mut head).ok()?;
+    head.truncate(read);
+    file.seek(SeekFrom::End(-(limits.tail_bytes as i64))).ok()?;
+    let mut tail = vec![0u8; limits.tail_bytes as usize];
+    let read = file.read(&mut tail).ok()?;
+    tail.truncate(read);
+    head.extend_from_slice(&tail);
+    Some(head)
 }
 
 /// Load every installed plugin's crash packs, activating the script host for any that need it.
@@ -609,22 +883,6 @@ fn is_refused_load(fact: &Fact) -> bool {
 /// diagnosis, with its evidence copy and history, runs only when it finds one, so an ordinary
 /// clean session stores and copies nothing.
 fn has_refused_load(ctx: &Ctx, record: &SessionRecord, live: &LivePacks<'_>) -> bool {
-    let Ok(resolved) = crate::crash_engine::instance_view::resolve_crash_instance(
-        ctx,
-        &record.instance_id,
-        live.instances,
-    ) else {
-        return false;
-    };
-    let built_in_report = load_built_in_packs(live.built_in);
-    let mut packs: Vec<LoadedCrashPack> = live.packs.to_vec();
-    packs.extend(built_in_report.packs);
-    packs.retain(|pack| {
-        pack.pack.games.is_empty() || pack.pack.games.iter().any(|game| game == &resolved.game_id)
-    });
-    if packs.is_empty() {
-        return false;
-    }
     let Ok(window) = record_window(record) else {
         return false;
     };
@@ -632,45 +890,27 @@ fn has_refused_load(ctx: &Ctx, record: &SessionRecord, live: &LivePacks<'_>) -> 
         Some(ExitObservation::Code { pid, .. }) => Some(*pid),
         _ => None,
     };
-    let Ok(instance_dir) = ctx.paths.instance_dir(&record.instance_id) else {
-        return false;
-    };
-    // A parser-only look, so the preloader's log is not needed here.
-    let roots = InstanceRoots {
-        instance_dir,
-        runtime_dir: None,
-    };
     let session = CrashSession {
         session_id: record.session_id.clone(),
         pid,
         working_dir: None,
         window,
     };
-    let specs: Vec<SourceSpec<'_>> = packs
-        .iter()
-        .flat_map(|pack| {
-            pack.pack.sources.iter().map(|source| SourceSpec {
-                plugin_id: &pack.plugin_id,
-                source,
-            })
-        })
-        .collect();
-    let facts = NoArtifactFacts;
-    let collection = collect_sources(
-        &specs,
-        &roots,
-        &facts as &dyn ArtifactFacts,
-        &session,
-        CollectionLimits::default(),
-    );
-    let files = bound_files_for_probe(&collection);
+    let Ok(evidence) = collect_instance_evidence(ctx, &record.instance_id, live, &session, &[])
+    else {
+        return false;
+    };
+    if evidence.game_packs().next().is_none() {
+        return false;
+    }
+    let files = bound_files_for_probe(&evidence.collection);
     if files.is_empty() {
         return false;
     }
     let Ok(output) = crate::crash_engine::analyze(&AnalyzeInput {
-        packs: &packs,
+        packs: &evidence.packs,
         files: &files,
-        runtime_version: resolved.runtime_version.as_deref(),
+        runtime_version: evidence.resolved.runtime_version.as_deref(),
         host: live.host,
         built_in: live.built_in,
         instance: None,
@@ -843,19 +1083,26 @@ fn diagnose_record(
     record: &SessionRecord,
     live: &LivePacks<'_>,
 ) -> Result<Diagnosed, String> {
-    let resolved = crate::crash_engine::instance_view::resolve_crash_instance(
-        ctx,
-        &record.instance_id,
-        live.instances,
-    )
-    .map_err(|error| format!("the instance could not be read: {error}"))?;
+    let window = record_window(record)?;
+    let pid = match &record.exit {
+        Some(ExitObservation::Code { pid, .. }) => Some(*pid),
+        _ => None,
+    };
+    let session = CrashSession {
+        session_id: record.session_id.clone(),
+        pid,
+        working_dir: None,
+        window,
+    };
+    let InstanceEvidence {
+        resolved,
+        packs,
+        collection,
+        ..
+    } = collect_instance_evidence(ctx, &record.instance_id, live, &session, &[])?;
     let game_id = resolved.game_id.clone();
     let runtime_version = resolved.runtime_version.clone();
     let could_not_check = resolved.could_not_check.clone();
-
-    let built_in_report = load_built_in_packs(live.built_in);
-    let mut packs: Vec<LoadedCrashPack> = live.packs.to_vec();
-    packs.extend(built_in_report.packs);
     let game_packs: Vec<&LoadedCrashPack> = packs
         .iter()
         .filter(|pack| {
@@ -875,44 +1122,6 @@ fn diagnose_record(
             startup_refusal: false,
         });
     }
-
-    let window = record_window(record)?;
-    let pid = match &record.exit {
-        Some(ExitObservation::Code { pid, .. }) => Some(*pid),
-        _ => None,
-    };
-    let instance_dir = ctx
-        .paths
-        .instance_dir(&record.instance_id)
-        .map_err(|error| format!("the instance folder could not be resolved: {error}"))?;
-    let roots = InstanceRoots {
-        instance_dir,
-        runtime_dir: crash_runtime_root(ctx, &record.instance_id),
-    };
-
-    let session = CrashSession {
-        session_id: record.session_id.clone(),
-        pid,
-        working_dir: None,
-        window,
-    };
-    let specs: Vec<SourceSpec<'_>> = game_packs
-        .iter()
-        .flat_map(|pack| {
-            pack.pack.sources.iter().map(|source| SourceSpec {
-                plugin_id: &pack.plugin_id,
-                source,
-            })
-        })
-        .collect();
-    let facts = NoArtifactFacts;
-    let collection = collect_sources(
-        &specs,
-        &roots,
-        &facts as &dyn ArtifactFacts,
-        &session,
-        CollectionLimits::default(),
-    );
     // The verdict rests on the evidence, not on whether a rule understood it.
     let crash_artifact = primary_crash_artifact(&collection, &game_packs);
 
