@@ -660,3 +660,303 @@ mod tests {
         assert_eq!(provenance_text(&Mo2Provenance::Absent), "No meta.ini");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vortex (MASTER_SPEC §26.10)
+// ---------------------------------------------------------------------------
+
+use agora_core::game_import::vortex::{
+    self, VortexPlan, VortexRunReport, VortexScan, VortexRequest,
+};
+use agora_core::game_import::vortex_store;
+use agora_game_api::GameId;
+
+/// The Vortex store to read: the one given, or `%APPDATA%\Vortex\state.v2`. A machine with neither
+/// is told where we looked, rather than shown an empty list of games.
+fn resolve_vortex_store(store: Option<String>) -> Result<PathBuf, GamesError> {
+    match store.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(store) => Ok(PathBuf::from(store)),
+        None => vortex_store::default_store_path().ok_or_else(|| {
+            GamesError::new(
+                BAD_PATH,
+                "This computer names no user-data folder for Vortex. Pick the folder that holds state.v2.",
+            )
+        }),
+    }
+}
+
+/// The games and profiles a Vortex store holds, and whether Agora supports each game. Reads a copy
+/// of the store; Vortex must be closed (its lock is refused).
+#[tauri::command]
+pub async fn games_import_vortex_scan(
+    app: tauri::AppHandle,
+    store: Option<String>,
+) -> Result<VortexScan, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<VortexScan, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(store)?;
+        let inventory = installed_games(&ctx);
+        vortex::scan(&ctx, &inventory, &store).map_err(core_failed)
+    })
+    .await
+    .map_err(|_| {
+        GamesError::new(
+            TASK_FAILED,
+            "Reading the Vortex store did not finish.",
+        )
+    })?
+}
+
+/// One Vortex import request. `dry_run` plans and reports; otherwise the profile is imported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexImportRequest {
+    /// The folder that holds `state.v2`; `None` uses the usual place.
+    #[serde(default)]
+    pub store: Option<String>,
+    /// Agora's game id, as the scan lists it.
+    pub game: String,
+    /// The Vortex profile, by name.
+    pub profile: String,
+    pub name: Option<String>,
+    pub dry_run: bool,
+    #[serde(default)]
+    pub install: Option<String>,
+}
+
+/// What `games_import_vortex` answered: the plan for a dry run, or the report of an import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VortexImportReply {
+    Plan(Box<VortexPlanDto>),
+    Run(Box<VortexRunDto>),
+}
+
+/// Plan or import one Vortex profile. Reads the store and copies mods, so the work runs on a
+/// blocking thread.
+#[tauri::command]
+pub async fn games_import_vortex(
+    app: tauri::AppHandle,
+    request: VortexImportRequest,
+) -> Result<VortexImportReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<VortexImportReply, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(request.store)?;
+        let game = GameId::new(&request.game).map_err(|error| {
+            GamesError::new(
+                CORE_FAILED,
+                format!("'{}' is not a game id: {error}", request.game),
+            )
+        })?;
+        let core_request = VortexRequest {
+            store,
+            game,
+            profile: request.profile,
+            name: request
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+        };
+        let inventory = installed_games(&ctx);
+        if request.dry_run {
+            let plan = vortex::plan(&ctx, &inventory, &core_request).map_err(import_failed)?;
+            return Ok(VortexImportReply::Plan(Box::new(VortexPlanDto::from(&plan))));
+        }
+        let report = vortex::run(
+            &ctx,
+            &inventory,
+            &core_request,
+            RunOptions::default(),
+            &|_| {},
+        )
+        .map_err(import_failed)?;
+        Ok(VortexImportReply::Run(Box::new(VortexRunDto::from(&report))))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Importing the Vortex profile did not finish."))?
+}
+
+/// The plan, in the fields the import screen shows. Nothing here is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexPlanDto {
+    pub store: String,
+    pub vortex_game: String,
+    pub game_id: String,
+    pub game_name: String,
+    pub profile: String,
+    pub instance_name: String,
+    pub install_id: String,
+    pub install_location: String,
+    pub staging: String,
+    pub mods: Vec<VortexModDto>,
+    pub mods_enabled: usize,
+    pub mods_disabled: usize,
+    pub files: usize,
+    pub bytes: u64,
+    pub manifest: VortexManifestDto,
+    /// The mod ids in layer order, highest first.
+    pub order: Vec<String>,
+    pub disagreements: Vec<VortexDisagreementDto>,
+    pub plugins: VortexPluginsDto,
+    pub problems: Vec<ProblemDto>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexModDto {
+    pub mod_id: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub nexus_mod_id: Option<u64>,
+    pub nexus_file_id: Option<u64>,
+    pub folder: String,
+    pub enabled: bool,
+    pub files: usize,
+    pub bytes: u64,
+    /// What the store claims, in words. A claim is never checked against a download.
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexManifestDto {
+    pub path: String,
+    pub found: bool,
+    pub files: usize,
+    pub matched: usize,
+    pub damaged: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexDisagreementDto {
+    pub file: String,
+    pub manifest_supplied: String,
+    pub rules_supply: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexPluginsDto {
+    pub kept: bool,
+    pub listed: usize,
+    pub active: usize,
+    pub notes: Vec<String>,
+}
+
+impl From<&VortexPlan> for VortexPlanDto {
+    fn from(plan: &VortexPlan) -> Self {
+        Self {
+            store: plan.store.to_string_lossy().into_owned(),
+            vortex_game: plan.vortex_game.clone(),
+            game_id: plan.game.as_str().to_string(),
+            game_name: plan.game_name.clone(),
+            profile: plan.profile.clone(),
+            instance_name: plan.instance_name.clone(),
+            install_id: plan.install_id.clone(),
+            install_location: plan.install_location.to_string_lossy().into_owned(),
+            staging: plan.staging.to_string_lossy().into_owned(),
+            mods: plan
+                .mods
+                .iter()
+                .map(|m| VortexModDto {
+                    mod_id: m.mod_id.clone(),
+                    name: m.name.clone(),
+                    version: m.version.clone(),
+                    nexus_mod_id: m.nexus_mod_id,
+                    nexus_file_id: m.nexus_file_id,
+                    folder: m.folder.clone(),
+                    enabled: m.enabled,
+                    files: m.files,
+                    bytes: m.bytes,
+                    provenance: vortex_provenance_text(&m.provenance),
+                })
+                .collect(),
+            mods_enabled: plan.mods_enabled,
+            mods_disabled: plan.mods_disabled,
+            files: plan.files,
+            bytes: plan.bytes,
+            manifest: VortexManifestDto {
+                path: plan.manifest.path.to_string_lossy().into_owned(),
+                found: plan.manifest.found,
+                files: plan.manifest.files,
+                matched: plan.manifest.matched,
+                damaged: plan.manifest.damaged.clone(),
+            },
+            order: plan.order.clone(),
+            disagreements: plan
+                .disagreements
+                .iter()
+                .map(|d| VortexDisagreementDto {
+                    file: d.file.clone(),
+                    manifest_supplied: d.manifest_supplied.clone(),
+                    rules_supply: d.rules_supply.clone(),
+                })
+                .collect(),
+            plugins: VortexPluginsDto {
+                kept: plan.plugins.kept,
+                listed: plan.plugins.lines.len(),
+                active: plan.plugins.active,
+                notes: plan.plugins.notes.clone(),
+            },
+            problems: plan
+                .problems
+                .iter()
+                .map(|p| ProblemDto {
+                    line: p.line,
+                    entry: p.entry.clone(),
+                    reason: p.reason.clone(),
+                })
+                .collect(),
+            warnings: plan.warnings.clone(),
+        }
+    }
+}
+
+/// What a Vortex import did, after its plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexRunDto {
+    pub instance_id: Option<String>,
+    pub instance_name: String,
+    pub stored_mods: usize,
+    pub content_layers: usize,
+    pub disabled_layers: usize,
+    pub duplicates: Vec<String>,
+    pub plugins_written: Option<usize>,
+    pub plugin_findings: Vec<String>,
+    pub next_steps: Vec<String>,
+}
+
+impl From<&VortexRunReport> for VortexRunDto {
+    fn from(report: &VortexRunReport) -> Self {
+        Self {
+            instance_id: report.instance_id.clone(),
+            instance_name: report.plan.instance_name.clone(),
+            stored_mods: report.stored_mods,
+            content_layers: report.content_layers,
+            disabled_layers: report.disabled_layers,
+            duplicates: report.duplicates.clone(),
+            plugins_written: report.plugins_written,
+            plugin_findings: report.plugin_findings.clone(),
+            next_steps: report.next_steps.clone(),
+        }
+    }
+}
+
+fn vortex_provenance_text(provenance: &agora_core::content_store::VortexProvenance) -> String {
+    use agora_core::content_store::VortexProvenance;
+    match provenance {
+        VortexProvenance::Claimed {
+            modid: Some(id), ..
+        } => format!("Nexus mod {id} (not checked)"),
+        VortexProvenance::Claimed { modid: None, .. } => "No Nexus mod ID in the store".to_string(),
+        VortexProvenance::Absent => "No provenance in the store".to_string(),
+    }
+}

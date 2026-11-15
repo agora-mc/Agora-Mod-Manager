@@ -401,6 +401,7 @@ fn resolve_template(template: &str, vars: &[(&str, &str)]) -> Result<String, Str
 /// List what an import would bring: every game Vortex has mods for, its profiles, and whether the
 /// game folder Vortex discovered is one Agora supports. Reads the store only; writes nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VortexScan {
     pub store: PathBuf,
     pub games: Vec<VortexScanGame>,
@@ -408,6 +409,7 @@ pub struct VortexScan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VortexScanGame {
     /// Vortex's own game id.
     pub vortex_game: String,
@@ -427,6 +429,7 @@ pub struct VortexScanGame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VortexScanProfile {
     pub id: String,
     pub name: String,

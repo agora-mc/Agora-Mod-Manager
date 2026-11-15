@@ -591,6 +591,8 @@ pub fn run() {
             games::tools::games_tools_use_output,
             games::import::games_import_mo2_scan,
             games::import::games_import_mo2,
+            games::import::games_import_vortex_scan,
+            games::import::games_import_vortex,
             games::catalog::games_catalog_list,
             games::catalog::games_catalog_install,
             games::user_files::games_user_files_status,

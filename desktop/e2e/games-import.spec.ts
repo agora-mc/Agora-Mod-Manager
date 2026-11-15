@@ -395,6 +395,130 @@ test.describe('Import dialog', () => {
     await expect(page.getByTestId('import-plan').getByRole('alert')).toContainText('not this game');
     await expect(page.getByRole('button', { name: 'Import as a new instance' })).toBeDisabled();
   });
+
+  test('imports a Vortex profile through the same dialog', async ({ page }) => {
+    const vortexScan = {
+      store: 'C:/Users/me/AppData/Roaming/Vortex/state.v2',
+      games: [
+        {
+          vortexGame: 'vortextestgame',
+          game: 'skyrim-se',
+          gameName: 'Skyrim Special Edition',
+          supported: true,
+          reason: null,
+          discoveredPath: 'D:/Games/Skyrim Special Edition',
+          staging: 'C:/Users/me/AppData/Roaming/Vortex/vortextestgame/mods',
+          stagingError: null,
+          mods: 1,
+          profiles: [{ id: 'p1', name: 'Main', modsEnabled: 1, modsTotal: 1, pluginsTxt: true, loadorderTxt: true }],
+          manifestFound: true,
+        },
+      ],
+      warnings: [],
+    };
+    const vortexPlan = {
+      kind: 'plan',
+      store: vortexScan.store,
+      vortexGame: 'vortextestgame',
+      gameId: 'skyrim-se',
+      gameName: 'Skyrim Special Edition',
+      profile: 'Main',
+      instanceName: 'Main (Vortex import)',
+      installId: 'steam:489830',
+      installLocation: 'D:/Games/Skyrim Special Edition',
+      staging: vortexScan.games[0].staging,
+      mods: [
+        {
+          modId: 'mod-a',
+          name: 'Alpha Mod',
+          version: '1.0',
+          nexusModId: 101,
+          nexusFileId: 11,
+          folder: 'Alpha Folder',
+          enabled: true,
+          files: 2,
+          bytes: 2048,
+          provenance: 'Nexus mod 101 (not checked)',
+        },
+      ],
+      modsEnabled: 1,
+      modsDisabled: 0,
+      files: 2,
+      bytes: 2048,
+      manifest: {
+        path: 'D:/Games/Skyrim Special Edition/Data/vortex.deployment.json',
+        found: true,
+        files: 1,
+        matched: 1,
+        damaged: null,
+      },
+      order: ['mod-a'],
+      disagreements: [{ file: 'shared.txt', manifestSupplied: 'Beta Mod', rulesSupply: 'Alpha Mod' }],
+      plugins: { kept: true, listed: 1, active: 1, notes: [] },
+      problems: [],
+      warnings: [],
+    };
+    const vortexRun = {
+      kind: 'run',
+      instanceId: 'inst-10',
+      instanceName: 'Main (Vortex import)',
+      storedMods: 1,
+      contentLayers: 1,
+      disabledLayers: 0,
+      duplicates: [],
+      pluginsWritten: 1,
+      pluginFindings: [],
+      nextSteps: ["Vortex's downloads were not copied; mods are stored as they are in the staging folder"],
+    };
+    await boot(
+      page,
+      [
+        { command: 'games_import_vortex', match: { dryRun: true }, reply: vortexPlan },
+        { command: 'games_import_vortex', match: { dryRun: false }, reply: vortexRun },
+      ],
+      { games_import_mo2_scan: { setups: [], warnings: [] }, games_import_vortex_scan: vortexScan },
+    );
+
+    await openImport(page);
+    await page.getByRole('button', { name: 'Vortex', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Import from Vortex' })).toBeVisible();
+    await page.getByTestId('vortex-profile-p1').click();
+
+    await expect(page.getByTestId('vortex-plan')).toBeVisible();
+    await expect(page.getByTestId('vortex-plan-mods')).toContainText('1 enabled mod');
+    await expect(page.getByTestId('vortex-plan-disagreements')).toContainText('shared.txt');
+
+    await page.getByRole('button', { name: 'Import as a new instance' }).click();
+    await page.getByRole('button', { name: 'Import profile', exact: true }).click();
+
+    const done = page.getByTestId('vortex-run');
+    await expect(done).toContainText('Imported as “Main (Vortex import)”');
+    await expect(done).toContainText('1 mod stored');
+  });
+
+  test('a Vortex store Vortex is running on says to close Vortex first', async ({ page }) => {
+    await boot(
+      page,
+      [
+        {
+          command: 'games_import_vortex_scan',
+          error: {
+            code: 'core_failed',
+            message:
+              'cannot read the Vortex state store: Vortex is running (it holds the lock on C:/Vortex/state.v2). Close Vortex completely, then try again',
+          },
+        },
+      ],
+      { games_import_mo2_scan: { setups: [], warnings: [] } },
+    );
+
+    await openImport(page);
+    await page.getByRole('button', { name: 'Vortex', exact: true }).click();
+
+    const error = page.getByTestId('vortex-scan-error');
+    await expect(error).toContainText('Close Vortex first');
+    await expect(error).toContainText('Close Vortex completely');
+  });
 });
 
 test.describe('Browse curated items', () => {
