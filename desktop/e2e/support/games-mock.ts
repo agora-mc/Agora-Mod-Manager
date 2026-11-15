@@ -57,8 +57,13 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
         // A game with no load order lists keeps the single-list wording, and a game page's
         // content tab asks for the tools that run on one item. Specs that need rows pass their own.
         games_plugins_lists: { lists: [] },
-        // The Plugins tab reads the user's load order rules for the section under the table.
+        // The Plugins tab reads the user's load order rules for the section under the table. A
+        // list with no overlaps reader asks for no conflicts, and a spec that drives the two
+        // actions answers those itself.
         games_plugins_rules: { rules: [] },
+        games_plugins_conflicts: { pairs: [], patched: 0, decided: 0, implicitPairs: 0, notes: [] },
+        games_plugins_rule_add: { changed: true, rules: [], overlaps: null, overlapsError: null },
+        games_plugins_rule_remove: { changed: true, rules: [], overlaps: null, overlapsError: null },
         games_tools_list: { instanceId: '', tools: [], known: [] },
         // The sharing setting lives on the Minecraft Settings page; a game-page
         // spec never changes it, but answering it keeps an errant visit honest.
