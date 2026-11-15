@@ -1573,6 +1573,116 @@ fn crash_investigate_finds_a_game_instances_pack_declared_logs() {
     );
 }
 
+/// A crash pack may name a whole folder as its source. `crash investigate` must read the files
+/// inside it, not quietly report nothing because no single file matched.
+#[test]
+fn crash_investigate_reads_a_folder_unit_source() {
+    let (_tmp, data_dir) = temp_data_dir();
+    run_agora(&data_dir, &["paths"]);
+    create_vanilla_instance(&data_dir, "crash-folder", "1.21");
+    install_folder_crash_pack(&data_dir);
+    let inner = data_dir.join("instances/crash-folder/event-logs/case-1/inner");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(
+        inner.join("evidence.log"),
+        "invented evidence in a folder source
+",
+    )
+    .unwrap();
+
+    let output = run_agora_json(&data_dir, &["crash", "investigate", "crash-folder"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed = assert_json_stdout(&output);
+    let names: Vec<&str> = parsed["files"]
+        .as_array()
+        .expect("files are an array")
+        .iter()
+        .filter_map(|file| file["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"inner/evidence.log"),
+        "the file inside the folder source was not read: {parsed}"
+    );
+}
+
+/// Register a development crash pack whose one source is a folder, in the data root the CLI opens.
+fn install_folder_crash_pack(data_dir: &Path) {
+    use agora_core::plugins::store::{self, PluginSource};
+    use agora_plugin_api::capability::{Capability, CapabilitySet};
+    use agora_plugin_api::manifest::PluginManifest;
+
+    let folder = data_dir.join("folder-pack-plugin");
+    std::fs::create_dir_all(folder.join("crash")).unwrap();
+    std::fs::write(
+        folder.join("agora-plugin.json"),
+        r#"{
+  "manifest": 1,
+  "id": "acme.folders",
+  "name": "Acme folder evidence",
+  "version": "1.0.0",
+  "license": "MIT",
+  "apiRange": ">=0.1, <0.2",
+  "capabilities": { "required": ["crash:contribute"] },
+  "contributions": { "crashPacks": [{ "path": "crash/pack.json" }] }
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("crash/pack.json"),
+        r#"{
+  "contract": 1,
+  "games": ["minecraft"],
+  "sources": [{
+    "id": "event_cases",
+    "where": { "root": "instance", "path": "event-logs" },
+    "match": { "glob": "case-*" },
+    "unit": "folder",
+    "format": "folder_evidence",
+    "bind": [{ "time": { "before_s": 5, "after_s": 30 } }]
+  }],
+  "parsers": [{
+    "id": "folder_evidence",
+    "detect": { "all": ["(?m)^invented evidence"] },
+    "entry": { "generic": { "name": "text_sections", "config": {
+      "sections": [{
+        "id": "evidence",
+        "header": "^invented evidence",
+        "lines": [{
+          "pattern": "^(?P<text>invented evidence.*)$",
+          "kind": "core.log_line",
+          "attrs": { "text": "text" }
+        }]
+      }]
+    } } }
+  }]
+}"#,
+    )
+    .unwrap();
+    let paths = agora_core::app_paths::AppPaths::from_root(data_dir.to_path_buf());
+    let conn = agora_core::db::local_state_connection(&paths.local_state_db()).unwrap();
+    let manifest =
+        PluginManifest::parse(&std::fs::read_to_string(folder.join("agora-plugin.json")).unwrap())
+            .unwrap();
+    let mut granted = CapabilitySet::new();
+    granted.insert(Capability::CrashContribute);
+    store::upsert(
+        &conn,
+        &manifest,
+        &granted,
+        &PluginSource::Development {
+            path: folder.clone(),
+        },
+        &folder,
+        true,
+        "2026-01-01T00:00:00Z",
+    )
+    .unwrap();
+}
+
 fn invented_crash_logger_log() -> String {
     "CRASH TIME: 2026-01-01 12:00:00
      Skyrim SSE v1.6.1170

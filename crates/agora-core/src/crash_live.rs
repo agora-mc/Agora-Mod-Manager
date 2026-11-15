@@ -366,24 +366,32 @@ impl InstanceEvidence {
         })
     }
 
-    /// Bound files, primary first, newest first, then explicit files. The first primary source is
-    /// the crash log; any other is supporting evidence.
-    fn ordered_bound(&self) -> Vec<(bool, &FoundArtifact)> {
-        let mut files: Vec<(bool, &FoundArtifact)> = self
+    /// Bound artifacts, primary first and newest first. A folder source stays whole; its files are
+    /// read when the analyzer needs them.
+    fn ordered_bound_artifacts(&self) -> Vec<(bool, &FoundArtifact)> {
+        let mut found: Vec<(bool, &FoundArtifact)> = self
             .collection
             .bound
             .iter()
-            .filter(|found| found.unit == agora_game_api::crash::ArtifactUnit::File)
-            .map(|found| (self.is_primary(found), found))
+            .map(|artifact| (self.is_primary(artifact), artifact))
             .collect();
-        files.sort_by(|left, right| {
+        found.sort_by(|left, right| {
             right
                 .0
                 .cmp(&left.0)
                 .then_with(|| right.1.modified.cmp(&left.1.modified))
                 .then_with(|| left.1.name.cmp(&right.1.name))
         });
-        files
+        found
+    }
+
+    /// Bound files only, for the evidence list and the legacy collected view. A folder is one
+    /// source, not one crash log.
+    fn ordered_bound(&self) -> Vec<(bool, &FoundArtifact)> {
+        self.ordered_bound_artifacts()
+            .into_iter()
+            .filter(|(_, found)| found.unit == agora_game_api::crash::ArtifactUnit::File)
+            .collect()
     }
 
     /// The evidence lines `crash investigate` prints, in reading order.
@@ -449,19 +457,25 @@ impl InstanceEvidence {
     /// would keep it.
     pub fn files(&self) -> Vec<crate::crash_engine::CrashFile> {
         use crate::crash_engine::CrashFile;
-        let mut files: Vec<CrashFile> = self
-            .ordered_bound()
-            .into_iter()
-            .filter_map(|(_, found)| {
-                let bytes = read_for_parsing(&found.path)?;
-                Some(CrashFile {
-                    name: found.name.clone(),
-                    bytes,
-                    origin: crate::crash_engine::CrashFileOrigin::Collected,
-                    source: Some(found.source_id.clone()),
-                })
-            })
-            .collect();
+        let mut files: Vec<CrashFile> = Vec::new();
+        for (_, found) in self.ordered_bound_artifacts() {
+            match found.unit {
+                agora_game_api::crash::ArtifactUnit::File => {
+                    let Some(bytes) = read_for_parsing(&found.path) else {
+                        continue;
+                    };
+                    files.push(CrashFile {
+                        name: found.name.clone(),
+                        bytes,
+                        origin: crate::crash_engine::CrashFileOrigin::Collected,
+                        source: Some(found.source_id.clone()),
+                    });
+                }
+                agora_game_api::crash::ArtifactUnit::Folder => {
+                    files.extend(folder_crash_files(found));
+                }
+            }
+        }
         for path in &self.explicit {
             let Some(bytes) = read_for_parsing(path) else {
                 continue;
@@ -547,6 +561,86 @@ pub fn collect_instance_evidence(
         collection,
         explicit,
     })
+}
+
+/// Read a folder source's files as analyzer inputs, without copying the folder. The walk follows
+/// the same copy limits, reparse-point rule and child copy policy as the live path's store copy, so
+/// a folder source finds the same files whether a session or `crash investigate` reads it.
+fn folder_crash_files(found: &FoundArtifact) -> Vec<crate::crash_engine::CrashFile> {
+    use crate::crash_engine::CrashFile;
+    use agora_game_api::crash::CopyPolicy;
+
+    let limits = CopyLimits::default();
+    let mut files = Vec::new();
+    let mut stack = vec![(found.path.clone(), 0usize)];
+    let mut entries = 0usize;
+    while let Some((folder, depth)) = stack.pop() {
+        if depth > limits.max_depth {
+            break;
+        }
+        let Ok(read) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in read {
+            entries += 1;
+            if entries > limits.max_entries {
+                break;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if crate::content_store::is_reparse_point_or_symlink(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                stack.push((path, depth + 1));
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let relative = relative_artifact_name(&found.path, &path);
+            if !crate::crash_engine::evidence::is_safe_artifact_name(&relative) {
+                continue;
+            }
+            let child = found.children.iter().find(|policy| {
+                let name = relative.rsplit('/').next().unwrap_or(&relative);
+                crate::crash_engine::evidence::glob_matches(&policy.glob, &relative)
+                    || crate::crash_engine::evidence::glob_matches(&policy.glob, name)
+            });
+            let copy = child.map(|policy| policy.copy).unwrap_or(found.copy);
+            if matches!(copy, CopyPolicy::Never | CopyPolicy::FactsOnly) {
+                continue;
+            }
+            let Some(bytes) = read_for_parsing(&path) else {
+                continue;
+            };
+            files.push(CrashFile {
+                name: relative,
+                bytes,
+                origin: crate::crash_engine::CrashFileOrigin::Collected,
+                source: Some(found.source_id.clone()),
+            });
+        }
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+    files
+}
+
+fn relative_artifact_name(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Read a file the way the live path's copy would keep it, without writing a copy: whole up to the
