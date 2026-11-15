@@ -106,6 +106,22 @@ fn args(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|p| p.to_string()).collect()
 }
 
+/// Spawn a just-copied test program, retrying the Linux race where it briefly reads as busy
+/// because a sibling test forked while the copy was open for writing and its child still holds
+/// that write handle until it execs.
+fn spawn_retrying_etxtbsy(command: &mut Command) -> std::process::Child {
+    let mut tries = 0;
+    loop {
+        match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result.expect("the crasher starts"),
+        }
+    }
+}
+
 fn watch(
     dir: &Path,
     images: &[&str],
@@ -497,12 +513,12 @@ fn an_ended_process_someone_still_holds_is_not_running() {
     let exe = dir.path().join(crasher().file_name().unwrap());
     std::fs::copy(crasher(), &exe).unwrap();
 
-    let mut held = Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .args(["exit", "0"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    let mut held = spawn_retrying_etxtbsy(&mut command);
     let deadline = Instant::now() + Duration::from_secs(20);
     // `try_wait` sees the exit and keeps the handle open, as the watcher does.
     while held.try_wait().unwrap().is_none() {
