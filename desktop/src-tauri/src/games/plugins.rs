@@ -262,6 +262,10 @@ fn finding_view(finding: &Finding) -> PluginFinding {
         Finding::RuleConflict { first, second, .. } => vec![first.clone(), second.clone()],
         Finding::MissingRuleItem { item, .. } => vec![item.clone()],
         Finding::ListLevel { items, .. } => items.clone(),
+        Finding::SorterMoves { moves, .. } => moves
+            .iter()
+            .map(|movement| movement.plugin.clone())
+            .collect(),
         Finding::RulesFailed { .. } => Vec::new(),
     };
     PluginFinding {

@@ -1355,15 +1355,16 @@ pub fn launch_checks(
     } else {
         Some(orders.iter().map(|order| order.entries.len()).sum())
     };
-    let mut load_order: Vec<crate::game_load_order::Finding> = orders
+    let order_findings: Vec<crate::game_load_order::Finding> = orders
         .iter()
         .flat_map(|order| order.findings.iter().cloned())
         .collect();
-    // Overlaps are checked here, not on a plain list read: the check can afford the reader's run,
-    // and the cache it fills is what a plain read shows afterwards.
-    load_order.extend(crate::game_load_order::overlap_findings(
-        ctx, id, definition, &orders,
-    ));
+    let order_is_clean = order_findings.is_empty();
+    // Overlaps and LOOT are checked here, not on a plain list read: the check can afford their
+    // run, and the caches they fill are what a plain read shows afterwards. The same function
+    // makes the launch's findings, so the two cannot print different lines.
+    let load_order =
+        crate::game_load_order::instance_findings(ctx, id, definition, &orders, links.as_ref());
     let outputs =
         crate::game_tools::output_findings_with_view(ctx, id, definition, links.as_ref())?;
     let requirements = crate::catalog_install::requirement_findings(ctx, id, definition);
@@ -1376,7 +1377,7 @@ pub fn launch_checks(
         });
     }
     if let Some(count) = plugin_count {
-        if load_order.is_empty() {
+        if order_is_clean {
             passed.push(PassedCheck {
                 kind: "load_order",
                 title: "Plugin load order".to_string(),
@@ -1901,7 +1902,16 @@ fn prepare_deployed(
     };
     // The deploy has synced the plugin list, so this is the order the game will read. Nothing has
     // been swapped in yet: a refused launch leaves the user's files as they were.
-    let load_order_findings = check_load_order(ctx, id, definition, options.launch_anyway, links)?;
+    let orders =
+        crate::game_load_order::orders_with_view(ctx, id, definition, links).map_err(|error| {
+            InstanceError::Other(format!("cannot check the plugin load order: {error}"))
+        })?;
+    // The same findings `games instance check` prints, from the same function: each list's own
+    // problems, the overlaps pass and LOOT's checks.
+    let load_order_findings = crate::game_launch::refuse_load_order(
+        crate::game_load_order::instance_findings(ctx, id, definition, &orders, links),
+        options.launch_anyway,
+    )?;
     // Stale or unknown tool output is a warning: the launch goes on (MASTER_SPEC §26.9).
     let generated_findings =
         crate::game_tools::output_findings_with_view(ctx, id, definition, links)
@@ -1909,8 +1919,6 @@ fn prepare_deployed(
     // The same warnings `games instance check` prints, from the same two sources: the game
     // package's diagnostics hook over this launch's order, and the mods' unmet requirements.
     let manifest_for_checks = get_manifest(ctx, id)?;
-    let orders = crate::game_load_order::orders_with_view(ctx, id, definition, links)
-        .map_err(|error| InstanceError::Other(error.to_string()))?;
     let diagnostics = diagnostics_for_orders(
         ctx,
         definition,
@@ -2039,27 +2047,6 @@ fn prepare_deployed(
         diagnostics,
         requirements,
     })
-}
-
-/// The load order findings a launch carries, after the plugin list is synced. A refusing finding
-/// refuses with [`LaunchError::LoadOrderProblems`] unless `launch_anyway`. A game with no plugin
-/// list has no load order to check.
-fn check_load_order(
-    ctx: &Ctx,
-    id: &str,
-    definition: &GameDefinition,
-    launch_anyway: bool,
-    links: Option<&crate::game_deploy::DeploymentPlan>,
-) -> Result<Vec<crate::game_load_order::Finding>, InstanceError> {
-    if definition.load_orders.is_empty() {
-        return Ok(Vec::new());
-    }
-    let findings = crate::game_load_order::check_all_with_view(ctx, id, definition, links)
-        .map_err(|e| InstanceError::Other(format!("cannot check the plugin load order: {e}")))?;
-    Ok(crate::game_launch::refuse_load_order(
-        findings,
-        launch_anyway,
-    )?)
 }
 
 /// Start a prepared launch. When it runs under the virtual file system and that cannot start,

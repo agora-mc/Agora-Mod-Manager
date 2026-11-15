@@ -863,6 +863,11 @@ pub struct SorterReply {
     /// Notes about the list as a whole, with no item.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub general: Vec<SorterNote>,
+    /// The sorter's own checks at their level: cleaning counts, incompatibilities and missing
+    /// requirements (MASTER_SPEC §31.6). They are always shown, unlike an `info` message from
+    /// `notes`, which stays in the plugin view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<SorterNote>,
 }
 
 /// One plugin's copy of a record, as an overlaps reader reports it.

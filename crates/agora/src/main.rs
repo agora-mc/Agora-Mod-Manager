@@ -901,6 +901,9 @@ enum InstancePluginsCmd {
         /// Load order id; the game's first list when omitted.
         #[arg(long)]
         list: Option<String>,
+        /// Name each move LOOT would make, not just how many.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Update what the list's sorter keeps, if the list declares an update hook.
     Masterlist {
@@ -11594,7 +11597,7 @@ fn plugins_load_order_command(
                 Err(e) => fail(e.to_string()),
             }
         }
-        InstancePluginsCmd::Check { .. } => {
+        InstancePluginsCmd::Check { verbose, .. } => {
             match load_order::check_in(ctx, &instance_id, game_def, list_id.as_deref()) {
                 Ok(findings) => {
                     // Only a finding a launch refuses for exits 1; warnings are printed and exit 0.
@@ -11619,6 +11622,13 @@ fn plugins_load_order_command(
                     } else {
                         for f in &findings {
                             println!("- {}", f.message());
+                            if verbose {
+                                if let load_order::Finding::SorterMoves { moves, .. } = f {
+                                    for line in sorter_move_lines(moves) {
+                                        println!("{line}");
+                                    }
+                                }
+                            }
                         }
                         if let Some(hint) = sort_hint(&instance_id, &findings) {
                             println!("{hint}");
@@ -11743,6 +11753,7 @@ fn plugins_load_order_command(
                     "pairs": report.pairs,
                     "patched": report.patched,
                     "decided": report.decided,
+                    "decided_pairs": report.decided_pairs,
                     "implicit_pairs": report.implicit_pairs,
                     "notes": report.notes,
                 });
@@ -11887,6 +11898,80 @@ fn overlap_failure_message(error: agora_core::game_load_order::LoadOrderError) -
     }
 }
 
+/// The moves LOOT would make, one line each, for `plugins check --verbose`.
+fn sorter_move_lines(moves: &[agora_core::game_load_order::SortMove]) -> Vec<String> {
+    moves
+        .iter()
+        .map(|movement| {
+            format!(
+                "  - '{}' moves from position {} to {}.",
+                movement.plugin, movement.from, movement.to
+            )
+        })
+        .collect()
+}
+
+/// What a plugin filter says about one plugin: each pair it wins or loses, and the pairs the
+/// player's own rule decides. Returned as lines so the wording can be tested without stdout.
+fn overlap_plugin_lines(
+    name: &str,
+    report: &agora_core::game_load_order::OverlapReport,
+) -> Vec<String> {
+    let wins = report.wins_over(name);
+    let loses = report.losers_of(name);
+    let decided_wins = report.decided_wins_over(name);
+    let decided_loses = report.decided_losers_of(name);
+    if wins.is_empty() && loses.is_empty() && decided_wins.is_empty() && decided_loses.is_empty() {
+        return vec![format!(
+            "'{name}' neither wins nor loses any record changes."
+        )];
+    }
+    let mut lines = Vec::new();
+    for (other, count) in &wins {
+        lines.push(format!(
+            "'{name}' replaces {} change{} made by '{other}'.",
+            count,
+            if *count == 1 { "" } else { "s" }
+        ));
+    }
+    for (other, count) in &loses {
+        lines.push(format!(
+            "'{name}' loses {} change{} to '{other}'.",
+            count,
+            if *count == 1 { "" } else { "s" }
+        ));
+    }
+    for (other, count) in &decided_wins {
+        lines.push(format!(
+            "'{name}' replaces {} change{} made by '{other}', as your rule decides.",
+            count,
+            if *count == 1 { "" } else { "s" }
+        ));
+    }
+    for (other, count) in &decided_loses {
+        lines.push(format!(
+            "'{name}' loses {} change{} to '{other}' by your choice.",
+            count,
+            if *count == 1 { "" } else { "s" }
+        ));
+    }
+    lines
+}
+
+/// The summary line for pairs a patch handles and pairs a rule decides, when there are any.
+fn overlap_patch_line(report: &agora_core::game_load_order::OverlapReport) -> Option<String> {
+    if report.patched == 0 && report.decided == 0 {
+        return None;
+    }
+    Some(format!(
+        "{} pair{} {} handled by a patch; {} decided by your rules.",
+        report.patched,
+        if report.patched == 1 { "" } else { "s" },
+        if report.patched == 1 { "is" } else { "are" },
+        report.decided
+    ))
+}
+
 /// Print one overlaps report. A plugin filter shows only the pairs that name it, and says what it
 /// wins and loses.
 fn print_overlap_report(
@@ -11906,25 +11991,8 @@ fn print_overlap_report(
     };
     let conflicts: usize = pairs.iter().map(|pair| pair.count).sum();
     if let Some(name) = plugin {
-        let wins = report.wins_over(name);
-        let loses = report.losers_of(name);
-        if wins.is_empty() && loses.is_empty() {
-            println!("'{name}' neither wins nor loses any record changes.");
-        } else {
-            for (other, count) in &wins {
-                println!(
-                    "'{name}' replaces {} change{} made by '{other}'.",
-                    count,
-                    if *count == 1 { "" } else { "s" }
-                );
-            }
-            for (other, count) in &loses {
-                println!(
-                    "'{name}' loses {} change{} to '{other}'.",
-                    count,
-                    if *count == 1 { "" } else { "s" }
-                );
-            }
+        for line in overlap_plugin_lines(name, report) {
+            println!("{line}");
         }
     }
     if pairs.is_empty() {
@@ -11966,13 +12034,8 @@ fn print_overlap_report(
             }
         }
     }
-    if report.patched > 0 || report.decided > 0 {
-        println!(
-            "{} pair{} patched by its winner; {} decided by your rules.",
-            report.patched,
-            if report.patched == 1 { "" } else { "s" },
-            report.decided
-        );
+    if let Some(line) = overlap_patch_line(report) {
+        println!("{line}");
     }
     if report.implicit_pairs > 0 {
         println!(
@@ -15834,8 +15897,9 @@ mod swap_cost_text {
 #[cfg(test)]
 mod tool_fallback_text {
     use super::{
-        merge_offers, switch_to_links_lines, tool_run_command, vfs_fallback_step, vfs_next_tier,
-        vfs_offer_lines, vfs_tool_envelope, VfsFallbackStep,
+        merge_offers, overlap_patch_line, overlap_plugin_lines, sorter_move_lines,
+        switch_to_links_lines, tool_run_command, vfs_fallback_step, vfs_next_tier, vfs_offer_lines,
+        vfs_tool_envelope, VfsFallbackStep,
     };
     use agora_core::game_tools::{CaptureMode, ToolError, ToolOffer};
 
@@ -15938,6 +16002,65 @@ mod tool_fallback_text {
         assert!(
             lines.contains("agora games instance set-deployment inst-1 links"),
             "{lines}"
+        );
+    }
+    #[test]
+    fn a_plugin_filter_says_a_decided_loss_is_the_players_choice() {
+        use agora_core::game_load_order::{ConflictPair, OverlapReport};
+
+        let report = OverlapReport {
+            decided: 1,
+            decided_pairs: vec![ConflictPair {
+                winner: "B.esp".into(),
+                loser: "A.esp".into(),
+                count: 3,
+                labels: vec!["GMST fJumpHeightMin".into()],
+            }],
+            ..Default::default()
+        };
+        let lines = overlap_plugin_lines("A.esp", &report);
+        assert_eq!(
+            lines,
+            ["'A.esp' loses 3 changes to 'B.esp' by your choice."]
+        );
+        assert!(!lines.iter().any(|line| line.contains("neither wins")));
+    }
+
+    #[test]
+    fn a_patched_pair_reads_as_handled_by_a_patch() {
+        use agora_core::game_load_order::OverlapReport;
+
+        let report = OverlapReport {
+            patched: 2,
+            decided: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            overlap_patch_line(&report).as_deref(),
+            Some("2 pairs are handled by a patch; 1 decided by your rules.")
+        );
+        assert_eq!(overlap_patch_line(&OverlapReport::default()), None);
+    }
+    #[test]
+    fn a_verbose_check_names_each_move_loot_would_make() {
+        let lines = sorter_move_lines(&[
+            agora_core::game_load_order::SortMove {
+                plugin: "B.esp".into(),
+                from: 3,
+                to: 1,
+            },
+            agora_core::game_load_order::SortMove {
+                plugin: "A.esp".into(),
+                from: 1,
+                to: 2,
+            },
+        ]);
+        assert_eq!(
+            lines,
+            [
+                "  - 'B.esp' moves from position 3 to 1.",
+                "  - 'A.esp' moves from position 1 to 2.",
+            ]
         );
     }
 }

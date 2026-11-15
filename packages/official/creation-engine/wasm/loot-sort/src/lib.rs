@@ -151,6 +151,13 @@ fn english_text(content: &[libloot::metadata::MessageContent]) -> Option<String>
         .map(|content| content.text().to_string())
 }
 
+/// Whether a `req` file name is a plugin file the module can see in its `/data` mount. Any other
+/// kind of required file is outside the module's view, so it is not reported as missing.
+fn is_plugin_file(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".esp") || lower.ends_with(".esm") || lower.ends_with(".esl")
+}
+
 fn read_metadata(request: &Request) -> Result<(String, Option<String>), String> {
     let masterlist = match &request.masterlist_yaml {
         Some(text) => text.clone(),
@@ -258,6 +265,19 @@ fn sort(request: &Request) -> Result<String, String> {
         .sort_plugins(&names)
         .map_err(|error| format!("the plugins cannot be sorted: {error}"))?;
 
+    // Only active plugins take part in the pre-launch checks (MASTER_SPEC §31.6), so the two
+    // metadata lists below are filtered against this set. Absent and inactive is not a check.
+    let active: std::collections::HashSet<String> = request
+        .active
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect();
+    let present: std::collections::HashSet<String> = request
+        .load_order
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect();
+
     let database = game.database();
     let database = database
         .read()
@@ -288,15 +308,39 @@ fn sort(request: &Request) -> Result<String, String> {
                 messages.push((level(message.message_type()), text));
             }
         }
-        for cleaning in metadata.dirty_info() {
-            if let Some(text) = english_text(cleaning.detail()) {
-                messages.push(("warn", text));
-            }
-        }
+
+        // LOOT's `inc` and `req` metadata are not turned into messages by libloot; it only uses
+        // them to order plugins. The pre-launch check needs them, so the reply carries them for
+        // active plugins: an incompatibility is reported only when the other file is active too,
+        // and a requirement only when it is a plugin file that is not present. A required file
+        // that is not a plugin (a DLL under `SKSE/Plugins`, say) is not visible to this module,
+        // which is mounted with the plugin files alone, so it is left out rather than guessed.
+        let (incompatible, requires) = if active.contains(&name.to_lowercase()) {
+            let incompatible: Vec<&str> = metadata
+                .incompatibilities()
+                .iter()
+                .map(|file| file.name().as_str())
+                .filter(|other| active.contains(&other.to_lowercase()))
+                .collect();
+            let requires: Vec<&str> = metadata
+                .requirements()
+                .iter()
+                .map(|file| file.name().as_str())
+                .filter(|file| !present.contains(&file.to_lowercase()) && is_plugin_file(file))
+                .collect();
+            (incompatible, requires)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         let group = metadata.group();
         let cleaning = metadata.dirty_info();
-        if messages.is_empty() && group.is_none() && cleaning.is_empty() {
+        if messages.is_empty()
+            && group.is_none()
+            && cleaning.is_empty()
+            && incompatible.is_empty()
+            && requires.is_empty()
+        {
             continue;
         }
 
@@ -347,6 +391,21 @@ fn sort(request: &Request) -> Result<String, String> {
             }
             out.push(']');
         }
+        out.push_str(",\"incompatible\":[");
+        for (index, other) in incompatible.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            json::write_string(other, &mut out);
+        }
+        out.push_str("],\"requires\":[");
+        for (index, file) in requires.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            json::write_string(file, &mut out);
+        }
+        out.push(']');
         out.push('}');
     }
     out.push_str("],\"general\":[");

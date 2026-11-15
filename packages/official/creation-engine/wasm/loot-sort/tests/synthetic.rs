@@ -381,3 +381,118 @@ fn a_rule_without_an_after_is_refused() {
     let error = run_request(request).unwrap_err();
     assert!(error.contains("'after'"), "{error}");
 }
+
+fn plugin_reply<'a>(value: &'a json::Value, name: &str) -> Option<&'a json::Value> {
+    value
+        .get("plugins")
+        .and_then(json::Value::as_array)
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin.get("name").and_then(json::Value::as_str) == Some(name))
+        })
+}
+
+fn names(value: &json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn an_active_incompatibility_names_only_the_other_active_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["A.esp", "B.esp", "C.esp"] {
+        write_plugin(&data, name, &[]);
+    }
+    let masterlist = dir.path().join("masterlist.yaml");
+    std::fs::write(
+        &masterlist,
+        "plugins:\n  - name: 'A.esp'\n    inc: ['B.esp', 'C.esp']\n",
+    )
+    .unwrap();
+
+    // C.esp is present but inactive, so only B.esp is an active incompatibility.
+    let reply = run_request(&request(
+        &data,
+        &["A.esp", "B.esp", "C.esp"],
+        &["A.esp", "B.esp"],
+        &masterlist,
+        None,
+    ))
+    .unwrap();
+    let value = json::parse(&reply).unwrap();
+    let a = plugin_reply(&value, "A.esp").expect("A.esp has a check");
+    assert_eq!(names(a, "incompatible"), ["B.esp"]);
+}
+
+#[test]
+fn a_requirement_is_reported_only_when_its_plugin_file_is_not_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["A.esp", "B.esp"] {
+        write_plugin(&data, name, &[]);
+    }
+    let masterlist = dir.path().join("masterlist.yaml");
+    std::fs::write(
+        &masterlist,
+        "plugins:\n  - name: 'A.esp'\n    req: ['B.esp', 'Missing.esp', 'SKSE/Plugins/NotVisible.dll']\n",
+    )
+    .unwrap();
+
+    let reply = run_request(&request(
+        &data,
+        &["A.esp", "B.esp"],
+        &["A.esp", "B.esp"],
+        &masterlist,
+        None,
+    ))
+    .unwrap();
+    let value = json::parse(&reply).unwrap();
+    let a = plugin_reply(&value, "A.esp").expect("A.esp has a check");
+    // B.esp is present and the DLL is outside the module's view; only Missing.esp is absent.
+    assert_eq!(names(a, "requires"), ["Missing.esp"]);
+}
+
+#[test]
+fn an_inactive_plugin_reports_no_incompatibilities_or_requirements() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["A.esp", "B.esp"] {
+        write_plugin(&data, name, &[]);
+    }
+    let masterlist = dir.path().join("masterlist.yaml");
+    std::fs::write(
+        &masterlist,
+        "plugins:\n  - name: 'A.esp'\n    inc: ['B.esp']\n    req: ['Missing.esp']\n",
+    )
+    .unwrap();
+
+    let reply = run_request(&request(
+        &data,
+        &["A.esp", "B.esp"],
+        &["B.esp"],
+        &masterlist,
+        None,
+    ))
+    .unwrap();
+    let value = json::parse(&reply).unwrap();
+    // A.esp is inactive and has nothing else to say, so it is left out rather than reported with
+    // empty checks; either way, no incompatibility or requirement comes from an inactive plugin.
+    if let Some(a) = plugin_reply(&value, "A.esp") {
+        assert!(names(a, "incompatible").is_empty());
+        assert!(names(a, "requires").is_empty());
+    }
+}

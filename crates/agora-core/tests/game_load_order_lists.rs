@@ -87,6 +87,7 @@ impl GamePackage for TestPackage {
                     .collect(),
                 notes: Vec::new(),
                 general: Vec::new(),
+                checks: Vec::new(),
             }))
         })
     }

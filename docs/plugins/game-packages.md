@@ -289,7 +289,7 @@ Every hook is called with one object, and its reply is JSON:
 - `LoadOrderRule` is the `before`, `requires` or `conflicts` object shown above.
 - `LoadOrderLine` has `name` and `active`.
 - `SorterEntry` has `name`, `active`, `locked`, `implicit` and `present`.
-- `SorterReply` has `order` (every present item's name, once, case-insensitively), `notes` and `general`.
+- `SorterReply` has `order` (every present item's name, once, case-insensitively), `notes`, `general` and `checks`. `notes` and `general` are the sorter's own messages; an `info` one stays in the plugin view. `checks` are the sorter's pre-launch checks at their own level (cleaning counts, incompatibilities, missing required files) and are always shown by the check and the launch.
 - A `SorterNote` has `item` (empty for the whole list), `level` (`error`, `warn` or `info`) and `text`.
 - `SorterStatus` has `fetchedAt`, `source` and `dataVersion`; `dataVersion` changes whenever the sorter's own data changes, and cached notes from another version are stale.
 

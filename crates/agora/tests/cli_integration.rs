@@ -5605,6 +5605,25 @@ fn local_state_rows(data_dir: &Path) -> std::collections::BTreeMap<String, Vec<S
 }
 
 #[test]
+fn loot_says_how_to_get_a_masterlist_and_names_the_setting_that_blocks_it() {
+    let fixture = skyrim_fixture("1.6.1170.0", &[]);
+    let id = fixture.instance_id.clone();
+
+    // No masterlist is saved, and plugin downloads ship off, so the check says how to get one
+    // and names the setting that turns the download back on.
+    let check = run_agora(
+        &fixture.data_dir,
+        &["games", "instance", "plugins", "check", &id],
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("No LOOT masterlist is saved yet"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("network_plugins_enabled"), "{stdout}");
+}
+
+#[test]
 fn games_instance_checks_change_no_database_row() {
     // The framework, load order, tool-output and content reads leave every table of the data
     // root's database as they found it. (The probe in `locks/` and the CLI log are the known
