@@ -2111,9 +2111,37 @@ pub async fn investigate_instance_evidence(
 ) -> LauncherResult<agora_core::crash_service::CrashInvestigation> {
     let ctx = crate::core_context(&app)?;
     tokio::task::spawn_blocking(move || {
-        let instance_dir = ctx.paths.instance_dir(&instance_id)?;
-        let evidence =
-            agora_core::crash_evidence::CrashEvidenceService::new().collect(&instance_dir, &[]);
+        let host: std::sync::Arc<dyn agora_plugin_api::host::ScriptHost> =
+            std::sync::Arc::new(agora_plugin_host::QuickJsHost::new());
+        let installed = agora_core::crash_live::load_installed_packs(&ctx, host.clone())?;
+        let built_in = agora_game_minecraft::crash::built_in_packs();
+        let instances = agora_game_minecraft::installed_content::MinecraftInstanceProvider;
+        let window = agora_core::crash_live::investigation_window(&ctx, &instance_id);
+        let session = agora_core::crash_engine::evidence::CrashSession {
+            session_id: format!("investigate-{instance_id}"),
+            pid: None,
+            working_dir: None,
+            window,
+        };
+        // The same pack-source search the live diagnosis runs, so a game instance's declared
+        // logs are found without naming them.
+        let found = agora_core::crash_live::collect_instance_evidence(
+            &ctx,
+            &instance_id,
+            &agora_core::crash_live::LivePacks {
+                packs: &installed.packs,
+                built_in: &built_in,
+                host: host.as_ref(),
+                instances: Some(&instances),
+            },
+            &session,
+            &[],
+        )
+        .map_err(|message| LauncherError::Generic {
+            code: "ERR_CRASH_EVIDENCE".into(),
+            message,
+        })?;
+        let evidence = found.collected();
         let answer = latest_analyzed_answer(&ctx, &instance_id)?;
         let view = crash_instance_view(&ctx, &instance_id)?;
         let suspects = answer
