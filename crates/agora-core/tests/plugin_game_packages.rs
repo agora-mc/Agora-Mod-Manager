@@ -31,8 +31,6 @@ fn dummy_package_def(game_id: &str) -> PackageDefinition {
             framework_ids: vec![],
             tool_ids: vec![],
             launch: None,
-            log_paths: vec![],
-            crash_paths: vec![],
             user_files: vec![],
             save_paths: vec![],
             linked_archive_patterns: vec![],

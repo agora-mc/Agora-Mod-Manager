@@ -1,0 +1,46 @@
+{
+  "contract": 1,
+  "games": ["cyberpunk-2077"],
+  "sources": [
+    {
+      "id": "r6_logs",
+      "where": {
+        "root": "runtime",
+        "path": "r6/logs"
+      },
+      "match": {
+        "glob": "*.log"
+      },
+      "bind": [
+        {
+          "time": {
+            "before_s": 2,
+            "after_s": 10
+          }
+        }
+      ],
+      "role": "supplementary",
+      "privacy": "personal"
+    },
+    {
+      "id": "red4ext_logs",
+      "where": {
+        "root": "runtime",
+        "path": "red4ext/logs"
+      },
+      "match": {
+        "glob": "*.log"
+      },
+      "bind": [
+        {
+          "time": {
+            "before_s": 2,
+            "after_s": 10
+          }
+        }
+      ],
+      "role": "supplementary",
+      "privacy": "personal"
+    }
+  ]
+}

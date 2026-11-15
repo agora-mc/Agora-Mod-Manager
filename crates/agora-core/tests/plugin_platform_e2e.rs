@@ -49,8 +49,6 @@ fn package_json() -> serde_json::Value {
             }],
             "framework_ids": [],
             "tool_ids": [],
-            "log_paths": [],
-            "crash_paths": [],
             "user_files": [],
             "save_paths": [],
             "linked_archive_patterns": [],

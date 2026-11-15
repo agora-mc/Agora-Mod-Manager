@@ -350,10 +350,6 @@ can ship one for its own game the same way any plugin does; the format is in
 [Community plugins](README.md#crash-packs). A game also declares which exits are a normal quit with
 `session.normal_exit_codes`.
 
-`log_paths` and `crash_paths` are still accepted on a game definition, but the Crash Doctor does not
-read them: a pack's sources say the same thing more precisely (glob, format and bind). They are
-redundant and are candidates for removal.
-
 ## Known gaps
 
 Tell us about others: finding them is the point of this stage.
@@ -408,8 +404,6 @@ Each value is a function name in your script. Every field is optional.
 | `framework_ids` | list of strings | optional | Framework ids the game may use; may be empty |
 | `tool_ids` | list of strings | optional | Tool ids the game may use; may be empty |
 | `launch` | launch recipe | optional | How to launch it; leave it out when `prepare_launch` supplies one |
-| `log_paths` | list of game paths | optional | Where its logs are; may be empty |
-| `crash_paths` | list of game paths | optional | Where crash evidence is; may be empty |
 | `user_files` | list of user file mappings | optional | Per-user files kept in the instance; may be empty |
 | `save_paths` | list of game paths | optional | Where its saves are; may be empty |
 | `linked_archive_patterns` | list of globs | optional | Archives linked rather than copied; may be empty |

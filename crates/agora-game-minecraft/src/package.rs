@@ -165,8 +165,6 @@ pub fn game_package() -> Arc<dyn GamePackage> {
                     framework_ids: Vec::new(),
                     tool_ids: Vec::new(),
                     launch: None,
-                    log_paths: Vec::new(),
-                    crash_paths: Vec::new(),
                     user_files: Vec::new(),
                     save_paths: Vec::new(),
                     linked_archive_patterns: Vec::new(),

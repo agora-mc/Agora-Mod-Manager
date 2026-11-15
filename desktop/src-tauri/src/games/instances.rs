@@ -1764,8 +1764,6 @@ mod tests {
             "framework_ids": [],
             "tool_ids": [],
             "launch": launch,
-            "log_paths": [],
-            "crash_paths": [],
             "user_files": [],
             "save_paths": [],
             "linked_archive_patterns": []

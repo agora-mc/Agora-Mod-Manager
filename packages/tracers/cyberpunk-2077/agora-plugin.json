@@ -7,12 +7,21 @@
   "apiRange": ">=0.1, <0.2",
   "entrypoint": "main.js",
   "capabilities": {
-    "required": ["game:define", "game:read"]
+    "required": [
+      "game:define",
+      "game:read",
+      "crash:contribute"
+    ]
   },
   "contributions": {
     "gamePackages": [
       {
         "path": "games/package.json"
+      }
+    ],
+    "crashPacks": [
+      {
+        "path": "crash/pack.json"
       }
     ]
   }

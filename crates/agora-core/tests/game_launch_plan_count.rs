@@ -85,8 +85,6 @@ fn definition(plugin_list: u8) -> GameDefinition {
                 path: RelPath::default(),
             },
         }),
-        log_paths: vec![],
-        crash_paths: vec![],
         user_files: vec![],
         save_paths: vec![],
         linked_archive_patterns: vec![],

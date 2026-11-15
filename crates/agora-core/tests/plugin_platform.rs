@@ -40,8 +40,6 @@ fn game(id: &str) -> serde_json::Value {
         "deployment": "redirect",
         "framework_ids": [],
         "tool_ids": [],
-        "log_paths": [],
-        "crash_paths": [],
         "user_files": [{
             "source": {"root": "user_data", "location": "local_app_data", "path": "Game/Plugins.txt"},
             "instance_path": "user/Plugins.txt",
@@ -114,7 +112,6 @@ fn the_guide_minimum_example_parses() {
     assert_eq!(package.games.len(), 1);
     assert!(package.frameworks.is_empty());
     assert!(package.tools.is_empty());
-    assert!(package.games[0].log_paths.is_empty());
 }
 
 #[test]
