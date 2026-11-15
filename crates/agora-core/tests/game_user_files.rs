@@ -4,10 +4,11 @@ use std::sync::{Arc, Mutex};
 use agora_core::ctx::CoreContext;
 use agora_core::game_registry::{GameRegistry, PackageSource};
 use agora_core::game_user_files::{
-    is_session_running, record_process, restore, restore_failure_message,
-    restore_finished_for_instance, restore_retrying_while_running, status, swap_in, Journal,
-    JournaledFile,
+    is_session_running, record_process, restore, restore_finished_for_instance, status, swap_in,
+    Journal, JournaledFile,
 };
+#[cfg(windows)]
+use agora_core::game_user_files::{restore_failure_message, restore_retrying_while_running};
 use agora_core::process_identity;
 use agora_game_api::{
     DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, PackageDefinition, RelPath,
