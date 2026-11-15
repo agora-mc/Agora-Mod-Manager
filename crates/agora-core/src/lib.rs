@@ -75,6 +75,7 @@ pub mod instance_runtime;
 /// removed. Use [`crate::launch_planner`] for all production Java launches.
 pub mod launch_history;
 pub mod library;
+pub mod linux_view;
 pub mod lkg;
 pub mod loadout;
 pub mod lock_manager;

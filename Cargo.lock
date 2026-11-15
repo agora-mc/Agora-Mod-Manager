@@ -110,6 +110,7 @@ dependencies = [
  "junction",
  "keyring",
  "md-5",
+ "nix 0.31.3",
  "pbkdf2 0.12.2",
  "quick-xml 0.39.4",
  "rand 0.8.6",

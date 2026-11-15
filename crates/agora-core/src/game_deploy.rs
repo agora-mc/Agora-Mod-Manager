@@ -30,9 +30,11 @@ pub enum DeployMode {
     Links,
     /// Real copies (rung 3).
     Copies,
-    /// The same link farm as `Links`, run under `agora_vfs.dll` (rung 1): every write lands in
-    /// the instance's writable layer, which the VFS shows on top, so the farm holds neither the
-    /// writable layer nor private copies of declared-write files.
+    /// The same link farm as `Links`, run under `agora_vfs.dll` (rung 1) on Windows: every write
+    /// lands in the instance's writable layer, which the VFS shows on top, so the farm holds
+    /// neither the writable layer nor private copies of declared-write files. On Linux this rung
+    /// is the overlay view in [`crate::linux_view`]: the same farm is the lower layer and the
+    /// instance's writable layer is the upper one, mounted in a private user and mount namespace.
     Virtual,
 }
 
