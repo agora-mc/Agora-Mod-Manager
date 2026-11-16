@@ -82,8 +82,6 @@ fn test_definition() -> GameDefinition {
                 path: RelPath::default(),
             },
         }),
-        log_paths: vec![],
-        crash_paths: vec![],
         user_files: vec![UserFileMapping {
             source: GamePath::UserData {
                 location: UserDataLocation::Documents,
