@@ -10488,8 +10488,8 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
 }
 
 /// `games instance launch` on Linux: Steam starts the game, so Agora records what it asked for
-/// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance
-/// returns `None` and the ordinary launch path runs it.
+/// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance,
+/// or a machine with no Steam command, returns `None` and the ordinary launch path runs it.
 #[cfg(target_os = "linux")]
 fn cli_linux_launch(
     ctx: &agora_core::ctx::Ctx,
@@ -10500,7 +10500,7 @@ fn cli_linux_launch(
 
     let status = match agora_core::game_wrap::start_via_steam(ctx, instance_id) {
         Ok(status) => status,
-        Err(WrapError::NotSteam(_)) => return Ok(None),
+        Err(WrapError::NotSteam(_)) | Err(WrapError::SteamMissing) => return Ok(None),
         Err(error) => {
             if json {
                 let out = serde_json::json!({
