@@ -248,6 +248,8 @@ export interface VortexPlanDto {
   instanceName: string;
   installId: string;
   installLocation: string;
+  /** The folder is a real install but Agora has not added it; a real import adds it first. */
+  wouldAddFolder: boolean;
   staging: string;
   mods: {
     modId: string;

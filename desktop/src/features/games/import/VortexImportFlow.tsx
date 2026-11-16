@@ -304,6 +304,11 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
                 Instance name:{' '}
                 <span className="font-medium text-foreground">{instanceName.trim() || current.instanceName}</span>
               </p>
+              {current.wouldAddFolder && (
+                <p className="text-sm text-muted-foreground">
+                  Agora will add the game folder first: {current.installLocation}
+                </p>
+              )}
               <label className="block space-y-1 text-sm">
                 <span className="text-muted-foreground">Name the new instance</span>
                 <input

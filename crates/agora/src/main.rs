@@ -551,8 +551,8 @@ enum ImportCmd {
         /// The store's folder. Defaults to `%APPDATA%\Vortex\state.v2`.
         #[arg(long, value_name = "DIR")]
         store: Option<PathBuf>,
-        /// The Agora game to import into (an id from `agora games list`). Required without `scan`;
-        /// `scan` shows which Vortex game maps to it.
+        /// The game to import, as `scan` lists it: the Vortex game id (`skyrimse`) or the Agora
+        /// game id (`skyrim-se`). Required without `scan`.
         #[arg(long)]
         game: Option<String>,
         /// The Vortex profile, by name.
@@ -9839,7 +9839,7 @@ fn run_games_import(
             }
             let Some(game) = game else {
                 anyhow::bail!(
-                    "--game is required: name the Agora game to import into, as `agora games import vortex scan` lists it"
+                    "--game is required: name the game as `agora games import vortex scan` lists it (its Vortex id or its Agora id)"
                 );
             };
             let Some(profile) = profile else {
@@ -9858,8 +9858,6 @@ fn run_games_import(
                 add_folder,
                 copy_saves,
             };
-            let inventory =
-                agora_core::game_import::vortex::prepare_inventory(ctx, &inventory, &request)?;
             if dry_run {
                 let plan = agora_core::game_import::vortex::plan(ctx, &inventory, &request)?;
                 if json {
@@ -10232,6 +10230,12 @@ fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
         plan.store_id, plan.instance_name
     );
     println!("  staging folder: {}", plan.staging.display());
+    if plan.would_add_folder {
+        println!(
+            "  the folder would be added first: {}",
+            plan.install_location.display()
+        );
+    }
     println!(
         "  mods: {} enabled, {} disabled, {} files, {}",
         plan.mods_enabled,

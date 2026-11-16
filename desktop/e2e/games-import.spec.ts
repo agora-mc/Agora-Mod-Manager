@@ -443,6 +443,7 @@ test.describe('Import dialog', () => {
       instanceName: 'Main (Vortex import)',
       installId: 'steam:489830',
       installLocation: 'D:/Games/Skyrim Special Edition',
+      wouldAddFolder: false,
       staging: vortexScan.games[0].staging,
       mods: [
         {
