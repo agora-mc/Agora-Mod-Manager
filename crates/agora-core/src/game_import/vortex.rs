@@ -1105,6 +1105,9 @@ pub struct VortexRequest {
     pub add_folder: bool,
     /// Copy the profile's own saves into the instance. INIs are copied with their profile.
     pub copy_saves: bool,
+    /// Bring the profile's disabled mods too, turned off. Off by default: a game's staging folder
+    /// is shared by every profile.
+    pub all_mods: bool,
 }
 
 /// A mod folder the profile lists, and what reading it found.
@@ -1183,6 +1186,8 @@ pub struct VortexPlan {
     pub mods: Vec<PlannedMod>,
     pub mods_enabled: usize,
     pub mods_disabled: usize,
+    /// Disabled mods left out because `--all-mods` was not given, by name.
+    pub mods_left_out: Vec<String>,
     pub files: usize,
     pub bytes: u64,
     pub manifest: ManifestPlan,
@@ -1244,8 +1249,19 @@ pub fn plan(
         ));
     }
     let mut problems = Vec::new();
-    let mods = plan_mods(game, profile, &staging, &mut problems);
+    let mods = plan_mods(game, profile, &staging, request.all_mods, &mut problems);
     let enabled = mods.iter().filter(|m| m.enabled).count();
+    // A game's staging folder is shared by every profile. Unless asked, only this profile's
+    // enabled mods are imported; the disabled ones are named for --verbose and counted.
+    let mods_left_out: Vec<String> = if request.all_mods {
+        Vec::new()
+    } else {
+        game.mods
+            .iter()
+            .filter(|entry| !profile.enabled.get(&entry.id).copied().unwrap_or(false))
+            .map(|entry| entry.name.clone())
+            .collect()
+    };
 
     let manifest_search = find_manifests(Some(&definition), &install.discovered.location);
     let mut manifest = ManifestPlan {
@@ -1341,7 +1357,9 @@ pub fn plan(
     }
 
     let files = mods.iter().map(|m| m.files).sum();
-    let bytes = mods.iter().map(|m| m.bytes).sum();
+    let bytes: u64 = mods.iter().map(|m| m.bytes).sum();
+    // Validate the space before anything (including adding a game folder) is written.
+    content_store::ensure_room_for_declared(&ctx.paths.content_root(), bytes)?;
     Ok(VortexPlan {
         store: state.source.clone(),
         vortex_game: game.id.clone(),
@@ -1360,6 +1378,7 @@ pub fn plan(
         staging,
         mods_enabled: enabled,
         mods_disabled: mods.len() - enabled,
+        mods_left_out,
         mods,
         files,
         bytes,
@@ -1456,11 +1475,16 @@ fn plan_mods(
     game: &VortexGame,
     profile: &VortexProfile,
     staging: &Path,
+    all_mods: bool,
     problems: &mut Vec<Problem>,
 ) -> Vec<PlannedMod> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for entry in &game.mods {
+        let enabled = profile.enabled.get(&entry.id).copied().unwrap_or(false);
+        if !enabled && !all_mods {
+            continue;
+        }
         if let Err(reason) = mo2::check_mod_folder_name(&entry.installation_folder) {
             problems.push(Problem {
                 line: None,
@@ -1535,7 +1559,7 @@ fn plan_mods(
             nexus_mod_id: entry.nexus_mod_id,
             nexus_file_id: entry.nexus_file_id,
             folder: entry.installation_folder.clone(),
-            enabled: profile.enabled.get(&entry.id).copied().unwrap_or(false),
+            enabled,
             files: paths.len(),
             bytes,
             provenance: provenance(entry),
@@ -2062,8 +2086,16 @@ pub fn run(
     options: RunOptions,
     progress: &dyn Fn(ImportProgress),
 ) -> Result<VortexRunReport, ImportError> {
-    let inventory = add_folder_for_request(ctx, inventory, request)?;
-    let plan = plan(ctx, &inventory, request)?;
+    // Plan and validate before writing anything, including a game folder. Only then is a folder
+    // with --add-folder added, and the plan is made again against the real install.
+    let mut plan = plan(ctx, inventory, request)?;
+    let inventory = if plan.would_add_folder {
+        let added = add_folder_for_request(ctx, inventory, request)?;
+        plan = self::plan(ctx, &added, request)?;
+        added
+    } else {
+        inventory.clone()
+    };
     let install = inventory
         .installs
         .iter()

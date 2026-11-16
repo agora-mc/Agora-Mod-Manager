@@ -575,6 +575,14 @@ enum ImportCmd {
         /// Copy the profile's own saves into the instance's own save folder under Documents.
         #[arg(long)]
         copy_saves: bool,
+        /// Bring the profile's disabled mods too, turned off. Off by default: the staging folder
+        /// is shared by every profile, so the safe default imports only this profile's enabled
+        /// mods.
+        #[arg(long)]
+        all_mods: bool,
+        /// List the mods a dry run leaves out, by name, as well as counting them.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -9817,6 +9825,8 @@ fn run_games_import(
             install,
             add_folder,
             copy_saves,
+            all_mods,
+            verbose,
         } => {
             let store = resolve_vortex_store(store)?;
             let inventory = agora_core::game_registry::installed_games(ctx);
@@ -9849,13 +9859,14 @@ fn run_games_import(
                 install,
                 add_folder,
                 copy_saves,
+                all_mods,
             };
             if dry_run {
                 let plan = agora_core::game_import::vortex::plan(ctx, &inventory, &request)?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&plan)?);
                 } else {
-                    print_vortex_plan(&plan);
+                    print_vortex_plan(&plan, verbose);
                 }
                 return Ok(());
             }
@@ -10203,7 +10214,7 @@ fn print_vortex_scan(report: &agora_core::game_import::vortex::VortexScan) {
     println!("Nothing was stored.");
 }
 
-fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
+fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan, verbose: bool) {
     println!(
         "Import plan: profile \"{}\" from {} (Vortex game {})",
         plan.profile,
@@ -10252,6 +10263,17 @@ fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
             planned.files,
             vortex_provenance_text(&planned.provenance)
         );
+    }
+    if !plan.mods_left_out.is_empty() {
+        println!(
+            "  left out: {} disabled mod(s) not enabled in this profile; --all-mods imports them turned off",
+            plan.mods_left_out.len()
+        );
+        if verbose {
+            for name in &plan.mods_left_out {
+                println!("    {name}");
+            }
+        }
     }
     println!(
         "  deployment manifest: {} ({} files, {} matched an imported mod)",

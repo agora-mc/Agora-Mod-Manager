@@ -265,6 +265,8 @@ export interface VortexPlanDto {
   }[];
   modsEnabled: number;
   modsDisabled: number;
+  /** Disabled mods left out by the default; `--all-mods` brings them. */
+  modsLeftOut: string[];
   files: number;
   bytes: number;
   manifest: {
@@ -316,6 +318,7 @@ export interface VortexImportRequest {
   install: string | null;
   addFolder: boolean;
   copySaves: boolean;
+  allMods: boolean;
 }
 
 function isVortexScanGame(value: unknown): value is VortexScanGame {

@@ -4112,7 +4112,9 @@ Most people who will try this already have a setup. Import has to be good.
   disk are still LevelDB. What is imported, as for MO2: each Vortex profile becomes an instance;
   each mod's staging folder
   (`settings.mods.installPath` per game, default `{USERDATA}/{GAME}/mods`) is copied into the
-  content store as it is on disk, with its name, version and Nexus ids; enabled state per profile;
+  content store as it is on disk, with its name, version and Nexus ids; enabled state per profile
+  (the default imports only the mods the profile enables, since one staging folder serves every
+  profile; `--all-mods` brings the rest turned off);
   the plugin list from the profile's `plugins.txt` / `loadorder.txt`. Vortex orders mods by rules,
   not by a list, so the layer order is taken from the deployment manifest (the mod that supplied a
   file wins it) with Vortex's rules as the tie-breaker, and any file the manifest and the rules

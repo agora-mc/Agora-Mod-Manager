@@ -327,6 +327,8 @@ pub struct PlanDto {
     pub mods: Vec<PlannedModDto>,
     pub mods_enabled: usize,
     pub mods_disabled: usize,
+    /// Disabled mods left out by the default (not `--all-mods`), by name.
+    pub mods_left_out: Vec<String>,
     pub files: usize,
     pub bytes: u64,
     /// Top-level `meta.ini` files left out of the stored content, across all mods.
@@ -435,6 +437,7 @@ impl From<&Mo2Plan> for PlanDto {
                 .collect(),
             mods_enabled: plan.mods_enabled,
             mods_disabled: plan.mods_disabled,
+            mods_left_out: plan.mods_left_out.clone(),
             files: plan.files,
             bytes: plan.bytes,
             meta_ini_excluded: plan.meta_ini_excluded,
@@ -723,6 +726,9 @@ pub struct VortexImportRequest {
     /// Copy the profile's own saves into the instance.
     #[serde(default)]
     pub copy_saves: bool,
+    /// Bring the profile's disabled mods too, turned off. Off by default.
+    #[serde(default)]
+    pub all_mods: bool,
 }
 
 /// What `games_import_vortex` answered: the plan for a dry run, or the report of an import.
@@ -763,6 +769,7 @@ pub async fn games_import_vortex(
                 .filter(|id| !id.is_empty()),
             add_folder: request.add_folder,
             copy_saves: request.copy_saves,
+            all_mods: request.all_mods,
         };
         let inventory = installed_games(&ctx);
         if request.dry_run {

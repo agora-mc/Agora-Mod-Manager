@@ -240,8 +240,10 @@ snapshot first, and `template delete` asks unless given `--yes`.
   id the scan prints (its Vortex id, e.g. `skyrimse`, or the Agora game id) with
   `agora games import vortex --game <id> --profile <name> --dry-run`; that shows the plan. Drop
   `--dry-run` to import. **Close Vortex first:** Agora refuses while Vortex holds the store's
-  lock, and never opens the live store (it reads a copy). Mods are copied from the staging folder
-  as they are on disk; downloads are not copied. The layer order comes from
+  lock, and never opens the live store (it reads a copy). By default only the mods the profile
+  enables are copied, because Vortex shares one staging folder across every profile; the plan
+  counts the disabled mods it leaves out (`--verbose` names them), and `--all-mods` brings them
+  too, turned off. Mods are copied as they are on disk; downloads are not copied. The layer order comes from
   `vortex.deployment.json`, with Vortex's rules as the tie-breaker, and every file where the two
   disagree is reported; with no manifest (a purged deployment), the rules alone decide and the
   plan says where it looked. A profile with local game settings brings its INIs; local saves are

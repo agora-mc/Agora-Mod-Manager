@@ -461,6 +461,7 @@ test.describe('Import dialog', () => {
       ],
       modsEnabled: 1,
       modsDisabled: 0,
+      modsLeftOut: [],
       files: 2,
       bytes: 2048,
       manifest: {
