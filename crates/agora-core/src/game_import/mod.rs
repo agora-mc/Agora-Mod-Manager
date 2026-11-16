@@ -82,7 +82,9 @@ pub enum ImportError {
     AlreadyImported { instance: String },
     #[error("name at least one profile to import")]
     NoProfiles,
-    #[error("this import needs {needed} bytes, but only {free} are free on the content store's drive")]
+    #[error(
+        "this import needs {needed} bytes, but only {free} are free on the content store's drive"
+    )]
     NotEnoughSpace { needed: u64, free: u64 },
     #[error("the setup's mod folder cannot be read: {0}")]
     ModsUnreadable(String),
@@ -513,8 +515,13 @@ fn mount_point(def: &GameDefinition) -> String {
 }
 
 fn normalise_path(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('/', "\\");
-    fold_path_case(text.trim_end_matches('\\'))
+    // Vortex, a game store and a user can all spell one folder differently: an
+    // 8.3 short name, another case, a trailing separator, `/` for `\`, or the
+    // `\?\` prefix. Resolve the real folder first, so two spellings of one
+    // folder compare equal; a folder that is gone keeps its stored spelling.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shown = crate::game_discovery::custom_folders::display_path(&resolved);
+    fold_path_case(shown.replace('/', "\\").trim_end_matches('\\'))
 }
 
 fn read_text_optional(path: &Path) -> Result<Option<String>, ImportError> {
@@ -1786,17 +1793,15 @@ fn import_executables(
 
 /// Read a setup's profiles and the mods each enables, for a grouping. Reads the
 /// setup only.
-pub fn mo2_profile_sets(
-    ini_path: &Path,
-) -> Result<Vec<profiles::ProfileSet>, ImportError> {
+pub fn mo2_profile_sets(ini_path: &Path) -> Result<Vec<profiles::ProfileSet>, ImportError> {
     let setup = inspect_setup(ini_path)?;
     let ini_text = read_text_optional(ini_path)?.unwrap_or_default();
     let ini_dir = ini_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let ini = mo2::parse_ini(&ini_text, ini_dir);
     let mut profiles = Vec::new();
     for name in setup.profiles {
-        let modlist = read_text_optional(&ini.profiles.join(&name).join("modlist.txt"))?
-            .unwrap_or_default();
+        let modlist =
+            read_text_optional(&ini.profiles.join(&name).join("modlist.txt"))?.unwrap_or_default();
         let enabled = mo2::parse_modlist(&modlist)
             .into_iter()
             .filter(|line| line.state == mo2::ModState::Enabled)
@@ -1900,11 +1905,12 @@ fn add_mo2_mod_to_merged(
         mod_folder: item.folder.clone(),
         reason: e.to_string(),
     })?;
-    let outcome = content_store::add_collected(ctx, &item.folder, files, source)
-        .map_err(|e| ImportError::Store {
+    let outcome = content_store::add_collected(ctx, &item.folder, files, source).map_err(|e| {
+        ImportError::Store {
             mod_folder: item.folder.clone(),
             reason: e.to_string(),
-        })?;
+        }
+    })?;
     let item_id = outcome.item().item_id.clone();
     let manifest = game_instance::get_manifest(ctx, instance_id)?;
     let present = manifest.layers.layers().iter().any(|layer| {
@@ -1928,8 +1934,8 @@ fn mo2_state_for_merge(
     plan: &Mo2Plan,
     layer_mod: &HashMap<String, Option<String>>,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
-    let mut state = crate::game_loadout::capture(ctx, instance_id, definition)
-        .map_err(ImportError::Other)?;
+    let mut state =
+        crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
     let enabled: std::collections::BTreeSet<&str> = plan
         .mods
         .iter()
@@ -2046,8 +2052,7 @@ pub fn mo2_run_profiles(
                     if folder_to_item.contains_key(&item.folder) {
                         continue;
                     }
-                    let item_id =
-                        add_mo2_mod_to_merged(ctx, &instance_id, profile_plan, item)?;
+                    let item_id = add_mo2_mod_to_merged(ctx, &instance_id, profile_plan, item)?;
                     folder_to_item.insert(item.folder.clone(), item_id);
                 }
             }
@@ -2059,10 +2064,7 @@ pub fn mo2_run_profiles(
             let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
             for layer in manifest.layers.layers() {
                 if let agora_game_api::LayerSource::Content { content } = &layer.source {
-                    layer_mod.insert(
-                        layer.id.as_str().to_string(),
-                        reverse.get(content).cloned(),
-                    );
+                    layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
                 }
             }
 

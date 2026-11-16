@@ -909,11 +909,13 @@ fn find_manifests(def: Option<&GameDefinition>, install: &Path) -> ManifestSearc
 const VORTEX_STAGING_MARKER: &str = "__vortex_staging_folder";
 
 fn normalise_path(path: &Path) -> String {
-    fold_path_case(
-        path.to_string_lossy()
-            .replace('/', "\\")
-            .trim_end_matches('\\'),
-    )
+    // Vortex, a game store and a user can all spell one folder differently: an
+    // 8.3 short name, another case, a trailing separator, `/` for `\`, or the
+    // `\?\` prefix. Resolve the real folder first, so two spellings of one
+    // folder compare equal; a folder that is gone keeps its stored spelling.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shown = crate::game_discovery::custom_folders::display_path(&resolved);
+    fold_path_case(shown.replace('/', "\\").trim_end_matches('\\'))
 }
 
 /// Where Vortex keeps a profile's plugin files. The source names the files but not their folder;
@@ -2901,8 +2903,8 @@ fn profile_state_for_merge(
     plan: &VortexPlan,
     layer_mod: &HashMap<String, Option<String>>,
 ) -> Result<crate::game_loadout::GameLoadout, ImportError> {
-    let mut state = crate::game_loadout::capture(ctx, instance_id, definition)
-        .map_err(ImportError::Other)?;
+    let mut state =
+        crate::game_loadout::capture(ctx, instance_id, definition).map_err(ImportError::Other)?;
     let enabled: BTreeSet<&str> = plan
         .mods
         .iter()
@@ -3056,10 +3058,7 @@ pub fn run_profiles(
             let mut layer_mod: HashMap<String, Option<String>> = HashMap::new();
             for layer in manifest.layers.layers() {
                 if let agora_game_api::LayerSource::Content { content } = &layer.source {
-                    layer_mod.insert(
-                        layer.id.as_str().to_string(),
-                        reverse.get(content).cloned(),
-                    );
+                    layer_mod.insert(layer.id.as_str().to_string(), reverse.get(content).cloned());
                 }
             }
 

@@ -561,6 +561,68 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
         .any(|folder| Path::new(folder) == f._tmp.path().join("game")));
 }
 
+/// The folder's 8.3 short name, the spelling CI's temp folder can arrive as.
+/// `None` when the volume does not make one, or gives the same name back.
+#[cfg(windows)]
+fn short_path(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buffer = vec![0u16; 260];
+    let len = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            wide.as_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
+    if len == 0 || len as usize >= buffer.len() {
+        return None;
+    }
+    buffer.truncate(len as usize);
+    let short = PathBuf::from(String::from_utf16_lossy(&buffer));
+    (short != path).then_some(short)
+}
+
+/// Vortex can name a folder with its 8.3 short form while the folder Agora added
+/// is stored under its long form. They are one folder, so the add must not
+/// happen twice and the planned install must still be there when the run looks
+/// for it.
+#[test]
+fn a_folder_spelled_with_its_83_short_name_is_the_same_folder() {
+    let f = fixture();
+    let game_dir = f._tmp.path().join("game");
+    let Some(short) = short_path(&game_dir) else {
+        return;
+    };
+    write_store(
+        &f.store,
+        &[(
+            &format!("settings###gameMode###discovered###{VORTEX_GAME}"),
+            format!(
+                r#"{{"path":"{}"}}"#,
+                short.to_string_lossy().replace('\\', "/")
+            ),
+        )],
+    );
+
+    let mut empty = f.inventory.clone();
+    empty.installs.clear();
+    empty.unsupported.clear();
+
+    let mut with_add = request(&f, Some("Short Path Import"));
+    with_add.add_folder = true;
+    let report = vortex::run(&f.ctx, &empty, &with_add, Default::default(), &|_| {})
+        .expect("the short spelling is the same folder, so the import runs");
+    assert_eq!(report.stored_mods, 2);
+    assert!(report.instance_id.is_some());
+    let folders = agora_core::game_discovery::custom_folders::list_folders(&f.ctx.paths).unwrap();
+    assert_eq!(folders.len(), 1, "the folder is added once: {folders:?}");
+}
+
 #[test]
 fn a_missing_manifest_falls_back_to_vortex_rules_and_says_where_it_looked() {
     let f = fixture();
