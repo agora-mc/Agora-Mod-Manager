@@ -2468,7 +2468,7 @@ mod tests {
 
     #[test]
     fn the_default_staging_folder_and_placeholders_match_vortex() {
-        let user_data = PathBuf::from(r"C:\Users\player\AppData\Roaming\Vortex");
+        let user_data = std::env::temp_dir().join("agora-vortex-user-data");
         assert_eq!(
             resolve_install_path(None, &user_data, "testgame", None).unwrap(),
             user_data.join("testgame").join("mods")
