@@ -2498,6 +2498,42 @@ export interface LoadoutCoverage {
   worlds: number;
 }
 
+export interface GameLoadoutContent {
+  item: string;
+  enabled: boolean;
+}
+
+export interface GameLoadoutPluginList {
+  list: string;
+  /** The instance copy's bytes; absent when the instance had none. */
+  contents?: number[] | null;
+}
+
+export interface GameLoadoutIni {
+  file: string;
+  /** The instance copy's bytes; absent when the instance used the shared file. */
+  contents?: number[] | null;
+}
+
+export interface GameLoadoutRule {
+  item: string;
+  after: string;
+}
+
+export interface GameLoadoutRules {
+  list: string;
+  rules: GameLoadoutRule[];
+}
+
+/** The part of a game instance's setup a loadout records. */
+export interface GameLoadout {
+  content: GameLoadoutContent[];
+  plugin_lists: GameLoadoutPluginList[];
+  inis: GameLoadoutIni[];
+  rules: GameLoadoutRules[];
+  saves: 'shared' | 'own';
+}
+
 export interface LoadoutProfile {
   name: string;
   enabled_mods: string[];
@@ -2506,6 +2542,8 @@ export interface LoadoutProfile {
   covers?: LoadoutCoverage | null;
   /** Every item the profile records, on and off. Null for profiles saved before this. */
   items?: LoadoutItem[] | null;
+  /** Present on a game instance's profile; null or absent on a Minecraft one. */
+  game?: GameLoadout | null;
 }
 
 export interface ImportResult {

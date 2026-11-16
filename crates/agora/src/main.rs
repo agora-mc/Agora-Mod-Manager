@@ -5509,8 +5509,16 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            let profile = agora_core::loadout::create_profile(&instance_dir, &name)
-                .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?;
+            let profile = if let Some(record) = agora_core::game_instance::get(ctx, &instance)? {
+                let definition = ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!("The definition for game '{}' is missing", record.game)
+                })?;
+                agora_core::game_loadout::create_game_profile(ctx, &instance, definition, &name)
+                    .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?
+            } else {
+                agora_core::loadout::create_profile(&instance_dir, &name)
+                    .map_err(|e| anyhow::anyhow!("Failed to create loadout: {e}"))?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&profile)?);
             } else {
@@ -5533,11 +5541,12 @@ async fn run_loadout_command(
                 let rows: Vec<Vec<String>> = profiles
                     .iter()
                     .map(|p| {
-                        vec![
-                            p.name.clone(),
-                            p.created_at.clone(),
-                            p.enabled_mods.len().to_string(),
-                        ]
+                        let entries = p
+                            .game
+                            .as_ref()
+                            .map(|game| game.content.iter().filter(|item| item.enabled).count())
+                            .unwrap_or(p.enabled_mods.len());
+                        vec![p.name.clone(), p.created_at.clone(), entries.to_string()]
                     })
                     .collect();
                 print_table(&["Name", "Created", "Entries"], &rows);
@@ -5552,28 +5561,47 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
-            // Same core service the desktop uses: the lock, the running-game
-            // check and the undo point are not things a second front end skips.
-            let service = agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
-            let unlisted = service.unlisted_mods(&instance, &name)?;
-            let choice = match (others, unlisted.is_empty()) {
-                (Some(choice), _) => choice.into(),
-                // Nothing would be switched off either way, so there is nothing to ask.
-                (None, true) => agora_core::loadout::UnlistedMods::Keep,
-                (None, false) => anyhow::bail!(
-                    "Loadout '{}' does not list {} enabled mod(s) on '{}': {}. \
-                     Rerun with --others keep to leave them on, or --others off to switch them off.",
-                    name,
-                    unlisted.len(),
-                    instance,
-                    unlisted.join(", ")
-                ),
-            };
-            service.apply(&instance, &name, choice)?;
+            let game_instance = agora_core::game_instance::get(ctx, &instance)?.is_some();
+            if game_instance {
+                let record = agora_core::game_instance::get(ctx, &instance)?
+                    .expect("the instance was just found");
+                let definition = ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!("The definition for game '{}' is missing", record.game)
+                })?;
+                agora_core::game_loadout::apply_game_profile_with_undo(
+                    ctx, &instance, definition, &name,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            } else {
+                // Same core service the desktop uses: the lock, the running-game
+                // check and the undo point are not things a second front end skips.
+                let service =
+                    agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
+                let unlisted = service.unlisted_mods(&instance, &name)?;
+                let choice = match (others, unlisted.is_empty()) {
+                    (Some(choice), _) => choice.into(),
+                    // Nothing would be switched off either way, so there is nothing to ask.
+                    (None, true) => agora_core::loadout::UnlistedMods::Keep,
+                    (None, false) => anyhow::bail!(
+                        "Loadout '{}' does not list {} enabled mod(s) on '{}': {}. \
+                         Rerun with --others keep to leave them on, or --others off to switch them off.",
+                        name,
+                        unlisted.len(),
+                        instance,
+                        unlisted.join(", ")
+                    ),
+                };
+                service.apply(&instance, &name, choice)?;
+            }
             if json {
                 println!(
                     "{}",
                     serde_json::json!({"status": "applied", "instanceId": instance, "profile": name})
+                );
+            } else if game_instance {
+                println!(
+                    "Applied loadout '{}' to '{}'. The setup it replaced was saved as the undo point (only the newest is kept).",
+                    name, instance
                 );
             } else {
                 println!(
@@ -5593,8 +5621,21 @@ async fn run_loadout_command(
             if !instance_dir.exists() {
                 anyhow::bail!("Instance '{}' not found", instance);
             }
+            let game_record = agora_core::game_instance::get(ctx, &instance)?;
+            let game_definition = match &game_record {
+                Some(record) => Some(ctx.games.game(&record.game).ok_or_else(|| {
+                    anyhow::anyhow!("The definition for game '{}' is missing", record.game)
+                })?),
+                None => None,
+            };
             let service = agora_game_minecraft::loadout_service::LoadoutService::new(ctx.clone());
-            let preview = service.update_preview(&instance, &name)?;
+            let preview = match game_definition {
+                Some(definition) => agora_core::game_loadout::plan_game_profile_update(
+                    ctx, &instance, definition, &name,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to read the loadout: {e}"))?,
+                None => service.update_preview(&instance, &name)?,
+            };
             if preview.changes.is_empty() {
                 if json {
                     println!(
@@ -5617,7 +5658,13 @@ async fn run_loadout_command(
                     println!("Loadout '{}' was not changed.", name);
                 }
             } else {
-                let done = service.update(&instance, &name)?;
+                let done = match game_definition {
+                    Some(definition) => agora_core::game_loadout::update_game_profile(
+                        ctx, &instance, definition, &name,
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to update the loadout: {e}"))?,
+                    None => service.update(&instance, &name)?,
+                };
                 if json {
                     println!(
                         "{}",
@@ -10534,9 +10581,20 @@ fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
     );
 }
 
+/// Whether a failed Steam hand-off may fall back to the ordinary launch.
+///
+/// Only a non-Steam install may: its launch has nothing to do with Steam. A Steam install with no
+/// `steam` command cannot work through any other path — a Windows game needs Proton through
+/// Steam, and a native Steam game needs the Steam client — so its error is reported instead.
+#[cfg(target_os = "linux")]
+fn steam_failure_falls_back(error: &agora_core::game_wrap::WrapError) -> bool {
+    matches!(error, agora_core::game_wrap::WrapError::NotSteam(_))
+}
+
 /// `games instance launch` on Linux: Steam starts the game, so Agora records what it asked for
-/// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance,
-/// or a machine with no Steam command, returns `None` and the ordinary launch path runs it.
+/// and hands the request to Steam. The `games wrap` it starts does the rest. A non-Steam instance
+/// returns `None` and the ordinary launch path runs it. A Steam instance that cannot be handed to
+/// Steam is an error, because the ordinary path cannot start it either.
 #[cfg(target_os = "linux")]
 fn cli_linux_launch(
     ctx: &agora_core::ctx::Ctx,
@@ -10547,7 +10605,7 @@ fn cli_linux_launch(
 
     let status = match agora_core::game_wrap::start_via_steam(ctx, instance_id) {
         Ok(status) => status,
-        Err(WrapError::NotSteam(_)) | Err(WrapError::SteamMissing) => return Ok(None),
+        Err(error) if steam_failure_falls_back(&error) => return Ok(None),
         Err(error) => {
             if json {
                 let out = serde_json::json!({
@@ -15854,6 +15912,21 @@ mod tests {
             Commands::Loadout {
                 action: LoadoutCmd::Update { yes: true, .. }
             }
+        ));
+    }
+
+    /// A Steam instance that cannot reach Steam must not be handed to the ordinary launch: that
+    /// path cannot start it. Only a non-Steam instance falls back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_a_non_steam_instance_falls_back_from_a_failed_steam_handoff() {
+        use agora_core::game_wrap::WrapError;
+        assert!(super::steam_failure_falls_back(&WrapError::NotSteam(
+            "gog".into()
+        )));
+        assert!(!super::steam_failure_falls_back(&WrapError::SteamMissing));
+        assert!(!super::steam_failure_falls_back(
+            &WrapError::InstallNotFound("skyrim".into())
         ));
     }
 

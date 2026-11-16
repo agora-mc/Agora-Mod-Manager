@@ -14,6 +14,7 @@ import { InstancePluginsTab } from '../plugins';
 import { useLoadOrderTab } from '../plugins/loadOrderTab';
 import { InstanceIniSavesTab } from '../iniSaves';
 import { InstanceToolsTab } from '../tools';
+import { LoadoutProfilesPanel } from '@/components/LoadoutProfilesPanel';
 import { GAME_INSTANCE_PAGE_TABS } from './gameNav';
 
 interface GameInstancePageProps {
@@ -47,6 +48,7 @@ export function GameInstancePage({ gameId, instanceId, page, onNavigatePage, onB
         {page === 'content' && <InstanceContentTab gameId={gameId} instanceId={instanceId} />}
         {page === 'plugins' && <InstancePluginsTab gameId={gameId} instanceId={instanceId} />}
         {page === 'ini-saves' && <InstanceIniSavesTab gameId={gameId} instanceId={instanceId} />}
+        {page === 'loadouts' && <LoadoutProfilesPanel instanceId={instanceId} kind="game" />}
         {page === 'tools' && <InstanceToolsTab gameId={gameId} instanceId={instanceId} />}
       </div>
     </InstanceSessionProvider>
