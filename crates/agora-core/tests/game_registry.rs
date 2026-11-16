@@ -1089,3 +1089,53 @@ fn an_empty_import_id_is_refused() {
         "{err:?}"
     );
 }
+
+#[test]
+fn the_repo_skyrim_package_keeps_its_vortex_import_id() {
+    use agora_core::game_registry::inherit::{self, PackageInput};
+    use serde_json::Value;
+
+    let packages = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official");
+    let read = |relative: &str| -> Value {
+        let path = packages.join(relative);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the package file is read"))
+            .expect("the package file is JSON")
+    };
+    let input = |plugin: &str, relative: &str| PackageInput {
+        source: PackageSource::Plugin {
+            plugin_id: plugin.to_string(),
+        },
+        blocked: false,
+        label: format!("Plugin {plugin}, game package {relative}"),
+        json: read(relative),
+    };
+    let inputs = vec![
+        input(
+            "agora.creation-engine",
+            "creation-engine/games/package.json",
+        ),
+        input("agora.skyrim-se", "skyrim-se/games/package.json"),
+    ];
+    let (resolved, warnings) = inherit::resolve(inputs);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let skyrim = resolved
+        .iter()
+        .find(|package| {
+            package
+                .definition
+                .games
+                .iter()
+                .any(|game| game.id.as_str() == "skyrim-se")
+        })
+        .expect("the Skyrim package resolves");
+    let game = skyrim
+        .definition
+        .games
+        .iter()
+        .find(|game| game.id.as_str() == "skyrim-se")
+        .unwrap();
+    assert_eq!(
+        game.import_ids.get("vortex").map(String::as_str),
+        Some("skyrimse")
+    );
+}

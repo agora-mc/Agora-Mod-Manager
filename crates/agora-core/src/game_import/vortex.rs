@@ -501,7 +501,7 @@ pub fn scan(
 
         if definition.is_none() {
             reason = Some(format!(
-                "no Agora game package names Vortex's '{}' game id; add `import_ids.vortex` to the game's definition",
+                "no installed game package names Vortex's '{}' id. Install the game's Agora plugin first: `agora registry sync`, then `agora plugin official list` and `agora plugin official install <plugin-id>`; if it is already installed, update it with `agora plugin official update <plugin-id>`",
                 game.id
             ));
         } else if let Some(def) = &definition {
@@ -526,9 +526,9 @@ pub fn scan(
                     }
                 },
             }
-            if let Some(path) = &game.discovered_path {
-                manifest = find_manifests(def, path);
-            }
+        }
+        if let Some(path) = &game.discovered_path {
+            manifest = find_manifests(definition, path);
         }
         if let Some(damaged) = &manifest.damaged {
             warnings.push(format!(
@@ -749,11 +749,13 @@ fn join_target(target: Option<&str>, rel_path: &str) -> String {
 }
 
 /// The folders Vortex may have deployed into for this game: the game root, and its data mount.
-fn manifest_folders(def: &GameDefinition, install: &Path) -> Vec<PathBuf> {
+fn manifest_folders(def: Option<&GameDefinition>, install: &Path) -> Vec<PathBuf> {
     let mut roots = vec![install.to_path_buf()];
-    let mount = data_mount(def);
-    if !mount.is_empty() {
-        roots.push(install.join(&mount));
+    if let Some(def) = def {
+        let mount = data_mount(def);
+        if !mount.is_empty() {
+            roots.push(install.join(&mount));
+        }
     }
     roots
 }
@@ -799,7 +801,7 @@ struct ManifestSearch {
 
 /// Read every deployment manifest the game's deploy folders hold. A missing one is not an error
 /// (`found: false`), and `searched` says where we looked.
-fn find_manifests(def: &GameDefinition, install: &Path) -> ManifestSearch {
+fn find_manifests(def: Option<&GameDefinition>, install: &Path) -> ManifestSearch {
     let mut search = ManifestSearch::default();
     for folder in manifest_folders(def, install) {
         let candidates = manifest_files_in(&folder);
@@ -1165,7 +1167,7 @@ pub fn plan(
     let mods = plan_mods(game, profile, &staging, &mut problems);
     let enabled = mods.iter().filter(|m| m.enabled).count();
 
-    let manifest_search = find_manifests(&definition, &install.discovered.location);
+    let manifest_search = find_manifests(Some(&definition), &install.discovered.location);
     let mut manifest = ManifestPlan {
         path: manifest_search
             .searched
@@ -2397,5 +2399,25 @@ mod tests {
             resolve_install_path(Some("{base}/mods"), &user_data, "testgame", None).unwrap(),
             user_data.join("testgame").join("mods")
         );
+    }
+
+    #[test]
+    fn with_no_definition_the_manifest_search_still_names_the_game_root() {
+        let tmp = tempfile::Builder::new()
+            .prefix("agora-vortex-manifest-")
+            .tempdir()
+            .expect("a temp folder can be made");
+        let game = tmp.path();
+        std::fs::write(
+            game.join("vortex.deployment.json"),
+            br#"{"version":1,"instance":"x","files":[]}"#,
+        )
+        .unwrap();
+        let search = find_manifests(None, game);
+        assert!(search.found);
+        assert!(search
+            .searched
+            .iter()
+            .any(|path| path == &game.join("vortex.deployment.json")));
     }
 }
