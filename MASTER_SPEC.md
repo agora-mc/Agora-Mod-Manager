@@ -4123,6 +4123,24 @@ Most people who will try this already have a setup. Import has to be good.
   file wins it) with Vortex's rules as the tie-breaker, and any file the manifest and the rules
   disagree on is reported. Downloads are not copied; they are referenced when their hashes match.
 
+- **Loadouts for game instances (designed 2026-11-15).** Minecraft instances already have loadouts
+  (`agora loadout`, the desktop's loadout picker): named sets of which content is on, applied with
+  an undo snapshot. Game instances get the same loadouts, through the same commands, picker and
+  store, not a second feature. For a game whose package declares them, a loadout also records the
+  plugin list (active set and order), the INIs (its own copies, or the instance's shared ones),
+  its load-after rules (§31.4) and its save choice; applying it restores all of them, and is
+  refused while the game runs. The content store keeps one copy of each file, so loadouts cost no
+  extra disk.
+- **Importing several profiles (Vortex and MO2).** When a setup has more than one profile, the
+  import asks whether to make **one instance with a loadout per profile** or **separate
+  instances**, and lets the player group profiles (some together, some apart). Agora suggests a
+  grouping from how much the profiles' enabled mods overlap (profiles sharing most of their mods
+  together; unrelated ones apart) and says why. A separate instance gets only the mods its profile
+  enables (`--all-mods` brings the rest in turned off); a merged instance holds the union of its
+  profiles' enabled mods, and each profile's loadout turns its own set on. Before copying anything
+  the import states the bytes the chosen profiles bring in and the free space on the content
+  store's drive, and refuses only when they cannot fit.
+
 ### 26.11 Game Support Packages and the Plugin System
 
 **The plugin system is extended, not replaced.** Its foundations hold: the `ScriptHost` seam, grants
