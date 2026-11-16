@@ -327,8 +327,6 @@ pub struct PlanDto {
     pub mods: Vec<PlannedModDto>,
     pub mods_enabled: usize,
     pub mods_disabled: usize,
-    /// Disabled mods left out by the default (not `--all-mods`), by name.
-    pub mods_left_out: Vec<String>,
     pub files: usize,
     pub bytes: u64,
     /// Top-level `meta.ini` files left out of the stored content, across all mods.
@@ -437,7 +435,6 @@ impl From<&Mo2Plan> for PlanDto {
                 .collect(),
             mods_enabled: plan.mods_enabled,
             mods_disabled: plan.mods_disabled,
-            mods_left_out: plan.mods_left_out.clone(),
             files: plan.files,
             bytes: plan.bytes,
             meta_ini_excluded: plan.meta_ini_excluded,
@@ -812,6 +809,8 @@ pub struct VortexPlanDto {
     pub mods: Vec<VortexModDto>,
     pub mods_enabled: usize,
     pub mods_disabled: usize,
+    /// Disabled mods left out by the default (not `--all-mods`), by name.
+    pub mods_left_out: Vec<String>,
     pub files: usize,
     pub bytes: u64,
     pub manifest: VortexManifestDto,
@@ -902,6 +901,7 @@ impl From<&VortexPlan> for VortexPlanDto {
                 .collect(),
             mods_enabled: plan.mods_enabled,
             mods_disabled: plan.mods_disabled,
+            mods_left_out: plan.mods_left_out.clone(),
             files: plan.files,
             bytes: plan.bytes,
             manifest: VortexManifestDto {
