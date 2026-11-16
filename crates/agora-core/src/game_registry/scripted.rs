@@ -144,7 +144,7 @@ impl ScriptedPackage {
             Some(id) if id == self.plugin_id.as_str() => Ok(self.plugin_id.clone()),
             Some(id) => PluginId::parse(id).map_err(|error| GameError {
                 code: "ERR_GAME_SCRIPT_OWNER".into(),
-                message: format!("the plugin that owns a script hook cannot be named: {error}"),
+                message: format!("the plugin that owns a script cannot be named: {error}"),
             }),
         }
     }

@@ -236,7 +236,7 @@ pub struct DeploymentRecord {
 pub enum DeployError {
     #[error("instance '{0}' not found")]
     InstanceNotFound(String),
-    #[error("cannot deploy unpinned instance '{0}': direct install into the game folder is a later rung (§26.5, rung 4)")]
+    #[error("cannot deploy unpinned instance '{0}': installing directly into the game folder is not supported yet")]
     UnpinnedInstance(String),
     #[error("base '{0}' not found")]
     BaseNotFound(String),

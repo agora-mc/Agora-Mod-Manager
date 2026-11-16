@@ -499,7 +499,7 @@ pub async fn install_catalog_pack(
             .as_deref()
             .ok_or_else(|| LauncherError::Generic {
                 code: "ERR_PINNED_MANIFEST".into(),
-                message: format!("'{}' is a provider pack with no plan digest.", item.name),
+                message: format!("'{}' is a content provider with no plan hash.", item.name),
             })?,
         accept_changed,
         name_override,

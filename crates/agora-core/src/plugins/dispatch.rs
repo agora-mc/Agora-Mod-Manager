@@ -911,7 +911,7 @@ fn game_instance_id(cx: &DispatchContext<'_>, args: &serde_json::Value) -> Plugi
             return Err(PluginError::new(
                 PluginErrorCode::CapabilityDenied,
                 format!(
-                    "this hook is bound to instance `{bound}`; it may not name `{instance_id}`"
+                    "this call is bound to instance `{bound}`; it may not name `{instance_id}`"
                 ),
             ));
         }

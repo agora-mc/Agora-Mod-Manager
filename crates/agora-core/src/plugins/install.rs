@@ -904,14 +904,12 @@ fn collect_script_files(
         }
         *entries += 1;
         if *entries > MAX_ENTRIES {
-            return Err(io_error(
-                "the plugin folder holds too many files to fingerprint",
-            ));
+            return Err(io_error("the plugin folder holds too many files to check"));
         }
         if meta.is_file() {
             *total = total.saturating_add(meta.len());
             if *total > MAX_TOTAL_BYTES {
-                return Err(io_error("the plugin folder is too large to fingerprint"));
+                return Err(io_error("the plugin folder is too large to check"));
             }
             let bytes = std::fs::read(&path)
                 .map_err(|e| io_error(format!("could not read {}: {e}", path.display())))?;
