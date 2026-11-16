@@ -505,6 +505,13 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
         .any(|install| install.game == GameId::new(GAME).unwrap()));
     let plan = vortex::plan(&f.ctx, &inventory, &request).expect("the plan is made");
     assert_eq!(plan.mods.len(), 3);
+    // A custom folder has no store, but the profile's INIs are still its own; the saves stay
+    // shared because Agora cannot tell which store's Documents folder it uses.
+    assert!(plan.local_settings);
+    assert_eq!(plan.inis.len(), 3);
+    assert!(plan.local_saves);
+    assert!(!plan.saves.local);
+    assert!(plan.saves.note.contains("custom folder"));
 }
 
 #[test]

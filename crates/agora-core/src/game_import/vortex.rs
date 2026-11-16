@@ -875,10 +875,30 @@ fn plan_inis(
         ));
         return Vec::new();
     }
+    // A custom folder has no store, so no store-specific mapping applies. The profile's files are
+    // named by their base name; use the first mapping for each instance path, which is the same
+    // file the game reads.
+    let mut mappings: Vec<&agora_game_api::UserFileMapping> = def
+        .user_files
+        .iter()
+        .filter(|m| m.applies_to_store(store))
+        .collect();
+    if mappings.is_empty() {
+        let mut seen = std::collections::BTreeSet::new();
+        for mapping in &def.user_files {
+            if seen.insert(mapping.instance_path.as_str().to_ascii_lowercase()) {
+                mappings.push(mapping);
+            }
+        }
+    }
     let mut out = Vec::new();
-    for mapping in def.user_files.iter().filter(|m| m.applies_to_store(store)) {
+    let mut seen = std::collections::BTreeSet::new();
+    for mapping in mappings {
         let instance_path = mapping.instance_path.as_str();
         if !instance_path.to_ascii_lowercase().ends_with(".ini") {
+            continue;
+        }
+        if !seen.insert(instance_path.to_ascii_lowercase()) {
             continue;
         }
         let name = instance_path.rsplit('/').next().unwrap_or(instance_path);
@@ -918,11 +938,19 @@ fn plan_saves(
             note: "the profile shares the game's saves".into(),
         });
     }
-    let Some(rule) = def
+    let mut direct = false;
+    let rule = def
         .save_location
         .iter()
         .find(|rule| rule.applies_to_store(store))
-    else {
+        .or_else(|| {
+            // A custom folder has no store. The first rule still names the Documents save
+            // folder, so the source can be counted; the instance cannot be told to use it
+            // because its store is unknown, so its saves stay shared.
+            direct = store.as_str() == "direct";
+            direct.then(|| def.save_location.first()).flatten()
+        });
+    let Some(rule) = rule else {
         return Ok(SavesPlan {
             local: true,
             files: 0,
@@ -960,12 +988,17 @@ fn plan_saves(
         }
     }
     Ok(SavesPlan {
-        local: true,
+        local: !direct,
         files,
         bytes,
         from: Some(from),
         to: None,
-        note: String::new(),
+        note: if direct {
+            "the install is a custom folder, so Agora cannot tell which store's Documents folder it uses; the saves stay shared"
+                .to_string()
+        } else {
+            String::new()
+        },
     })
 }
 
@@ -1215,6 +1248,9 @@ pub fn plan(
         &profile.id,
         profile.local_saves,
     )?;
+    if profile.local_saves && !saves.local && !saves.note.is_empty() {
+        warnings.push(saves.note.clone());
+    }
 
     if request.name.is_none() {
         if let Some(instance) = find_import_of_kind(ctx, "vortex", &request.store, &profile.name)? {
@@ -2144,7 +2180,7 @@ pub fn run(
         }
 
         // The profile's own saves: the instance uses its own, and --copy-saves copies the files.
-        if plan.local_saves {
+        if plan.saves.local {
             if let Some(rule) = crate::game_saves::rule_for(&def, &install.discovered.store) {
                 crate::game_saves::set_choice_inner(
                     ctx,
