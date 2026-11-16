@@ -892,7 +892,7 @@ fn read_provenance(mod_dir: &Path) -> Mo2Provenance {
             installation_file: meta.installation_file,
             repository: meta.repository,
             game_name: meta.game_name,
-            note: "provenance claimed, not verified".into(),
+            note: "source claimed, not verified".into(),
         },
         Err(reason) => Mo2Provenance::Unreadable { reason },
     }
@@ -1616,7 +1616,7 @@ pub fn run(
                     }
                 } else if plan.saves.files > 0 {
                     report.next_steps.push(format!(
-                    "{} save file(s) were not copied (saves go under Documents, which needs --copy-saves). To copy them by hand, copy the files in {} into {}",
+                    "Agora did not copy {} save file(s) (saves go under Documents, which needs --copy-saves). To copy them by hand, copy the files in {} into {}",
                     plan.saves.files,
                     plan.saves.from.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
                     folder.display()

@@ -713,7 +713,7 @@ fn import_stores_bytes_orders_layers_and_leaves_the_setup_alone() {
     match claimed {
         Some(Mo2Provenance::Claimed { modid, note, .. }) => {
             assert_eq!(modid, Some(42));
-            assert_eq!(note, "provenance claimed, not verified");
+            assert_eq!(note, "source claimed, not verified");
         }
         other => panic!("Alpha's provenance was {other:?}"),
     }
