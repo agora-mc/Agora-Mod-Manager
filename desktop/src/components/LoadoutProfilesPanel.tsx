@@ -87,9 +87,25 @@ export function LoadoutProfilesPanel({
   const [confirmDeleteProfile, setConfirmDeleteProfile] = useState<string | null>(null);
   const [unlistedChoice, setUnlistedChoice] = useState<{ profile: string; mods: string[] } | null>(null);
   const [updateReview, setUpdateReview] = useState<{ profile: string; changes: LoadoutChange[] } | null>(null);
+  // A page that gives no callback (a game instance's Loadouts tab) still shows
+  // what happened instead of swallowing it.
+  const [localStatus, setLocalStatus] = useState<string | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
 
   const isGame = kind === 'game';
-  const reportError = (cause: unknown) => onError?.(formatError(cause));
+  const reportStatus = (message: string) => {
+    if (onStatus) onStatus(message);
+    else setLocalStatus(message);
+  };
+  const reportError = (cause: unknown) => {
+    const message = formatError(cause);
+    if (onError) onError(message);
+    else setLocalError(message);
+  };
+  const clearError = () => {
+    if (onError) onError(null);
+    else setLocalError(null);
+  };
 
   const reloadProfiles = async () => {
     try {
@@ -106,11 +122,11 @@ export function LoadoutProfilesPanel({
 
   const runProfileApply = async (name: string, unlistedMods: UnlistedModsChoice) => {
     setProfileBusy(name);
-    onError?.(null);
+    clearError();
     try {
       await applyLoadoutProfile(instanceId, name, unlistedMods);
       await onApplied?.();
-      onStatus?.(
+      reportStatus(
         isGame
           ? `Profile "${name}" applied. The setup it replaced was saved as the undo point.`
           : `Profile "${name}" applied. Before switching, Agora saved an undo point under Snapshots, labelled before-loadout (only the newest is kept).`,
@@ -123,7 +139,7 @@ export function LoadoutProfilesPanel({
   };
 
   const requestProfileApply = async (name: string) => {
-    onError?.(null);
+    clearError();
     setProfileBusy(name);
     const unlisted = await listLoadoutUnlistedMods(instanceId, name).catch((e: unknown) => {
       reportError(e);
@@ -139,12 +155,12 @@ export function LoadoutProfilesPanel({
   };
 
   const requestProfileUpdate = async (name: string) => {
-    onError?.(null);
+    clearError();
     setProfileBusy(name);
     try {
       const preview = await previewLoadoutUpdate(instanceId, name);
       if (preview.changes.length === 0) {
-        onStatus?.(`Profile "${name}" already matches the current setup. Nothing to save.`);
+        reportStatus(`Profile "${name}" already matches the current setup. Nothing to save.`);
       } else {
         setUpdateReview({ profile: name, changes: preview.changes });
       }
@@ -157,11 +173,11 @@ export function LoadoutProfilesPanel({
 
   const saveProfileUpdate = async (name: string) => {
     setProfileBusy(name);
-    onError?.(null);
+    clearError();
     try {
       await updateLoadoutProfile(instanceId, name);
       await reloadProfiles();
-      onStatus?.(`Profile "${name}" now records the current setup of this instance.`);
+      reportStatus(`Profile "${name}" now records the current setup of this instance.`);
     } catch (e) {
       reportError(e);
     } finally {
@@ -187,12 +203,12 @@ export function LoadoutProfilesPanel({
               onClick={async () => {
                 const name = profileNameInput.trim();
                 if (!name) return;
-                onError?.(null);
+                clearError();
                 try {
                   await createLoadoutProfile(instanceId, name);
                   await reloadProfiles();
                   setProfileNameInput('');
-                  onStatus?.(`Profile "${name}" created.`);
+                  reportStatus(`Profile "${name}" created.`);
                 } catch (e) {
                   reportError(e);
                 }
@@ -243,7 +259,7 @@ export function LoadoutProfilesPanel({
                       <button
                         onClick={async () => {
                           setProfileBusy(prof.name);
-                          onError?.(null);
+                          clearError();
                           try {
                             await deleteLoadoutProfile(instanceId, prof.name);
                             await reloadProfiles();
@@ -282,6 +298,12 @@ export function LoadoutProfilesPanel({
           </div>
         )}
       </section>
+
+      {(localStatus || localError) && (
+        <p className={localError ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'} role="status">
+          {localError ?? localStatus}
+        </p>
+      )}
 
       <Dialog
         open={unlistedChoice !== null}
