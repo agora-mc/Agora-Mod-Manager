@@ -15,6 +15,7 @@
 //! Nothing here names a game. The Steam app id, the install and the Proton prefix come from the
 //! install record; the per-user files come from the game definition.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, UNIX_EPOCH};
@@ -136,11 +137,18 @@ pub fn start_via_steam(
             created_unix_ms: now_ms(ctx),
         },
     )?;
-    let program = std::env::var_os(STEAM_COMMAND_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("steam"));
-    let started = Command::new(&program)
-        .arg(format!("steam://rungameid/{app_id}"))
+    let roots = crate::game_discovery::platform::find_steam_roots();
+    let flatpak_root = roots.iter().any(|root| is_flatpak_root(root));
+    let launcher = match std::env::var_os(STEAM_COMMAND_ENV) {
+        Some(program) => Some(SteamLauncher::Native(PathBuf::from(program))),
+        None => launcher_in(std::env::var_os("PATH").as_deref(), flatpak_root),
+    };
+    let Some(launcher) = launcher else {
+        clear_pending(ctx);
+        return Err(WrapError::SteamMissing);
+    };
+    let started = launcher
+        .command(&format!("steam://rungameid/{app_id}"))
         .spawn();
     if let Err(error) = started {
         // Nothing will pick the record up, so it must not claim a later launch.
@@ -150,8 +158,97 @@ pub fn start_via_steam(
         }
         return Err(WrapError::SteamStart(error.to_string()));
     }
-    let roots = crate::game_discovery::platform::find_steam_roots();
-    Ok(steam::launch_status(&roots, &app_id))
+    let mut status = steam::launch_status(&roots, &app_id);
+    status.launcher = launcher.describe().to_string();
+    Ok(status)
+}
+
+/// How Steam can be asked to start a game on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SteamLauncher {
+    /// The store's own `steam` command.
+    Native(PathBuf),
+    /// A Flatpak install has no `steam` on `PATH`; its command names the sandbox.
+    Flatpak(PathBuf),
+}
+
+impl SteamLauncher {
+    fn command(&self, url: &str) -> Command {
+        match self {
+            SteamLauncher::Native(program) => {
+                let mut command = Command::new(program);
+                command.arg(url);
+                command
+            }
+            SteamLauncher::Flatpak(program) => {
+                let mut command = Command::new(program);
+                command.args(["run", "com.valvesoftware.Steam", url]);
+                command
+            }
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        match self {
+            SteamLauncher::Native(_) => "steam",
+            SteamLauncher::Flatpak(_) => "flatpak run com.valvesoftware.Steam",
+        }
+    }
+}
+
+fn is_flatpak_root(root: &Path) -> bool {
+    root.components()
+        .any(|part| part.as_os_str() == "com.valvesoftware.Steam")
+}
+
+/// `steam` when it is on `PATH`; `flatpak` when only a Flatpak Steam root exists. A machine with
+/// neither cannot be asked to start a game, which is an error, never a silent no-op.
+fn launcher_in(path: Option<&OsStr>, flatpak_root: bool) -> Option<SteamLauncher> {
+    if let Some(steam) = find_executable(path, "steam") {
+        return Some(SteamLauncher::Native(steam));
+    }
+    if flatpak_root {
+        if let Some(flatpak) = find_executable(path, "flatpak") {
+            return Some(SteamLauncher::Flatpak(flatpak));
+        }
+    }
+    None
+}
+
+fn find_executable(path: Option<&OsStr>, name: &str) -> Option<PathBuf> {
+    let path = path?;
+    for dir in std::env::split_paths(path) {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let with_exe = dir.join(format!("{name}.exe"));
+            if is_executable(&with_exe) {
+                return Some(with_exe);
+            }
+        }
+    }
+    None
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Run Steam's command through the chosen instance, or untouched when there is none.
@@ -712,6 +809,61 @@ mod tests {
         .unwrap();
         assert_eq!(take_pending(&ctx).unwrap().instance_id, "fresh");
         assert!(take_pending(&ctx).is_none());
+    }
+
+    #[test]
+    fn steam_is_preferred_and_flatpak_is_used_only_when_steam_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let path = tmp.path().join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.to_string()
+            });
+            std::fs::write(
+                &path,
+                b"#!/bin/sh
+exit 0
+",
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+        let path = std::env::join_paths([tmp.path()]).unwrap();
+
+        let steam = make("steam");
+        let flatpak = make("flatpak");
+        assert_eq!(
+            launcher_in(Some(&path), true),
+            Some(SteamLauncher::Native(steam))
+        );
+
+        std::fs::remove_file(
+            tmp.path()
+                .join(if cfg!(windows) { "steam.exe" } else { "steam" }),
+        )
+        .unwrap();
+        assert_eq!(
+            launcher_in(Some(&path), true),
+            Some(SteamLauncher::Flatpak(flatpak))
+        );
+        assert_eq!(launcher_in(Some(&path), false), None);
+        assert_eq!(launcher_in(None, true), None);
+    }
+
+    #[test]
+    fn a_flatpak_root_is_recognised_from_its_sandbox_folder() {
+        assert!(is_flatpak_root(Path::new(
+            "/home/player/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+        )));
+        assert!(!is_flatpak_root(Path::new(
+            "/home/player/.local/share/Steam"
+        )));
     }
 
     #[test]

@@ -262,8 +262,9 @@ Agora runs from linked files (and, if links cannot work, copies) and says why, t
 chain as Windows. Per-user files are bind-mounted from the instance's copies inside the namespace,
 so the real files are never swapped or changed. Steam starts the game on Linux, so the overlay is
 entered by `agora games wrap %command%` in the game's Steam launch options. `agora games instance
-launch` asks Steam to start it and prints the exact text and the files Agora read when the wrapper
-is missing; Agora only reads `localconfig.vdf`, never edits Steam's files. The game's Windows
+launch` asks Steam to start it (with its `steam` command, or `flatpak run com.valvesoftware.Steam`
+when only a Flatpak Steam is installed) and prints the exact text and the files Agora read when the
+wrapper is missing; Agora only reads `localconfig.vdf`, never edits Steam's files. The game's Windows
 `Documents` and `LocalAppData` files, and its crash sources, resolve inside the Proton prefix's
 `drive_c/users/steamuser` folders. Launching through Proton has not been tested on real hardware
 yet, and the CLI says so on every Linux launch (MASTER_SPEC §26.5).

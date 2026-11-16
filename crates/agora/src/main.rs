@@ -10073,6 +10073,7 @@ fn cli_linux_launch(
             "launch_options_text": status.expected,
             "launch_options_files": status.files,
             "problems": status.problems,
+            "launcher": status.launcher,
             "note": agora_core::game_wrap::PROTON_UNTESTED,
             "exitCode": 0,
         });
@@ -10080,8 +10081,14 @@ fn cli_linux_launch(
     } else {
         println!("{}", agora_core::game_wrap::PROTON_UNTESTED);
         println!(
-            "Asked Steam to start app {}. Agora recorded instance '{}' for the next two minutes.",
-            status.app_id, instance_id
+            "Asked Steam to start app {} through {}. Agora recorded instance '{}' for the next two minutes.",
+            status.app_id,
+            if status.launcher.is_empty() {
+                "steam"
+            } else {
+                status.launcher.as_str()
+            },
+            instance_id
         );
         print_linux_launch_options(&status);
     }

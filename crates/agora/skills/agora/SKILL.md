@@ -145,8 +145,9 @@ agora --json crash analyze <FILE> --instance <ID>
 ```
 
 On Linux, Steam starts the game. Put `agora games wrap %command%` in the game's Steam launch
-options, then `agora --json games instance launch <ID>` asks Steam to start it and reports whether
-the wrapper is there. If it is not, give the person the exact text to paste and where; Agora only
+options, then `agora --json games instance launch <ID>` asks Steam to start it (with `steam`, or
+`flatpak run com.valvesoftware.Steam` when Steam is a Flatpak) and reports whether the wrapper is
+there. If it is not, give the person the exact text to paste and where; Agora only
 reads Steam's files. `agora games instance default <ID>` chooses the instance a Steam launch uses.
 The game's Windows user files and crash logs live inside the Proton prefix under
 `steamapps/compatdata/<appid>/pfx`. Every Linux launch says that Proton has not been tested on real

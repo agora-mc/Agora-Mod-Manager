@@ -215,7 +215,8 @@ Steam starts the game, so Agora runs through the game's launch options:
 
 1. Open the game in Steam, choose **Properties → Launch Options**, and paste
    `agora games wrap %command%`.
-2. Run `agora games instance launch <ID>` once. It asks Steam to start the game and checks the
+2. Run `agora games instance launch <ID>` once. It asks Steam to start the game (the `steam`
+   command, or `flatpak run com.valvesoftware.Steam` when Steam is a Flatpak) and checks the
    setting. When the wrapper is missing it prints the exact text to paste and the `localconfig.vdf`
    files it read. Agora never writes Steam's files.
 3. To make a launch use one instance, run `agora games instance default <ID>`. Launching from

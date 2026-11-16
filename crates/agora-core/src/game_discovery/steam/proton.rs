@@ -66,6 +66,9 @@ pub struct SteamLaunchStatus {
     pub wrapper_present: bool,
     /// The `localconfig.vdf` files that were looked at.
     pub files: Vec<PathBuf>,
+    /// The command Agora used to ask Steam to start the game, when a launch asked it.
+    #[serde(default)]
+    pub launcher: String,
     /// Unreadable or unparsable files, named with the reason. Empty means every file was read.
     pub problems: Vec<String>,
 }
@@ -109,6 +112,7 @@ pub fn launch_status(steam_roots: &[PathBuf], app_id: &str) -> SteamLaunchStatus
         wrapper_present,
         files,
         problems,
+        launcher: String::new(),
     }
 }
 
