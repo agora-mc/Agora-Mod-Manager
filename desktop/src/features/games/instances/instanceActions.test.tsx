@@ -45,6 +45,7 @@ vi.mock('./api', async (importOriginal) => {
     ...actual,
     getGameInstance: vi.fn(),
     checkGameInstance: vi.fn(),
+    getSteamLaunchInfo: vi.fn(async () => ({ supported: false })),
     stopGameInstance: vi.fn(),
     renameGameInstance: vi.fn(),
     cloneGameInstance: vi.fn(),

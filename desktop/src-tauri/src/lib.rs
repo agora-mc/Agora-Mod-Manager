@@ -526,6 +526,7 @@ pub fn run() {
             games::instances::games_instance_check,
             games::instances::games_instance_set_deployment,
             games::instances::games_instance_launch,
+            games::instances::games_instance_steam_status,
             games::content::games_content_list,
             games::content::games_content_add,
             games::content::games_content_verify,

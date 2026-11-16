@@ -545,6 +545,42 @@ export async function launchGameInstance(
   return reply;
 }
 
+/** What Steam's launch options say for an instance on Linux; `supported` is false elsewhere. */
+export interface SteamLaunchInfo {
+  supported: boolean;
+  appId: string | null;
+  expected: string;
+  configured: string | null;
+  wrapperPresent: boolean;
+  files: string[];
+  problems: string[];
+  /** The untested-Proton line the CLI prints on every Linux launch. */
+  note: string;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function isSteamLaunchInfo(value: unknown): value is SteamLaunchInfo {
+  return isRecord(value)
+    && typeof value.supported === 'boolean'
+    && (value.appId === null || typeof value.appId === 'string')
+    && typeof value.expected === 'string'
+    && (value.configured === null || typeof value.configured === 'string')
+    && typeof value.wrapperPresent === 'boolean'
+    && isStringArray(value.files)
+    && isStringArray(value.problems)
+    && typeof value.note === 'string';
+}
+
+/** Read Steam's launch options for an instance, read only. Never edits Steam's files. */
+export async function getSteamLaunchInfo(instanceId: string): Promise<SteamLaunchInfo> {
+  const reply: unknown = await invoke<unknown>('games_instance_steam_status', { instanceId });
+  if (!isSteamLaunchInfo(reply)) throw shapeError('games_instance_steam_status');
+  return reply;
+}
+
 export function onCreateProgress(handler: (progress: CreateProgress) => void): Promise<UnlistenFn> {
   return listen<CreateProgress>(CREATE_PROGRESS_EVENT, (event) => handler(event.payload));
 }

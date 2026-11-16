@@ -103,6 +103,8 @@ pub struct LogSweepReport {
 /// guessed.
 pub struct InstanceRoots {
     pub instance_dir: PathBuf,
+    /// The Proton prefix the game's Windows user folders live in, when it runs through Proton.
+    pub proton_prefix: Option<PathBuf>,
 }
 
 impl SourceRoots for InstanceRoots {
@@ -113,8 +115,14 @@ impl SourceRoots for InstanceRoots {
                 relative: path.as_str().to_string(),
             }),
             GamePath::UserData { location, path } => {
-                let base = crate::game_user_files::user_data_root(location)
-                    .ok_or_else(|| format!("the user data folder for {location:?} is not known"))?;
+                let base = match &self.proton_prefix {
+                    Some(prefix) => {
+                        crate::game_user_files::user_data_root_in_prefix(prefix, location)
+                    }
+                    None => crate::game_user_files::user_data_root(location).ok_or_else(|| {
+                        format!("the user data folder for {location:?} is not known")
+                    })?,
+                };
                 Ok(SourceLocation {
                     base,
                     relative: path.as_str().to_string(),
@@ -269,7 +277,10 @@ pub fn sweep_instance_logs(
         .paths
         .instance_dir(setup.instance_id)
         .map_err(|error| format!("the instance folder could not be resolved: {error}"))?;
-    let roots = InstanceRoots { instance_dir };
+    let roots = InstanceRoots {
+        instance_dir,
+        proton_prefix: crate::game_instance::proton_prefix(ctx, setup.instance_id),
+    };
 
     let game_packs: Vec<&LoadedCrashPack> = setup
         .packs

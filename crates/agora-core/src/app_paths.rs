@@ -167,6 +167,11 @@ impl AppPaths {
         self.root.join("local_state.db")
     }
 
+    /// The short-lived record `games instance launch` leaves for `games wrap` to pick up.
+    pub fn pending_launch_path(&self) -> PathBuf {
+        self.root.join("pending-launch.json")
+    }
+
     /// Path to the cached read-only registry SQLite database.
     pub fn registry_db(&self) -> PathBuf {
         self.root.join("registry.db")

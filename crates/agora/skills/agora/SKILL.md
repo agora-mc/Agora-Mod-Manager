@@ -145,6 +145,15 @@ agora --json games instance plugins conflicts <ID>
 agora --json crash analyze <FILE> --instance <ID>
 ```
 
+On Linux, Steam starts the game. Put `agora games wrap %command%` in the game's Steam launch
+options, then `agora --json games instance launch <ID>` asks Steam to start it (with `steam`, or
+`flatpak run com.valvesoftware.Steam` when Steam is a Flatpak) and reports whether the wrapper is
+there. If it is not, give the person the exact text to paste and where; Agora only
+reads Steam's files. `agora games instance default <ID>` chooses the instance a Steam launch uses.
+The game's Windows user files and crash logs live inside the Proton prefix under
+`steamapps/compatdata/<appid>/pfx`. Every Linux launch says that Proton has not been tested on real
+hardware yet, and a step-down to linked or copied files is announced with its reason.
+
 `games instance check` is the pre-launch answer. It names a framework built for another game
 version, a load order a launch would refuse, the game's declared INI warnings, and stale or
 unknown tool output, and says which command rebuilds a tool. It also counts plugin conflicts and

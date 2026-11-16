@@ -209,6 +209,28 @@ Offline readiness is per instance. While you are still online:
 
 Microsoft sign-in, updates, and uncached downloads cannot complete offline.
 
+### Steam and Proton on Linux
+
+Steam starts the game, so Agora runs through the game's launch options:
+
+1. Open the game in Steam, choose **Properties → Launch Options**, and paste
+   `agora games wrap %command%`.
+2. Run `agora games instance launch <ID>` once. It asks Steam to start the game (the `steam`
+   command, or `flatpak run com.valvesoftware.Steam` when Steam is a Flatpak) and checks the
+   setting. When the wrapper is missing it prints the exact text to paste and the `localconfig.vdf`
+   files it read. Agora never writes Steam's files.
+3. To make a launch use one instance, run `agora games instance default <ID>`. Launching from
+   Steam uses the launch Agora recorded for two minutes, else that default, else Steam's command
+   runs untouched.
+
+Launching through Proton on Linux has not been tested on real hardware yet.
+
+A **step-down** means the overlay could not be mounted over the game folder (for example because
+user namespaces are unavailable). Agora says why and runs from linked files, or copies when links
+cannot work. Nothing is written to the game's install before the step-down is announced. The
+game's Windows `Documents` and `LocalAppData` files live inside
+`steamapps/compatdata/<appid>/pfx/drive_c/users/steamuser`, and crash sources are read there.
+
 ### A script gets unexpected results
 
 Always use `--output json` rather than parsing human output, capture standard output and standard error separately, and check the exit code rather than any success message. Add `--log-file <PATH>` to keep the diagnostics. See [Structured output](./CLI.md#structured-output).

@@ -482,7 +482,9 @@ fn starting_contents(
         );
         return Ok(blank_doc(rule));
     }
-    let real = crate::game_user_files::resolve_user_file_source(&mapping.source)?;
+    let prefix = crate::game_instance::proton_prefix(ctx, instance_id);
+    let real =
+        crate::game_user_files::resolve_user_file_source_in(prefix.as_deref(), &mapping.source)?;
     Ok(match read_optional(&real)? {
         Some(bytes) => parse_doc(ctx, instance_id, definition, rule, bytes)?,
         None => blank_doc(rule),

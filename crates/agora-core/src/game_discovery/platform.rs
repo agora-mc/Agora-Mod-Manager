@@ -7,17 +7,24 @@ use crate::game_discovery::DiscoveryWarning;
 
 /// Find Steam root on the current system.
 pub fn find_steam_root() -> Option<PathBuf> {
+    find_steam_roots().into_iter().next()
+}
+
+/// Every Steam root on the current system, in the order they are preferred. Linux has more than
+/// one (`~/.local/share/Steam`, `~/.steam/steam`, and the Flatpak sandbox's own folder), and a
+/// machine can have more than one of them installed.
+pub fn find_steam_roots() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        find_steam_root_windows()
+        find_steam_root_windows().into_iter().collect()
     }
     #[cfg(target_os = "linux")]
     {
-        find_steam_root_linux()
+        find_steam_roots_linux()
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        None
+        Vec::new()
     }
 }
 
@@ -51,19 +58,30 @@ fn find_steam_root_windows() -> Option<PathBuf> {
     None
 }
 
+/// Points every Steam lookup at an invented tree. Test hook; nothing in the product sets it.
+pub const STEAM_ROOT_ENV: &str = "AGORA_STEAM_ROOT";
+
 #[cfg(target_os = "linux")]
-fn find_steam_root_linux() -> Option<PathBuf> {
-    if let Some(home) = dirs::home_dir() {
-        let p1 = home.join(".local/share/Steam");
-        if p1.exists() {
-            return Some(p1);
-        }
-        let p2 = home.join(".steam/steam");
-        if p2.exists() {
-            return Some(p2);
+fn find_steam_roots_linux() -> Vec<PathBuf> {
+    if let Some(root) = std::env::var_os(STEAM_ROOT_ENV) {
+        let root = PathBuf::from(root);
+        return root.is_dir().then_some(root).into_iter().collect();
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    for candidate in [
+        home.join(".local/share/Steam"),
+        home.join(".steam/steam"),
+        home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+        home.join(".var/app/com.valvesoftware.Steam/.steam/steam"),
+    ] {
+        if candidate.is_dir() && !roots.contains(&candidate) {
+            roots.push(candidate);
         }
     }
-    None
+    roots
 }
 
 /// Find GOG registry entries on Windows.

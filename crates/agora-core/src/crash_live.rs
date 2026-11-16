@@ -523,6 +523,7 @@ pub fn collect_instance_evidence(
     let roots = InstanceRoots {
         instance_dir,
         runtime_dir: crash_runtime_root(ctx, instance_id),
+        proton_prefix: crate::game_instance::proton_prefix(ctx, instance_id),
     };
     let specs: Vec<SourceSpec<'_>> = packs
         .iter()
@@ -1572,6 +1573,8 @@ struct InstanceRoots {
     instance_dir: PathBuf,
     /// The folder the game ran from, when it could be resolved. The preloader writes its log there.
     runtime_dir: Option<PathBuf>,
+    /// The Proton prefix the game's Windows user folders live in, when it runs through Proton.
+    proton_prefix: Option<PathBuf>,
 }
 
 impl SourceRoots for InstanceRoots {
@@ -1591,8 +1594,14 @@ impl SourceRoots for InstanceRoots {
                 })
             }
             GamePath::UserData { location, path } => {
-                let base = crate::game_user_files::user_data_root(location)
-                    .ok_or_else(|| format!("the user data folder for {location:?} is not known"))?;
+                let base = match &self.proton_prefix {
+                    Some(prefix) => {
+                        crate::game_user_files::user_data_root_in_prefix(prefix, location)
+                    }
+                    None => crate::game_user_files::user_data_root(location).ok_or_else(|| {
+                        format!("the user data folder for {location:?} is not known")
+                    })?,
+                };
                 Ok(SourceLocation {
                     base,
                     relative: path.as_str().to_string(),
