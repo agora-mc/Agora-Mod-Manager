@@ -218,6 +218,21 @@ fn render_line(rule: &LoadOrderDefinition, name: &[u8], active: bool) -> Vec<u8>
     line
 }
 
+/// A whole list's bytes, in the game's own format, from its names and states.
+/// A multi-profile import needs each profile's list before the instance exists,
+/// so it cannot go through [`write_order_locked`].
+pub fn list_bytes(rule: &LoadOrderDefinition, entries: &[(String, bool)]) -> Vec<u8> {
+    let mut file = ListFile::from_header(rule);
+    for (name, active) in entries {
+        if name.trim().is_empty() {
+            continue;
+        }
+        file.lines
+            .push(render_line(rule, name.as_bytes(), *active));
+    }
+    file.render()
+}
+
 /// Bring `file` in step with the plugins `desired` (in the order new ones are appended) and
 /// the plugins Agora `old_managed`. Returns what was added and removed.
 fn apply_sync(

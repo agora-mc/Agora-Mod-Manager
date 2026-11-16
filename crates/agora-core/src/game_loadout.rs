@@ -201,6 +201,40 @@ pub fn create_game_profile(
     Ok(profile)
 }
 
+/// Write a profile with `state` under `name`. Used by an import, which builds
+/// each profile's state from the setup it read rather than from the instance as
+/// it stands. An existing profile keeps its `created_at`.
+pub fn save_game_profile(
+    ctx: &Ctx,
+    instance_id: &str,
+    name: &str,
+    state: GameLoadout,
+) -> Result<LoadoutProfile, String> {
+    if name.trim().is_empty() {
+        return Err("A loadout profile needs a name".into());
+    }
+    let dir = instance_dir(ctx, instance_id)?;
+    let created_at = loadout::read_profile(&dir, name)
+        .map(|existing| existing.created_at)
+        .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339());
+    let enabled_mods = state
+        .content
+        .iter()
+        .filter(|item| item.enabled)
+        .map(|item| item.item.clone())
+        .collect();
+    let profile = LoadoutProfile {
+        name: name.to_string(),
+        enabled_mods,
+        created_at,
+        covers: None,
+        items: None,
+        game: Some(state),
+    };
+    loadout::write_profile(&dir, &profile)?;
+    Ok(profile)
+}
+
 /// The changes that [`update_game_profile`] would make, in the order the
 /// sections are recorded. Only the content items are compared one by one; each
 /// other section is reported as a whole when its bytes or rules differ.
