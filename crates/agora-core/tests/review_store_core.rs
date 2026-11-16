@@ -51,6 +51,7 @@ fn register_test_game_with_features(def: GameDefinition) -> Arc<GameRegistry> {
 fn make_test_definition() -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("test-game").unwrap(),
         extends: None,

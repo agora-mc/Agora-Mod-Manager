@@ -56,13 +56,19 @@ type RunState =
   | { status: 'error'; message: string; progress: ImportProgress | null; startedAt: number; instanceName: string }
   | { status: 'done'; report: Mo2RunDto };
 
+/** What the dialog needs from a finished import, whichever importer made it. */
+export interface ImportDone {
+  instanceId: string | null;
+  instanceName: string;
+}
+
 /** Where the import has got to, for the dialog's step row and footer. */
 export interface ImportFlowState {
   step: ImportStep;
   /** An import is copying files; the dialog must not close. */
   running: boolean;
   /** The finished import's report, once there is one. */
-  report: Mo2RunDto | null;
+  report: ImportDone | null;
 }
 
 export type ImportStep = 'setup' | 'profile' | 'preview' | 'importing' | 'done';

@@ -78,6 +78,20 @@ pub enum ContentSource {
         provenance: Mo2Provenance,
         added_at_unix_ms: i64,
     },
+    /// A mod folder of a Vortex setup, imported as it is in the staging folder (MASTER_SPEC
+    /// §26.10). `provenance` is what Vortex's state claims; no hash has verified it.
+    VortexImport {
+        /// The Vortex store it was read from (`state.v2`), as the import was run with it.
+        store: String,
+        /// Vortex's own game id, e.g. `skyrimse`.
+        game: String,
+        /// Vortex's mod id.
+        mod_id: String,
+        /// The mod's folder inside the staging folder (`installationPath`).
+        installation_folder: String,
+        provenance: VortexProvenance,
+        added_at_unix_ms: i64,
+    },
     /// An archive from the curated catalog for another game (MASTER_SPEC §26.8): the entry, the
     /// release and asset it came from, and whether a hash its source published checked the bytes.
     /// `release` is `None` for a `direct_hash` file. An unverified item's hash is remembered, so a
@@ -118,6 +132,23 @@ pub enum Mo2Provenance {
     Absent,
     /// A `meta.ini` exists but could not be read as one.
     Unreadable { reason: String },
+}
+
+/// What a Vortex `IMod` claims about where it came from. Vortex's state is the source, not a
+/// verified download, so `note` says the claim was not checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum VortexProvenance {
+    /// The mod entry was read. These are its own claims.
+    Claimed {
+        modid: Option<u64>,
+        fileid: Option<u64>,
+        version: Option<String>,
+        name: Option<String>,
+        note: String,
+    },
+    /// The mod entry has no `attributes`.
+    Absent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1623,6 +1654,22 @@ fn commit_manifest(
                         mo2_folder: f,
                         ..
                     } if t == setup && f == mo2_folder
+                )
+            }),
+            ContentSource::VortexImport {
+                store,
+                game,
+                mod_id,
+                ..
+            } => !existing_item.sources.iter().any(|s| {
+                matches!(
+                    s,
+                    ContentSource::VortexImport {
+                        store: t,
+                        game: g,
+                        mod_id: m,
+                        ..
+                    } if t == store && g == game && m == mod_id
                 )
             }),
             ContentSource::Catalog {

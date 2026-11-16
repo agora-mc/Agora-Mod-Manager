@@ -43,6 +43,7 @@ fn definition() -> GameDefinition {
     let plugin_list = 2u8;
     let mut def = GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("count-game").unwrap(),
         extends: None,

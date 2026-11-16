@@ -197,3 +197,153 @@ export async function importMo2Profile(request: Mo2ImportRequest): Promise<Mo2Im
 export function listenImportProgress(onProgress: (progress: ImportProgress) => void): Promise<UnlistenFn> {
   return listen<ImportProgress>(IMPORT_PROGRESS_EVENT, (event) => onProgress(event.payload));
 }
+
+// ---------------------------------------------------------------------------
+// Vortex (MASTER_SPEC §26.10)
+// ---------------------------------------------------------------------------
+
+export interface VortexScanProfile {
+  id: string;
+  name: string;
+  modsEnabled: number;
+  modsTotal: number;
+  pluginsTxt: boolean;
+  loadorderTxt: boolean;
+  localSettings: boolean;
+  localSaves: boolean;
+}
+
+export interface VortexScanGame {
+  vortexGame: string;
+  game: string | null;
+  gameName: string | null;
+  supported: boolean;
+  reason: string | null;
+  discoveredPath: string | null;
+  install: string | null;
+  needsFolderAdd: boolean;
+  detection: string | null;
+  staging: string | null;
+  stagingError: string | null;
+  stagingMarker: boolean;
+  mods: number;
+  profiles: VortexScanProfile[];
+  manifestFound: boolean;
+  manifestFiles: number;
+  manifestSearched: string[];
+}
+
+export interface VortexScanReply {
+  store: string;
+  games: VortexScanGame[];
+  warnings: string[];
+}
+
+export interface VortexPlanDto {
+  store: string;
+  vortexGame: string;
+  gameId: string;
+  gameName: string;
+  profile: string;
+  instanceName: string;
+  installId: string;
+  installLocation: string;
+  staging: string;
+  mods: {
+    modId: string;
+    name: string;
+    version: string | null;
+    nexusModId: number | null;
+    nexusFileId: number | null;
+    folder: string;
+    enabled: boolean;
+    files: number;
+    bytes: number;
+    provenance: string;
+  }[];
+  modsEnabled: number;
+  modsDisabled: number;
+  files: number;
+  bytes: number;
+  manifest: {
+    path: string;
+    found: boolean;
+    files: number;
+    matched: number;
+    damaged: string | null;
+    searched: string[];
+  };
+  order: string[];
+  disagreements: { file: string; manifestSupplied: string; rulesSupply: string }[];
+  plugins: { kept: boolean; listed: number; active: number; notes: string[] };
+  localSettings: boolean;
+  inis: string[];
+  localSaves: boolean;
+  saves: { local: boolean; files: number; bytes: number; note: string };
+  problems: Problem[];
+  warnings: string[];
+}
+
+export interface VortexRunDto {
+  instanceId: string | null;
+  instanceName: string;
+  storedMods: number;
+  contentLayers: number;
+  disabledLayers: number;
+  duplicates: string[];
+  pluginsWritten: number | null;
+  pluginFindings: string[];
+  inisCopied: string[];
+  savesCopied: number;
+  savesSkippedExisting: number;
+  savesFolder: string | null;
+  nextSteps: string[];
+}
+
+export type VortexImportReply =
+  | ({ kind: 'plan' } & VortexPlanDto)
+  | ({ kind: 'run' } & VortexRunDto);
+
+export interface VortexImportRequest {
+  /** The folder that holds `state.v2`; `null` uses `%APPDATA%\Vortex\state.v2`. */
+  store: string | null;
+  game: string;
+  profile: string;
+  name: string | null;
+  dryRun: boolean;
+  install: string | null;
+  addFolder: boolean;
+  copySaves: boolean;
+}
+
+function isVortexScanGame(value: unknown): value is VortexScanGame {
+  return isRecord(value)
+    && typeof value.vortexGame === 'string'
+    && typeof value.supported === 'boolean'
+    && typeof value.mods === 'number'
+    && Array.isArray(value.profiles);
+}
+
+/** The games and profiles a Vortex store holds. Rejects on a reply that is not a list. */
+export async function scanVortex(store?: string | null): Promise<VortexScanReply> {
+  const reply: unknown = await invoke<unknown>('games_import_vortex_scan', { store: store ?? null });
+  if (
+    !isRecord(reply)
+    || !Array.isArray(reply.games)
+    || !reply.games.every(isVortexScanGame)
+    || !isStringArray(reply.warnings)
+    || typeof reply.store !== 'string'
+  ) {
+    throw new Error('games_import_vortex_scan did not return a list of games.');
+  }
+  return reply as unknown as VortexScanReply;
+}
+
+/** Plan (`dryRun`) or import one Vortex profile. Rejects on a reply that is neither a plan nor a report. */
+export async function importVortexProfile(request: VortexImportRequest): Promise<VortexImportReply> {
+  const reply: unknown = await invoke<unknown>('games_import_vortex', { request });
+  if (!isRecord(reply) || (reply.kind !== 'plan' && reply.kind !== 'run')) {
+    throw new Error('games_import_vortex did not return a plan or a report.');
+  }
+  return reply as unknown as VortexImportReply;
+}

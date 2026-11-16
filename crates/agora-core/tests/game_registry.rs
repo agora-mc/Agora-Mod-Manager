@@ -43,6 +43,7 @@ fn make_package(
 fn dummy_game(id: &str, stores: Vec<(&str, &str)>) -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new(id).unwrap(),
         extends: None,
@@ -416,6 +417,7 @@ fn spike_machine_skyrim_steam_and_gog_identification() {
     let mut builder = GameRegistry::builder();
     let skyrim_def = GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("skyrim-se").unwrap(),
         extends: None,
@@ -578,6 +580,7 @@ fn unreadable_executable_falls_back_to_store_record_and_nothing_usable_gives_uni
     let mut builder = GameRegistry::builder();
     let game = GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new("test-game").unwrap(),
         extends: None,
@@ -1028,5 +1031,105 @@ fn an_ini_check_with_no_condition_is_refused() {
     assert!(
         matches!(err, GameRegistryError::InvalidIniCheck { .. }),
         "{err:?}"
+    );
+}
+
+#[test]
+fn an_import_id_claimed_by_two_games_is_refused() {
+    let mut first = dummy_game("import-game-a", vec![]);
+    first.import_ids.insert("vortex".into(), "shared-id".into());
+    let mut second = dummy_game("import-game-b", vec![]);
+    second
+        .import_ids
+        .insert("vortex".into(), "shared-id".into());
+    let mut builder = GameRegistry::builder();
+    builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "first".into(),
+            },
+            make_package("import-first", vec![first], vec![], vec![]),
+        )
+        .expect("the first game registers");
+    let err = builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "second".into(),
+            },
+            make_package("import-second", vec![second], vec![], vec![]),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GameRegistryError::ImportIdAlreadyClaimed { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn an_empty_import_id_is_refused() {
+    let mut game = dummy_game("import-empty", vec![]);
+    game.import_ids.insert("vortex".into(), " ".into());
+    let mut builder = GameRegistry::builder();
+    let err = builder
+        .add(
+            PackageSource::Compiled {
+                crate_name: "test".into(),
+            },
+            make_package("import-empty-pkg", vec![game], vec![], vec![]),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GameRegistryError::InvalidImportId { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn the_repo_skyrim_package_keeps_its_vortex_import_id() {
+    use agora_core::game_registry::inherit::{self, PackageInput};
+    use serde_json::Value;
+
+    let packages = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/official");
+    let read = |relative: &str| -> Value {
+        let path = packages.join(relative);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("the package file is read"))
+            .expect("the package file is JSON")
+    };
+    let input = |plugin: &str, relative: &str| PackageInput {
+        source: PackageSource::Plugin {
+            plugin_id: plugin.to_string(),
+        },
+        blocked: false,
+        label: format!("Plugin {plugin}, game package {relative}"),
+        json: read(relative),
+    };
+    let inputs = vec![
+        input(
+            "agora.creation-engine",
+            "creation-engine/games/package.json",
+        ),
+        input("agora.skyrim-se", "skyrim-se/games/package.json"),
+    ];
+    let (resolved, warnings) = inherit::resolve(inputs);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let skyrim = resolved
+        .iter()
+        .find(|package| {
+            package
+                .definition
+                .games
+                .iter()
+                .any(|game| game.id.as_str() == "skyrim-se")
+        })
+        .expect("the Skyrim package resolves");
+    let game = skyrim
+        .definition
+        .games
+        .iter()
+        .find(|game| game.id.as_str() == "skyrim-se")
+        .unwrap();
+    assert_eq!(
+        game.import_ids.get("vortex").map(String::as_str),
+        Some("skyrimse")
     );
 }

@@ -11,6 +11,9 @@
       "extends": "creation-engine",
       "name": "The Elder Scrolls V: Skyrim Special Edition",
       "mo2_game_name": "Skyrim Special Edition",
+      "import_ids": {
+        "vortex": "skyrimse"
+      },
       "stores": [
         {
           "store": "steam",

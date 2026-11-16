@@ -416,6 +416,7 @@ Each value is a function name in your script. Every field is optional.
 | `save_location` | list of save location rules | optional | How per-instance saves are chosen |
 | `ini_checks` | list of INI checks | optional | Settings the instance and launch checks warn about |
 | `mo2_game_name` | string | optional | The game's name in Mod Organizer 2, for imports |
+| `import_ids` | map of strings | optional | How another manager names this game, for imports; the key is the manager (`vortex` today), the value its game id (e.g. `skyrimse`) |
 | `session` | session rules | optional | Which process ends a session and which exits are normal |
 
 A store is `{ "store": "gog", "product": "1234567890" }`: `store` names the store and `product`

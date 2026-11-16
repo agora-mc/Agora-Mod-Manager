@@ -236,6 +236,18 @@ snapshot first, and `template delete` asks unless given `--yes`.
 - **Backups:** `agora backup export <ID> --out <DIR>` writes a snapshot as one zip, and
   `agora backup import <FILE>` restores it as a snapshot without touching the live instance.
   `agora backup prune <ID> --keep <N>` deletes old snapshots, so it needs the person's yes.
+- **Vortex:** `agora games import vortex scan` lists the games and profiles in
+  `%APPDATA%\Vortex\state.v2` (or `--store <DIR>`), and says which games Agora supports.
+  `agora games import vortex --game <id> --profile <name> --dry-run` shows the plan; drop
+  `--dry-run` to import. **Close Vortex first:** Agora refuses while Vortex holds the store's
+  lock, and never opens the live store (it reads a copy). Mods are copied from the staging folder
+  as they are on disk; downloads are not copied. The layer order comes from
+  `vortex.deployment.json`, with Vortex's rules as the tie-breaker, and every file where the two
+  disagree is reported; with no manifest (a purged deployment), the rules alone decide and the
+  plan says where it looked. A profile with local game settings brings its INIs; local saves are
+  copied under Documents only with `--copy-saves`. If scan says the game folder is a real install
+  Agora has not added, import with `--add-folder` (or run `agora games folder add <path>` first).
+  Show the plan before importing; a second import of the same profile needs `--name`.
 
 ## Finding and installing content
 

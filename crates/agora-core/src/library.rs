@@ -738,6 +738,13 @@ fn source_of(item: &ContentItem) -> (&'static str, String) {
         Some(ContentSource::Mo2Import { mo2_folder, .. }) => {
             ("mo2", format!("Mod Organizer 2 folder: {mo2_folder}"))
         }
+        Some(ContentSource::VortexImport {
+            installation_folder,
+            ..
+        }) => (
+            "vortex",
+            format!("Vortex staging folder: {installation_folder}"),
+        ),
         Some(ContentSource::Catalog { game, verified, .. }) => {
             (
                 "catalog",

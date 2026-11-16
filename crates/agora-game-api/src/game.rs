@@ -604,6 +604,11 @@ pub struct GameDefinition {
     /// §26.10). Absent when no MO2 setup can be matched to this game.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mo2_game_name: Option<String>,
+    /// How another manager names this game, for importing its setup. The key is the manager
+    /// (`vortex` today) and the value is the id that manager uses (for example `skyrimse`).
+    /// Absent when no importer can match a setup to this game.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub import_ids: BTreeMap<String, String>,
     /// How a session of this game is watched and judged (MASTER_SPEC §30.6). Absent means the
     /// recipe's executable is the game and only exit code 0 is a normal quit.
     #[serde(default, skip_serializing_if = "SessionRules::is_default")]
@@ -3140,6 +3145,7 @@ mod tests {
     fn linked_archive_matching_is_case_insensitive() {
         let def = GameDefinition {
             mo2_game_name: None,
+            import_ids: Default::default(),
             session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
             extends: None,
@@ -3190,6 +3196,7 @@ mod tests {
     fn declared_write_matching_is_case_insensitive() {
         let def = GameDefinition {
             mo2_game_name: None,
+            import_ids: Default::default(),
             session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
             extends: None,
@@ -3230,6 +3237,7 @@ mod tests {
     fn excluded_paths_matching_is_case_insensitive() {
         let def = GameDefinition {
             mo2_game_name: None,
+            import_ids: Default::default(),
             session: Default::default(),
             id: GameId::new("skyrim-se").unwrap(),
             extends: None,
@@ -3266,6 +3274,7 @@ mod tests {
     fn copy_patterns_match_defaults_and_custom_case_insensitively() {
         let def = GameDefinition {
             mo2_game_name: None,
+            import_ids: Default::default(),
             session: Default::default(),
             id: GameId::new("valheim").unwrap(),
             extends: None,

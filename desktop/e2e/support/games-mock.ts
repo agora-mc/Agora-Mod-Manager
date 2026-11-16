@@ -65,6 +65,10 @@ export async function installGamesMock(page: Page, table: GamesMockTable): Promi
         games_plugins_rule_add: { changed: true, rules: [], overlaps: null, overlapsError: null },
         games_plugins_rule_remove: { changed: true, rules: [], overlaps: null, overlapsError: null },
         games_tools_list: { instanceId: '', tools: [], known: [] },
+        // The Import dialog opens on Mod Organizer 2, so a Vortex scan is asked for only when the
+        // user picks Vortex. An empty store is the honest default; a spec that imports passes its
+        // own games.
+        games_import_vortex_scan: { store: '', games: [], warnings: [] },
         // The sharing setting lives on the Minecraft Settings page; a game-page
         // spec never changes it, but answering it keeps an errant visit honest.
         get_content_sharing: 'link',

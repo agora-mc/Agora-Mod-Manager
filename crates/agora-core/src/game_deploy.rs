@@ -3846,6 +3846,7 @@ mod placement_tests {
     fn precompiled_path_rules_answer_as_the_definition_does() {
         let definition = GameDefinition {
             mo2_game_name: None,
+            import_ids: Default::default(),
             session: Default::default(),
             id: agora_game_api::GameId::new("rules-game").unwrap(),
             extends: None,

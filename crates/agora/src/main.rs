@@ -538,12 +538,59 @@ enum ImportCmd {
         #[arg(long, value_name = "INSTALL_ID")]
         install: Option<String>,
     },
+    /// Vortex: list the games and profiles its state store holds, or import one profile.
+    ///
+    /// Vortex must be closed: Agora refuses while Vortex holds the store's lock. Agora reads a
+    /// copy of `state.v2`, never the live store, and copies each mod's staging folder as it is on
+    /// disk. The layer order comes from `vortex.deployment.json`, with Vortex's rules as the
+    /// tie-breaker; a file the two disagree on is reported. Downloads are not copied.
+    Vortex {
+        /// Use `scan` to list what the store holds instead of importing one profile.
+        #[command(subcommand)]
+        action: Option<VortexImportCmd>,
+        /// The store's folder. Defaults to `%APPDATA%\Vortex\state.v2`.
+        #[arg(long, value_name = "DIR")]
+        store: Option<PathBuf>,
+        /// The Agora game to import into (an id from `agora games list`). Required without `scan`;
+        /// `scan` shows which Vortex game maps to it.
+        #[arg(long)]
+        game: Option<String>,
+        /// The Vortex profile, by name.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Name for the new instance. Needed to import the same profile again.
+        #[arg(long)]
+        name: Option<String>,
+        /// Plan the import and print it. Nothing is stored or created.
+        #[arg(long)]
+        dry_run: bool,
+        /// Import onto this install (an id from `agora games list`) instead of the game folder
+        /// Vortex discovered.
+        #[arg(long, value_name = "INSTALL_ID")]
+        install: Option<String>,
+        /// Add Vortex's game folder to Agora first (the `games folder add` path), when it is a
+        /// real install Agora does not know yet.
+        #[arg(long)]
+        add_folder: bool,
+        /// Copy the profile's own saves into the instance's own save folder under Documents.
+        #[arg(long)]
+        copy_saves: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum Mo2ImportCmd {
     /// List Mod Organizer 2 setups on this machine, found in the usual place and by scanning the
     /// fixed drives for ModOrganizer.ini. The mods are not read.
+    Scan,
+}
+
+/// Vortex: read a copy of its state store (MASTER_SPEC §26.10). Vortex must be closed: the store's
+/// lock is refused when it is running.
+#[derive(Subcommand)]
+enum VortexImportCmd {
+    /// List the games and profiles the store holds, whether Agora supports them, and whether the
+    /// deployment manifest and plugin list were found. Nothing is written.
     Scan,
 }
 
@@ -9768,8 +9815,103 @@ fn run_games_import(
                 print_mo2_run(&report);
             }
         }
+        ImportCmd::Vortex {
+            action,
+            store,
+            game,
+            profile,
+            name,
+            dry_run,
+            install,
+            add_folder,
+            copy_saves,
+        } => {
+            let store = resolve_vortex_store(store)?;
+            let inventory = agora_core::game_registry::installed_games(ctx);
+            if let Some(VortexImportCmd::Scan) = action {
+                let report = agora_core::game_import::vortex::scan(ctx, &inventory, &store)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_vortex_scan(&report);
+                }
+                return Ok(());
+            }
+            let Some(game) = game else {
+                anyhow::bail!(
+                    "--game is required: name the Agora game to import into, as `agora games import vortex scan` lists it"
+                );
+            };
+            let Some(profile) = profile else {
+                anyhow::bail!(
+                    "--profile is required: name the Vortex profile to import, as `agora games import vortex scan` lists it"
+                );
+            };
+            let game = agora_game_api::GameId::new(&game)
+                .map_err(|error| anyhow::anyhow!("'{game}' is not a game id: {error}"))?;
+            let request = agora_core::game_import::vortex::VortexRequest {
+                store,
+                game,
+                profile,
+                name,
+                install,
+                add_folder,
+                copy_saves,
+            };
+            let inventory =
+                agora_core::game_import::vortex::prepare_inventory(ctx, &inventory, &request)?;
+            if dry_run {
+                let plan = agora_core::game_import::vortex::plan(ctx, &inventory, &request)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    print_vortex_plan(&plan);
+                }
+                return Ok(());
+            }
+            if !json {
+                eprintln!(
+                    "Importing. Every mod is stored as it is in Vortex's staging folder; a large setup takes a while. If it is interrupted, run it again: stored bytes are reused."
+                );
+            }
+            let report = agora_core::game_import::vortex::run(
+                ctx,
+                &inventory,
+                &request,
+                RunOptions::default(),
+                &|p: ImportProgress| {
+                    if !json && p.phase == ImportPhase::Storing && p.current_mod.is_none() {
+                        eprintln!(
+                            "  stored {}/{} mods, {} of {}",
+                            p.mods_done,
+                            p.mods_total,
+                            human_gb(p.bytes_done),
+                            human_gb(p.bytes_total)
+                        );
+                    }
+                },
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_vortex_run(&report);
+            }
+        }
     }
     Ok(())
+}
+
+/// The Vortex store to read: the one given, or `%APPDATA%\Vortex\state.v2`. A machine where neither
+/// exists is told where we looked, rather than being shown an empty list of games.
+fn resolve_vortex_store(store: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(store) = store {
+        return Ok(store);
+    }
+    agora_core::game_import::vortex_store::default_store_path().ok_or_else(|| {
+        anyhow::anyhow!(
+            "this machine names no user-data folder for Vortex; give the store's folder with --store"
+        )
+    })
 }
 
 fn human_gb(bytes: u64) -> String {
@@ -9961,6 +10103,305 @@ fn print_mo2_run(report: &agora_core::game_import::Mo2RunReport) {
         println!("  next: {step}");
     }
     println!("The setup at {} was only read.", plan.setup.display());
+}
+
+fn vortex_provenance_text(provenance: &agora_core::content_store::VortexProvenance) -> String {
+    use agora_core::content_store::VortexProvenance;
+    match provenance {
+        VortexProvenance::Claimed {
+            modid: Some(id), ..
+        } => format!("Nexus mod {id}, not verified"),
+        VortexProvenance::Claimed { modid: None, .. } => "no Nexus mod id".to_string(),
+        VortexProvenance::Absent => "no provenance recorded".to_string(),
+    }
+}
+
+fn print_vortex_scan(report: &agora_core::game_import::vortex::VortexScan) {
+    println!("Vortex store: {}", report.store.display());
+    if report.games.is_empty() {
+        println!("No games in this store.");
+    }
+    for game in &report.games {
+        let title = game
+            .game_name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        println!(
+            "{}: {} - {} mods{}",
+            game.vortex_game,
+            if game.supported {
+                "supported"
+            } else {
+                "not supported"
+            },
+            game.mods,
+            title
+        );
+        match (&game.staging, &game.staging_error) {
+            (Some(path), _) => println!("  staging: {}", path.display()),
+            (None, Some(reason)) => println!("  staging: cannot be read: {reason}"),
+            (None, None) => println!("  staging: not named"),
+        }
+        if let Some(path) = &game.discovered_path {
+            println!("  game folder: {}", path.display());
+        }
+        if let Some(reason) = &game.reason {
+            println!("  why not: {reason}");
+        }
+        if let Some(detection) = &game.detection {
+            println!("  detection: {detection}");
+        }
+        if game.needs_folder_add {
+            println!(
+                "  add it first with `agora games folder add \"{}\"`, or import with --add-folder",
+                game.discovered_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
+        println!(
+            "  deployment manifest: {}",
+            if game.manifest_found {
+                format!("{} file(s)", game.manifest_files)
+            } else {
+                let looked: Vec<String> = game
+                    .manifest_searched
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect();
+                format!("not found (looked in {})", looked.join(", "))
+            }
+        );
+        if let Some(staging) = &game.staging {
+            println!(
+                "  staging marker: {}",
+                if game.staging_marker {
+                    "present"
+                } else {
+                    "__vortex_staging_folder not found"
+                }
+            );
+            let _ = staging;
+        }
+        if game.profiles.is_empty() {
+            println!("  profiles: none");
+        }
+        for profile in &game.profiles {
+            let plugin_note = match (profile.plugins_txt, profile.loadorder_txt) {
+                (true, true) => "plugins.txt and loadorder.txt",
+                (true, false) => "plugins.txt",
+                (false, true) => "loadorder.txt",
+                (false, false) => "no plugin list",
+            };
+            let own = match (profile.local_settings, profile.local_saves) {
+                (true, true) => "own INIs and saves",
+                (true, false) => "own INIs",
+                (false, true) => "own saves",
+                (false, false) => "shared settings and saves",
+            };
+            println!(
+                "  profile \"{}\": {} enabled of {} mods, {}, {}",
+                profile.name, profile.mods_enabled, profile.mods_total, plugin_note, own
+            );
+        }
+    }
+    for warning in &report.warnings {
+        println!("  warning: {warning}");
+    }
+    println!("Nothing was stored.");
+}
+
+fn print_vortex_plan(plan: &agora_core::game_import::vortex::VortexPlan) {
+    println!(
+        "Import plan: profile \"{}\" from {} (Vortex game {})",
+        plan.profile,
+        plan.store.display(),
+        plan.vortex_game
+    );
+    println!(
+        "  game: {} ({}), install {} at {}",
+        plan.game_name,
+        plan.game,
+        plan.install_id,
+        plan.install_location.display()
+    );
+    println!(
+        "  store: {}   instance: {}",
+        plan.store_id, plan.instance_name
+    );
+    println!("  staging folder: {}", plan.staging.display());
+    println!(
+        "  mods: {} enabled, {} disabled, {} files, {}",
+        plan.mods_enabled,
+        plan.mods_disabled,
+        plan.files,
+        human_gb(plan.bytes)
+    );
+    for planned in &plan.mods {
+        println!(
+            "    {:<8} {} {} ({} files) [{}]",
+            if planned.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            planned.name,
+            planned
+                .version
+                .as_deref()
+                .map(|v| format!("v{v}"))
+                .unwrap_or_default(),
+            planned.files,
+            vortex_provenance_text(&planned.provenance)
+        );
+    }
+    println!(
+        "  deployment manifest: {} ({} files, {} matched an imported mod)",
+        if plan.manifest.found {
+            plan.manifest.path.display().to_string()
+        } else {
+            "not found".to_string()
+        },
+        plan.manifest.files,
+        plan.manifest.matched
+    );
+    if let Some(reason) = &plan.manifest.damaged {
+        println!("    cannot be used: {reason}");
+    }
+    if !plan.manifest.found {
+        let looked: Vec<String> = plan
+            .manifest
+            .searched
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        println!(
+            "    the order comes from Vortex's rules alone; looked in {}",
+            looked.join(", ")
+        );
+    }
+    let names: Vec<String> = plan
+        .order
+        .iter()
+        .map(|id| {
+            plan.mods
+                .iter()
+                .find(|m| &m.mod_id == id)
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| id.clone())
+        })
+        .collect();
+    println!("  layer order (highest first): {}", names.join(" > "));
+    if !plan.disagreements.is_empty() {
+        println!(
+            "  the manifest and the rules disagree on {} file(s):",
+            plan.disagreements.len()
+        );
+        for disagreement in &plan.disagreements {
+            println!(
+                "    {}: manifest says {}, the rules alone would pick {}",
+                disagreement.file, disagreement.manifest_supplied, disagreement.rules_supply
+            );
+        }
+    }
+    if plan.plugins.kept {
+        println!(
+            "  plugins: {} active of {} listed; {} always-loaded plugin(s) left to the game",
+            plan.plugins.active,
+            plan.plugins.lines.len(),
+            plan.plugins.implicit_skipped.len()
+        );
+    } else {
+        println!("  plugins: the game keeps no plugin list");
+    }
+    for note in &plan.plugins.notes {
+        println!("  note: {note}");
+    }
+    if plan.local_settings {
+        let names: Vec<&str> = plan.inis.iter().map(|ini| ini.name.as_str()).collect();
+        println!(
+            "  INIs (the profile's own): {}",
+            if names.is_empty() {
+                "none found in its folder".to_string()
+            } else {
+                names.join(", ")
+            }
+        );
+    } else {
+        println!("  INIs: shared with the game");
+    }
+    if plan.local_saves {
+        println!(
+            "  saves (the profile's own): {} file(s), {}; copied only with --copy-saves",
+            plan.saves.files,
+            human_gb(plan.saves.bytes)
+        );
+        if !plan.saves.note.is_empty() {
+            println!("    {}", plan.saves.note);
+        }
+    } else {
+        println!("  saves: shared with the game");
+    }
+    for problem in &plan.problems {
+        println!("  problem: {}: {}", problem.entry, problem.reason);
+    }
+    for warning in &plan.warnings {
+        println!("  warning: {warning}");
+    }
+    println!("Nothing was stored. Run without --dry-run to import.");
+}
+
+fn print_vortex_run(report: &agora_core::game_import::vortex::VortexRunReport) {
+    if report.interrupted {
+        println!(
+            "Stopped after {} mod(s), before the instance was made. Run the import again to finish.",
+            report.stored_mods
+        );
+        return;
+    }
+    let plan = &report.plan;
+    println!(
+        "Imported profile \"{}\" as instance {} ({}).",
+        plan.profile,
+        report.instance_id.as_deref().unwrap_or("?"),
+        plan.instance_name
+    );
+    match (&report.base_id, report.base_built) {
+        (Some(base), Some(true)) => println!("  base: {base} (built)"),
+        (Some(base), _) => println!("  base: {base} (reused)"),
+        _ => {}
+    }
+    println!(
+        "  mods: {} stored; {} content layer(s), {} of them disabled",
+        report.stored_mods, report.content_layers, report.disabled_layers
+    );
+    for duplicate in &report.duplicates {
+        println!("  duplicate: {duplicate}");
+    }
+    if let Some(count) = report.plugins_written {
+        println!("  plugin list: {count} line(s) written");
+    }
+    for finding in &report.plugin_findings {
+        println!("  plugin order: {finding}");
+    }
+    if !report.inis_copied.is_empty() {
+        println!("  INIs copied: {}", report.inis_copied.join(", "));
+    }
+    if report.saves_copied > 0 || report.saves_skipped_existing > 0 {
+        println!(
+            "  saves copied: {} ({} already there, left alone)",
+            report.saves_copied, report.saves_skipped_existing
+        );
+    }
+    for step in &report.next_steps {
+        println!("  next: {step}");
+    }
+    println!(
+        "The Vortex store at {} was only read.",
+        plan.store.display()
+    );
 }
 
 fn print_discovery_report(report: &agora_core::game_discovery::DiscoveryReport) {

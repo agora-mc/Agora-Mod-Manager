@@ -121,6 +121,7 @@ fn writes_a_file(id: &str, file: &str) -> ToolDefinition {
 fn definition(tools: &[ToolDefinition]) -> GameDefinition {
     GameDefinition {
         mo2_game_name: None,
+        import_ids: Default::default(),
         session: Default::default(),
         id: GameId::new(GAME).unwrap(),
         extends: None,

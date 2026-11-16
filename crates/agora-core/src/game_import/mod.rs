@@ -11,6 +11,8 @@
 //! decides what they mean for a game and what to store.
 
 pub mod mo2;
+pub mod vortex;
+pub mod vortex_store;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -83,6 +85,30 @@ pub enum ImportError {
     NoModlist(String),
     #[error("the overwrite folder cannot be read: {0}")]
     OverwriteUnreadable(String),
+    #[error("the Vortex state holds no mods (`persistent.mods` is missing), so there is nothing to import")]
+    VortexNoMods,
+    #[error("the Vortex state names no game Agora supports ({0}); its games are listed by `agora games import vortex scan`")]
+    NoVortexGame(String),
+    #[error("Vortex has no profile named '{profile}' for {game} (its profiles are listed by `agora games import vortex scan`)")]
+    NoVortexProfile { profile: String, game: String },
+    #[error("the staging folder Vortex names for {game} is not there: {path}")]
+    NoStaging { game: String, path: PathBuf },
+    #[error("Vortex never discovered a game folder for {game}; discover the game in Vortex, or add its folder in Agora first")]
+    VortexFolderMissing { game: String },
+    #[error("Vortex's game folder is a real {game} install at {path}, but Agora has not added it. Run `agora games folder add \"{}\"`, or import with --add-folder", path.display())]
+    VortexFolderNotAdded { game: String, path: PathBuf },
+    #[error("Vortex's game folder for {game} is {path}, which Agora cannot use: {reason}")]
+    VortexFolderNotGame {
+        game: String,
+        path: PathBuf,
+        reason: String,
+    },
+    #[error("Agora could not add Vortex's game folder: {0}")]
+    FolderAdd(String),
+    #[error("the store cannot say where {game}'s staging folder is: {reason}")]
+    BadStagingPath { game: String, reason: String },
+    #[error(transparent)]
+    VortexStore(#[from] vortex_store::VortexStoreError),
     #[error("cannot store mod '{mod_folder}': {reason}")]
     Store { mod_folder: String, reason: String },
     #[error(transparent)]
@@ -1149,16 +1175,27 @@ fn saves_entries(from: &Path) -> Result<Vec<std::fs::DirEntry>, ImportError> {
 
 /// The instance an earlier import of this setup and profile made, if there is one.
 fn find_import(ctx: &Ctx, ini_path: &Path, profile: &str) -> Result<Option<String>, ImportError> {
-    let setup = normalise_path(ini_path);
+    find_import_of_kind(ctx, "mo2", ini_path, profile)
+}
+
+/// The instance an earlier import of this store/setup and profile made, whatever importer made it.
+/// `setup` is the file or folder the import read (an MO2 setup's ini, or a Vortex store).
+pub(crate) fn find_import_of_kind(
+    ctx: &Ctx,
+    kind: &str,
+    setup: &Path,
+    profile: &str,
+) -> Result<Option<String>, ImportError> {
+    let wanted = normalise_path(setup);
     for record in game_instance::list(ctx)? {
         let manifest = match game_instance::get_manifest(ctx, &record.instance_id) {
             Ok(m) => m,
             Err(_) => continue,
         };
         if let Some(rec) = manifest.imported_from {
-            if rec.kind == "mo2"
+            if rec.kind == kind
                 && rec.profile == profile
-                && normalise_path(Path::new(&rec.setup)) == setup
+                && normalise_path(Path::new(&rec.setup)) == wanted
             {
                 return Ok(Some(record.name.clone()));
             }

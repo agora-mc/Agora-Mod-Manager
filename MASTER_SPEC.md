@@ -4107,8 +4107,10 @@ Most people who will try this already have a setup. Import has to be good.
   (`%APPDATA%\Vortex\state.v2`; keys are state paths joined with `###`, values are JSON) and
   writes `vortex.deployment.json` (which mod supplied each deployed file) into each game's mod
   folder. Agora reads a copy of the store, never the live one, and refuses while Vortex is running
-  (the store's `LOCK`), saying to close Vortex. Read with the pure-Rust `rusty-leveldb`. What is
-  imported, as for MO2: each Vortex profile becomes an instance; each mod's staging folder
+  (the store's `LOCK`), saying to close Vortex. Read with the pure-Rust `rusty-leveldb`: Vortex's
+  current backend attaches the same LevelDB files through DuckDB's `level_pivot`, so the files on
+  disk are still LevelDB. What is imported, as for MO2: each Vortex profile becomes an instance;
+  each mod's staging folder
   (`settings.mods.installPath` per game, default `{USERDATA}/{GAME}/mods`) is copied into the
   content store as it is on disk, with its name, version and Nexus ids; enabled state per profile;
   the plugin list from the profile's `plugins.txt` / `loadorder.txt`. Vortex orders mods by rules,

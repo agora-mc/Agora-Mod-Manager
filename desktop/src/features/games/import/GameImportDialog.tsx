@@ -11,14 +11,38 @@ import { ArrowRight, Check, Download, Hourglass } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
 import { Mo2ImportFlow, type ImportFlowState, type ImportStep } from './Mo2ImportFlow';
+import { VortexImportFlow } from './VortexImportFlow';
 
-const STEPS: { id: ImportStep; label: string }[] = [
+type ImportSource = 'mo2' | 'vortex';
+
+const MO2_STEPS: { id: ImportStep; label: string }[] = [
   { id: 'setup', label: 'Choose a setup' },
   { id: 'profile', label: 'Choose a profile' },
   { id: 'preview', label: 'Preview' },
   { id: 'importing', label: 'Importing' },
   { id: 'done', label: 'Imported' },
 ];
+
+const VORTEX_STEPS: { id: ImportStep; label: string }[] = [
+  { id: 'setup', label: 'Choose a profile' },
+  { id: 'profile', label: 'Choose a profile' },
+  { id: 'preview', label: 'Preview' },
+  { id: 'importing', label: 'Importing' },
+  { id: 'done', label: 'Imported' },
+];
+
+const SOURCE_COPY: Record<ImportSource, { title: string; description: string }> = {
+  mo2: {
+    title: 'Import from Mod Organizer 2',
+    description:
+      'Bring a Mod Organizer 2 profile in as a new instance. Agora only reads the setup: every mod is copied in as it is on disk, and the profile’s load order, plugins, INIs and saves are set on the new instance.',
+  },
+  vortex: {
+    title: 'Import from Vortex',
+    description:
+      'Bring a Vortex profile in as a new instance. Close Vortex first: Agora reads a copy of its state store and refuses while Vortex holds it. Every mod is copied from the staging folder as it is on disk; the layer order comes from the deployment manifest, with Vortex’s rules as the tie-breaker.',
+  },
+};
 
 const INITIAL: ImportFlowState = { step: 'setup', running: false, report: null };
 
@@ -33,6 +57,7 @@ interface GameImportDialogProps {
 }
 
 export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpenInstance }: GameImportDialogProps) {
+  const [source, setSource] = useState<ImportSource>('mo2');
   const [state, setState] = useState<ImportFlowState>(INITIAL);
   // Someone tried to close the dialog during an import: say why it stayed, instead of ignoring them.
   const [closeRefused, setCloseRefused] = useState(false);
@@ -47,6 +72,13 @@ export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpe
   useEffect(() => {
     if (!state.running) setCloseRefused(false);
   }, [state.running]);
+
+  // A different source is a different flow: its own steps, and nothing carried over.
+  useEffect(() => {
+    setState(INITIAL);
+  }, [source]);
+
+  const steps = source === 'mo2' ? MO2_STEPS : VORTEX_STEPS;
 
   const close = (next: boolean) => {
     if (next) {
@@ -63,7 +95,7 @@ export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpe
     onOpenChange(false);
   };
 
-  const at = STEPS.findIndex((entry) => entry.id === state.step);
+  const at = steps.findIndex((entry) => entry.id === state.step);
   const newInstance = state.report?.instanceId ?? null;
 
   return (
@@ -80,15 +112,34 @@ export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpe
               <Download className="h-4 w-4" />
             </span>
             <div className="min-w-0 space-y-1">
-              <DialogTitle className="text-base font-semibold">Import from Mod Organizer 2</DialogTitle>
-              <DialogDescription>
-                Bring a Mod Organizer 2 profile in as a new instance. Agora only reads the setup: every mod is copied in
-                as it is on disk, and the profile’s load order, plugins, INIs and saves are set on the new instance.
-              </DialogDescription>
+              <DialogTitle className="text-base font-semibold">{SOURCE_COPY[source].title}</DialogTitle>
+              <DialogDescription>{SOURCE_COPY[source].description}</DialogDescription>
+              <div className="flex flex-wrap gap-2 pt-1" role="group" aria-label="Import from">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={source === 'mo2' ? 'default' : 'outline'}
+                  aria-pressed={source === 'mo2'}
+                  disabled={state.running}
+                  onClick={() => setSource('mo2')}
+                >
+                  Mod Organizer 2
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={source === 'vortex' ? 'default' : 'outline'}
+                  aria-pressed={source === 'vortex'}
+                  disabled={state.running}
+                  onClick={() => setSource('vortex')}
+                >
+                  Vortex
+                </Button>
+              </div>
             </div>
           </div>
           <ol className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs" aria-label="Import steps">
-            {STEPS.map((entry, index) => {
+            {steps.map((entry, index) => {
               const done = index < at;
               const current = index === at;
               return (
@@ -113,7 +164,11 @@ export function GameImportDialog({ gameId, open, onOpenChange, onImported, onOpe
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
-          <Mo2ImportFlow gameId={gameId} onStateChange={setState} />
+          {source === 'mo2' ? (
+            <Mo2ImportFlow gameId={gameId} onStateChange={setState} />
+          ) : (
+            <VortexImportFlow onStateChange={setState} />
+          )}
         </div>
 
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-border px-6 py-3">
