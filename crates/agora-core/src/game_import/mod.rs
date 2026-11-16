@@ -1892,6 +1892,7 @@ pub struct Mo2MultiReport {
 fn add_mo2_mod_to_merged(
     ctx: &Ctx,
     instance_id: &str,
+    definition: &GameDefinition,
     plan: &Mo2Plan,
     item: &PlannedMod,
 ) -> Result<String, ImportError> {
@@ -1917,7 +1918,13 @@ fn add_mo2_mod_to_merged(
         matches!(&layer.source, agora_game_api::LayerSource::Content { content } if content == &item_id)
     });
     if !present {
-        game_deploy::add_to_instance(ctx, instance_id, &item_id).map_err(|e| {
+        let mount = mount_point(definition);
+        let mount_arg = if mount.is_empty() {
+            None
+        } else {
+            Some(mount.as_str())
+        };
+        game_deploy::add_content(ctx, instance_id, &item_id, mount_arg, None).map_err(|e| {
             ImportError::Other(format!(
                 "'{}' could not be put on the merged instance: {e}",
                 item.folder
@@ -2052,7 +2059,8 @@ pub fn mo2_run_profiles(
                     if folder_to_item.contains_key(&item.folder) {
                         continue;
                     }
-                    let item_id = add_mo2_mod_to_merged(ctx, &instance_id, profile_plan, item)?;
+                    let item_id =
+                        add_mo2_mod_to_merged(ctx, &instance_id, &definition, profile_plan, item)?;
                     folder_to_item.insert(item.folder.clone(), item_id);
                 }
             }

@@ -18,6 +18,8 @@ import { formatError } from '@/lib/tauri';
 import { addGameFolder } from '../discovery/api';
 import {
   importVortexProfile,
+  importVortexProfiles,
+  suggestVortexProfiles,
   scanVortex,
   type VortexPlanDto,
   type VortexRunDto,
@@ -27,6 +29,7 @@ import {
 } from './api';
 import type { ImportDone, ImportFlowState, ImportStep } from './Mo2ImportFlow';
 import { ImportProgressView } from './ImportProgressView';
+import { MultiProfilesSection } from './MultiProfilesSection';
 
 const STEP_CARD = 'space-y-3 rounded-xl border border-border bg-background/60 p-4';
 
@@ -563,6 +566,48 @@ export function VortexImportFlow({ onStateChange }: VortexImportFlowProps) {
               {game.supported && game.profiles.length === 0 && (
                 <p className="text-sm text-muted-foreground">Vortex lists no profile for this game.</p>
               )}
+              {game.supported && game.game && (
+                <MultiProfilesSection
+                  profiles={game.profiles.map((profile) => ({
+                    name: profile.name,
+                    detail: profileSummary(profile),
+                  }))}
+                  onSuggest={() => suggestVortexProfiles(null, game.game as string)}
+                  onPlan={async (profiles, mode) => {
+                    const reply = await importVortexProfiles({
+                      store: null,
+                      game: game.game as string,
+                      profiles,
+                      mode,
+                      name: null,
+                      dryRun: true,
+                      install: null,
+                      addFolder: false,
+                      copySaves,
+                      allMods,
+                    });
+                    if (reply.kind !== 'plan') throw new Error('The preview did not return a plan.');
+                    return reply;
+                  }}
+                  onRun={async (profiles, mode) => {
+                    const reply = await importVortexProfiles({
+                      store: null,
+                      game: game.game as string,
+                      profiles,
+                      mode,
+                      name: null,
+                      dryRun: false,
+                      install: null,
+                      addFolder: false,
+                      copySaves,
+                      allMods,
+                    });
+                    if (reply.kind !== 'run') throw new Error('The import did not return a report.');
+                    return reply;
+                  }}
+                />
+              )}
+
             </div>
           ))}
           {scan.reply.warnings.length > 0 && (

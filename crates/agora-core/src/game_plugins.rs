@@ -227,8 +227,7 @@ pub fn list_bytes(rule: &LoadOrderDefinition, entries: &[(String, bool)]) -> Vec
         if name.trim().is_empty() {
             continue;
         }
-        file.lines
-            .push(render_line(rule, name.as_bytes(), *active));
+        file.lines.push(render_line(rule, name.as_bytes(), *active));
     }
     file.render()
 }

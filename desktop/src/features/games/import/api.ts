@@ -193,6 +193,111 @@ export async function importMo2Profile(request: Mo2ImportRequest): Promise<Mo2Im
   return reply as unknown as Mo2ImportReply;
 }
 
+// ---------------------------------------------------------------------------
+// Importing several profiles
+// ---------------------------------------------------------------------------
+
+export type ImportGrouping = 'merged' | 'separate';
+
+export interface ProfileOverlap {
+  a: string;
+  b: string;
+  shared: number;
+  union: number;
+  ratio: number;
+}
+
+export interface ProfileSuggestion {
+  threshold: number;
+  groups: { profiles: string[]; pairs: ProfileOverlap[] }[];
+  pairs: ProfileOverlap[];
+  note: string;
+}
+
+export interface MultiProfileSummary {
+  profile: string;
+  enabled: number;
+  files: number;
+  bytes: number;
+}
+
+export interface MultiPlanDto {
+  manager: 'vortex' | 'mo2';
+  grouping: ImportGrouping;
+  profiles: string[];
+  bytes: number;
+  freeBytes: number | null;
+  fits: boolean;
+  suggestion: ProfileSuggestion;
+  plans: MultiProfileSummary[];
+  warnings: string[];
+}
+
+export interface MultiRunDto {
+  instances: string[];
+  loadouts: string[];
+}
+
+export type MultiImportReply =
+  | ({ kind: 'plan' } & MultiPlanDto)
+  | ({ kind: 'run' } & MultiRunDto);
+
+export interface VortexMultiRequest {
+  store: string | null;
+  game: string;
+  profiles: string[];
+  mode: ImportGrouping;
+  name: string | null;
+  dryRun: boolean;
+  install: string | null;
+  addFolder: boolean;
+  copySaves: boolean;
+  allMods: boolean;
+}
+
+export interface Mo2MultiRequest {
+  iniPath: string;
+  profiles: string[];
+  mode: ImportGrouping;
+  name: string | null;
+  dryRun: boolean;
+  copySaves: boolean;
+  install: string | null;
+}
+
+function isMultiReply(reply: unknown): reply is MultiImportReply {
+  return isRecord(reply) && (reply.kind === 'plan' || reply.kind === 'run');
+}
+
+/** Agora's suggested grouping of a Vortex game's profiles. */
+export async function suggestVortexProfiles(
+  store: string | null,
+  game: string,
+): Promise<ProfileSuggestion> {
+  return invoke<ProfileSuggestion>('games_import_vortex_suggest', { store, game });
+}
+
+/** Agora's suggested grouping of an MO2 setup's profiles. */
+export async function suggestMo2Profiles(iniPath: string): Promise<ProfileSuggestion> {
+  return invoke<ProfileSuggestion>('games_import_mo2_suggest', { iniPath });
+}
+
+export async function importVortexProfiles(request: VortexMultiRequest): Promise<MultiImportReply> {
+  const reply: unknown = await invoke<unknown>('games_import_vortex_multi', { request });
+  if (!isMultiReply(reply)) {
+    throw new Error('games_import_vortex_multi did not return a plan or a report.');
+  }
+  return reply;
+}
+
+export async function importMo2Profiles(request: Mo2MultiRequest): Promise<MultiImportReply> {
+  const reply: unknown = await invoke<unknown>('games_import_mo2_multi', { request });
+  if (!isMultiReply(reply)) {
+    throw new Error('games_import_mo2_multi did not return a plan or a report.');
+  }
+  return reply;
+}
+
 /** Subscribe to the progress of a running import. Call the returned function to unsubscribe. */
 export function listenImportProgress(onProgress: (progress: ImportProgress) => void): Promise<UnlistenFn> {
   return listen<ImportProgress>(IMPORT_PROGRESS_EVENT, (event) => onProgress(event.payload));
@@ -207,6 +312,8 @@ export interface VortexScanProfile {
   name: string;
   modsEnabled: number;
   modsTotal: number;
+  /** The mods this profile enables, for comparing profiles. */
+  enabledModIds?: string[];
   pluginsTxt: boolean;
   loadorderTxt: boolean;
   localSettings: boolean;

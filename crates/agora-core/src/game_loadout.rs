@@ -87,8 +87,12 @@ fn instance_dir(ctx: &Ctx, instance_id: &str) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The undo point lives in its own folder, because `list_profiles` reads every
+/// `.json` file directly in the loadouts folder as a profile.
 fn undo_path(instance_dir: &std::path::Path) -> PathBuf {
-    loadout::loadouts_dir(instance_dir).join("game-undo.json")
+    loadout::loadouts_dir(instance_dir)
+        .join("undo")
+        .join("last.json")
 }
 
 fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>, String> {

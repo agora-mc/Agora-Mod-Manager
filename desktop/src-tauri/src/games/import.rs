@@ -685,6 +685,281 @@ fn resolve_vortex_store(store: Option<String>) -> Result<PathBuf, GamesError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Importing several profiles (§26.10)
+// ---------------------------------------------------------------------------
+
+/// How several profiles import: one instance with a loadout per profile, or one
+/// instance per profile.
+fn grouping_from_mode(
+    mode: &str,
+) -> Result<agora_core::game_import::profiles::Grouping, GamesError> {
+    match mode {
+        "merged" => Ok(agora_core::game_import::profiles::Grouping::Merged),
+        "separate" => Ok(agora_core::game_import::profiles::Grouping::Separate),
+        other => Err(GamesError::new(
+            CORE_FAILED,
+            format!("'{other}' is not a grouping; use merged or separate"),
+        )),
+    }
+}
+
+/// One profile's numbers in a multi-profile plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiProfileSummary {
+    pub profile: String,
+    pub enabled: usize,
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// What a multi-profile import would do.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiPlanDto {
+    pub manager: String,
+    pub grouping: String,
+    pub profiles: Vec<String>,
+    pub bytes: u64,
+    pub free_bytes: Option<u64>,
+    pub fits: bool,
+    pub suggestion: agora_core::game_import::profiles::Suggestion,
+    pub plans: Vec<MultiProfileSummary>,
+    pub warnings: Vec<String>,
+}
+
+/// What a multi-profile import did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiRunDto {
+    pub instances: Vec<String>,
+    pub loadouts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MultiImportReply {
+    Plan(Box<MultiPlanDto>),
+    Run(Box<MultiRunDto>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VortexMultiRequest {
+    #[serde(default)]
+    pub store: Option<String>,
+    pub game: String,
+    pub profiles: Vec<String>,
+    pub mode: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub dry_run: bool,
+    #[serde(default)]
+    pub install: Option<String>,
+    #[serde(default)]
+    pub add_folder: bool,
+    #[serde(default)]
+    pub copy_saves: bool,
+    #[serde(default)]
+    pub all_mods: bool,
+}
+
+#[tauri::command]
+pub async fn games_import_vortex_multi(
+    app: tauri::AppHandle,
+    request: VortexMultiRequest,
+) -> Result<MultiImportReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<MultiImportReply, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(request.store)?;
+        let grouping = grouping_from_mode(&request.mode)?;
+        let game = GameId::new(&request.game).map_err(|error| {
+            GamesError::new(
+                CORE_FAILED,
+                format!("'{}' is not a game id: {error}", request.game),
+            )
+        })?;
+        let core_request = VortexRequest {
+            store,
+            game,
+            profile: request.profiles.first().cloned().unwrap_or_default(),
+            name: request
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+            add_folder: request.add_folder,
+            copy_saves: request.copy_saves,
+            all_mods: request.all_mods,
+        };
+        let inventory = installed_games(&ctx);
+        if request.dry_run {
+            let plan =
+                vortex::plan_profiles(&ctx, &inventory, &core_request, &request.profiles, grouping)
+                    .map_err(import_failed)?;
+            return Ok(MultiImportReply::Plan(Box::new(MultiPlanDto {
+                manager: "vortex".into(),
+                grouping: request.mode,
+                profiles: plan.profiles.clone(),
+                bytes: plan.bytes,
+                free_bytes: plan.free_bytes,
+                fits: plan.fits,
+                suggestion: plan.suggestion.clone(),
+                plans: plan
+                    .profiles
+                    .iter()
+                    .zip(plan.plans.iter())
+                    .map(|(profile, planned)| MultiProfileSummary {
+                        profile: profile.clone(),
+                        enabled: planned.mods_enabled,
+                        files: planned.files,
+                        bytes: planned.bytes,
+                    })
+                    .collect(),
+                warnings: plan.warnings.clone(),
+            })));
+        }
+        let report = vortex::run_profiles(
+            &ctx,
+            &inventory,
+            &core_request,
+            &request.profiles,
+            grouping,
+            RunOptions::default(),
+            &|_| {},
+        )
+        .map_err(import_failed)?;
+        Ok(MultiImportReply::Run(Box::new(MultiRunDto {
+            instances: report.instances,
+            loadouts: report.loadouts,
+        })))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Importing the Vortex profiles did not finish."))?
+}
+
+#[tauri::command]
+pub async fn games_import_vortex_suggest(
+    app: tauri::AppHandle,
+    store: Option<String>,
+    game: String,
+) -> Result<agora_core::game_import::profiles::Suggestion, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<_, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let store = resolve_vortex_store(store)?;
+        let inventory = installed_games(&ctx);
+        let sets = vortex::profile_sets(&ctx, &inventory, &store, &game).map_err(import_failed)?;
+        Ok(agora_core::game_import::profiles::suggest_grouping(
+            &sets.profiles,
+        ))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Reading the Vortex profiles did not finish."))?
+}
+
+#[tauri::command]
+pub async fn games_import_mo2_suggest(
+    ini_path: String,
+) -> Result<agora_core::game_import::profiles::Suggestion, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<_, GamesError> {
+        let sets = game_import::mo2_profile_sets(Path::new(&ini_path)).map_err(import_failed)?;
+        Ok(agora_core::game_import::profiles::suggest_grouping(&sets))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Reading the setup's profiles did not finish."))?
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mo2MultiRequest {
+    pub ini_path: String,
+    pub profiles: Vec<String>,
+    pub mode: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub dry_run: bool,
+    #[serde(default)]
+    pub copy_saves: bool,
+    #[serde(default)]
+    pub install: Option<String>,
+}
+
+#[tauri::command]
+pub async fn games_import_mo2_multi(
+    app: tauri::AppHandle,
+    request: Mo2MultiRequest,
+) -> Result<MultiImportReply, GamesError> {
+    tokio::task::spawn_blocking(move || -> Result<MultiImportReply, GamesError> {
+        let ctx = crate::core_context(&app)?;
+        let grouping = grouping_from_mode(&request.mode)?;
+        let core_request = Mo2Request {
+            ini_path: PathBuf::from(&request.ini_path),
+            profile: request.profiles.first().cloned().unwrap_or_default(),
+            name: request
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
+            copy_saves: request.copy_saves,
+            install: request
+                .install
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
+        };
+        let inventory = installed_games(&ctx);
+        if request.dry_run {
+            let plan = game_import::mo2_plan_profiles(
+                &ctx,
+                &inventory,
+                &core_request,
+                &request.profiles,
+                grouping,
+            )
+            .map_err(import_failed)?;
+            return Ok(MultiImportReply::Plan(Box::new(MultiPlanDto {
+                manager: "mo2".into(),
+                grouping: request.mode,
+                profiles: plan.profiles.clone(),
+                bytes: plan.bytes,
+                free_bytes: plan.free_bytes,
+                fits: plan.fits,
+                suggestion: plan.suggestion.clone(),
+                plans: plan
+                    .profiles
+                    .iter()
+                    .zip(plan.plans.iter())
+                    .map(|(profile, planned)| MultiProfileSummary {
+                        profile: profile.clone(),
+                        enabled: planned.mods_enabled,
+                        files: planned.files,
+                        bytes: planned.bytes,
+                    })
+                    .collect(),
+                warnings: plan.warnings.clone(),
+            })));
+        }
+        let report = game_import::mo2_run_profiles(
+            &ctx,
+            &inventory,
+            &core_request,
+            &request.profiles,
+            grouping,
+            RunOptions::default(),
+            &|_| {},
+        )
+        .map_err(import_failed)?;
+        Ok(MultiImportReply::Run(Box::new(MultiRunDto {
+            instances: report.instances,
+            loadouts: report.loadouts,
+        })))
+    })
+    .await
+    .map_err(|_| GamesError::new(TASK_FAILED, "Importing the MO2 profiles did not finish."))?
+}
+
 /// The games and profiles a Vortex store holds, and whether Agora supports each game. Reads a copy
 /// of the store; Vortex must be closed (its lock is refused).
 #[tauri::command]
