@@ -37,6 +37,11 @@ pub const KNOWN_RESTRICTED_ENV: &str = "AGORA_LINUX_VIEW_KNOWN_RESTRICTED";
 /// can be exercised on any Linux host. Test hook; nothing ships that sets it.
 pub const REFUSE_OVERLAY_ENV: &str = "AGORA_LINUX_VIEW_REFUSE_OVERLAY";
 
+/// When set to a non-empty value, the kernel overlay mount is skipped as if the kernel refused
+/// it, so the `fuse-overlayfs` path can be exercised on a host that has both. Test hook;
+/// nothing ships that sets it.
+pub const REFUSE_KERNEL_OVERLAY_ENV: &str = "AGORA_LINUX_VIEW_REFUSE_KERNEL_OVERLAY";
+
 /// The command to run inside the namespace. `environment` of `None` inherits the
 /// caller's environment, which is what a game wrapper wants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,7 +238,9 @@ mod linux_impl {
 
             let refuse =
                 std::env::var_os(REFUSE_OVERLAY_ENV).is_some_and(|value| !value.is_empty());
-            let prepared = Prepared::new(request, &lower, &upper, &work, refuse)?;
+            let refuse_kernel =
+                std::env::var_os(REFUSE_KERNEL_OVERLAY_ENV).is_some_and(|value| !value.is_empty());
+            let prepared = Prepared::new(request, &lower, &upper, &work, refuse, refuse_kernel)?;
             run_prepared(prepared)
         }
     }
@@ -264,6 +271,7 @@ mod linux_impl {
     /// syscalls until it execs.
     struct Prepared {
         refuse: bool,
+        refuse_kernel: bool,
         proc_setgroups: CString,
         proc_uid_map: CString,
         proc_gid_map: CString,
@@ -291,6 +299,7 @@ mod linux_impl {
             upper: &Path,
             work: &Path,
             refuse: bool,
+            refuse_kernel: bool,
         ) -> Result<Self, ViewError> {
             let kernel_data = format!(
                 "lowerdir={},upperdir={},workdir={},userxattr",
@@ -347,6 +356,7 @@ mod linux_impl {
                 .collect::<Result<Vec<_>, ViewError>>()?;
             Ok(Prepared {
                 refuse,
+                refuse_kernel,
                 proc_setgroups: CString::new("/proc/self/setgroups").expect("a fixed path"),
                 proc_uid_map: CString::new("/proc/self/uid_map").expect("a fixed path"),
                 proc_gid_map: CString::new("/proc/self/gid_map").expect("a fixed path"),
@@ -499,13 +509,18 @@ mod linux_impl {
             );
         }
 
-        let mechanism = match mount::<CStr, CStr, CStr, CStr>(
-            Some(prepared.overlay_source.as_c_str()),
-            prepared.target.as_c_str(),
-            Some(prepared.overlay_fs.as_c_str()),
-            MsFlags::empty(),
-            Some(prepared.kernel_data.as_c_str()),
-        ) {
+        let kernel = if prepared.refuse_kernel {
+            Err(nix::errno::Errno::ENOTSUP)
+        } else {
+            mount::<CStr, CStr, CStr, CStr>(
+                Some(prepared.overlay_source.as_c_str()),
+                prepared.target.as_c_str(),
+                Some(prepared.overlay_fs.as_c_str()),
+                MsFlags::empty(),
+                Some(prepared.kernel_data.as_c_str()),
+            )
+        };
+        let mechanism = match kernel {
             Ok(()) => OverlayMechanism::Kernel,
             Err(kernel) => match try_fuse(prepared) {
                 Ok(()) => OverlayMechanism::Fuse,

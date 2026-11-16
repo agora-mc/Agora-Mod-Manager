@@ -20,8 +20,8 @@ use agora_core::game_registry::{
     GameRegistry, IdentifiedInstall, PackageSource, RuntimeResolution,
 };
 use agora_core::linux_view::{
-    self, CommandSpec, PerUserMount, ViewOutcome, ViewRequest, ViewRun, KNOWN_RESTRICTED_ENV,
-    REFUSE_OVERLAY_ENV,
+    self, CommandSpec, OverlayMechanism, PerUserMount, ViewOutcome, ViewRequest, ViewRun,
+    KNOWN_RESTRICTED_ENV, REFUSE_KERNEL_OVERLAY_ENV, REFUSE_OVERLAY_ENV,
 };
 use agora_game_api::{
     BaseReference, DeploymentStrategy, GameDefinition, GameId, GamePackage, GamePath, InstallId,
@@ -505,6 +505,114 @@ fn merged_view_and_write_isolation() {
         "the content object was replaced instead of copied up"
     );
     assert_eq!(read(&real_user), b"real per-user");
+}
+
+/// True when `fuse-overlayfs` is somewhere on this process's `PATH`.
+fn fuse_overlayfs_installed() -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join("fuse-overlayfs");
+            candidate.is_file()
+        })
+    })
+}
+
+#[test]
+fn fuse_overlay_runs_when_the_kernel_refuses() {
+    let _serial = serial();
+    if !fuse_overlayfs_installed() {
+        eprintln!("SKIPPED: fuse-overlayfs is not on PATH on this host");
+        return;
+    }
+    struct ClearEnv;
+    impl Drop for ClearEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(REFUSE_KERNEL_OVERLAY_ENV);
+        }
+    }
+    std::env::set_var(REFUSE_KERNEL_OVERLAY_ENV, "1");
+    let _clear = ClearEnv;
+
+    let fixture = Fixture::new();
+    let out = fixture._tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let target = fixture._tmp.path().join("target");
+    write(&target.join("outside.txt"), b"outside");
+
+    let lower = fixture.lower();
+    let base_before = read(&fixture.base_location.join("base_only.txt"));
+    let lower_before = read(&lower.join("mod_file.txt"));
+
+    let mut request = ViewRequest {
+        instance_id: fixture.instance_id.clone(),
+        target: target.clone(),
+        command: fixture.command(concat!(
+            "set -e
+",
+            "cat \"$TARGET/shared.txt\" > \"$OUT/merged-shared\"
+",
+            "cat \"$TARGET/base_only.txt\" > \"$OUT/merged-base\"
+",
+            "cat \"$TARGET/mod_file.txt\" > \"$OUT/merged-mod\"
+",
+            "cat \"$TARGET/written.txt\" > \"$OUT/merged-written\"
+",
+            "printf 'changed base\n' > \"$TARGET/base_only.txt\"
+",
+            "printf 'new in upper\n' > \"$TARGET/new_in_upper.txt\"
+",
+            "rm \"$TARGET/delete_me.txt\"
+",
+        )),
+        per_user_files: vec![],
+    };
+    request.command.environment = Some(vec![
+        (
+            "PATH".into(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        ),
+        ("TARGET".into(), target.display().to_string()),
+        ("OUT".into(), out.display().to_string()),
+    ]);
+
+    let run = ran(run_view(&fixture, &request)).expect("the fixture host must run the view");
+    assert_eq!(
+        run.mechanism,
+        OverlayMechanism::Fuse,
+        "the kernel overlay was refused, so the fuse path must have mounted the view"
+    );
+    assert!(run.status.success(), "the command failed: {:?}", run.status);
+
+    assert_eq!(read(&out.join("merged-shared")), b"mod shared");
+    assert_eq!(read(&out.join("merged-base")), b"base only");
+    assert_eq!(read(&out.join("merged-mod")), b"mod only");
+    assert_eq!(read(&out.join("merged-written")), b"only writable");
+
+    assert_eq!(
+        read(&fixture.writable().join("base_only.txt")),
+        b"changed base
+"
+    );
+    assert_eq!(
+        read(&fixture.writable().join("new_in_upper.txt")),
+        b"new in upper
+"
+    );
+    assert!(
+        fixture.writable().join("delete_me.txt").exists(),
+        "a delete must leave a whiteout in the writable layer"
+    );
+    assert_eq!(
+        read(&fixture.base_location.join("base_only.txt")),
+        base_before
+    );
+    assert_eq!(read(&lower.join("delete_me.txt")), b"mod delete");
+    assert_eq!(read(&lower.join("mod_file.txt")), lower_before);
+    assert_eq!(read(&target.join("outside.txt")), b"outside");
+    assert!(
+        !target.join("new_in_upper.txt").exists(),
+        "the overlay was visible outside the namespace"
+    );
 }
 
 #[test]
