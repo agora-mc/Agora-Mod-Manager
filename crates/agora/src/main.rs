@@ -10941,8 +10941,6 @@ fn cli_linux_launch(
     instance_id: &str,
     json: bool,
 ) -> anyhow::Result<Option<i32>> {
-    use agora_core::game_wrap::WrapError;
-
     let status = match agora_core::game_wrap::start_via_steam(ctx, instance_id) {
         Ok(status) => status,
         Err(error) if steam_failure_falls_back(&error) => return Ok(None),

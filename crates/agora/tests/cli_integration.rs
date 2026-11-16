@@ -5517,6 +5517,10 @@ fn run_vfs_fixture(fixture: &VfsFixture, args: &[&str]) -> std::process::Output 
     run_command(cmd, args)
 }
 
+/// On Linux a Steam instance is handed to Steam, and refuses before the ordinary launch when no
+/// `steam` command exists. This test drives the ordinary launch, which a Steam instance does not
+/// take there.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn a_launch_that_cannot_start_the_vfs_says_why_and_prints_both_ways_to_run_from_links() {
     let fixture = vfs_fixture();
@@ -5714,15 +5718,19 @@ fn games_instance_check_names_a_framework_built_for_another_version() {
     assert_eq!(json["findings"][0]["problem"]["kind"], "wrong_version");
     assert_eq!(json["findings"][0]["found"][0], "skse64_1_6_1179.dll");
 
-    // A launch makes the same check and refuses before it starts anything.
-    let out_launch = run_agora(
-        &fixture.data_dir,
-        &["games", "instance", "launch", &id, "--deployment", "links"],
-    );
-    assert_eq!(out_launch.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&out_launch.stderr);
-    assert!(stderr.contains("Skyrim Script Extender (SKSE)"), "{stderr}");
-    assert!(stderr.contains("--launch-anyway"), "{stderr}");
+    // A launch makes the same check and refuses before it starts anything. On Linux a Steam
+    // instance is handed to Steam first, and without a `steam` command it refuses there.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out_launch = run_agora(
+            &fixture.data_dir,
+            &["games", "instance", "launch", &id, "--deployment", "links"],
+        );
+        assert_eq!(out_launch.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out_launch.stderr);
+        assert!(stderr.contains("Skyrim Script Extender (SKSE)"), "{stderr}");
+        assert!(stderr.contains("--launch-anyway"), "{stderr}");
+    }
 }
 
 /// The fixture with one invented SKSE plugin built only for 1.6.640, in the install's
@@ -5753,28 +5761,33 @@ fn a_launch_prints_the_plugin_version_warning_the_check_prints() {
         "the check must warn about the old plugin: {check_out}"
     );
 
-    let out = run_vfs_fixture(
-        &fixture,
-        &[
-            "games",
-            "instance",
-            "launch",
-            &id,
-            "--deployment",
-            "links",
-            "--wait",
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    assert!(
-        stderr.contains("exampleold.dll"),
-        "the launch did not print the check's plugin-version warning: {stderr}"
-    );
-    assert!(
-        stderr.contains("built for another game version"),
-        "the launch did not print the check's plugin-version warning: {stderr}"
-    );
+    // On Linux a Steam instance is handed to Steam first, and refuses without a `steam` command,
+    // so only the ordinary launch elsewhere prints the check's warning.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = run_vfs_fixture(
+            &fixture,
+            &[
+                "games",
+                "instance",
+                "launch",
+                &id,
+                "--deployment",
+                "links",
+                "--wait",
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("exampleold.dll"),
+            "the launch did not print the check's plugin-version warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("built for another game version"),
+            "the launch did not print the check's plugin-version warning: {stderr}"
+        );
+    }
 }
 
 #[test]

@@ -142,17 +142,20 @@ pub fn capture(
         });
     }
 
+    // Only the instance's own copies are part of a profile. The game's shared file is where a
+    // copy is seeded from, not something an apply restores, so capturing never needs the user's
+    // Documents folder and a machine without one still gets a complete profile.
+    let store = crate::game_ini::store_of(ctx, instance_id).map_err(|e| e.to_string())?;
     let mut inis = Vec::new();
-    for file in
-        crate::game_ini::list_files(ctx, instance_id, definition).map_err(|e| e.to_string())?
+    for mapping in definition
+        .user_files
+        .iter()
+        .filter(|m| m.applies_to_store(&store))
     {
-        let contents = if file.copy_exists {
-            read_optional(&dir.join(&file.instance_path))?
-        } else {
-            None
-        };
+        let instance_path = mapping.instance_path.as_str().to_string();
+        let contents = read_optional(&crate::game_ini::join_rel(&dir, &instance_path))?;
         inis.push(GameLoadoutIni {
-            file: file.instance_path,
+            file: instance_path,
             contents,
         });
     }

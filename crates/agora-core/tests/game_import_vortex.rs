@@ -556,9 +556,23 @@ fn a_fresh_data_dir_says_the_folder_needs_adding_then_adds_it() {
     assert_eq!(report.stored_mods, 2);
     assert!(report.instance_id.is_some());
     let folders = agora_core::game_discovery::custom_folders::list_folders(&f.ctx.paths).unwrap();
-    assert!(folders
-        .iter()
-        .any(|folder| Path::new(folder) == f._tmp.path().join("game")));
+    let added = folder_identity(&f._tmp.path().join("game"));
+    assert!(
+        folders
+            .iter()
+            .any(|folder| folder_identity(Path::new(folder)) == added),
+        "{folders:?}"
+    );
+}
+
+/// The identity the code compares a game folder by: the real folder, shown without the `\\?\`
+/// prefix and case-folded. A temp folder can arrive in its 8.3 short form, so the test compares
+/// the way the code does rather than by spelling.
+fn folder_identity(path: &Path) -> String {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    agora_core::game_discovery::custom_folders::folder_key(
+        &agora_core::game_discovery::custom_folders::display_path(&real),
+    )
 }
 
 /// The folder's 8.3 short name, the spelling CI's temp folder can arrive as.
@@ -1056,8 +1070,11 @@ fn the_real_skyrim_package_maps_and_imports_a_not_yet_added_folder() {
     assert!(report.instance_id.is_some());
     assert_eq!(report.stored_mods, 1);
     let folders = custom_folders::list_folders(&ctx.paths).unwrap();
+    let added = folder_identity(&game_dir);
     assert!(
-        folders.iter().any(|folder| Path::new(folder) == game_dir),
+        folders
+            .iter()
+            .any(|folder| folder_identity(Path::new(folder)) == added),
         "{folders:?}"
     );
 }
